@@ -18,6 +18,13 @@ test json-less-than-errors {
 @sqlstate 42883
 expect error {}
 
+test json-equals-null-errors {
+    CREATE TABLE t(j json);
+    SELECT j = NULL FROM t;
+}
+@sqlstate 42883
+expect error {}
+
 test json-in-list-errors {
     CREATE TABLE t(j json);
     SELECT j IN ('{}') FROM t;

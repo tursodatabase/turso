@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::StrictType;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -763,7 +764,7 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
-            let chain = resolved.chain;
+            let chain = &resolved.chain;
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
             let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -785,28 +786,23 @@ fn translate_cast_expr(
             {
                 emit_integer_to_boolean_cast(program, target_register);
             }
-            // A domain whose types have no expression to convert the value holds
-            // it as its base SQL type, so the CAST converts it as a CAST to that
-            // type would: CAST('2' AS d) is the integer 2 for a domain d over
-            // integer.
-            let converts_by_expression = chain
-                .iter()
-                .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
-            if is_domain
-                && !converts_by_expression
-                && !resolved.primitive.eq_ignore_ascii_case("any")
-            {
-                program.emit_insn(Insn::Cast {
+            // The CAST first converts the value to the type's input type as a
+            // CAST to that type would, then stores it as a column of the type
+            // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
+            // CAST(5.5 AS d) for a domain d over integer.
+            match resolver.schema().plain_input_type(&resolved)? {
+                StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
                     reg: target_register,
-                    affinity: Affinity::of_written_type(&resolved.primitive),
-                });
+                    affinity: storage_class.affinity(),
+                }),
+                StrictType::Any => {}
             }
-            emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
-            emit_decode(program, &chain, target_register, resolver)?;
+            emit_store_value(program, &resolved, target_register, &ty_params, resolver)?;
+            emit_decode(program, chain, target_register, resolver)?;
             // The domain's CHECKs see the value after DECODE, as they do on a
             // column of the domain.
             if is_domain {
-                emit_domain_cast_constraints(program, &chain, tn, target_register, resolver)?;
+                emit_domain_cast_constraints(program, chain, tn, target_register, resolver)?;
             }
             return Ok(target_register);
         }

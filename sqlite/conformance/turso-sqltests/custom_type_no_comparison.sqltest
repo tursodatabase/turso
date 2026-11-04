@@ -457,6 +457,22 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test no-comparison-check-array-function {
+    CREATE TABLE t(i inet, CHECK (array_position(ARRAY['x'], i) IS NULL)) STRICT;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-cast-to-array {
+    CREATE TABLE t(i inet, CHECK (CAST(i AS inet[]) IS NOT NULL)) STRICT;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
 test no-comparison-check-case-operand {
     CREATE TABLE t(i inet CHECK (CASE i WHEN '10.0.0.1' THEN 0 ELSE 1 END)) STRICT;
 }
@@ -526,14 +542,30 @@ test no-comparison-null-tests-work {
     SELECT id FROM t WHERE j IS NULL;
     SELECT id FROM t WHERE i IS NOT NULL;
     SELECT id FROM t WHERE j NOTNULL;
-    SELECT id, j = NULL FROM t ORDER BY id;
 }
 expect {
     2
     2
     1
-    1|
-    2|
+}
+
+# PostgreSQL refuses `json = NULL`: only IS NULL works on every type.
+@requires strict "uses STRICT tables"
+test no-comparison-json-equals-null {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j = NULL FROM t;
+}
+expect error {
+    values of type json cannot be compared; to compare their text, CAST them to text
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-is-other-column {
+    CREATE TABLE t(j json, j2 json) STRICT;
+    SELECT j IS j2 FROM t;
+}
+expect error {
+    values of type json cannot be compared; to compare their text, CAST them to text
 }
 
 @requires strict "uses STRICT tables"

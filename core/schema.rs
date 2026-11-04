@@ -19,6 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
+use crate::types::StrictType;
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -446,6 +447,29 @@ impl ResolvedType {
     /// type, such as `CREATE DOMAIN pos AS integer`.
     pub fn base_type(&self) -> Option<&Arc<TypeDef>> {
         self.chain.iter().find(|type_def| !type_def.is_domain)
+    }
+
+    /// The SQL type the type takes as input: the `value` type of the type, or
+    /// of the type a domain is based on, or the plain type a domain is based
+    /// on.
+    pub fn input_type(&self) -> &str {
+        self.base_type()
+            .map_or(self.primitive.as_str(), |type_def| {
+                type_def.value_input_type()
+            })
+    }
+
+    /// The storage class of the values the type stores: that of its BASE, or
+    /// of the plain type a domain is based on.
+    pub fn storage_class(&self) -> crate::Result<crate::types::StorageClass> {
+        match StrictType::named(&self.primitive) {
+            Some(StrictType::Stores(storage_class)) => Ok(storage_class),
+            Some(StrictType::Any) | None => Err(crate::LimboError::InternalError(format!(
+                "type {} is based on {}, which is not INTEGER, REAL, TEXT or BLOB",
+                self.leaf().name,
+                self.primitive
+            ))),
+        }
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
@@ -1900,12 +1924,18 @@ impl Schema {
             .unwrap_or_else(|| resolved.primitive == "text"))
     }
 
-    /// Fails when `element_type` has its own order, as numeric does. Array
-    /// elements compare by their stored form, which does not sort in the
-    /// type's order.
+    /// Fails when `element_type` is neither a STRICT type nor a custom type,
+    /// or when it has its own order, as numeric does. Array elements compare
+    /// by their stored form, which does not sort in the type's order.
     pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
         let Some(type_def) = self.get_type_def_unchecked(element_type) else {
-            return Ok(());
+            return match StrictType::named(element_type) {
+                Some(StrictType::Stores(_) | StrictType::Any) => Ok(()),
+                None => crate::bail_parse_error!(
+                    "unknown datatype for array elements: \"{}\"",
+                    element_type
+                ),
+            };
         };
         if self.type_ordering(type_def).is_some() {
             crate::bail_parse_error!(
@@ -2031,6 +2061,41 @@ impl Schema {
         }
         let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
         Ok(Some(ResolvedType { primitive, chain }))
+    }
+
+    /// The plain SQL type the type takes as input: its input type, followed
+    /// through custom types. A type declared `(value date)` takes text, as
+    /// date is declared `(value text)`. Fails for a name a STRICT column
+    /// can't be declared with, such as `(value float)`.
+    pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<StrictType> {
+        self.plain_value_type(&resolved.leaf().name, resolved.input_type())
+    }
+
+    /// The plain SQL type that `value_type`, the value type of type
+    /// `type_name`, leads to through custom types. `type_name` need not be in
+    /// the schema yet, so CREATE TYPE can check its own value type.
+    pub fn plain_value_type(&self, type_name: &str, value_type: &str) -> Result<StrictType> {
+        let mut input_type = value_type.to_string();
+        let mut seen = vec![type_name.to_lowercase()];
+        loop {
+            if seen.contains(&input_type.to_lowercase()) {
+                return Err(LimboError::ParseError(format!(
+                    "the value types of type {type_name} lead back to type {input_type}"
+                )));
+            }
+            match self.resolve_type_unchecked(&input_type)? {
+                Some(next) => {
+                    seen.push(input_type.to_lowercase());
+                    input_type = next.input_type().to_string();
+                }
+                None => break,
+            }
+        }
+        StrictType::named(&input_type).ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "type {type_name} takes values of type {input_type}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type"
+            ))
+        })
     }
 
     /// `type_def` itself, or the type a domain is based on: a domain stores,
@@ -5434,8 +5499,8 @@ impl BTreeTable {
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+            } else if let Some(resolved) = schema.resolve_type(&col.ty_str, table.is_strict)? {
+                col.ty_str = schema.plain_input_type(&resolved)?.name().to_string();
             }
         }
         Ok(Arc::new(modified))
@@ -7677,18 +7742,6 @@ impl Column {
         self.info.affinity()
     }
 
-    pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
-        use crate::types::ValueType;
-        turso_macros::match_ignore_ascii_case!(match self.ty_str.as_bytes() {
-            b"INTEGER" | b"INT" => Some(ValueType::Integer),
-            b"REAL" => Some(ValueType::Float),
-            b"BLOB" => Some(ValueType::Blob),
-            b"TEXT" => Some(ValueType::Text),
-            // ANY and custom types
-            _ => None,
-        })
-    }
-
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
@@ -8071,6 +8124,17 @@ impl Column {
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         self.info.set_array_dimensions(dims)
+    }
+    /// The type of a STRICT column declared INTEGER, INT, REAL, TEXT, BLOB or
+    /// ANY. Callers handle arrays and custom types before asking.
+    pub fn strict_type(&self, table_name: &str) -> Result<StrictType> {
+        StrictType::named(&self.ty_str).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "STRICT column {table_name}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
+                self.name.as_deref().unwrap_or(""),
+                self.ty_str
+            ))
+        })
     }
     /// Whether both columns declare the same type: name, type parameters
     /// (`varchar(10)` is not `varchar(3)`) and array dimensions.

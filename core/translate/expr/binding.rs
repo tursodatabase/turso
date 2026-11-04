@@ -613,7 +613,8 @@ pub fn bind_and_rewrite_expr<'a>(
 
 /// Fails when `expr` uses an operator that no function of its operands' types
 /// runs, such as `d * 2` for a date d, applies a COLLATE to a type that takes
-/// none, or compares two types with different orders. This runs on every
+/// none, compares two types with different orders, or puts a value that can't
+/// be compared into an array (see [check_expr_array_arguments]). This runs on every
 /// expression a statement binds, so it also catches what the planner never
 /// compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are
 /// bound only once the binding walk is done, so these are further walks.
@@ -637,6 +638,7 @@ pub(crate) fn check_custom_types(
     })?;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         check_expr_collation(expr, &context)?;
+        check_expr_array_arguments(expr, &context.type_env())?;
         Ok(WalkControl::Continue)
     })?;
     Ok(())

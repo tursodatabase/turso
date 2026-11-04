@@ -2095,3 +2095,29 @@ test check_constraint_error_has_no_result_code_suffix {
 expect error {
     ^CHECK constraint failed: x<5$
 }
+
+# SQLite checks a CHECK's collations and RAISE only when a row is written, so
+# CREATE TABLE accepts these.
+test check_constraint_unknown_collation_accepted_at_create_table {
+    CREATE TABLE t(a CHECK (a COLLATE nosuch = 'x'));
+    SELECT name FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    t
+}
+
+test check_constraint_unknown_collation_fails_at_insert {
+    CREATE TABLE t(a CHECK (a COLLATE nosuch = 'x'));
+    INSERT INTO t VALUES ('x');
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test check_constraint_raise_accepted_at_create_table {
+    CREATE TABLE t(a CHECK (raise(ignore)));
+    SELECT name FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    t
+}

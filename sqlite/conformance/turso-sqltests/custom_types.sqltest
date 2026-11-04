@@ -756,6 +756,56 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test drop-type-in-use-by-union-variant {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE o AS UNION(a cents, b text);
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-domain-base {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN o AS cents;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-type-decode {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE o BASE integer ENCODE value DECODE CAST(value AS cents);
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-type-coerce {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE o BASE integer ENCODE value COERCE CAST(value AS cents) DECODE value;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-type-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE o BASE integer ENCODE value DECODE value DEFAULT CAST(1 AS cents);
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
 @requires materialized_views "uses MATERIALIZED VIEW"
 @skip-if mvcc "materialized views are not supported in MVCC"
 test drop-type-in-use-by-materialized-view {

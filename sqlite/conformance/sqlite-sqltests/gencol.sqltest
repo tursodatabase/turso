@@ -6329,3 +6329,13 @@ test gencol_strict_alter_add_virtual_check_error_when_type_passes {
 expect error {
     CHECK constraint failed
 }
+
+# SQLite checks a generated column's collations only when the column is
+# computed, so CREATE TABLE accepts an unknown one.
+test gencol_unknown_collation_accepted_at_create_table {
+    CREATE TABLE t(a, b AS (a COLLATE nosuch));
+    SELECT name FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    t
+}
