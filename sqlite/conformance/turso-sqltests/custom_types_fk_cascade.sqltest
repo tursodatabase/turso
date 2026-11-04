@@ -236,7 +236,7 @@ expect {
 @requires custom_types "uses custom types"
 test cascade-update-key-of-different-type {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE sh BASE text ENCODE upper(value) DECODE lower(value);
+    CREATE TYPE sh BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE parent(id integer PRIMARY KEY) STRICT;
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id sh
         REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
@@ -297,26 +297,17 @@ expect {
     0
 }
 
-# A DECODE that changes values reads 'A' and 'a' back as 'a', so the cascade,
-# which finds children by that value, also finds the child of 'a'. It then
-# runs the child's ENCODE instead of copying the stored key, and the foreign
-# key check refuses the result instead of the child silently moving to 'B'.
+# A DECODE that changes values reads 'A' and 'a' back as 'a', so a cascade
+# that finds children by that value would also find the child of 'a'. Such a
+# type can't be a key.
 @requires strict "uses STRICT tables"
 @requires custom_types "uses custom types"
-test cascade-update-of-key-whose-decode-changes-values {
-    PRAGMA foreign_keys = ON;
+test key-whose-decode-changes-values-is-refused {
     CREATE TYPE ci BASE text ENCODE value DECODE lower(value);
     CREATE TABLE parent(id ci PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id ci
-        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
-
-    INSERT INTO parent VALUES ('A'), ('a');
-    INSERT INTO child VALUES (1, 'A'), (2, 'a');
-
-    UPDATE parent SET id = 'B' WHERE rowid = 1;
 }
 expect error {
-    FOREIGN KEY constraint failed
+    column 'id' of type 'ci' cannot be a key
 }
 
 # A SET DEFAULT action writes the column's DEFAULT, which is a user value, so
