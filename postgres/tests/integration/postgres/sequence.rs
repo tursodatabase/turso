@@ -119,6 +119,24 @@ fn test_create_sequence_cache_zero(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_create_sequence_cache_above_one(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    let err = conn
+        .execute("CREATE SEQUENCE big_cache_seq CACHE 10")
+        .expect_err("CACHE 10 must fail");
+    assert_eq!(err.sqlstate, "0A000", "{err:?}");
+    assert!(
+        err.message.contains("CACHE 10") && err.message.contains("not supported"),
+        "unexpected error: {err}"
+    );
+    pg_assert_no_rows(
+        &conn,
+        "SELECT 1 FROM pg_sequences WHERE sequencename = 'big_cache_seq'",
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_create_sequence_minvalue_exceeds_maxvalue(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -695,7 +713,7 @@ fn test_pg_sequences_columns(db: TempDatabase) {
 
     pg_execute(
         &conn,
-        "CREATE SEQUENCE cat_full START WITH 5 INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CACHE 10",
+        "CREATE SEQUENCE cat_full START WITH 5 INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CACHE 1",
     );
 
     let schema = pg_query_text(
@@ -728,13 +746,6 @@ fn test_pg_sequences_columns(db: TempDatabase) {
     );
     assert_eq!(max, 1000);
 
-    // pg_sequences.cache_size reports the value the engine actually uses for
-    // allocation, not the value requested in CREATE SEQUENCE. Turso's
-    // disk-only sequence design never caches values (every nextval reads and
-    // writes the backing-table watermark inline with the executing
-    // transaction), so cache_size is always 1 regardless of the requested
-    // `CACHE n`. PG's behavior on a server that physically can't cache is
-    // the same — it reports the actual cache size, not the requested one.
     let cache = pg_query_int(
         &conn,
         "SELECT cache_size FROM pg_sequences WHERE sequencename = 'cat_full'",
