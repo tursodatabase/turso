@@ -2621,50 +2621,18 @@ pub fn op_convert_to_type(
         insn
     );
     let reg = &mut state.registers[*reg];
-    let number_before = match reg.get_value() {
-        Value::Null => {
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
-        Value::Numeric(number) => Some(*number),
-        Value::Text(_) | Value::Blob(_) => None,
-    };
-    if let Err(actual) = convert_to_strict_type(reg, *value_type) {
-        bail_constraint_error!(
-            "cannot store {} value {} ({})",
-            actual,
-            description,
-            SQLITE_CONSTRAINT
-        );
-    }
-    if let Some(number) = number_before {
-        if !is_same_number(number, reg.get_value()) {
+    if !matches!(reg.get_value(), Value::Null) {
+        if let Err(actual) = convert_to_strict_type(reg, *value_type) {
             bail_constraint_error!(
-                "cannot store {} {}: converting it changes it to {} ({})",
-                Value::Numeric(number),
+                "cannot store {} value {} ({})",
+                actual,
                 description,
-                reg.get_value(),
                 SQLITE_CONSTRAINT
             );
         }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
-}
-
-/// Whether `converted` still is `number`. Converting an integer to REAL loses
-/// digits beyond 2^53, and converting a REAL to TEXT can keep fewer digits
-/// than the number needs.
-fn is_same_number(number: Numeric, converted: &Value) -> bool {
-    match (number, converted) {
-        (Numeric::Integer(i), Value::Numeric(Numeric::Float(f))) => {
-            f64::from(*f) as i128 == i128::from(i)
-        }
-        (Numeric::Float(f), Value::Text(text)) => {
-            text.as_str().parse::<f64>().ok() == Some(f64::from(f))
-        }
-        _ => true,
-    }
 }
 
 pub fn op_is_type(

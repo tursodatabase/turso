@@ -1026,7 +1026,7 @@ mod tests {
                 ))
                 .unwrap();
                 let plain_value = encode.replace("value", "7");
-                let mut expected = stored_kind_and_value(
+                let expected = stored_kind_and_value(
                     &conn,
                     &[
                         &format!("CREATE TABLE plain_{ty}(c {base}) STRICT"),
@@ -1034,24 +1034,6 @@ mod tests {
                     ],
                     &format!("SELECT typeof(c), quote(c) FROM plain_{ty}"),
                 );
-                // A STRICT column stores 2^53 + 1 as the REAL 2^53, and a REAL
-                // as text with fewer digits than it needs; a custom type
-                // refuses both.
-                let changes_the_number = stored_kind_and_value(
-                    &conn,
-                    &[],
-                    &format!(
-                        "SELECT CAST(ifnull(max( \
-                                 (typeof({plain_value}) = 'integer' AND typeof(c) = 'real' \
-                                  AND CAST(c AS integer) != {plain_value}) \
-                                 OR (typeof({plain_value}) = 'real' AND typeof(c) = 'text' \
-                                  AND CAST(c AS real) != {plain_value})), 0) AS text), '' \
-                         FROM plain_{ty}"
-                    ),
-                );
-                if changes_the_number == Ok(("1".to_string(), String::new())) {
-                    expected = Err("changes the number".to_string());
-                }
                 let table_with_c = |prefix: &str, column: &str| {
                     format!("CREATE TABLE {prefix}_{ty}(id INTEGER PRIMARY KEY, {column}) STRICT")
                 };
@@ -1173,9 +1155,6 @@ mod tests {
         };
         run().map_err(|err| {
             let message = err.to_string();
-            if message.contains("converting it changes it") {
-                return "changes the number".to_string();
-            }
             match message.find("cannot store ") {
                 Some(start) => message[start..]
                     .split(" value")

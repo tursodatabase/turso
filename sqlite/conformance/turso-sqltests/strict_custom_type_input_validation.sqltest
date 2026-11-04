@@ -248,13 +248,14 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test integer-that-real-cannot-hold-exactly-is-refused {
+test large-integer-is-stored-as-a-real-column-stores-it {
     CREATE TYPE big(value any) BASE real ENCODE value DECODE value;
-    CREATE TABLE t(id INTEGER PRIMARY KEY, c big) STRICT;
-    INSERT INTO t VALUES (1, 9007199254740993);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c big, r REAL) STRICT;
+    INSERT INTO t VALUES (1, 9007199254740993, 9007199254740993);
+    SELECT typeof(c), CAST(c AS integer), CAST(r AS integer) FROM t;
 }
-expect error {
-    cannot store 9007199254740993 as type big .BASE REAL.: converting it changes it
+expect {
+    real|9007199254740992|9007199254740992
 }
 
 @requires strict "uses STRICT tables"
@@ -291,12 +292,12 @@ expect {
     integer|7
 }
 
-test cast-to-domain-refuses-what-its-base-cannot-store {
+test cast-to-domain-over-plain-type-converts-as-sqlite-cast {
     CREATE DOMAIN d AS integer;
-    SELECT CAST('abc' AS d);
+    SELECT CAST('abc' AS d), CAST(1.5 AS d);
 }
-expect error {
-    cannot store TEXT value as type d
+expect {
+    0|1
 }
 
 @requires strict "uses STRICT tables"

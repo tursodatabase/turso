@@ -57,7 +57,7 @@ CREATE TYPE cents BASE integer
     DECODE value / 100;
 ```
 
-The stored value always has the BASE's kind. The result of ENCODE, and of COERCE, is converted as a STRICT column of the BASE converts a value: `'5'` becomes `5` in an `integer` base, and `5` becomes `'5'` in a `text` base. A value the conversion cannot keep is refused instead of stored, such as text that is not a number in an `integer` base, or an integer too large for a `real` base to hold exactly. INSERT, UPDATE, column defaults and CAST all convert the same way, and COERCE sees the converted value.
+The stored value always has the BASE's kind. The result of ENCODE, and of COERCE, is converted as a STRICT column of the BASE converts a value: `'5'` becomes `5` in an `integer` base, and `5` becomes `'5'` in a `text` base. A value the column would refuse, such as text that is not a number in an `integer` base, is refused instead of stored. INSERT, UPDATE, column defaults and CAST all convert the same way, and COERCE sees the converted value.
 
 ```sql
 CREATE TYPE iv(value integer) BASE integer
@@ -67,10 +67,12 @@ CREATE TYPE iv(value integer) BASE integer
 SELECT typeof(CAST(5 AS iv));
 -- integer
 
-CREATE TYPE big(value integer) BASE real;
+CREATE TYPE xv(value integer) BASE integer
+    ENCODE 'x' || value
+    DECODE value;
 
-SELECT CAST(9007199254740993 AS big);
--- Error: cannot store 9007199254740993 as type big (BASE REAL): converting it changes it to 9.00719925474099e+15
+SELECT CAST(5 AS xv);
+-- Error: cannot store TEXT value as type xv (BASE INTEGER)
 ```
 
 A domain stores the BASE of the type it is defined on, or its plain SQL type when it is defined on one.
