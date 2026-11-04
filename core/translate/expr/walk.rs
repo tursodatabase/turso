@@ -423,6 +423,28 @@ fn expr_contains_function(
     Ok(found)
 }
 
+/// Fails with "no such function" when this expression, or a subquery in it,
+/// calls a function no name resolves to. SQLite resolves every name of an
+/// expression before it folds or drops any part of it.
+pub(crate) fn reject_unknown_function(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::WithSubqueries,
+        &mut |call, func| {
+            if func.is_some() {
+                return Ok(WalkControl::Continue);
+            }
+            let (ast::Expr::FunctionCall { name, .. } | ast::Expr::FunctionCallStar { name, .. }) =
+                call
+            else {
+                unreachable!("walk_function_calls visits function calls only");
+            };
+            crate::bail_parse_error!("no such function: {}", name.as_str())
+        },
+    )
+}
+
 /// Which function calls [walk_function_calls] visits.
 #[derive(Clone, Copy)]
 pub(crate) enum FunctionCalls {
