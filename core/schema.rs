@@ -1881,12 +1881,12 @@ impl Schema {
             _ => column.ty_str.clone(),
         };
         crate::bail_parse_error!(
-            "column '{name}' of type '{}{brackets}' cannot be a key: different stored values can decode to the same value. Index CAST({name} AS {primitive}{brackets}) instead",
+            "column '{name}' of type '{}{brackets}' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value. Index CAST({name} AS {primitive}{brackets}) instead",
             column.ty_str
         );
     }
 
-    /// Whether different stored values of the column can read back as the same
+    /// Whether different stored values of the column might read back as the same
     /// value, so a key on the column would tell apart values that queries
     /// treat as equal. The column's type decides: built-in types, types
     /// without a DECODE and types whose DECODE is `value` are not lossy, and a

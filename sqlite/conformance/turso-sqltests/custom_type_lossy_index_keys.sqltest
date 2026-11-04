@@ -30,7 +30,7 @@ test lossy-create-index {
     CREATE INDEX i ON t(c);
 }
 expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\) instead
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
 @requires strict "uses STRICT tables"
@@ -39,7 +39,7 @@ test lossy-unique-column {
     CREATE TABLE t(id INTEGER PRIMARY KEY, c lossy_ci UNIQUE) STRICT;
 }
 expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\) instead
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
 @requires strict "uses STRICT tables"
@@ -48,7 +48,7 @@ test lossy-primary-key {
     CREATE TABLE t(id INTEGER, c lossy_ci, PRIMARY KEY(c)) STRICT;
 }
 expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\) instead
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
 @requires strict "uses STRICT tables"
@@ -58,7 +58,7 @@ test lossy-foreign-key-child-column {
     CREATE TABLE child(id INTEGER PRIMARY KEY, c lossy_ci REFERENCES parent(c)) STRICT;
 }
 expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\) instead
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
 @requires strict "uses STRICT tables"
@@ -69,7 +69,7 @@ test lossy-alter-add-column-references {
     ALTER TABLE t ADD COLUMN c lossy_ci REFERENCES parent(c);
 }
 expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\) instead
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
 # Changing the type of a column that is already a key must be refused too.
@@ -81,7 +81,7 @@ test lossy-alter-column-type-of-a-key {
     ALTER TABLE t ALTER COLUMN c TO d lossy_ci;
 }
 expect error {
-    of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\([cd] AS text\) instead
+    of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\([cd] AS text\) instead
 }
 
 # A TEMP table finds its column types in the main database, like any other
@@ -93,7 +93,7 @@ test lossy-create-index-on-temp-table {
     CREATE INDEX temp.i ON t(c);
 }
 expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\) instead
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
 @requires strict "uses STRICT tables"
@@ -103,7 +103,7 @@ test lossy-alter-column-type-of-a-temp-table-key {
     ALTER TABLE temp.t ALTER COLUMN c TO d lossy_ci;
 }
 expect error {
-    column 'd' of type 'lossy_ci' cannot be a key: different stored values can decode to the same value\. Index CAST\(d AS text\) instead
+    column 'd' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(d AS text\) instead
 }
 
 @requires strict "uses STRICT tables"
@@ -113,7 +113,7 @@ test array-of-lossy-type-index {
     CREATE INDEX i ON t(c);
 }
 expect error {
-    column 'c' of type 'lossy_ci\[\]' cannot be a key: different stored values can decode to the same value\. Index CAST\(c AS text\[\]\) instead
+    column 'c' of type 'lossy_ci\[\]' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\[\]\) instead
 }
 
 # An index on an explicit conversion is allowed, and gives the same rows as a scan.
