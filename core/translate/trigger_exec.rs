@@ -967,15 +967,26 @@ pub fn fire_trigger(
                 )?;
             }
 
-            let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            // SQLite reports a row value of the wrong width anywhere in the
+            // clause (`WHEN (a, g) = (1, 2, 3)`) before it emits any of it, so
+            // this runs on the whole clause before the short-circuit below
+            // translates a leaf and reports an unresolved column first.
+            expr::walk_expr(&when_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                expr::reject_row_value_misuse_at(e)?;
+                Ok(WalkControl::Continue)
+            })?;
 
+            // A trigger fires only when its WHEN clause is true, so an AND or
+            // OR in it short-circuits (sqlite3ExprIfFalse with JUMPIFNULL):
+            // `WHEN new.x > 0 OR json_extract(..)` never runs the function
+            // when new.x > 0. NEW/OLD are already Expr::Register, so no tables.
             let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: when_reg,
-                jump_if_null: true,
-                target_pc: skip_label,
-            });
+            let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+                let reg = program.alloc_register();
+                translate_expr(program, None, leaf, reg, resolver)?;
+                Ok(reg)
+            };
+            expr::emit_jump_to_skip_unless_true(program, &when_expr, skip_label, &mut emit_leaf)?;
 
             // Execute trigger commands if WHEN clause is true
             execute_trigger_commands(

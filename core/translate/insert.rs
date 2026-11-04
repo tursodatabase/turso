@@ -1416,22 +1416,30 @@ fn emit_partial_index_check(
             }
         })
         .collect();
-    let reg = program.alloc_register();
-    crate::translate::expr::emit_dml_expr_index_value(
-        program,
-        resolver,
-        expr,
-        &columns,
-        &column_regs,
-        table,
-        reg,
-    )?;
+    // The row is indexed only when the partial WHERE is true, so an AND or OR
+    // in it short-circuits (sqlite3ExprIfFalse with JUMPIFNULL): a function in
+    // a decided-away operand never runs. Each leaf keeps its DML index-value
+    // encoding.
     let skip_label = program.allocate_label();
-    program.emit_insn(Insn::IfNot {
-        reg,
-        target_pc: skip_label,
-        jump_if_null: true,
-    });
+    let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+        let reg = program.alloc_register();
+        crate::translate::expr::emit_dml_expr_index_value(
+            program,
+            resolver,
+            leaf.clone(),
+            &columns,
+            &column_regs,
+            table,
+            reg,
+        )?;
+        Ok(reg)
+    };
+    crate::translate::expr::emit_jump_to_skip_unless_true(
+        program,
+        &expr,
+        skip_label,
+        &mut emit_leaf,
+    )?;
     Ok(Some(skip_label))
 }
 

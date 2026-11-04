@@ -272,21 +272,106 @@ pub fn translate_and_or_condition_jump(
     let Some(referenced_tables) = referenced_tables.filter(|_| is_and_or) else {
         return Ok(false);
     };
-    let jump_target_when_true = program.allocate_label();
-    translate_condition_expr(
-        program,
-        referenced_tables,
-        expr,
-        ConditionMetadata {
-            jump_if_condition_is_true: false,
-            jump_target_when_true,
-            jump_target_when_false,
-            jump_target_when_null: jump_target_when_false,
-        },
-        resolver,
-    )?;
-    program.preassign_label_to_next_insn(jump_target_when_true);
+    let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+        let reg = program.alloc_register();
+        translate_expr(program, Some(referenced_tables), leaf, reg, resolver)?;
+        Ok(reg)
+    };
+    emit_jump_to_skip_unless_true(program, expr, jump_target_when_false, &mut emit_leaf)?;
     Ok(true)
+}
+
+/// Emits a leaf condition into a register and returns it. Used by
+/// [emit_short_circuit_jump] so a schema condition (CHECK, trigger WHEN,
+/// partial index WHERE) keeps evaluating its leaves the way it already did.
+pub type LeafEmitter<'a> = dyn FnMut(&mut ProgramBuilder, &ast::Expr) -> Result<usize> + 'a;
+
+/// A trigger `WHEN` clause or a partial index `WHERE` fires or indexes a row
+/// only when it is true, so SQLite skips it on false and NULL
+/// (sqlite3ExprIfFalse with JUMPIFNULL). Jumps to `skip_label` then,
+/// short-circuiting an AND or OR so a skipped operand never runs. `emit_leaf`
+/// evaluates a leaf into a register.
+pub fn emit_jump_to_skip_unless_true(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    skip_label: BranchOffset,
+    emit_leaf: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    emit_short_circuit_jump(program, expr, skip_label, false, true, emit_leaf)
+}
+
+/// A CHECK constraint passes when its expression is true or NULL, and fails
+/// only when it is false (sqlite3ExprIfTrue to the all-ok label, with
+/// JUMPIFNULL). Jumps to `passed_label` on true and NULL, short-circuiting an
+/// AND or OR so a decided-away operand never runs, and falls through to the
+/// caller's failure handling on false.
+pub fn emit_jump_when_check_passes(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    passed_label: BranchOffset,
+    emit_leaf: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    emit_short_circuit_jump(program, expr, passed_label, true, true, emit_leaf)
+}
+
+/// Jumps to `dest` when `expr` is true (if `jump_on_true`) or false (if not),
+/// and also when it is NULL if `jump_if_null`, short-circuiting AND and OR as
+/// SQLite's sqlite3ExprIfTrue/IfFalse do. A leaf is evaluated by `emit_leaf`
+/// and tested, so its truth and NULL semantics are unchanged. The
+/// short-circuit branch of the opposite operator flips JUMPIFNULL so NULL
+/// still reaches the other operand, as SQLite does.
+fn emit_short_circuit_jump(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    dest: BranchOffset,
+    jump_on_true: bool,
+    jump_if_null: bool,
+    emit_leaf: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    let both_decide_here = if jump_on_true {
+        ast::Operator::Or
+    } else {
+        ast::Operator::And
+    };
+    match unwrap_parens(expr)? {
+        ast::Expr::Binary(lhs, op, rhs)
+            if matches!(op, ast::Operator::And | ast::Operator::Or) && *op == both_decide_here =>
+        {
+            // Both operands jump to the same place: `a OR b` to the true
+            // target, `a AND b` to the false target.
+            emit_short_circuit_jump(program, lhs, dest, jump_on_true, jump_if_null, emit_leaf)?;
+            emit_short_circuit_jump(program, rhs, dest, jump_on_true, jump_if_null, emit_leaf)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::And | ast::Operator::Or, rhs) => {
+            // The other operator: if the first operand already decides the
+            // opposite outcome, skip past the second.
+            let past = program.allocate_label();
+            emit_short_circuit_jump(program, lhs, past, !jump_on_true, !jump_if_null, emit_leaf)?;
+            emit_short_circuit_jump(program, rhs, dest, jump_on_true, jump_if_null, emit_leaf)?;
+            program.preassign_label_to_next_insn(past);
+            Ok(())
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Not, inner) => {
+            emit_short_circuit_jump(program, inner, dest, !jump_on_true, jump_if_null, emit_leaf)
+        }
+        leaf => {
+            let reg = emit_leaf(program, leaf)?;
+            if jump_on_true {
+                program.emit_insn(Insn::If {
+                    reg,
+                    target_pc: dest,
+                    jump_if_null,
+                });
+            } else {
+                program.emit_insn(Insn::IfNot {
+                    reg,
+                    target_pc: dest,
+                    jump_if_null,
+                });
+            }
+            Ok(())
+        }
+    }
 }
 
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]

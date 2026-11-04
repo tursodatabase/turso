@@ -9,9 +9,10 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
-        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        bind_and_rewrite_expr, emit_constraint_values_decode, emit_jump_when_check_passes,
+        emit_stored_column, emit_table_column, emit_user_facing_column_value,
+        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
+        WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -2275,8 +2276,6 @@ fn emit_check_constraint_bytecode(
     column_mappings: &[(&str, usize)],
 ) -> Result<()> {
     for check_constraint in check_constraints {
-        let expr_result_reg = program.alloc_register();
-
         let mut rewritten_expr = check_constraint.expr.clone();
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();
@@ -2295,29 +2294,28 @@ fn emit_check_constraint_bytecode(
             )?;
         }
 
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            &rewritten_expr,
-            expr_result_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-
-        // CHECK constraint passes if the result is NULL or non-zero (truthy)
+        // CHECK passes if the result is NULL or truthy, and an AND or OR in
+        // it short-circuits, so `CHECK (b > 0 OR json_extract(b, '$.a'))`
+        // never runs the function when b > 0 (sqlite3ExprIfTrue, JUMPIFNULL).
         let constraint_passed_label = program.allocate_label();
-
-        // NULL means unknown, which passes CHECK constraints in SQLite
-        program.emit_insn(Insn::IsNull {
-            reg: expr_result_reg,
-            target_pc: constraint_passed_label,
-        });
-
-        program.emit_insn(Insn::If {
-            reg: expr_result_reg,
-            target_pc: constraint_passed_label,
-            jump_if_null: false,
-        });
+        let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+            let reg = program.alloc_register();
+            translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                leaf,
+                reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            Ok(reg)
+        };
+        emit_jump_when_check_passes(
+            program,
+            &rewritten_expr,
+            constraint_passed_label,
+            &mut emit_leaf,
+        )?;
 
         // SQLite reports a failed CHECK by its constraint name, or by the
         // expression's source text exactly as the user wrote it.
