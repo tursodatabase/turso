@@ -1,0 +1,91 @@
+# Foreign keys through the PostgreSQL frontend. PostgreSQL always enforces
+# them, so no setting is needed to turn them on.
+
+@database :memory:
+
+test fk-insert-missing-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO child VALUES (42);
+}
+@sqlstate 23503
+expect error {}
+
+test fk-insert-existing-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1), (NULL);
+    SELECT count(*) FROM child;
+}
+expect {
+    2
+}
+
+test fk-update-to-missing-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    UPDATE child SET pid = 2;
+}
+@sqlstate 23503
+expect error {}
+
+test fk-delete-referenced-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    DELETE FROM parent;
+}
+@sqlstate 23503
+expect error {}
+
+test fk-on-delete-cascade {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (1), (2);
+    INSERT INTO child VALUES (1), (1), (2);
+    DELETE FROM parent WHERE id = 1;
+    SELECT pid FROM child;
+}
+expect {
+    2
+}
+
+test fk-on-delete-set-null {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    DELETE FROM parent;
+    SELECT count(*) FROM child WHERE pid IS NULL;
+}
+expect {
+    1
+}
+
+test fk-on-update-cascade {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    UPDATE parent SET id = 5;
+    SELECT pid FROM child;
+}
+expect {
+    5
+}
+
+# Schema databases are file-backed, so the schema is dropped before each
+# create to keep repeated test runs independent of old sidecar files.
+test fk-references-table-in-other-schema {
+    DROP SCHEMA IF EXISTS fk_app CASCADE;
+    CREATE SCHEMA fk_app;
+    CREATE TABLE fk_app.accounts (id uuid PRIMARY KEY);
+    CREATE TABLE settings (id uuid PRIMARY KEY REFERENCES fk_app.accounts(id));
+    INSERT INTO settings VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+@sqlstate 23503
+expect error {}

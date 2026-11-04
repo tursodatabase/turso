@@ -289,6 +289,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    /// Whether new connections enforce foreign keys.
+    ///
+    /// PostgreSQL always enforces them. SQLite enforces them only after
+    /// `PRAGMA foreign_keys = ON`.
+    fn enforces_foreign_keys_by_default(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

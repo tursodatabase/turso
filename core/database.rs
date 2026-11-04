@@ -2789,7 +2789,7 @@ impl Database {
                 crate::connection::SubqueryUnnestingMode::Auto,
             ),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
-            fk_pragma: AtomicBool::new(false),
+            fk_pragma: AtomicBool::new(self.dialect.enforces_foreign_keys_by_default()),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
             writes_stored_values: AtomicBool::new(false),

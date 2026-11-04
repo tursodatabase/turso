@@ -226,6 +226,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn enforces_foreign_keys_by_default(&self) -> bool {
+        true
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
