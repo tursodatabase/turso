@@ -2146,7 +2146,7 @@ impl Schema {
         }
         #[expect(
             clippy::disallowed_methods,
-            reason = "UNREVIEWED fallback: a column without a name has `value` in its domain CHECKs replaced by the empty string; nothing makes callers pass a named column"
+            reason = "UNREVIEWED fallback (#11379): a column without a name has `value` in its domain CHECKs replaced by the empty string; nothing makes callers pass a named column"
         )]
         let col_name = column.name.as_deref().unwrap_or("").to_string();
         for td in &resolved.chain {
@@ -5480,7 +5480,7 @@ impl BTreeTable {
             .and_then(|set| set.constraint_name.clone());
         #[expect(
             clippy::disallowed_methods,
-            reason = "UNREVIEWED fallback: a table built with `BTreeTable::new` and no PRIMARY KEY set guesses from its columns whether the key was written on the column or as a table constraint"
+            reason = "UNREVIEWED fallback (#11379): a table built with `BTreeTable::new` and no PRIMARY KEY set guesses from its columns whether the key was written on the column or as a table constraint"
         )]
         let primary_key_is_inline = unique_sets
             .iter()

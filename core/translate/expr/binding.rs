@@ -551,7 +551,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                             // Add column name as a string literal
                                             #[expect(
                                                 clippy::disallowed_methods,
-                                                reason = "UNREVIEWED fallback: a column without a name gets the JSON key `column<position>`, but SQLite names an unaliased subquery column by its text (`1+1`)"
+                                                reason = "UNREVIEWED fallback (#11379): a column without a name gets the JSON key `column<position>`, but SQLite names an unaliased subquery column by its text (`1+1`)"
                                             )]
                                             let col_name = col.name.clone().unwrap_or_else(|| {
                                                 format!("column{}", col_idx + 1)
