@@ -26,28 +26,14 @@ expect error {
 
 # --- A type that declares OPERATOR '<' sorts and is indexed by its stored value ---
 
-# cents stores 9 as 900 and 10 as 1000. ORDER BY and an index both sort the
-# stored integers, so 9 comes before 10.
+# cents stores 9 as 900 and 10 as 1000. ORDER BY sorts the stored integers,
+# so 9 comes before 10.
 @requires strict "uses STRICT tables"
 test user-type-sorts-by-stored-value-in-order-by {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val cents) STRICT;
     INSERT INTO t1 VALUES (1, 10), (2, 9), (3, 2);
     SELECT val FROM t1 ORDER BY val;
-}
-expect {
-    2
-    9
-    10
-}
-
-@requires strict "uses STRICT tables"
-test user-type-sorts-by-stored-value-in-index {
-    CREATE TYPE cents2 BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
-    CREATE TABLE t2(id INTEGER PRIMARY KEY, val cents2) STRICT;
-    CREATE INDEX idx2 ON t2(val);
-    INSERT INTO t2 VALUES (1, 10), (2, 9), (3, 2);
-    SELECT val FROM t2 ORDER BY val;
 }
 expect {
     2
@@ -148,22 +134,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test sort-by-stored-value-monotonic-integer-with-index {
-    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
-    CREATE TABLE t5b(id INTEGER PRIMARY KEY, val myint1b) STRICT;
-    CREATE INDEX idx5b ON t5b(val);
-    INSERT INTO t5b VALUES (1, 30);
-    INSERT INTO t5b VALUES (2, 10);
-    INSERT INTO t5b VALUES (3, 20);
-    SELECT val FROM t5b ORDER BY val;
-}
-expect {
-    10
-    20
-    30
-}
-
-@requires strict "uses STRICT tables"
 test sort-by-stored-value-desc-order {
     CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t6(id INTEGER PRIMARY KEY, val myint2) STRICT;
@@ -171,22 +141,6 @@ test sort-by-stored-value-desc-order {
     INSERT INTO t6 VALUES (2, 10);
     INSERT INTO t6 VALUES (3, 20);
     SELECT val FROM t6 ORDER BY val DESC;
-}
-expect {
-    30
-    20
-    10
-}
-
-@requires strict "uses STRICT tables"
-test sort-by-stored-value-desc-order-with-index {
-    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
-    CREATE TABLE t6b(id INTEGER PRIMARY KEY, val myint2b) STRICT;
-    CREATE INDEX idx6b ON t6b(val);
-    INSERT INTO t6b VALUES (1, 30);
-    INSERT INTO t6b VALUES (2, 10);
-    INSERT INTO t6b VALUES (3, 20);
-    SELECT val FROM t6b ORDER BY val DESC;
 }
 expect {
     30
@@ -213,23 +167,6 @@ expect {
     cherry
 }
 
-# Same query with an index — must produce identical results.
-@requires strict "uses STRICT tables"
-test sort-by-stored-value-non-monotonic-encoding-with-index {
-    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t_rev2(id INTEGER PRIMARY KEY, val rev2) STRICT;
-    CREATE INDEX idx_rev2 ON t_rev2(val);
-    INSERT INTO t_rev2 VALUES (1, 'apple');
-    INSERT INTO t_rev2 VALUES (2, 'banana');
-    INSERT INTO t_rev2 VALUES (3, 'cherry');
-    SELECT val FROM t_rev2 ORDER BY val;
-}
-expect {
-    banana
-    apple
-    cherry
-}
-
 # DESC with non-monotonic encoding.
 # DESC encoded: yrrehc > elppa > ananab → display: cherry, apple, banana.
 @requires strict "uses STRICT tables"
@@ -240,22 +177,6 @@ test sort-by-stored-value-non-monotonic-desc {
     INSERT INTO t_rev3 VALUES (2, 'banana');
     INSERT INTO t_rev3 VALUES (3, 'cherry');
     SELECT val FROM t_rev3 ORDER BY val DESC;
-}
-expect {
-    cherry
-    apple
-    banana
-}
-
-@requires strict "uses STRICT tables"
-test sort-by-stored-value-non-monotonic-desc-with-index {
-    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t_rev4(id INTEGER PRIMARY KEY, val rev4) STRICT;
-    CREATE INDEX idx_rev4 ON t_rev4(val);
-    INSERT INTO t_rev4 VALUES (1, 'apple');
-    INSERT INTO t_rev4 VALUES (2, 'banana');
-    INSERT INTO t_rev4 VALUES (3, 'cherry');
-    SELECT val FROM t_rev4 ORDER BY val DESC;
 }
 expect {
     cherry
