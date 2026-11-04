@@ -10,18 +10,17 @@ use crate::{
         Policy, RowSecurityCatalog, RowSecurityChange, RowSecurityRow,
         CREATE_ROW_SECURITY_TABLE_SQL, ROW_SECURITY_TABLE_NAME,
     },
-    storage::pager::CreateBTreeFlags,
     translate::{
         collate::CollationSeq,
         emitter::Resolver,
         expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl},
         plan::{JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
-        schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+        schema::{emit_create_internal_table, emit_schema_cookie},
     },
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
     Result, MAIN_DB_ID,
 };
@@ -526,12 +525,7 @@ fn emit_catalog_update(
     resolver: &Resolver,
     change: RowSecurityChange,
 ) {
-    program.emit_insn(Insn::SetCookie {
-        db: MAIN_DB_ID,
-        cookie: Cookie::SchemaVersion,
-        value: (resolver.schema().schema_version + 1) as i32,
-        p5: 0,
-    });
+    emit_schema_cookie(resolver, program);
     program.emit_insn(Insn::UpdateRowSecurity {
         db: MAIN_DB_ID,
         change: Box::new(change),
@@ -554,7 +548,16 @@ impl RowSecurityRows {
                 let root_page = RegisterOrLiteral::Literal(table.root_page);
                 (table, root_page)
             }
-            None => Self::emit_create_table(resolver, program)?,
+            None => {
+                let created = emit_create_internal_table(
+                    program,
+                    resolver,
+                    ROW_SECURITY_TABLE_NAME,
+                    CREATE_ROW_SECURITY_TABLE_SQL,
+                    &[],
+                )?;
+                (created.table, created.root_page)
+            }
         };
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
         program.emit_insn(Insn::OpenWrite {
@@ -563,48 +566,6 @@ impl RowSecurityRows {
             db: MAIN_DB_ID,
         });
         Ok(Self { cursor_id })
-    }
-
-    fn emit_create_table(
-        resolver: &Resolver,
-        program: &mut ProgramBuilder,
-    ) -> Result<(Arc<BTreeTable>, RegisterOrLiteral<i64>)> {
-        let root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: MAIN_DB_ID,
-            root: root_reg,
-            flags: CreateBTreeFlags::new_table(),
-        });
-        let schema_table = resolver
-            .schema()
-            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .expect("sqlite_schema always exists");
-        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: schema_cursor_id,
-            root_page: 1i64.into(),
-            db: MAIN_DB_ID,
-        });
-        emit_schema_entry(
-            program,
-            resolver,
-            schema_cursor_id,
-            None,
-            SchemaEntryType::Table,
-            ROW_SECURITY_TABLE_NAME,
-            ROW_SECURITY_TABLE_NAME,
-            root_reg,
-            Some(CREATE_ROW_SECURITY_TABLE_SQL.to_string()),
-        )?;
-        program.emit_insn(Insn::ParseSchema {
-            db: schema_cursor_id,
-            where_clause: Some(format!(
-                "tbl_name = '{ROW_SECURITY_TABLE_NAME}' AND type != 'trigger'"
-            )),
-            trigger_target_database_id: None,
-        });
-        let table = Arc::new(BTreeTable::from_sql(CREATE_ROW_SECURITY_TABLE_SQL, 0)?);
-        Ok((table, RegisterOrLiteral::Register(root_reg)))
     }
 
     fn emit_insert(&self, program: &mut ProgramBuilder, row: &RowSecurityRow) {

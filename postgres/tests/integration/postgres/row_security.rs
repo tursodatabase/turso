@@ -787,6 +787,37 @@ fn query_conditions_never_see_hidden_rows() {
     }
 }
 
+/// The first ALTER TABLE ... ENABLE ROW LEVEL SECURITY creates the table
+/// that stores row-level security, so a rollback must remove it from the
+/// schema as well as from the file.
+#[test]
+fn rolled_back_first_enable_leaves_no_row_security_behind() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE TABLE docs (id int PRIMARY KEY, owner text)",
+        "INSERT INTO docs VALUES (1, 'alice'), (2, 'bob')",
+        "CREATE ROLE alice",
+        "BEGIN",
+        "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY own ON docs USING (owner = current_user)",
+        "ROLLBACK",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(integers(&conn, "SELECT id FROM docs ORDER BY id"), [1, 2]);
+    conn.execute("RESET ROLE").unwrap();
+
+    conn.execute("ALTER TABLE docs ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    conn.execute("CREATE POLICY own ON docs USING (owner = current_user)")
+        .unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(integers(&conn, "SELECT id FROM docs ORDER BY id"), [1]);
+}
+
 fn create_docs_with_row_security(conn: &PgConnection) {
     for sql in [
         "CREATE TABLE docs (id int PRIMARY KEY, owner text)",
