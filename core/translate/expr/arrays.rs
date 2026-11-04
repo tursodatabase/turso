@@ -1,70 +1,45 @@
 use super::*;
+use crate::function::{AccumulatorFunc, AggFunc};
 use crate::types::StrictType;
-use crate::vdbe::insn::{ArrayEncodeData, ArrayEncodeTarget};
-
-/// Maximum number of array elements supported in the per-element transform loop.
-/// Limited by the fixed register block allocated at compile time.
-const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
+use crate::vdbe::insn::{AggStepData, ArrayEncodeData, ArrayEncodeTarget};
 
 /// Emit a per-element transform loop on an array blob in `reg`.
 /// Extracts each element, applies `transform_element` to the register holding
-/// it, stores results into contiguous registers, then rebuilds the blob with
-/// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
-/// A NULL array stays NULL.
+/// it, and collects the results with array_agg's accumulator, which builds the
+/// new blob once at the end, so the loop takes O(N) time for any N.
+/// A NULL array stays NULL, and an empty array stays empty.
 pub(super) fn emit_array_element_loop(
     program: &mut ProgramBuilder,
     reg: usize,
     transform_element: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
-    let null_label = program.allocate_label();
+    let done_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
         reg,
-        target_pc: null_label,
+        target_pc: done_label,
     });
 
     let reg_len = program.alloc_register();
     let reg_idx = program.alloc_register();
     let reg_elem = program.alloc_register();
-    // Reserve a contiguous block for transformed elements.
-    // At runtime, we only use registers[elem_base..elem_base+len].
-    let elem_base = program.alloc_registers(MAX_ARRAY_LOOP_ELEMENTS);
+    let reg_acc = program.alloc_register();
 
     program.emit_insn(Insn::ArrayLength { reg, dest: reg_len });
-
-    // Guard: halt if the array exceeds the register block size.
-    let max_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        value: MAX_ARRAY_LOOP_ELEMENTS as i64,
-        dest: max_reg,
+    // array_agg of no elements is NULL, not an empty array.
+    program.emit_insn(Insn::IfNot {
+        reg: reg_len,
+        target_pc: done_label,
+        jump_if_null: false,
     });
-    let ok_label = program.allocate_label();
-    program.emit_insn(Insn::Le {
-        lhs: reg_len,
-        rhs: max_reg,
-        target_pc: ok_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: SQLITE_CONSTRAINT,
-        description: format!(
-            "array exceeds maximum element count for custom type transform ({MAX_ARRAY_LOOP_ELEMENTS})"
-        ),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(ok_label);
     // reg_idx is the 1-based array index for ArrayElement (PG convention)
     program.emit_insn(Insn::Integer {
         value: 1,
         dest: reg_idx,
     });
-    // reg_offset is the 0-based offset for RegCopyOffset into the register block
-    let reg_offset = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: reg_offset,
+    // A NULL accumulator starts a new array_agg.
+    program.emit_insn(Insn::Null {
+        dest: reg_acc,
+        dest_end: None,
     });
 
     let loop_start = program.allocate_label();
@@ -88,19 +63,19 @@ pub(super) fn emit_array_element_loop(
 
     transform_element(program, reg_elem)?;
 
-    // Store transformed element into contiguous register block at 0-based offset
-    program.emit_insn(Insn::RegCopyOffset {
-        src: reg_elem,
-        base: elem_base,
-        offset_reg: reg_offset,
+    let array_agg = AccumulatorFunc::Agg(AggFunc::ArrayAgg);
+    program.emit_insn(Insn::AggStep {
+        data: Box::new(AggStepData {
+            acc_reg: reg_acc,
+            col: reg_elem,
+            delimiter: 0,
+            func: array_agg.clone(),
+            collation: CollationSeq::BINARY,
+        }),
     });
 
     program.emit_insn(Insn::AddImm {
         register: reg_idx,
-        value: 1,
-    });
-    program.emit_insn(Insn::AddImm {
-        register: reg_offset,
         value: 1,
     });
     program.emit_insn(Insn::Goto {
@@ -108,15 +83,17 @@ pub(super) fn emit_array_element_loop(
     });
 
     program.preassign_label_to_next_insn(loop_end_label);
-
-    // Rebuild the array blob from the contiguous register block in one pass
-    program.emit_insn(Insn::MakeArrayDynamic {
-        start_reg: elem_base,
-        count_reg: reg_len,
-        dest: reg,
+    program.emit_insn(Insn::AggFinal {
+        register: reg_acc,
+        func: array_agg,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_acc,
+        dst_reg: reg,
+        extra_amount: 0,
     });
 
-    program.preassign_label_to_next_insn(null_label);
+    program.preassign_label_to_next_insn(done_label);
     Ok(())
 }
 

@@ -43,6 +43,29 @@ expect {
     Ab|{Ab}|{ab}
 }
 
+test array-of-more-than-1024-elements-runs-encode-and-decode-on-each {
+    -- d1 has only a DECODE, so the array is written as it is and only reads
+    -- run a step on each element. ci runs ENCODE on each element when written.
+    CREATE TYPE d1(value integer) BASE integer DECODE value - 1;
+    CREATE TYPE ci(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE big(id INTEGER PRIMARY KEY, a d1[], c ci[]) STRICT;
+    INSERT INTO big VALUES (1, (SELECT array_agg(value) FROM generate_series(1, 2000)), (SELECT array_agg(value) FROM generate_series(1, 2000)));
+    SELECT array_length(a), a[1], a[2000], array_length(c), c[1], c[2000] FROM big;
+}
+expect {
+    2000|0|1999|2000|1|2000
+}
+
+test array-empty-stays-empty-through-encode-and-decode {
+    CREATE TYPE ci(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE e(id INTEGER PRIMARY KEY, c ci[]) STRICT;
+    INSERT INTO e VALUES (1, '{}');
+    SELECT c, array_length(c), CAST('{}' AS ci[]) FROM e;
+}
+expect {
+    {}|0|{}
+}
+
 test array-infinity-rejected {
     CREATE TABLE inf1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
     INSERT INTO inf1 VALUES (1, '{1e309}');

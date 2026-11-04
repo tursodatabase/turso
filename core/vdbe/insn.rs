@@ -1054,14 +1054,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Create an array from contiguous registers (dynamic count).
-    /// Like MakeArray but count is read from count_reg at runtime.
-    MakeArrayDynamic {
-        start_reg: usize,
-        count_reg: usize,
-        dest: usize,
-    },
-
     /// Extract a field from a struct blob by field index.
     /// If src_reg is NULL, dest = NULL.
     StructField {
@@ -1095,16 +1087,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Copy a register value to a dynamically-computed destination.
-    /// ```text
-    /// dest = registers[base + registers[offset_reg]]
-    /// registers[base + registers[offset_reg]] = registers[src]
-    /// ```
-    RegCopyOffset {
-        src: usize,
-        base: usize,
-        offset_reg: usize,
-    },
     /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
     /// of the cursor's current table row into `dest` (as a blob), following overflow
     /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
@@ -2510,12 +2492,10 @@ impl InsnVariants {
             InsnVariants::ArrayElement => execute::op_array_element,
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
-            InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
             InsnVariants::StructField => execute::op_struct_field,
             InsnVariants::UnionPack => execute::op_union_pack,
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
-            InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::BlobRead => execute::op_blob_read,
             InsnVariants::BlobWrite => execute::op_blob_write,
             InsnVariants::BlobLen => execute::op_blob_len,

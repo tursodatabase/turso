@@ -2970,50 +2970,6 @@ pub fn op_make_array(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Create an array from contiguous registers with dynamic count.
-pub fn op_make_array_dynamic(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        MakeArrayDynamic {
-            start_reg,
-            count_reg,
-            dest
-        },
-        insn
-    );
-
-    let count = match state.registers[*count_reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
-        _ => 0,
-    };
-
-    let end = start_reg.checked_add(count).ok_or_else(|| {
-        LimboError::InternalError("MakeArrayDynamic: register range overflow".into())
-    })?;
-    if end > state.registers.len() {
-        return Err(LimboError::InternalError(format!(
-            "MakeArrayDynamic: register range {}..{} exceeds register file size {}",
-            start_reg,
-            end,
-            state.registers.len()
-        ))
-        .into());
-    }
-
-    state.registers[*dest].set_value(make_array_from_registers(
-        &state.registers,
-        *start_reg,
-        count,
-    )?);
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
 /// Split the register file to get a shared reference to `src` and a mutable
 /// reference to `dst`. Panics if `src == dst`.
 #[inline]
@@ -3172,48 +3128,6 @@ pub fn op_union_extract(
         }
         None => state.registers[*dest].set_null(),
     };
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// Copy a register value to a dynamically-computed destination register.
-pub fn op_reg_copy_offset(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        RegCopyOffset {
-            src,
-            base,
-            offset_reg
-        },
-        insn
-    );
-
-    let offset = match state.registers[*offset_reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
-        _ => 0,
-    };
-    let dest = *base + offset;
-    if dest >= state.registers.len() {
-        return Err(LimboError::InternalError(format!(
-            "RegCopyOffset: destination register {} out of bounds (max {})",
-            dest,
-            state.registers.len()
-        ))
-        .into());
-    }
-    if dest != *src {
-        // try_clone_from reuses the destination register's allocation.
-        let [src, dst] = state
-            .registers
-            .get_disjoint_mut([*src, dest])
-            .expect("RegCopyOffset source and destination registers are distinct");
-        dst.try_clone_from(src)?;
-    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
