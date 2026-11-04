@@ -19,8 +19,9 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         apply_static_rewrites, expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        AndWithIntegerZero, BetweenToComparisons, BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size,
+        is_aggregate_or_window_function, unwrap_parens, walk_function_calls, AndWithIntegerZero,
+        BetweenToComparisons, BindingBehavior, FunctionCalls, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -3287,42 +3288,34 @@ fn split_predicate_at_and_boundaries<T: From<Expr>>(predicate: &Expr, out_predic
 /// emitted, so `WHERE 0 AND sum(a)` has to fail now, not when `sum(a)` is
 /// emitted. A function inside a subquery belongs to that subquery.
 fn reject_aggregate_in_predicate(expr: &Expr, resolver: &Resolver) -> Result<()> {
-    walk_expr(expr, &mut |e| {
-        let (name, arg_count, call, has_over) = match e {
-            Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => (
-                name,
-                args.len(),
-                format!("{}()", name.as_str()),
-                filter_over.over_clause.is_some(),
-            ),
-            Expr::FunctionCallStar { name, filter_over } => (
-                name,
-                0,
-                format!("{}(*)", name.as_str()),
-                filter_over.over_clause.is_some(),
-            ),
-            _ => return Ok(WalkControl::Continue),
-        };
-        let is_aggregate = match resolver.resolve_function(name.as_str(), arg_count)? {
-            Some(Func::Window(_)) => {
-                crate::bail_parse_error!("misuse of window function {call}")
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::OfThisQuery,
+        &mut |call, func| {
+            let Some(func) = func else {
+                return Ok(WalkControl::Continue);
+            };
+            if !is_aggregate_or_window_function(func) {
+                return Ok(WalkControl::Continue);
             }
-            Some(Func::Agg(_)) => true,
-            Some(Func::External(external)) => external.func.is_aggregate(),
-            _ => false,
-        };
-        if is_aggregate {
-            let kind = if has_over { "window" } else { "aggregate" };
-            crate::bail_parse_error!("misuse of {kind} function {call}");
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
+            let (name, args, has_over) = match call {
+                Expr::FunctionCall {
+                    name, filter_over, ..
+                } => (name, "()", filter_over.over_clause.is_some()),
+                Expr::FunctionCallStar { name, filter_over } => {
+                    (name, "(*)", filter_over.over_clause.is_some())
+                }
+                _ => unreachable!("walk_function_calls visits function calls only"),
+            };
+            let kind = if matches!(func, Func::Window(_)) || has_over {
+                "window"
+            } else {
+                "aggregate"
+            };
+            crate::bail_parse_error!("misuse of {kind} function {}{args}", name.as_str())
+        },
+    )
 }
 
 pub fn parse_row_id<F>(
