@@ -243,12 +243,18 @@ pub(crate) fn emit_store_value(
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
     for type_def in chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
         }
         emit_coerce(program, type_def, reg, type_params, resolver)?;
     }
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 

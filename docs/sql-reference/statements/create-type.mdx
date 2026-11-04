@@ -67,6 +67,8 @@ The ENCODE expression is evaluated whenever a value is written to a column of th
 
 For arrays of a custom type, NULL elements also bypass ENCODE and DECODE and remain NULL when stored and read.
 
+When `INSERT OR REPLACE` or a column's `NOT NULL ON CONFLICT REPLACE` rule substitutes a default for NULL, that default is type-checked, encoded, and coerced like an ordinary input. The resulting value must still satisfy NOT NULL.
+
 ```sql
 -- Store text in reversed form
 CREATE TYPE reversed_text BASE text
@@ -227,6 +229,8 @@ SELECT CAST(42.5 AS cents);
 SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 -- -1.50|2.50
 ```
+
+A NULL input bypasses ENCODE, COERCE, and DECODE. Domain constraints still apply: a NOT NULL domain rejects a NULL cast. After upgrading, run `REINDEX` on expression or partial indexes that depend on a CAST whose ENCODE previously changed NULL into another value.
 
 A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 

@@ -413,6 +413,8 @@ pub struct ArrayEncodeData {
     pub reg: usize,
     pub element_affinity: Affinity,
     pub element_type: Arc<str>,
+    pub not_null_domain: Option<Arc<str>>,
+    pub array_dimensions: u32,
     pub table_name: Arc<str>,
     pub col_name: Arc<str>,
 }

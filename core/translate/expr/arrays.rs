@@ -139,26 +139,21 @@ pub(super) fn emit_array_encode(
                     reg,
                     element_affinity: Affinity::Blob,
                     element_type: "ANY".into(),
+                    not_null_domain: None,
+                    array_dimensions: col.array_dimensions(),
                     table_name: table_name.into(),
                     col_name: col.name.as_deref().unwrap_or("").into(),
                 }),
             });
 
             emit_array_element_loop(program, reg, |program, element_reg| {
-                let skip_label = program.allocate_label();
-                program.emit_insn(Insn::IsNull {
-                    reg: element_reg,
-                    target_pc: skip_label,
-                });
                 emit_store_value(
                     program,
                     std::slice::from_ref(type_def),
                     element_reg,
                     &col.ty_params,
                     resolver,
-                )?;
-                program.preassign_label_to_next_insn(skip_label);
-                Ok(())
+                )
             })?;
         }
     }
@@ -180,11 +175,23 @@ pub(super) fn emit_array_encode(
     } else {
         col.ty_str.to_uppercase().into()
     };
+    let not_null_domain = resolver
+        .schema()
+        .resolve_type_unchecked(&col.ty_str)?
+        .and_then(|resolved| {
+            resolved
+                .chain
+                .iter()
+                .find(|td| td.not_null)
+                .map(|td| td.name.as_str().into())
+        });
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
             reg,
             element_affinity,
             element_type,
+            not_null_domain,
+            array_dimensions: col.array_dimensions(),
             table_name: table_name.into(),
             col_name: col_name.into(),
         }),
@@ -258,26 +265,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             continue;
         };
 
-        // Check if any type in the chain has not_null — if so, don't skip NULLs
-        let any_not_null = resolved.chain.iter().any(|td| td.not_null);
-
-        let skip_label = if !any_not_null {
-            // Skip NULL values: jump over encode if NULL
-            let label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label,
-            });
-            Some(label)
-        } else {
-            None
-        };
-
         emit_store_value(program, &resolved.chain, reg, &col.ty_params, resolver)?;
-
-        if let Some(label) = skip_label {
-            program.preassign_label_to_next_insn(label);
-        }
     }
     Ok(())
 }

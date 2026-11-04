@@ -1884,10 +1884,11 @@ fn emit_notnulls(
     row_is_encoded: bool,
     include_column: impl Fn(&Column) -> bool,
 ) -> Result<()> {
-    for column_mapping in insertion
+    for (column_index, column_mapping) in insertion
         .col_mappings
         .iter()
-        .filter(|m| m.column.notnull() && include_column(m.column))
+        .enumerate()
+        .filter(|(_, m)| m.column.notnull() && include_column(m.column))
     {
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
         if column_mapping.column.is_rowid_alias() {
@@ -1907,6 +1908,25 @@ fn emit_notnulls(
         let on_replace = matches!(effective, ResolveType::Replace);
         let on_ignore = matches!(effective, ResolveType::Ignore);
 
+        let has_decode = row_is_encoded
+            && resolver
+                .schema()
+                .column_has_decode(column_mapping.column, ctx.table.is_strict);
+        let check_reg = if has_decode {
+            let decoded_reg = program.alloc_register();
+            crate::translate::expr::emit_user_facing_column_value(
+                program,
+                column_mapping.register,
+                decoded_reg,
+                column_mapping.column,
+                ctx.table.is_strict,
+                resolver,
+            )?;
+            decoded_reg
+        } else {
+            column_mapping.register
+        };
+
         // If a NOT NULL constraint violation occurs, the REPLACE conflict resolution replaces the NULL value with the default value for that column,
         // or if the column has no default value, then the ABORT algorithm is used
         if on_replace {
@@ -1914,7 +1934,7 @@ fn emit_notnulls(
                 let skip_label = program.allocate_label();
 
                 program.emit_insn(Insn::NotNull {
-                    reg: column_mapping.register,
+                    reg: check_reg,
                     target_pc: skip_label,
                 });
 
@@ -1927,6 +1947,45 @@ fn emit_notnulls(
                     resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
+
+                if row_is_encoded
+                    && resolver
+                        .schema()
+                        .column_has_custom_type(column_mapping.column, ctx.table.is_strict)
+                    && ctx.table.is_strict
+                {
+                    let mut column_mask = ColumnMask::default();
+                    column_mask.set(column_index)?;
+                    let start_reg = insertion.first_col_register();
+                    program.emit_insn(Insn::TypeCheck {
+                        start_reg,
+                        count: insertion.num_non_virtual_cols,
+                        check_generated: false,
+                        table_reference: BTreeTable::input_type_check_table_ref(
+                            ctx.table,
+                            resolver.schema(),
+                            Some(&column_mask),
+                        )?,
+                    });
+                    crate::translate::expr::emit_custom_type_encode_columns(
+                        program,
+                        resolver,
+                        ctx.table.columns(),
+                        start_reg,
+                        Some(&column_mask),
+                        &ctx.table.name,
+                        &ColumnLayout::from_btree(ctx.table)?,
+                    )?;
+                    program.emit_insn(Insn::TypeCheck {
+                        start_reg,
+                        count: insertion.num_non_virtual_cols,
+                        check_generated: false,
+                        table_reference: BTreeTable::type_check_table_ref(
+                            ctx.table,
+                            resolver.schema(),
+                        ),
+                    });
+                }
 
                 // The statement-level Affinity insn already ran on the
                 // original (NULL) value, so the substituted default needs the
@@ -1942,32 +2001,20 @@ fn emit_notnulls(
                     });
                 }
 
+                if has_decode {
+                    crate::translate::expr::emit_user_facing_column_value(
+                        program,
+                        column_mapping.register,
+                        check_reg,
+                        column_mapping.column,
+                        ctx.table.is_strict,
+                        resolver,
+                    )?;
+                }
                 program.preassign_label_to_next_insn(skip_label);
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
-
-        // Determine which register to check: for custom type columns with
-        // a DECODE expression, decode the encoded value into a temp register
-        // and check the *decoded* value. This prevents "ghost NULLs" where
-        // ENCODE produces a non-NULL value but DECODE returns NULL.
-        let has_decode = resolver
-            .schema()
-            .column_has_decode(column_mapping.column, ctx.table.is_strict);
-        let check_reg = if has_decode {
-            let decoded_reg = program.alloc_register();
-            crate::translate::expr::emit_user_facing_column_value(
-                program,
-                column_mapping.register,
-                decoded_reg,
-                column_mapping.column,
-                ctx.table.is_strict,
-                resolver,
-            )?;
-            decoded_reg
-        } else {
-            column_mapping.register
-        };
 
         // For IGNORE, skip to the next row if NULL
         if on_ignore {

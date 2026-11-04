@@ -611,6 +611,171 @@ test domain-cast-null-to-nullable {
 expect {
 }
 
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-encode-nullable-chain {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE DOMAIN nullable_inner AS null_fallback CHECK (value > 0);
+    CREATE DOMAIN nullable_outer AS nullable_inner;
+    SELECT CAST(NULL AS nullable_outer) IS NULL, CAST(2 AS nullable_outer);
+}
+expect {
+    1|2
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-encode-notnull-cast {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE DOMAIN encoding_notnull AS null_fallback NOT NULL;
+    SELECT CAST(NULL AS encoding_notnull);
+}
+expect error {
+    domain encoding_notnull does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-encode-notnull-insert {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE DOMAIN encoding_notnull AS null_fallback NOT NULL;
+    CREATE TABLE null_domain_values (v encoding_notnull) STRICT;
+    INSERT INTO null_domain_values VALUES (NULL);
+}
+expect error {
+    NOT NULL constraint failed: null_domain_values.v
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-encode-check-cast {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE DOMAIN encoding_checked AS null_fallback CHECK (value IS NOT NULL);
+    SELECT CAST(NULL AS encoding_checked);
+}
+expect error {
+    value for domain encoding_checked violates check constraint
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-replace-encodes-default {
+    CREATE TYPE scaled BASE integer ENCODE value * 10 DECODE value / 10;
+    CREATE DOMAIN required_scaled AS scaled NOT NULL;
+    CREATE TABLE t(v required_scaled DEFAULT 7) STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+    SELECT v FROM t;
+}
+expect {
+    7
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-allows-null-array {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE DOMAIN inherited_int AS required_int;
+    CREATE TABLE t(v inherited_int[]) STRICT;
+    INSERT INTO t VALUES(NULL), (ARRAY[]), (ARRAY[1,2]);
+    SELECT v IS NULL, array_length(v) FROM t ORDER BY rowid;
+    SELECT CAST(NULL AS inherited_int[]) IS NULL;
+}
+expect {
+    1|
+    0|0
+    0|2
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-rejects-null-element {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE DOMAIN inherited_int AS required_int;
+    CREATE TABLE t(v inherited_int[]) STRICT;
+    INSERT INTO t VALUES(ARRAY[NULL,1]);
+}
+expect error {
+    domain required_int does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-rejects-text-null-element {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(v required_int[]) STRICT;
+    INSERT INTO t VALUES('{1,NULL}');
+}
+expect error {
+    domain required_int does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-update-rejects-null-element {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(v required_int[]) STRICT;
+    INSERT INTO t VALUES(ARRAY[1]);
+    UPDATE t SET v = ARRAY[NULL];
+}
+expect error {
+    domain required_int does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-upsert-rejects-null-element {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v required_int[]) STRICT;
+    INSERT INTO t VALUES(1, ARRAY[1]);
+    INSERT INTO t VALUES(1, ARRAY[2]) ON CONFLICT(id) DO UPDATE SET v = ARRAY[NULL];
+}
+expect error {
+    domain required_int does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-cast-rejects-null-element {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    SELECT CAST(ARRAY[NULL,1] AS required_int[]);
+}
+expect error {
+    domain required_int does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-matrix-rejects-null-leaf {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(v required_int[][]) STRICT;
+    INSERT INTO t VALUES(ARRAY[ARRAY[1,NULL]]);
+}
+expect error {
+    domain required_int does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-matrix-allows-null-inner-array {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(v required_int[][]) STRICT;
+    INSERT INTO t VALUES(ARRAY[ARRAY[1],NULL]);
+    SELECT v[1][1], v[2] IS NULL FROM t;
+}
+expect {
+    1|1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-column-notnull-still-applies {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(v required_int[] NOT NULL) STRICT;
+    INSERT INTO t VALUES(NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.v
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-array-large-nonnull-control {
+    CREATE DOMAIN required_int AS integer NOT NULL;
+    CREATE TABLE t(v required_int[]) STRICT;
+    WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 1025)
+    INSERT INTO t SELECT array_agg(x) FROM n;
+    SELECT array_length(v) FROM t;
+}
+expect {
+    1025
+}
+
 
 @requires custom_types "uses CREATE DOMAIN"
 test domain-check-plus-table-check-pass {

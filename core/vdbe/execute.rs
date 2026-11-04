@@ -2649,6 +2649,8 @@ pub fn op_array_encode(
         reg,
         element_affinity,
         element_type,
+        not_null_domain,
+        array_dimensions,
         table_name,
         col_name,
     } = data.as_ref();
@@ -2679,6 +2681,9 @@ pub fn op_array_encode(
                     col_name,
                     SQLITE_CONSTRAINT
                 );
+            }
+            if let Some(domain) = not_null_domain {
+                check_array_domain_not_null(b, *array_dimensions, domain)?;
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2747,10 +2752,37 @@ pub fn op_array_encode(
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
+    if let Some(domain) = not_null_domain {
+        check_array_domain_not_null(record.get_payload(), *array_dimensions, domain)?;
+    }
     state.registers[*reg].set_blob(record.into_payload())?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn check_array_domain_not_null(blob: &[u8], dimensions: u32, domain: &str) -> Result<()> {
+    assert!(dimensions > 0);
+    let mut arrays = vec![(blob, dimensions)];
+    while let Some((blob, dimensions)) = arrays.pop() {
+        for value in ValueIterator::new(blob)? {
+            match value? {
+                ValueRef::Null if dimensions == 1 => {
+                    return Err(LimboError::ConstraintViolation(Box::new(
+                        crate::ConstraintViolation::new(
+                            crate::ConstraintKind::NotNull,
+                            format!("domain {domain} does not allow null values"),
+                        ),
+                    )));
+                }
+                ValueRef::Blob(inner) if dimensions > 1 => {
+                    arrays.push((inner, dimensions - 1));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.

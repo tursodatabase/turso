@@ -390,6 +390,10 @@ test array-custom-encode-skips-null-elements {
     INSERT INTO null_sensitive_encode_arrays VALUES (2, ARRAY[])
         ON CONFLICT (id) DO UPDATE SET v = ARRAY[NULL, 5, NULL];
     SELECT id, v FROM null_sensitive_encode_arrays ORDER BY id;
+    INSERT INTO null_sensitive_encode_arrays VALUES (5, '{NULL,6,NULL}') RETURNING id, v;
+    SELECT array_length(CAST(ARRAY[NULL, 7, NULL] AS null_sensitive_encode[])),
+        array_element(CAST(ARRAY[NULL, 7, NULL] AS null_sensitive_encode[]), 1) IS NULL,
+        CAST(NULL AS null_sensitive_encode[]) IS NULL;
 }
 expect {
     1|{NULL,1,NULL,2,NULL}
@@ -400,6 +404,8 @@ expect {
     2|{NULL,5,NULL}
     3|{}
     4|
+    5|{NULL,6,NULL}
+    3|1|1
 }
 
 test array-custom-encode-preserves-null-like-scalar {
