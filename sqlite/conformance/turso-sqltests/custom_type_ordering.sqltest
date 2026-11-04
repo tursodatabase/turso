@@ -1,36 +1,37 @@
 @database :memory:
 @requires-file custom_types "uses custom types"
 
-# --- ERROR TESTS: types without OPERATOR '<' cannot be sorted or indexed ---
+# --- Any type with a DECODE can be sorted and indexed ---
 
 @requires strict "uses STRICT tables"
-test order-by-blocked-for-non-orderable-type {
+test order-by-type-with-decode {
     CREATE TYPE noorder BASE text ENCODE value DECODE value;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val noorder) STRICT;
-    INSERT INTO t1 VALUES (1, 'a');
+    INSERT INTO t1 VALUES (1, 'b'), (2, 'a');
     SELECT val FROM t1 ORDER BY val;
 }
-expect error {
-    cannot ORDER BY column 'val' of type 'noorder': type does not declare OPERATOR '<'
+expect {
+    a
+    b
 }
 
 @requires strict "uses STRICT tables"
-test create-index-blocked-for-non-orderable-type {
+test create-index-on-type-with-decode {
     CREATE TYPE noorder2 BASE text ENCODE value DECODE value;
     CREATE TABLE t2(id INTEGER PRIMARY KEY, val noorder2) STRICT;
     CREATE INDEX idx2 ON t2(val);
+    INSERT INTO t2 VALUES (1, 'b'), (2, 'a');
+    SELECT id FROM t2 WHERE val = 'a';
 }
-expect error {
-    cannot create index on column 'val' of type 'noorder2': type does not declare OPERATOR '<'
+expect {
+    2
 }
-
-# --- A type that declares OPERATOR '<' sorts and is indexed by its stored value ---
 
 # cents stores 9 as 900 and 10 as 1000. ORDER BY sorts the values and an index
 # sorts the stored integers, so 9 comes before 10 in both.
 @requires strict "uses STRICT tables"
 test user-type-sorts-by-stored-value-in-order-by {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val cents) STRICT;
     INSERT INTO t1 VALUES (1, 10), (2, 9), (3, 2);
     SELECT val FROM t1 ORDER BY val;
@@ -43,7 +44,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test user-type-sorts-by-stored-value-in-index {
-    CREATE TYPE cents2 BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents2 BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t2(id INTEGER PRIMARY KEY, val cents2) STRICT;
     CREATE INDEX idx2 ON t2(val);
     INSERT INTO t2 VALUES (1, 10), (2, 9), (3, 2);
@@ -55,18 +56,11 @@ expect {
     10
 }
 
-test create-type-rejects-less-than-operator-with-function {
-    CREATE TYPE orderable_lt BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+test create-type-has-no-operator-clause {
+    CREATE TYPE orderable_lt BASE text ENCODE value DECODE value OPERATOR '<';
 }
 expect error {
-    OPERATOR '<' takes no function: a type that declares it sorts by its stored value
-}
-
-test create-type-rejects-operators-other-than-less-than {
-    CREATE TYPE orderable_eq BASE text ENCODE value DECODE value OPERATOR '=' test_uint_eq;
-}
-expect error {
-    CREATE TYPE does not accept OPERATOR '=': only OPERATOR '<' is supported
+    near "OPERATOR": syntax error
 }
 
 @requires strict "uses STRICT tables"
@@ -100,7 +94,7 @@ expect {
 # Identity encode/decode: encoded = decoded, so sort order matches alphabetical.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-identity-encoding {
-    CREATE TYPE orderable BASE text ENCODE value DECODE value OPERATOR '<';
+    CREATE TYPE orderable BASE text ENCODE value DECODE value;
     CREATE TABLE t3(id INTEGER PRIMARY KEY, val orderable) STRICT;
     INSERT INTO t3 VALUES (1, 'banana');
     INSERT INTO t3 VALUES (2, 'apple');
@@ -116,7 +110,7 @@ expect {
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-identity-encoding-with-index {
-    CREATE TYPE orderable2 BASE text ENCODE value DECODE value OPERATOR '<';
+    CREATE TYPE orderable2 BASE text ENCODE value DECODE value;
     CREATE TABLE t4(id INTEGER PRIMARY KEY, val orderable2) STRICT;
     CREATE INDEX idx4 ON t4(val);
     INSERT INTO t4 VALUES (1, 'banana');
@@ -134,7 +128,7 @@ expect {
 # Sorting encoded integers preserves numeric order.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-monotonic-integer {
-    CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t5(id INTEGER PRIMARY KEY, val myint) STRICT;
     INSERT INTO t5 VALUES (1, 30);
     INSERT INTO t5 VALUES (2, 10);
@@ -149,7 +143,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-monotonic-integer-with-index {
-    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t5b(id INTEGER PRIMARY KEY, val myint1b) STRICT;
     CREATE INDEX idx5b ON t5b(val);
     INSERT INTO t5b VALUES (1, 30);
@@ -165,7 +159,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-desc-order {
-    CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t6(id INTEGER PRIMARY KEY, val myint2) STRICT;
     INSERT INTO t6 VALUES (1, 30);
     INSERT INTO t6 VALUES (2, 10);
@@ -180,7 +174,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-desc-order-with-index {
-    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t6b(id INTEGER PRIMARY KEY, val myint2b) STRICT;
     CREATE INDEX idx6b ON t6b(val);
     INSERT INTO t6b VALUES (1, 30);
@@ -200,7 +194,7 @@ expect {
 # ORDER BY sorts the decoded text, not the stored ananab < elppa < yrrehc.
 @requires strict "uses STRICT tables"
 test order-by-sorts-by-value-non-monotonic-encoding {
-    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev(id INTEGER PRIMARY KEY, val rev) STRICT;
     INSERT INTO t_rev VALUES (1, 'apple');
     INSERT INTO t_rev VALUES (2, 'banana');
@@ -216,7 +210,7 @@ expect {
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
 test order-by-sorts-by-value-non-monotonic-encoding-with-index {
-    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev2(id INTEGER PRIMARY KEY, val rev2) STRICT;
     CREATE INDEX idx_rev2 ON t_rev2(val);
     INSERT INTO t_rev2 VALUES (1, 'apple');
@@ -232,7 +226,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test order-by-sorts-by-value-non-monotonic-desc {
-    CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev3(id INTEGER PRIMARY KEY, val rev3) STRICT;
     INSERT INTO t_rev3 VALUES (1, 'apple');
     INSERT INTO t_rev3 VALUES (2, 'banana');
@@ -247,7 +241,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test order-by-sorts-by-value-non-monotonic-desc-with-index {
-    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev4(id INTEGER PRIMARY KEY, val rev4) STRICT;
     CREATE INDEX idx_rev4 ON t_rev4(val);
     INSERT INTO t_rev4 VALUES (1, 'apple');
@@ -265,7 +259,7 @@ expect {
 # reverse of the order of `<`. Every sort follows `<`.
 @requires strict "uses STRICT tables"
 test order-by-sorts-by-value-reversing-encoding {
-    CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value OPERATOR '<';
+    CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value;
     CREATE TABLE n(id INTEGER PRIMARY KEY, c neg, g integer) STRICT;
     INSERT INTO n VALUES (1, 3, 1), (2, 1, 2), (3, 10, 1), (4, 2, 2), (5, NULL, 1);
     SELECT group_concat(c, ',') FROM (SELECT c FROM n WHERE c > 2);
@@ -294,7 +288,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test window-order-by-and-partition-by-sort-by-value {
-    CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value OPERATOR '<';
+    CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value;
     CREATE TABLE n(id INTEGER PRIMARY KEY, c neg, g neg) STRICT;
     INSERT INTO n VALUES (1, 3, 1), (2, 1, 2), (3, 10, 1), (4, 2, 2);
     SELECT c, row_number() OVER (ORDER BY c) FROM n ORDER BY id;
@@ -309,6 +303,115 @@ expect {
     1|3|2
     2|2|1
     2|1|2
+}
+
+# Every other place that sorts follows `<` too: aggregate ORDER BY, GROUP BY
+# then ORDER BY, a recursive CTE's ORDER BY, a named window, WITHIN GROUP,
+# DISTINCT and a scalar subquery as the sort key.
+@requires strict "uses STRICT tables"
+test every-order-by-sorts-by-value {
+    CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE n(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO n VALUES (1, 3), (2, 1), (3, 10), (4, 2), (5, NULL);
+    SELECT group_concat(id, ',' ORDER BY c) FROM n WHERE c IS NOT NULL;
+    SELECT group_concat(c, ',') FROM (SELECT c FROM n WHERE c IS NOT NULL GROUP BY c ORDER BY c);
+    WITH RECURSIVE r(x) AS (SELECT c FROM n WHERE c IS NOT NULL UNION ALL SELECT x FROM r WHERE 0 ORDER BY 1) SELECT group_concat(x, ',') FROM r;
+    SELECT group_concat(r, ',') FROM (SELECT id, rank() OVER w AS r FROM n WHERE c IS NOT NULL WINDOW w AS (ORDER BY c) ORDER BY id);
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY c) FROM n;
+    SELECT group_concat(c, ',') FROM (SELECT DISTINCT c FROM n WHERE c IS NOT NULL ORDER BY c);
+    SELECT group_concat(id, ',') FROM (SELECT id FROM n WHERE c IS NOT NULL ORDER BY (SELECT m.c FROM n AS m WHERE m.id = n.id));
+}
+expect {
+    2,4,1,3
+    1,2,3,10
+    1,2,3,10
+    3,1,4,2
+    2
+    1,2,3,10
+    2,4,1,3
+}
+
+# --- Every ORDER BY refuses a type whose values can't be compared ---
+
+@requires strict "uses STRICT tables"
+test order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT a FROM h ORDER BY a;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test union-order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT id FROM h UNION SELECT a FROM h ORDER BY 1;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test group-by-order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT count(*) FROM h GROUP BY id ORDER BY a;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test aggregate-order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT group_concat(id ORDER BY a) FROM h;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test within-group-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY a) FROM h;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test window-order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT row_number() OVER (ORDER BY a) FROM h;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test named-window-order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT rank() OVER w FROM h WINDOW w AS (ORDER BY a);
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test recursive-cte-order-by-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    WITH RECURSIVE r(x) AS (SELECT a FROM h UNION ALL SELECT x FROM r WHERE 0 ORDER BY 1) SELECT x FROM r;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test subquery-sort-key-refuses-inet {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, a inet) STRICT;
+    SELECT id FROM h ORDER BY (SELECT a FROM h LIMIT 1);
+}
+expect error {
+    values of type inet cannot be compared
 }
 
 # --- BUILT-IN TYPES sort correctly ---

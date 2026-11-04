@@ -154,7 +154,7 @@ mod tests {
             let conn = db.connect_limbo();
             conn.execute(
                 "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
+                 DECODE string_reverse(value)",
             )
             .unwrap();
             conn.execute(
@@ -232,7 +232,7 @@ mod tests {
             let conn = db.connect_limbo();
             conn.execute(
                 "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
+                 DECODE string_reverse(value)",
             )
             .unwrap();
             conn.execute(
@@ -1137,7 +1137,7 @@ mod tests {
             "CREATE DOMAIN doc AS json",
             "CREATE TYPE point AS STRUCT(x INT, y INT)",
             "CREATE TYPE number AS UNION(i INT, f REAL)",
-            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<'",
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
             "CREATE DOMAIN positive AS integer CHECK (value > 0)",
         ] {
             conn.execute(sql).unwrap();

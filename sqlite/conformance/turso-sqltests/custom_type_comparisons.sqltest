@@ -887,7 +887,7 @@ expect error {
 test cmp-index-seek-key-is-encoded {
     -- The index holds encoded values (500, 700), so a seek key is encoded
     -- before it is compared. The results match the same queries on a scan.
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, c cents) STRICT;
     INSERT INTO t VALUES (1, 5), (2, 7);
     CREATE INDEX t_c ON t(c);

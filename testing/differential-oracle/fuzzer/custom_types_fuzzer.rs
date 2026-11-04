@@ -190,7 +190,6 @@ struct CustomTypeDef {
     base: String,
     encode: String,
     decode: String,
-    has_order: bool,
     default: Option<String>,
 }
 
@@ -394,9 +393,6 @@ fn custom_type_def_sql(ct: &CustomTypeDef) -> String {
         "CREATE TYPE {} BASE {} ENCODE ({}) DECODE ({})",
         ct.name, ct.base, ct.encode, ct.decode
     );
-    if ct.has_order {
-        sql.push_str(" OPERATOR '<'");
-    }
     if let Some(default) = &ct.default {
         sql.push_str(&format!(" DEFAULT ({default})"));
     }
@@ -436,7 +432,6 @@ fn gen_custom_type_defs(rng: &mut StdRng, n: usize) -> Vec<CustomTypeDef> {
                 "value".to_string(),
             ),
         };
-        let has_order = rng.random_bool(0.5);
         let default = if rng.random_bool(0.3) {
             match base.as_str() {
                 "integer" => Some(rng.random_range(0..=100i64).to_string()),
@@ -451,7 +446,6 @@ fn gen_custom_type_defs(rng: &mut StdRng, n: usize) -> Vec<CustomTypeDef> {
             base,
             encode,
             decode,
-            has_order,
             default,
         });
     }

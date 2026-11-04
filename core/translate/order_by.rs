@@ -6,7 +6,7 @@ use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     emit_explain,
-    schema::{Index, IndexColumn, PseudoCursorType, Schema},
+    schema::{Index, IndexColumn, PseudoCursorType},
     translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
     util::exprs_are_equivalent,
     vdbe::{
@@ -24,31 +24,6 @@ use super::{
 };
 
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
-
-/// For a result column expression that is a column reference to a custom type,
-/// returns the column definition and type definition.
-fn result_column_custom_type_info<'a>(
-    expr: &ast::Expr,
-    referenced_tables: &'a TableReferences,
-    schema: &'a Schema,
-) -> Option<(
-    &'a crate::schema::Column,
-    std::sync::Arc<crate::schema::TypeDef>,
-)> {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?.clone();
-        Some((col, type_def))
-    } else {
-        None
-    }
-}
 
 // Metadata for handling ORDER BY operations
 #[derive(Debug)]
@@ -88,20 +63,6 @@ impl EmitOrderBy {
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
-        for (expr, _, _) in order_by.iter() {
-            if let Some((col, type_def)) =
-                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
-            {
-                if col.type_ordering().is_none() && !type_def.is_sortable() {
-                    crate::bail_parse_error!(
-                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                        col.name.as_deref().unwrap_or("?"),
-                        type_def.name
-                    );
-                }
-            }
-        }
-
         let only_aggs = order_by
             .iter()
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));

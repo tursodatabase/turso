@@ -23,7 +23,6 @@ CREATE TYPE type_name BASE base_type
     [ENCODE encode_expr]
     [COERCE coerce_expr]
     [DECODE decode_expr]
-    [OPERATOR '<']
     [DEFAULT default_expr];
 ```
 
@@ -31,7 +30,6 @@ CREATE TYPE type_name BASE base_type
 - **ENCODE** — Expression applied to `value` before writing to disk.
 - **COERCE** — (Optional) Expression that fits the encoded `value` to the column's type parameters, such as a maximum length. See [Parametric Types](#parametric-types).
 - **DECODE** — Expression applied to `value` when reading from disk.
-- **OPERATOR '<'** — (Optional) Lets ORDER BY and CREATE INDEX sort the type; see [Ordering](#ordering). Arithmetic operators can't be declared; see [Operators](#operators).
 - **DEFAULT** — (Optional) Default value for columns of this type when no value is supplied.
 
 The special identifier `value` refers to the input being encoded or decoded.
@@ -107,40 +105,27 @@ SELECT amount + 1 FROM prices;
 -- Error: operator does not exist: cents + integer
 ```
 
-The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The only OPERATOR clause `CREATE TYPE` accepts is a plain `OPERATOR '<'`; see [Ordering](#ordering). Any other fails: `OPERATOR '+' f` fails with `CREATE TYPE does not accept OPERATOR '+': only OPERATOR '<' is supported`.
+The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators.
 
 ## Ordering
 
-ORDER BY and indexes sort a custom type by its **encoded (on-disk) value**, using the base type's comparison, while `=`, `<` and the other operators compare decoded values. So a type with a DECODE must declare `OPERATOR '<'` (no function) to say that its encoding keeps the order of its input. Without it, ORDER BY and CREATE INDEX on its columns fail with `type does not declare OPERATOR '<'`. When the encoding keeps the order, the sort order matches the decoded values:
+ORDER BY, GROUP BY, DISTINCT, `=`, `<` and the other operators use the decoded value, so ORDER BY gives the order of `<` even when the encoding does not keep the order of its input:
 
 ```sql
--- ENCODE value * 100 keeps the order: 10→1000, 20→2000, 30→3000.
-CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
-CREATE TABLE prices(id INTEGER PRIMARY KEY, amount cents) STRICT;
-INSERT INTO prices VALUES (1, 30), (2, 10), (3, 20);
-SELECT amount FROM prices ORDER BY amount;
--- 10
--- 20
--- 30
-```
-
-If a type declares `OPERATOR '<'` but its encoding does **not** keep the order, the sort follows the encoded form:
-
-```sql
--- Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
--- Encoded text sort: ananab < elppa < yrrehc → display: banana, apple, cherry.
+-- Stored: apple→elppa, banana→ananab, cherry→yrrehc.
 CREATE TYPE reversed BASE text
     ENCODE string_reverse(value)
-    DECODE string_reverse(value)
-    OPERATOR '<';
+    DECODE string_reverse(value);
 
 CREATE TABLE t(id INTEGER PRIMARY KEY, val reversed) STRICT;
-INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');
+INSERT INTO t VALUES (1, 'banana'), (2, 'cherry'), (3, 'apple');
 SELECT val FROM t ORDER BY val;
--- banana
 -- apple
+-- banana
 -- cherry
 ```
+
+Indexes hold the encoded value, so an ORDER BY on such a column sorts its rows instead of reading them in index order.
 
 ### Types with Their Own Order
 
@@ -338,13 +323,13 @@ List all available types (built-in and custom) with their metadata:
 
 ```sql
 PRAGMA list_types;
--- type      | parent | encode                | coerce | decode                | default | operators
--- INTEGER   |        |                       |        |                       |         |
--- REAL      |        |                       |        |                       |         |
--- TEXT      |        |                       |        |                       |         |
--- BLOB      |        |                       |        |                       |         |
--- ANY       |        |                       |        |                       |         |
--- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0       |
+-- type      | parent | encode                | coerce | decode                | default
+-- INTEGER   |        |                       |        |                       |
+-- REAL      |        |                       |        |                       |
+-- TEXT      |        |                       |        |                       |
+-- BLOB      |        |                       |        |                       |
+-- ANY       |        |                       |        |                       |
+-- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0
 ```
 
 ### sqlite_turso_types

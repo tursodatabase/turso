@@ -33,34 +33,34 @@ mod tests {
         },
         TypeCase {
             name: "DECODE value",
-            create: &["CREATE TYPE up BASE text ENCODE upper(value) DECODE value OPERATOR '<'"],
+            create: &["CREATE TYPE up BASE text ENCODE upper(value) DECODE value"],
             column_type: "up",
             values: &["'b'", "'A'", "'c'", "'a'", "'B'"],
         },
         TypeCase {
             name: "DECODE reverses the order",
             create: &[
-                "CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value OPERATOR '<'",
+                "CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value",
             ],
             column_type: "neg",
             values: &["3", "1", "10", "2", "1", "-4"],
         },
         TypeCase {
             name: "DECODE reverses the text",
-            create: &["CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<'"],
+            create: &["CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value)"],
             column_type: "rev",
             values: &["'apple'", "'banana'", "'cherry'", "'ab'", "'ba'"],
         },
         TypeCase {
             name: "DECODE merges values",
-            create: &["CREATE TYPE ci BASE text ENCODE value DECODE lower(value) OPERATOR '<'"],
+            create: &["CREATE TYPE ci BASE text ENCODE value DECODE lower(value)"],
             column_type: "ci",
             values: &["'B'", "'a'", "'A'", "'c'", "'b'"],
         },
         TypeCase {
             name: "DECODE keeps the order",
             create: &[
-                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<'",
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
             ],
             column_type: "cents",
             values: &["10", "9", "2", "-3", "9"],
@@ -68,7 +68,7 @@ mod tests {
         TypeCase {
             name: "domain over a type whose DECODE reverses the order",
             create: &[
-                "CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value OPERATOR '<'",
+                "CREATE TYPE neg(value integer) BASE integer ENCODE -value DECODE -value",
                 "CREATE DOMAIN dneg AS neg",
             ],
             column_type: "dneg",
