@@ -48,7 +48,7 @@ Basics not enumerated by the official feature matrix.
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
@@ -428,7 +428,7 @@ Upgrade is not supported.
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
 | ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read the tables they own or were granted `SELECT` on, but not write rows, use sequences, or change the schema they do not own; `GRANT SELECT` on tables is the only `GRANT` accepted and is stored in `pg_class.relacl`; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
-| Row-level security | ❌ Not supported | |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` is stored and shown in `pg_class.relrowsecurity`, but no rows are limited yet; policies, `CREATE POLICY` and `FORCE ROW LEVEL SECURITY` are not supported |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |
