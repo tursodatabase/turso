@@ -1150,7 +1150,7 @@ fn check_when_clause_function_calls(when_expr: &ast::Expr, resolver: &Resolver) 
                 unresolved_column_seen = true;
             }
             ast::Expr::FunctionCall { .. } | ast::Expr::FunctionCallStar { .. } => {
-                expr::reject_unknown_function(e, resolver)?;
+                expr::check_function_calls(e, resolver)?;
             }
             _ => {}
         }

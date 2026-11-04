@@ -138,6 +138,18 @@ pub(crate) fn validate_check_expr(
         }
         Ok(WalkControl::Continue)
     })?;
+    // SQLite checks the argument of likelihood() once every name is resolved
+    // and no subquery or parameter is left, so that check comes last.
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            if let Some(Func::Scalar(crate::function::ScalarFunc::Likelihood)) =
+                resolver.resolve_function(name.as_str(), args.len())?
+            {
+                super::expr::check_likelihood_arguments(args)?;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
