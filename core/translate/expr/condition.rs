@@ -439,8 +439,12 @@ fn translate_leaf_condition_expr(
                 "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
             );
         }
+        // A collation changes nothing about whether a value is true, so the
+        // value is evaluated and tested, as SQLite does.
         ast::Expr::Collate(_, _) => {
-            crate::bail_parse_error!("Collate in WHERE clause is not supported");
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(
