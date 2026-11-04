@@ -8,6 +8,7 @@ mod checkpoint_crash_atomicity;
 mod checkpoint_stale_page_size;
 mod common;
 mod conflict_resolution;
+mod custom_type_sorts;
 mod custom_types;
 mod database;
 mod database_leak;

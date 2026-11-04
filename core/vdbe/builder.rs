@@ -404,7 +404,6 @@ impl ProgramBuilderFlags {
     const READONLY: u16 = 1 << 3;
     const IS_SUBPROGRAM: u16 = 1 << 4;
     const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
-    const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
@@ -500,18 +499,6 @@ impl ProgramBuilderFlags {
     #[inline]
     pub fn set_has_statement_conflict(&mut self, v: bool) {
         self.set(Self::HAS_STATEMENT_CONFLICT, v)
-    }
-
-    #[inline]
-    /// When set, a custom-type column is read in its stored form, without
-    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
-    /// compares stored values.
-    pub const fn suppress_custom_type_decode(self) -> bool {
-        self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
-    }
-    #[inline]
-    pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
-        self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
     }
 
     #[inline]

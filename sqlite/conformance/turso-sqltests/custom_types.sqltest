@@ -995,10 +995,9 @@ expect error {
 }
 
 # test_reverse stores reversed text: 'apple' -> 'elppa', 'banana' -> 'ananab'.
-# With OPERATOR '<', ORDER BY sorts by the stored value: 'ananab' < 'elppa' < 'yrrehc',
-# so the decoded values come out as banana, apple, cherry.
+# ORDER BY sorts by the decoded value, not by the stored 'ananab' < 'elppa' < 'yrrehc'.
 @requires strict "uses STRICT tables"
-test order-by-custom-type-sorts-by-stored-value {
+test order-by-custom-type-sorts-by-value {
     CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t1(val test_reverse) STRICT;
     INSERT INTO t1 VALUES ('apple');
@@ -1007,14 +1006,13 @@ test order-by-custom-type-sorts-by-stored-value {
     SELECT val FROM t1 ORDER BY val;
 }
 expect {
-    banana
     apple
+    banana
     cherry
 }
 
 # A CAST gives the decoded value, so ORDER BY on it sorts by the decoded value,
-# the same as an index on the CAST holds it. ORDER BY on the column itself
-# sorts by the stored value.
+# the same as ORDER BY on the column and an index on the CAST.
 @requires strict "uses STRICT tables"
 test order-by-cast-to-custom-type-sorts-decoded-with-and-without-index {
     CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
@@ -1030,7 +1028,7 @@ test order-by-cast-to-custom-type-sorts-decoded-with-and-without-index {
     SELECT group_concat(plain) FROM (SELECT plain FROM t1 ORDER BY CAST(plain AS test_reverse));
 }
 expect {
-    banana,apple,cherry
+    apple,banana,cherry
     apple,banana,cherry
     apple,banana,cherry
     apple,banana,cherry

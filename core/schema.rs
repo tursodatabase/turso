@@ -577,10 +577,9 @@ impl TypeDef {
         }
     }
 
-    /// Whether ORDER BY and CREATE INDEX accept values of the type. A type
-    /// with its own order sorts in it. Otherwise values sort by their stored
-    /// value, which only keeps the order of the decoded values when the type
-    /// says so with OPERATOR '<' (or has no DECODE, so the two are the same).
+    /// Whether ORDER BY and CREATE INDEX accept values of the type: it has its
+    /// own order, has no DECODE, or declares OPERATOR '<'. ORDER BY sorts the
+    /// values DECODE returns; an index sorts the stored values.
     pub fn is_sortable(&self) -> bool {
         self.ordering().is_some()
             || self.decode().is_none()

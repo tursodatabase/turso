@@ -125,22 +125,20 @@ The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` tu
 
 ### Sorting and comparing
 
-ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. When ENCODE does not keep the order, ORDER BY follows the stored form:
+Comparison operators, ORDER BY, GROUP BY, DISTINCT, window `PARTITION BY` and `ORDER BY`, MIN and MAX use the value DECODE returns. Indexes sort a custom type by its stored value, using SQLite's comparison for the base type. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. ORDER BY sorts by the value even when ENCODE does not keep the order:
 
 ```sql
 CREATE TYPE reversed_text BASE text
-    ENCODE turso_reverse(value)
-    DECODE turso_reverse(value)
+    ENCODE string_reverse(value)
+    DECODE string_reverse(value)
     OPERATOR '<';
 CREATE TABLE t(w reversed_text) STRICT;
-INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');
+INSERT INTO t VALUES ('banana'), ('cherry'), ('apple');
 SELECT w FROM t ORDER BY w;
--- banana   (stored as 'ananab')
 -- apple    (stored as 'elppa')
+-- banana   (stored as 'ananab')
 -- cherry   (stored as 'yrrehc')
 ```
-
-`ORDER BY CAST(x AS reversed_text)` sorts by the decoded value instead (apple, banana, cherry), because a CAST gives the decoded value. An index on the CAST holds the decoded value too.
 
 The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and so does a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN` or `CREATE INDEX`. Comparing two types with different orders fails with `cannot compare type x with type y`.
 

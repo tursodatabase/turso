@@ -306,7 +306,7 @@ impl EmitOrderBy {
         // We emit the columns in SELECT order, not sorter order (sorter always has the sort keys first).
         // This is tracked in sort_metadata.remappings.
         let start_reg = t_ctx.reg_result_cols_start.unwrap();
-        for (i, rc) in result_columns.iter().enumerate() {
+        for i in 0..result_columns.len() {
             let reg = start_reg + i;
             let remapping = remappings
                 .get(i)
@@ -314,33 +314,6 @@ impl EmitOrderBy {
 
             let column_idx = remapping.orderby_sorter_idx;
             program.emit_column_or_rowid(cursor_id, column_idx, reg);
-
-            // Deduplicated columns share a sort key slot, which stores the encoded
-            // (on-disk) value (decode was suppressed during sorter insert). Apply
-            // DECODE now so the result set contains human-readable values.
-            if remapping.deduplicated {
-                if let Some((_, type_def)) = result_column_custom_type_info(
-                    &rc.expr,
-                    &plan.table_references,
-                    t_ctx.resolver.schema(),
-                ) {
-                    if let Some(decode_expr) = type_def.decode() {
-                        let skip_label = program.allocate_label();
-                        program.emit_insn(Insn::IsNull {
-                            reg,
-                            target_pc: skip_label,
-                        });
-                        super::expr::emit_type_expr(
-                            program,
-                            decode_expr,
-                            reg,
-                            reg,
-                            &t_ctx.resolver,
-                        )?;
-                        program.preassign_label_to_next_insn(skip_label);
-                    }
-                }
-            }
         }
 
         // Decode array blobs to JSON text for display, after extracting from sorter
@@ -426,26 +399,13 @@ impl EmitOrderBy {
                     extra_amount: 0,
                 });
             } else {
-                // Sort keys must be encoded (on-disk) values. Suppress decode so the
-                // sorter compares stored values, with SQLite's comparison or the
-                // built-in type's own order (numeric).
-                let is_custom =
-                    result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
-                        .is_some_and(|(_, td)| td.decode().is_some());
-                if is_custom {
-                    program.flags.set_suppress_custom_type_decode(true);
-                }
-                let result = translate_expr(
+                translate_expr(
                     program,
                     Some(&plan.table_references),
                     expr,
                     key_reg,
                     resolver,
-                );
-                if is_custom {
-                    program.flags.set_suppress_custom_type_decode(false);
-                }
-                result?;
+                )?;
             }
         }
 

@@ -276,7 +276,7 @@ fn copy_cached_expr_reg(
     });
     // Hash join payloads store raw encoded values; apply DECODE for custom
     // type columns so the result set contains human-readable text.
-    if needs_decode && !program.flags.suppress_custom_type_decode() {
+    if needs_decode {
         if let ast::Expr::Column {
             table: table_ref_id,
             column,
@@ -2685,18 +2685,14 @@ fn translate_column_expr(
                     maybe_apply_affinity(column.ty(), target_register, program);
                 }
 
-                // Decode custom type columns (skipped when building ORDER BY sort keys
-                // for types without a `<` operator, so the sorter sorts on encoded values)
-                if !program.flags.suppress_custom_type_decode() {
-                    emit_user_facing_column_value(
-                        program,
-                        target_register,
-                        target_register,
-                        column,
-                        table.is_strict(),
-                        resolver,
-                    )?;
-                }
+                emit_user_facing_column_value(
+                    program,
+                    target_register,
+                    target_register,
+                    column,
+                    table.is_strict(),
+                    resolver,
+                )?;
             }
             Ok(target_register)
         }
