@@ -1,14 +1,18 @@
-//! The SQLite dialect and built-in SQLite-style catalog tables.
+//! The engine's own SQL and the built-ins every dialect composes with.
 //!
-//! [`SqliteDialect`] is the [`super::Dialect`] for SQLite: schema
-//! rows are plain SQLite text parsed with the SQLite parser. The catalog
-//! tables here (`pragma_*` table-valued functions, `json_each`/`json_tree`,
-//! `sqlite_dbpage`, `btree_dump`, and `sqlite_turso_types`) are registered
-//! into every fresh schema by [`crate::schema::Schema::with_options`]
-//! through [`register_builtin_catalog`]. ATTACH and DETACH, which give
-//! SQLite one namespace per database, are in [`attach`].
+//! The engine compiles SQLite syntax: a frontend dialect translates its
+//! statements into the SQLite AST, and the statements the engine runs for
+//! itself are written in SQLite SQL. This module has the parts of that
+//! language that every dialect shares: the parser entry points, the
+//! built-in functions, and the built-in catalog tables (`pragma_*`
+//! table-valued functions, `json_each`/`json_tree`, `sqlite_dbpage`,
+//! `btree_dump`, and `sqlite_turso_types`), which each dialect registers
+//! with [`register_builtin_catalog`].
+//!
+//! [`EngineDialect`] is the dialect of the statements the engine runs for
+//! itself. The SQLite dialect that users open databases with is
+//! `SqliteDialect` in the `turso_sqlite` crate.
 
-pub mod attach;
 use crate::namespace::NamespaceId;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
@@ -33,13 +37,13 @@ use crate::function::JsonFunc;
 #[allow(unused_imports)]
 use crate::function::{AggFunc, Func, MathFunc, ScalarFunc, VectorFunc, WindowFunc};
 
-/// The SQLite dialect: statements are SQLite SQL and `sqlite_schema`
-/// rows are canonical SQLite text.
-pub struct SqliteDialect;
+/// The dialect of the statements the engine runs for itself: SQLite SQL
+/// with the built-in functions and catalog tables.
+pub(crate) struct EngineDialect;
 
-impl super::Dialect for SqliteDialect {
+impl super::Dialect for EngineDialect {
     fn name(&self) -> &'static str {
-        "sqlite"
+        "engine"
     }
 
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -67,16 +71,7 @@ impl super::Dialect for SqliteDialect {
         tbl_name: &turso_parser::ast::QualifiedName,
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String> {
-        match body {
-            turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
-                "CREATE TABLE {} {}",
-                tbl_name.name.as_ident(),
-                body
-            )),
-            turso_parser::ast::CreateTableBody::AsSelect(_) => {
-                crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-            }
-        }
+        format_table_sql(tbl_name, body)
     }
 
     fn register_catalog(
@@ -92,9 +87,10 @@ impl super::Dialect for SqliteDialect {
     }
 }
 
-/// The SQL comment is valid SQLite syntax, so without this check the SQLite
-/// parser would accept the PostgreSQL DDL with SQLite column semantics.
-fn reject_postgres_table_sql(sql: &str) -> crate::Result<()> {
+/// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that
+/// marks it is valid SQLite syntax, so without this check the SQLite parser
+/// would accept the PostgreSQL DDL with SQLite column semantics.
+pub fn reject_postgres_table_sql(sql: &str) -> crate::Result<()> {
     if sql.starts_with(super::POSTGRES_TABLE_SQL_PREFIX) {
         return Err(crate::LimboError::Corrupt(format!(
             "malformed database schema: table was created by the postgres frontend: {sql}"
@@ -108,6 +104,23 @@ pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     let cmd = parser.next_cmd()?;
     Ok((cmd, parser.offset()))
+}
+
+/// Formats canonical SQLite `CREATE TABLE` text from its AST.
+pub fn format_table_sql(
+    tbl_name: &turso_parser::ast::QualifiedName,
+    body: &turso_parser::ast::CreateTableBody,
+) -> crate::Result<String> {
+    match body {
+        turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
+            "CREATE TABLE {} {}",
+            tbl_name.name.as_ident(),
+            body
+        )),
+        turso_parser::ast::CreateTableBody::AsSelect(_) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
+    }
 }
 
 /// Parse persisted SQLite table SQL into a `CREATE TABLE` statement.

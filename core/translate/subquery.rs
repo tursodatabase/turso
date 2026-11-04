@@ -29,7 +29,11 @@ use crate::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
-        expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
+        },
+        insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
@@ -632,24 +636,40 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    let mut subquery_parser = get_subquery_parser(
-        program,
-        out_subqueries,
-        referenced_tables,
-        resolver,
-        connection,
-        &outer_query_refs_for_correlated_subquery,
-        position,
-        origin,
-        allow_correlated,
-        cse_map,
-        same_query_map,
-        shared,
-    );
-    for expr in exprs {
-        walk_expr_mut(expr, &mut subquery_parser)?;
+    // Only custom types and arrays fail the checks below, and without custom
+    // types enabled there are neither.
+    let custom_types_enabled = !resolver.schema().type_registry.is_empty();
+    let mut with_subqueries = Vec::new();
+    {
+        let mut subquery_parser = get_subquery_parser(
+            program,
+            out_subqueries,
+            referenced_tables,
+            resolver,
+            connection,
+            &outer_query_refs_for_correlated_subquery,
+            position,
+            origin,
+            allow_correlated,
+            cse_map,
+            same_query_map,
+            shared,
+        );
+        for expr in exprs {
+            let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
+            walk_expr_mut(expr, &mut subquery_parser)?;
+            if has_subquery {
+                let expr: &ast::Expr = expr;
+                with_subqueries.push(expr);
+            }
+        }
     }
-
+    // Binding checked these with the types of their subqueries not known yet.
+    // Check them again with those types, as compiling them would, in case
+    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
+    for expr in with_subqueries {
+        check_custom_types(expr, Some(referenced_tables), resolver)?;
+    }
     Ok(())
 }
 

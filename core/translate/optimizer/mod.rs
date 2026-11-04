@@ -4930,7 +4930,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::dialect::SqliteDialect),
+            crate::sync::Arc::new(crate::EngineDialect),
             None,
         )
     }

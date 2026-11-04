@@ -20,6 +20,7 @@ doc = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+turso_sqlite = { path = "../sqlite/frontend", version = "0.9.0-pre.2" }
 env_logger = { workspace = true, default-features = false }
 turso_core = { path = "../core", version = "0.9.0-pre.2", default-features = false, features = [
     "baseline",

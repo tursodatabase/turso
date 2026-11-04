@@ -860,7 +860,7 @@ fn validate(
                 }
             }
             table.resolve_custom_types(resolver.schema());
-            table.check_collates_are_allowed()?;
+            table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
     }
@@ -3137,8 +3137,12 @@ pub fn translate_create_type(
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
 
-        let type_def =
-            crate::schema::TypeDef::from_create_type(&normalized_name, body, false, String::new())?;
+        let type_def = crate::schema::TypeDef::from_create_type(
+            &normalized_name,
+            body,
+            crate::schema::TypeOrigin::User,
+            String::new(),
+        )?;
         resolver
             .schema()
             .plain_value_type(&normalized_name, type_def.value_input_type())?;

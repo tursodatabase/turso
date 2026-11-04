@@ -345,14 +345,14 @@ mod tests {
 
     use turso_parser::ast;
 
-    use crate::{Connection, Database, MemoryIO, SqliteDialect};
+    use crate::{Connection, Database, EngineDialect, MemoryIO};
 
     #[test]
     fn create_role_fails_under_a_dialect_without_roles() {
         let db = Database::open_file(
             Arc::new(MemoryIO::new()),
             ":memory:",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();

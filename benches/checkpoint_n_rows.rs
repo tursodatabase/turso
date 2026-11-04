@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect,
-    StepResult,
+    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult,
 };
+use turso_sqlite::SqliteDialect;
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]

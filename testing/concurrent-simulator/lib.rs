@@ -16,7 +16,6 @@ use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
-use turso_core::SqliteDialect;
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
@@ -25,6 +24,7 @@ use turso_core::{
     IO, LimboError, OpenFlags, Statement, Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
+use turso_sqlite::SqliteDialect;
 
 mod allocation_fault;
 pub mod chaotic_btree;

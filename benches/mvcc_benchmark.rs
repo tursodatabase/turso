@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{

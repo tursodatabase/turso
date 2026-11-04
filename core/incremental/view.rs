@@ -884,7 +884,7 @@ mod tests {
     };
     use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
-    use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
+    use crate::{ConnectOpts, Database, DatabaseOpts, EngineDialect, OpenFlags, StepResult};
     use turso_parser::ast;
 
     #[test]
@@ -1192,7 +1192,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_views(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -1236,7 +1236,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_views(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

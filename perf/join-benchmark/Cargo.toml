@@ -18,6 +18,7 @@ name = "turso-join-benchmark"
 path = "main.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

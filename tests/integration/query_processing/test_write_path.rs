@@ -12,6 +12,7 @@ use turso_core::vdbe::StepResult;
 use turso_core::{
     CheckpointMode, ConnectOpts, Connection, LimboError, Numeric, Row, Statement, Value,
 };
+use turso_sqlite::SqliteDialect;
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -2095,7 +2096,7 @@ fn test_matview_aggregate_state_survives_reopen(tmp_db: TempDatabase) -> anyhow:
         tmp_db.db_flags,
         tmp_db.db_opts,
         None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
+        std::sync::Arc::new(SqliteDialect),
     )?;
     let conn = db2.connect(ConnectOpts::new())?;
 
