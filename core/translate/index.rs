@@ -223,10 +223,12 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
+    // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
@@ -238,6 +240,8 @@ pub fn translate_create_index(
                             col.name
                         );
                     }
+                    // A json column can't declare OPERATOR '<', so name the
+                    // real reason first.
                     resolver
                         .schema()
                         .check_key_column_has_comparison(column, tbl.is_strict)?;
@@ -249,12 +253,11 @@ pub fn translate_create_index(
                         );
                     }
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
-        } else if col.pos_in_table == EXPR_INDEX_SENTINEL {
-            let expr = col
-                .expr
-                .as_ref()
-                .expect("expression index column must have an expression");
+        } else if let Some(expr) = col.expression() {
             resolver.with_schema(database_id, |schema| {
                 check_index_expression_has_comparison(
                     expr,

@@ -151,21 +151,21 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-index-and-update-use-encoded-default {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
-    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    ALTER TABLE t ADD COLUMN c scaled DEFAULT 5;
     SELECT id, x, c FROM t;
     CREATE INDEX ic ON t(c);
-    SELECT count(*) FROM t WHERE c = 5;
+    SELECT count(*) FROM t WHERE c = 500;
     UPDATE t SET x = 11;
     SELECT id, x, c FROM t;
     PRAGMA integrity_check;
 }
 expect {
-    1|10|5
+    1|10|500
     1
-    1|11|5
+    1|11|500
     ok
 }
 
@@ -227,10 +227,10 @@ expect {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-index-delete {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
-    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    ALTER TABLE t ADD COLUMN c scaled DEFAULT 5;
     CREATE INDEX ic ON t(c);
     DELETE FROM t WHERE id = 1;
     SELECT count(*) FROM t;
