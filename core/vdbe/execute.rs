@@ -2687,6 +2687,7 @@ pub fn op_array_encode(
     let ArrayEncodeData {
         reg,
         element_type,
+        element_kind,
         table_name,
         col_name,
     } = data.as_ref();
@@ -2702,7 +2703,7 @@ pub fn op_array_encode(
     // output feeds directly into ArrayEncode with ANY affinity, but rejects raw blobs
     // (e.g. zeroblob, X'DEADBEEF') that would crash on read.
     if let Value::Blob(b) = val {
-        if element_type.eq_ignore_ascii_case("ANY") {
+        if *element_kind == StrictType::Any {
             // Validate blob is a well-formed record using streaming iterator
             // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
             let valid = !b.is_empty()
@@ -2755,8 +2756,8 @@ pub fn op_array_encode(
         }
 
         let mut reg_tmp = Register::Value(elem);
-        match StrictType::named(element_type) {
-            Some(StrictType::Stores(expected_type)) => {
+        match *element_kind {
+            StrictType::Stores(expected_type) => {
                 if let Err(value_type) = convert_to_strict_type(&mut reg_tmp, expected_type) {
                     bail_constraint_error!(
                         "cannot store {} value in {} ({})",
@@ -2766,13 +2767,7 @@ pub fn op_array_encode(
                     );
                 }
             }
-            Some(StrictType::Any) => {}
-            None => {
-                return Err(LimboError::InternalError(format!(
-                    "array elements of {table_name}.{col_name} have type {element_type}, which is not INTEGER, REAL, TEXT, BLOB or ANY"
-                ))
-                .into());
-            }
+            StrictType::Any => {}
         }
         coerced_elements.push(reg_tmp.get_value().clone());
     }

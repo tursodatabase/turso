@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::StrictType;
 use crate::vdbe::insn::ArrayEncodeData;
 
 /// Maximum number of array elements supported in the per-element transform loop.
@@ -139,6 +140,7 @@ pub(super) fn emit_array_encode(
                 data: Box::new(ArrayEncodeData {
                     reg,
                     element_type: "ANY".into(),
+                    element_kind: StrictType::Any,
                     table_name: table_name.into(),
                     col_name: col.name.as_deref().unwrap_or("").into(),
                 }),
@@ -156,17 +158,24 @@ pub(super) fn emit_array_encode(
     // Only 1-dimensional arrays validate elements against the declared type,
     // and elements of a custom type against the type's BASE.
     let col_name = col.name.as_deref().unwrap_or("");
-    let element_type = if col.array_dimensions() > 1 {
+    let element_type: Arc<str> = if col.array_dimensions() > 1 {
         "ANY".into()
     } else if let Some(resolved) = &resolved {
         resolved.primitive.to_uppercase().into()
     } else {
         col.ty_str.to_uppercase().into()
     };
+    // check_array_element_type refuses other names before code is emitted.
+    let element_kind = StrictType::named(&element_type).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "array elements of {table_name}.{col_name} have type {element_type}, which is not INTEGER, REAL, TEXT, BLOB or ANY"
+        ))
+    })?;
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
             reg,
             element_type,
+            element_kind,
             table_name: table_name.into(),
             col_name: col_name.into(),
         }),

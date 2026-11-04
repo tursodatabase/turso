@@ -1933,25 +1933,32 @@ impl Schema {
     /// date is declared `(value text)`. Fails for a name a STRICT column
     /// can't be declared with, such as `(value float)`.
     pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<StrictType> {
-        let mut input_type = resolved.input_type().to_string();
-        let mut seen = vec![resolved.leaf().name.to_lowercase()];
-        while let Some(next) = self.resolve_type_unchecked(&input_type)? {
-            let name = input_type.to_lowercase();
-            if seen.contains(&name) {
+        self.plain_value_type(&resolved.leaf().name, resolved.input_type())
+    }
+
+    /// The plain SQL type that `value_type`, the value type of type
+    /// `type_name`, leads to through custom types. `type_name` need not be in
+    /// the schema yet, so CREATE TYPE can check its own value type.
+    pub fn plain_value_type(&self, type_name: &str, value_type: &str) -> Result<StrictType> {
+        let mut input_type = value_type.to_string();
+        let mut seen = vec![type_name.to_lowercase()];
+        loop {
+            if seen.contains(&input_type.to_lowercase()) {
                 return Err(LimboError::ParseError(format!(
-                    "the value types of type {} lead back to type {}",
-                    resolved.leaf().name,
-                    input_type
+                    "the value types of type {type_name} lead back to type {input_type}"
                 )));
             }
-            seen.push(name);
-            input_type = next.input_type().to_string();
+            match self.resolve_type_unchecked(&input_type)? {
+                Some(next) => {
+                    seen.push(input_type.to_lowercase());
+                    input_type = next.input_type().to_string();
+                }
+                None => break,
+            }
         }
         StrictType::named(&input_type).ok_or_else(|| {
             LimboError::ParseError(format!(
-                "type {} takes values of type {}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type",
-                resolved.leaf().name,
-                input_type
+                "type {type_name} takes values of type {input_type}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type"
             ))
         })
     }

@@ -3136,6 +3136,12 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
+
+        let type_def =
+            crate::schema::TypeDef::from_create_type(&normalized_name, body, false, String::new())?;
+        resolver
+            .schema()
+            .plain_value_type(&normalized_name, type_def.value_input_type())?;
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence

@@ -337,29 +337,46 @@ expect error {
     cannot store INT value in BLOB column t.b
 }
 
-test cast-refuses-a-value-type-strict-columns-refuse {
+test create-type-refuses-a-value-type-strict-columns-refuse {
     CREATE TYPE fv(value float) BASE real;
-    SELECT CAST('2' AS fv);
 }
 expect error {
     type fv takes values of type float, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
 }
 
-test insert-refuses-a-value-type-strict-columns-refuse {
-    CREATE TYPE fv(value float) BASE real;
-    CREATE TABLE f(c fv) STRICT;
-    INSERT INTO f VALUES (2);
+test create-type-refuses-an-unknown-value-type {
+    CREATE TYPE uv(value nosuchtype) BASE text;
 }
 expect error {
-    type fv takes values of type float, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
+    type uv takes values of type nosuchtype, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
 }
 
-test cast-fails-when-value-types-lead-back-to-the-type {
+test create-type-refuses-a-value-type-that-leads-back-to-the-type {
     CREATE TYPE cyc(value cyc) BASE text;
-    SELECT CAST('a' AS cyc);
 }
 expect error {
     the value types of type cyc lead back to type cyc
+}
+
+test insert-refuses-a-value-type-that-was-dropped {
+    CREATE TYPE inner_t(value text) BASE text;
+    CREATE TYPE outer_t(value inner_t) BASE text;
+    DROP TYPE inner_t;
+    CREATE TABLE t(c outer_t) STRICT;
+    INSERT INTO t VALUES ('x');
+}
+expect error {
+    type outer_t takes values of type inner_t, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
+}
+
+test cast-refuses-a-value-type-that-was-dropped {
+    CREATE TYPE inner_t(value text) BASE text;
+    CREATE TYPE outer_t(value inner_t) BASE text;
+    DROP TYPE inner_t;
+    SELECT CAST('x' AS outer_t);
+}
+expect error {
+    type outer_t takes values of type inner_t, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
 }
 
 test cast-to-domain-converts-as-its-base {

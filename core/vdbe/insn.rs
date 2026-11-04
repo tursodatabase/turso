@@ -411,7 +411,9 @@ pub struct IvmSumFinalizeData {
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
     pub reg: usize,
+    /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
+    pub element_kind: crate::types::StrictType,
     pub table_name: Arc<str>,
     pub col_name: Arc<str>,
 }
