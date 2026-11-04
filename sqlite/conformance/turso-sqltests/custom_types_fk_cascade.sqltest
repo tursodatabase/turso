@@ -229,25 +229,26 @@ expect {
     200|200
 }
 
-# The child's key matches the parent's by stored value, so the cascade copies
-# the parent's stored value even when the child column has a different type.
+# A child column of a different type than the parent's gets the parent's
+# value, as an assignment would: it goes through the child type's ENCODE and
+# is converted to the child type's BASE.
 @requires strict "uses STRICT tables"
 @requires custom_types "uses custom types"
 test cascade-update-key-of-different-type {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value;
+    CREATE TYPE sh BASE text ENCODE upper(value) DECODE lower(value);
     CREATE TABLE parent(id integer PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id x100
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id sh
         REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (100);
+    INSERT INTO parent VALUES (1);
     INSERT INTO child VALUES (1, 1);
 
-    UPDATE parent SET id = 200;
-    SELECT p.id, c.parent_id FROM parent p, child c;
+    UPDATE parent SET id = 2;
+    SELECT p.id, c.parent_id, typeof(c.parent_id) FROM parent p, child c;
 }
 expect {
-    200|200
+    2|2|text
 }
 
 # A SET DEFAULT action writes the column's DEFAULT, which is a user value, so

@@ -529,6 +529,12 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
+    /// Whether reading a custom-type column runs its DECODE.
+    pub const fn decodes_custom_type_columns(self) -> bool {
+        !self.suppress_custom_type_decode() && !self.reads_stored_values()
+    }
+
+    #[inline]
     /// When set, the values INSERT and UPDATE write to custom-type columns
     /// are already stored values, so they are written without ENCODE. Set
     /// for statements that copy rows, such as VACUUM's table copy and an

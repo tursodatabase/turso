@@ -1719,8 +1719,11 @@ pub fn emit_fk_update_parent_actions(
 pub struct FkActionContext {
     /// Registers containing OLD parent key values (for DELETE and UPDATE)
     pub old_key_registers: Vec<usize>,
-    /// Registers containing NEW parent key values as stored (for UPDATE only)
+    /// Registers containing NEW parent key values (for UPDATE only)
     pub new_key_registers: Option<Vec<usize>>,
+    /// Whether the NEW key registers hold the parent's stored key, which the
+    /// action writes into the child without ENCODE.
+    pub new_key_is_stored: bool,
 }
 
 impl FkActionContext {
@@ -1728,13 +1731,19 @@ impl FkActionContext {
         Self {
             old_key_registers,
             new_key_registers: None,
+            new_key_is_stored: false,
         }
     }
 
-    pub fn new_for_update(old_key_registers: Vec<usize>, new_key_registers: Vec<usize>) -> Self {
+    pub fn new_for_update(
+        old_key_registers: Vec<usize>,
+        new_key_registers: Vec<usize>,
+        new_key_is_stored: bool,
+    ) -> Self {
         Self {
             old_key_registers,
             new_key_registers: Some(new_key_registers),
+            new_key_is_stored,
         }
     }
 
@@ -1885,11 +1894,6 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4)
 /// This is required for self-referential cascades and foreign-key cycles. In
 /// both cases, the generated action SQL can fire the same action again before
 /// the first action program has finished compiling.
-///
-/// `writes_stored_values` makes the action's UPDATE write its parameters to
-/// custom-type columns without ENCODE. CASCADE UPDATE sets it because it
-/// copies the parent's stored key into the child.
-#[allow(clippy::too_many_arguments)]
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -1898,7 +1902,6 @@ fn emit_fk_action_subprogram(
     ctx: &FkActionContext,
     foreign_key: Arc<ForeignKey>,
     description: &'static str,
-    writes_stored_values: bool,
 ) -> Result<()> {
     let parent_change = ctx.parent_change();
     let compile_stack = resolver.fk_action_compile_stack.clone();
@@ -1918,7 +1921,7 @@ fn emit_fk_action_subprogram(
         );
         subprogram_builder
             .flags
-            .set_writes_stored_values(writes_stored_values);
+            .set_writes_stored_values(ctx.new_key_is_stored);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
@@ -2186,7 +2189,6 @@ fn fire_fk_cascade_delete(
         ctx,
         fk_ref.fk.clone(),
         "fk cascade delete",
-        false,
     )
 }
 
@@ -2218,7 +2220,6 @@ fn fire_fk_set_null(
         ctx,
         fk_ref.fk.clone(),
         "fk set null",
-        false,
     )
 }
 
@@ -2250,7 +2251,6 @@ fn fire_fk_set_default(
         ctx,
         fk_ref.fk.clone(),
         "fk set default",
-        false,
     )
 }
 
@@ -2283,7 +2283,6 @@ fn fire_fk_cascade_update(
         ctx,
         fk_ref.fk.clone(),
         "fk cascade update",
-        true,
     )
 }
 
@@ -2549,15 +2548,19 @@ pub fn fire_fk_update_actions(
             new_rowid_reg,
             new_key_start,
         )?;
-        // ON UPDATE CASCADE writes the parent's new key into the child as
-        // stored, so the child holds the same stored value as the parent. When
-        // no key column has a DECODE, the decoded key below is that value.
+        // ON UPDATE CASCADE copies the parent's stored key into a child column
+        // of the same type, as PostgreSQL copies a value assigned to a column
+        // of its own type. A child column of another type gets the parent's
+        // value and runs its own ENCODE. When no key column has a DECODE, the
+        // decoded key below is the stored key.
+        let new_key_is_stored = matches!(fk_ref.fk.on_update, RefAct::Cascade)
+            && child_key_has_parent_types(resolver, &parent_bt, fk_ref);
         let key_has_decode = parent_cols.iter().any(|pcol| {
             parent_bt
                 .get_column(pcol)
                 .is_some_and(|(_, col)| resolver.schema().column_has_decode(col, true))
         });
-        let new_stored_key_start = if key_has_decode {
+        let new_stored_key_start = if new_key_is_stored && key_has_decode {
             let start = program.alloc_registers(ncols);
             copy_key_from_values(
                 program,
@@ -2595,7 +2598,11 @@ pub fn fire_fk_update_actions(
 
         program.preassign_label_to_next_insn(key_changed);
 
-        let ctx = FkActionContext::new_for_update(old_key_registers, new_key_registers);
+        let ctx = FkActionContext::new_for_update(
+            old_key_registers,
+            new_key_registers,
+            new_key_is_stored,
+        );
 
         match fk_ref.fk.on_update {
             RefAct::Cascade => {
@@ -2616,6 +2623,34 @@ pub fn fire_fk_update_actions(
     }
 
     Ok(())
+}
+
+/// Whether every child key column has the type of its parent key column, so a
+/// parent's stored key is also a stored key for the child. Columns without a
+/// custom type always qualify: their stored form is their value.
+fn child_key_has_parent_types(
+    resolver: &Resolver,
+    parent_bt: &BTreeTable,
+    fk_ref: &ResolvedFkRef,
+) -> bool {
+    let schema = resolver.schema();
+    let child_bt = &fk_ref.child_table;
+    fk_ref
+        .parent_cols
+        .iter()
+        .zip(fk_ref.child_pos.iter())
+        .all(|(pcol, &cpos)| {
+            let child_col = &child_bt.columns()[cpos];
+            let parent_col = parent_bt.get_column(pcol).map(|(_, col)| col);
+            let child_has_custom_type =
+                schema.column_has_custom_type(child_col, child_bt.is_strict);
+            let parent_has_custom_type = parent_col
+                .is_some_and(|col| schema.column_has_custom_type(col, parent_bt.is_strict));
+            if !child_has_custom_type && !parent_has_custom_type {
+                return true;
+            }
+            parent_col.is_some_and(|col| col.ty_str.eq_ignore_ascii_case(&child_col.ty_str))
+        })
 }
 
 /// Emit pre-DROP FK checks and actions for a table.
