@@ -457,6 +457,22 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test no-comparison-check-array-function {
+    CREATE TABLE t(i inet, CHECK (array_position(ARRAY['x'], i) IS NULL)) STRICT;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-cast-to-array {
+    CREATE TABLE t(i inet, CHECK (CAST(i AS inet[]) IS NOT NULL)) STRICT;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
 test no-comparison-check-case-operand {
     CREATE TABLE t(i inet CHECK (CASE i WHEN '10.0.0.1' THEN 0 ELSE 1 END)) STRICT;
 }

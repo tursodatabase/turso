@@ -681,6 +681,72 @@ pub(crate) fn type_without_comparison<'a>(
     }
 }
 
+/// Fails when `expr` itself, not counting its operands, puts a value whose
+/// type can't be compared into an array or compares it with array elements,
+/// as `array_position(ARRAY['x'], i)` does for an inet i. Binding runs this so
+/// that CREATE TABLE refuses such a CHECK constraint instead of every INSERT;
+/// code generation runs the same checks.
+pub(crate) fn check_expr_array_arguments(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
+    let schema = env.schema();
+    match expr {
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let func = env.resolve_function(name.as_str(), args.len())?;
+            if matches!(func, Some(Func::Scalar(func)) if func.is_array_function()) {
+                check_array_arguments(args.iter().map(|arg| arg.as_ref()), env, schema)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Concat, rhs)
+            if type_of(lhs, env).is_array() || type_of(rhs, env).is_array() =>
+        {
+            check_array_arguments([lhs.as_ref(), rhs.as_ref()], env, schema)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::ArrayContains | ast::Operator::ArrayOverlap, rhs) => {
+            check_array_arguments([lhs.as_ref(), rhs.as_ref()], env, schema)
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if type_name.is_array() => {
+            schema.check_array_element_type(&crate::util::dequote(&type_name.name))
+        }
+        // These put no value into an array.
+        ast::Expr::Between { .. }
+        | ast::Expr::Binary(..)
+        | ast::Expr::Case { .. }
+        | ast::Expr::Cast { .. }
+        | ast::Expr::Collate(..)
+        | ast::Expr::Column { .. }
+        | ast::Expr::Default
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Exists(_)
+        | ast::Expr::FieldAccess { .. }
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Id(_)
+        | ast::Expr::InList { .. }
+        | ast::Expr::InSelect { .. }
+        | ast::Expr::InTable { .. }
+        | ast::Expr::IsNull(_)
+        | ast::Expr::Like { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::MergedColumn(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::NotNull(_)
+        | ast::Expr::Parenthesized(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Raise(..)
+        | ast::Expr::Register { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Subquery(_)
+        | ast::Expr::SubqueryResult { .. }
+        | ast::Expr::Unary(..)
+        | ast::Expr::Variable(_) => Ok(()),
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+    }
+}
+
 /// Fails when an argument of an array function or of `||`, `@>` or `&&` on
 /// arrays has a type whose values can't be compared. These put their arguments
 /// into arrays or compare them with array elements.
