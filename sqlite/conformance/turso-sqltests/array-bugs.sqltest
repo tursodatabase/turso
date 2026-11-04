@@ -367,11 +367,22 @@ test array-of-encoded-type-holds-element-values {
     SELECT 'nested', m[1][2], m[2][1], m[2] = ARRAY[3,4] FROM t WHERE id = 1;
     SELECT 'scan', id FROM t WHERE a = ARRAY[3,4];
     SELECT 'scan-text', id FROM t WHERE a = '{1,2}';
-    CREATE INDEX ta ON t(a);
-    SELECT 'seek', id FROM t WHERE a = ARRAY[3,4];
-    SELECT 'seek-text', id FROM t WHERE a = '{1,2}';
     UPDATE t SET a = array_append(a, 9) WHERE id = 1;
     SELECT 'append', a FROM t WHERE id = 1;
+    -- ci can't be a key, since its DECODE reads 100 and 101 back as 1. A type
+    -- with no DECODE can. Its values read back as stored (3 reads as 300), in
+    -- the array as in the plain column v, and an index lookup finds the rows
+    -- a scan finds.
+    CREATE TYPE cs(value integer) BASE integer ENCODE value * 100;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a cs[], v cs) STRICT;
+    INSERT INTO s VALUES (1, ARRAY[1,2], 1), (2, '{3,4}', 3);
+    SELECT 'cs-read', id, a, v FROM s ORDER BY id;
+    SELECT 'cs-scan', id FROM s WHERE a = ARRAY[300,400] AND v = 300;
+    SELECT 'cs-scan-text', id FROM s WHERE a = '{100,200}';
+    CREATE INDEX sa ON s(a);
+    SELECT 'cs-seek', id FROM s WHERE a = ARRAY[300,400];
+    SELECT 'cs-seek-text', id FROM s WHERE a = '{100,200}';
+    SELECT 'cs-seek-input', count(*) FROM s WHERE a = ARRAY[3,4];
 }
 expect {
     cast|{1,2}
@@ -380,7 +391,12 @@ expect {
     nested|2|3|1
     scan|2
     scan-text|1
-    seek|2
-    seek-text|1
     append|{1,2,9}
+    cs-read|1|{100,200}|100
+    cs-read|2|{300,400}|300
+    cs-scan|2
+    cs-scan-text|1
+    cs-seek|2
+    cs-seek-text|1
+    cs-seek-input|0
 }
