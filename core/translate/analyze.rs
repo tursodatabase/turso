@@ -14,7 +14,7 @@ use crate::{
     },
     util::normalize_ident,
     vdbe::{
-        affinity::Affinity,
+        affinity::{Affinity, CastTypeTag},
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
@@ -430,6 +430,7 @@ pub fn translate_analyze(
             program.emit_insn(Insn::Cast {
                 reg: stat_text_reg,
                 affinity: Affinity::Text,
+                written_type: CastTypeTag::Other,
             });
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(tablename_reg),

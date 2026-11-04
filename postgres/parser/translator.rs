@@ -2479,6 +2479,7 @@ impl PostgreSQLTranslator {
             // Evaluate the arguments in their own VALUES row so that names like `value` or
             // `start` resolve to columns on the left, not to generate_series's own columns.
             // VALUES, unlike a SELECT, still rejects aggregate and window functions.
+            let args = checked_generate_series_arguments(args);
             let (arguments, args) = function_arguments_subquery(args);
             return Ok(ast::SelectTable::Select {
                 select: single_column_function_select(
@@ -5169,6 +5170,24 @@ fn single_column_function_select(
 }
 
 #[allow(clippy::vec_box)]
+fn checked_generate_series_arguments(args: Vec<Box<ast::Expr>>) -> Vec<Box<ast::Expr>> {
+    const NAMES: [&str; 3] = ["start", "stop", "step"];
+    args.into_iter()
+        .enumerate()
+        .map(|(index, arg)| match NAMES.get(index) {
+            Some(name) => Box::new(function_call(
+                "pg_generate_series_argument",
+                vec![
+                    *arg,
+                    ast::Expr::Literal(ast::Literal::String(format!("'{name}'"))),
+                ],
+            )),
+            None => arg,
+        })
+        .collect()
+}
+
+#[allow(clippy::vec_box)]
 fn function_arguments_subquery(
     args: Vec<Box<ast::Expr>>,
 ) -> (ast::SelectTable, Vec<Box<ast::Expr>>) {
@@ -6147,11 +6166,15 @@ fn pg_type_name_to_ast_type(
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => "INTEGER",
+        // Qualified so that CAST does not resolve to turso's built-in smallint,
+        // bigint and numeric types, which follow column rules instead.
+        "SMALLINT" | "INT2" => "pg_catalog.int2",
+        "BIGINT" | "INT8" => "pg_catalog.int8",
+        "REAL" | "FLOAT4" => "REAL",
+        "DOUBLE PRECISION" | "FLOAT8" => "DOUBLE PRECISION",
+        "NUMERIC" | "DECIMAL" => "pg_catalog.numeric",
+        "MONEY" => "REAL",
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
@@ -8019,15 +8042,15 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM (VALUES (pg_generate_series_argument (1, 'start'), pg_generate_series_argument (3, 'stop'))) arg, main.generate_series (arg.column1, arg.column2)) g",
             ),
             (
                 "SELECT g FROM generate_series(1, 3) g",
-                "SELECT g FROM LATERAL (SELECT value g FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+                "SELECT g FROM LATERAL (SELECT value g FROM (VALUES (pg_generate_series_argument (1, 'start'), pg_generate_series_argument (3, 'stop'))) arg, main.generate_series (arg.column1, arg.column2)) g",
             ),
             (
                 "SELECT * FROM generate_series(1, 3)",
-                "SELECT * FROM LATERAL (SELECT value generate_series FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) generate_series",
+                "SELECT * FROM LATERAL (SELECT value generate_series FROM (VALUES (pg_generate_series_argument (1, 'start'), pg_generate_series_argument (3, 'stop'))) arg, main.generate_series (arg.column1, arg.column2)) generate_series",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");

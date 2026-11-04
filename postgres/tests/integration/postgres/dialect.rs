@@ -3996,7 +3996,7 @@ fn test_pg_input_error_info_float_overflow(db: TempDatabase) {
     let row = rows.row().unwrap();
     assert_eq!(
         row.get_value(0).to_string(),
-        "value \"1e400\" is out of range for type real"
+        "\"1e400\" is out of range for type real"
     );
     assert_eq!(row.get_value(1).to_string(), "22003");
     drop(rows);
@@ -4012,7 +4012,7 @@ fn test_pg_input_error_info_float_overflow(db: TempDatabase) {
     let row = rows.row().unwrap();
     assert_eq!(
         row.get_value(0).to_string(),
-        "value \"1e4000\" is out of range for type double precision"
+        "\"1e4000\" is out of range for type double precision"
     );
     assert_eq!(row.get_value(1).to_string(), "22003");
     drop(rows);

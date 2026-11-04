@@ -39,8 +39,410 @@ test error-aborts-rest-of-batch {
 @sqlstate 42P01
 expect error {}
 
-# Schema databases are file-backed, so the schema table is dropped before each
-# create to keep repeated test runs independent of old sidecar files.
+test error-cast-non-numeric-text-to-int {
+    SELECT 'abc'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "abc"}
+
+test error-cast-function-non-numeric-text-to-int {
+    SELECT CAST('abc' AS int);
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "abc"}
+
+test error-cast-text-with-trailing-junk-to-int {
+    SELECT '12abc'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "12abc"}
+
+test error-cast-empty-text-to-int {
+    SELECT ''::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: ""}
+
+test error-cast-non-numeric-text-to-float8 {
+    SELECT 'abc'::float8;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type double precision: "abc"}
+
+test error-cast-non-numeric-text-to-real {
+    SELECT 'abc'::real;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type real: "abc"}
+
+test error-cast-float4-alias-non-numeric-text {
+    SELECT 'abc'::float4;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type real: "abc"}
+
+test error-cast-non-numeric-text-to-numeric {
+    SELECT 'abc'::numeric;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type numeric: "abc"}
+
+test error-cast-text-with-trailing-junk-to-numeric {
+    SELECT '12abc'::numeric;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type numeric: "12abc"}
+
+test error-cast-empty-text-to-numeric {
+    SELECT ''::numeric;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type numeric: ""}
+
+test error-cast-non-numeric-text-to-smallint {
+    SELECT 'abc'::smallint;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type smallint: "abc"}
+
+test error-cast-non-numeric-text-to-bigint {
+    SELECT 'abc'::bigint;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type bigint: "abc"}
+
+test error-cast-out-of-range-text-to-int {
+    SELECT '3000000000'::int;
+}
+@sqlstate 22003
+expect error {value "3000000000" is out of range for type integer}
+
+test error-cast-out-of-range-text-to-smallint {
+    SELECT '40000'::smallint;
+}
+@sqlstate 22003
+expect error {value "40000" is out of range for type smallint}
+
+test error-cast-out-of-range-text-to-bigint {
+    SELECT '9223372036854775808'::bigint;
+}
+@sqlstate 22003
+expect error {value "9223372036854775808" is out of range for type bigint}
+
+test error-cast-out-of-range-text-to-double {
+    SELECT '1e400'::float8;
+}
+@sqlstate 22003
+expect error {"1e400" is out of range for type double precision}
+
+test error-cast-out-of-range-text-to-real {
+    SELECT '1e39'::real;
+}
+@sqlstate 22003
+expect error {"1e39" is out of range for type real}
+
+test error-cast-non-numeric-text-to-domain-over-int {
+    CREATE DOMAIN cast_int_domain AS int;
+    SELECT 'abc'::cast_int_domain;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "abc"}
+
+test cast-text-with-spaces-to-int {
+    SELECT ' 12 '::int;
+}
+expect {
+12
+}
+
+test cast-text-with-plus-sign-to-int {
+    SELECT '+7'::int;
+}
+expect {
+7
+}
+
+test cast-numeric-text-to-int {
+    SELECT '12'::int;
+}
+expect {
+12
+}
+
+test cast-exponent-text-to-float8 {
+    SELECT '1e2'::float8::int;
+}
+expect {
+100
+}
+
+test cast-exponent-text-to-numeric {
+    SELECT '1e2'::numeric::int;
+}
+expect {
+100
+}
+
+test cast-text-with-spaces-to-smallint {
+    SELECT ' -3 '::smallint;
+}
+expect {
+-3
+}
+
+test cast-infinity-text-to-double {
+    SELECT ('-Infinity'::float8 < 0)::int;
+}
+expect {
+1
+}
+
+test cast-infinity-text-to-numeric {
+    SELECT ('Infinity'::numeric > 1e300)::int;
+}
+expect {
+1
+}
+
+test cast-infinity-words-to-float8 {
+    SELECT ('Infinity'::float8 > 1e300::float8)::int, ('-inf'::float8 < 0)::int, ('+inf'::float8 > 0)::int, (' INF '::float8 > 0)::int, ('-Infinity '::float8 < 0)::int;
+}
+expect {
+1|1|1|1|1
+}
+
+test cast-infinity-words-to-real {
+    SELECT ('Infinity'::real > 1e30::real)::int, ('-inf'::float4 < 0)::int, ('+inf'::float4 > 0)::int, (' iNf '::real > 0)::int;
+}
+expect {
+1|1|1|1
+}
+
+test cast-infinity-words-to-numeric {
+    SELECT ('Infinity'::numeric > 1e300)::int, ('-inf'::numeric < 0)::int, ('+inf'::numeric > 0)::int, (' INFINITY '::numeric > 0)::int, ('+Infinity'::decimal > 0)::int;
+}
+expect {
+1|1|1|1|1
+}
+
+test cast-hex-binary-octal-text-to-int {
+    SELECT '0x1F'::int2, '0x1F'::int4, '0x1F'::int8, '0b101'::int4, '0o17'::int4, '0X1f'::int4;
+}
+expect {
+31|31|31|5|15|31
+}
+
+test cast-signed-and-spaced-hex-text-to-int {
+    SELECT '-0x1F'::int, '+0x1F'::int, ' 0x1F '::int, '-0x8000'::int2, '0x7FFFFFFF'::int4;
+}
+expect {
+-31|31|31|-32768|2147483647
+}
+
+test cast-underscore-text-to-int {
+    SELECT '1_000'::int2, '1_000'::int4, '1_000'::int8, '0x_1'::int4, '0x1_F'::int4, '-1_0'::int;
+}
+expect {
+1000|1000|1000|1|31|-10
+}
+
+test cast-prefixed-and-underscore-text-to-numeric {
+    SELECT '0x1F'::numeric::int, '-0b101'::numeric::int, '0o17'::numeric::int, ('1_000.5'::numeric = 1000.5)::int, ('1_0.2_5e1'::numeric = 102.5)::int;
+}
+expect {
+31|-5|15|1|1
+}
+
+test cast-hex-text-to-float8 {
+    SELECT '0x1F'::float8::int, '-0x1F'::float4::int;
+}
+expect {
+31|-31
+}
+
+test cast-denormal-and-zero-exponent-text-to-float8 {
+    SELECT ('1e-310'::float8 > 0)::int, ('0e-400'::float8 = 0)::int, ('3.4e38'::real > 0)::int;
+}
+expect {
+1|1|1
+}
+
+test error-cast-empty-hex-text-to-int {
+    SELECT '0x'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "0x"}
+
+test error-cast-double-underscore-text-to-int {
+    SELECT '1__0'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "1__0"}
+
+test error-cast-leading-underscore-text-to-int {
+    SELECT '_1'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "_1"}
+
+test error-cast-trailing-underscore-text-to-int {
+    SELECT '1_'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "1_"}
+
+test error-cast-infinity-text-to-int {
+    SELECT 'Infinity'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "Infinity"}
+
+test error-cast-nan-text-to-int {
+    SELECT 'NaN'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "NaN"}
+
+test error-cast-fraction-text-to-int {
+    SELECT '1.5'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "1.5"}
+
+test error-cast-exponent-text-to-int {
+    SELECT '1e2'::int;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type integer: "1e2"}
+
+test error-cast-fraction-text-to-smallint {
+    SELECT '1.5'::int2;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type smallint: "1.5"}
+
+test error-cast-underscore-text-to-float8 {
+    SELECT '1_000'::float8;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type double precision: "1_000"}
+
+test error-cast-binary-text-to-float8 {
+    SELECT '0b11'::float8;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type double precision: "0b11"}
+
+test error-cast-misspelled-infinity-text-to-float8 {
+    SELECT 'infinit'::float8;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type double precision: "infinit"}
+
+test error-cast-signed-nan-text-to-numeric {
+    SELECT '-NaN'::numeric;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type numeric: "-NaN"}
+
+test error-cast-underscore-before-point-text-to-numeric {
+    SELECT '1._5'::numeric;
+}
+@sqlstate 22P02
+expect error {invalid input syntax for type numeric: "1._5"}
+
+test error-cast-out-of-range-hex-text-to-int {
+    SELECT '0x80000000'::int4;
+}
+@sqlstate 22003
+expect error {value "0x80000000" is out of range for type integer}
+
+test error-cast-out-of-range-hex-text-to-bigint {
+    SELECT '0xFFFFFFFFFFFFFFFF'::int8;
+}
+@sqlstate 22003
+expect error {value "0xFFFFFFFFFFFFFFFF" is out of range for type bigint}
+
+test error-cast-underflow-text-to-float8 {
+    SELECT '1e-400'::float8;
+}
+@sqlstate 22003
+expect error {"1e-400" is out of range for type double precision}
+
+test error-cast-underflow-text-to-real {
+    SELECT '1e-50'::real;
+}
+@sqlstate 22003
+expect error {"1e-50" is out of range for type real}
+
+test cast-float-to-int-rounds-half-away-from-zero {
+    SELECT 1.5::int, (-1.5)::int, 0.4::int, 2.5::int, (-2.5)::int, 2.4::int2, 2.5::numeric::int, (-2.5)::numeric::int8, 2.6::float8::int;
+}
+expect {
+2|-2|0|3|-3|2|3|-3|3
+}
+
+test cast-in-range-integer-to-narrower-integer {
+    SELECT 32767::int4::int2, (-32768)::int8::int2, 2147483647::int8::int4, (-2147483648)::int8::int4;
+}
+expect {
+32767|-32768|2147483647|-2147483648
+}
+
+test error-cast-float-to-int-out-of-range {
+    SELECT 2147483647.5::int;
+}
+@sqlstate 22003
+expect error {integer out of range}
+
+test error-cast-float-to-smallint-out-of-range {
+    SELECT 32767.5::int2;
+}
+@sqlstate 22003
+expect error {smallint out of range}
+
+test error-cast-float-to-bigint-out-of-range {
+    SELECT 1e19::int8;
+}
+@sqlstate 22003
+expect error {bigint out of range}
+
+test error-cast-infinity-to-int {
+    SELECT 'Infinity'::float8::int4;
+}
+@sqlstate 22003
+expect error {integer out of range}
+
+test error-cast-int-to-smallint-out-of-range {
+    SELECT 40000::int4::int2;
+}
+@sqlstate 22003
+expect error {smallint out of range}
+
+test error-cast-negative-int-to-smallint-out-of-range {
+    SELECT (-32769)::int4::int2;
+}
+@sqlstate 22003
+expect error {smallint out of range}
+
+test error-cast-bigint-to-int-out-of-range {
+    SELECT 3000000000::int8::int4;
+}
+@sqlstate 22003
+expect error {integer out of range}
+
+test error-cast-literal-to-smallint-out-of-range {
+    SELECT 40000::int2;
+}
+@sqlstate 22003
+expect error {smallint out of range}
+
+test error-cast-float8-to-real-out-of-range {
+    SELECT 1e39::float8::float4;
+}
+@sqlstate 22003
+expect error {value out of range: overflow}
+
 test error-drop-type-used-by-table-in-other-schema {
     CREATE SCHEMA IF NOT EXISTS err_drop_type;
     DROP TABLE IF EXISTS err_drop_type.t;
@@ -60,3 +462,60 @@ test error-drop-domain-used-by-table-in-other-schema {
 }
 @sqlstate 2BP01
 expect error {}
+
+test error-generate-series-infinite-stop {
+    SELECT * FROM generate_series(0::numeric, 'inf'::numeric, 10::numeric);
+}
+@sqlstate 22023
+expect error {stop value cannot be infinity}
+
+test error-generate-series-negative-infinite-stop {
+    SELECT * FROM generate_series(0::numeric, '-inf'::numeric, -10::numeric);
+}
+@sqlstate 22023
+expect error {stop value cannot be infinity}
+
+test error-generate-series-infinite-start {
+    SELECT * FROM generate_series('inf'::numeric, 10::numeric, 1::numeric);
+}
+@sqlstate 22023
+expect error {start value cannot be infinity}
+
+test error-generate-series-negative-infinite-start {
+    SELECT * FROM generate_series('-inf'::numeric, 10::numeric, 1::numeric);
+}
+@sqlstate 22023
+expect error {start value cannot be infinity}
+
+test error-generate-series-infinite-step {
+    SELECT * FROM generate_series(0::numeric, 10::numeric, 'inf'::numeric);
+}
+@sqlstate 22023
+expect error {step size cannot be infinity}
+
+test error-generate-series-negative-infinite-step {
+    SELECT * FROM generate_series(0::numeric, 10::numeric, '-inf'::numeric);
+}
+@sqlstate 22023
+expect error {step size cannot be infinity}
+
+test error-generate-series-zero-step {
+    SELECT * FROM generate_series(0, 10, 0);
+}
+@sqlstate 22023
+expect error {step size cannot equal zero}
+
+test error-generate-series-numeric-zero-step {
+    SELECT * FROM generate_series(0::numeric, 10::numeric, 0::numeric);
+}
+@sqlstate 22023
+expect error {step size cannot equal zero}
+
+test generate-series-numeric-finite-bounds {
+    SELECT count(*) FROM generate_series(1::numeric, 5::numeric);
+    SELECT count(*) FROM generate_series(0::numeric, 10::numeric, 5::numeric);
+}
+expect {
+    5
+    3
+}

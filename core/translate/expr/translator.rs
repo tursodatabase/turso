@@ -799,6 +799,7 @@ fn translate_cast_expr(
                 program.emit_insn(Insn::Cast {
                     reg: target_register,
                     affinity: Affinity::of_written_type(&resolved.primitive),
+                    written_type: resolver.catalog.dialect.cast_type_tag(&resolved.primitive),
                 });
             }
             emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
@@ -814,11 +815,18 @@ fn translate_cast_expr(
 
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
     let type_affinity = cast_type_name
-        .map(|name| Affinity::of_written_type(&name))
+        .as_deref()
+        .map(Affinity::of_written_type)
         .unwrap_or(Affinity::Numeric);
+    let written_type = cast_type_name
+        .as_deref()
+        .map_or(CastTypeTag::Other, |name| {
+            resolver.catalog.dialect.cast_type_tag(name)
+        });
     program.emit_insn(Insn::Cast {
         reg: target_register,
         affinity: type_affinity,
+        written_type,
     });
     Ok(target_register)
 }

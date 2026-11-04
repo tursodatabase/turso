@@ -721,6 +721,18 @@ fn stringify_register(val: ValueRef) -> Option<Value> {
     }
 }
 
+/// The type a CAST names, for dialects whose conversions depend on the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastTypeTag {
+    Other,
+    Int2,
+    Int4,
+    Int8,
+    Real,
+    Double,
+    Numeric,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

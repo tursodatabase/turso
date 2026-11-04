@@ -1,5 +1,6 @@
 use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
+use crate::number_input::{parse_pg_number, PgNumberType};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
@@ -10,7 +11,7 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
@@ -118,6 +119,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "pg_generate_series_argument"(FunctionArity::Exact(2), true) => {
+            exec_pg_generate_series_argument(args)?
+        },
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -636,6 +640,30 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+/// Returns a generate_series argument unchanged, or raises the error PostgreSQL
+/// raises for an infinite bound or step, or a step of zero.
+fn exec_pg_generate_series_argument(args: &[Register]) -> Result<Value> {
+    let value = args[0].get_value();
+    let name = text_arg(args, 1);
+    let message = match value {
+        Value::Numeric(Numeric::Float(number)) if f64::from(*number).is_infinite() => {
+            if name == "step" {
+                "step size cannot be infinity".to_string()
+            } else {
+                format!("{name} value cannot be infinity")
+            }
+        }
+        Value::Numeric(Numeric::Integer(0)) if name == "step" => {
+            "step size cannot equal zero".to_string()
+        }
+        Value::Numeric(Numeric::Float(number)) if name == "step" && f64::from(*number) == 0.0 => {
+            "step size cannot equal zero".to_string()
+        }
+        _ => return Ok(value.clone()),
+    };
+    Err(sqlstate_error(SQLSTATE_INVALID_PARAMETER_VALUE, message))
+}
+
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
     role_name_in(&conn.role_catalog(), role)
 }
@@ -1070,7 +1098,7 @@ fn pg_type_name(value: &Value) -> &'static str {
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
 /// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
-pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
+pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, &'static str)> {
     let trimmed = input.trim();
 
     // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
@@ -1084,6 +1112,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         None => (type_name.to_lowercase(), None),
     };
 
+    if let Some(number_type) = PgNumberType::from_type_name(&base_type) {
+        return parse_pg_number(input, number_type).err();
+    }
+
     match base_type.as_str() {
         "bool" | "boolean" => {
             if parse_pg_bool(trimmed).is_some() {
@@ -1091,88 +1123,17 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type boolean: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            }
-        },
-        "float4" | "real" => match trimmed.parse::<f32>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "float8" | "double precision" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "numeric" | "decimal" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_nan() || v.is_infinite() => Some((
-                format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
         "text" => None,
         "varchar" | "character varying" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
                     return Some((
                         format!("value too long for type character varying({max_len})"),
-                        "22001".to_string(),
+                        "22001",
                     ));
                 }
             }
@@ -1183,7 +1144,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 if trimmed.chars().count() > max_len {
                     return Some((
                         format!("value too long for type character({max_len})"),
-                        "22001".to_string(),
+                        "22001",
                     ));
                 }
             }
@@ -1194,7 +1155,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 Some((
                     format!("invalid input syntax for type uuid: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             } else {
                 None
@@ -1212,7 +1173,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type date: \"{input}\""),
-                    "22007".to_string(),
+                    "22007",
                 ))
             }
         }
@@ -1223,7 +1184,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type timestamp: \"{input}\""),
-                    "22007".to_string(),
+                    "22007",
                 ))
             }
         }
@@ -1241,7 +1202,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type timestamp with time zone: \"{input}\""),
-                    "22007".to_string(),
+                    "22007",
                 ))
             }
         }
@@ -1259,7 +1220,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type time: \"{input}\""),
-                    "22007".to_string(),
+                    "22007",
                 ))
             }
         }
@@ -1274,7 +1235,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 };
                 Some((
                     format!("invalid input syntax for type {type_label}: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
@@ -1286,7 +1247,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 } else {
                     Some((
                         format!("invalid input syntax for type bytea: \"{input}\""),
-                        "22P02".to_string(),
+                        "22P02",
                     ))
                 }
             } else {
@@ -1303,7 +1264,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                     if prefix_str.parse::<u8>().is_err() {
                         return Some((
                             format!("invalid input syntax for type {base_type}: \"{input}\""),
-                            "22P02".to_string(),
+                            "22P02",
                         ));
                     }
                 }
@@ -1311,7 +1272,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type {base_type}: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
@@ -1326,7 +1287,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type macaddr: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
@@ -1336,14 +1297,11 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
-        _ => Some((
-            format!("type \"{type_name}\" does not exist"),
-            "42704".to_string(),
-        )),
+        _ => Some((format!("type \"{type_name}\" does not exist"), "42704")),
     }
 }
 

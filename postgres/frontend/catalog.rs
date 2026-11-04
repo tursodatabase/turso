@@ -1,4 +1,7 @@
 use crate::functions::validate_pg_input;
+use crate::number_input::{
+    cast_float_to_number, cast_integer_to_number, cast_text_to_number, PgNumberType,
+};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
@@ -9,8 +12,8 @@ use turso_core::{
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
     security::roles::{Role, RoleCatalog, RoleId},
-    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
-    Result, Statement, Value, WalkControl,
+    walk_expr_mut, Affinity, CastTypeTag, Connection, Dialect, Func, IOResult, LimboError,
+    NamespaceId, Numeric, OpenOptions, Result, Statement, Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
@@ -227,6 +230,40 @@ impl Dialect for PostgresDialect {
 
     fn mod_of_integers_is_integer(&self) -> bool {
         true
+    }
+
+    fn cast_type_tag(&self, type_name: &str) -> CastTypeTag {
+        let name = type_name.to_ascii_uppercase();
+        match name.strip_prefix("PG_CATALOG.").unwrap_or(&name) {
+            "SMALLINT" | "INT2" => CastTypeTag::Int2,
+            "INTEGER" | "INT" | "INT4" => CastTypeTag::Int4,
+            "BIGINT" | "INT8" => CastTypeTag::Int8,
+            "REAL" | "FLOAT4" => CastTypeTag::Real,
+            "DOUBLE PRECISION" | "FLOAT8" => CastTypeTag::Double,
+            "NUMERIC" | "DECIMAL" => CastTypeTag::Numeric,
+            _ => CastTypeTag::Other,
+        }
+    }
+
+    fn cast_value(
+        &self,
+        value: &Value,
+        target: Affinity,
+        written_type: CastTypeTag,
+    ) -> Result<Value> {
+        let Some(number_type) = PgNumberType::from_cast_tag(written_type) else {
+            return Ok(value.cast_to_affinity(target)?);
+        };
+        match value {
+            Value::Text(text) => cast_text_to_number(text.as_str(), number_type),
+            Value::Numeric(Numeric::Integer(integer)) => {
+                cast_integer_to_number(*integer, number_type)
+            }
+            Value::Numeric(Numeric::Float(float)) => {
+                cast_float_to_number(f64::from(*float), number_type)
+            }
+            Value::Null | Value::Blob(_) => Ok(value.cast_to_affinity(target)?),
+        }
     }
 
     fn converts_strings_compared_with_custom_types(&self) -> bool {
