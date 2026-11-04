@@ -169,6 +169,24 @@ expect {
     lt-text|1
 }
 
+@requires strict "uses STRICT tables"
+test decode-kind-cast-to-blob-type-compares-as-blob {
+    -- bytea is stored as a blob, so CAST to it gives a blob, and c compares
+    -- like a plain BLOB column: equal only to the blob x'3132', not to 12
+    -- or '12'.
+    CREATE TYPE b(value any) BASE text DECODE CAST(value AS bytea);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c b) STRICT;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, c BLOB) STRICT;
+    INSERT INTO t VALUES (1, '12');
+    INSERT INTO p VALUES (1, x'3132');
+    SELECT 't', typeof(c), c = x'3132', c = 12, c = '12' FROM t;
+    SELECT 'p', typeof(c), c = x'3132', c = 12, c = '12' FROM p;
+}
+expect {
+    t|blob|1|0|0
+    p|blob|1|0|0
+}
+
 # Before b exists, CAST(value AS b) converts to NUMERIC, as SQLite does for
 # an unknown type name. Creating b would change what that CAST gives, and so
 # the values already stored in an index on it.
