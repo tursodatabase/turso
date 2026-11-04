@@ -31,6 +31,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
     Table,
 };
+use crate::security::roles::RoleId;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
@@ -181,6 +182,10 @@ pub struct Resolver<'a> {
     /// The statement is compiled for a role that is not a superuser, which may
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
+    /// The role whose access row-level security limits in the statement being
+    /// compiled. The superuser for statements the engine runs on its own
+    /// behalf and inside [`Resolver::without_row_security`].
+    pub(crate) row_security_role: RoleId,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -375,6 +380,15 @@ impl Resolver<'static> {
 }
 
 impl<'a> Resolver<'a> {
+    /// Compiles `f` as for the superuser, so row-level security limits
+    /// nothing, and then restores the role.
+    pub(crate) fn without_row_security<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
+        let result = f(self);
+        self.row_security_role = role;
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
@@ -411,6 +425,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
             role_is_not_superuser: false,
+            row_security_role: RoleId::SUPERUSER,
         }
     }
 
@@ -446,6 +461,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role,
         }
     }
 
@@ -463,6 +479,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role,
         }
     }
 

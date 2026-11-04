@@ -31,6 +31,16 @@ impl PermissionDenied {
             reason: Reason::Owner,
         }
     }
+
+    /// The row-level security policy of `table` does not let the role write
+    /// a row to it.
+    pub fn policy(table: Object) -> Self {
+        Self {
+            action: Action::Write,
+            object: table,
+            reason: Reason::Policy,
+        }
+    }
 }
 
 impl fmt::Display for PermissionDenied {
@@ -42,6 +52,11 @@ impl fmt::Display for PermissionDenied {
                 "permission denied: {} on {} needs its owner",
                 self.action, self.object
             ),
+            Reason::Policy => write!(
+                f,
+                "permission denied: {} on {} violates its row-level security policy",
+                self.action, self.object
+            ),
         }
     }
 }
@@ -50,6 +65,7 @@ impl fmt::Display for PermissionDenied {
 pub enum Reason {
     Privilege,
     Owner,
+    Policy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,22 +1,196 @@
-//! Bytecode for the statements that enable and disable row-level security,
-//! and for keeping the stored tables with row-level security up to date when
-//! a table is renamed or dropped.
+//! Row-level security limits which rows of a table a role may access.
+//!
+//! The statements that read and write rows call the hooks of this module,
+//! which ask [`PolicyCatalog::policy_for`] which rows the role may access and
+//! limit the statement to them. The role is the one the statement is compiled
+//! for, [`Resolver::row_security_role`].
+//!
+//! The module also compiles the statements that enable and disable row-level
+//! security, and keeps the stored tables with row-level security up to date
+//! when a table is renamed or dropped.
+
+use std::sync::Arc;
+
+use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
     namespace::{NamespaceId, NamespaceRef},
-    security::policy::{PolicyCatalog, CREATE_ROW_SECURITY_TABLE_SQL, ROW_SECURITY_TABLE_NAME},
+    schema::{BTreeTable, Table},
+    security::permission::{Action, Object, PermissionDenied},
+    security::policy::{
+        Command, Policy, PolicyCatalog, CREATE_ROW_SECURITY_TABLE_SQL, ROW_SECURITY_TABLE_NAME,
+    },
     translate::{
         collate::CollationSeq,
         emitter::Resolver,
+        plan::{JoinOrigin, TableReferences, WhereTerm, WhereTermOrigin},
         schema::{emit_create_internal_table, emit_schema_cookie},
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
-    Result, MAIN_DB_ID,
+    vtab::{VirtualTable, VirtualTableType},
+    Connection, LimboError, Result, MAIN_DB_ID,
 };
+
+/// Limits the rows of the tables in `table_references` that the statement
+/// reads, updates or deletes to the rows the role may access, by adding a
+/// filter to `where_clause` for each table that the role may not access in
+/// full.
+///
+/// For the right side of a LEFT JOIN the filter is part of the join
+/// condition, so a hidden row reads as NULLs like a row that does not exist.
+/// The filters go before the statement's own conditions.
+pub(crate) fn filter_rows(
+    command: Command,
+    table_references: &TableReferences,
+    where_clause: &mut Vec<WhereTerm>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut filters = Vec::new();
+    for table in table_references.joined_tables() {
+        let Table::BTree(btree) = &table.table else {
+            continue;
+        };
+        match policy(resolver, table.namespace, &btree.declared_name, command) {
+            Policy::Allow => continue,
+            Policy::Deny => {}
+        }
+        reject_joins_that_keep_right_rows(table_references, &btree.declared_name)?;
+        let is_outer = table
+            .join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.is_outer());
+        filters.push(WhereTerm {
+            expr: no_rows(),
+            origin: if is_outer {
+                WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
+            } else {
+                WhereTermOrigin::Where
+            },
+            consumed: false,
+        });
+    }
+    where_clause.splice(0..0, filters);
+    Ok(())
+}
+
+/// Checks that the role may insert rows into `table`.
+pub(crate) fn check_insert(
+    table: &BTreeTable,
+    namespace: NamespaceRef,
+    resolver: &Resolver,
+) -> Result<()> {
+    match policy(resolver, namespace, &table.declared_name, Command::Insert) {
+        Policy::Allow => Ok(()),
+        Policy::Deny => Err(LimboError::PermissionDenied(Box::new(
+            PermissionDenied::policy(Object::Table(table.declared_name.clone())),
+        ))),
+    }
+}
+
+/// Checks that the role may read the virtual table. A virtual table that
+/// shows the database file would show the rows that row-level security
+/// hides, so only a superuser may read it.
+pub(crate) fn check_virtual_table(table: &VirtualTable, resolver: &Resolver) -> Result<()> {
+    let reads_raw_storage = matches!(
+        &table.vtab_type,
+        VirtualTableType::Internal(internal) if internal.read().reads_raw_storage()
+    );
+    if reads_raw_storage
+        && !resolver
+            .schema()
+            .roles
+            .is_superuser(resolver.row_security_role)
+    {
+        return Err(LimboError::PermissionDenied(Box::new(
+            PermissionDenied::privilege(Action::Read, Object::Table(table.name.clone())),
+        )));
+    }
+    Ok(())
+}
+
+/// Checks that the current role may open a BLOB handle on a row of `table`
+/// of the root namespace, which reads and writes the row without a
+/// statement.
+pub(crate) fn check_blob_open(
+    connection: &Arc<Connection>,
+    table_name: &str,
+    read_write: bool,
+) -> Result<()> {
+    let (command, action) = if read_write {
+        (Command::Update, Action::Write)
+    } else {
+        (Command::Select, Action::Read)
+    };
+    let policy = connection.with_schema(MAIN_DB_ID, |schema| {
+        schema.policies.policy_for(
+            &schema.roles,
+            connection.current_role(),
+            NamespaceId::ROOT,
+            table_name,
+            command,
+        )
+    });
+    match policy {
+        Policy::Allow => Ok(()),
+        Policy::Deny => Err(LimboError::PermissionDenied(Box::new(
+            PermissionDenied::privilege(action, Object::Table(table_name.to_string())),
+        ))),
+    }
+}
+
+fn policy(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table_name: &str,
+    command: Command,
+) -> Policy {
+    if namespace.database_id != MAIN_DB_ID {
+        return Policy::Allow;
+    }
+    let schema = resolver.schema();
+    schema.policies.policy_for(
+        &schema.roles,
+        resolver.row_security_role,
+        namespace.id,
+        table_name,
+        command,
+    )
+}
+
+/// A RIGHT or FULL JOIN emits the unmatched rows of its right side after the
+/// join loop, without the filters of the tables on its left. A filter on
+/// either side would then hide too many rows or too few.
+fn reject_joins_that_keep_right_rows(
+    table_references: &TableReferences,
+    table_name: &str,
+) -> Result<()> {
+    for join_info in table_references
+        .joined_tables()
+        .iter()
+        .filter_map(|table| table.join_info.as_ref())
+    {
+        if join_info.is_full_outer() {
+            bail_parse_error!(
+                "FULL JOIN with table \"{table_name}\" that has row-level security is not supported"
+            );
+        }
+        if join_info.keeps_right_rows() {
+            bail_parse_error!(
+                "RIGHT JOIN with table \"{table_name}\" that has row-level security is not supported"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A condition that no row passes.
+fn no_rows() -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))
+}
 
 /// ALTER TABLE ... ENABLE ROW LEVEL SECURITY, or DISABLE when `enabled` is
 /// false. Enabling it for a table that already has it, or disabling it for a

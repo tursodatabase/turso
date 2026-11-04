@@ -34,6 +34,10 @@ impl InternalVirtualTable for DbPageTable {
         "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)".to_string()
     }
 
+    fn reads_raw_storage(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         let pager = conn.get_pager();
         let cursor = DbPageCursor::new(pager);

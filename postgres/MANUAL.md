@@ -17,15 +17,28 @@ ALTER TABLE name DISABLE ROW LEVEL SECURITY
 `DISABLE ROW LEVEL SECURITY` turns it off. The `relrowsecurity` column of
 `pg_class` shows which tables have it.
 
+A table with row-level security shows no rows to a role that is not a
+superuser, as a PostgreSQL table with row-level security and no policies does.
+Queries return no rows from it, wherever the table appears in them: in joins,
+subqueries, common table expressions, views and `COPY ... TO STDOUT`. In a
+`LEFT JOIN`, the table's columns read as NULL. Superusers see every row.
+
 **Parameters:**
 
 - `name`: The name of an existing table, optionally qualified with its schema.
 
 **Notes:**
 
-Row-level security does not limit any rows yet: a table with it on still shows
-and changes every row, for every role. Policies and `CREATE POLICY` are not
-supported yet.
+Policies and `CREATE POLICY` are not supported yet, so a role that is not a
+superuser cannot see any row of a table with row-level security.
+
+A view reads its tables as the role that runs the query, like a PostgreSQL view
+with `security_invoker`, so a view of a table with row-level security shows no
+rows to a role either.
+
+A query of a role that joins a table with row-level security with `RIGHT JOIN`
+or `FULL JOIN` fails. Virtual tables that show the database file itself can
+only be read by a superuser.
 
 Enabling row-level security for a table that already has it, or disabling it
 for a table that does not, does nothing. Renaming a table keeps its row-level

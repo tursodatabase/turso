@@ -3,11 +3,13 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::security::policy::Command;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::row_security;
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -329,6 +331,7 @@ fn prepare_update_plan(
         &mut from_tables,
         connection,
     )?;
+    row_security::filter_rows(Command::Select, &from_tables, &mut where_clause, resolver)?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
     // a column name that already appears in another FROM-side table without being
@@ -373,6 +376,12 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
+    row_security::filter_rows(
+        Command::Update,
+        &read_scope_tables,
+        &mut where_clause,
+        resolver,
+    )?;
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {

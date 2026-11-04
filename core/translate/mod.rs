@@ -164,6 +164,9 @@ pub fn translate(
     })?;
 
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
+    if check_privileges {
+        resolver.row_security_role = connection.current_role();
+    }
     if check_privileges
         && !resolver
             .schema()
