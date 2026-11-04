@@ -24,13 +24,14 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
-    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator, SerialSequence,
+    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgGrantSelectStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
 
@@ -1107,6 +1108,13 @@ impl DeferredOperation {
                         }
                         return Ok(None);
                     }
+                    FrontendStmt::GrantSelect(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        check_grant_select(conn, stmt)?;
+                        return Ok(None);
+                    }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
                     | FrontendStmt::Show(_)
@@ -1703,7 +1711,8 @@ fn try_prepare_special(
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
-        | FrontendStmt::CommentOn(_)) => crate::Statement::with_deferred(
+        | FrontendStmt::CommentOn(_)
+        | FrontendStmt::GrantSelect(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1768,6 +1777,10 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
+        // Every role may already read every table, so a GRANT SELECT by any
+        // role changes nothing. PostgreSQL also lets a role that may not
+        // grant run GRANT, and only warns that it granted nothing.
+        FrontendStmt::GrantSelect(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),
@@ -1793,6 +1806,75 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         }
     };
     Err(LimboError::PermissionDenied(Box::new(denial)))
+}
+
+/// Checks that the tables and roles of a GRANT SELECT exist, with
+/// PostgreSQL's errors, tables first as in PostgreSQL. The grant itself
+/// changes nothing, because every role may already read every table.
+fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Result<()> {
+    match &stmt.tables {
+        PgGrantTables::Named(tables) => {
+            for (schema, table) in tables {
+                if let Some(schema) = schema {
+                    check_schema_exists(conn, schema)?;
+                }
+                if !relation_exists(conn, schema.as_deref(), table) {
+                    let name = match schema {
+                        Some(schema) => format!("{schema}.{table}"),
+                        None => table.clone(),
+                    };
+                    return Err(sqlstate_error(
+                        SQLSTATE_UNDEFINED_TABLE,
+                        format!("relation \"{name}\" does not exist"),
+                    ));
+                }
+            }
+        }
+        PgGrantTables::AllInSchemas(schemas) => {
+            for schema in schemas {
+                check_schema_exists(conn, schema)?;
+            }
+        }
+    }
+    let roles = conn.role_catalog();
+    for grantee in &stmt.roles {
+        let PgGrantee::Role(name) = grantee else {
+            continue;
+        };
+        if !catalog::postgres_roles(&roles).any(|role| role.name == *name) {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_OBJECT,
+                format!("role \"{name}\" does not exist"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
+    if catalog::namespace_exists(conn, schema) {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INVALID_SCHEMA_NAME,
+        format!("schema \"{schema}\" does not exist"),
+    ))
+}
+
+/// Whether a table, view, materialized view or sequence named `name` exists
+/// in `schema`, or in the search path when no schema is given.
+fn relation_exists(conn: &Arc<Connection>, schema: Option<&str>, name: &str) -> bool {
+    relation_lookup_namespaces(conn, schema)
+        .iter()
+        .any(|namespace| {
+            conn.with_schema(namespace.database_id(), |schema| {
+                let id = namespace.target.id;
+                schema.get_table(id, name).is_some()
+                    || schema.get_view(id, name).is_some()
+                    || schema.is_materialized_view(id, name)
+                    || schema.get_sequence(id, name).is_some()
+            })
+        })
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {

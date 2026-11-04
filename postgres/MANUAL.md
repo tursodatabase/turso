@@ -52,6 +52,53 @@ SELECT rolname FROM pg_roles;
 (2 rows)
 ```
 
+### `GRANT SELECT` — let roles read tables
+
+**Synopsis:**
+
+```sql
+GRANT SELECT ON [ TABLE ] table_name [, ...] TO role_specification [, ...]
+GRANT SELECT ON ALL TABLES IN SCHEMA schema_name [, ...] TO role_specification [, ...]
+
+where role_specification is:
+    role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
+```
+
+**Description:**
+
+`GRANT SELECT` lets roles read tables. Every role may already read every
+table, because table privileges are not stored yet, so `GRANT SELECT` changes
+nothing. It is accepted so that scripts written for PostgreSQL, which grant
+`SELECT` before a role reads a table, run unchanged.
+
+**Parameters:**
+
+- `table_name`: The name of an existing table, view, materialized view or
+  sequence, optionally qualified with its schema.
+- `schema_name`: The name of an existing schema. `ALL TABLES IN SCHEMA` names
+  every table in it.
+- `role_name`: The name of an existing role.
+
+**Notes:**
+
+`GRANT SELECT` fails if a table, schema or role does not exist, with the same
+errors as PostgreSQL. The tables are checked before the roles.
+
+Only `SELECT` on tables is accepted. Other privileges, column privileges,
+`WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of objects, and
+`REVOKE` fail as not supported, so that a script never believes it changed
+what a role may do when it did not. `GRANT role_name TO role_name` is not
+supported either.
+
+**Examples:**
+
+```sql
+CREATE ROLE reader;
+CREATE TABLE accounts (id int);
+GRANT SELECT ON accounts TO reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+```
+
 ### `SET ROLE` — set the current role
 
 **Synopsis:**
@@ -86,15 +133,15 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-`GRANT` and table privileges are not supported yet. A role that is not a
-superuser may read the rows of every table, and it may alter and drop the
-relations it owns (see `ALTER TABLE ... OWNER TO`), except that renaming a
+Ownership is supported (see `ALTER TABLE ... OWNER TO`), but table
+privileges are not stored yet, and `GRANT SELECT` is the only `GRANT`
+accepted. A role that is not a superuser may read the rows of every table,
+and it may alter and drop the relations it owns, except that renaming a
 relation or creating an index on it also needs CREATE on the schema, which
-only a superuser has; it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create objects
-or roles, or `COPY FROM` a file. Creating objects stays superuser-only
-because PostgreSQL gates it on the schema's CREATE privilege, which does not
-exist yet.
+only a superuser has; it cannot insert, update, delete or truncate rows,
+call `nextval` or `setval`, create objects or roles, or `COPY FROM` a file.
+Creating objects stays superuser-only because PostgreSQL gates it on the
+schema's CREATE privilege, which does not exist yet.
 
 **Examples:**
 
