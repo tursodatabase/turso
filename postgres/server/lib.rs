@@ -726,16 +726,21 @@ fn encode_value(
             .encode_field(&None::<i8>)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Integer(i)) => {
-            // Boolean columns: encode as true/false instead of 0/1
-            if *pg_type == Type::BOOL {
-                encoder
-                    .encode_field(&(*i != 0))
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            let encoded = if *pg_type == Type::BOOL {
+                // Boolean columns: encode as true/false instead of 0/1
+                encoder.encode_field(&(*i != 0))
+            } else if *pg_type == Type::INT4 {
+                // Binary format writes the width of the Rust type, so INT4
+                // needs an i32. A value outside the i32 range keeps the i64
+                // encoding as before, which binary clients still misread.
+                match i32::try_from(*i) {
+                    Ok(i) => encoder.encode_field(&i),
+                    Err(_) => encoder.encode_field(i),
+                }
             } else {
-                encoder
-                    .encode_field(i)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            }
+                encoder.encode_field(i)
+            };
+            encoded.map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
         }
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
@@ -1189,6 +1194,58 @@ mod tests {
             messages.push(message);
             if done {
                 return messages;
+            }
+        }
+    }
+
+    #[test]
+    fn int4_results_are_four_bytes_in_binary_format() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
+        conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
+        // Each field is a 4-byte length followed by the value.
+        for (sql, expected_type, binary, text) in [
+            (
+                "SELECT 42::int4",
+                Type::INT4,
+                &b"\0\0\0\x04\0\0\0\x2a"[..],
+                &b"\0\0\0\x0242"[..],
+            ),
+            (
+                "SELECT -1::int4",
+                Type::INT4,
+                b"\0\0\0\x04\xff\xff\xff\xff",
+                b"\0\0\0\x02-1",
+            ),
+            (
+                "SELECT i FROM t",
+                Type::INT4,
+                b"\0\0\0\x04\0\0\0\x2a",
+                b"\0\0\0\x0242",
+            ),
+            (
+                "SELECT b FROM t",
+                Type::INT8,
+                b"\0\0\0\x08\0\0\0\0\0\0\0\x2a",
+                b"\0\0\0\x0242",
+            ),
+        ] {
+            for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
+            {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let fields = Arc::new(build_field_info(&stmt, &format));
+                assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
+                let rows = stmt.run_collect_rows().unwrap();
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
         }
     }
