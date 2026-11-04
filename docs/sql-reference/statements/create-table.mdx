@@ -215,7 +215,7 @@ CREATE TABLE contacts (
 
 ### GENERATED ALWAYS AS
 
-A generated column gets its value from an expression over the other columns of the same row. Turso calculates the value each time a query reads the column, so the value is not stored in the row.
+A generated column gets its value from an expression over the other columns of the same row. A `VIRTUAL` generated column is calculated each time a query reads the column, so its value is not stored in the row. A `STORED` generated column is calculated each time a row is inserted or updated, and its value is stored in the row.
 
 ```sql
 CREATE TABLE order_lines (
@@ -225,9 +225,17 @@ CREATE TABLE order_lines (
 );
 ```
 
-The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (price * qty)` defines the same column. `INSERT` and `UPDATE` cannot write a generated column. You can create an index on a generated column. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does.
+The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (price * qty)` defines the same column. Write `STORED` after the expression to store the value:
 
-Turso supports only virtual generated columns. A `STORED` generated column gives an error.
+```sql
+CREATE TABLE order_lines (
+    price REAL,
+    qty INTEGER,
+    total REAL GENERATED ALWAYS AS (price * qty) STORED
+);
+```
+
+`INSERT` and `UPDATE` cannot write a generated column. A generated column can read other generated columns, virtual or stored, as long as no column depends on itself. You can create an index on a generated column. A generated column cannot be part of the `PRIMARY KEY`. A stored generated column cannot have a [custom type](/docs/sql-reference/statements/create-type) or an [array type](/docs/sql-reference/data-types#array-types), and its expression cannot read a column that has one. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does, with `hidden` set to 2 for a virtual column and 3 for a stored column.
 
 ## Table Constraints
 
@@ -415,7 +423,6 @@ The following CREATE TABLE features are not yet supported:
 | `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
-| `GENERATED ALWAYS AS (...) STORED` | Stored generated columns are not supported. Use [virtual generated columns](#generated-always-as) instead |
 
 ### Experimental Features
 

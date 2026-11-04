@@ -1198,9 +1198,8 @@ fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Resu
 // Build the SELECT and INSERT SQL strings for copying a table's data.
 //
 // Uses the in-memory `BTreeTable` column metadata from the schema to derive
-// the copy-column list. Virtual generated columns are excluded from both
-// SELECT and INSERT since they are computed, not stored. This keeps both
-// lists tied to the same stored-column model.
+// the copy-column list. Generated columns are excluded from both SELECT and
+// INSERT since they are computed, not copied.
 //
 // For e.g. given a schema:
 // CREATE TABLE employees (
@@ -1230,7 +1229,7 @@ pub(crate) fn build_copy_sql(
         )));
     };
 
-    // Collect non-virtual-generated columns with their quoted names.
+    // Collect non-generated columns with their quoted names.
     let mut data_columns: Vec<String> = Vec::new();
     let mut rowid_alias_col_idx: Option<usize> = None;
     for (i, col) in btree.columns().iter().enumerate() {

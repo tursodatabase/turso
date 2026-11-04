@@ -1060,7 +1060,7 @@ pub fn translate_alter_table(
                 }
             }
 
-            // Check if any virtual column depends on the dropped column
+            // Check if any generated column depends on the dropped column
             {
                 let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
@@ -1224,16 +1224,20 @@ pub fn translate_alter_table(
                     }
                 )
             });
-            if is_stored {
-                return Err(LimboError::ParseError(
-                    "cannot add a STORED column".to_string(),
-                ));
-            }
             if is_generated {
                 for c in &col_def.constraints {
-                    if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
-                        validate_generated_function_calls(expr, &resolver.catalog)?;
+                    match &c.constraint {
+                        ast::ColumnConstraint::Generated { expr, .. } => {
+                            crate::schema::validate_generated_expr(expr)?;
+                            validate_generated_function_calls(expr, &resolver.catalog)?;
+                        }
+                        ast::ColumnConstraint::Default(_) => {
+                            return Err(LimboError::ParseError(format!(
+                                "generated column \"{}\" cannot have a DEFAULT value",
+                                col_def.col_name
+                            )));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1404,6 +1408,16 @@ pub fn translate_alter_table(
                     "generated UPDATE statement did not parse as expected".to_string(),
                 ));
             };
+
+            if is_stored {
+                btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
+                emit_halt_if_table_has_rows(
+                    program,
+                    &original_btree,
+                    database_id,
+                    "cannot add a STORED column",
+                )?;
+            }
 
             let mut computes_default_for_existing_rows = false;
             if !is_generated {
@@ -1871,6 +1885,19 @@ pub fn translate_alter_table(
                 if old_column.unique() {
                     return Err(LimboError::ParseError(
                         "UNIQUE constraint cannot be altered".to_string(),
+                    ));
+                }
+            }
+
+            if !rename {
+                let affected = btree.columns_affected_by_update([column_index])?;
+                if (&affected)
+                    .into_iter()
+                    .any(|idx| btree.columns()[idx].is_stored_generated())
+                {
+                    return Err(LimboError::ParseError(
+                        "cannot alter a STORED column or a column that a STORED column uses"
+                            .to_string(),
                     ));
                 }
             }
