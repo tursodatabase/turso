@@ -718,6 +718,29 @@ expect {
     2
 }
 
+# SQLite's WHERE clause analysis checks the column count of `x IN (SELECT
+# ...)` before any fold, through AND and OR but not under NOT IN.
+
+test or-with-a-constant-operand-in-where-still-checks-the-in-subquery-column-count {
+    CREATE TABLE in_columns(a);
+    INSERT INTO in_columns VALUES (1);
+    SELECT a FROM in_columns WHERE 1 OR a IN (SELECT 1, 2);
+}
+expect error {
+    sub-select returns 2 columns - expected 1
+}
+
+test or-with-a-constant-operand-in-where-leaves-not-in-alone {
+    CREATE TABLE in_columns(a);
+    INSERT INTO in_columns VALUES (1);
+    SELECT a FROM in_columns WHERE 1 OR a NOT IN (SELECT 1, 2);
+    SELECT a FROM in_columns WHERE 1 OR (a, a) IN (SELECT 1, 2);
+}
+expect {
+    1
+    1
+}
+
 # A column name that is only resolved when the statement runs, as in a
 # trigger WHEN clause or an UPSERT DO UPDATE, is still checked.
 
