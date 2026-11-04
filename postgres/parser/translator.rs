@@ -7266,10 +7266,32 @@ pub struct PgGrantSelectStmt {
 /// The tables of a GRANT SELECT statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgGrantTables {
-    /// `ON [TABLE] t, s.u`: each table with its schema, if one was written.
-    Named(Vec<(Option<String>, String)>),
+    /// `ON [TABLE] t, s.u`.
+    Named(Vec<PgGrantTable>),
     /// `ON ALL TABLES IN SCHEMA s, ...`: the schemas.
     AllInSchemas(Vec<String>),
+}
+
+/// A table named in a GRANT statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgGrantTable {
+    /// The schema as written, if one was.
+    pub schema: Option<String>,
+    /// The table name as written.
+    pub relname: String,
+    /// The name the table has in the engine, as for any other statement, so
+    /// that `pg_catalog.pg_class` names the catalog table.
+    pub name: ast::QualifiedName,
+}
+
+impl PgGrantTable {
+    /// The name as written, with its schema if one was written.
+    pub fn written_name(&self) -> String {
+        match &self.schema {
+            Some(schema) => format!("{schema}.{}", self.relname),
+            None => self.relname.clone(),
+        }
+    }
 }
 
 /// A role that a GRANT gives a privilege to.
@@ -7323,10 +7345,11 @@ pub fn try_extract_grant_select(
                 .objects
                 .iter()
                 .map(|object| match &object.node {
-                    Some(Node::RangeVar(table)) => Ok((
-                        (!table.schemaname.is_empty()).then(|| table.schemaname.clone()),
-                        table.relname.clone(),
-                    )),
+                    Some(Node::RangeVar(table)) => Ok(PgGrantTable {
+                        schema: (!table.schemaname.is_empty()).then(|| table.schemaname.clone()),
+                        relname: table.relname.clone(),
+                        name: PostgreSQLTranslator::new().qualified_name_from_range_var(table)?,
+                    }),
                     _ => Err(ParseError::ParseError(
                         "GRANT: unexpected table node".into(),
                     )),
@@ -12356,8 +12379,16 @@ mod tests {
                 .unwrap(),
             Some(PgGrantSelectStmt {
                 tables: PgGrantTables::Named(vec![
-                    (None, "t".to_string()),
-                    (Some("app".to_string()), "Docs".to_string()),
+                    PgGrantTable {
+                        schema: None,
+                        relname: "t".to_string(),
+                        name: ast::QualifiedName::single(exact_name("t")),
+                    },
+                    PgGrantTable {
+                        schema: Some("app".to_string()),
+                        relname: "Docs".to_string(),
+                        name: ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
+                    },
                 ]),
                 roles: vec![
                     PgGrantee::Role("alice".to_string()),
@@ -12375,6 +12406,29 @@ mod tests {
             })
         );
         assert_eq!(grant("SELECT 1").unwrap(), None);
+    }
+
+    #[test]
+    fn grant_select_names_catalog_tables_as_other_statements_do() {
+        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap();
+        let names = |sql: &str| match grant(sql).unwrap().tables {
+            PgGrantTables::Named(tables) => tables
+                .into_iter()
+                .map(|table| table.name.to_string())
+                .collect::<Vec<_>>(),
+            PgGrantTables::AllInSchemas(_) => unreachable!("tables are named"),
+        };
+
+        assert_eq!(
+            names(
+                "GRANT SELECT ON pg_class, pg_catalog.pg_roles, information_schema.schemata TO r"
+            ),
+            vec![
+                "main.pg_class",
+                "main.pg_roles",
+                "main.pg_information_schema_schemata"
+            ]
+        );
     }
 
     #[test]
@@ -12412,6 +12466,10 @@ mod tests {
             (
                 "GRANT SELECT ON t TO alice GRANTED BY postgres",
                 "GRANT ... GRANTED BY is not supported",
+            ),
+            (
+                "GRANT SELECT ON otherdb.public.t TO alice",
+                "a cross-database reference is not supported",
             ),
         ] {
             let error = try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap_err();

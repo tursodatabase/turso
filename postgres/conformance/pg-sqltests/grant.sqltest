@@ -215,3 +215,42 @@ test grant-select-in-a-read-only-transaction-fails {
 }
 @sqlstate 25006
 expect error {}
+
+test grant-select-on-catalog-tables {
+    CREATE ROLE gs_catalog_reader;
+    CREATE TABLE gs_catalog_docs (id INT);
+    GRANT SELECT ON pg_catalog.pg_class, pg_namespace, pg_catalog.pg_roles TO gs_catalog_reader;
+    SET ROLE gs_catalog_reader;
+    SELECT relname FROM pg_catalog.pg_class WHERE relname = 'gs_catalog_docs';
+}
+expect {
+    gs_catalog_docs
+}
+
+test grant-select-on-information-schema-table {
+    CREATE ROLE gs_schemata_reader;
+    GRANT SELECT ON information_schema.schemata TO gs_schemata_reader;
+    SET ROLE gs_schemata_reader;
+    SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'public';
+}
+expect {
+    public
+}
+
+test grant-select-on-index-fails {
+    CREATE ROLE gs_index_grantee;
+    CREATE TABLE gs_indexed (id INT);
+    CREATE INDEX gs_indexed_idx ON gs_indexed (id);
+    GRANT SELECT ON gs_indexed_idx TO gs_index_grantee;
+}
+@sqlstate 42809
+expect error {
+    "gs_indexed_idx" is an index
+}
+
+test grant-select-on-table-in-another-database-fails {
+    CREATE ROLE gs_cross_database;
+    GRANT SELECT ON gs_other_db.public.t TO gs_cross_database;
+}
+@sqlstate 0A000
+expect error {}

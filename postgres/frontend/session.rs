@@ -12,8 +12,10 @@ use crate::settings::{
     SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
+use turso_core::schema::SchemaObjectType;
 use turso_core::schema::Table;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
+use turso_core::security::roles::{Role, RoleCatalog};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -1725,16 +1727,11 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
         ParseError::ParseError(message) => LimboError::ParseError(message),
         ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
-        ParseError::SchemaQualifiedName { ref schema, .. }
-            if !catalog::namespace_exists(conn, schema) =>
-        {
-            sqlstate_error(
-                SQLSTATE_INVALID_SCHEMA_NAME,
-                format!("schema \"{schema}\" does not exist"),
-            )
-        }
-        ParseError::SchemaQualifiedName { .. } => {
-            sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
+        ParseError::SchemaQualifiedName { ref schema, .. } => {
+            match check_schema_exists(conn, schema) {
+                Err(missing_schema) => missing_schema,
+                Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+            }
         }
     }
 }
@@ -1814,19 +1811,24 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
 fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Result<()> {
     match &stmt.tables {
         PgGrantTables::Named(tables) => {
-            for (schema, table) in tables {
-                if let Some(schema) = schema {
+            for table in tables {
+                if let Some(schema) = &table.schema {
                     check_schema_exists(conn, schema)?;
                 }
-                if !relation_exists(conn, schema.as_deref(), table) {
-                    let name = match schema {
-                        Some(schema) => format!("{schema}.{table}"),
-                        None => table.clone(),
-                    };
-                    return Err(sqlstate_error(
-                        SQLSTATE_UNDEFINED_TABLE,
-                        format!("relation \"{name}\" does not exist"),
-                    ));
+                match relation_type(conn, &table.name) {
+                    Some(RelationType::Index) => {
+                        return Err(sqlstate_error(
+                            SQLSTATE_WRONG_OBJECT_TYPE,
+                            format!("\"{}\" is an index", table.relname),
+                        ))
+                    }
+                    Some(RelationType::Readable) => {}
+                    None => {
+                        return Err(sqlstate_error(
+                            SQLSTATE_UNDEFINED_TABLE,
+                            format!("relation \"{}\" does not exist", table.written_name()),
+                        ))
+                    }
                 }
             }
         }
@@ -1838,14 +1840,8 @@ fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Resul
     }
     let roles = conn.role_catalog();
     for grantee in &stmt.roles {
-        let PgGrantee::Role(name) = grantee else {
-            continue;
-        };
-        if !catalog::postgres_roles(&roles).any(|role| role.name == *name) {
-            return Err(sqlstate_error(
-                SQLSTATE_UNDEFINED_OBJECT,
-                format!("role \"{name}\" does not exist"),
-            ));
+        if let PgGrantee::Role(name) = grantee {
+            find_role(&roles, name)?;
         }
     }
     Ok(())
@@ -1861,18 +1857,31 @@ fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
     ))
 }
 
-/// Whether a table, view, materialized view or sequence named `name` exists
-/// in `schema`, or in the search path when no schema is given.
-fn relation_exists(conn: &Arc<Connection>, schema: Option<&str>, name: &str) -> bool {
+enum RelationType {
+    /// A table, view, materialized view or sequence.
+    Readable,
+    Index,
+}
+
+/// The type of the relation `name`, looked up in its schema, or in the search
+/// path when it has none.
+fn relation_type(conn: &Arc<Connection>, name: &ast::QualifiedName) -> Option<RelationType> {
+    let schema = name.namespace.as_ref().map(|schema| schema.as_str());
     relation_lookup_namespaces(conn, schema)
         .iter()
-        .any(|namespace| {
+        .find_map(|namespace| {
             conn.with_schema(namespace.database_id(), |schema| {
                 let id = namespace.target.id;
-                schema.get_table(id, name).is_some()
-                    || schema.get_view(id, name).is_some()
-                    || schema.is_materialized_view(id, name)
-                    || schema.get_sequence(id, name).is_some()
+                let name = name.name.as_str();
+                match schema.get_object_type(id, name) {
+                    Some(SchemaObjectType::Index) => Some(RelationType::Index),
+                    Some(SchemaObjectType::Table | SchemaObjectType::View) => {
+                        Some(RelationType::Readable)
+                    }
+                    None => (schema.is_materialized_view(id, name)
+                        || schema.get_sequence(id, name).is_some())
+                    .then_some(RelationType::Readable),
+                }
             })
         })
 }
@@ -2020,6 +2029,18 @@ fn is_core_database_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
 }
 
+/// The role named `name`, including the built-in roles that PostgreSQL has.
+fn find_role(roles: &RoleCatalog, name: &str) -> Result<Role> {
+    catalog::postgres_roles(roles)
+        .find(|role| role.name == name)
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_UNDEFINED_OBJECT,
+                format!("role \"{name}\" does not exist"),
+            )
+        })
+}
+
 /// Makes `value` the current role, as SET ROLE does. `none`, or no value,
 /// makes the session's login role current again.
 pub(crate) fn set_role(
@@ -2031,12 +2052,7 @@ pub(crate) fn set_role(
         None => None,
         Some(name) => {
             let roles = conn.role_catalog();
-            let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
-                return Err(sqlstate_error(
-                    SQLSTATE_UNDEFINED_OBJECT,
-                    format!("role \"{name}\" does not exist"),
-                ));
-            };
+            let role = find_role(&roles, name)?;
             if !roles.can_set_role(conn.session_role(), role.id) {
                 return Err(LimboError::PermissionDenied(Box::new(
                     PermissionDenied::privilege(Action::SetRole, Object::Role(name.to_owned())),

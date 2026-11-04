@@ -74,15 +74,17 @@ nothing. It is accepted so that scripts written for PostgreSQL, which grant
 **Parameters:**
 
 - `table_name`: The name of an existing table, view, materialized view or
-  sequence, optionally qualified with its schema.
+  sequence, optionally qualified with its schema. Catalog tables such as
+  `pg_catalog.pg_class` can be named too.
 - `schema_name`: The name of an existing schema. `ALL TABLES IN SCHEMA` names
   every table in it.
 - `role_name`: The name of an existing role.
 
 **Notes:**
 
-`GRANT SELECT` fails if a table, schema or role does not exist, with the same
-errors as PostgreSQL. The tables are checked before the roles.
+`GRANT SELECT` fails if a table, schema or role does not exist, if a name is
+an index, or if a name refers to another database, with the same errors as
+PostgreSQL. The tables are checked before the roles.
 
 Only `SELECT` on tables is accepted. Other privileges, column privileges,
 `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of objects, and
