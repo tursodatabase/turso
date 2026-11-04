@@ -513,6 +513,9 @@ pub(crate) fn emit_array_decode_for_results(
     start_reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    if program.flags.reads_stored_values() {
+        return Ok(());
+    }
     let env = TypeEnv::new(Some(table_references), resolver);
     for (i, rc) in result_columns.iter().enumerate() {
         if type_of(&rc.expr, &env).is_array() {
@@ -527,7 +530,7 @@ pub(crate) fn emit_array_decode_for_results(
             let reg = start_reg + i;
             if let Some(col) = array_col {
                 emit_array_decode(program, reg, col, resolver)?;
-            } else if !program.flags.keep_array_results_as_blobs() {
+            } else {
                 program.emit_insn(Insn::ArrayDecode { reg });
             }
         }

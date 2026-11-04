@@ -7856,6 +7856,13 @@ impl Column {
     pub fn set_array_dimensions(&mut self, dims: u32) {
         self.info.set_array_dimensions(dims)
     }
+    /// Whether both columns declare the same type: name, type parameters
+    /// (`varchar(10)` is not `varchar(3)`) and array dimensions.
+    pub fn has_same_declared_type(&self, other: &Column) -> bool {
+        self.ty_str.eq_ignore_ascii_case(&other.ty_str)
+            && self.ty_params == other.ty_params
+            && self.array_dimensions() == other.array_dimensions()
+    }
 }
 
 #[repr(u8)]
