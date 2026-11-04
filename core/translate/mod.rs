@@ -109,10 +109,13 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
-    program.flags.set_keep_array_results_as_blobs(matches!(
+    program.flags.set_reads_stored_values(matches!(
         origin,
         crate::statement::StatementOrigin::InternalHelper
     ));
+    program
+        .flags
+        .set_writes_stored_values(connection.writes_stored_values());
 
     program.prologue();
     // Engine-generated statements, helpers and reads of the engine's own

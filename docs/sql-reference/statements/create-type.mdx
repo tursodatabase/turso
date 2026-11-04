@@ -61,7 +61,7 @@ CREATE TYPE cents BASE integer
 
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
 
-- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first). It does not run when VACUUM copies rows or when `ON UPDATE CASCADE` copies the parent's new key into the child: those copy the stored value as it is.
 - **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT, and on CAST after ENCODE (see [CAST Support](#cast-support)).
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 

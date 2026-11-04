@@ -184,3 +184,90 @@ test cascade-text-based-type {
 expect {
     WORLD
 }
+
+# ============================================================================
+# CASCADE UPDATE copies the parent's stored key without running ENCODE again
+# ============================================================================
+
+# ENCODE value+1 with DECODE value does not undo ENCODE, so a DECODE then
+# ENCODE round trip would write 11 into the child instead of the parent's 10.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-copies-stored-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value;
+    CREATE TABLE parent(id plus1 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id plus1
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (5);
+    INSERT INTO child VALUES (1, 5);
+
+    UPDATE parent SET id = 9 WHERE id = 6;
+    SELECT p.id, c.parent_id FROM parent p, child c;
+}
+expect {
+    10|10
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-encode-only-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value;
+    CREATE TABLE parent(id x100 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id x100
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    UPDATE parent SET id = 2;
+    SELECT p.id, c.parent_id FROM parent p, child c;
+}
+expect {
+    200|200
+}
+
+# The child's key matches the parent's by stored value, so the cascade copies
+# the parent's stored value even when the child column has a different type.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-key-of-different-type {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value;
+    CREATE TABLE parent(id integer PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id x100
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (100);
+    INSERT INTO child VALUES (1, 1);
+
+    UPDATE parent SET id = 200;
+    SELECT p.id, c.parent_id FROM parent p, child c;
+}
+expect {
+    200|200
+}
+
+# A SET DEFAULT action writes the column's DEFAULT, which is a user value, so
+# it still goes through ENCODE.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test set-default-encodes-default-value {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value;
+    CREATE TABLE parent(id plus1 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id plus1 DEFAULT 7
+        REFERENCES parent(id) ON DELETE SET DEFAULT) STRICT;
+
+    INSERT INTO parent VALUES (5);
+    INSERT INTO parent VALUES (7);
+    INSERT INTO child VALUES (1, 5);
+
+    DELETE FROM parent WHERE id = 6;
+    SELECT parent_id FROM child;
+}
+expect {
+    8
+}

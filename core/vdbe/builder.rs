@@ -407,7 +407,8 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
-    const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
+    const READS_STORED_VALUES: u16 = 1 << 9;
+    const WRITES_STORED_VALUES: u16 = 1 << 10;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -515,16 +516,29 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, array result columns are returned as their stored record
-    /// blobs instead of being converted to display text. Engine-internal
-    /// statements (e.g. VACUUM's table copy) write these values back to
-    /// storage, and the text form does not keep element types.
-    pub const fn keep_array_results_as_blobs(self) -> bool {
-        self.get(Self::KEEP_ARRAY_RESULTS_AS_BLOBS)
+    /// When set, a custom-type column is read as its stored value, without
+    /// DECODE, and an array result stays a record blob instead of becoming
+    /// display text. Engine-internal statements (e.g. VACUUM's table copy)
+    /// write these values back to storage as they are.
+    pub const fn reads_stored_values(self) -> bool {
+        self.get(Self::READS_STORED_VALUES)
     }
     #[inline]
-    pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
-        self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
+    pub const fn set_reads_stored_values(&mut self, v: bool) {
+        self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// When set, the values INSERT and UPDATE write to custom-type columns
+    /// are already stored values, so they are written without ENCODE. Set
+    /// for statements that copy rows, such as VACUUM's table copy and an
+    /// ON UPDATE CASCADE action.
+    pub const fn writes_stored_values(self) -> bool {
+        self.get(Self::WRITES_STORED_VALUES)
+    }
+    #[inline]
+    pub const fn set_writes_stored_values(&mut self, v: bool) {
+        self.set(Self::WRITES_STORED_VALUES, v)
     }
 
     #[inline]

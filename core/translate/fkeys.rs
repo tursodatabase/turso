@@ -1719,7 +1719,7 @@ pub fn emit_fk_update_parent_actions(
 pub struct FkActionContext {
     /// Registers containing OLD parent key values (for DELETE and UPDATE)
     pub old_key_registers: Vec<usize>,
-    /// Registers containing NEW parent key values (for UPDATE only)
+    /// Registers containing NEW parent key values as stored (for UPDATE only)
     pub new_key_registers: Option<Vec<usize>>,
 }
 
@@ -1885,6 +1885,11 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4)
 /// This is required for self-referential cascades and foreign-key cycles. In
 /// both cases, the generated action SQL can fire the same action again before
 /// the first action program has finished compiling.
+///
+/// `writes_stored_values` makes the action's UPDATE write its parameters to
+/// custom-type columns without ENCODE. CASCADE UPDATE sets it because it
+/// copies the parent's stored key into the child.
+#[allow(clippy::too_many_arguments)]
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -1893,6 +1898,7 @@ fn emit_fk_action_subprogram(
     ctx: &FkActionContext,
     foreign_key: Arc<ForeignKey>,
     description: &'static str,
+    writes_stored_values: bool,
 ) -> Result<()> {
     let parent_change = ctx.parent_change();
     let compile_stack = resolver.fk_action_compile_stack.clone();
@@ -1910,6 +1916,9 @@ fn emit_fk_action_subprogram(
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
         );
+        subprogram_builder
+            .flags
+            .set_writes_stored_values(writes_stored_values);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
@@ -2177,6 +2186,7 @@ fn fire_fk_cascade_delete(
         ctx,
         fk_ref.fk.clone(),
         "fk cascade delete",
+        false,
     )
 }
 
@@ -2208,6 +2218,7 @@ fn fire_fk_set_null(
         ctx,
         fk_ref.fk.clone(),
         "fk set null",
+        false,
     )
 }
 
@@ -2239,6 +2250,7 @@ fn fire_fk_set_default(
         ctx,
         fk_ref.fk.clone(),
         "fk set default",
+        false,
     )
 }
 
@@ -2271,6 +2283,7 @@ fn fire_fk_cascade_update(
         ctx,
         fk_ref.fk.clone(),
         "fk cascade update",
+        true,
     )
 }
 
@@ -2536,13 +2549,26 @@ pub fn fire_fk_update_actions(
             new_rowid_reg,
             new_key_start,
         )?;
+        // ON UPDATE CASCADE writes the parent's new key into the child as
+        // stored, so the child holds the same stored value as the parent.
+        let new_stored_key_start = program.alloc_registers(ncols);
+        copy_key_from_values(
+            program,
+            &parent_bt,
+            parent_cols,
+            new_values_start,
+            &new_image_layout,
+            new_rowid_reg,
+            new_stored_key_start,
+        )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
         decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
         decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
-        let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
+        let new_key_registers: Vec<usize> =
+            (new_stored_key_start..new_stored_key_start + ncols).collect();
 
         // Check if parent key changed - skip action if all values are equal
         let skip_action = program.allocate_label();
