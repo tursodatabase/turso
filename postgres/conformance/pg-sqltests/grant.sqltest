@@ -254,3 +254,13 @@ test grant-select-on-table-in-another-database-fails {
 }
 @sqlstate 0A000
 expect error {}
+
+test grant-select-to-pg-database-owner {
+    CREATE TABLE gs_database_owner (id INT);
+    INSERT INTO gs_database_owner VALUES (1);
+    GRANT SELECT ON gs_database_owner TO pg_database_owner;
+    SELECT id FROM gs_database_owner;
+}
+expect {
+    1
+}

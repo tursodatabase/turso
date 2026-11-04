@@ -1840,8 +1840,13 @@ fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Resul
     }
     let roles = conn.role_catalog();
     for grantee in &stmt.roles {
-        if let PgGrantee::Role(name) = grantee {
-            find_role(&roles, name)?;
+        match grantee {
+            // pg_roles lists it, so PostgreSQL scripts grant to it.
+            PgGrantee::Role(name) if name == catalog::PG_DATABASE_OWNER_NAME => {}
+            PgGrantee::Role(name) => {
+                find_role(&roles, name)?;
+            }
+            PgGrantee::Public | PgGrantee::CurrentRole => {}
         }
     }
     Ok(())

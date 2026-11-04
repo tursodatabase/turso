@@ -1,4 +1,4 @@
-use crate::catalog::PG_DATABASE_OWNER_OID;
+use crate::catalog::{PG_DATABASE_OWNER_NAME, PG_DATABASE_OWNER_OID};
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
@@ -666,7 +666,7 @@ fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
 
 fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
     if oid == PG_DATABASE_OWNER_OID {
-        return Some("pg_database_owner".to_string());
+        return Some(PG_DATABASE_OWNER_NAME.to_string());
     }
     crate::catalog::postgres_roles(&conn.role_catalog())
         .find(|role| crate::catalog::role_oid(role.id) == oid)

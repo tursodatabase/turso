@@ -24,6 +24,9 @@ use turso_sqlite::SqliteDialect;
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
 pub(crate) const PG_DATABASE_OWNER_OID: i64 = 6171;
+/// The owner of the public schema, which PostgreSQL makes for every database.
+/// It is listed in pg_roles but is not a role of the engine.
+pub(crate) const PG_DATABASE_OWNER_NAME: &str = "pg_database_owner";
 /// pg_depend uses column zero for a whole object; table columns are numbered from one.
 const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
 /// Catalog BOOLEAN values are stored as integers; one means true.
@@ -938,11 +941,9 @@ impl SnapshotRows for PgRolesTable {
         let mut rows: Vec<_> = postgres_roles(&conn.role_catalog())
             .map(|role| role_row(&role))
             .collect();
-        // The owner of the public schema, which PostgreSQL makes for every
-        // database.
         rows.push(vec![
             Value::from_i64(PG_DATABASE_OWNER_OID),
-            Value::build_text("pg_database_owner"),
+            Value::build_text(PG_DATABASE_OWNER_NAME),
             Value::from_i64(0),
             Value::from_i64(1),
             Value::from_i64(0),
