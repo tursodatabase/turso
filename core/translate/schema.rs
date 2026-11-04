@@ -19,7 +19,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::expr_type::{decode_type, iif_values, value_kind, ExprType};
+use crate::translate::expr::expr_type::{decode_type, iif_values, value_type, ExprType};
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
@@ -3116,6 +3116,7 @@ pub fn translate_create_type(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
+    check_name_not_cast_to("type", &normalized_name, resolver)?;
 
     // Validate encode/coerce/decode expressions for safety (only for custom types)
     if let ast::CreateTypeBody::CustomType {
@@ -3151,18 +3152,16 @@ pub fn translate_create_type(
 /// so they would have to guess it.
 fn check_decode_type(type_def: &TypeDef, resolver: &Resolver) -> Result<()> {
     let schema = resolver.schema();
-    let Some(ty) = decode_type(type_def, schema, resolver.catalog.symbol_table) else {
-        return Ok(());
-    };
-    if value_kind(&ty, schema).is_some() {
+    let syms = resolver.catalog.symbol_table;
+    if value_type(type_def, schema, syms).is_some() {
         return Ok(());
     }
     let name = &type_def.name;
-    if let ExprType::Custom {
+    if let Some(ExprType::Custom {
         type_def: other, ..
-    } = &ty
+    }) = decode_type(type_def, schema, syms)
     {
-        if schema.type_ordering(other).is_some() {
+        if schema.type_ordering(&other).is_some() {
             bail_parse_error!(
                 "DECODE of type {name} returns a {}, which only compares in its own order; wrap it in CAST(... AS <type>), such as CAST(... AS text)",
                 other.name
@@ -3306,6 +3305,7 @@ pub fn translate_create_domain(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
+    check_name_not_cast_to("domain", &normalized_name, resolver)?;
 
     // Validate base type exists — must be a primitive or a registered type
     let base_normalized = normalize_ident(base_type);
@@ -3358,6 +3358,26 @@ pub fn translate_create_domain(
     persist_type_definition(normalized_name, sql, resolver, program)
 }
 
+/// Refuse a new type or domain whose name an existing type or stored
+/// expression already casts to. That CAST follows SQLite's rules for the name
+/// (`CAST(x AS b)` gives a NUMERIC), and creating the type would change the
+/// values it gives, such as those stored in an index.
+fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver) -> Result<()> {
+    let registry_key = type_registry_key(normalized_name);
+    if let Some(name) = find_type_using(resolver.schema(), &registry_key)? {
+        bail_parse_error!(
+            "cannot create {kind} {normalized_name}: type {name} already casts to it; \
+             create {normalized_name} before {name}"
+        );
+    }
+    if let Some(owner) =
+        find_in_any_database(resolver, |schema| find_cast_to_type(schema, &registry_key))?
+    {
+        bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
+    }
+    Ok(())
+}
+
 pub fn translate_drop_type(
     type_name: &str,
     if_exists: bool,
@@ -3395,28 +3415,15 @@ pub fn translate_drop_type(
 
     // Check if anything in any database uses this type
     let registry_key = type_registry_key(type_name);
-    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
-    database_ids.set(MAIN_DB_ID)?;
-    if resolver.has_temp_database() {
-        database_ids.set(crate::TEMP_DB_ID)?;
-    }
-    for database_id in database_ids {
-        let type_use =
-            resolver.with_schema(database_id, |schema| find_type_use(schema, &registry_key))?;
-        if let Some(type_use) = type_use {
-            bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
-        }
+    if let Some(type_use) =
+        find_in_any_database(resolver, |schema| find_type_use(schema, &registry_key))?
+    {
+        bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
     }
 
     // Check if any other type/domain depends on this type
-    for (name, td) in resolver.schema().type_registry.iter() {
-        if type_registry_key(name) != registry_key && type_def_uses_type(td, &registry_key)? {
-            bail_parse_error!(
-                "cannot drop type {}: type {} depends on it",
-                normalized_name,
-                name
-            );
-        }
+    if let Some(name) = find_type_using(resolver.schema(), &registry_key)? {
+        bail_parse_error!("cannot drop type {normalized_name}: type {name} depends on it");
     }
 
     // Open cursor to sqlite_turso_types table
@@ -3496,6 +3503,25 @@ pub fn translate_drop_type(
     Ok(())
 }
 
+/// The first answer `find` gives for the schema of the main, temp or an
+/// attached database.
+fn find_in_any_database(
+    resolver: &Resolver,
+    find: impl Fn(&Schema) -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
+    database_ids.set(MAIN_DB_ID)?;
+    if resolver.has_temp_database() {
+        database_ids.set(crate::TEMP_DB_ID)?;
+    }
+    for database_id in database_ids {
+        if let Some(found) = resolver.with_schema(database_id, &find)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 /// Describes the first object in `schema` that uses the type: a column of
 /// that type, or any stored expression that casts to it.
 fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
@@ -3512,6 +3538,11 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
             }
         }
     }
+    find_cast_to_type(schema, registry_key)
+}
+
+/// Describes the first stored expression in `schema` that casts to the type.
+fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
     let mut type_use = None;
     walk_schema_expressions(schema, &mut |owner, expr| {
         if type_use.is_none() && is_cast_to_type(expr, registry_key) {
@@ -3524,6 +3555,17 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
         })
     })?;
     Ok(type_use)
+}
+
+/// The name of the first other type or domain that uses the type: as its
+/// BASE, a field or variant, or a CAST in one of its expressions.
+fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+    for (name, type_def) in schema.type_registry.iter() {
+        if type_registry_key(name) != registry_key && type_def_uses_type(type_def, registry_key)? {
+            return Ok(Some(name.clone()));
+        }
+    }
+    Ok(None)
 }
 
 fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {

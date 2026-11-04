@@ -317,15 +317,22 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
 }
 
 /// The kind of value a built-in type reads as. uuid, jsonb and numeric store
-/// blobs and DECODE them to text; every other built-in type reads as its BASE
-/// stores. The built-in types are registered before any connection's
-/// functions, so the kind of `uuid_str(value)` can't be worked out from the
-/// DECODE then; a test checks these against the DECODE of each type.
-fn builtin_value_type(type_name: &str, base: &str) -> Option<BuiltinType> {
-    match type_name {
-        "uuid" | "jsonb" | "numeric" => Some(BuiltinType::Text),
-        _ => crate::translate::expr::expr_type::primitive_value_type(base),
-    }
+/// blobs and DECODE them to text. The built-in types are registered before any
+/// connection's functions, so the kind of `uuid_str(value)` can't be worked
+/// out from the DECODE then; a test checks these against the DECODE of each
+/// type.
+fn builtin_value_type(type_name: &str) -> crate::Result<BuiltinType> {
+    Ok(match type_name {
+        "boolean" | "smallint" | "bigint" => BuiltinType::Integer,
+        "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timestamp"
+        | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => BuiltinType::Text,
+        "bytea" => BuiltinType::Blob,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "built-in type {type_name} has no kind of value"
+            )))
+        }
+    })
 }
 
 /// Operators on built-in types. User types have none: `x + 1` on a user type is
@@ -692,7 +699,7 @@ impl TypeDef {
                 let (ordering, value_type, operator_signatures) = if is_builtin {
                     (
                         builtin_ordering(type_name),
-                        builtin_value_type(type_name, base),
+                        Some(builtin_value_type(type_name)?),
                         builtin_signatures(type_name),
                     )
                 } else {
@@ -2073,9 +2080,9 @@ impl Schema {
     }
 
     /// Works out again the kind of value each user-defined type reads as. A
-    /// type's kind can depend on a type created after it, as with
-    /// `DECODE CAST(value AS b)` before `CREATE TYPE b`, so this repeats until
-    /// no kind changes. Built-in types name their kind when they are created.
+    /// type's kind can depend on the kind of a type its DECODE casts to, so
+    /// this repeats until no kind changes, whatever order the types were
+    /// added in. Built-in types name their kind when they are created.
     fn update_value_types(&mut self, syms: &SymbolTable) -> Result<()> {
         // Each pass settles at least one more type of a chain of types
         // referring to each other, so a pass per type is enough.
@@ -2100,7 +2107,9 @@ impl Schema {
                 self.type_registry.insert(key, Arc::new(type_def));
             }
         }
-        Ok(())
+        Err(LimboError::InternalError(
+            "kinds of user-defined types kept changing".to_string(),
+        ))
     }
 
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom

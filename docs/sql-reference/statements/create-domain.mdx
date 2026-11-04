@@ -30,6 +30,8 @@ Domains are transparent to the query engine for operations like ORDER BY, indexi
 
 Domains work only with STRICT tables. Using a domain name in a non-STRICT table has no effect.
 
+`CREATE DOMAIN d` fails while a type, index, CHECK constraint, generated column, column default, view or trigger already uses `CAST(... AS d)`: that CAST converts to NUMERIC until `d` exists, and creating `d` would change what it gives. Create the domain first.
+
 ## Clauses
 
 ### IF NOT EXISTS

@@ -168,17 +168,41 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test decode-kind-follows-a-type-created-later {
-    -- a's DECODE casts to b, created after a and the table. Once b exists, a
-    -- reads as b's kind, text, so c > 9 compares with the text '9', and the
-    -- text '10' sorts before '9'.
+test decode-kind-follows-the-type-it-casts-to {
+    -- a's DECODE casts to b, so a reads as b's kind, text: c > 9 compares
+    -- with the text '9', and the text '10' sorts before '9'.
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value);
     CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
     CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT;
-    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value);
     INSERT INTO t VALUES (1, '10'), (2, '9');
     SELECT 'gt-number', id FROM t WHERE c > 9;
     SELECT 'lt-text', id FROM t WHERE c < '9';
 }
 expect {
     lt-text|1
+}
+
+# Before b exists, CAST(value AS b) converts to NUMERIC, as SQLite does for
+# an unknown type name. Creating b would change what that CAST gives, and so
+# the values already stored in an index on it.
+@requires strict "uses STRICT tables"
+test create-type-refused-when-a-type-casts-to-its-name {
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT;
+    CREATE INDEX t_c ON t(c > 9);
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value);
+}
+expect error {
+    cannot create type b: type a already casts to it; create b before a
+}
+
+@requires strict "uses STRICT tables"
+test create-domain-refused-when-an-index-casts-to-its-name {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c text) STRICT;
+    CREATE INDEX t_c ON t(CAST(c AS b));
+    CREATE DOMAIN b AS text;
+}
+expect error {
+    cannot create domain b: index t_c already casts to it
 }

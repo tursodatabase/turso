@@ -15137,12 +15137,7 @@ pub fn op_add_type(
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     let syms = conn.syms.read();
-    conn.with_database_schema_mut(*db, |schema| {
-        schema.add_type_from_sql(sql, &syms)?;
-        // The new type can change the kind of an existing type whose DECODE
-        // casts to it, and so how that type's columns compare.
-        schema.resolve_all_custom_type_affinities()
-    })??;
+    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql, &syms))??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

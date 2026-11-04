@@ -793,7 +793,11 @@ pub(super) fn sqlite_operand_type(ty: ExprType) -> ExprType {
     match &ty {
         ExprType::Custom { type_def, .. } => read_type(type_def),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
-        _ => ty,
+        ExprType::Builtin(_)
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown => ty,
     }
 }
 
@@ -803,7 +807,11 @@ fn stored_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
     match &ty {
         ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
-        _ => ty,
+        ExprType::Builtin(_)
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown => ty,
     }
 }
 
@@ -830,14 +838,7 @@ fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
     let Ok(Some(resolved)) = schema.resolve_type_unchecked(&type_def.name) else {
         return ExprType::Builtin(BuiltinType::Any);
     };
-    ExprType::Builtin(match resolved.primitive.to_ascii_lowercase().as_str() {
-        "integer" => BuiltinType::Integer,
-        "real" => BuiltinType::Real,
-        "numeric" => BuiltinType::Numeric,
-        "text" => BuiltinType::Text,
-        "blob" => BuiltinType::Blob,
-        _ => BuiltinType::Any,
-    })
+    ExprType::Builtin(primitive_value_type(&resolved.primitive).unwrap_or(BuiltinType::Any))
 }
 
 /// The kind of value a custom type or domain reads as, worked out when the
@@ -888,6 +889,7 @@ fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
 }
 
 /// The kind of value a SQLite type such as `integer` holds. None for ANY.
+/// Unlike a column's affinity, a `blob` BASE holds only blobs.
 pub(crate) fn primitive_value_type(primitive: &str) -> Option<BuiltinType> {
     if primitive.eq_ignore_ascii_case("any") {
         return None;
@@ -908,7 +910,13 @@ pub(crate) fn value_kind(ty: &ExprType, schema: &Schema) -> Option<BuiltinType> 
     match ty {
         ExprType::Builtin(BuiltinType::Any) | ExprType::Null | ExprType::Unknown => None,
         ExprType::Builtin(BuiltinType::Decimal) => Some(BuiltinType::Real),
-        ExprType::Builtin(builtin) => Some(*builtin),
+        ExprType::Builtin(
+            builtin @ (BuiltinType::Integer
+            | BuiltinType::Real
+            | BuiltinType::Numeric
+            | BuiltinType::Text
+            | BuiltinType::Blob),
+        ) => Some(*builtin),
         ExprType::Untyped => Some(BuiltinType::Text),
         ExprType::Array { .. } => Some(BuiltinType::Blob),
         ExprType::Custom { type_def, .. } => match schema.type_ordering(type_def) {
@@ -1466,6 +1474,34 @@ mod tests {
             "wrong types:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    /// CREATE TYPE accepts a DECODE only when this gives a kind.
+    #[test]
+    fn value_kind_of_every_type() {
+        let schema = test_schema();
+        let cases = [
+            (builtin(BuiltinType::Integer), Some(BuiltinType::Integer)),
+            (builtin(BuiltinType::Real), Some(BuiltinType::Real)),
+            (builtin(BuiltinType::Decimal), Some(BuiltinType::Real)),
+            (builtin(BuiltinType::Numeric), Some(BuiltinType::Numeric)),
+            (builtin(BuiltinType::Text), Some(BuiltinType::Text)),
+            (builtin(BuiltinType::Blob), Some(BuiltinType::Blob)),
+            (builtin(BuiltinType::Any), None),
+            (ExprType::Untyped, Some(BuiltinType::Text)),
+            (ExprType::Null, None),
+            (ExprType::Unknown, None),
+            (
+                ExprType::array(builtin(BuiltinType::Integer), 1),
+                Some(BuiltinType::Blob),
+            ),
+            (custom("cents", &[]), Some(BuiltinType::Integer)),
+            // numeric compares in its own order, which no affinity gives.
+            (custom("numeric", &["10", "2"]), None),
+        ];
+        for (ty, expected) in cases {
+            assert_eq!(value_kind(&ty, &schema), expected, "{ty:?}");
+        }
     }
 
     fn parse_expr(sql: &str) -> ast::Expr {
