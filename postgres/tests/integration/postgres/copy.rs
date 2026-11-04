@@ -133,6 +133,26 @@ fn test_copy_from_file_not_found(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_copy_from_file_rejected_when_file_copy_is_off(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.set_allow_file_copy(false);
+
+    conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+
+    let tsv = write_temp_file("1\n");
+    let err = conn
+        .execute(format!("COPY t FROM '{}'", tsv.path().display()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("permission denied to COPY from a file"),
+        "unexpected error: {err}"
+    );
+
+    assert!(query_all(&conn, "SELECT a FROM t").is_empty());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_copy_from_wrong_column_count(db: TempDatabase) {
     let conn = db.connect_postgres();
 

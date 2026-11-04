@@ -99,7 +99,10 @@ impl TursoPgServer {
                                 &self.db,
                                 self.connect_opts.clone(),
                             ) {
-                                Ok(session) => session,
+                                Ok(session) => {
+                                    session.set_allow_file_copy(false);
+                                    session
+                                }
                                 Err(e) => {
                                     error!("Error opening a session for {}: {}", addr, e);
                                     continue;

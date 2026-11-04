@@ -2,6 +2,7 @@ use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
 use std::num::NonZero;
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
 
@@ -23,8 +24,8 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -44,6 +45,7 @@ pub struct PgConnection {
 struct PgConnectionInner {
     conn: Arc<Connection>,
     tx: Arc<PgTxState>,
+    allow_file_copy: AtomicBool,
 }
 
 /// The transaction state of a session as PostgreSQL reports it in
@@ -145,8 +147,16 @@ impl PgConnection {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 tx: Arc::new(PgTxState::default()),
+                allow_file_copy: AtomicBool::new(true),
             }),
         })
+    }
+
+    /// Allows `COPY ... FROM 'file'` to read files on the host. Every session
+    /// starts as the superuser, so the privilege check lets it through; the
+    /// wire server, which does not authenticate clients, turns it off.
+    pub fn set_allow_file_copy(&self, allow: bool) {
+        self.inner.allow_file_copy.store(allow, Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -1609,6 +1619,13 @@ fn try_prepare_special(
     else {
         return Ok(None);
     };
+    if let FrontendStmt::CopyFrom(copy) = &stmt {
+        if !pg_conn.allow_file_copy.load(Ordering::Relaxed) {
+            return Err(LimboError::PermissionDenied(Box::new(
+                PermissionDenied::privilege(Action::Read, Object::File(copy.filename.clone())),
+            )));
+        }
+    }
     let stmt = match stmt {
         FrontendStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
         FrontendStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
@@ -2145,13 +2162,53 @@ fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
         .is_some_and(|namespace| !namespace.is_database())
 }
 
+/// The largest file `COPY FROM` reads. PostgreSQL needs no such limit because
+/// it streams the file; tursopg reads the whole file into memory, so an endless
+/// or huge file (`/dev/zero`, a large log) would exhaust memory and, with
+/// `panic = "abort"` in the release profile, abort the process.
+const MAX_COPY_FILE_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Reads the file of `COPY FROM '<file>'`. Only regular files are read, so a
+/// device or FIFO that never reaches end of file is refused, and the read stops
+/// after `max_bytes`, which also bounds a file that grows while it is read.
+fn read_copy_file(filename: &str, max_bytes: u64) -> Result<String> {
+    use std::io::Read;
+
+    let cannot_read = |e: std::io::Error| {
+        LimboError::ParseError(format!("COPY FROM: cannot read '{filename}': {e}"))
+    };
+    let too_large = || {
+        sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            format!("COPY FROM: '{filename}' exceeds the {max_bytes}-byte limit"),
+        )
+    };
+    // Checked before opening, because opening a FIFO waits for a writer.
+    let metadata = std::fs::metadata(filename).map_err(cannot_read)?;
+    if !metadata.is_file() {
+        return Err(LimboError::ParseError(format!(
+            "COPY FROM: '{filename}' is not a regular file"
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+    let file = std::fs::File::open(filename).map_err(cannot_read)?;
+    let mut data = String::new();
+    file.take(max_bytes + 1)
+        .read_to_string(&mut data)
+        .map_err(cannot_read)?;
+    if data.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    Ok(data)
+}
+
 fn prepare_copy_rows(
     stmt: &PgCopyFromStmt,
     column_count: usize,
 ) -> Result<(String, Vec<Vec<Option<String>>>)> {
-    let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
-    })?;
+    let data = read_copy_file(&stmt.filename, MAX_COPY_FILE_BYTES)?;
 
     let table_name = match &stmt.schema_name {
         Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
@@ -3192,5 +3249,27 @@ mod tests {
         );
         // Writes must now be allowed.
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+
+    #[test]
+    fn copy_from_reads_only_bounded_regular_files() {
+        use super::read_copy_file;
+        use turso_pg_parser::sqlstate::SQLSTATE_PROGRAM_LIMIT_EXCEEDED;
+
+        let path = std::env::temp_dir().join(format!("turso_copy_test_{}.tsv", std::process::id()));
+        std::fs::write(&path, "1\tone\n2\ttwo\n").unwrap();
+        let file = path.to_str().unwrap();
+
+        assert_eq!(read_copy_file(file, 1024).unwrap(), "1\tone\n2\ttwo\n");
+
+        let sqlstate_of = |e| crate::error::ErrorReport::from(&e).sqlstate;
+        let too_large = read_copy_file(file, 4).unwrap_err();
+        assert_eq!(sqlstate_of(too_large), SQLSTATE_PROGRAM_LIMIT_EXCEEDED);
+
+        let directory = std::env::temp_dir();
+        let not_a_file = read_copy_file(directory.to_str().unwrap(), 1024).unwrap_err();
+        assert!(not_a_file.to_string().contains("not a regular file"));
+
+        std::fs::remove_file(&path).unwrap();
     }
 }
