@@ -571,6 +571,46 @@ expect error {
     no such column
 }
 
+test and-or-with-a-constant-operand-still-checks-a-function-name-in-a-trigger-when {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN 1 OR nosuchfunc(new.a) BEGIN INSERT INTO later_log VALUES (1); END;
+    INSERT INTO later VALUES (1);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+# Names are resolved in source order, so a column the WHEN clause cannot
+# resolve is reported before a function after it.
+
+test a-trigger-when-reports-an-unknown-column-before-a-function-after-it {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN g = 2 AND 1 AND nosuchfunc(new.a) BEGIN INSERT INTO later_log VALUES (1); END;
+    INSERT INTO later VALUES (1);
+}
+expect error {
+    no such column: g
+}
+
+# `x AND 0` is decided by SQLite's parser, so a trigger WHEN clause drops an
+# unknown column name there too, and the row is inserted.
+
+test and-with-integer-zero-drops-an-unknown-column-name-in-a-trigger-when {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN 0 AND nosuchcol BEGIN INSERT INTO later_log VALUES (1); END;
+    CREATE TRIGGER later_tr2 AFTER INSERT ON later WHEN new.nosuchcol AND 0 AND new.a BEGIN INSERT INTO later_log VALUES (2); END;
+    INSERT INTO later VALUES (1);
+    SELECT a FROM later;
+    SELECT count(*) FROM later_log;
+}
+expect {
+    1
+    0
+}
+
 test and-or-with-a-constant-operand-still-checks-a-name-in-an-upsert {
     CREATE TABLE later(a PRIMARY KEY, b);
     INSERT INTO later VALUES (1, 1);
