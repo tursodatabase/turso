@@ -276,11 +276,7 @@ pub(crate) fn emit_array_decode(
     let Some(resolved) = resolve_array_element_type(col, resolver)? else {
         return Ok(());
     };
-    if resolved
-        .chain
-        .iter()
-        .all(|td| td.decode_returns_value_unchanged())
-    {
+    if resolved.decode_returns_value_unchanged() {
         return Ok(());
     }
     emit_array_leaf_loop(
