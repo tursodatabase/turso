@@ -124,11 +124,13 @@ fn expr_calls_function(expr: &Expr) -> bool {
 /// when one operand is an integer literal or TRUE/FALSE
 /// (sqlite3ExprSimplifiedAndOr), so the other operand never runs:
 /// `SELECT 1 OR json_extract('bare', '$.a')` is 1 and
-/// `CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 ...` does not run
-/// the subquery. In [BINDING_REWRITES] it runs after binding, so names in the
-/// dropped operand are still checked, and before subquery planning, so the
-/// subquery is never planned or emitted. A HAVING clause applies it after
-/// its terms have moved to WHERE or not, because SQLite decides that before
+/// `(SELECT abs(-9223372036854775807 - 1)) OR 1` does not run the subquery.
+/// In [BINDING_REWRITES] it runs after binding, so names in the dropped
+/// operand are still checked. An operand with a subquery waits for the
+/// subquery planner, which resolves the names inside the subquery first and
+/// then drops the operand, so the subquery is never emitted (see
+/// subquery::get_subquery_parser). A HAVING clause applies it after its
+/// terms have moved to WHERE or not, because SQLite decides that before
 /// this fold. An expression that is translated without binding, like a
 /// column DEFAULT, gets the same fold when its bytecode is emitted (see
 /// [and_or_truth_value]).
@@ -142,7 +144,9 @@ impl StaticRewrite for AndOrConstantOperand {
     ) -> Result<WalkControl> {
         // The operand that replaces the node can be an AND or OR of the same
         // shape: `(x AND 0) AND y` becomes `x AND 0`, which becomes `0`.
-        while replace_and_or_with_deciding_operand(expr, resolver)? {}
+        while replace_and_or_with_deciding_operand(expr, resolver, &mut |dropped| {
+            Ok(!expr_contains_subquery(dropped))
+        })? {}
         Ok(WalkControl::Continue)
     }
 }
@@ -151,11 +155,13 @@ impl StaticRewrite for AndOrConstantOperand {
 /// other, as sqlite3ExprSimplifiedAndOr does. The deciding operand is a
 /// literal, which becomes the 0 or 1 the AND or OR would have given (`0 OR 5`
 /// is 1, not 5), or an AND or OR whose own operands decide it, which is kept
-/// as it is, so `5 AND 0 AND x` keeps `5 AND 0`. Returns true when `expr`
-/// was replaced.
-fn replace_and_or_with_deciding_operand(
+/// as it is, so `5 AND 0 AND x` keeps `5 AND 0`. `may_drop` sees the operand
+/// about to go and says whether it goes now. Returns true when `expr` was
+/// replaced.
+pub(crate) fn replace_and_or_with_deciding_operand(
     expr: &mut ast::Expr,
     resolver: Option<&Resolver<'_>>,
+    may_drop: &mut dyn FnMut(&ast::Expr) -> Result<bool>,
 ) -> Result<bool> {
     let Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) = expr else {
         return Ok(false);
@@ -181,6 +187,9 @@ fn replace_and_or_with_deciding_operand(
     // UPSERT DO UPDATE does, is still checked when it is resolved, so the
     // operand that holds it stays until then.
     if expr_contains_unresolved_column_name(dropped) {
+        return Ok(false);
+    }
+    if !may_drop(dropped)? {
         return Ok(false);
     }
     let kept_is_and_or = matches!(

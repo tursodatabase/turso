@@ -123,7 +123,8 @@ pub(crate) use emission::{
 };
 pub use metadata::ConditionMetadata;
 pub(crate) use rewrite::{
-    apply_static_rewrites, AndWithIntegerZero, BetweenToComparisons, BINDING_REWRITES,
+    apply_static_rewrites, replace_and_or_with_deciding_operand, AndWithIntegerZero,
+    BetweenToComparisons, BINDING_REWRITES,
 };
 pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
@@ -137,7 +138,7 @@ pub use vectors::expr_vector_size;
 pub(crate) use walk::expression_can_fail_on_input;
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
-    expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_outer_query, expr_references_subquery_id, walk_expr, walk_expr_mut,
-    WalkControl,
+    expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
+    expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
+    walk_expr, walk_expr_mut, WalkControl,
 };
