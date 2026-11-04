@@ -712,7 +712,15 @@ fn check_bound_expr_up_to_a_subquery(expr: &ast::Expr, resolver: &Resolver<'_>) 
                 reached_a_subquery = true;
                 return Ok(WalkControl::SkipChildren);
             }
-            Expr::FunctionCall { name, args, .. } => {
+            // An ordered-set aggregate, `percentile_cont(0.5) WITHIN GROUP
+            // (ORDER BY x)`, has its own name list in the planner (see
+            // planner::build_ordered_set_aggregate).
+            Expr::FunctionCall {
+                name,
+                args,
+                within_group,
+                ..
+            } if within_group.is_empty() => {
                 match resolver.resolve_function(name.as_str(), args.len())? {
                     None => crate::bail_parse_error!("no such function: {}", name.as_str()),
                     Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,

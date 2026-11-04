@@ -691,14 +691,27 @@ fn translate_case_expr(
         )?;
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            when_expr,
-            expr_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        // A WHEN without a base is a condition, which SQLite compiles with
+        // sqlite3ExprIfFalse, so an AND or OR there skips an operand once
+        // the other decides it, as it does in WHERE.
+        let jumped_on_condition = base_reg.is_none()
+            && translate_and_or_condition_jump(
+                program,
+                referenced_tables,
+                when_expr,
+                next_case_label,
+                resolver,
+            )?;
+        if !jumped_on_condition {
+            translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                when_expr,
+                expr_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
@@ -721,6 +734,7 @@ fn translate_case_expr(
                     &ExprContext::new(referenced_tables, resolver),
                 )?,
             }),
+            None if jumped_on_condition => {}
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
                 reg: expr_reg,
@@ -1490,63 +1504,27 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::Iif => {
                     let args = expect_arguments_min!(args, 2, srf);
-
-                    let iif_end_label = program.allocate_label();
-                    let condition_reg = program.alloc_register();
-
-                    for pair in args.chunks_exact(2) {
-                        let condition_expr = &pair[0];
-                        let value_expr = &pair[1];
-                        let next_check_label = program.allocate_label();
-
-                        translate_expr_no_constant_opt(
-                            program,
-                            referenced_tables,
-                            condition_expr,
-                            condition_reg,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-
-                        program.emit_insn(Insn::IfNot {
-                            reg: condition_reg,
-                            target_pc: next_check_label,
-                            jump_if_null: true,
-                        });
-
-                        translate_expr_no_constant_opt(
-                            program,
-                            referenced_tables,
-                            value_expr,
-                            target_register,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-                        program.emit_insn(Insn::Goto {
-                            target_pc: iif_end_label,
-                        });
-
-                        program.preassign_label_to_next_insn(next_check_label);
-                    }
-
-                    if args.len() % 2 != 0 {
-                        translate_expr_no_constant_opt(
-                            program,
-                            referenced_tables,
-                            args.last().unwrap(),
-                            target_register,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-                    } else {
-                        program.emit_insn(Insn::Null {
-                            dest: target_register,
-                            dest_end: None,
-                        });
-                    }
-
-                    program.preassign_label_to_next_insn(iif_end_label);
-                    Ok(target_register)
+                    // SQLite's parser turns iif(c, t, f) into
+                    // CASE WHEN c THEN t ELSE f END, so the condition is
+                    // compiled as a CASE WHEN condition is, and an AND or OR
+                    // in it skips an operand once the other decides it.
+                    let mut pairs = args.chunks_exact(2);
+                    let when_then_pairs = (&mut pairs)
+                        .map(|pair| (pair[0].clone(), pair[1].clone()))
+                        .collect();
+                    let else_expr = pairs.remainder().first().cloned();
+                    let case = ast::Expr::Case {
+                        base: None,
+                        when_then_pairs,
+                        else_expr,
+                    };
+                    translate_case_expr(
+                        program,
+                        referenced_tables,
+                        &case,
+                        target_register,
+                        resolver,
+                    )
                 }
 
                 ScalarFunc::Glob | ScalarFunc::Like => {

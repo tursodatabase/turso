@@ -248,6 +248,47 @@ pub(super) fn translate_in_list(
     Ok(())
 }
 
+/// Compiles an AND or OR that decides a jump, as the condition of a CASE
+/// WHEN without a base or an aggregate's FILTER clause does, through the
+/// jumps of [translate_condition_expr], as SQLite's sqlite3ExprIfFalse
+/// does for them: control goes to `jump_target_when_false` when the
+/// condition is false or NULL, and an operand is skipped once the other
+/// has decided the result, so `CASE WHEN a = 0 AND json_extract(b, '$.a')
+/// THEN 'y' ELSE 'n' END` never runs the function for a row with `a = 1`.
+/// Returns false for any other expression, and for an expression
+/// translated without tables, as a CHECK constraint is: the caller
+/// evaluates those into a register and tests it, as before.
+pub fn translate_and_or_condition_jump(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    jump_target_when_false: BranchOffset,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let is_and_or = matches!(
+        unwrap_parens(expr)?,
+        ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
+    );
+    let Some(referenced_tables) = referenced_tables.filter(|_| is_and_or) else {
+        return Ok(false);
+    };
+    let jump_target_when_true = program.allocate_label();
+    translate_condition_expr(
+        program,
+        referenced_tables,
+        expr,
+        ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true,
+            jump_target_when_false,
+            jump_target_when_null: jump_target_when_false,
+        },
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(jump_target_when_true);
+    Ok(true)
+}
+
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
