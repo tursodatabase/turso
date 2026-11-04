@@ -106,7 +106,7 @@ pub use binding::{
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column};
-pub use condition::translate_condition_expr;
+pub use condition::{translate_and_or_condition_jump, translate_condition_expr};
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
