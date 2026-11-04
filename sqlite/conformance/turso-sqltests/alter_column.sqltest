@@ -350,10 +350,45 @@ expect {
 # Adding a stored generated column via ALTER TABLE should error
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
     ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {
     cannot add a STORED column
+}
+
+test alter-column-read-by-stored-column-error {
+    CREATE TABLE t(a INTEGER, s AS (a || '') STORED);
+    ALTER TABLE t ALTER COLUMN a TO a REAL;
+}
+expect error {
+    cannot alter a STORED column or a column that a STORED column uses
+}
+
+test alter-column-read-by-stored-column-through-virtual-error {
+    CREATE TABLE t(a INTEGER, v AS (a * 2) VIRTUAL, s AS (v || '') STORED);
+    ALTER TABLE t ALTER COLUMN a TO a TEXT COLLATE NOCASE;
+}
+expect error {
+    cannot alter a STORED column or a column that a STORED column uses
+}
+
+test alter-column-stored-column-error {
+    CREATE TABLE t(a, s AS (a * 2) STORED);
+    ALTER TABLE t ALTER COLUMN s TO s AS (a * 3);
+}
+expect error {
+    cannot alter a STORED column or a column that a STORED column uses
+}
+
+test alter-column-not-read-by-stored-column-with-rows {
+    CREATE TABLE t(a INTEGER, b INTEGER, s AS (a || '') STORED);
+    INSERT INTO t VALUES (5, 6);
+    ALTER TABLE t ALTER COLUMN b TO b REAL;
+    SELECT a, typeof(b), s FROM t;
+}
+expect {
+    5|real|5
 }
 
 test alter-column-only-to-generated-error {
