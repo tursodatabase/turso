@@ -14,7 +14,7 @@ use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
-use crate::{bail_constraint_error, LimboError, ValueRef};
+use crate::{LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
     jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
@@ -265,7 +265,9 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
 pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
     if let ValueRef::Blob(blob) = value {
         if !is_jsonb_blob(blob) {
-            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+            return Err(LimboError::SqlError(
+                "JSON cannot hold BLOB values".to_string(),
+            ));
         }
     }
     Ok(())
@@ -788,7 +790,12 @@ fn json_path_from_db_value<'a>(
                     ],
                 }));
             }
-            _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
+            _ => {
+                return Err(LimboError::SqlError(format!(
+                    "JSON path error near: {:?}",
+                    path.to_string()
+                )))
+            }
         },
     };
     Ok(Some(json_path_from_text(text, strict)?))
@@ -912,7 +919,9 @@ where
 {
     let mut values = values.into_iter();
     if values.len() % 2 != 0 {
-        bail_constraint_error!("json_object() requires an even number of arguments")
+        return Err(LimboError::SqlError(
+            "json_object() requires an even number of arguments".to_string(),
+        ));
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50)?;
 
@@ -925,7 +934,9 @@ where
         })?;
         let first = first.as_value_ref();
         if first.value_type() != ValueType::Text {
-            bail_constraint_error!("json_object() labels must be TEXT")
+            return Err(LimboError::SqlError(
+                "json_object() labels must be TEXT".to_string(),
+            ));
         }
         let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
@@ -953,7 +964,9 @@ where
 {
     let mut values = values.into_iter();
     if values.len() % 2 != 0 {
-        bail_constraint_error!("json_object() requires an even number of arguments")
+        return Err(LimboError::SqlError(
+            "json_object() requires an even number of arguments".to_string(),
+        ));
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50)?;
 
@@ -966,7 +979,9 @@ where
         })?;
         let first = first.as_value_ref();
         if first.value_type() != ValueType::Text {
-            bail_constraint_error!("json_object() labels must be TEXT")
+            return Err(LimboError::SqlError(
+                "json_object() labels must be TEXT".to_string(),
+            ));
         }
         let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
@@ -1116,7 +1131,9 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
                 let json = Jsonb::from_raw_data(blob)?;
                 Ok(Value::Text(Text::json(json.to_string()?)))
             } else {
-                crate::bail_constraint_error!("JSON cannot hold BLOB values")
+                Err(LimboError::SqlError(
+                    "JSON cannot hold BLOB values".to_string(),
+                ))
             }
         }
         ValueRef::Null => Ok(Value::Text(Text::json("null".to_string()))),

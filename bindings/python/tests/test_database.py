@@ -510,6 +510,10 @@ def test_decimal_parameter_is_rejected(provider):
         "SELECT 'a' LIKE 'a' ESCAPE 'xx'",
         "SELECT 'a' LIKE printf('%.*c', 50001, 'a')",
         "SELECT 'a' GLOB printf('%.*c', 50001, 'a')",
+        "SELECT json_object(1, 2)",
+        "SELECT json_set('{}', '$.a')",
+        "SELECT json_insert('{}', '$.a')",
+        "SELECT json_replace('{}', '$.a')",
     ],
 )
 def test_sql_error_raises_operational_error(provider, sql):
