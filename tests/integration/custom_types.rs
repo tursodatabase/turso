@@ -994,4 +994,153 @@ mod tests {
             conn.close().unwrap();
         }
     }
+
+    /// Types whose values cannot be compared: comparing their stored text or
+    /// blob would give other answers than PostgreSQL.
+    const TYPES_WITHOUT_COMPARISON: &[&str] = &[
+        "json", "jsonb", "inet", "cidr", "macaddr", "macaddr8", "doc", "point", "number",
+    ];
+
+    const TYPES_WITH_COMPARISON: &[&str] = &[
+        "integer",
+        "text",
+        "uuid",
+        "boolean",
+        "smallint",
+        "bigint",
+        "numeric(10,2)",
+        "varchar(10)",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "bytea",
+        "cents",
+        "positive",
+    ];
+
+    /// Statements that compare values of the columns `c` and `d`, of type
+    /// `{ty}`, or that make a column of that type a key. `{n}` is replaced by a
+    /// number that is different for each statement, so tables and indexes they
+    /// create don't clash.
+    const COMPARISONS: &[&str] = &[
+        "SELECT c = d FROM t",
+        "SELECT c <> d FROM t",
+        "SELECT c < d FROM t",
+        "SELECT c >= d FROM t",
+        "SELECT c IS d FROM t",
+        "SELECT c IS NOT d FROM t",
+        "SELECT c BETWEEN d AND d FROM t",
+        "SELECT c IN (d) FROM t",
+        "SELECT c FROM t WHERE c IN (SELECT d FROM t)",
+        "SELECT (c, 1) = (d, 1) FROM t",
+        "SELECT nullif(c, d) FROM t",
+        "SELECT CASE c WHEN d THEN 1 END FROM t",
+        "SELECT coalesce(c, d) = d FROM t",
+        "SELECT count(*) FROM t GROUP BY c",
+        "SELECT DISTINCT c FROM t",
+        "SELECT count(DISTINCT c) FROM t",
+        "SELECT c FROM t ORDER BY c",
+        "SELECT c FROM t ORDER BY +c",
+        "SELECT min(c) FROM t",
+        "SELECT max(c) FROM t",
+        "SELECT c FROM t UNION SELECT d FROM t",
+        "SELECT c FROM t UNION ALL SELECT d FROM t",
+        "SELECT c FROM t INTERSECT SELECT d FROM t",
+        "SELECT c FROM t EXCEPT SELECT d FROM t",
+        "SELECT row_number() OVER (PARTITION BY c) FROM t",
+        "SELECT row_number() OVER (ORDER BY c) FROM t",
+        "SELECT count(*) FROM t a JOIN t b ON a.c = b.d",
+        "SELECT count(*) FROM t a LEFT JOIN t b ON a.c = b.d",
+        "CREATE INDEX i{n} ON t(c)",
+        "CREATE INDEX i{n} ON t((c))",
+        "CREATE INDEX i{n} ON t(id) WHERE c = d",
+        "CREATE TABLE u{n}(k {ty} PRIMARY KEY) STRICT",
+        "CREATE TABLE u{n}(k {ty} UNIQUE) STRICT",
+        "CREATE TABLE u{n}(id INTEGER PRIMARY KEY, k {ty}, UNIQUE(k)) STRICT",
+        "CREATE TABLE u{n}(k {ty} REFERENCES t(id)) STRICT",
+        "ALTER TABLE t ADD COLUMN k{n} {ty} REFERENCES t(id)",
+        "SELECT ARRAY[c] FROM t",
+        "SELECT array_agg(c) FROM t",
+        "CREATE TABLE u{n}(k {ty}[]) STRICT",
+    ];
+
+    /// Errors that some of the statements above give for other reasons: a
+    /// STRUCT or UNION column cannot be indexed, and an array of numeric would
+    /// not compare its elements in numeric order.
+    const OTHER_ERRORS: &[&str] = &[
+        "cannot create index on STRUCT/UNION column",
+        "arrays of type numeric are not supported",
+    ];
+
+    /// Statements that read, write or test for NULL values of `c` and `d`
+    /// without comparing them, which work for every type.
+    const NOT_COMPARISONS: &[&str] = &[
+        "SELECT c, d FROM t",
+        "SELECT c IS NULL, c IS NOT NULL, c ISNULL, c NOTNULL, c NOT NULL FROM t",
+        "SELECT c = NULL FROM t",
+        "SELECT * FROM (SELECT c FROM t)",
+        "WITH w AS (SELECT c FROM t) SELECT c FROM w",
+        "SELECT coalesce(c, d) FROM t",
+        "SELECT CAST(c AS text) = 'x' FROM t",
+        "SELECT c FROM t ORDER BY CAST(c AS text)",
+        "SELECT count(c) FROM t",
+        "CREATE INDEX i{n} ON t(CAST(c AS text))",
+        "CREATE VIEW v{n} AS SELECT c FROM t",
+        "INSERT INTO t(c, d) SELECT d, c FROM t",
+        "UPDATE t SET c = d",
+        "DELETE FROM t WHERE c IS NULL RETURNING c",
+    ];
+
+    /// Every statement that compares values of a type without a comparison is
+    /// an error, and the same statements work for types that have one.
+    #[test]
+    fn test_types_without_comparison_refuse_every_comparison() {
+        let mut wrong = Vec::new();
+        for (types, refused) in [
+            (TYPES_WITHOUT_COMPARISON, true),
+            (TYPES_WITH_COMPARISON, false),
+        ] {
+            for ty in types {
+                let (_db, conn) = database_with_table_of_type(ty);
+                for (n, template) in COMPARISONS.iter().enumerate() {
+                    let sql = template.replace("{ty}", ty).replace("{n}", &n.to_string());
+                    match (conn.execute(&sql), refused) {
+                        (Err(e), true) if e.to_string().contains("cannot be compared") => {}
+                        (Err(e), _) if OTHER_ERRORS.iter().any(|o| e.to_string().contains(o)) => {}
+                        (Ok(()), false) => {}
+                        (result, _) => wrong.push(format!("{ty}: {sql}: {result:?}")),
+                    }
+                }
+                for (n, template) in NOT_COMPARISONS.iter().enumerate() {
+                    let n = COMPARISONS.len() + n;
+                    let sql = template.replace("{ty}", ty).replace("{n}", &n.to_string());
+                    if let Err(e) = conn.execute(&sql) {
+                        wrong.push(format!("{ty}: {sql}: {e}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    fn database_with_table_of_type(ty: &str) -> (TempDatabase, Arc<turso_core::Connection>) {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        for sql in [
+            "CREATE DOMAIN doc AS json",
+            "CREATE TYPE point AS STRUCT(x INT, y INT)",
+            "CREATE TYPE number AS UNION(i INT, f REAL)",
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<'",
+            "CREATE DOMAIN positive AS integer CHECK (value > 0)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        conn.execute(format!(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, c {ty}, d {ty}) STRICT"
+        ))
+        .unwrap();
+        (db, conn)
+    }
 }

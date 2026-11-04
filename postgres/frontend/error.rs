@@ -282,6 +282,12 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("cannot drop type")
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
+    } else if msg.starts_with("values of type ") && msg.contains(" cannot be compared; ") {
+        SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.starts_with("column '") && msg.contains(" cannot be a key: values of type ") {
+        SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.starts_with("arrays of type ") && msg.contains(" cannot be compared") {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("no such table")

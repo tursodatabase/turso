@@ -310,6 +310,27 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
     }
 }
 
+/// Built-in types whose stored values don't compare the way PostgreSQL compares
+/// the type, so they are not compared at all. json has no comparison in
+/// PostgreSQL. jsonb ignores key order, inet and cidr compare address bytes and
+/// masks, and macaddr accepts several spellings of one address, none of which
+/// comparing the stored text or blob does.
+fn builtin_has_comparison(type_name: &str) -> bool {
+    !matches!(
+        type_name,
+        "json" | "jsonb" | "inet" | "cidr" | "macaddr" | "macaddr8"
+    )
+}
+
+/// The error for an array whose elements have `element_type`, whose values
+/// can't be compared.
+pub(crate) fn array_without_comparison_error(element_type: &TypeDef) -> crate::LimboError {
+    crate::LimboError::ParseError(format!(
+        "arrays of type {} are not supported, because values of type {} cannot be compared",
+        element_type.name, element_type.name
+    ))
+}
+
 /// Operators on built-in types. User types have none: `x + 1` on a user type is
 /// an error. The functions read plain values as they are, so nothing is encoded first:
 /// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
@@ -548,6 +569,20 @@ impl TypeDef {
         match &self.kind {
             TypeDefKind::Custom { ordering, .. } => *ordering,
             _ => None,
+        }
+    }
+
+    /// Whether values of the type itself can be compared, sorted, grouped and
+    /// used as keys. STRUCT and UNION values can't: their stored bytes don't
+    /// compare field by field. A domain or a type based on another type also
+    /// needs that type to have a comparison; [Schema::type_without_comparison]
+    /// checks the whole chain.
+    pub fn has_comparison(&self) -> bool {
+        match &self.kind {
+            TypeDefKind::Custom { .. } => {
+                !self.is_builtin || builtin_has_comparison(&self.name.to_lowercase())
+            }
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => false,
         }
     }
 
@@ -1834,6 +1869,37 @@ impl Schema {
             .ordering()
     }
 
+    /// Whether values of `type_def` can be compared: neither it nor any type it
+    /// is based on lacks a comparison (see [TypeDef::has_comparison]). A type
+    /// that can't be resolved has none.
+    pub fn type_has_comparison(&self, type_def: &TypeDef) -> bool {
+        match self.resolve_type_unchecked(&type_def.name) {
+            Ok(Some(resolved)) => resolved.chain.iter().all(|td| td.has_comparison()),
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    /// Fails when `column` can't be a key (an index, UNIQUE, PRIMARY KEY or
+    /// FOREIGN KEY column) because values of its type can't be compared.
+    pub fn check_key_column_has_comparison(
+        &self,
+        column: &Column,
+        is_strict: bool,
+    ) -> crate::Result<()> {
+        use crate::translate::expr::expr_type::{column_type, type_without_comparison};
+        let ty = column_type(column, is_strict, self);
+        let Some(type_def) = type_without_comparison(&ty, self) else {
+            return Ok(());
+        };
+        crate::bail_parse_error!(
+            "column '{}' of type '{}{}' cannot be a key: values of type {} cannot be compared",
+            column.name.as_deref().unwrap_or_default(),
+            column.ty_str,
+            "[]".repeat(column.array_dimensions() as usize),
+            type_def.name
+        );
+    }
+
     /// Fails when `element_type` has its own order, as numeric does. Array
     /// elements compare by their stored form, which does not sort in the
     /// type's order.
@@ -1847,6 +1913,11 @@ impl Schema {
                 type_def.name,
                 type_def.name
             );
+        }
+        // Array functions such as array_position and @> compare elements
+        // without asking how their type compares.
+        if !self.type_has_comparison(type_def) {
+            return Err(array_without_comparison_error(type_def));
         }
         Ok(())
     }
@@ -5306,6 +5377,26 @@ impl BTreeTable {
         for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
             if let Some((_, column)) = self.get_column(&key.name) {
                 key_collation(key.collation, column.type_ordering())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails when a column of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table has a type whose values can't be compared. Call this after
+    /// [Self::resolve_custom_types].
+    pub(crate) fn check_keys_have_comparison(&self, schema: &Schema) -> Result<()> {
+        let unique_columns = self
+            .unique_sets
+            .iter()
+            .flat_map(|set| set.columns.iter().map(|key| key.name.as_str()));
+        let foreign_columns = self
+            .foreign_keys
+            .iter()
+            .flat_map(|fk| fk.child_columns.iter().map(String::as_str));
+        for name in unique_columns.chain(foreign_columns) {
+            if let Some((_, column)) = self.get_column(name) {
+                schema.check_key_column_has_comparison(column, self.is_strict)?;
             }
         }
         Ok(())

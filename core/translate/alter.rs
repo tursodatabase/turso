@@ -1342,7 +1342,8 @@ pub fn translate_alter_table(
             // added column. Without this, columns typed with a domain would
             // silently skip domain-level enforcement after ALTER TABLE.
             resolver.with_schema(database_id, |schema| {
-                btree.propagate_domain_constraints(schema)
+                btree.propagate_domain_constraints(schema)?;
+                btree.check_keys_have_comparison(schema)
             })?;
             // Refresh local `column` from btree so that domain NOT NULL is
             // visible to the empty-table check below.
@@ -1954,6 +1955,25 @@ pub fn translate_alter_table(
                 table.resolve_custom_types(resolver.schema());
                 let column = &table.columns()[column_index];
                 key_collation(column.text_collation(), column.type_ordering())?;
+                // Indexes, including those of UNIQUE and PRIMARY KEY, and
+                // FOREIGN KEYs still name the column by its old name.
+                let is_key_column =
+                    table_indexes
+                        .iter()
+                        .flat_map(|index| &index.columns)
+                        .any(|index_column| {
+                            index_column.expr.is_none() && index_column.pos_in_table == column_index
+                        })
+                        || btree
+                            .foreign_keys
+                            .iter()
+                            .flat_map(|fk| fk.child_columns.iter())
+                            .any(|name| name.eq_ignore_ascii_case(old_column_name));
+                if is_key_column {
+                    resolver
+                        .schema()
+                        .check_key_column_has_comparison(column, table.is_strict)?;
+                }
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()

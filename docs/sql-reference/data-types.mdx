@@ -142,6 +142,9 @@ Turso provides several built-in custom types available in STRICT tables:
 | `uuid` | BLOB | UUID stored as 16-byte blob, displayed as string |
 | `bytea` | BLOB | Binary data (PostgreSQL-compatible alias) |
 | `inet` | TEXT | IP address |
+| `cidr` | TEXT | IP network |
+| `macaddr` | TEXT | MAC address (6 bytes) |
+| `macaddr8` | TEXT | MAC address (8 bytes) |
 | `json` | TEXT | Validated JSON text |
 | `jsonb` | BLOB | JSON in binary format |
 
@@ -161,6 +164,27 @@ INSERT INTO events VALUES (
     1,
     '{"venue": "online"}'
 );
+```
+
+#### Types whose values cannot be compared
+
+Values of `json`, `jsonb`, `inet`, `cidr`, `macaddr` and `macaddr8` are stored as the text or blob they were written as, and comparing that would give other answers than PostgreSQL. For example, PostgreSQL treats jsonb `'{"a":1,"b":2}'` and `'{"b":2,"a":1}'` as equal, and the same for inet `'::1'` and `'0:0:0:0:0:0:0:1'`. So any statement that compares these values is an error. The same applies to domains over these types, to STRUCT and UNION types, and to the result of `->` on a json or jsonb value. That covers:
+
+- `=`, `<`, `IS`, `IN`, `BETWEEN`, `CASE x WHEN` and `nullif`
+- `GROUP BY`, `DISTINCT`, `ORDER BY`, `PARTITION BY`, `min` and `max`
+- joins on these columns, and `UNION`, `INTERSECT` and `EXCEPT`. `UNION ALL` is refused too, even though it does not compare rows.
+- `PRIMARY KEY`, `UNIQUE`, `REFERENCES` and indexes on these columns
+- arrays of these types (`json[]`, `ARRAY[inet_column]`, `array_agg(json_column)`), because array functions compare elements
+
+`IS NULL` and `IS NOT NULL` still work. To compare the stored text, cast it:
+
+```sql
+CREATE TABLE docs(id INTEGER PRIMARY KEY, body json) STRICT;
+INSERT INTO docs VALUES (1, '{"a":1}');
+SELECT id FROM docs WHERE body = '{"a":1}';
+-- error: values of type json cannot be compared; to compare their text, CAST them to text
+SELECT id FROM docs WHERE CAST(body AS text) = '{"a":1}';
+-- 1
 ```
 
 For the full custom types reference including ENCODE/DECODE/COERCE, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
@@ -186,6 +210,8 @@ SELECT id, platform.telegram, platform.slack FROM contacts ORDER BY id;
 -- 1|12345|
 -- 2||U0ABC
 ```
+
+STRUCT and UNION values cannot be compared as a whole; compare their fields instead, as in `pos.x > 5` above. See [Types whose values cannot be compared](#types-whose-values-cannot-be-compared).
 
 For the full composite types reference, see [CREATE TYPE — Composite Types](/docs/sql-reference/statements/create-type#composite-types-struct-and-union).
 
@@ -223,7 +249,7 @@ INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '["a","b"]', '[0, 1, 1]');
 
 Arrays are displayed as JSON arrays on output. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements.
 
-Arrays compare element by element, each element by its stored value: in an `INTEGER[]`, `'{1}'` and `'{1.0}'` are equal, while in a `TEXT[]` they are the different texts `'1'` and `'1.0'`. Because of this, an array of a type with its own order, such as `numeric[]`, is an error: its elements would not compare in that type's order.
+Arrays compare element by element, each element by its stored value: in an `INTEGER[]`, `'{1}'` and `'{1.0}'` are equal, while in a `TEXT[]` they are the different texts `'1'` and `'1.0'`. Because of this, an array of a type with its own order, such as `numeric[]`, is an error: its elements would not compare in that type's order. Arrays of [types whose values cannot be compared](#types-whose-values-cannot-be-compared), such as `json[]`, are an error too.
 
 For the full set of array functions, operators, and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
 

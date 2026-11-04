@@ -10,7 +10,7 @@ use turso_parser::ast;
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
-use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
+use crate::schema::{array_without_comparison_error, BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
@@ -609,6 +609,32 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
     }
 }
 
+/// The custom type of `ty` when values of it can't be compared (see
+/// [TypeDef::has_comparison]), or of its elements when `ty` is an array.
+pub(crate) fn type_without_comparison<'a>(
+    ty: &'a ExprType,
+    schema: &Schema,
+) -> Option<&'a Arc<TypeDef>> {
+    match ty {
+        ExprType::Custom { type_def, .. } => {
+            (!schema.type_has_comparison(type_def)).then_some(type_def)
+        }
+        ExprType::Array { element, .. } => type_without_comparison(element, schema),
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::Unknown => None,
+    }
+}
+
+/// Fails when `element`, an element of an array being built by `ARRAY[...]`
+/// or array_agg, has a type whose values can't be compared. Array functions
+/// such as array_position and `@>` compare elements without asking how their
+/// type compares.
+pub(crate) fn check_array_element_compares(element: &ExprType, schema: &Schema) -> Result<()> {
+    match type_without_comparison(element, schema) {
+        Some(type_def) => Err(array_without_comparison_error(type_def)),
+        None => Ok(()),
+    }
+}
+
 /// Custom types only apply to columns of STRICT tables.
 pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> ExprType {
     let scalar = match schema.get_type_def(&column.ty_str, is_strict) {
@@ -727,8 +753,23 @@ fn binary_type(
             }
             ExprType::Builtin(BuiltinType::Text)
         }
-        Operator::ArrowRight | Operator::ArrowRightShift => affinity_type(expr, env),
+        // As in PostgreSQL, `->` on a json or jsonb value gives a json value,
+        // whose comparisons are refused, rather than text compared by its
+        // characters. `->>` gives text.
+        Operator::ArrowRight => json_extract_type(&type_of(lhs, env), env.schema())
+            .unwrap_or_else(|| affinity_type(expr, env)),
+        Operator::ArrowRightShift => affinity_type(expr, env),
     }
+}
+
+/// The json type when `operand` is a value whose type cannot be compared, such
+/// as json or jsonb.
+fn json_extract_type(operand: &ExprType, schema: &Schema) -> Option<ExprType> {
+    type_without_comparison(operand, schema)?;
+    Some(ExprType::Custom {
+        type_def: Arc::clone(schema.get_type_def_unchecked("json")?),
+        params: Vec::new(),
+    })
 }
 
 /// The type of the operator expression `expr` when a custom type's function runs
@@ -1042,6 +1083,15 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // coalesce(money_column, 2) is a numeric.
         (a, b) if is_domain(&a) || is_domain(&b) => {
             common_scalar_type(without_domain(a, schema), without_domain(b, schema), schema)
+        }
+        // A type whose values cannot be compared stays that type when mixed with
+        // another one, so that comparing the result is refused instead of
+        // comparing stored text: coalesce(inet_column, cidr_column) is an inet,
+        // as in PostgreSQL.
+        (custom @ ExprType::Custom { .. }, _) | (_, custom @ ExprType::Custom { .. })
+            if type_without_comparison(&custom, schema).is_some() =>
+        {
+            custom
         }
         // A number mixed with a type that computes with exact numbers is a value
         // of that type without parameters: coalesce(numeric_column, 0) is a

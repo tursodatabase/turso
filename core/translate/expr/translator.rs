@@ -1231,6 +1231,13 @@ fn translate_function_call_expr(
                 // Arity and custom-types checks are done at bind time
                 // in validate_custom_type_function_call.
                 ScalarFunc::Array => {
+                    let context = ExprContext::new(referenced_tables, resolver);
+                    for arg in args {
+                        check_array_element_compares(
+                            &type_of(arg, &context.type_env()),
+                            resolver.schema(),
+                        )?;
+                    }
                     translate_variadic_insn!(
                         program,
                         referenced_tables,

@@ -1,4 +1,5 @@
 use crate::alloc::TursoVecExt;
+use crate::translate::expr::expr_type::{check_array_element_compares, type_of};
 use crate::translate::expr_context::ExprContext;
 use turso_parser::ast;
 
@@ -746,6 +747,11 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("array_agg bad number of arguments");
             }
+            let context = ExprContext::new(Some(referenced_tables), resolver);
+            check_array_element_compares(
+                &type_of(agg_arg_source.arg_at(0), &context.type_env()),
+                resolver.schema(),
+            )?;
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {

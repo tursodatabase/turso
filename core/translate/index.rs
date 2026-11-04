@@ -10,12 +10,12 @@ use crate::schema::{
 use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
-    collate::{key_collation, CollationSeq, TextCollation},
+    collate::{key_collation, no_comparison_error, CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::expr_type::{type_of, type_ordering, TypeEnv},
+    expr::expr_type::{type_of, type_ordering, type_without_comparison, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
         translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
@@ -238,6 +238,9 @@ pub fn translate_create_index(
                             col.name
                         );
                     }
+                    resolver
+                        .schema()
+                        .check_key_column_has_comparison(column, tbl.is_strict)?;
                     if column.type_ordering().is_none() && !type_def.is_sortable() {
                         bail_parse_error!(
                             "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
@@ -1151,6 +1154,9 @@ pub(crate) fn expression_type_ordering(
     let mut expr = expr.clone();
     crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
     let ty = type_of(&expr, &TypeEnv::over_table(table, schema, syms));
+    if let Some(type_def) = type_without_comparison(&ty, schema) {
+        return Err(no_comparison_error(&ty, type_def));
+    }
     Ok(type_ordering(&ty, schema))
 }
 

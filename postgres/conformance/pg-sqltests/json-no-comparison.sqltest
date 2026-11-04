@@ -1,0 +1,93 @@
+# json values cannot be compared: PostgreSQL has no equality or ordering
+# operator for json. Every way of comparing them is an error, and IS NULL and
+# casts to text still work.
+
+@database :memory:
+
+test json-equals-errors {
+    CREATE TABLE t(j json);
+    SELECT j = j FROM t;
+}
+@sqlstate 42883
+expect error {}
+
+test json-less-than-errors {
+    CREATE TABLE t(j json);
+    SELECT j < j FROM t;
+}
+@sqlstate 42883
+expect error {}
+
+test json-in-list-errors {
+    CREATE TABLE t(j json);
+    SELECT j IN ('{}') FROM t;
+}
+@sqlstate 42883
+expect error {}
+
+test json-group-by-errors {
+    CREATE TABLE t(j json);
+    SELECT count(*) FROM t GROUP BY j;
+}
+@sqlstate 42883
+expect error {}
+
+test json-distinct-errors {
+    CREATE TABLE t(j json);
+    SELECT DISTINCT j FROM t;
+}
+@sqlstate 42883
+expect error {}
+
+test json-order-by-errors {
+    CREATE TABLE t(j json);
+    SELECT j FROM t ORDER BY j;
+}
+@sqlstate 42883
+expect error {}
+
+test json-union-errors {
+    CREATE TABLE t(j json);
+    SELECT j FROM t UNION SELECT j FROM t;
+}
+@sqlstate 42883
+expect error {}
+
+test json-join-errors {
+    CREATE TABLE t(j json);
+    SELECT count(*) FROM t a JOIN t b ON a.j = b.j;
+}
+@sqlstate 42883
+expect error {}
+
+test json-primary-key-errors {
+    CREATE TABLE t(j json PRIMARY KEY);
+}
+@sqlstate 42704
+expect error {}
+
+test json-unique-errors {
+    CREATE TABLE t(j json UNIQUE);
+}
+@sqlstate 42704
+expect error {}
+
+test json-create-index-errors {
+    CREATE TABLE t(j json);
+    CREATE INDEX t_j ON t(j);
+}
+@sqlstate 42704
+expect error {}
+
+test json-null-tests-and-text-comparisons-work {
+    CREATE TABLE t(id integer PRIMARY KEY, j json);
+    INSERT INTO t VALUES (1, '{"a":1}'), (2, NULL);
+    SELECT id FROM t WHERE j IS NULL;
+    SELECT id FROM t WHERE j IS NOT NULL;
+    SELECT id FROM t WHERE CAST(j AS text) = '{"a":1}';
+}
+expect {
+    2
+    1
+    1
+}

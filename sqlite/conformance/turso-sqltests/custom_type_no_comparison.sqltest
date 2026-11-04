@@ -1,0 +1,366 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# Values of json, jsonb, inet, cidr, macaddr, macaddr8, STRUCT and UNION types
+# cannot be compared. Comparing their stored text or blob would give other
+# answers than PostgreSQL: jsonb '{"a":1,"b":2}' equals '{"b":2,"a":1}', inet
+# '::1' equals '0:0:0:0:0:0:0:1', and macaddr '08:00:2b:01:02:03' equals
+# '08-00-2b-01-02-03'. Every way of comparing them is an error instead.
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-equals {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j = '{}' FROM t;
+}
+expect error {
+    values of type json cannot be compared; to compare their text, CAST them to text
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-jsonb-equals-ignores-key-order-in-postgresql {
+    CREATE TABLE t(j jsonb) STRICT;
+    INSERT INTO t VALUES ('{"a":1,"b":2}');
+    SELECT j = '{"b":2,"a":1}' FROM t;
+}
+expect error {
+    values of type jsonb cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-inet-less-than {
+    CREATE TABLE t(a inet, b inet) STRICT;
+    SELECT a < b FROM t;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-cidr-in-list {
+    CREATE TABLE t(c cidr) STRICT;
+    SELECT c IN ('10.0.0.0/8') FROM t;
+}
+expect error {
+    values of type cidr cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-macaddr-group-by {
+    CREATE TABLE t(m macaddr) STRICT;
+    INSERT INTO t VALUES ('08:00:2b:01:02:03'), ('08-00-2b-01-02-03');
+    SELECT count(*) FROM t GROUP BY m;
+}
+expect error {
+    values of type macaddr cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-macaddr8-distinct {
+    CREATE TABLE t(m macaddr8) STRICT;
+    SELECT DISTINCT m FROM t;
+}
+expect error {
+    values of type macaddr8 cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-order-by {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j FROM t ORDER BY +j;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-aggregates {
+    CREATE TABLE t(j json) STRICT;
+    SELECT count(DISTINCT j) FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-min {
+    CREATE TABLE t(j json) STRICT;
+    SELECT min(j) FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-partition-by {
+    CREATE TABLE t(j json) STRICT;
+    SELECT row_number() OVER (PARTITION BY j) FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-join {
+    CREATE TABLE t(j json) STRICT;
+    SELECT count(*) FROM t a JOIN t b ON a.j = b.j;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-union {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j FROM t UNION SELECT j FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+# UNION ALL does not compare its rows, but its columns' collations are worked
+# out like those of UNION, so it is refused too.
+@requires strict "uses STRICT tables"
+test no-comparison-json-union-all {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j FROM t UNION ALL SELECT j FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-domain-over-json {
+    CREATE DOMAIN doc AS json;
+    CREATE TABLE t(d doc) STRICT;
+    SELECT d = '{}' FROM t;
+}
+expect error {
+    values of type doc cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-struct {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(p point) STRICT;
+    SELECT p = struct_pack(1, 2) FROM t;
+}
+expect error {
+    values of type point cannot be compared; compare their fields instead
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-union-type {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE t(n number) STRICT;
+    SELECT DISTINCT n FROM t;
+}
+expect error {
+    values of type number cannot be compared; compare their fields instead
+}
+
+# coalesce of an inet and a cidr is an inet, as in PostgreSQL, so comparing it
+# is refused instead of comparing their text.
+@requires strict "uses STRICT tables"
+test no-comparison-coalesce-of-inet-and-cidr {
+    CREATE TABLE t(i inet, c cidr) STRICT;
+    SELECT coalesce(i, c) = coalesce(c, i) FROM t;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+# `->` on jsonb gives json, as in PostgreSQL, so comparing it is refused.
+@requires strict "uses STRICT tables"
+test no-comparison-json-arrow-result {
+    CREATE TABLE t(j jsonb) STRICT;
+    SELECT j -> 'a' = '{"y":2,"x":1}' FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+# ============================================================================
+# Keys and indexes
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-primary-key {
+    CREATE TABLE t(j json PRIMARY KEY) STRICT;
+}
+expect error {
+    column 'j' of type 'json' cannot be a key: values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-inet-unique {
+    CREATE TABLE t(a inet UNIQUE) STRICT;
+}
+expect error {
+    column 'a' of type 'inet' cannot be a key: values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-domain-over-json-unique {
+    CREATE DOMAIN doc AS json;
+    CREATE TABLE t(d doc UNIQUE) STRICT;
+}
+expect error {
+    column 'd' of type 'doc' cannot be a key: values of type doc cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-create-index {
+    CREATE TABLE t(j json) STRICT;
+    CREATE INDEX t_j ON t(j);
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-expression-index {
+    CREATE TABLE t(j json) STRICT;
+    CREATE INDEX t_j ON t((j));
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-foreign-key-child {
+    CREATE TABLE p(k text PRIMARY KEY) STRICT;
+    CREATE TABLE c(j json REFERENCES p(k)) STRICT;
+}
+expect error {
+    column 'j' of type 'json' cannot be a key: values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-add-column-references {
+    CREATE TABLE p(k text PRIMARY KEY) STRICT;
+    CREATE TABLE c(x integer) STRICT;
+    ALTER TABLE c ADD COLUMN j json REFERENCES p(k);
+}
+expect error {
+    column 'j' of type 'json' cannot be a key: values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-alter-indexed-column-to-json {
+    CREATE TABLE t(c text) STRICT;
+    CREATE INDEX t_c ON t(c);
+    ALTER TABLE t ALTER COLUMN c TO c2 json;
+}
+expect error {
+    column 'c2' of type 'json' cannot be a key: values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-alter-column-in-expression-index-to-json {
+    CREATE TABLE t(c text) STRICT;
+    CREATE INDEX t_c ON t(coalesce(c, ''));
+    ALTER TABLE t ALTER COLUMN c TO c2 json;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+# ============================================================================
+# Arrays: array functions such as array_position and `@>` compare elements
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-column {
+    CREATE TABLE t(a cidr[]) STRICT;
+}
+expect error {
+    arrays of type cidr are not supported, because values of type cidr cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-constructor {
+    CREATE TABLE t(m macaddr) STRICT;
+    SELECT ARRAY[m] FROM t;
+}
+expect error {
+    arrays of type macaddr are not supported, because values of type macaddr cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-agg {
+    CREATE TABLE t(j json) STRICT;
+    SELECT array_agg(j) FROM t;
+}
+expect error {
+    arrays of type json are not supported, because values of type json cannot be compared
+}
+
+test no-comparison-array-cast {
+    SELECT CAST('{}' AS inet[]);
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+# ============================================================================
+# What still works
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test no-comparison-null-tests-work {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j json, i inet) STRICT;
+    INSERT INTO t VALUES (1, '{}', NULL), (2, NULL, '1.2.3.4');
+    SELECT id FROM t WHERE j IS NULL;
+    SELECT id FROM t WHERE i IS NOT NULL;
+    SELECT id FROM t WHERE j NOTNULL;
+    SELECT id, j = NULL FROM t ORDER BY id;
+}
+expect {
+    2
+    2
+    1
+    1|
+    2|
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-cast-to-text-compares {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j json, i inet) STRICT;
+    INSERT INTO t VALUES (1, '{"a":1}', '1.2.3.4'), (2, '{"b":2}', '1.2.3.5');
+    CREATE INDEX t_i ON t(CAST(i AS text));
+    SELECT id FROM t WHERE CAST(j AS text) = '{"a":1}';
+    SELECT id FROM t ORDER BY CAST(i AS text) DESC;
+    SELECT id FROM t WHERE j ->> 'b' = 2;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-reads-and-writes-work {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j jsonb, m macaddr) STRICT;
+    INSERT INTO t VALUES (1, '{"a":{"x":1}}', '08:00:2b:01:02:03');
+    UPDATE t SET j = j -> 'a' WHERE id = 1;
+    INSERT INTO t SELECT id + 1, j, m FROM t;
+    SELECT id, j, m FROM (SELECT * FROM t) ORDER BY id;
+    DELETE FROM t WHERE id = 2 RETURNING id, j;
+}
+expect {
+    1|{"x":1}|08:00:2b:01:02:03
+    2|{"x":1}|08:00:2b:01:02:03
+    2|{"x":1}
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-struct-fields-compare {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(1, 2)), (2, struct_pack(3, 4));
+    SELECT id FROM t WHERE p.x = 3 ORDER BY p.y;
+}
+expect {
+    2
+}

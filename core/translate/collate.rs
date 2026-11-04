@@ -3,16 +3,18 @@ use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, UnaryOperator};
+use turso_parser::ast::{Expr, Literal, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
-    schema::Schema,
+    schema::{Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType},
+        expr::expr_type::{
+            query_column_type, type_of, type_ordering, type_without_comparison, ExprType,
+        },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
     },
@@ -505,6 +507,20 @@ pub fn comparison_collation_across_queries(
     rhs: &Expr,
     rhs_context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    // A comparison with the NULL literal never compares two values, so it
+    // works on a type whose values can't be compared. `c IS NULL` is parsed as
+    // one.
+    let compares_with_null = |operand: &Expr, other: &Expr, other_context: &ExprContext| {
+        matches!(operand, Expr::Literal(Literal::Null))
+            && type_without_comparison(
+                &type_of(other, &other_context.type_env()),
+                other_context.schema(),
+            )
+            .is_some()
+    };
+    if compares_with_null(lhs, rhs, rhs_context) || compares_with_null(rhs, lhs, lhs_context) {
+        return Ok(CollationSeq::BINARY);
+    }
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
         return Ok(CollationSeq::Type(ordering));
     }
@@ -542,8 +558,8 @@ pub fn in_subquery_collation(
     let rhs_order = operand_order(
         &query_column_type(query, column, resolver),
         resolver.schema(),
-    );
-    let lhs_order = expr_operand_order(lhs, &lhs_context);
+    )?;
+    let lhs_order = expr_operand_order(lhs, &lhs_context)?;
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
     if let Some(ordering) = common_ordering([lhs_order, rhs_order], has_collate)? {
         return Ok(CollationSeq::Type(ordering));
@@ -656,7 +672,7 @@ fn common_type_ordering<'a, 'c, 's: 'c>(
             has_collate |= has_collate_operator(expr);
             expr_operand_order(expr, context.borrow())
         })
-        .collect();
+        .collect::<Result<_>>()?;
     common_ordering(orders, has_collate)
 }
 
@@ -735,19 +751,42 @@ enum OperandOrder {
     ArrayOfUnknownElements,
 }
 
-fn expr_operand_order(expr: &Expr, context: &ExprContext<'_, '_>) -> OperandOrder {
+fn expr_operand_order(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<OperandOrder> {
     let ty = type_of(expr, &context.type_env());
     operand_order(&ty, context.schema())
 }
 
-fn operand_order(ty: &ExprType, schema: &Schema) -> OperandOrder {
-    if ty.is_array_of_unknown_elements() {
-        return OperandOrder::ArrayOfUnknownElements;
+/// Fails when values of type `ty` can't be compared. Every comparison, sort
+/// key, grouping key and hash key asks for the order of its operands here.
+fn operand_order(ty: &ExprType, schema: &Schema) -> Result<OperandOrder> {
+    if let Some(type_def) = type_without_comparison(ty, schema) {
+        return Err(no_comparison_error(ty, type_def));
     }
-    match type_ordering(ty, schema) {
+    if ty.is_array_of_unknown_elements() {
+        return Ok(OperandOrder::ArrayOfUnknownElements);
+    }
+    Ok(match type_ordering(ty, schema) {
         Some(ordering) => OperandOrder::Type(ordering),
         None => OperandOrder::None,
-    }
+    })
+}
+
+/// The error for comparing values of `ty`, whose custom type, or element type,
+/// is `type_def`.
+pub(crate) fn no_comparison_error(ty: &ExprType, type_def: &TypeDef) -> LimboError {
+    let brackets = match ty {
+        ExprType::Array { dimensions, .. } => "[]".repeat(*dimensions as usize),
+        _ => String::new(),
+    };
+    let instead = if type_def.is_struct() || type_def.is_union() {
+        "compare their fields instead"
+    } else {
+        "to compare their text, CAST them to text"
+    };
+    LimboError::ParseError(format!(
+        "values of type {}{brackets} cannot be compared; {instead}",
+        type_def.name
+    ))
 }
 
 /// The collation of one expression, or None when it has none (SQLite's
