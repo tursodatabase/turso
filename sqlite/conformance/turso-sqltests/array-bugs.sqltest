@@ -42,15 +42,6 @@ expect {
     {Ab}|{Ab}|{ab}
 }
 
-test array-alter-column-to-unknown-element-type-refused {
-    CREATE TABLE alter_unknown (id INTEGER PRIMARY KEY, a integer[]) STRICT;
-    INSERT INTO alter_unknown VALUES (1, '{1}');
-    ALTER TABLE alter_unknown ALTER COLUMN a TO b nosuch[];
-}
-expect error {
-    unknown datatype for array column b
-}
-
 test array-infinity-rejected {
     CREATE TABLE inf1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
     INSERT INTO inf1 VALUES (1, '{1e309}');

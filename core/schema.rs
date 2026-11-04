@@ -7860,13 +7860,12 @@ impl Column {
     /// so it follows its element type.
     pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
         let ordering = if self.is_array() {
-            // A type that fails to resolve has no ordering, so the answer is
-            // "differs": the index then serves only `=`, the safe answer.
-            schema
-                .resolve_type(&self.ty_str, is_strict)
-                .ok()
-                .flatten()
-                .and_then(|resolved| resolved.ordering())
+            match schema.resolve_type(&self.ty_str, is_strict) {
+                Ok(resolved) => resolved.and_then(|resolved| resolved.ordering()),
+                // Resolving fails only for a circular type chain or when out of
+                // memory. Answer "differs", so the index serves only `=`.
+                Err(_) => return true,
+            }
         } else {
             self.type_ordering
         };

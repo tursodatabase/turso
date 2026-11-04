@@ -12,8 +12,8 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        validate_check_expr, validate_default_expr, validate_generated_function_calls,
-        SQLITE_TABLEID,
+        check_column_type, validate_check_expr, validate_default_expr,
+        validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
@@ -38,8 +38,8 @@ use crate::{
         trigger::create_trigger_to_sql,
     },
     util::{
-        check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
-        normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        check_expr_references_column, escape_sql_string_literal, normalize_ident,
+        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
         rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -1179,49 +1179,8 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let default_type_mismatch;
-            {
-                let ty = column.ty_str.as_str();
-                if btree.is_strict && ty.is_empty() {
-                    return Err(LimboError::ParseError(format!(
-                        "missing datatype for {table_name}.{new_column_name}"
-                    )));
-                }
-                let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
-                let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
-                if column.is_array() {
-                    resolver
-                        .schema()
-                        .check_array_element_type(&normalize_ident(ty))?;
-                }
-                // Domain types require STRICT tables because domain constraints
-                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
-                if !is_builtin && !btree.is_strict {
-                    let type_def = resolver
-                        .schema()
-                        .get_type_def_unchecked(&normalize_ident(ty));
-                    if let Some(td) = type_def {
-                        if td.is_domain {
-                            return Err(LimboError::ParseError(format!(
-                                "domain type columns require STRICT tables: {table_name}.{new_column_name}"
-                            )));
-                        }
-                    }
-                }
-
-                if !is_builtin && btree.is_strict {
-                    let type_def = resolver
-                        .schema()
-                        .get_type_def_unchecked(&normalize_ident(ty));
-                    if type_def.is_none() {
-                        return Err(LimboError::ParseError(format!(
-                            "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
-                        )));
-                    }
-                }
-
-                default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
-            }
+            check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema());
                 key_collation(column.text_collation(), column.type_ordering())?;
@@ -1793,6 +1752,12 @@ pub fn translate_alter_table(
                 match rename {
                     true => (false, false, None),
                     false => {
+                        check_column_type(
+                            &definition,
+                            table_name,
+                            btree.is_strict,
+                            resolver.schema(),
+                        )?;
                         let replacement_column =
                             btree.column_for_alter(column_index, &definition)?;
                         let old_column = &btree.columns()[column_index];
