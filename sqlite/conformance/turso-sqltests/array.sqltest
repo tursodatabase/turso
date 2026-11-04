@@ -352,11 +352,30 @@ test array-boolean-decode-roundtrip {
     CREATE TABLE t24 (id INTEGER PRIMARY KEY, flags boolean[]) STRICT;
     INSERT INTO t24 VALUES (1, '{true, false}');
     INSERT INTO t24 VALUES (2, '{false, false, true}');
+    INSERT INTO t24 VALUES (3, ARRAY[NULL, true, NULL, false, NULL]);
+    INSERT INTO t24 VALUES (4, ARRAY[NULL, NULL]);
+    INSERT INTO t24 VALUES (5, ARRAY[]);
+    INSERT INTO t24 VALUES (6, NULL);
     SELECT id, flags, array_length(flags) FROM t24 ORDER BY id;
 }
 expect {
     1|{1,0}|2
     2|{0,0,1}|3
+    3|{NULL,1,NULL,0,NULL}|5
+    4|{NULL,NULL}|2
+    5|{}|0
+    6||
+}
+
+test array-custom-decode-skips-null-elements {
+    CREATE TYPE null_sensitive BASE integer ENCODE value
+        DECODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'NULL reached decoder') ELSE value + 1 END;
+    CREATE TABLE null_sensitive_arrays (v null_sensitive[]) STRICT;
+    INSERT INTO null_sensitive_arrays VALUES (ARRAY[NULL, 1, NULL, 2, NULL]);
+    SELECT v FROM null_sensitive_arrays;
+}
+expect {
+    {NULL,2,NULL,3,NULL}
 }
 
 test array-subscript-on-null {

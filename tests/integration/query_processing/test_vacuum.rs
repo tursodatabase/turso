@@ -3954,6 +3954,36 @@ fn test_vacuum_into_preserves_custom_types() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_vacuum_into_preserves_null_array_elements() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flags boolean[]) STRICT")?;
+    conn.execute(
+        "INSERT INTO t VALUES
+         (1, ARRAY[NULL, true, NULL, false, NULL]),
+         (2, ARRAY[NULL, NULL]), (3, ARRAY[]), (4, NULL)",
+    )?;
+    let query = "SELECT id, hex(flags) FROM t ORDER BY id";
+    let source_rows: Vec<(i64, String)> = conn.exec_rows(query);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("null_array_elements.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+    let dest_rows: Vec<(i64, String)> = dest_conn.exec_rows(query);
+    assert_eq!(dest_rows, source_rows);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let flags: Vec<(String,)> = dest_conn.exec_rows("SELECT flags FROM t WHERE id = 1");
+    assert_eq!(flags, vec![("{NULL,1,NULL,0,NULL}".to_string(),)]);
+
+    Ok(())
+}
+
 /// VACUUM INTO must preserve custom types that carry non-monotonic encoders
 /// and indexes on them. The copied destination must still order
 /// through the preserved index and remain usable for new schema objects that
