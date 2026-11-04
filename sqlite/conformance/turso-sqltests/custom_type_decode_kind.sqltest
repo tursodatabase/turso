@@ -194,6 +194,18 @@ expect error {
     cannot create domain b: index t_c already casts to it
 }
 
+# Recreating a with DECODE CAST(value AS b) would make reading a column of
+# either type run the two DECODEs in turn without end.
+@requires strict "uses STRICT tables"
+test drop-type-refused-when-another-type-decodes-to-it {
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS text);
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a);
+    DROP TYPE a;
+}
+expect error {
+    cannot drop type a: type b depends on it
+}
+
 @requires strict "uses STRICT tables"
 test create-type-refused-when-it-casts-to-itself {
     -- Reading a column of a would run a's DECODE again without end.

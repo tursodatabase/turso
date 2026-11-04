@@ -459,10 +459,7 @@ fn register_column_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ExprType> {
         return None;
     };
     let column = env.resolver()?.register_columns.get(register)?;
-    Some(stored_operand_type(
-        column.column_type.clone(),
-        env.schema(),
-    ))
+    Some(stored_operand_type(column.column_type.clone()))
 }
 
 /// The expression inside parentheses, COLLATE and unary `+`, which give their
@@ -696,7 +693,7 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
         ExprType::Array { element, .. } => {
             // Elements compare by their stored form.
             let element_is_text = matches!(
-                stored_operand_type(element.as_ref().clone(), schema),
+                stored_operand_type(element.as_ref().clone()),
                 ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped
             );
             Some(if element_is_text {
@@ -864,8 +861,8 @@ pub(super) fn sqlite_operand_type(ty: ExprType) -> ExprType {
 
 /// Like [`sqlite_operand_type`], for a value in its stored form: a custom
 /// value is a value of the type it is stored as.
-fn stored_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
-    operand_type(ty, |type_def| stored_type(type_def, schema))
+fn stored_operand_type(ty: ExprType) -> ExprType {
+    operand_type(ty, stored_type)
 }
 
 /// The type an operand has for SQLite's own arithmetic, where `custom_type`
@@ -908,13 +905,9 @@ fn negated_type(ty: ExprType) -> ExprType {
     }
 }
 
-/// The built-in type a custom type's values are stored as: its base type, after
-/// following domains and custom types built on other custom types.
-fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
-    let Ok(Some(resolved)) = schema.resolve_type_unchecked(&type_def.name) else {
-        return ExprType::Builtin(BuiltinType::Any);
-    };
-    ExprType::Builtin(primitive_value_type(&resolved.primitive).unwrap_or(BuiltinType::Any))
+/// The built-in type a custom type's values are stored as.
+fn stored_type(type_def: &TypeDef) -> ExprType {
+    ExprType::Builtin(type_def.stored_type().unwrap_or(BuiltinType::Any))
 }
 
 /// The kind of value a custom type or domain reads as, worked out when the
@@ -961,6 +954,15 @@ fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
     match schema.get_type_def_unchecked(base) {
         Some(type_def) => type_def.value_type(),
         None => primitive_value_type(base),
+    }
+}
+
+/// The kind of value a type stores: that of its BASE, which is a SQLite type
+/// or, for a domain, the type the domain is based on.
+pub(crate) fn stored_value_type(type_def: &TypeDef, schema: &Schema) -> Option<BuiltinType> {
+    match schema.get_type_def_unchecked(type_def.base()) {
+        Some(base) => base.stored_type(),
+        None => primitive_value_type(type_def.base()),
     }
 }
 

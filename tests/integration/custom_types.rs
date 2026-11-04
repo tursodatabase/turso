@@ -370,6 +370,74 @@ mod tests {
         );
     }
 
+    /// CREATE TYPE refuses a DECODE whose kind can't be worked out, so a
+    /// stored type with one must not open and compare by a guessed kind.
+    #[test]
+    fn test_reopen_fails_when_stored_type_reads_as_no_known_kind() {
+        let err = reopen_after_storing_type_sql(
+            "CREATE TYPE r(value any) BASE integer ENCODE value DECODE round(value)",
+        );
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value DECODE of type r returns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CREATE DOMAIN refuses a base type that does not exist yet, so a stored
+    /// domain based on itself must not open and use its values as a guessed kind.
+    #[test]
+    fn test_reopen_fails_when_stored_type_stores_no_known_kind() {
+        let err = reopen_after_storing_type_sql("CREATE DOMAIN r AS r");
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value type r stores"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Creates type `r` and a table using it, replaces the stored SQL of `r`
+    /// with `type_sql`, and returns the error from opening the database again.
+    fn reopen_after_storing_type_sql(type_sql: &str) -> String {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_stored_type_sql.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE r(value any) BASE text ENCODE value DECODE CAST(value AS real)",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t(a r) STRICT").unwrap();
+            conn.execute("INSERT INTO t VALUES ('10')").unwrap();
+
+            conn.start_nested();
+            let stmt = conn.prepare(format!(
+                "UPDATE __turso_internal_types SET sql = '{type_sql}' WHERE name = 'r'"
+            ));
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        match turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        ) {
+            Ok(_) => panic!("open must fail for stored type SQL {type_sql}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
     #[test]
     fn test_schema_reparse_fails_when_stored_custom_type_does_not_parse() {
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
