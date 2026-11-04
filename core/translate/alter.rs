@@ -12,8 +12,8 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        validate_check_expr, validate_default_expr, validate_generated_function_calls,
-        SQLITE_TABLEID,
+        translate_check_and_generated_exprs, validate_check_expr, validate_default_expr,
+        validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
@@ -1901,6 +1901,12 @@ pub fn translate_alter_table(
                     replacement_column.name.as_deref(),
                 ) {
                     table.rename_column_in_keys(old_name, new_name);
+                    // As the stored CREATE TABLE is rewritten when the
+                    // statement runs.
+                    for check in &mut table.check_constraints {
+                        rename_identifiers(&mut check.expr, old_name, new_name);
+                        check.source = None;
+                    }
                 }
                 table.columns_mut()[column_index] = replacement_column.clone();
                 // An inline REFERENCES in the new definition is a new FOREIGN KEY
@@ -1932,6 +1938,7 @@ pub fn translate_alter_table(
                         validate_check_expr(expr, &table.name, &column_names, &resolver.catalog)?;
                     }
                 }
+                translate_check_and_generated_exprs(&table, resolver, namespace)?;
                 Some(table)
             } else {
                 None
