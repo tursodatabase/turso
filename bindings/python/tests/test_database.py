@@ -249,15 +249,22 @@ def test_writer_waits_for_lock_held_by_another_connection(provider, timeout_kwar
         (-1, 0),
         (float("nan"), 0),
         (float("-inf"), 0),
-        (float("inf"), 2147483647),
-        (2e16, 2147483647),
-        (1e30, 2147483647),
     ],
 )
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_timeout_sets_busy_timeout_in_milliseconds(provider, timeout, busy_timeout):
     conn = connect(provider, ":memory:", timeout=timeout)
     assert conn.execute("PRAGMA busy_timeout").fetchall() == [(busy_timeout,)]
+    conn.close()
+
+
+# sqlite3 converts these with a C `(int)` cast, which is undefined for values
+# that do not fit: x86-64 gives 0 and arm64 gives 2147483647. Turso always
+# waits as long as an int allows.
+@pytest.mark.parametrize("timeout", [float("inf"), 2e16, 1e30])
+def test_timeout_too_large_for_int_waits_longest_possible(timeout):
+    conn = turso.connect(":memory:", timeout=timeout)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(2147483647,)]
     conn.close()
 
 
