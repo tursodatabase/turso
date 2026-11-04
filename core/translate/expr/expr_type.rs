@@ -64,6 +64,22 @@ pub(crate) enum BuiltinType {
     Any,
 }
 
+impl BuiltinType {
+    /// The name SQLite gives the type, so that SQLite's NUMERIC, whose values are
+    /// integers or reals, isn't mistaken for the custom numeric type. A decimal
+    /// written in the statement is a REAL to SQLite.
+    pub(crate) fn sqlite_name(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real | Self::Decimal => "REAL",
+            Self::Numeric => "NUMERIC",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
+}
+
 impl ExprType {
     pub(crate) fn array(element: ExprType, dimensions: u32) -> Self {
         match element {

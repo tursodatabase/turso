@@ -2756,7 +2756,7 @@ fn check_range_offset_type(
             crate::bail_parse_error!(
                 "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
                  {order_type} and an offset of SQLite type {}; cast the offset to integer",
-                sqlite_type_name(builtin)
+                builtin.sqlite_name()
             )
         }
         (
@@ -2845,20 +2845,6 @@ fn declared_range_offsets(type_def: &TypeDef) -> RangeOffsets {
     type_def
         .range_offsets
         .expect("a type that is not a domain declares its RANGE offsets")
-}
-
-/// The name SQLite gives the type, so that SQLite's NUMERIC, whose values are
-/// integers or reals, isn't mistaken for the custom numeric type. A decimal
-/// written in the statement is a REAL to SQLite.
-fn sqlite_type_name(ty: BuiltinType) -> &'static str {
-    match ty {
-        BuiltinType::Integer => "INTEGER",
-        BuiltinType::Real | BuiltinType::Decimal => "REAL",
-        BuiltinType::Numeric => "NUMERIC",
-        BuiltinType::Text => "TEXT",
-        BuiltinType::Blob => "BLOB",
-        BuiltinType::Any => "ANY",
-    }
 }
 
 /// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.
