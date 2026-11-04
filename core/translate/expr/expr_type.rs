@@ -258,7 +258,7 @@ impl<'a> TypeEnv<'a> {
             .find(|param| param.name.eq_ignore_ascii_case(name))
         {
             Some(ast::TypeParam { ty: Some(ty), .. }) => {
-                builtin_type_of_affinity(Affinity::of_written_type(ty))
+                ExprType::Builtin(builtin_type_of_affinity(Affinity::of_written_type(ty)))
             }
             Some(ast::TypeParam { ty: None, .. }) => ExprType::Builtin(BuiltinType::Any),
             None => ExprType::Unknown,
@@ -681,7 +681,7 @@ fn field_type(
                 type_def: Arc::clone(type_def),
                 params: Vec::new(),
             },
-            None => builtin_type_of_affinity(Affinity::affinity(name)),
+            None => ExprType::Builtin(builtin_type_of_affinity(Affinity::affinity(name))),
         },
         None => ExprType::Unknown,
     }
@@ -728,8 +728,10 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
         }
         // An array column stores blobs, so its affinity says nothing about its
         // elements; the declared element type does.
-        None if column.is_array() => builtin_type_of_affinity(Affinity::affinity(&column.ty_str)),
-        None => builtin_type_of_affinity(column.affinity()),
+        None if column.is_array() => {
+            ExprType::Builtin(builtin_type_of_affinity(Affinity::affinity(&column.ty_str)))
+        }
+        None => ExprType::Builtin(builtin_type_of_affinity(column.affinity())),
     };
     ExprType::array(scalar, column.array_dimensions())
 }
@@ -741,7 +743,11 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
         None => match Affinity::of_written_type(&name) {
             // A CAST to BLOB always gives a blob.
             Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
-            affinity => builtin_type_of_affinity(affinity),
+            affinity @ (Affinity::Integer
+            | Affinity::Real
+            | Affinity::Numeric
+            | Affinity::Text
+            | Affinity::None) => ExprType::Builtin(builtin_type_of_affinity(affinity)),
         },
     };
     ExprType::array(scalar, type_name.array_dimensions)
@@ -959,17 +965,18 @@ fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
 }
 
 /// The kind of value a SQLite type such as `integer` holds. None for ANY.
-/// Unlike a column's affinity, a `blob` BASE holds only blobs.
 pub(crate) fn primitive_value_type(primitive: &str) -> Option<BuiltinType> {
     if primitive.eq_ignore_ascii_case("any") {
         return None;
     }
-    Some(match Affinity::affinity(primitive) {
-        Affinity::Integer => BuiltinType::Integer,
-        Affinity::Real => BuiltinType::Real,
-        Affinity::Numeric => BuiltinType::Numeric,
-        Affinity::Text => BuiltinType::Text,
+    let affinity = Affinity::affinity(primitive);
+    Some(match affinity {
+        // A BASE is stored like a STRICT column, so a `blob` BASE holds only
+        // blobs, while a blob column in a plain table holds any kind.
         Affinity::Blob | Affinity::None => BuiltinType::Blob,
+        Affinity::Integer | Affinity::Real | Affinity::Numeric | Affinity::Text => {
+            builtin_type_of_affinity(affinity)
+        }
     })
 }
 
@@ -1353,17 +1360,18 @@ fn affinity_type(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         Some(resolver) => get_expr_affinity(expr, &super::ExprContext::new(env.tables(), resolver)),
         None => get_expr_affinity(expr, &TableMetadata::new(env.tables())),
     };
-    builtin_type_of_affinity(affinity)
+    ExprType::Builtin(builtin_type_of_affinity(affinity))
 }
 
-fn builtin_type_of_affinity(affinity: Affinity) -> ExprType {
-    ExprType::Builtin(match affinity {
+/// The kind of value a column with `affinity` holds. A blob column holds any kind.
+fn builtin_type_of_affinity(affinity: Affinity) -> BuiltinType {
+    match affinity {
         Affinity::Integer => BuiltinType::Integer,
         Affinity::Real => BuiltinType::Real,
         Affinity::Numeric => BuiltinType::Numeric,
         Affinity::Text => BuiltinType::Text,
         Affinity::Blob | Affinity::None => BuiltinType::Any,
-    })
+    }
 }
 
 #[cfg(test)]
