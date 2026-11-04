@@ -40,6 +40,10 @@ A query of a role that joins a table with row-level security with `RIGHT JOIN`
 or `FULL JOIN` fails. Virtual tables that show the database file itself can
 only be read by a superuser.
 
+`SET ROLE` applies to the statements that start after it. A statement that
+is already running, such as a query a superuser started and is still reading
+rows from, keeps the role it started with until it finishes.
+
 Enabling row-level security for a table that already has it, or disabling it
 for a table that does not, does nothing. Renaming a table keeps its row-level
 security, and a new table created with the name of a dropped table starts
