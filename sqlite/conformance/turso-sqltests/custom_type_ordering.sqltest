@@ -897,6 +897,34 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-compared-with-date-in-row-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (SELECT d, 1) = ('x' COLLATE NOCASE, 1);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test where-term-or-true-rejects-collate-compared-with-date-in-row-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE (SELECT d, 1) = ('x' COLLATE NOCASE, 1) OR 1;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test collate-compared-with-text-in-row-subquery-applies {
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('A');
+    SELECT (SELECT s, 1) = ('a' COLLATE NOCASE, 1) FROM t;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
 test create-table-rejects-collate-on-date-column {
     CREATE TABLE t(d date COLLATE NOCASE) STRICT;
 }

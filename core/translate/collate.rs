@@ -12,7 +12,10 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType},
+        expr::{
+            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            row_value_component_expr, row_value_len,
+        },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
     },
@@ -837,15 +840,18 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
 }
 
 /// The check of [check_expr_collation] for `lhs` compared with `rhs`. Row
-/// values compare element by element, each pair with its own collation.
+/// values, as in `(SELECT d, 1) = ('x' COLLATE nocase, 1)`, compare element by
+/// element, each pair with its own collation, split as code generation splits
+/// them.
 fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
-    if let (Expr::Parenthesized(lhs), Expr::Parenthesized(rhs)) = (lhs, rhs) {
-        if lhs.len() > 1 && lhs.len() == rhs.len() {
-            return lhs
-                .iter()
-                .zip(rhs)
-                .try_for_each(|(lhs, rhs)| check_comparison(lhs, rhs, context));
+    let len = row_value_len(lhs)?.max(row_value_len(rhs)?);
+    if len > 1 {
+        for idx in 0..len {
+            let lhs = row_value_component_expr(lhs, idx)?;
+            let rhs = row_value_component_expr(rhs, idx)?;
+            check_comparison(&lhs, &rhs, context)?;
         }
+        return Ok(());
     }
     common_type_ordering([(lhs, context), (rhs, context)])?;
     Ok(())
@@ -907,6 +913,13 @@ fn operand_order(ty: &ExprType, schema: &Schema, has_collate: bool) -> Result<Op
         return Ok(OperandOrder::ArrayOfUnknownElements);
     }
     Ok(match type_ordering(ty, schema) {
+        // The values compare in the type's order, which no COLLATE changes, so
+        // a COLLATE here would be ignored.
+        Some(_) if has_collate => {
+            return Err(LimboError::ParseError(format!(
+                "collations are not supported by type {ty}"
+            )))
+        }
         Some(ordering) => OperandOrder::Type(ordering),
         None => OperandOrder::None,
     })
