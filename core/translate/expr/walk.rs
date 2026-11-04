@@ -452,19 +452,47 @@ pub(crate) fn check_function_calls(expr: &ast::Expr, resolver: &Resolver<'_>) ->
         resolver,
         FunctionCalls::WithSubqueries,
         &mut |call, func| {
-            let (name, args) = match call {
-                ast::Expr::FunctionCall { name, args, .. } => (name, args.as_slice()),
-                ast::Expr::FunctionCallStar { name, .. } => (name, &[][..]),
-                _ => unreachable!("walk_function_calls visits function calls only"),
-            };
-            match func {
-                None => crate::bail_parse_error!("no such function: {}", name.as_str()),
-                Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,
-                Some(_) => {}
-            }
+            reject_disallowed_function_call(call, func)?;
             Ok(WalkControl::Continue)
         },
     )
+}
+
+/// Fails for a function call SQLite's resolver rejects: a name no function
+/// has, or a likelihood() with a bad second argument. `func` is what the
+/// name resolved to, or None.
+pub(crate) fn reject_disallowed_function_call(call: &ast::Expr, func: Option<&Func>) -> Result<()> {
+    let (name, args) = match call {
+        ast::Expr::FunctionCall { name, args, .. } => (name, args.as_slice()),
+        ast::Expr::FunctionCallStar { name, .. } => (name, &[][..]),
+        _ => unreachable!("reject_disallowed_function_call takes a function call only"),
+    };
+    match func {
+        None => crate::bail_parse_error!("no such function: {}", name.as_str()),
+        Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// Checks the argument of every likelihood() call in `expr`, resolving each
+/// name with `resolve`. SQLite makes this check once names are resolved and
+/// no subquery or parameter is left, so a CHECK or generated-column
+/// expression runs it as a last pass over the whole tree.
+pub(crate) fn check_likelihood_calls(
+    expr: &ast::Expr,
+    resolve: impl Fn(&str, usize) -> Result<Option<Func>>,
+) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            if let Some(Func::Scalar(ScalarFunc::Likelihood)) = resolve(name.as_str(), args.len())?
+            {
+                check_likelihood_arguments(args)?;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// likelihood(x, p) takes a floating point constant p between 0.0 and 1.0,

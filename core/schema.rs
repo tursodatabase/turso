@@ -6840,17 +6840,8 @@ fn string_literal_eq(value: &str, expected: &str) -> bool {
 
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     validate_generated_expr_node(expr)?;
-    // SQLite checks the argument of likelihood() once every name is resolved
-    // and no subquery or parameter is left, so that check comes last.
-    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if let Expr::FunctionCall { name, args, .. } = e {
-            if let Some(Func::Scalar(crate::function::ScalarFunc::Likelihood)) =
-                Func::resolve_function(name.as_str(), args.len())?
-            {
-                crate::translate::expr::check_likelihood_arguments(args)?;
-            }
-        }
-        Ok(WalkControl::Continue)
+    crate::translate::expr::check_likelihood_calls(expr, |name, nargs| {
+        Func::resolve_function(name, nargs)
     })?;
     Ok(())
 }

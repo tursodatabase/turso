@@ -103,7 +103,10 @@ pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr, B
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
-pub use condition::{translate_and_or_condition_jump, translate_condition_expr};
+pub use condition::{
+    emit_jump_to_skip_unless_true, emit_jump_when_check_passes, translate_and_or_condition_jump,
+    translate_condition_expr,
+};
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
@@ -137,8 +140,9 @@ pub use utils::{
 pub(crate) use vectors::select_column_count;
 pub use vectors::{expr_vector_size, reject_row_value_misuse_at};
 pub(crate) use walk::{
-    check_function_calls, check_likelihood_arguments, expression_can_fail_on_input,
-    is_aggregate_or_window_function, reject_unknown_collation, walk_function_calls, FunctionCalls,
+    check_function_calls, check_likelihood_arguments, check_likelihood_calls,
+    expression_can_fail_on_input, is_aggregate_or_window_function, reject_disallowed_function_call,
+    reject_unknown_collation, walk_function_calls, FunctionCalls,
 };
 pub use walk::{
     expr_contains_function_that_changes_within_statement,

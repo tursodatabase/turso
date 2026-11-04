@@ -721,16 +721,12 @@ fn check_bound_expr_up_to_a_subquery(expr: &ast::Expr, resolver: &Resolver<'_>) 
                 within_group,
                 ..
             } if within_group.is_empty() => {
-                match resolver.resolve_function(name.as_str(), args.len())? {
-                    None => crate::bail_parse_error!("no such function: {}", name.as_str()),
-                    Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,
-                    Some(_) => {}
-                }
+                let func = resolver.resolve_function(name.as_str(), args.len())?;
+                reject_disallowed_function_call(e, func.as_ref())?;
             }
             Expr::FunctionCallStar { name, .. } => {
-                if resolver.resolve_function(name.as_str(), 0)?.is_none() {
-                    crate::bail_parse_error!("no such function: {}", name.as_str());
-                }
+                let func = resolver.resolve_function(name.as_str(), 0)?;
+                reject_disallowed_function_call(e, func.as_ref())?;
             }
             _ => {}
         }
