@@ -280,6 +280,21 @@ def test_cursor_rowcount_delete(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_lastrowid_after_insert_that_changes_no_rows(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+    cursor.execute("INSERT INTO test (id, email) VALUES (1, 'a')")
+
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO test (email) VALUES ('a') ON CONFLICT (email) DO NOTHING")
+
+    assert cursor.lastrowid == 1
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_cursor_fetchmany(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
