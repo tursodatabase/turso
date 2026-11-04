@@ -1110,7 +1110,8 @@ mod tests {
                 ty: "date[]",
                 strict: true,
                 stored: "ARRAY['2024-01-02']",
-                probe: "ARRAY['2024-01-02']",
+                // A bare ARRAY['2024-01-02'] is a text[].
+                probe: "CAST(ARRAY['2024-01-02'] AS date[])",
                 collate: Collate::Refused("date[]"),
             },
         ];

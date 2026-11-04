@@ -912,6 +912,8 @@ fn translate_collate_expr(
     // types that take no collation, such as `d COLLATE nocase` for a date d.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     resolver.resolve_collation(collation.as_str())?;
+    // Binding checks this too, but an upsert's DO UPDATE binds its expressions
+    // with its own code, so they are checked here.
     check_collate_operand(expr, &ExprContext::new(referenced_tables, resolver))?;
     Ok(target_register)
 }
