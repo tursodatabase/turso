@@ -105,3 +105,12 @@ expect {
     1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex___turso_ns1_k2_1
     1|0|0|SCAN k3 USING COVERING INDEX k3_code
 }
+
+test explain-uses-cast-expression-index {
+    CREATE TABLE cast_indexed (x text);
+    CREATE INDEX cast_indexed_idx ON cast_indexed ((x::int));
+    EXPLAIN SELECT x FROM cast_indexed WHERE x::int = 4;
+}
+expect {
+    1|0|0|SEARCH cast_indexed USING INDEX cast_indexed_idx (CAST (x AS INTEGER)=?)
+}
