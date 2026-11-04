@@ -66,6 +66,8 @@ impl ConstraintViolation {
 pub struct DialectError {
     pub code: &'static str,
     pub message: String,
+    /// More about the error, in a sentence of its own.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]

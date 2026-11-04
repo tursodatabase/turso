@@ -1,9 +1,11 @@
+use crate::dialect::TableRemoval;
 use crate::namespace::NamespaceRef;
 use crate::schema::Table;
 use crate::security::policy::Command;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
+use crate::translate::fkeys::reject_removal_of_referenced_table;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
@@ -155,6 +157,15 @@ pub fn translate_delete(
             privilege,
             reads_target_columns,
         )?;
+        if truncate {
+            reject_removal_of_referenced_table(
+                resolver,
+                connection,
+                target.namespace,
+                target.table.get_name(),
+                TableRemoval::Truncate,
+            )?;
+        }
         roles::hide_constraint_values_from_role_without_select(
             program,
             resolver,

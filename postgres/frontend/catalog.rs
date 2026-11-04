@@ -1,3 +1,4 @@
+use crate::error::{foreign_key_constraint_name, sqlstate_error_with_detail};
 use crate::functions::validate_pg_input;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -7,9 +8,10 @@ use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
-        identity_table_sql_marker, split_identity_table_sql_marker, POSTGRES_TABLE_SQL_PREFIX,
+        identity_table_sql_marker, split_identity_table_sql_marker, ReferencingForeignKey,
+        TableRemoval, POSTGRES_TABLE_SQL_PREFIX,
     },
-    namespace::mangle_name,
+    namespace::{demangle_name, mangle_name},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
@@ -23,6 +25,9 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
+};
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -401,6 +406,36 @@ impl Dialect for PostgresDialect {
 
     fn generates_integer_primary_keys(&self) -> bool {
         false
+    }
+
+    fn referenced_table_removal_error(
+        &self,
+        removal: TableRemoval,
+        table: &str,
+        referencing: ReferencingForeignKey<'_>,
+    ) -> Option<LimboError> {
+        let table = demangle_name(true, table).1;
+        let referencing_table = demangle_name(true, referencing.table).1;
+        Some(match removal {
+            TableRemoval::DropTable => {
+                let constraint = referencing.constraint_name.map_or_else(
+                    || foreign_key_constraint_name(referencing_table, referencing.columns),
+                    str::to_string,
+                );
+                sqlstate_error_with_detail(
+                    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!("cannot drop table {table} because other objects depend on it"),
+                    format!(
+                        "constraint {constraint} on table {referencing_table} depends on table {table}"
+                    ),
+                )
+            }
+            TableRemoval::Truncate => sqlstate_error_with_detail(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "cannot truncate a table referenced in a foreign key constraint",
+                format!("Table \"{referencing_table}\" references \"{table}\"."),
+            ),
+        })
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

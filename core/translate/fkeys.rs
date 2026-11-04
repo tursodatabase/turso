@@ -1,6 +1,7 @@
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use crate::dialect::{ReferencingForeignKey, TableRemoval};
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
@@ -2870,6 +2871,45 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+/// Fails with the dialect's error when another table has a foreign key to
+/// table `name`, which DROP TABLE or TRUNCATE is about to remove.
+pub fn reject_removal_of_referenced_table(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    removal: TableRemoval,
+) -> Result<()> {
+    if !connection.foreign_keys_enabled() {
+        return Ok(());
+    }
+    let referencing = resolver.with_schema(namespace.database_id, |s| {
+        if !s.any_resolved_fks_referencing(namespace.id, name) {
+            return Ok(None);
+        }
+        Ok::<_, LimboError>(
+            s.resolved_fks_referencing(namespace.id, name)?
+                .into_iter()
+                .find(|fk_ref| !fk_ref.is_self_reference()),
+        )
+    })?;
+    let Some(referencing) = referencing else {
+        return Ok(());
+    };
+    let referencing = ReferencingForeignKey {
+        table: &referencing.child_table.name,
+        constraint_name: referencing.fk.constraint_name.as_deref(),
+        columns: &referencing.fk.child_columns,
+    };
+    match connection
+        .dialect()
+        .referenced_table_removal_error(removal, name, referencing)
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

@@ -59,6 +59,20 @@ pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> Lim
     LimboError::Dialect(Box::new(DialectError {
         code: sqlstate,
         message: message.into(),
+        detail: None,
+    }))
+}
+
+/// [sqlstate_error] with a DETAIL line.
+pub fn sqlstate_error_with_detail(
+    sqlstate: &'static str,
+    message: impl Into<String>,
+    detail: impl Into<String>,
+) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: sqlstate,
+        message: message.into(),
+        detail: Some(detail.into()),
     }))
 }
 
@@ -120,6 +134,9 @@ impl From<&LimboError> for ErrorReport {
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
         }
+        if let LimboError::Dialect(dialect_error) = error {
+            report.detail.clone_from(&dialect_error.detail);
+        }
         report
     }
 }
@@ -142,17 +159,21 @@ fn constraint_name(violation: &ConstraintViolation, table: &str) -> Option<Strin
                 violation.column_names.join("_")
             ))
         }
-        ConstraintKind::ForeignKey => Some(format!(
-            "{}_{}_fkey",
-            table,
-            violation.column_names.join("_")
-        )),
+        ConstraintKind::ForeignKey => {
+            Some(foreign_key_constraint_name(table, &violation.column_names))
+        }
         ConstraintKind::Check => Some(format!("{table}_check")),
         ConstraintKind::NotNull
         | ConstraintKind::Trigger
         | ConstraintKind::Datatype
         | ConstraintKind::Other => None,
     }
+}
+
+/// The name PostgreSQL gives a foreign key of `table` on `columns` that was
+/// declared without one.
+pub(crate) fn foreign_key_constraint_name(table: &str, columns: &[String]) -> String {
+    format!("{}_{}_fkey", table, columns.join("_"))
 }
 
 fn constraint_message(violation: &ConstraintViolation, report: &ErrorReport) -> String {
