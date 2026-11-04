@@ -4427,7 +4427,7 @@ fn test_vacuum_refuses_a_key_on_a_lossy_custom_type_column() -> anyhow::Result<(
         }
         let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
         let conn = tmp_db.connect_limbo();
-        conn.execute("CREATE TYPE ci BASE text ENCODE value DECODE lower(value) OPERATOR '<'")?;
+        conn.execute("CREATE TYPE ci BASE text ENCODE value DECODE lower(value)")?;
 
         let err = conn.execute("VACUUM").unwrap_err().to_string();
         assert!(
