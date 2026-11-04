@@ -635,6 +635,10 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.set_foreign_keys_enabled(false);
                 state.target_conn.set_check_constraints_ignored(true);
                 state.target_conn.wal_auto_actions_disable();
+                // The source rows are read as stored values (the SELECT is an
+                // internal helper statement), so they are written without
+                // ENCODE. SQLite's VACUUM copies the records unchanged too.
+                state.target_conn.set_writes_stored_values(true);
 
                 // Wrap all operations in a single write transaction so helper
                 // statements share one durable target build and cleanup can
