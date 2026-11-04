@@ -66,7 +66,7 @@ use crate::{
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
-use gencol::compute_virtual_columns;
+use gencol::compute_generated_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
@@ -325,6 +325,15 @@ pub fn translate_insert(
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)
         );
+    };
+    let columns = if columns.is_empty()
+        && connection
+            .dialect()
+            .positional_insert_includes_generated_columns()
+    {
+        name_positional_insert_columns(&btree_table, &mut body)
+    } else {
+        columns
     };
 
     let BoundInsertResult {
@@ -585,13 +594,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            &btree_table,
-        )?;
+        compute_generated_columns(program, &dml_ctx, resolver, &btree_table)?;
 
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
@@ -761,10 +764,10 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    let types_checked_first = has_before_triggers || insertion.has_generated_columns();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
-            !column.is_virtual_generated() && !has_custom_type(column)
+            !column.is_generated() && !has_custom_type(column)
         })?;
     }
     if let Some(type_check_table) = &maybe_type_check_table {
@@ -795,14 +798,13 @@ pub fn translate_insert(
         });
     }
     emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
-        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+        !column.is_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
-    if insertion.has_virtual_columns() {
+    if insertion.has_generated_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
-        compute_virtual_columns(
+        compute_generated_columns(
             program,
-            &ctx.table.columns_topo_sort()?,
             &dml_ctx.with_form(DmlRowForm::Stored),
             resolver,
             &btree_table,
@@ -825,7 +827,7 @@ pub fn translate_insert(
             &insertion,
             resolver,
             true,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 
@@ -1201,6 +1203,49 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+/// Names the first columns of the table, which an INSERT without a column list writes, except
+/// the generated columns that only get DEFAULT.
+fn name_positional_insert_columns(table: &BTreeTable, body: &mut InsertBody) -> Vec<ast::Name> {
+    let InsertBody::Select(select, _) = body else {
+        return Vec::new();
+    };
+    let value_count = match &select.body.select {
+        OneSelect::Values(rows) => rows.first().map_or(0, Vec::len),
+        OneSelect::Select { columns, .. } => {
+            if columns
+                .iter()
+                .any(|c| matches!(c, ResultColumn::Star | ResultColumn::TableStar(_)))
+            {
+                return Vec::new();
+            }
+            columns.len()
+        }
+    };
+    let mut targets: Vec<(&Column, ast::Name)> = table
+        .columns()
+        .iter()
+        .filter(|c| !c.hidden())
+        .filter_map(|c| Some((c, ast::Name::exact(c.name.clone()?))))
+        .take(value_count)
+        .collect();
+    if let (OneSelect::Values(rows), true) =
+        (&mut select.body.select, select.body.compounds.is_empty())
+    {
+        for position in (0..targets.len()).rev() {
+            let all_default = rows
+                .iter()
+                .all(|row| matches!(row.get(position).map(AsRef::as_ref), Some(Expr::Default)));
+            if targets[position].0.is_generated() && all_default {
+                targets.remove(position);
+                for row in rows.iter_mut() {
+                    row.remove(position);
+                }
+            }
+        }
+    }
+    targets.into_iter().map(|(_, name)| name).collect()
 }
 
 pub(crate) fn emit_remember_written_rowid(
@@ -1685,7 +1730,13 @@ fn resolve_upserts(
         } = upsert.do_clause
         {
             // Normalize SET pairs once
-            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
+            let mut rewritten_sets = collect_set_clauses_for_upsert(
+                table,
+                sets,
+                connection
+                    .dialect()
+                    .update_set_default_computes_generated_columns(),
+            )?;
             let set_column_names: Vec<_> = sets
                 .iter()
                 .flat_map(|set| set.col_names.iter().cloned())
@@ -2316,11 +2367,11 @@ fn init_source_emission<'a>(
     if !values.is_empty() {
         // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
         if values.len() != required_column_count {
-            crate::bail_parse_error!(
-                "table {} has {required_column_count} columns but {} values were supplied",
+            return Err(connection.dialect().insert_value_count_error(
                 table.get_name(),
-                values.len()
-            );
+                required_column_count,
+                values.len(),
+            ));
         }
     }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
@@ -2368,12 +2419,19 @@ fn init_source_emission<'a>(
                 let num_result_cols = program.nested(|program| {
                     translate_select(select, resolver, program, query_destination, connection)
                 })?;
+                if columns.is_empty()
+                    && connection
+                        .dialect()
+                        .positional_insert_includes_generated_columns()
+                {
+                    reject_positional_values_for_generated_columns(table, num_result_cols)?;
+                }
                 if num_result_cols != required_column_count {
-                    crate::bail_parse_error!(
-                        "table {} has {required_column_count} columns but {} values were supplied",
+                    return Err(connection.dialect().insert_value_count_error(
                         table.get_name(),
+                        required_column_count,
                         num_result_cols,
-                    );
+                    ));
                 }
 
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
@@ -2542,6 +2600,20 @@ fn init_source_emission<'a>(
     Ok(())
 }
 
+/// Fail if one of the first `value_count` columns, which an INSERT without a column list
+/// writes, is a generated column.
+fn reject_positional_values_for_generated_columns(table: &Table, value_count: usize) -> Result<()> {
+    for column in table
+        .columns()
+        .iter()
+        .filter(|c| !c.hidden())
+        .take(value_count)
+    {
+        column.ensure_not_generated("INSERT into", column.name.as_deref().unwrap_or_default())?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub struct AutoincMeta {
     seq_cursor_id: usize,
@@ -2603,8 +2675,8 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
-    fn has_virtual_columns(&self) -> bool {
-        self.col_mappings.len() - self.num_non_virtual_cols > 0
+    fn has_generated_columns(&self) -> bool {
+        self.col_mappings.iter().any(|m| m.column.is_generated())
     }
 
     /// Returns the column mapping for a given column name.
@@ -4398,8 +4470,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
-/// Virtual columns are skipped: their registers are not computed yet, and
-/// `compute_virtual_columns` encodes them when it computes them.
+/// Generated columns are skipped: their registers are not computed yet, and
+/// `compute_generated_columns` encodes them when it computes them.
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -4416,7 +4488,7 @@ fn emit_custom_type_encode(
         columns
             .iter()
             .enumerate()
-            .filter(|(_, column)| !column.is_virtual_generated())
+            .filter(|(_, column)| !column.is_generated())
             .map(|(i, _)| i),
     )?;
     crate::translate::expr::emit_custom_type_encode_columns(

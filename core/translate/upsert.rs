@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_virtual_columns;
-use crate::alloc::TursoIteratorExt;
+use super::emitter::gencol::compute_generated_columns;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -192,8 +192,12 @@ fn upsert_index_is_affected(
         return Ok(true);
     }
 
+    let changed_cols = match table.btree() {
+        Some(btree) => btree.columns_affected_by_update(directly_changed_cols.iter())?,
+        None => directly_changed_cols.try_clone()?,
+    };
     for c in referenced_index_cols(idx, table)? {
-        if directly_changed_cols.get(c) {
+        if changed_cols.get(c) {
             return Ok(true);
         }
     }
@@ -201,8 +205,7 @@ fn upsert_index_is_affected(
 }
 
 /// Collect the set of columns referenced by the partial WHERE (empty if none), or
-/// by the expression of any IndexColumn on the index. Virtual-column references
-/// are expanded to their transitive stored-column dependencies.
+/// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask> {
     let mut referenced_cols = ColumnMask::default();
 
@@ -216,10 +219,7 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
             referenced_cols.set(ic.pos_in_table)?;
         }
     }
-    match table.btree() {
-        Some(btree) => btree.dependencies_of_columns(referenced_cols),
-        None => Ok(referenced_cols),
-    }
+    Ok(referenced_cols)
 }
 
 /// Columns referenced by any expression index columns on the index.
@@ -773,43 +773,24 @@ pub fn emit_upsert(
                     None,
                 )?,
             });
-        }
-    }
 
-    // Recompute virtual columns for the new row after SET clauses have modified base columns.
-    // This must happen before CHECK constraints, triggers, and index updates.
-    compute_new_row_virtual_columns(
-        program,
-        ctx,
-        new_start,
-        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-        &layout,
-        DmlRowForm::UserFacing,
-        resolver,
-    )?;
-
-    if let Some(bt) = table.btree() {
-        if bt.is_strict {
-            // Encode ALL columns. Both non-SET columns (decoded from disk above)
-            // and SET columns (user-facing values from expressions) need encoding
-            // before being written to disk.
+            // The generated columns are encoded when they are computed below.
+            let non_generated_columns: ColumnMask = bt
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.is_generated())
+                .map(|(idx, _)| idx)
+                .try_collect()?;
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 resolver,
                 bt.columns(),
                 new_start,
-                None,
+                Some(&non_generated_columns),
                 &bt.name,
                 &layout,
             )?;
-
-            // Post-encode TypeCheck: validate encoded values match storage type.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: bt.columns().len(),
-                check_generated: true,
-                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
-            });
         } else {
             // For non-STRICT tables, apply column affinity to the values.
             // This must happen early so that both index records and the table record
@@ -829,6 +810,31 @@ pub fn emit_upsert(
                     });
                 }
             }
+        }
+    }
+
+    // Recompute generated columns for the new row after SET clauses have modified base columns.
+    // This must happen before CHECK constraints, triggers, and index updates.
+    compute_new_row_generated_columns(
+        program,
+        ctx,
+        new_start,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+        &layout,
+        DmlRowForm::Stored,
+        resolver,
+    )?;
+    emit_generated_column_notnull_checks(program, ctx, new_start, &layout, constraint_on_error);
+
+    if let Some(bt) = table.btree() {
+        if bt.is_strict {
+            // Post-encode TypeCheck: validate encoded values match storage type.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: new_start,
+                count: bt.columns().len(),
+                check_generated: true,
+                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
+            });
         }
 
         // Evaluate CHECK constraints on the new values
@@ -969,7 +975,7 @@ pub fn emit_upsert(
                     resolver,
                 )?;
             }
-            compute_new_row_virtual_columns(
+            compute_new_row_generated_columns(
                 program,
                 ctx,
                 new_start,
@@ -978,6 +984,13 @@ pub fn emit_upsert(
                 DmlRowForm::Stored,
                 resolver,
             )?;
+            emit_generated_column_notnull_checks(
+                program,
+                ctx,
+                new_start,
+                &layout,
+                constraint_on_error,
+            );
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
@@ -1661,9 +1674,9 @@ pub fn emit_upsert(
         }
     }
 
-    // Compute virtual columns for RETURNING (if any virtual columns exist)
+    // Compute the generated columns of the NEW image for RETURNING
     if !returning.is_empty() {
-        compute_new_row_virtual_columns(
+        compute_new_row_generated_columns(
             program,
             ctx,
             new_start,
@@ -1707,7 +1720,7 @@ fn do_update_constraint_on_error(program: &ProgramBuilder) -> Option<ast::Resolv
     }
 }
 
-fn compute_new_row_virtual_columns(
+fn compute_new_row_generated_columns(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
     new_start: usize,
@@ -1716,7 +1729,7 @@ fn compute_new_row_virtual_columns(
     form: DmlRowForm,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    if !ctx.table.has_virtual_columns {
+    if !ctx.table.has_generated_columns() {
         return Ok(());
     }
     let dml_ctx = DmlColumnContext::layout(
@@ -1726,13 +1739,32 @@ fn compute_new_row_virtual_columns(
         layout.clone(),
         form,
     );
-    compute_virtual_columns(
-        program,
-        &ctx.table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        ctx.table,
-    )
+    compute_generated_columns(program, &dml_ctx, resolver, ctx.table)
+}
+
+fn emit_generated_column_notnull_checks(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    new_start: usize,
+    layout: &ColumnLayout,
+    on_error: Option<ast::ResolveType>,
+) {
+    for (idx, column) in ctx.table.columns().iter().enumerate() {
+        if !column.is_generated() || !column.notnull() {
+            continue;
+        }
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
+            target_reg: layout.to_register(new_start, idx),
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!(
+                "{}.{}",
+                ctx.table.name,
+                column.name.as_deref().expect("table columns have names")
+            ),
+            on_error,
+        });
+    }
 }
 
 /// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.
@@ -1743,6 +1775,7 @@ fn compute_new_row_virtual_columns(
 pub fn collect_set_clauses_for_upsert(
     table: &Table,
     set_items: &mut [ast::Set],
+    set_default_computes_generated_columns: bool,
 ) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
     let lookup: HashMap<String, usize> = table
         .columns()
@@ -1768,8 +1801,14 @@ pub fn collect_set_clauses_for_upsert(
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
             let ident = normalize_ident(cn.as_str());
             let idx = match lookup.get(&ident) {
+                Some(idx)
+                    if set_default_computes_generated_columns
+                        && table.columns()[*idx].is_generated()
+                        && matches!(*e, ast::Expr::Default) =>
+                {
+                    continue
+                }
                 Some(idx) => {
-                    // cannot upsert generated column
                     table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
                     *idx
                 }

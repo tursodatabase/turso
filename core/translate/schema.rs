@@ -830,6 +830,18 @@ fn validate(
         if !is_nested {
             let mut table =
                 create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+            if !resolver.dialect.allows_generated_columns_in_primary_key() {
+                for (pk_name, _) in &table.primary_key_columns {
+                    if table
+                        .get_column(pk_name)
+                        .is_some_and(|(_, c)| c.is_generated())
+                    {
+                        bail_parse_error!(
+                            "generated column \"{pk_name}\" cannot be part of the PRIMARY KEY"
+                        );
+                    }
+                }
+            }
             if !table.has_rowid {
                 if table.has_autoincrement {
                     bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");

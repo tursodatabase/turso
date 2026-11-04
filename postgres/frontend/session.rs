@@ -23,14 +23,15 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
-    set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
-    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    added_generated_column, execution_takes_snapshot, frontend_stmt, is_drop_matview,
+    is_tx_exit_stmt, set_transaction_access_mode, unnamed_index_name,
+    unqualified_create_table_name_location, FrontendStmt, PgAddedGeneratedColumn, PgCommentTarget,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropExpressionStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo,
+    PgSetValue, PgShowStmt, PostgreSQLTranslator, TranslateResult,
 };
 use turso_pg_parser::ParseError;
 
@@ -418,10 +419,18 @@ fn prepare_statement_inner(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
-    let translator = PostgreSQLTranslator::new();
-    let translated = translator
-        .translate_with_prereqs(&parse_result)
-        .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    let existing_generated_columns = added_generated_column(&parse_result)
+        .map(|column| generated_columns_of(&pg_conn.conn, &column))
+        .unwrap_or_default();
+    let translated = match turso_pg_parser::translator::drop_expression_stmt(&parse_result)
+        .map_err(|e| translation_error(&pg_conn.conn, e))?
+    {
+        Some(stmt) => translate_drop_expression(&pg_conn.conn, &stmt)?,
+        None => PostgreSQLTranslator::new()
+            .with_existing_generated_columns(existing_generated_columns)
+            .translate_with_prereqs(&parse_result)
+            .map_err(|e| translation_error(&pg_conn.conn, e))?,
+    };
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
@@ -476,6 +485,128 @@ fn prepare_statement_inner(
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
     .with_post_run(post_run))
+}
+
+/// The names of the generated columns of the table that `column` is added to.
+fn generated_columns_of(conn: &Arc<Connection>, column: &PgAddedGeneratedColumn) -> Vec<String> {
+    let schema = conn.current_schema();
+    relation_lookup_namespaces(conn, column.schema_name.as_deref())
+        .into_iter()
+        .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
+        .find_map(|namespace| schema.get_btree_table(namespace.target.id, &column.table_name))
+        .map(|table| {
+            table
+                .columns()
+                .iter()
+                .filter(|c| c.is_generated())
+                .filter_map(|c| c.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// DROP EXPRESSION as an ALTER COLUMN that removes the generation expression and keeps the values.
+fn translate_drop_expression(
+    conn: &Arc<Connection>,
+    stmt: &PgDropExpressionStmt,
+) -> Result<TranslateResult> {
+    let schema = conn.current_schema();
+    let table = relation_lookup_namespaces(conn, stmt.schema_name.as_deref())
+        .into_iter()
+        .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
+        .find_map(|namespace| schema.get_btree_table(namespace.target.id, &stmt.table_name));
+    let table = match table {
+        Some(table) => table,
+        None if stmt.table_if_exists => return noop_translation(),
+        None => {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("relation \"{}\" does not exist", stmt.table_name),
+            ))
+        }
+    };
+    let column = &stmt.column_name;
+    let not_generated = || {
+        sqlstate_error(
+            SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            format!(
+                "column \"{column}\" of relation \"{}\" is not a stored generated column",
+                stmt.table_name
+            ),
+        )
+    };
+    let named_column = table
+        .columns()
+        .iter()
+        .find(|c| c.name.as_deref() == Some(column.as_str()));
+    match named_column {
+        None => {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_COLUMN,
+                format!(
+                    "column \"{column}\" of relation \"{}\" does not exist",
+                    stmt.table_name
+                ),
+            ))
+        }
+        Some(c) if !c.is_stored_generated() && stmt.if_exists => return noop_translation(),
+        Some(c) if !c.is_stored_generated() => return Err(not_generated()),
+        Some(_) => {}
+    }
+    // Without its expression, a single integer PRIMARY KEY column becomes the rowid, but its
+    // values are in the records and not in the rowids, so the table would need a rebuild.
+    if table
+        .primary_key_columns
+        .iter()
+        .any(|(name, _)| name == column)
+    {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "ALTER COLUMN ... DROP EXPRESSION on primary key column \"{column}\" is not supported"
+            ),
+        ));
+    }
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
+        body: ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+        ..
+    })) = turso_parser::parser::Parser::new(table.to_sql().as_bytes())
+        .next_cmd()
+        .map_err(|e| LimboError::InternalError(e.to_string()))?
+    else {
+        return Err(LimboError::InternalError(format!(
+            "the definition of table {} is not a CREATE TABLE",
+            stmt.table_name
+        )));
+    };
+    let mut definition = columns
+        .into_iter()
+        .find(|c| c.col_name.as_str() == column)
+        .ok_or_else(not_generated)?;
+    definition
+        .constraints
+        .retain(|c| !matches!(c.constraint, ast::ColumnConstraint::Generated { .. }));
+    Ok(TranslateResult {
+        prereqs: Vec::new(),
+        cmd: ast::Cmd::Stmt(ast::Stmt::AlterTable(ast::AlterTable {
+            name: stmt.table.clone(),
+            body: ast::AlterTableBody::AlterColumn {
+                old: ast::Name::exact(column.clone()),
+                new: definition,
+            },
+        })),
+    })
+}
+
+fn noop_translation() -> Result<TranslateResult> {
+    let noop = turso_parser::parser::Parser::new(b"SELECT 0 WHERE 0")
+        .next_cmd()
+        .map_err(|e| LimboError::InternalError(e.to_string()))?
+        .ok_or_else(|| LimboError::InternalError("empty no-op statement".to_string()))?;
+    Ok(TranslateResult {
+        prereqs: Vec::new(),
+        cmd: noop,
+    })
 }
 
 /// Connection and session state changes that must follow a statement's

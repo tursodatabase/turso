@@ -728,13 +728,55 @@ test pg-get-expr-null-oid-does-not-hide-invalid-expression {
 @sqlstate 42883
 expect error {}
 
-@skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
 test pg-get-expr-check-constraint {
     CREATE TABLE checked (val int CHECK (val > 0));
-    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
+    SELECT pg_get_expr(d.conbin, d.conrelid), pg_get_constraintdef(d.oid)
+    FROM pg_constraint d JOIN pg_class c ON c.oid = d.conrelid
+    WHERE d.contype = 'c' AND c.relname = 'checked';
 }
 expect {
-    val > 0
+    (val > 0)|CHECK ((val > 0))
+}
+
+test pg-get-expr-default-expressions {
+    CREATE TABLE demo (a int DEFAULT (1 + 2), b text DEFAULT 'x', c text DEFAULT current_user, d boolean DEFAULT true);
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid)
+    FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    ORDER BY a.attnum;
+}
+expect {
+    a|(1 + 2)
+    b|'x'::text
+    c|CURRENT_USER
+    d|true
+}
+
+test pg-get-expr-string-default-labeled-with-column-type {
+    CREATE TABLE z (d date DEFAULT '2024-01-01', u uuid DEFAULT '00000000-0000-0000-0000-000000000000', j jsonb DEFAULT '{}', v varchar(10) DEFAULT 'x', ts timestamp DEFAULT '2024-01-01 10:00:00', ia int[] DEFAULT '{1,2}');
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid)
+    FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    ORDER BY a.attnum;
+}
+expect {
+    d|'2024-01-01'::date
+    u|'00000000-0000-0000-0000-000000000000'::uuid
+    j|'{}'::jsonb
+    v|'x'::character varying
+    ts|'2024-01-01 10:00:00'::timestamp without time zone
+    ia|'{1,2}'::integer[]
+}
+
+test pg-get-constraintdef-check-literal-and-is-true {
+    CREATE TABLE z (a int, d date, CHECK (d > '2020-01-01'), CHECK (a > 0 IS TRUE), CHECK (a > 0 IS NOT FALSE));
+    SELECT pg_get_constraintdef(d.oid)
+    FROM pg_constraint d JOIN pg_class c ON c.oid = d.conrelid
+    WHERE d.contype = 'c' AND c.relname = 'z'
+    ORDER BY 1;
+}
+expect {
+    CHECK (((a > 0) IS NOT FALSE))
+    CHECK (((a > 0) IS TRUE))
+    CHECK ((d > '2020-01-01'::date))
 }
 
 test percentile-cont-within-group {

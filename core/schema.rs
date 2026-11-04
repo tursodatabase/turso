@@ -5037,7 +5037,7 @@ pub(crate) struct GeneratedColGraph {
     dependencies: Vec<ColumnMask>,
     /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
     dependents: Vec<ColumnMask>,
-    /// Column indices in topological (dependency) order. Contains all columns.
+    /// All column indices, each after the columns it reads and otherwise in table order.
     topological_sort: Vec<usize>,
 }
 
@@ -5049,9 +5049,11 @@ impl GeneratedColGraph {
         let mut direct_dependents = try_vec![ColumnMask::default(); n]?;
         let mut in_degree: Vec<u32> = try_vec![0; n]?;
 
-        // walk each virtual column's expression once to extract edges
+        // walk each generated column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+            let (GeneratedType::Virtual { ref expr, .. } | GeneratedType::Stored { ref expr, .. }) =
+                col.generated_type()
+            else {
                 continue;
             };
             let mut direct = BitSet::default();
@@ -5072,13 +5074,16 @@ impl GeneratedColGraph {
 
         // Kahn's algorithm (topological sort) over direct_deps.
         let mut topological_sort: Vec<usize> = Vec::try_with_capacity_ext(n)?;
-        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
-        while let Some(i) = ready.pop() {
+        let mut ready: BinaryHeap<std::cmp::Reverse<usize>> = (0..n)
+            .filter(|&i| in_degree[i] == 0)
+            .map(std::cmp::Reverse)
+            .try_collect()?;
+        while let Some(std::cmp::Reverse(i)) = ready.pop() {
             topological_sort.try_push(i)?;
             for j in direct_dependents[i].iter() {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
-                    ready.try_push(j)?;
+                    ready.try_push(std::cmp::Reverse(j))?;
                 }
             }
         }
@@ -5387,6 +5392,10 @@ impl BTreeTable {
         self.has_virtual_columns
     }
 
+    pub fn has_generated_columns(&self) -> bool {
+        self.columns.iter().any(|c| c.is_generated())
+    }
+
     /// Build a `ColumnLayout` for this table's register mapping.
     pub fn column_layout(&self) -> Result<ColumnLayout, TryReserveError> {
         ColumnLayout::from_btree(self)
@@ -5529,13 +5538,21 @@ impl BTreeTable {
 
             push_collation(&mut sql, column.text_collation());
 
-            if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
-                if column.generated_always {
-                    sql.push_str(" GENERATED ALWAYS");
+            match column.generated_type() {
+                GeneratedType::Virtual { original_sql, .. } => {
+                    if column.generated_always {
+                        sql.push_str(" GENERATED ALWAYS");
+                    }
+                    sql.push_str(" AS (");
+                    sql.push_str(original_sql);
+                    sql.push(')');
                 }
-                sql.push_str(" AS (");
-                sql.push_str(original_sql);
-                sql.push(')');
+                GeneratedType::Stored { original_sql, .. } => {
+                    sql.push_str(" GENERATED ALWAYS AS (");
+                    sql.push_str(original_sql);
+                    sql.push_str(") STORED");
+                }
+                GeneratedType::NotGenerated => {}
             }
 
             // Add column-level CHECK constraints inline
@@ -5821,7 +5838,7 @@ impl BTreeTable {
         {
             let mut guard = self.columns_mut();
             for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
+                if guard[i].is_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
@@ -5836,7 +5853,7 @@ impl BTreeTable {
         &mut self,
         dropped_index: usize,
     ) -> Result<()> {
-        if !self.has_virtual_columns {
+        if !self.has_generated_columns() {
             return Ok(());
         }
 
@@ -6768,6 +6785,7 @@ pub fn create_table(
 
                 let mut default = None;
                 let mut generated: Option<Box<Expr>> = None;
+                let mut generated_stored = false;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut explicit_notnull = false;
@@ -6786,14 +6804,11 @@ pub fn create_table(
                             ))?;
                         }
                         ast::ColumnConstraint::Generated { expr, typ, .. } => {
-                            if typ
-                                .as_ref()
-                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
-                            {
-                                bail_parse_error!("Stored generated columns are not supported");
-                            }
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
+                            generated_stored = typ
+                                .as_ref()
+                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -6932,12 +6947,6 @@ pub fn create_table(
                 }
 
                 if let Some(ref gen_expr) = generated {
-                    if primary_key {
-                        bail_parse_error!(
-                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
-                            name
-                        );
-                    }
                     if default.is_some() {
                         bail_parse_error!(
                             "generated column \"{}\" cannot have a DEFAULT value",
@@ -6962,12 +6971,6 @@ pub fn create_table(
                     .iter()
                     .any(|(col_name, _)| col_name.eq_ignore_ascii_case(&name))
                 {
-                    if generated.is_some() {
-                        crate::bail_parse_error!(
-                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
-                            name
-                        );
-                    }
                     primary_key = true;
                 }
 
@@ -6978,17 +6981,26 @@ pub fn create_table(
                         ColDefFlags::RowIdAlias,
                         typename_exactly_integer
                             && primary_key
-                            && !primary_key_desc_columns_constraint,
+                            && !primary_key_desc_columns_constraint
+                            && generated.is_none(),
                     )
                     .with(ColDefFlags::NotNull, notnull)
                     .with(ColDefFlags::ExplicitNotNull, explicit_notnull)
                     .with(ColDefFlags::Unique, unique);
 
+                let gen_type = generated.map(|expr| {
+                    let original_sql = expr.to_string();
+                    if generated_stored {
+                        GeneratedType::Stored { expr, original_sql }
+                    } else {
+                        GeneratedType::Virtual { expr, original_sql }
+                    }
+                });
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
                     default,
-                    generated,
+                    gen_type,
                     ty,
                     collation,
                     ColDef {
@@ -7447,7 +7459,11 @@ pub enum GeneratedType {
         expr: Box<Expr>,
         original_sql: String,
     },
-    // Stored { resolved: Box<Expr>, original_sql: String },
+    /// Stored generated column: computed at write time and persisted on disk.
+    Stored {
+        expr: Box<Expr>,
+        original_sql: String,
+    },
     NotGenerated,
 }
 
@@ -7504,18 +7520,12 @@ impl Column {
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
-        generated: Option<Box<Expr>>,
+        generated: Option<GeneratedType>,
         ty: Type,
         col: Option<TextCollation>,
         coldef: ColDef,
     ) -> Self {
-        let generated_type = match generated {
-            Some(expr) => {
-                let original_sql = expr.to_string();
-                GeneratedType::Virtual { expr, original_sql }
-            }
-            None => GeneratedType::NotGenerated,
-        };
+        let generated_type = generated.unwrap_or(GeneratedType::NotGenerated);
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
             coldef: &coldef,
@@ -7546,7 +7556,8 @@ impl Column {
         let name = value.col_name.as_str();
 
         let mut default = None;
-        let mut generated = None;
+        let mut generated: Option<Box<Expr>> = None;
+        let mut generated_stored = false;
         let mut coldef = ColDef {
             flags: ColDefFlags::from_def_flags(&flags),
             ..Default::default()
@@ -7586,8 +7597,11 @@ impl Column {
                     }
                     collation.replace(collation_seq);
                 }
-                ast::ColumnConstraint::Generated { expr, .. } => {
+                ast::ColumnConstraint::Generated { expr, typ, .. } => {
                     generated = Some(expr.clone());
+                    generated_stored = typ
+                        .as_ref()
+                        .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
                 }
                 _ => {}
             };
@@ -7625,14 +7639,23 @@ impl Column {
             ColDefFlags::RowIdAlias,
             coldef.flags.contains(ColDefFlags::PrimaryKey)
                 && typename_exactly_integer
-                && primary_key_order != SortOrder::Desc,
+                && primary_key_order != SortOrder::Desc
+                && generated.is_none(),
         );
 
+        let gen_type = generated.map(|expr| {
+            let original_sql = expr.to_string();
+            if generated_stored {
+                GeneratedType::Stored { expr, original_sql }
+            } else {
+                GeneratedType::Virtual { expr, original_sql }
+            }
+        });
         let mut col = Column::new(
             Some(name.to_string()),
             ty_str,
             default,
-            generated,
+            gen_type,
             ty,
             collation,
             coldef,
@@ -7705,9 +7728,16 @@ impl Column {
     }
 
     #[inline]
+    pub fn is_stored_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Stored { .. })
+    }
+
+    #[inline]
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_ref())
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -7715,7 +7745,9 @@ impl Column {
     #[inline]
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_mut())
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -7723,6 +7755,10 @@ impl Column {
     #[inline]
     pub fn set_generated_original_sql(&mut self, new_sql: String) {
         if let GeneratedType::Virtual {
+            ref mut original_sql,
+            ..
+        }
+        | GeneratedType::Stored {
             ref mut original_sql,
             ..
         } = self.generated_type

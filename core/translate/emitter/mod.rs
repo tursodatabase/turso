@@ -2050,13 +2050,7 @@ pub(crate) fn emit_columns_and_dependencies(
     }
 
     let table_arc = Arc::new(table.clone());
-    gencol::compute_virtual_columns(
-        program,
-        &table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &table_arc,
-    )?;
+    gencol::compute_virtual_columns(program, &dml_ctx, resolver, &table_arc)?;
 
     Ok(dml_ctx)
 }
@@ -2223,6 +2217,14 @@ fn emit_index_column_value_new_image(
                     table,
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::Stored { .. } => {
+                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
             }
             GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {
