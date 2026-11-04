@@ -30,8 +30,8 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
-            WalkControl,
+            check_custom_types, get_expr_affinity, replace_and_or_with_deciding_operand,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
@@ -278,20 +278,28 @@ pub fn plan_subqueries_from_select_plan(
     {
         crate::stack::trace_stack!("select_where");
         let aggregates_moved_before_where = resolver.count_aggregates_moved_from_subqueries();
-        plan_subqueries_with_outer_query_access(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            plan.where_clause.iter_mut().map(|t| &mut t.expr),
-            connection,
-            SubqueryPosition::Where,
-            SubqueryOrigin::SelectWhere,
-            SubqueryPosition::Where.allow_correlated(),
-            &mut cse_map,
-            &mut same_query_map,
-            &[],
-        )?;
+        // An ON term of an outer join keeps both AND/OR operands, as in
+        // SQLite (EP_OuterON), so those terms are planned without the fold.
+        for fold_and_or in [true, false] {
+            plan_subqueries_with_outer_query_access(
+                program,
+                &mut plan.non_from_clause_subqueries,
+                &mut plan.table_references,
+                resolver,
+                plan.where_clause
+                    .iter_mut()
+                    .filter(|t| t.origin.is_outer_join() != fold_and_or)
+                    .map(|t| &mut t.expr),
+                connection,
+                SubqueryPosition::Where,
+                SubqueryOrigin::SelectWhere,
+                SubqueryPosition::Where.allow_correlated(),
+                fold_and_or,
+                &mut cse_map,
+                &mut same_query_map,
+                &[],
+            )?;
+        }
         // A subquery in WHERE moves an aggregate of this query's columns up to
         // this query, but this query cannot compute an aggregate in WHERE. ON
         // clauses and table-valued function arguments are WHERE terms too.
@@ -315,6 +323,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::GroupBy,
                 SubqueryOrigin::SelectGroupBy,
                 SubqueryPosition::GroupBy.allow_correlated(),
+                true,
                 &mut cse_map,
                 &mut same_query_map,
                 &shared_subqueries,
@@ -332,6 +341,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
                 !group_by.exprs.is_empty(),
+                true,
                 &mut cse_map,
                 &mut same_query_map,
                 &[],
@@ -352,6 +362,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::ResultColumn,
             SubqueryOrigin::SelectList,
             SubqueryPosition::ResultColumn.allow_correlated(),
+            true,
             &mut cse_map,
             &mut same_query_map,
             &shared_subqueries,
@@ -371,6 +382,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::OrderBy,
             SubqueryOrigin::SelectOrderBy,
             SubqueryPosition::OrderBy.allow_correlated(),
+            true,
             &mut cse_map,
             &mut same_query_map,
             &[],
@@ -444,6 +456,7 @@ pub(crate) fn plan_limit_offset_subqueries(
         SubqueryPosition::LimitOffset,
         SubqueryOrigin::SelectLimitOffset,
         false,
+        true,
         cse_map,
         same_query_map,
         &[],
@@ -474,20 +487,28 @@ pub fn plan_subqueries_from_where_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    plan_subqueries_with_outer_query_access(
-        program,
-        non_from_clause_subqueries,
-        table_references,
-        resolver,
-        where_clause.iter_mut().map(|term| &mut term.expr),
-        connection,
-        SubqueryPosition::Where,
-        SubqueryOrigin::DmlWhere,
-        SubqueryPosition::Where.allow_correlated(),
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &[],
-    )?;
+    // An ON term of an outer join keeps both AND/OR operands, as in SQLite
+    // (EP_OuterON), so those terms are planned without the fold.
+    for fold_and_or in [true, false] {
+        plan_subqueries_with_outer_query_access(
+            program,
+            non_from_clause_subqueries,
+            table_references,
+            resolver,
+            where_clause
+                .iter_mut()
+                .filter(|term| term.origin.is_outer_join() != fold_and_or)
+                .map(|term| &mut term.expr),
+            connection,
+            SubqueryPosition::Where,
+            SubqueryOrigin::DmlWhere,
+            SubqueryPosition::Where.allow_correlated(),
+            fold_and_or,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &[],
+        )?;
+    }
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
@@ -515,6 +536,7 @@ pub fn plan_subqueries_from_values(
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
         SubqueryOrigin::SelectList,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        true,
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
@@ -545,6 +567,7 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        true,
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
@@ -582,6 +605,7 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlReturning,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        true,
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
@@ -613,6 +637,7 @@ pub fn plan_subqueries_in_expr_without_from_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::ExprWithoutFromClause,
         false,
+        true,
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
@@ -632,6 +657,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    fold_and_or: bool,
     cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
@@ -651,6 +677,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
             position,
             origin,
             allow_correlated,
+            fold_and_or,
             cse_map,
             same_query_map,
             shared,
@@ -750,6 +777,10 @@ fn collect_scalar_subqueries<'a>(
 type SubqueryParser<'a> = Box<dyn FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a>;
 
 /// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
+///
+/// With `fold_and_or`, an AND or OR that a literal operand decides is folded
+/// here, once the names inside the other operand's subqueries are resolved
+/// (see [AndOrConstantOperand], which leaves such an operand to this walk).
 #[allow(clippy::too_many_arguments)]
 fn get_subquery_parser<'a>(
     program: &'a mut ProgramBuilder,
@@ -763,6 +794,7 @@ fn get_subquery_parser<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    fold_and_or: bool,
     cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
     same_query_map: &'a mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &'a [ast::Expr],
@@ -780,6 +812,24 @@ fn get_subquery_parser<'a>(
 
     Box::new(move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
+            // SQLite resolves every name before sqlite3ExprSimplifiedAndOr
+            // drops an operand, so the subqueries of the operand that goes
+            // are planned for their names and the plans thrown away. The
+            // operand that stays is planned below like any other.
+            ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _) if fold_and_or => {
+                while replace_and_or_with_deciding_operand(expr, Some(resolver), &mut |dropped| {
+                    resolve_names_in_dropped_operand(
+                        dropped,
+                        program,
+                        resolver,
+                        referenced_tables,
+                        get_outer_query_refs,
+                        connection,
+                    )?;
+                    Ok(true)
+                })? {}
+                Ok(WalkControl::Continue)
+            }
             ast::Expr::Exists(_) => {
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
@@ -1035,6 +1085,7 @@ fn get_subquery_parser<'a>(
                         position,
                         origin,
                         allow_correlated,
+                        fold_and_or,
                         &mut *cse_map,
                         &mut *same_query_map,
                         shared,
@@ -1183,6 +1234,45 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     })
+}
+
+/// Plans each subquery of `operand` and throws the plan away: the names
+/// inside it are resolved, so a wrong column name is still an error, and
+/// nothing of it is emitted.
+fn resolve_names_in_dropped_operand(
+    operand: &ast::Expr,
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    referenced_tables: &TableReferences,
+    get_outer_query_refs: &dyn Fn(
+        &TableReferences,
+    ) -> Result<crate::alloc::Vec<OuterQueryReference>>,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let mut selects = Vec::new();
+    walk_expr(operand, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                selects.push(select.as_ref().clone())
+            }
+            ast::Expr::InSelect { rhs, .. } => selects.push(rhs.as_ref().clone()),
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    for select in selects {
+        let outer_query_refs = get_outer_query_refs(referenced_tables)?;
+        let result_reg = program.alloc_register();
+        prepare_select_plan(
+            select,
+            resolver,
+            program,
+            &outer_query_refs,
+            QueryDestination::ExistsSubqueryResult { result_reg },
+            connection,
+        )?;
+    }
+    Ok(())
 }
 
 /// Recollect all aggregates after subquery planning.
