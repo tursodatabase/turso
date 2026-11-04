@@ -492,12 +492,17 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+    pub fn unique_index(table: &BTreeTable, index: &Index, regs: Vec<usize>) -> Self {
+        let kind = if table.is_primary_key_index(index) {
+            crate::ConstraintKind::PrimaryKey
+        } else {
+            crate::ConstraintKind::Unique
+        };
         Self {
-            kind: crate::ConstraintKind::Unique,
+            kind,
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
-            table_name: table.to_string(),
+            table_name: table.name.clone(),
             column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
             violation_regs: regs,
             row_col_names: vec![],

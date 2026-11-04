@@ -80,7 +80,7 @@ use crate::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        LimboError, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
@@ -193,7 +193,10 @@ use super::{Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{
+    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
+    Pager, Result,
+};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -2590,14 +2593,13 @@ pub fn op_type_check(
                 let _applied = apply_affinity_char(reg, col.affinity());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
+                    return Err(datatype_violation(format!(
+                        "cannot store {} value in {} column {}.{}",
                         value_type,
                         col.ty_str,
                         &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+                        col.name.as_deref().unwrap_or("")
+                    )));
                 }
             }
             Ok(())
@@ -2693,7 +2695,7 @@ pub fn op_array_encode(
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"
         );
     }
 
@@ -2723,12 +2725,10 @@ pub fn op_array_encode(
         });
 
         if !type_ok {
-            bail_constraint_error!(
-                "cannot store {} value in {} ({})",
-                value_type,
-                element_type,
-                SQLITE_CONSTRAINT
-            );
+            return Err(datatype_violation(format!(
+                "cannot store {value_type} value in {element_type}"
+            ))
+            .into());
         }
 
         coerced_elements.push(coerced);
@@ -2748,17 +2748,23 @@ fn non_array_value_error(element_type: &str, target: &ArrayEncodeTarget) -> Limb
         ArrayEncodeTarget::Column {
             table_name,
             col_name,
-        } => format!(
-            "cannot store non-array value in {element_type} column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
-        ),
-        ArrayEncodeTarget::Cast => {
-            format!("cannot cast a non-array value to an array ({SQLITE_CONSTRAINT})")
+        } => {
+            format!("cannot store non-array value in {element_type} column {table_name}.{col_name}")
         }
+        ArrayEncodeTarget::Cast => "cannot cast a non-array value to an array".to_string(),
         ArrayEncodeTarget::IndexKey => {
-            format!("cannot use a non-array value as an array index key ({SQLITE_CONSTRAINT})")
+            "cannot use a non-array value as an array index key".to_string()
         }
     };
-    LimboError::Constraint(message)
+    datatype_violation(message)
+}
+
+/// A value whose type does not match its column's type.
+fn datatype_violation(message: String) -> LimboError {
+    LimboError::ConstraintViolation(Box::new(ConstraintViolation::new(
+        ConstraintKind::Datatype,
+        message,
+    )))
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.
@@ -3712,7 +3718,7 @@ pub fn halt(
         // CONFLICT clause, or a trigger step's OR clause) is embedded in the
         // error, so whichever program aborts applies it instead of its own.
         if let Some(resolve_type) = on_error {
-            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+            return Err(LimboError::Raise(resolve_type, Box::new(error)).into());
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
@@ -3914,7 +3920,6 @@ fn build_constraint_violation_error(
     err_code: usize,
     description: &str,
 ) -> LimboError {
-    use crate::{ConstraintKind, ConstraintViolation};
     let (kind, message) = match err_code {
         SQLITE_CONSTRAINT_PRIMARYKEY => (
             ConstraintKind::PrimaryKey,
@@ -3933,6 +3938,7 @@ fn build_constraint_violation_error(
             format!("NOT NULL constraint failed: {description}"),
         ),
         SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        SQLITE_CONSTRAINT_TRIGGER => (ConstraintKind::Trigger, description.to_string()),
         _ => (ConstraintKind::Other, description.to_string()),
     };
     let mut violation = ConstraintViolation::new(kind, message);
@@ -10187,7 +10193,10 @@ pub fn op_function(
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10197,7 +10206,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10207,7 +10219,10 @@ pub fn op_function(
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10217,7 +10232,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10254,7 +10272,10 @@ pub fn op_function(
             }
             JsonFunc::JsonSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10268,7 +10289,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10412,7 +10436,7 @@ pub fn op_function(
                                 let mut chars = escape_cow.chars();
                                 let c = chars.next();
                                 if c.is_none() || chars.next().is_some() {
-                                    return Err(LimboError::Constraint(
+                                    return Err(LimboError::SqlError(
                                         "ESCAPE expression must be a single character".to_string(),
                                     )
                                     .into());

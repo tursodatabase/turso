@@ -735,9 +735,10 @@ impl From<LimboError> for TursoError {
         match value {
             // A Raise is a constraint error that carries its own conflict
             // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
-            LimboError::ForeignKeyConstraint(e)
-            | LimboError::Constraint(e)
-            | LimboError::Raise(_, e) => TursoError::Constraint(e),
+            LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
+                TursoError::Constraint(e)
+            }
+            LimboError::Raise(_, e) => TursoError::Constraint(e.to_string()),
             LimboError::ConstraintViolation(violation) => TursoError::Constraint(violation.message),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
@@ -1873,6 +1874,8 @@ mod tests {
             turso_core::ConstraintKind::ForeignKey,
             turso_core::ConstraintKind::NotNull,
             turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Trigger,
+            turso_core::ConstraintKind::Datatype,
             turso_core::ConstraintKind::Other,
         ] {
             let error = LimboError::ConstraintViolation(Box::new(

@@ -756,6 +756,14 @@ impl Statement {
         self._step(None).map_err(|error| self.format_error(error))
     }
 
+    /// Like [`Self::step`], but a constraint violation stays a
+    /// [`LimboError::ConstraintViolation`] that names its kind in every
+    /// dialect, so the caller can report its extended result code.
+    #[inline]
+    pub fn step_with_structured_errors(&mut self) -> Result<StepResult> {
+        self._step(None)
+    }
+
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
@@ -1844,11 +1852,11 @@ mod tests {
 
     #[test]
     fn internal_constraint_errors_are_structured() {
-        for (sql, kind, message, foreign_key) in constraint_error_cases() {
+        for (sql, kind, message, foreign_key, extended_code) in constraint_error_cases() {
             let conn = constraint_test_connection();
             let mut stmt = conn.prepare(sql).unwrap();
             let error = loop {
-                match stmt._step(None) {
+                match stmt.step_with_structured_errors() {
                     Err(error) => break error,
                     Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
                         stmt.pager.io.step().unwrap();
@@ -1863,12 +1871,13 @@ mod tests {
             assert_eq!(error.to_string(), message, "{sql}");
             assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
             assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
         }
     }
 
     #[test]
     fn public_constraint_errors_preserve_sqlite_variants() {
-        for (sql, _, message, foreign_key) in constraint_error_cases() {
+        for (sql, _, message, foreign_key, _) in constraint_error_cases() {
             for with_waker in [false, true] {
                 let conn = constraint_test_connection();
                 let mut stmt = conn.prepare(sql).unwrap();
@@ -1939,57 +1948,131 @@ mod tests {
         assert_eq!(error.sqlite_result_code(), 19);
     }
 
-    fn constraint_error_cases() -> [(&'static str, crate::ConstraintKind, &'static str, bool); 8] {
+    fn constraint_error_cases(
+    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
         [
             (
                 "INSERT INTO parent VALUES (1, 'b', 1)",
                 crate::ConstraintKind::PrimaryKey,
                 "UNIQUE constraint failed: parent.id",
                 false,
+                1555,
             ),
             (
                 "INSERT INTO parent VALUES (2, 'a', 1)",
                 crate::ConstraintKind::Unique,
                 "UNIQUE constraint failed: parent.code",
                 false,
+                2067,
             ),
             (
                 "INSERT INTO parent VALUES (2, NULL, 1)",
                 crate::ConstraintKind::NotNull,
                 "NOT NULL constraint failed: parent.code",
                 false,
+                1299,
             ),
             (
                 "INSERT INTO parent VALUES (2, 'b', -1)",
                 crate::ConstraintKind::Check,
                 "CHECK constraint failed: positive",
                 false,
+                275,
             ),
             (
                 "INSERT INTO child VALUES (99)",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "DELETE FROM parent",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "INSERT INTO deferred_child VALUES (99)",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "INSERT INTO trigger_source VALUES (1)",
                 crate::ConstraintKind::PrimaryKey,
                 "UNIQUE constraint failed: parent.id",
                 false,
+                1555,
+            ),
+            (
+                "INSERT INTO text_key VALUES ('k')",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: text_key.k",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO pair_key VALUES (1, 1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "UPDATE pair_key SET b = 1 WHERE b = 2",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO pair_key VALUES (1, 2) ON CONFLICT DO UPDATE SET b = 1",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO strict_int VALUES ('x')",
+                crate::ConstraintKind::Datatype,
+                "cannot store TEXT value in INTEGER column strict_int.a",
+                false,
+                3091,
             ),
         ]
+    }
+
+    /// RAISE and a constraint's own ON CONFLICT clause halt with their own
+    /// resolve type, and the error still reports the halt's result code.
+    #[test]
+    fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
+        for (sql, message, extended_code) in [
+            ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
+            (
+                "INSERT INTO unique_rollback VALUES (1)",
+                "UNIQUE constraint failed: unique_rollback.a",
+                2067,
+            ),
+        ] {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                match stmt.step_with_structured_errors() {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt.pager.io.step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+        }
     }
 
     fn constraint_test_connection() -> Arc<crate::Connection> {
@@ -2003,6 +2086,15 @@ mod tests {
             "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
             "INSERT INTO parent VALUES (1, 'a', 1)",
             "INSERT INTO child VALUES (1)",
+            "CREATE TABLE text_key (k TEXT PRIMARY KEY)",
+            "INSERT INTO text_key VALUES ('k')",
+            "CREATE TABLE pair_key (a, b, PRIMARY KEY (a, b))",
+            "INSERT INTO pair_key VALUES (1, 1), (1, 2)",
+            "CREATE TABLE strict_int (a INTEGER) STRICT",
+            "CREATE TABLE raise_abort (a)",
+            "CREATE TRIGGER raise_abort_trigger BEFORE INSERT ON raise_abort BEGIN SELECT RAISE(ABORT, 'nope'); END",
+            "CREATE TABLE unique_rollback (a UNIQUE ON CONFLICT ROLLBACK)",
+            "INSERT INTO unique_rollback VALUES (1)",
         ] {
             conn.execute(sql).unwrap();
         }

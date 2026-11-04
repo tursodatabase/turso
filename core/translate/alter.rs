@@ -1987,7 +1987,6 @@ pub fn translate_alter_table(
                             }
                         }
                         Err(LimboError::ParseError(message)) => {
-                            let message = message.strip_prefix("Parse error: ").unwrap_or(&message);
                             let error =
                                 if let Some(column) = message.strip_prefix("no such column: ") {
                                     format!(

@@ -200,7 +200,7 @@ test unterminated_string_document_errors {
     SELECT json('"abc');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 # Even JSON5 numbers need a digit in the mantissa: a bare dot, a bare
@@ -323,14 +323,14 @@ test nul_escape_followed_by_digit_errors {
     SELECT json('["\01"]');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 test digitless_number_document_errors {
     SELECT json('.');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 # The error position counts characters, not bytes: é is one character
@@ -761,7 +761,7 @@ test json5_unquoted_key_slash_is_malformed {
     SELECT json('{ MNO_123/xyz : 789 }');
 }
 expect error {
-    ^(Parse error: )?malformed JSON$
+    ^malformed JSON$
 }
 
 # \uXXXX escapes may appear anywhere in an unquoted key, whatever they
@@ -940,7 +940,7 @@ test json_bad_path_error_message_format {
     SELECT json_extract('{"b":[1]}', '$.b[#-]');
 }
 expect error {
-    ^(Parse error: )?bad JSON path: '\$\.b\[#-\]'$
+    ^bad JSON path: '\$\.b\[#-\]'$
 }
 
 # Apostrophes in the path are doubled in the message, like SQLite's %Q.
@@ -948,7 +948,7 @@ test json_bad_path_message_doubles_apostrophes {
     SELECT json_extract('{}', 'x''y''z');
 }
 expect error {
-    ^(Parse error: )?bad JSON path: 'x''y''z'$
+    ^bad JSON path: 'x''y''z'$
 }
 
 # %Q reads a C string, so the message stops at an embedded NUL.
@@ -956,7 +956,7 @@ test json_bad_path_message_stops_at_nul {
     SELECT json_extract('{}', 'x' || char(0) || 'y');
 }
 expect error {
-    ^(Parse error: )?bad JSON path: 'x'$
+    ^bad JSON path: 'x'$
 }
 
 # subtype() reports 74 ('J') for TEXT a JSON function produced, and 0
@@ -994,7 +994,7 @@ test non_jsonb_blob_arguments_error {
     SELECT json_array(x'313233');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?JSON cannot hold BLOB values$
+    ^(Runtime error: )?JSON cannot hold BLOB values$
 }
 
 # Document arguments accept blobs everywhere: JSONB blobs directly,
@@ -1050,14 +1050,14 @@ test patch_validates_target_before_null_patch {
     SELECT json_patch(x'ABCD', 'null');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 test jsonb_patch_validates_target_before_null_patch {
     SELECT jsonb_patch(x'ABCD', 'null');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 # json_error_position reads a non-JSONB blob as text that stops at the

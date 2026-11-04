@@ -1271,15 +1271,6 @@ fn query_pragma(
                 resolver.with_schema(table_namespace.database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(table_namespace.id, &table_name) {
                         let btree = table.btree();
-                        let pk_cols: Vec<String> = btree
-                            .as_ref()
-                            .map(|bt| {
-                                bt.primary_key_columns
-                                    .iter()
-                                    .map(|(name, _)| name.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
                         let without_rowid_pk_index = match &btree {
                             Some(bt) => without_rowid_primary_key_index(bt)?,
                             None => None,
@@ -1290,19 +1281,13 @@ fn query_pragma(
                             .map(|index| index.as_ref())
                             .chain(without_rowid_pk_index.as_ref());
                         for (seq, index) in indices.enumerate() {
-                            let origin = if index.name.starts_with("sqlite_autoindex_") {
-                                let idx_cols: Vec<&str> =
-                                    index.columns.iter().map(|c| c.name.as_str()).collect();
-                                if idx_cols.len() == pk_cols.len()
-                                    && idx_cols
-                                        .iter()
-                                        .zip(pk_cols.iter())
-                                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                                {
-                                    "pk"
-                                } else {
-                                    "u"
-                                }
+                            let origin = if btree
+                                .as_ref()
+                                .is_some_and(|bt| bt.is_primary_key_index(index))
+                            {
+                                "pk"
+                            } else if index.name.starts_with("sqlite_autoindex_") {
+                                "u"
                             } else {
                                 "c"
                             };
