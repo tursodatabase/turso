@@ -470,6 +470,32 @@ impl ResolvedType {
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         self.chain.iter().find_map(|td| td.default_expr())
     }
+
+    /// Whether storing a value of the type may change it: some type in the
+    /// chain has an ENCODE or a COERCE.
+    pub fn has_encode_or_coerce(&self) -> bool {
+        self.chain.iter().any(|td| td.has_encode_or_coerce())
+    }
+
+    /// Whether reading a stored value of the type runs a DECODE.
+    pub fn has_decode(&self) -> bool {
+        self.chain.iter().any(|td| td.decode().is_some())
+    }
+
+    /// Whether the type refuses NULL: some type in the chain is NOT NULL.
+    pub fn not_null(&self) -> bool {
+        self.chain.iter().any(|td| td.not_null)
+    }
+
+    /// Whether values of the type take a COLLATE. A domain answers as its
+    /// base type does, and a domain over a SQLite type takes one when that
+    /// type is text.
+    pub fn accepts_collate(&self) -> bool {
+        self.chain
+            .iter()
+            .find_map(|td| td.accepts_collate)
+            .unwrap_or_else(|| self.primitive == "text")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1888,9 +1914,8 @@ impl Schema {
             .ordering()
     }
 
-    /// Whether values of `type_def` take a COLLATE. A domain answers as its
-    /// base type does, and a domain over a SQLite type takes one when that
-    /// type is text.
+    /// Whether values of `type_def` take a COLLATE. See
+    /// [ResolvedType::accepts_collate].
     pub fn type_accepts_collate(&self, type_def: &TypeDef) -> crate::Result<bool> {
         if let Some(accepts_collate) = type_def.accepts_collate {
             return Ok(accepts_collate);
@@ -1900,11 +1925,7 @@ impl Schema {
             .ok_or_else(|| {
                 LimboError::InternalError(format!("type {} is not registered", type_def.name))
             })?;
-        Ok(resolved
-            .chain
-            .iter()
-            .find_map(|type_def| type_def.accepts_collate)
-            .unwrap_or_else(|| resolved.primitive == "text"))
+        Ok(resolved.accepts_collate())
     }
 
     /// Fails when `element_type` is neither a STRICT type nor a custom type,
@@ -1942,7 +1963,7 @@ impl Schema {
         self.resolve_type(&column.ty_str, is_strict)
             .ok()
             .flatten()
-            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
+            .is_some_and(|resolved| resolved.has_decode())
     }
 
     /// Fails when `column` is lossy, so it cannot be an index, UNIQUE, PRIMARY KEY
@@ -2070,17 +2091,15 @@ impl Schema {
         &self,
         column: &Column,
     ) -> Result<(bool, Vec<CheckConstraint>)> {
-        let mut not_null = false;
         let mut checks = vec![];
         let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
-            return Ok((not_null, checks));
+            return Ok((false, checks));
         };
         if !resolved.is_domain() {
-            return Ok((not_null, checks));
+            return Ok((false, checks));
         }
         let col_name = column.name.as_deref().unwrap_or("").to_string();
         for td in &resolved.chain {
-            not_null |= td.not_null;
             for (i, dc) in td.domain_checks.iter().enumerate() {
                 let rewritten = rewrite_value_to_column(&dc.check, &col_name);
                 let name = dc
@@ -2095,7 +2114,7 @@ impl Schema {
                 })?;
             }
         }
-        Ok((not_null, checks))
+        Ok((resolved.not_null(), checks))
     }
 
     pub fn remove_type(&mut self, type_name: &str) {
