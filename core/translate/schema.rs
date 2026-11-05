@@ -3373,7 +3373,11 @@ pub fn translate_create_domain(
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
-        let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        let mut s = format!(
+            "CREATE DOMAIN {} AS {}",
+            quote_identifier(&normalized_name),
+            quote_identifier(base_type)
+        );
         if let Some(ref def) = default {
             s.push_str(&format!(" DEFAULT {def}"));
         }

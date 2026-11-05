@@ -141,6 +141,47 @@ mod tests {
         }
     }
 
+    /// A quoted type or domain name is stored without its quotes, so after
+    /// reopening it is still found by its plain name and can be dropped.
+    #[test]
+    fn test_quoted_type_names_persist_across_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("quoted_type_names_reopen.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE \"my type\"(value text) BASE text ENCODE upper(value) DECODE value",
+            )
+            .unwrap();
+            conn.execute("CREATE DOMAIN \"Pos\" AS integer CHECK (value > 0)")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a \"my type\", b pos) STRICT")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t VALUES ('abc', 3)").unwrap();
+            assert!(conn.execute("INSERT INTO t VALUES ('x', -1)").is_err());
+            let rows: Vec<(String, i64)> = conn.exec_rows("SELECT a, b FROM t");
+            assert_eq!(rows, vec![("ABC".to_string(), 3)]);
+            conn.execute("DROP TABLE t").unwrap();
+            conn.execute("DROP TYPE \"my type\"").unwrap();
+            conn.execute("DROP DOMAIN pos").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM __turso_internal_types");
+        assert_eq!(rows, vec![(0,)]);
+    }
+
     /// Indexes on custom-type columns must keep their order after reopening:
     /// the stored-value order of a user type, and numeric's own order, both for
     /// column indexes and for expression indexes.
