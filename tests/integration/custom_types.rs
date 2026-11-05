@@ -876,6 +876,45 @@ mod tests {
         }
     }
 
+    /// A statement prepared before another connection creates a type in main
+    /// that an attached database casts to is refused when it runs.
+    #[test]
+    fn test_statement_prepared_before_a_type_is_created_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let aux_db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let aux_conn = aux_db.connect_limbo();
+            aux_conn.execute("CREATE TABLE t(x text)").unwrap();
+            aux_conn
+                .execute("CREATE INDEX i ON t(CAST(x AS tag))")
+                .unwrap();
+            aux_conn.close().unwrap();
+        }
+        let db = TempDatabase::new_with_existent_with_opts(
+            &temp_dir.path().join("main.db"),
+            custom_types.with_attach(true),
+        );
+        let conn = db.connect_limbo();
+        let other_conn = db.connect_limbo();
+        conn.execute("CREATE TABLE m(x text)").unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let mut stmt = conn.prepare("INSERT INTO aux.t VALUES ('a')").unwrap();
+        other_conn
+            .execute("CREATE TYPE tag BASE text ENCODE value DECODE 'A' || value")
+            .unwrap();
+
+        let err = stmt.run_ignore_rows().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "index i casts to type tag in database aux: custom types and domains can only be used in the main database"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A transaction that finds an attached database refused can still be
     /// rolled back.
     #[test]
