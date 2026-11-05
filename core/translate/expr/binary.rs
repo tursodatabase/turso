@@ -68,8 +68,8 @@ fn emit_row_valued_binary_expr(
 
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_row_value(program, referenced_tables, e1, lhs_arity, lhs_reg, resolver)?;
+    translate_row_value(program, referenced_tables, e2, lhs_arity, rhs_reg, resolver)?;
 
     emit_binary_expr_row_valued(
         program,
@@ -443,6 +443,30 @@ pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_
         })),
         _ => Ok(Cow::Borrowed(expr)),
     }
+}
+
+/// Writes the `len` components of the row value `expr` into the registers
+/// starting at `start_reg`. Each component is translated as one value, so a
+/// row value nested inside another is "row value misused", as in SQLite.
+pub(super) fn translate_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &Expr,
+    len: usize,
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for idx in 0..len {
+        let component = row_value_component_expr(expr, idx)?;
+        translate_expr(
+            program,
+            referenced_tables,
+            &component,
+            start_reg + idx,
+            resolver,
+        )?;
+    }
+    Ok(())
 }
 
 /// The number of components [row_value_component_expr] splits `expr` into.
