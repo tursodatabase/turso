@@ -30,6 +30,18 @@ test error-syntax {
 @sqlstate 42601
 expect error {}
 
+test error-values-lists-have-different-lengths {
+    VALUES (1), (2, 3), (4);
+}
+@sqlstate 42601
+expect error {}
+
+test error-insert-values-lists-have-different-lengths {
+    INSERT INTO t VALUES (1), (2, 3), (4);
+}
+@sqlstate 42601
+expect error {}
+
 test error-aborts-rest-of-batch {
     CREATE TABLE t (a int);
     INSERT INTO t VALUES (1);
