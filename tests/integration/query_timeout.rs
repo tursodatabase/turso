@@ -1,6 +1,6 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use turso_core::vdbe::StepResult;
 
 fn run_until_terminal(stmt: &mut turso_core::Statement) -> turso_core::Result<StepResult> {
@@ -60,7 +60,24 @@ fn query_timeout_allows_short_running_query(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
-const SLOW_JOIN: &str = "SELECT count(*) FROM tasks a, tasks b, tasks c";
+/// Runs for minutes on 200 rows, so a statement that returns quickly was
+/// stopped inside the trigger rather than after it.
+const SLOW_JOIN: &str = "SELECT count(*) FROM tasks a, tasks b, tasks c, tasks d";
+
+fn run_expecting_prompt_interrupt(stmt: &mut turso_core::Statement) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let result = run_until_terminal(stmt);
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(result, Ok(StepResult::Interrupt)),
+        "expected interrupt, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the trigger body ran for {elapsed:?} before the statement stopped"
+    );
+    Ok(())
+}
 
 fn create_tasks(conn: &std::sync::Arc<turso_core::Connection>) -> anyhow::Result<()> {
     conn.execute("CREATE TABLE tasks(id INTEGER PRIMARY KEY)")?;
@@ -84,11 +101,7 @@ fn query_timeout_interrupts_trigger_body(tmp_db: TempDatabase) -> anyhow::Result
     conn.set_query_timeout(Duration::from_millis(10));
 
     let mut stmt = conn.prepare("UPDATE outbox SET v = v + 1")?;
-    let result = run_until_terminal(&mut stmt)?;
-    assert!(
-        matches!(result, StepResult::Interrupt),
-        "expected interrupt, got {result:?}"
-    );
+    run_expecting_prompt_interrupt(&mut stmt)?;
     drop(stmt);
 
     conn.set_query_timeout(Duration::ZERO);
@@ -123,11 +136,7 @@ fn query_timeout_interrupts_trigger_fired_by_foreign_key_action(
     conn.set_query_timeout(Duration::from_millis(10));
 
     let mut stmt = conn.prepare("DELETE FROM parent WHERE id = 1")?;
-    let result = run_until_terminal(&mut stmt)?;
-    assert!(
-        matches!(result, StepResult::Interrupt),
-        "expected interrupt, got {result:?}"
-    );
+    run_expecting_prompt_interrupt(&mut stmt)?;
     Ok(())
 }
 
@@ -154,11 +163,7 @@ fn connection_interrupt_inside_trigger_returns_interrupt(
     );
 
     let mut stmt = conn.prepare("UPDATE outbox SET v = v + 1 WHERE id = 1")?;
-    let result = run_until_terminal(&mut stmt);
+    run_expecting_prompt_interrupt(&mut stmt)?;
     conn.set_progress_handler(0, None);
-    assert!(
-        matches!(result, Ok(StepResult::Interrupt)),
-        "expected interrupt, got {result:?}"
-    );
     Ok(())
 }
