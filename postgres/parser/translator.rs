@@ -1665,11 +1665,22 @@ impl PostgreSQLTranslator {
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
+        let mut expected_len: Option<usize> = None;
         // First pass: compute the default mask across ALL rows.
         // A column is "all defaults" only if every row has DEFAULT for that position.
         let mut default_mask: Vec<bool> = Vec::new();
         for (row_idx, row_node) in values_lists.iter().enumerate() {
             if let Some(Node::List(list)) = &row_node.node {
+                if let Some(expected_len) = expected_len {
+                    if list.items.len() != expected_len {
+                        return Err(ParseError::ParseError(
+                            "VALUES lists must all be the same length".into(),
+                        ));
+                    }
+                } else {
+                    expected_len = Some(list.items.len());
+                }
+
                 if row_idx == 0 {
                     default_mask = list
                         .items
@@ -1710,6 +1721,7 @@ impl PostgreSQLTranslator {
                 }
             }
         }
+
         Ok((rows, default_mask))
     }
 
@@ -1873,6 +1885,14 @@ impl PostgreSQLTranslator {
                 }
                 rows.push(exprs);
             }
+
+            let expected_len = rows[0].len();
+            if rows.iter().any(|row| row.len() != expected_len) {
+                return Err(ParseError::ParseError(
+                    "VALUES lists must all be the same length".into(),
+                ));
+            }
+
             let body = ast::SelectBody {
                 select: ast::OneSelect::Values(rows),
                 compounds: vec![],
@@ -2990,13 +3010,16 @@ impl PostgreSQLTranslator {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
-                let expr = Box::new(self.translate_expr(arg)?);
+                let mut expr = Box::new(self.translate_expr(arg)?);
                 let pg_type_name = type_cast
                     .type_name
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
+                }
+                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
+                    expr = Box::new(int8_cast_operand(arg, *expr));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -3968,8 +3991,12 @@ impl PostgreSQLTranslator {
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
                 }
+                let mut operand = args.into_iter().next().unwrap();
+                if func_name.eq_ignore_ascii_case("int8") {
+                    operand = Box::new(int8_cast_operand(&func_call.args[0], *operand));
+                }
                 return Ok(ast::Expr::Cast {
-                    expr: args.into_iter().next().unwrap(),
+                    expr: operand,
                     type_name: Some(ast::Type {
                         name: type_name.to_string(),
                         size: None,
@@ -6134,6 +6161,109 @@ fn json_type_or_raise(
     }
 }
 
+/// The operand of an int8 cast, made to raise "bigint out of range" when it is
+/// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
+/// clamp it. The literal is checked from its text, because a literal just past
+/// the range becomes a REAL equal to i64::MIN or 2^63.
+fn int8_cast_operand(arg: &pg_query::protobuf::Node, operand: ast::Expr) -> ast::Expr {
+    match numeric_literal_text(arg) {
+        Some(literal) if numeric_literal_exceeds_int8(literal) => {
+            function_call("int8_out_of_range", vec![])
+        }
+        _ => operand,
+    }
+}
+
+/// The text of a non-integer numeric literal, also when written with a unary
+/// plus. PostgreSQL's parser already folds a unary minus into the literal.
+fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst, AExprKind};
+    match arg.node.as_ref()? {
+        Node::AConst(AConst {
+            val: Some(Val::Fval(f)),
+            ..
+        }) => Some(&f.fval),
+        Node::AExpr(a_expr)
+            if a_expr.kind() == AExprKind::AexprOp
+                && a_expr.lexpr.is_none()
+                && matches!(
+                    a_expr.name.as_slice(),
+                    [pg_query::protobuf::Node {
+                        node: Some(Node::String(name)),
+                    }] if name.sval == "+"
+                ) =>
+        {
+            numeric_literal_text(a_expr.rexpr.as_ref()?)
+        }
+        _ => None,
+    }
+}
+
+/// Rounds half away from zero before the range check, like PostgreSQL's
+/// numeric to int8 cast.
+fn numeric_literal_exceeds_int8(literal: &str) -> bool {
+    let literal = literal.replace('_', "");
+    let (negative, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, literal.as_str()),
+    };
+    let limit = if negative {
+        i64::MIN.unsigned_abs() as u128
+    } else {
+        i64::MAX as u128
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = unsigned[2..].trim_start_matches('0');
+        // Too many digits for a u128 is far outside the bigint range.
+        return u128::from_str_radix(digits, radix).map_or(!digits.is_empty(), |m| m > limit);
+    }
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => match exponent.parse::<i64>() {
+            Ok(exponent) => (mantissa, exponent),
+            Err(_) => return false,
+        },
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let all_digits = format!("{int_part}{frac_part}");
+    let digits = all_digits.trim_start_matches('0').as_bytes();
+    if digits.is_empty() {
+        return false;
+    }
+    let int_len = (digits.len() as i64)
+        .saturating_sub(frac_part.len() as i64)
+        .saturating_add(exponent);
+    if int_len > 19 {
+        return true;
+    }
+    if int_len < 0 {
+        return false;
+    }
+    let int_len = int_len as usize;
+    let mut magnitude: u128 = 0;
+    for i in 0..int_len {
+        let digit = digits.get(i).map_or(0, |d| d - b'0');
+        magnitude = magnitude * 10 + digit as u128;
+    }
+    if digits.get(int_len).is_some_and(|&d| d >= b'5') {
+        magnitude += 1;
+    }
+    magnitude > limit
+}
+
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -6163,10 +6293,12 @@ fn pg_type_name_to_ast_type(
         _ => &pg_type,
     };
 
+    let array_dimensions = type_name.array_bounds.len() as u32;
+    check_array_dimensions(array_dimensions)?;
     Ok(ast::Type {
         name: name.to_string(),
         size: None,
-        array_dimensions: type_name.array_bounds.len() as u32,
+        array_dimensions,
     })
 }
 
@@ -6240,7 +6372,20 @@ fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, Pars
     if !typmods.is_empty() && mapping.type_params.is_empty() {
         return Err(not_supported(format!("a type modifier on {pg_type}")));
     }
+    check_array_dimensions(mapping.array_dimensions)?;
     Ok(mapping)
+}
+
+/// PostgreSQL accepts any number of `[]` in a type name, but a Turso column
+/// or cast holds at most [ast::MAX_ARRAY_DIMENSIONS].
+fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
+    if dimensions > ast::MAX_ARRAY_DIMENSIONS {
+        return Err(not_supported(format!(
+            "an array type with {dimensions} dimensions (at most {})",
+            ast::MAX_ARRAY_DIMENSIONS
+        )));
+    }
+    Ok(())
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
@@ -7861,7 +8006,9 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     // function tursopg provides has a lowercase name, so a quoted name like
     // "LOWER" names no function. Reject it here because core, like SQLite,
     // matches function names without regard to case.
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+    if name.bytes().any(|b| b.is_ascii_uppercase())
+        || FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS.contains(&name.as_str())
+    {
         return Err(ParseError::Sqlstate {
             sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
             message: format!("no such function: {name}"),
@@ -7869,6 +8016,9 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     }
     Ok(name)
 }
+
+/// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
+const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
     match names {
@@ -11326,6 +11476,48 @@ mod tests {
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 5)");
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (5, 2)");
         assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
+    }
+
+    #[test]
+    fn reject_insert_values_with_different_row_lengths() {
+        let sql = "INSERT INTO t VALUES (1), (2, 3), (4)";
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains("VALUES lists must all be the same length"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_insert_values_with_default_and_different_row_lengths() {
+        let sql = "INSERT INTO t (a, b) VALUES (1, DEFAULT), (2)";
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains("VALUES lists must all be the same length"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_select_values_with_different_row_lengths() {
+        let sql = "VALUES (1), (2, 3), (4)";
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains("VALUES lists must all be the same length"),
+            "{err}"
+        );
     }
 
     fn translate_to_sql(sql: &str) -> String {

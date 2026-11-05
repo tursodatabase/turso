@@ -774,10 +774,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                format!("{} ({})", data.target, data.element_type),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -818,19 +815,6 @@ pub fn insn_to_row(
                 "MakeArray",
                 *start_reg as i64,
                 *count as i64,
-                *dest as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::MakeArrayDynamic {
-                start_reg,
-                count_reg,
-                dest,
-            } => (
-                "MakeArrayDynamic",
-                *start_reg as i64,
-                *count_reg as i64,
                 *dest as i64,
                 Value::build_text(""),
                 0,
@@ -884,19 +868,6 @@ pub fn insn_to_row(
                 *src_reg as i64,
                 *dest as i64,
                 *expected_tag as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::RegCopyOffset {
-                src,
-                base,
-                offset_reg,
-            } => (
-                "RegCopyOffset",
-                *src as i64,
-                *base as i64,
-                *offset_reg as i64,
                 Value::build_text(""),
                 0,
                 String::new(),

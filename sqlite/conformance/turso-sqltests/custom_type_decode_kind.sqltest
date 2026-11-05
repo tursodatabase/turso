@@ -1,0 +1,323 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# A column of a custom type compares by the kind of value its DECODE gives,
+# not by how the value is stored. CREATE TYPE refuses a DECODE when it can't
+# tell that kind.
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-untyped-function {
+    CREATE TYPE j(value any) BASE text ENCODE CAST(value AS text) DECODE json_extract(value, '$');
+}
+expect error {
+    cannot tell what kind of value DECODE of type j returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-mixed-case {
+    CREATE TYPE m(value any) BASE text ENCODE CAST(value AS text) DECODE CASE WHEN value = '' THEN 0 ELSE value END;
+}
+expect error {
+    cannot tell what kind of value DECODE of type m returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-type-with-own-order {
+    CREATE TYPE n(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS numeric(10, 2));
+}
+expect error {
+    DECODE of type n returns a numeric, which only compares in its own order
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-cast-compares-as-real {
+    -- The values are stored as text, where '10.0' < '9.6'. DECODE gives
+    -- reals, so 10.0 > 9.6.
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(json_extract(value, '$') AS real) AS text) DECODE CAST(json_extract(value, '$') AS real);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c price) STRICT;
+    INSERT INTO t VALUES (1, '10.0'), (2, 9.5), (3, 100), (4, NULL), (5, '2e1');
+    SELECT 'lt', id FROM t WHERE c < 9.6 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 9.6 ORDER BY id;
+    SELECT 'eq', id FROM t WHERE c = 10 ORDER BY id;
+    SELECT 'eq-text', id FROM t WHERE c = '9.5' ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (20, 100) ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c WHERE a.id = 2 ORDER BY 3;
+    SELECT 'minmax', min(c), max(c) FROM t;
+}
+expect {
+    lt|2
+    gt|1
+    gt|3
+    gt|5
+    eq|1
+    eq-text|2
+    in|3
+    in|5
+    join|2|1
+    join|2|3
+    join|2|5
+    minmax|9.5|100.0
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-check-and-generated-column {
+    -- CHECK and generated columns compare the decoded value too.
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real);
+    CREATE TABLE g(id INTEGER PRIMARY KEY, c price CHECK (c < 50), small INTEGER GENERATED ALWAYS AS (c < 9.6)) STRICT;
+    INSERT INTO g(id, c) VALUES (1, 9.5), (2, 10);
+    SELECT id, small FROM g ORDER BY id;
+}
+expect {
+    1|1
+    2|0
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-check-rejects-by-decoded-value {
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real);
+    CREATE TABLE g(id INTEGER PRIMARY KEY, c price CHECK (c < 9.6)) STRICT;
+    INSERT INTO g VALUES (1, 10);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-upsert-compares-decoded-values {
+    -- The DO UPDATE WHERE compares excluded.c and c as reals: as text,
+    -- '12.0' > 9.6 and '10.0' > 9.6 would both be false.
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c price, d integer) STRICT;
+    INSERT INTO t VALUES (1, 10, 0), (2, 10, 0);
+    INSERT INTO t VALUES (1, 12, 0) ON CONFLICT(id) DO UPDATE SET d = 1 WHERE excluded.c > 9.6;
+    INSERT INTO t VALUES (2, 12, 0) ON CONFLICT(id) DO UPDATE SET d = 2 WHERE c > 9.6;
+    SELECT id, c, d FROM t ORDER BY id;
+}
+expect {
+    1|10.0|1
+    2|10.0|2
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-raise-adds-no-kind {
+    -- RAISE gives no value, so the coalesce reads as an integer: 10 > 9,
+    -- although the text '10' < '9'.
+    CREATE TYPE s(value any) BASE text ENCODE value DECODE coalesce(CAST(value AS integer), RAISE(ABORT, 'bad'));
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c s) STRICT;
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    SELECT id, typeof(c) FROM t WHERE c > 9;
+}
+expect {
+    1|integer
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-json-arrow-is-text {
+    -- `->` always gives JSON text, so c compares as text: '10' < '9'.
+    CREATE TYPE j(value any) BASE text ENCODE value DECODE value -> '$.a';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c j) STRICT;
+    INSERT INTO t VALUES (1, '{"a":10}'), (2, '{"a":9}');
+    SELECT id, typeof(c), c FROM t WHERE c < 9;
+}
+expect {
+    1|text|10
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-json-double-arrow {
+    -- `->>` gives the SQL value it extracts, whose kind varies.
+    CREATE TYPE j(value any) BASE text ENCODE value DECODE value ->> '$.a';
+}
+expect error {
+    cannot tell what kind of value DECODE of type j returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-nested-type-and-domain {
+    -- A DECODE that casts to another custom type, or to a domain, reads as
+    -- that type's kind.
+    CREATE TYPE int_text(value any) BASE text ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS integer);
+    CREATE TYPE wrapped(value any) BASE text ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS int_text);
+    CREATE DOMAIN positive AS int_text CHECK (value > 0);
+    CREATE TYPE via_domain(value any) BASE text ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS positive);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, w wrapped, d via_domain) STRICT;
+    INSERT INTO t VALUES (1, 10, 10), (2, 9, 9);
+    SELECT 'wrapped', id FROM t WHERE w > 9 ORDER BY id;
+    SELECT 'domain', id FROM t WHERE d > 9 ORDER BY id;
+}
+expect {
+    wrapped|1
+    domain|1
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-uuid-compares-as-text {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, x uuid) STRICT;
+    INSERT INTO u VALUES (1, '01945ca0-3189-76c0-9a8f-caf310fc8b8e'), (2, '550e8400-e29b-41d4-a716-446655440000');
+    SELECT 'eq', id FROM u WHERE x = '550e8400-e29b-41d4-a716-446655440000';
+    CREATE INDEX u_x ON u(x);
+    SELECT 'eq', id FROM u WHERE x = '550e8400-e29b-41d4-a716-446655440000';
+}
+expect {
+    eq|2
+    eq|2
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-round-is-real {
+    -- round gives a real or NULL for any argument, so this DECODE's kind is
+    -- known: '10' > 9.6 although the text '10' < '9.6'.
+    CREATE TYPE r(value any) BASE text ENCODE value DECODE round(value, 2);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c r) STRICT;
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    SELECT id FROM t WHERE c > 9.6;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-math-of-text-is-real {
+    -- These functions convert a text argument to a real, so each DECODE is
+    -- accepted and reads as a real.
+    CREATE TYPE f_exp(value any) BASE text ENCODE value DECODE exp(value);
+    CREATE TYPE f_ln(value any) BASE text ENCODE value DECODE ln(value);
+    CREATE TYPE f_log(value any) BASE text ENCODE value DECODE log(value);
+    CREATE TYPE f_log2(value any) BASE text ENCODE value DECODE log(value, 2);
+    CREATE TYPE f_log10(value any) BASE text ENCODE value DECODE log10(value);
+    CREATE TYPE f_mod(value any) BASE text ENCODE value DECODE mod(value, 3);
+    CREATE TYPE f_pow(value any) BASE text ENCODE value DECODE pow(value, 2);
+    CREATE TYPE f_power(value any) BASE text ENCODE value DECODE power(value, 2);
+    CREATE TYPE f_sqrt(value any) BASE text ENCODE value DECODE sqrt(value);
+    CREATE TABLE t(a f_exp, b f_ln, c f_log, d f_log2, e f_log10, f f_mod, g f_pow, h f_power, i f_sqrt) STRICT;
+    INSERT INTO t VALUES ('4', '4', '4', '4', '4', '4', '4', '4', '4');
+    SELECT typeof(a), typeof(b), typeof(c), typeof(d), typeof(e), typeof(f), typeof(g), typeof(h), typeof(i) FROM t;
+}
+expect {
+    real|real|real|real|real|real|real|real|real
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-round-of-integer {
+    -- In PostgreSQL, round() of an exact number gives an exact number, so
+    -- the kind of round() of an integer is not known.
+    CREATE TYPE ri(value any) BASE integer ENCODE value DECODE round(value);
+}
+expect error {
+    cannot tell what kind of value DECODE of type ri returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-true-or-false-is-integer {
+    -- Like a comparison, these give 1, 0 or NULL, so they compare as
+    -- integers: 1 < '09' as numbers, although the text '1' > '09'.
+    CREATE TYPE bt(value any) BASE integer ENCODE value DECODE value BETWEEN 1 AND 5;
+    CREATE TYPE il(value any) BASE integer ENCODE value DECODE value IN (1, 2);
+    CREATE TYPE lk(value any) BASE text ENCODE value DECODE value LIKE 'a%';
+    CREATE TYPE gb(value any) BASE text ENCODE value DECODE value GLOB 'a*';
+    CREATE TYPE rx(value any) BASE text ENCODE value DECODE value REGEXP '^a';
+    CREATE TYPE nn(value any) BASE text ENCODE value DECODE value NOT NULL;
+    CREATE TABLE t(a bt, b il, c lk, d gb, e rx, f nn) STRICT;
+    INSERT INTO t VALUES (3, 1, 'abc', 'abc', 'abc', 'abc');
+    SELECT a < '09', b < '09', c < '09', d < '09', e < '09', f < '09' FROM t;
+}
+expect {
+    1|1|1|1|1|1
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-follows-the-type-it-casts-to {
+    -- a's DECODE casts to b, so a reads as b's kind, text: c > 9 compares
+    -- with the text '9', and the text '10' sorts before '9'.
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value);
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT;
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    SELECT 'gt-number', id FROM t WHERE c > 9;
+    SELECT 'lt-text', id FROM t WHERE c < '9';
+}
+expect {
+    lt-text|1
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-cast-to-blob-type-compares-as-blob {
+    -- bytea is stored as a blob, so CAST to it gives a blob, and c compares
+    -- like a plain BLOB column: equal only to the blob x'3132', not to 12
+    -- or '12'.
+    CREATE TYPE b(value any) BASE text DECODE CAST(value AS bytea);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c b) STRICT;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, c BLOB) STRICT;
+    INSERT INTO t VALUES (1, '12');
+    INSERT INTO p VALUES (1, x'3132');
+    SELECT 't', typeof(c), c = x'3132', c = 12, c = '12' FROM t;
+    SELECT 'p', typeof(c), c = x'3132', c = 12, c = '12' FROM p;
+}
+expect {
+    t|blob|1|0|0
+    p|blob|1|0|0
+}
+
+# Before b exists, CAST(value AS b) converts to NUMERIC, as SQLite does for
+# an unknown type name. Creating b would change what that CAST gives, and so
+# the values already stored in an index on it.
+@requires strict "uses STRICT tables"
+test create-type-refused-when-a-type-casts-to-its-name {
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT;
+    CREATE INDEX t_c ON t(c > 9);
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value);
+}
+expect error {
+    cannot create type b: type a already casts to it; create b before a
+}
+
+@requires strict "uses STRICT tables"
+test create-type-refused-when-two-types-would-cast-to-each-other {
+    -- The kinds of a and b would each depend on the other's.
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a);
+}
+expect error {
+    cannot create type b: type a already casts to it; create b before a
+}
+
+@requires strict "uses STRICT tables"
+test create-domain-refused-when-an-index-casts-to-its-name {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c text) STRICT;
+    CREATE INDEX t_c ON t(CAST(c AS b));
+    CREATE DOMAIN b AS text;
+}
+expect error {
+    cannot create domain b: index t_c already casts to it
+}
+
+# Recreating a with DECODE CAST(value AS b) would make reading a column of
+# either type run the two DECODEs in turn without end.
+@requires strict "uses STRICT tables"
+test drop-type-refused-when-another-type-decodes-to-it {
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS text);
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a);
+    DROP TYPE a;
+}
+expect error {
+    cannot drop type a: type b depends on it
+}
+
+@requires strict "uses STRICT tables"
+test create-type-refused-when-it-casts-to-itself {
+    -- Reading a column of a would run a's DECODE again without end.
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a);
+}
+expect error {
+    cannot create type a: it casts to itself
+}
+
+@requires strict "uses STRICT tables"
+test create-domain-refused-when-it-casts-to-itself {
+    CREATE DOMAIN d AS text CHECK (CAST(value AS d) IS NOT NULL);
+}
+expect error {
+    cannot create domain d: it casts to itself
+}

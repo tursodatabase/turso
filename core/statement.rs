@@ -790,6 +790,12 @@ impl Statement {
         self.state.current_time = Some(now);
     }
 
+    /// Makes a trigger or foreign key action stop at the deadline of the
+    /// statement that runs it.
+    pub(crate) fn set_query_deadline(&mut self, deadline: Option<crate::MonotonicInstant>) {
+        self.state.query_deadline = deadline;
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;
@@ -1562,7 +1568,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Interrupt) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(

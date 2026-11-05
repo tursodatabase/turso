@@ -62,8 +62,8 @@ DROP TYPE cents;
 
 ```sql
 CREATE TYPE reversed_text BASE text
-    ENCODE turso_reverse(value)
-    DECODE turso_reverse(value);
+    ENCODE reverse(value)
+    DECODE reverse(value);
 
 DROP TYPE reversed_text;
 ```

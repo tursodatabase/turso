@@ -69,6 +69,26 @@ fn create_table_then_select() {
 }
 
 #[test]
+fn result_table_has_no_lines_between_rows() {
+    let output = run_tursopg(
+        b"CREATE TABLE t(a INT, b TEXT);\nINSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');\nSELECT * FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        "\
+┌───┬───┐
+│ a │ b │
+├───┼───┤
+│ 1 │ x │
+│ 2 │ y │
+│ 3 │ z │
+└───┴───┘
+"
+    );
+}
+
+#[test]
 fn repl_reports_errors_like_psql() {
     let output = run_tursopg(
         b"CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (1);\nSELECT 1/0;\n",

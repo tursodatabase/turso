@@ -765,6 +765,9 @@ fn prepare_one_select_plan(
 
             {
                 trace_stack!("process_order_by");
+                let is_aggregate_query = has_group_by
+                    || agg_count_before_order_by > 0
+                    || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
                 for (expr, _, _) in key.iter() {
                     let had_agg = resolve_window_and_aggregate_functions(
                         expr,
@@ -780,7 +783,7 @@ fn prepare_one_select_plan(
                     // e.g. SELECT f1 FROM t ORDER BY min(f1);
                     // But SELECT 1 ORDER BY sum(1) is allowed (no FROM clause).
                     let has_from = !plan.table_references.joined_tables().is_empty();
-                    if had_agg && has_from && !has_group_by && agg_count_before_order_by == 0 {
+                    if had_agg && has_from && !is_aggregate_query {
                         let agg = &plan.aggregates[agg_count_before_order_by];
                         crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                     }
@@ -797,9 +800,8 @@ fn prepare_one_select_plan(
                         &mut cut_named_windows,
                     )?;
                 }
-                let is_aggregate_query = has_group_by || agg_count_before_order_by > 0;
                 if !cut_windows.is_empty() && !is_aggregate_query {
-                    for (expr, _, _) in terms_cut_after_rowid.iter() {
+                    for (expr, _, _) in key.iter().chain(terms_cut_after_rowid.iter()) {
                         if let Some(name) = first_aggregate_without_over_clause(expr, resolver)? {
                             crate::bail_parse_error!("misuse of aggregate: {}()", name);
                         }
@@ -957,6 +959,20 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+/// Whether a result column calls an aggregate, also one inside a window function
+/// such as the `sum(a)` in `row_number() OVER (ORDER BY sum(a))`.
+fn result_columns_contain_aggregate(
+    result_columns: &[ResultSetColumn],
+    resolver: &Resolver,
+) -> Result<bool> {
+    for result_column in result_columns {
+        if first_aggregate_without_over_clause(&result_column.expr, resolver)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn first_aggregate_without_over_clause<'a>(

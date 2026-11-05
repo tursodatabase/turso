@@ -106,10 +106,10 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
-    // Array columns: pass through raw record blob. ArrayDecode is emitted
-    // at display time (ResultRow) so that functions/subscripts see raw blobs.
+    // An array stays a record blob, holding the values its elements read as.
+    // It is turned into text only for output.
     if column.is_array() {
-        return Ok(());
+        return emit_array_decode(program, dest_reg, column, resolver);
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
         emit_decode(program, &resolved, dest_reg, resolver)?;
@@ -457,10 +457,8 @@ pub(crate) fn emit_constraint_values_decode(
             table.is_strict,
             resolver,
         )?;
-        // emit_user_facing_column_value leaves arrays encoded, because SELECT
-        // decodes them when it outputs the row.
         if column.is_array() {
-            emit_array_decode(program, decoded_reg, column, resolver)?;
+            program.emit_insn(Insn::ArrayDecode { reg: decoded_reg });
         }
         info.violation_regs[i] = decoded_reg;
     }

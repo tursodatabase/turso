@@ -161,8 +161,8 @@ use super::{
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
-        AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SorterOpenData,
+        AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
+        IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
@@ -303,6 +303,9 @@ pub enum InsnFunctionStepResult {
     IO,
     Row,
     Step,
+    /// A trigger or foreign key action the instruction runs was interrupted,
+    /// so the statement stops as interrupted too.
+    Interrupt,
 }
 
 pub fn op_init(
@@ -2680,8 +2683,7 @@ pub fn op_array_encode(
         element_type,
         element_kind,
         dimensions,
-        table_name,
-        col_name,
+        target,
     } = data.as_ref();
 
     let val = state.registers[*reg].get_value();
@@ -2704,10 +2706,9 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                return Err(datatype_violation(format!(
-                    "cannot store non-array value in {element_type} column {table_name}.{col_name}"
-                ))
-                .into());
+                return crate::error::cold_return(Err(
+                    non_array_value_error(element_type, target).into()
+                ));
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2721,16 +2722,13 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        return Err(datatype_violation(format!(
-            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
-        ))
-        .into());
+        return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name}"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"
         );
     }
 
@@ -2742,6 +2740,23 @@ pub fn op_array_encode(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The error for a value that is not an array, going to `target`.
+fn non_array_value_error(element_type: &str, target: &ArrayEncodeTarget) -> LimboError {
+    let message = match target {
+        ArrayEncodeTarget::Column {
+            table_name,
+            col_name,
+        } => {
+            format!("cannot store non-array value in {element_type} column {table_name}.{col_name}")
+        }
+        ArrayEncodeTarget::Cast => "cannot cast a non-array value to an array".to_string(),
+        ArrayEncodeTarget::IndexKey => {
+            "cannot use a non-array value as an array index key".to_string()
+        }
+    };
+    datatype_violation(message)
 }
 
 /// Converts the elements of an array with `dimensions` levels: in INTEGER[][]
@@ -2756,21 +2771,16 @@ fn convert_array_elements(
     let ArrayEncodeData {
         element_type,
         element_kind,
-        table_name,
-        col_name,
+        target,
         ..
     } = data;
-    let not_an_array = || {
-        datatype_violation(format!(
-            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
-        ))
-    };
+    let not_an_array = || non_array_value_error(element_type, target);
     let mut converted = Vec::with_capacity(elements.len());
     for element in elements {
         let value = match (dimensions, element) {
             (0, _) => {
                 return Err(LimboError::InternalError(format!(
-                    "array column {table_name}.{col_name} has no dimensions"
+                    "array for {target} has no dimensions"
                 )))
             }
             (_, Value::Null) => Value::Null,
@@ -2963,50 +2973,6 @@ pub fn op_make_array(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Create an array from contiguous registers with dynamic count.
-pub fn op_make_array_dynamic(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        MakeArrayDynamic {
-            start_reg,
-            count_reg,
-            dest
-        },
-        insn
-    );
-
-    let count = match state.registers[*count_reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
-        _ => 0,
-    };
-
-    let end = start_reg.checked_add(count).ok_or_else(|| {
-        LimboError::InternalError("MakeArrayDynamic: register range overflow".into())
-    })?;
-    if end > state.registers.len() {
-        return Err(LimboError::InternalError(format!(
-            "MakeArrayDynamic: register range {}..{} exceeds register file size {}",
-            start_reg,
-            end,
-            state.registers.len()
-        ))
-        .into());
-    }
-
-    state.registers[*dest].set_value(make_array_from_registers(
-        &state.registers,
-        *start_reg,
-        count,
-    )?);
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
 /// Split the register file to get a shared reference to `src` and a mutable
 /// reference to `dst`. Panics if `src == dst`.
 #[inline]
@@ -3165,48 +3131,6 @@ pub fn op_union_extract(
         }
         None => state.registers[*dest].set_null(),
     };
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// Copy a register value to a dynamically-computed destination register.
-pub fn op_reg_copy_offset(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        RegCopyOffset {
-            src,
-            base,
-            offset_reg
-        },
-        insn
-    );
-
-    let offset = match state.registers[*offset_reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
-        _ => 0,
-    };
-    let dest = *base + offset;
-    if dest >= state.registers.len() {
-        return Err(LimboError::InternalError(format!(
-            "RegCopyOffset: destination register {} out of bounds (max {})",
-            dest,
-            state.registers.len()
-        ))
-        .into());
-    }
-    if dest != *src {
-        // try_clone_from reuses the destination register's allocation.
-        let [src, dst] = state
-            .registers
-            .get_disjoint_mut([*src, dest])
-            .expect("RegCopyOffset source and destination registers are distinct");
-        dst.try_clone_from(src)?;
-    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6086,6 +6010,7 @@ pub fn op_program(
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
+                    statement.set_query_deadline(state.query_deadline);
                     let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
@@ -6103,7 +6028,20 @@ pub fn op_program(
                                 return Ok(state.suspend_on_io(io));
                             }
                             StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
+                            StepResult::Interrupt => {
+                                // The subprogram already aborted itself when it stopped.
+                                finish_subprogram(
+                                    program,
+                                    &mut state.metrics,
+                                    &mut statement,
+                                    is_trigger,
+                                    true,
+                                    saved_last_insert_rowid,
+                                    saved_last_changes_value,
+                                );
+                                return Ok(InsnFunctionStepResult::Interrupt);
+                            }
+                            StepResult::Busy => {
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
@@ -15227,7 +15165,8 @@ pub fn op_add_type(
 ) -> InsnResult {
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
-    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
+    let syms = conn.syms.read();
+    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql, &syms))??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20362,7 +20301,11 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO)
         }
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+        Ok(
+            InsnFunctionStepResult::Done
+            | InsnFunctionStepResult::Row
+            | InsnFunctionStepResult::Interrupt,
+        ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {

@@ -4344,7 +4344,9 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
                 1,
                 "01".to_string(),
                 "04090F0E3101".to_string(),
-                "0301026400C8".to_string(),
+                // c reads as the array of values {1,2}; the stored {100,200}
+                // is checked by the database hash below.
+                "03090102".to_string(),
                 "{1,2}".to_string()
             ),
             (
@@ -4356,9 +4358,11 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
             ),
         ]
     );
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db).hash;
 
     conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(compute_plain_vacuum_dbhash(&tmp_db).hash, before_hash);
     let after_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
     assert_eq!(after_rows, before_rows);
 
