@@ -3539,4 +3539,91 @@ mod tests {
 
         Ok(())
     }
+
+    /// `VmHWM` of this process from `/proc/self/status`, in MiB: the
+    /// kernel's high-water mark of resident memory, which no later free
+    /// lowers.
+    #[cfg(target_os = "linux")]
+    fn process_peak_rss_mib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("VmHWM:"))
+            .expect("VmHWM in /proc/self/status");
+        let kib: u64 = line
+            .split_whitespace()
+            .nth(1)
+            .expect("VmHWM value")
+            .parse()
+            .expect("VmHWM is kB");
+        kib / 1024
+    }
+
+    /// `VACUUM INTO` must run in bounded memory: copying a database must
+    /// not need the whole database resident, let alone twice it, or a
+    /// backup of a database larger than the host's RAM budget is an OOM
+    /// kill. Builds a ~250 MiB file-backed fixture (a table of 1 KB blobs
+    /// with a secondary index), runs the plain public statement, prints
+    /// the process high-water mark before and after, and asserts the peak
+    /// stays under a bound well below twice the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "writes ~500 MB and takes minutes unoptimised; run with: \
+                cargo test -p turso_core --release --lib vacuum_into_peak_rss -- --ignored --nocapture"]
+    fn vacuum_into_peak_rss_is_bounded() -> Result<()> {
+        const ROWS: usize = 200_000;
+        const ROWS_PER_TXN: usize = 1_000;
+        const PAYLOAD_BYTES: usize = 1_000;
+        const BOUND_MIB: u64 = 256;
+
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let dest_path = dir.path().join("copy.db");
+        let db = Database::open_file_with_flags(
+            io,
+            source_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT NOT NULL, v BLOB NOT NULL)")?;
+        conn.execute("CREATE INDEX t_k ON t(k)")?;
+        for row in 0..ROWS {
+            if row % ROWS_PER_TXN == 0 {
+                conn.execute("BEGIN")?;
+            }
+            conn.execute(format!(
+                "INSERT INTO t(k, v) VALUES ('key-{row:012}', randomblob({PAYLOAD_BYTES}))"
+            ))?;
+            if row % ROWS_PER_TXN == ROWS_PER_TXN - 1 {
+                conn.execute("COMMIT")?;
+            }
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let file_mib = std::fs::metadata(&source_path).unwrap().len() / (1024 * 1024);
+        assert!(file_mib >= 150, "fixture is only {file_mib} MiB");
+
+        let before = process_peak_rss_mib();
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let after = process_peak_rss_mib();
+        let copy_mib = std::fs::metadata(&dest_path).unwrap().len() / (1024 * 1024);
+        println!(
+            "VACUUM INTO of a {file_mib} MiB database: peak RSS {before} MiB before, \
+             {after} MiB after (+{} MiB); the copy is {copy_mib} MiB",
+            after.saturating_sub(before)
+        );
+        assert!(
+            copy_mib.abs_diff(file_mib) <= file_mib / 10,
+            "the copy is {copy_mib} MiB for a {file_mib} MiB source"
+        );
+        assert!(
+            after <= BOUND_MIB,
+            "VACUUM INTO of a {file_mib} MiB database drove the process peak RSS to \
+             {after} MiB (bound {BOUND_MIB} MiB)"
+        );
+        Ok(())
+    }
 }
