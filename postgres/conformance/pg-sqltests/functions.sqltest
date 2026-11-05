@@ -768,6 +768,43 @@ expect {
     2
 }
 
+# PostgreSQL has no oid column on user tables; tursopg reads oid as the rowid.
+# Both must reject a fraction that reads it, without stopping the server.
+test percentile-disc-fraction-reads-oid {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (1);
+    SELECT percentile_disc(oid) WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect error {}
+
+test percentile-cont-fraction-reads-oid {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (1);
+    SELECT percentile_cont(oid) WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect error {}
+
+test percentile-disc-fraction-reads-rowid {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (1);
+    SELECT percentile_disc(rowid) WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect error {}
+
+test percentile-disc-fraction-reads-qualified-oid-of-empty-table {
+    CREATE TABLE demo (value int);
+    SELECT percentile_disc(demo.oid) WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect error {}
+
+test percentile-disc-fraction-compares-oid-in-insert-select {
+    CREATE TABLE demo (value int);
+    CREATE TABLE result (x float8);
+    INSERT INTO demo VALUES (1);
+    INSERT INTO result SELECT percentile_disc(oid = 1) WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect error {}
+
 @skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test acldefault-object-kinds {
     SELECT pg_catalog.acldefault('c', 4294967294);
