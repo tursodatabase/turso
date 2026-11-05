@@ -120,7 +120,7 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
-pub(crate) use translator::is_sqlite_cast_to;
+pub(crate) use translator::custom_type_cast_target;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };

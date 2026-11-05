@@ -879,25 +879,36 @@ fn custom_type_cast_chain(
     if type_name.array_dimensions > 0 {
         return Ok(None);
     }
-    let Some(mut resolved) =
-        schema.resolve_type_unchecked(&crate::util::dequote(&type_name.name))?
-    else {
+    let Some(type_def) = custom_type_cast_target(type_name, schema) else {
         return Ok(None);
     };
-    if resolved.is_domain() {
-        return Ok(Some(resolved));
+    let mut resolved = schema
+        .resolve_type_unchecked(&type_def.name)?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("type {} is not in the registry", type_def.name))
+        })?;
+    if !resolved.is_domain() {
+        resolved.chain.truncate(1);
     }
-    if is_sqlite_cast_to(resolved.leaf(), type_name) {
-        return Ok(None);
-    }
-    resolved.chain.truncate(1);
     Ok(Some(resolved))
+}
+
+/// The custom type a CAST to `type_name` converts each value to, or None when
+/// it is SQLite's CAST: `type_name` is not a custom type, or leaves out the
+/// type's arguments. The `[]` of an array type is not looked at: a CAST to
+/// `time[]` converts each element to time.
+pub(crate) fn custom_type_cast_target<'a>(
+    type_name: &ast::Type,
+    schema: &'a crate::schema::Schema,
+) -> Option<&'a Arc<TypeDef>> {
+    let type_def = schema.get_type_def_unchecked(&crate::util::dequote(&type_name.name))?;
+    (!is_sqlite_cast_to(type_def, type_name)).then_some(type_def)
 }
 
 /// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
 /// instead: the type takes arguments and `type_name` doesn't give all of them.
 /// CAST(x AS NUMERIC) is a common SQLite idiom.
-pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
+fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
     let type_arg_count = match &type_name.size {
         Some(ast::TypeSize::MaxSize(_)) => 1,
         Some(ast::TypeSize::TypeSize(..)) => 2,

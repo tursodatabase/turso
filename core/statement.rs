@@ -1333,10 +1333,18 @@ impl Statement {
             return None;
         }
         let column = &self.program.result_columns.get(idx)?;
-        let affinity = translate::expr::get_expr_affinity(
-            &column.expr,
-            &translate::expr_context::TableMetadata::new(Some(&self.program.table_references)),
-        );
+        let affinity = self
+            .program
+            .connection
+            .with_schema(crate::MAIN_DB_ID, |schema| {
+                translate::expr::get_expr_affinity(
+                    &column.expr,
+                    &translate::expr_context::TableMetadata::new(
+                        Some(&self.program.table_references),
+                        schema,
+                    ),
+                )
+            });
         affinity_to_primitive(affinity).map(str::to_string)
     }
 

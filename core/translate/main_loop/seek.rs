@@ -224,7 +224,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     // NULL in the seek register and let the index comparison
                     // find the rows whose key component is NULL.
                     if !expr.is_nonnull(
-                        &TableMetadata::new(Some(self.tables)),
+                        &TableMetadata::new(Some(self.tables), self.t_ctx.resolver.schema()),
                         &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
                     ) && !self.seek_def.is_null_matching_key_component(i)
                     {
@@ -399,7 +399,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 if !expr.is_nonnull(
-                    &TableMetadata::new(Some(self.tables)),
+                    &TableMetadata::new(Some(self.tables), self.t_ctx.resolver.schema()),
                     &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
                 ) {
                     self.program.emit_insn(Insn::IsNull {

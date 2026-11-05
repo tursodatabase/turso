@@ -4,7 +4,7 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
+        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Schema, Table,
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
@@ -51,8 +51,12 @@ use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprT
 ///
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, &TableMetadata::new(tables))
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    schema: &Schema,
+) -> Affinity {
+    get_expr_affinity(expr, &TableMetadata::new(tables, schema))
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -65,20 +69,34 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
 /// class.
-pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+pub(super) fn compound_column_affinity(
+    arms: &[&SelectPlan],
+    i: usize,
+    schema: &Schema,
+) -> Affinity {
     if arms.is_empty() {
         return Affinity::None;
     }
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
+            .map(|rc| {
+                get_expr_affinity(
+                    &rc.expr,
+                    &TableMetadata::new(Some(&arm.table_references), schema),
+                )
+            })
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| expr_data_type(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
+            .map(|rc| {
+                expr_data_type(
+                    &rc.expr,
+                    &TableMetadata::new(Some(&arm.table_references), schema),
+                )
+            })
             .unwrap_or(StorageClassMask::from_null())
     };
 
@@ -172,8 +190,8 @@ impl ResultSetColumn {
 
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
-    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables))).short_type_name()
+    pub fn declared_type(&self, tables: &TableReferences, schema: &Schema) -> &'static str {
+        get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables), schema)).short_type_name()
     }
 }
 
@@ -3179,9 +3197,13 @@ pub(super) fn query_output_columns(
                 .or_else(|| result_column.name(table_references).map(String::from));
             let affinity = compound_arms
                 .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index))
+                .map(|arms| compound_column_affinity(arms, column_index, resolver.schema()))
                 .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                    infer_type_from_expr(
+                        &result_column.expr,
+                        Some(table_references),
+                        resolver.schema(),
+                    )
                 });
             let column_type = affinity.to_type();
             let mut column = Column::new(

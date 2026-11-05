@@ -908,7 +908,7 @@ fn detect_simple_aggregate(
             if is_unfiltered_btree_count
                 && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
                 && agg.args[0].is_nonnull(
-                    &TableMetadata::new(Some(&plan.table_references)),
+                    &TableMetadata::new(Some(&plan.table_references), resolver.schema()),
                     &TypeEnv::new(Some(&plan.table_references), resolver),
                 ) =>
         {
@@ -3092,6 +3092,7 @@ fn operation_for_unmatched_right_rows(
             &constraints,
             &constraint_usages,
             Some(table_references),
+            resolver.schema(),
             false,
         ),
         _ => Err(LimboError::InternalError(
@@ -3403,6 +3404,7 @@ fn apply_table_access_plan(
                     constraints,
                     constraint_usages,
                     Some(table_references),
+                    resolver.schema(),
                     table_references.outer_join_may_null_extend(table_id),
                 )?;
             }
@@ -3441,7 +3443,7 @@ fn apply_table_access_plan(
                     *iter_dir,
                     where_clause,
                     Some(table_references),
-                    Some(resolver),
+                    resolver,
                 )?;
 
                 table_references.joined_tables_mut()[table_idx].op =
@@ -3649,7 +3651,7 @@ fn build_multi_index_scan_operation(
                     IterationDirection::Forwards,
                     where_clause,
                     Some(table_references),
-                    Some(resolver),
+                    resolver,
                 )?,
             },
             MultiIndexBranchAccessParams::InSeek { source } => {
@@ -3690,7 +3692,7 @@ fn btree_search_operation(
                 iter_dir,
                 where_clause,
                 Some(table_references),
-                Some(resolver),
+                resolver,
             )?,
         }));
     }
@@ -3703,7 +3705,12 @@ fn btree_search_operation(
     if let Some(eq) = &constraint_refs[0].eq {
         return Ok(Operation::Search(Search::RowidEq {
             cmp_expr: constraints[eq.constraint_pos]
-                .get_constraining_expr(where_clause, Some(table_references), Some(resolver))
+                .get_constraining_expr(
+                    where_clause,
+                    Some(table_references),
+                    resolver.schema(),
+                    Some(resolver),
+                )
                 .1,
         }));
     }
@@ -3715,7 +3722,7 @@ fn btree_search_operation(
             iter_dir,
             where_clause,
             Some(table_references),
-            Some(resolver),
+            resolver,
         )?,
     }))
 }
@@ -3747,6 +3754,7 @@ fn build_vtab_scan_op(
     vtab_constraints: &[ConstraintInfo],
     constraint_usages: &[ConstraintUsage],
     referenced_tables: Option<&TableReferences>,
+    schema: &Schema,
     outer_join_may_add_nulls: bool,
 ) -> Result<Operation> {
     if constraint_usages.len() != vtab_constraints.len() {
@@ -3792,7 +3800,8 @@ fn build_vtab_scan_op(
         {
             where_term.consumed = true;
         }
-        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables, None);
+        let (_, expr, _) =
+            constraint.get_constraining_expr(where_clause, referenced_tables, schema, None);
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -4488,7 +4497,7 @@ pub fn build_seek_def_from_constraints(
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<SeekDef> {
     if constraint_refs.is_empty() {
         // Zero-prefix seeks are used for extremum scans over an already ordered

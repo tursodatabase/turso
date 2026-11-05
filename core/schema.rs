@@ -2163,6 +2163,26 @@ impl Schema {
             .ordering()
     }
 
+    /// The affinity comparisons with values of `type_def` use. A type with its
+    /// own order compares by how its values are stored; any other type
+    /// compares by the kind of value it reads as.
+    pub fn type_comparison_affinity(&self, type_def: &TypeDef) -> Affinity {
+        let ordering = if type_def.is_domain {
+            // Registering a type fails when its bases form a cycle, so the
+            // bases of a registered type always resolve.
+            self.resolve_type_unchecked(&type_def.name)
+                .expect("the bases of a registered type resolve")
+                .expect("a registered type is in the registry")
+                .ordering()
+        } else {
+            type_def.ordering()
+        };
+        match ordering {
+            Some(_) => type_def.stored_type().affinity(),
+            None => type_def.value_type().affinity(),
+        }
+    }
+
     /// Whether values of `type_def` take a COLLATE. See
     /// [ResolvedType::accepts_collate].
     pub fn type_accepts_collate(&self, type_def: &TypeDef) -> crate::Result<bool> {
@@ -8446,12 +8466,7 @@ impl Column {
                 let stored_affinity = Affinity::affinity(&resolved.primitive);
                 self.override_affinity(stored_affinity);
                 self.type_ordering = resolved.ordering();
-                self.value_affinity = Some(match self.type_ordering {
-                    // Its values compare in the type's own order, by how
-                    // they are stored.
-                    Some(_) => stored_affinity,
-                    None => resolved.leaf().value_type().affinity(),
-                });
+                self.value_affinity = Some(schema.type_comparison_affinity(resolved.leaf()));
             }
             None => self.value_affinity = None,
         }

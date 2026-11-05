@@ -1,5 +1,8 @@
 use crate::{
-    translate::{alter::literal_default_value, expr_context::ExprProperties},
+    schema::Schema,
+    translate::{
+        alter::literal_default_value, expr::custom_type_cast_target, expr_context::ExprProperties,
+    },
     types::ValueType,
     vdbe::affinity::Affinity,
 };
@@ -56,7 +59,7 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                Affinity::of_written_type(&crate::util::dequote(&type_name.name))
+                cast_affinity(type_name, metadata.schema())
             } else {
                 Affinity::None
             }
@@ -91,6 +94,22 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
             .subquery_affinity(*subquery_id, *result_reg_start)
             .unwrap_or(Affinity::None),
         _ => Affinity::None,
+    }
+}
+
+/// The affinity of a CAST's result. A CAST to a custom type gives a value of
+/// that type, which compares like a column of the type: `CAST('10:00' AS time)`
+/// has TEXT affinity, although SQLite's rule for the name `time` gives NUMERIC.
+/// A CAST to an array gives an array, not a value of the element type, so it
+/// keeps SQLite's rule.
+fn cast_affinity(type_name: &ast::Type, schema: &Schema) -> Affinity {
+    let custom_type = match type_name.array_dimensions {
+        0 => custom_type_cast_target(type_name, schema),
+        _ => None,
+    };
+    match custom_type {
+        Some(type_def) => schema.type_comparison_affinity(type_def),
+        None => Affinity::of_written_type(&crate::util::dequote(&type_name.name)),
     }
 }
 

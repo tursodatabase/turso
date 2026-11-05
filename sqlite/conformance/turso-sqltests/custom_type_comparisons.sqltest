@@ -1293,3 +1293,18 @@ test cmp-numeric-with-non-number-text-index {
 expect error {
     invalid input syntax for type numeric: "abc"
 }
+
+@requires strict "uses STRICT tables"
+test cmp-time-with-cast-to-time-uses-index {
+    -- A CAST to time gives a time, which compares like a time column, so the
+    -- index on the column can find it.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    CREATE INDEX t_tm ON t(tm);
+    INSERT INTO t VALUES (1, '09:30'), (2, '10:00');
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE tm = CAST('10:00:00' AS time);
+    SELECT id FROM t WHERE tm = CAST('10:00:00' AS time);
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX t_tm (tm=?)
+    2
+}

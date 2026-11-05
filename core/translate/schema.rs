@@ -967,8 +967,10 @@ fn derive_ctas_schema(
         // Names come from the leftmost arm, but compound affinity can weaken its type.
         let ty = compound_arms
             .as_ref()
-            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
-            .unwrap_or_else(|| col.declared_type(table_refs));
+            .map(|arms| {
+                compound_column_affinity(arms, column_index, resolver.schema()).short_type_name()
+            })
+            .unwrap_or_else(|| col.declared_type(table_refs, resolver.schema()));
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {

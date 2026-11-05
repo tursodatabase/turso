@@ -151,6 +151,7 @@ impl Constraint {
         &self,
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
+        schema: &Schema,
         resolver: Option<&Resolver>,
     ) -> (ast::Operator, ast::Expr, Affinity) {
         // For multi-index branches, use the pre-computed constraining expression
@@ -172,7 +173,9 @@ impl Constraint {
                 Some(resolver) => {
                     comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver))
                 }
-                None => comparison_affinity(lhs, rhs, &TableMetadata::new(referenced_tables)),
+                None => {
+                    comparison_affinity(lhs, rhs, &TableMetadata::new(referenced_tables, schema))
+                }
             };
         }
 
@@ -577,7 +580,7 @@ pub(super) fn add_implied_column_equalities(
             continue;
         }
 
-        let affinity_metadata = TableMetadata::new(Some(table_references));
+        let affinity_metadata = TableMetadata::new(Some(table_references), resolver.schema());
         let collation_metadata = ExprContext::new(Some(table_references), resolver);
         let left_affinity = get_expr_affinity(left, &affinity_metadata);
         let right_affinity = get_expr_affinity(right, &affinity_metadata);
@@ -840,7 +843,11 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| {
-                        comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
+                        comparison_affinity(
+                            lhs,
+                            rhs,
+                            &TableMetadata::new(Some(table_references), schema),
+                        )
                     });
                 let cmp_collation = match operator.as_ast_operator() {
                     Some(op) if op.is_comparison() => {
@@ -1105,7 +1112,7 @@ pub fn constraints_from_where_clause(
                 // is the LHS column's affinity; the RHS literals are not folded.
                 let cmp_aff = Some(get_expr_affinity(
                     lhs,
-                    &TableMetadata::new(Some(table_references)),
+                    &TableMetadata::new(Some(table_references), schema),
                 ));
                 let cmp_collation = Some(decide_once(&mut term_collations[i], || {
                     in_list_collation(
@@ -1504,28 +1511,28 @@ impl RangeConstraintRef {
         constraints: &[Constraint],
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
+        resolver: &Resolver,
     ) -> SeekRangeConstraint {
+        let constraining_expr = |constraint: &Constraint| {
+            constraint.get_constraining_expr(
+                where_clause,
+                referenced_tables,
+                resolver.schema(),
+                Some(resolver),
+            )
+        };
         if let Some(ref eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
                 self.nulls_order,
-                constraints[eq.constraint_pos].get_constraining_expr(
-                    where_clause,
-                    referenced_tables,
-                    resolver,
-                ),
+                constraining_expr(&constraints[eq.constraint_pos]),
             );
         }
         SeekRangeConstraint::new_range(
             self.sort_order,
             self.nulls_order,
-            self.lower_bound.map(|x| {
-                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
-            }),
-            self.upper_bound.map(|x| {
-                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
-            }),
+            self.lower_bound.map(|x| constraining_expr(&constraints[x])),
+            self.upper_bound.map(|x| constraining_expr(&constraints[x])),
         )
     }
 }
@@ -2250,7 +2257,7 @@ pub(crate) fn summarize_binary_term_for_index(
         rhs,
         operator,
         table_col_pos,
-        &TableMetadata::new(Some(table_references)),
+        &TableMetadata::new(Some(table_references), resolver.schema()),
     );
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2327,7 +2334,7 @@ pub(crate) fn analyze_binary_term_for_index(
         rhs,
         operator,
         table_col_pos,
-        &TableMetadata::new(Some(table_references)),
+        &TableMetadata::new(Some(table_references), schema),
     );
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(

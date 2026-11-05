@@ -1099,6 +1099,13 @@ mod tests {
 
     use super::*;
 
+    fn table_metadata(table_references: &TableReferences) -> TableMetadata<'_> {
+        TableMetadata::new(
+            Some(table_references),
+            Box::leak(Box::new(Schema::default())),
+        )
+    }
+
     #[test]
     fn test_locale_collation_names() {
         assert!(matches!(
@@ -1175,7 +1182,7 @@ mod tests {
             };
             let collseq = expr_collation_if_any(
                 &expr,
-                &TableMetadata::new(Some(&table_references)),
+                &table_metadata(&table_references),
                 &Resolver::empty_for_tests().catalog,
             )
             .unwrap();
@@ -1202,7 +1209,7 @@ mod tests {
             );
             let collseq = expr_collation_if_any(
                 &expr,
-                &TableMetadata::new(Some(&table_references)),
+                &table_metadata(&table_references),
                 &Resolver::empty_for_tests().catalog,
             )
             .unwrap();
@@ -1231,7 +1238,7 @@ mod tests {
         );
         let collseq = expr_collation_if_any(
             &expr,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1255,7 +1262,7 @@ mod tests {
         );
         let collseq_plus = expr_collation_if_any(
             &expr_plus,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1278,7 +1285,7 @@ mod tests {
         );
         let collseq_cast = expr_collation_if_any(
             &expr_cast,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1305,7 +1312,7 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = expr_collation_if_any(
             &expr,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1335,7 +1342,7 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = expr_collation_if_any(
             &expr,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1357,7 +1364,7 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = expr_collation_if_any(
             &expr,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1370,7 +1377,7 @@ mod tests {
         let expr = Expr::Literal(Literal::String("abc".to_string()));
         let collseq = expr_collation_if_any(
             &expr,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -1390,7 +1397,7 @@ mod tests {
         // alias declares one.
         let collseq = expr_collation_if_any(
             &expr,
-            &TableMetadata::new(Some(&table_references)),
+            &table_metadata(&table_references),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();

@@ -1138,7 +1138,7 @@ fn column_pair_compares_the_same(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let affinity_metadata = TableMetadata::new(Some(tables));
+    let affinity_metadata = TableMetadata::new(Some(tables), resolver.schema());
     if get_expr_affinity(&pair.inner, &affinity_metadata)
         != get_expr_affinity(&pair.outer, &affinity_metadata)
     {

@@ -196,6 +196,7 @@ fn get_table_local_constraints_for_branch(
         constraint.constraining_expr = Some(constraint.get_constraining_expr(
             &synthetic_where_terms,
             Some(table_references),
+            schema,
             None,
         ));
     }

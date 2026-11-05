@@ -26,6 +26,8 @@ pub(crate) trait ExprProperties<
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
     fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
+    /// The schema whose custom types a CAST can name.
+    fn schema(&self) -> &Schema;
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +42,7 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
         resolver: &'a Resolver<'schema>,
     ) -> Self {
         Self {
-            tables: TableMetadata::new(tables),
+            tables: TableMetadata::new(tables, resolver.schema()),
             resolver,
         }
     }
@@ -118,16 +120,21 @@ impl ExprProperties for ExprContext<'_, '_> {
         let subquery = self.resolver.row_value_subqueries.get(query)?;
         Some(subquery.column(result_reg)?.affinity)
     }
+
+    fn schema(&self) -> &Schema {
+        self.tables.schema
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct TableMetadata<'a> {
     tables: Option<&'a TableReferences>,
+    schema: &'a Schema,
 }
 
 impl<'a> TableMetadata<'a> {
-    pub(crate) fn new(tables: Option<&'a TableReferences>) -> Self {
-        Self { tables }
+    pub(crate) fn new(tables: Option<&'a TableReferences>, schema: &'a Schema) -> Self {
+        Self { tables, schema }
     }
 }
 
@@ -199,5 +206,9 @@ impl ExprProperties for TableMetadata<'_> {
 
     fn subquery_affinity(&self, query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
         self.tables?.scalar_subquery_affinity(query)
+    }
+
+    fn schema(&self) -> &Schema {
+        self.schema
     }
 }

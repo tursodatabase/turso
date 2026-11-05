@@ -100,7 +100,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             let affinity = comparison_affinity(
                 build_expr,
                 probe_expr,
-                &TableMetadata::new(Some(self.table_references)),
+                &TableMetadata::new(Some(self.table_references), self.t_ctx.resolver.schema()),
             );
             key_affinities.push(affinity.aff_mask());
         }
