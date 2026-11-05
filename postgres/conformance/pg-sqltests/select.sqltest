@@ -1113,6 +1113,72 @@ expect {
     0
 }
 
+test like-computed-pattern-matches-multibyte-characters {
+    SELECT 'héllo' LIKE 'h_llo' || '';
+    SELECT 'héllo' LIKE 'h__llo' || '';
+    SELECT 'aéb€c' LIKE '%' || '€c';
+    SELECT 'aéb€c' LIKE 'a%\€_' || '';
+    SELECT '€€x' LIKE '%€' || 'x';
+    SELECT 'xé' LIKE '%' || '_';
+    SELECT 'é€' LIKE '%' || '_é';
+}
+expect {
+    t
+    f
+    t
+    t
+    t
+    t
+    f
+}
+
+test like-computed-pattern-with-wildcards-after-percent {
+    SELECT 'abc' LIKE '%%' || '';
+    SELECT 'abc' LIKE 'a%%c' || '';
+    SELECT '' LIKE '%%' || '';
+    SELECT 'ab' LIKE '%_%_%' || '';
+    SELECT 'a' LIKE '%_%_%' || '';
+    SELECT 'abcab' LIKE '%ab' || '';
+    SELECT 'aab' LIKE '%_ab' || '';
+    SELECT '' LIKE '%\' || '';
+    SELECT 'b' LIKE 'a\' || '';
+}
+expect {
+    t
+    t
+    t
+    t
+    f
+    t
+    t
+    f
+    f
+}
+
+test like-computed-pattern-ending-with-escape-after-percent-errors {
+    SELECT 'x' LIKE '%\' || '';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test like-computed-pattern-ending-with-escape-after-text-runs-out-errors {
+    SELECT 'a' LIKE '%_\' || '';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test like-escape-ending-with-escape-after-text-runs-out-errors {
+    SELECT 'ab' LIKE 'a%_#' ESCAPE '#';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
 test like-escape-longer-than-one-character-errors {
     SELECT 'abc' LIKE 'abc' ESCAPE '##';
 }
