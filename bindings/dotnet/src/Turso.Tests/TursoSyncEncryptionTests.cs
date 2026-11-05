@@ -74,7 +74,7 @@ public sealed class TursoSyncEncryptionTests
             request.Headers.GetValues("x-turso-encryption-cipher").Should().Equal("aes256gcm");
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new ByteArrayContent([11, 10, 3, 114, 101, 118, 26, 0, 64, 1, 72, 1]),
+                Content = new ByteArrayContent([9, 10, 3, 114, 101, 118, 26, 0, 64, 1]),
             });
         }
     }

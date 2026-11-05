@@ -954,7 +954,7 @@ func TestSyncEncryptionBootstrapOfflineReopen(t *testing.T) {
 		require.Equal(t, cloudKey, r.Header.Get("x-turso-encryption-key"))
 		require.Equal(t, "aes256gcm", r.Header.Get("x-turso-encryption-cipher"))
 		require.NotContains(t, fmt.Sprint(r.Header), localKey)
-		_, _ = w.Write([]byte{11, 10, 3, 114, 101, 118, 26, 0, 64, 1, 72, 1})
+		_, _ = w.Write([]byte{9, 10, 3, 114, 101, 118, 26, 0, 64, 1})
 	}))
 	defer server.Close()
 	file := filepath.Join(t.TempDir(), "replica.db")

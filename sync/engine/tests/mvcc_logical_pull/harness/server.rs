@@ -170,7 +170,6 @@ impl InProcessServer {
             self.bootstrap_base.read_logical_log()?.len()
         };
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: self.remote.crypto.is_some(),
             server_revision: revision_at(log_end),
             db_size: (database.len() / PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -253,11 +252,6 @@ impl InProcessServer {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![MvccLogicalLogRangeProto {
-                    transmitted_length: self
-                        .remote
-                        .crypto
-                        .as_ref()
-                        .map(|_| new_frames.len() as u64),
                     generation: 1,
                     start_offset: offset as u64,
                     end_offset: log.len() as u64,
@@ -272,7 +266,6 @@ impl InProcessServer {
             })
         };
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: self.remote.crypto.is_some(),
             server_revision: revision_at(log.len()),
             db_size: 0,
             raw_encoding: Some(PageSetRawEncodingProto {}),

@@ -1188,7 +1188,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     )?;
                 }
                 let meta = DatabaseMetadata {
-                    encryption_cipher: None,
                     version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
                     synced_revision: Some(revision.clone()),
@@ -1241,7 +1240,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 // until the first server contact; the first pull resolves it.
                 let remote_pull_protocol = forced_protocol.unwrap_or(RemotePullProtocol::Unknown);
                 let meta = DatabaseMetadata {
-                    encryption_cipher: None,
                     version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
                     synced_revision: None,
@@ -4410,7 +4408,6 @@ mod tests {
                 .unwrap();
 
         let meta = DatabaseMetadata {
-            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "initial-client".to_string(),
             synced_revision: None,
@@ -4435,7 +4432,6 @@ mod tests {
         std::fs::write(create_meta_path(&main_path), meta.dump().unwrap()).unwrap();
 
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: false,
             protocol: 0,
             server_revision: "g1:o10".to_string(),
             db_size: 0,
@@ -4570,7 +4566,6 @@ mod tests {
             .unwrap();
         let slot = Arc::new(Mutex::new(None));
         let meta = DatabaseMetadata {
-            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "client-a".to_string(),
             synced_revision: Some(DatabasePullRevision::V1 {
@@ -4619,6 +4614,7 @@ mod tests {
                     changes_file,
                     crate::sync_cipher::ChangeKind::Logical,
                     txns.len(),
+                    txns.iter().map(prost::Message::encoded_len).sum(),
                 )),
                 slot,
             }),
@@ -4645,7 +4641,7 @@ mod tests {
                         .unwrap();
                     for txn in &txns {
                         staging
-                            .append_record(&coro, &txn.encode_length_delimited_to_vec())
+                            .append_record(&coro, &txn.encode_to_vec())
                             .await
                             .unwrap();
                     }
@@ -4777,7 +4773,6 @@ mod tests {
             revision: "g1:o1".to_string(),
         };
         let meta = DatabaseMetadata {
-            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "client-a".to_string(),
             synced_revision: Some(old_revision.clone()),
@@ -4824,6 +4819,7 @@ mod tests {
                     changes_file,
                     crate::sync_cipher::ChangeKind::Logical,
                     txns.len(),
+                    txns.iter().map(prost::Message::encoded_len).sum(),
                 )),
                 slot: Arc::new(Mutex::new(None)),
             }),
@@ -4996,6 +4992,7 @@ mod tests {
                     changes_file,
                     crate::sync_cipher::ChangeKind::Pages,
                     records,
+                    records * crate::database_sync_operations::WAL_FRAME_SIZE,
                 );
                 let slot = Arc::new(Mutex::new(Some(changes_file)));
                 let file_slot = MutexSlot {
@@ -5103,7 +5100,6 @@ mod tests {
     ) -> Vec<u8> {
         assert_eq!(db_bytes.len() % super::PAGE_SIZE, 0);
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: false,
             server_revision: server_revision.to_string(),
             db_size: (db_bytes.len() / super::PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -5169,7 +5165,6 @@ mod tests {
         // The replace-base apply issues one follow-up logical pull from the
         // new revision; serve it an empty logical stream.
         let followup_logical_response = PullUpdatesRespProtoBody {
-            encrypted_sync: false,
             server_revision: server_revision.to_string(),
             db_size: (remote_bytes.len() / super::PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -5341,7 +5336,6 @@ mod tests {
         );
         // The catch-up pull gets an empty logical stream: already current.
         let catch_up_response = PullUpdatesRespProtoBody {
-            encrypted_sync: false,
             server_revision: server_revision.to_string(),
             db_size: (remote_bytes.len() / super::PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -5432,7 +5426,6 @@ mod tests {
                 .unwrap();
 
         let meta = DatabaseMetadata {
-            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "legacy-client".to_string(),
             synced_revision: Some(DatabasePullRevision::Legacy {

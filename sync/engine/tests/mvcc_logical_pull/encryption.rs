@@ -414,7 +414,7 @@ fn encrypted_source_supports_a_plaintext_replica() {
 }
 
 #[test]
-fn encrypted_creation_refuses_existing_files_and_old_servers() {
+fn encrypted_creation_refuses_existing_files_and_incompatible_pages() {
     let remote = Remote::new_encrypted(&[]).unwrap();
     let directory = Arc::new(tempfile::tempdir().unwrap());
     let original = b"existing database must not be overwritten";
@@ -426,19 +426,26 @@ fn encrypted_creation_refuses_existing_files_and_old_servers() {
         std::fs::read(directory.path().join("replica.db")).unwrap(),
         original
     );
-    let old_remote = Remote::new(&[]).unwrap();
+    let plaintext_remote = Remote::new(&[]).unwrap();
     let fresh = Arc::new(tempfile::tempdir().unwrap());
-    let error = Replica::open_encrypted(&fresh, InProcessServer::new(old_remote), Some([22; 32]))
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("acknowledge"), "{error}");
-    assert!(!fresh.path().join("replica.db-info").exists());
-    assert_eq!(
-        std::fs::metadata(fresh.path().join("replica.db"))
-            .unwrap()
-            .len(),
-        0
+    let error = Replica::open_encrypted(
+        &fresh,
+        InProcessServer::new(plaintext_remote),
+        Some([22; 32]),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error.to_string().contains("page header is incompatible"),
+        "{error}"
     );
+    assert!(!fresh.path().join("replica.db-info").exists());
+    // The bootstrap may reserve its extent before validating individual pages,
+    // but incompatible plaintext pages must never be installed.
+    assert!(std::fs::read(fresh.path().join("replica.db"))
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0));
 }
 
 #[test]

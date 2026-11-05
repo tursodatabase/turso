@@ -12,7 +12,7 @@ from turso.aio import sync as aio_sync
 
 LOCAL_KEY = "16" * 32
 CLOUD_KEY = base64.b64encode(bytes([11]) * 32).decode()
-HEADER = bytes([10, 3, 114, 101, 118, 26, 0, 64, 1, 72, 1])
+HEADER = bytes([10, 3, 114, 101, 118, 26, 0, 64, 1])
 
 
 class EmptyEncryptedSource(http.server.BaseHTTPRequestHandler):

@@ -37,6 +37,9 @@ Configure clients with the base64 encoding of that cloud key and an independent
 local hex key. The sample server validates encryption credentials for both
 pull and SQL push requests. It serves authenticated, decrypted pages and MVCC
 frames over HTTP; keep it on loopback or use an HTTPS proxy for network access.
+SQL pipeline requests may send only the cloud key, as JavaScript's
+`remoteWritesExperimental` path does. Any supplied cipher must match the server's
+configuration; pull requests require both the cloud key and cipher headers.
 It supports one MVCC generation, without production retained-generation storage.
 Corrupt MVCC headers fail the pull before any replacement fallback; the client's
 existing data and sync revision remain unchanged.
@@ -153,10 +156,18 @@ silently discard the database, regenerate keys, or restart bootstrap. A failed
 response does not publish its revision. A page-apply failure can leave partial
 local changes; applications choose whether to reopen or recreate the replica.
 
-A native encrypted server must acknowledge support in every pull response using
-protobuf response tag 9 (`encrypted_sync`). An older server is rejected before
-bootstrap writes or progress publication. Legacy remote page sync retains its
-existing compatibility behavior.
+The server validates the requested cipher against database metadata and the cloud
+key against stored data. Pull responses carry no encryption capability flag or
+wire-length field; clients derive wire boundaries from native frame headers and
+the configured source cipher. This assumes a server that implements cipher
+validation; support is not negotiated with older servers.
+
+Local metadata authenticates with the supplied cipher and key, without storing
+a cipher name in its JSON. Downloaded changes use a single plaintext varint
+length followed by encrypted message chunks, or fixed-size encrypted page
+records. There is no scratch-file header or footer: a completed batch's identity,
+counts, and size stay in memory. Scratch writes complete before apply, without
+an fsync; abandoned downloads are reset after restart.
 
 ## Validation
 
@@ -169,8 +180,7 @@ cargo +stable test -p turso_core --features conn_raw_api encrypted_mvcc_reload
 
 The encrypted integration tests in `sync/engine/tests/mvcc_logical_pull/encryption.rs`
 cover empty and zero-page bootstrap, incremental pull, plaintext replicas,
-metadata/staging confidentiality, wrong or missing local keys, capability
-rejection, replacement, failed replacement recovery, checkpoint, and reopen.
+metadata/staging confidentiality, wrong or missing local keys, incompatible bootstrap pages, replacement, failed replacement recovery, checkpoint, and reopen.
 They also inject bootstrap failures before/after database sync and metadata
 publication, exercise pending replacement recovery at startup, and verify that
 a metadata write failure preserves the published revision. A host-storage test

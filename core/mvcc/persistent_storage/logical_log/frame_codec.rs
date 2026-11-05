@@ -61,6 +61,15 @@ pub fn inspect_frame_prefix(
     bytes: &[u8],
     crypto: Option<&EncryptionContext>,
 ) -> Result<Option<FrameLayout>> {
+    inspect_frame_prefix_with_overhead(bytes, crypto.map(|c| (c.tag_size(), c.nonce_size())))
+}
+
+/// Keyless framing calculation shared by stored-frame decoding and plaintext sync range parsing.
+/// Overhead is `(tag_size, nonce_size)` for the source cipher, independent of local storage.
+pub fn inspect_frame_prefix_with_overhead(
+    bytes: &[u8],
+    overhead: Option<(usize, usize)>,
+) -> Result<Option<FrameLayout>> {
     if bytes.len() < 4 {
         return Ok(None);
     }
@@ -92,7 +101,7 @@ pub fn inspect_frame_prefix(
     let plaintext_size = recovery_size
         .checked_add(extension_size)
         .ok_or_else(|| corrupt("logical log plaintext size overflow"))?;
-    let stored_body_size = if let Some(crypto) = crypto {
+    let stored_body_size = if let Some((tag_size, nonce_size)) = overhead {
         let chunks = encrypted_payload_chunk_count(plaintext_size, ENCRYPTED_PAYLOAD_CHUNK_SIZE);
         if chunks > u32::MAX as usize {
             return Err(corrupt("logical log chunk index overflow"));
@@ -100,8 +109,8 @@ pub fn inspect_frame_prefix(
         encrypted_payload_blob_size(
             plaintext_size,
             ENCRYPTED_PAYLOAD_CHUNK_SIZE,
-            crypto.tag_size(),
-            crypto.nonce_size(),
+            tag_size,
+            nonce_size,
         )?
     } else {
         plaintext_size

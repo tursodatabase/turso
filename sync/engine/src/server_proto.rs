@@ -109,8 +109,6 @@ pub struct MvccLogicalLogRangeProto {
     pub starts_with_header: bool,
     #[prost(bytes, optional, tag = "5")]
     pub crc_seed: Option<Vec<u8>>,
-    #[prost(uint64, optional, tag = "6")]
-    pub transmitted_length: Option<u64>,
 }
 
 #[derive(prost::Message, Clone, PartialEq, Eq)]
@@ -125,8 +123,6 @@ pub struct MvccLogicalLogMetadataProto {
 
 #[derive(prost::Message)]
 pub struct PullUpdatesRespProtoBody {
-    #[prost(bool, tag = "9")]
-    pub encrypted_sync: bool,
     #[prost(string, tag = "1")]
     pub server_revision: String,
     // db size in pages (e.g. for 4kb db file db_size equals to 1)
@@ -580,7 +576,6 @@ mod pull_updates_tests {
     #[test]
     fn pull_updates_mvcc_log_header_round_trips_metadata() {
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: false,
             server_revision: "rev-42".to_string(),
             protocol: PullUpdatesProtocol::MvccLogical as i32,
             db_size: 3,
@@ -592,7 +587,6 @@ mod pull_updates_tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: true,
                 ranges: vec![MvccLogicalLogRangeProto {
-                    transmitted_length: None,
                     generation: 7,
                     start_offset: 11,
                     end_offset: 99,

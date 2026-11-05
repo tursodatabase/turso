@@ -6355,6 +6355,14 @@ mod tests {
                     .expect("frame");
                     assert_eq!(frame.source_end(), end as u64);
                     assert_eq!(frame.wire_size(), layout.wire_size());
+                    let keyless = inspect_frame_prefix_with_overhead(
+                        &stored[offset..],
+                        Some((cipher.tag_size(), cipher.nonce_size())),
+                    )
+                    .expect("keyless layout")
+                    .expect("complete header");
+                    assert_eq!(keyless.stored_size(), layout.stored_size());
+                    assert_eq!(keyless.wire_size(), frame.wire_size());
                     assert_eq!(frame.extension().is_empty(), !portable);
                     let wire = plaintext_wire_parts(&frame, wire_crc);
                     normalized.extend_from_slice(wire.header);

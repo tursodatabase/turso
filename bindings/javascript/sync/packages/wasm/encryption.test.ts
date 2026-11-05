@@ -29,7 +29,7 @@ test('encrypted OPFS bootstrap, checkpoint, offline reopen, and wrong key', asyn
     const path = `encrypted-${crypto.randomUUID()}.db`;
     const localKey = '16'.repeat(32);
     const cloudKey = btoa(String.fromCharCode(...new Uint8Array(32).fill(11)));
-    const header = Uint8Array.from([10, 3, 114, 101, 118, 26, 0, 64, 1, 72, 1]);
+    const header = Uint8Array.from([10, 3, 114, 101, 118, 26, 0, 64, 1]);
     const fetch: typeof globalThis.fetch = async (_url, options) => {
         const headers = new Headers(options?.headers);
         expect(headers.get('x-turso-encryption-key')).toBe(cloudKey);

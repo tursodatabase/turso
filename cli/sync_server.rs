@@ -291,8 +291,10 @@ impl TursoSyncServer {
         let (method, path, body) = parse_http_request(request_data)?;
         info!("Request: {} {}", method, path);
         let route = parse_route(&method, &path);
+        let require_cipher = matches!(route, Route::PullUpdates { .. });
         if matches!(route, Route::Pipeline { .. } | Route::PullUpdates { .. })
-            && validate_encryption_headers(request_data, self.encryption.as_ref()).is_err()
+            && validate_encryption_headers(request_data, self.encryption.as_ref(), require_cipher)
+                .is_err()
         {
             return Ok(text_response(
                 400,
@@ -754,7 +756,6 @@ impl TursoSyncServer {
         let db_size = current_sync_db_size_pages(&conn, wal_state.max_frame)?;
 
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: conn.get_encryption_cipher_mode().is_some(),
             server_revision: server_revision.to_string(),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -931,7 +932,6 @@ impl TursoSyncServer {
                         end_offset: snapshot.end_offset,
                         starts_with_header: start_offset == 0,
                         crc_seed,
-                        transmitted_length: normalized.as_ref().map(|_| (end - start) as u64),
                     }],
                 }),
                 log[start..end].to_vec(),
@@ -939,7 +939,6 @@ impl TursoSyncServer {
         };
 
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: self.encryption.is_some(),
             server_revision: format!("g1:o{}", snapshot.end_offset),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -993,7 +992,6 @@ impl TursoSyncServer {
         db_size: u64,
     ) -> Result<HttpResponse> {
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: self.encryption.is_some(),
             server_revision,
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -1038,12 +1036,6 @@ impl TursoSyncServer {
         let (db_size, pages) = self.read_replace_base_pages(db)?;
 
         let header = PullUpdatesRespProtoBody {
-            encrypted_sync: db
-                .conn
-                .lock()
-                .unwrap()
-                .get_encryption_cipher_mode()
-                .is_some(),
             server_revision,
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -1139,6 +1131,7 @@ impl ServerEncryption {
 fn validate_encryption_headers(
     request: &[u8],
     encryption: Option<&ServerEncryption>,
+    require_cipher: bool,
 ) -> Result<()> {
     let end = find_header_end(request, 0).ok_or_else(|| anyhow!("missing HTTP headers"))?;
     let headers = std::str::from_utf8(&request[..end])?;
@@ -1167,10 +1160,14 @@ fn validate_encryption_headers(
         );
         return Ok(());
     };
-    anyhow::ensure!(
-        cipher.map(CipherMode::try_from).transpose()? == Some(encryption.cipher),
-        "cipher mismatch"
-    );
+    if let Some(cipher) = cipher {
+        anyhow::ensure!(
+            CipherMode::try_from(cipher)? == encryption.cipher,
+            "cipher mismatch"
+        );
+    } else {
+        anyhow::ensure!(!require_cipher, "missing encryption cipher");
+    }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(key.ok_or_else(|| anyhow!("missing encryption key"))?)?;
     let key = match bytes.len() {
@@ -1760,6 +1757,62 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn encrypted_pipeline_accepts_key_only_but_pull_requires_cipher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = dir_server(dir.path());
+        let encryption = ServerEncryption {
+            cipher: CipherMode::Aes256Gcm,
+            key: EncryptionKey::new_256([11; 32]),
+        };
+        server.encryption = Some(encryption.clone());
+        if let DbSource::Dir { config, .. } = &mut server.source {
+            config.encryption = Some(encryption);
+        }
+        let key = base64::engine::general_purpose::STANDARD.encode([11; 32]);
+        let key_header = format!("x-turso-encryption-key: {key}\r\n");
+        let request = |endpoint: &str, headers: &str, body: &str| {
+            format!(
+                "POST /db/key-only/{endpoint} HTTP/1.1\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let pull = request("pull-updates", &key_header, "");
+        assert_eq!(server.handle_request(pull.as_bytes()).unwrap().status, 400);
+        assert!(!dir.path().join("key-only").exists());
+
+        // RemoteWriter's SQL requests carry the cloud key without a cipher.
+        let body =
+            r#"{"requests":[{"type":"execute","stmt":{"sql":"CREATE TABLE secret(value TEXT)"}}]}"#;
+        let pipeline = request("v2/pipeline", &key_header, body);
+        let response = server.handle_request(pipeline.as_bytes()).unwrap();
+        assert_eq!(response.status, 200);
+        let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response["results"][0]["type"], "ok");
+
+        let wrong_key = base64::engine::general_purpose::STANDARD.encode([12; 32]);
+        for headers in [
+            String::new(),
+            key_header.replace(&key, &wrong_key),
+            format!("{key_header}x-turso-encryption-cipher: aegis256\r\n"),
+            format!("{key_header}x-turso-encryption-cipher: invalid\r\n"),
+            format!("{key_header}{key_header}"),
+        ] {
+            let pipeline = request("v2/pipeline", &headers, body);
+            assert_eq!(
+                server.handle_request(pipeline.as_bytes()).unwrap().status,
+                400
+            );
+        }
+        // Cached connections must also accept the key-only form.
+        let body = r#"{"requests":[{"type":"execute","stmt":{"sql":"INSERT INTO secret VALUES ('remote write')"}}]}"#;
+        let pipeline = request("v2/pipeline", &key_header, body);
+        let response = server.handle_request(pipeline.as_bytes()).unwrap();
+        assert_eq!(response.status, 200);
+        let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response["results"][0]["type"], "ok");
+    }
+
+    #[test]
     fn encrypted_requests_validate_credentials_before_opening_or_writing() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = dir_server(dir.path());
@@ -1814,7 +1867,8 @@ mod tests {
         );
         assert!(validate_encryption_headers(
             format!("POST / HTTP/1.1\r\n{valid}\r\n").as_bytes(),
-            None
+            None,
+            false
         )
         .is_err());
     }
@@ -2005,7 +2059,6 @@ mod tests {
             .unwrap();
         let mut bytes = response.body.as_slice();
         let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
-        assert!(header.encrypted_sync);
         assert!(header.db_size > 0);
         let first = PageData::decode_length_delimited(&mut bytes).unwrap();
         assert!(first.encoded_page.starts_with(b"SQLite format 3\0"));

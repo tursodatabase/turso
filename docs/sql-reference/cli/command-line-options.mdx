@@ -147,9 +147,12 @@ tursodb --sync-server 127.0.0.1:8080 \
 Core's AES-GCM and AEGIS ciphers are supported. Clients supply the same cipher and
 the base64 encoding of the cloud key through their remote encryption settings.
 Their local encryption key can differ. Both SQL pipeline and pull requests must
-include valid `x-turso-encryption-key` and `x-turso-encryption-cipher` headers;
-missing, incorrect, or duplicate credentials return HTTP 400 before opening a
-database or executing SQL. A plaintext server rejects these headers.
+include a valid `x-turso-encryption-key`. Pull requests also require
+`x-turso-encryption-cipher`; SQL pipeline requests may omit it, using the server's
+configured cipher. A supplied cipher must match that configuration. Missing
+required headers, incorrect credentials, or duplicate headers return HTTP 400
+before opening a database or executing SQL. A plaintext server rejects these
+headers.
 
 This also works with `--sync-dir`: every database uses the configured cipher and
 cloud key, including databases created on demand. Encrypted sync supports full

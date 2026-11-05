@@ -9,7 +9,7 @@ test('encrypted bootstrap, local writes, checkpoint, offline reopen, and wrong k
     const path = join(directory, 'replica.db');
     const localKey = '16'.repeat(32);
     const cloudKey = Buffer.alloc(32, 11).toString('base64');
-    const header = Uint8Array.from([10, 3, 114, 101, 118, 26, 0, 64, 1, 72, 1]);
+    const header = Uint8Array.from([10, 3, 114, 101, 118, 26, 0, 64, 1]);
     const fetch: typeof globalThis.fetch = async (_url, options) => {
         const headers = new Headers(options?.headers);
         expect(headers.get('x-turso-encryption-key')).toBe(cloudKey);

@@ -44,6 +44,7 @@ class EncryptedSync(unittest.TestCase):
             args += ["--sync-dir", str(dbs)] if directory else [str(tmp / "source.db")]
             headers = {"x-turso-encryption-key": base64.b64encode(bytes([11]) * 32).decode(),
                        "x-turso-encryption-cipher": cipher}
+            key_only_headers = {"x-turso-encryption-key": headers["x-turso-encryption-key"]}
             env = {**os.environ, "SYNC_E2E_CIPHER": cipher}
             replica = tmp / "replica.db"
 
@@ -73,6 +74,7 @@ class EncryptedSync(unittest.TestCase):
                 start()
                 # Reject missing/wrong credentials before opening or mutating a database.
                 for bad in [{}, {**headers, "x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
+                            {"x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
                             {**headers, "x-turso-encryption-cipher": "aes128gcm"}]:
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         pipeline("CREATE TABLE forbidden(x)", bad)
@@ -84,7 +86,9 @@ class EncryptedSync(unittest.TestCase):
                 run("exec", "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
                 run("exec", "INSERT INTO items VALUES (1, 'client secret')")
                 run("push")
-                pipeline("INSERT INTO items VALUES (2, '" + "server secret " * 8000 + "')")
+                # JavaScript RemoteWriter sends the cloud key without a cipher.
+                pipeline("INSERT INTO items VALUES (2, '" + "server secret " * 8000 + "')",
+                         key_only_headers)
                 run("pull")
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items")["value"], 2)
                 run("checkpoint")

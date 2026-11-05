@@ -1,12 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use turso_core::{io::FileSyncType, Buffer, Completion, EncryptionContext, File};
+use turso_core::{Buffer, Completion, EncryptionContext, File};
 
 use crate::{
     errors::Error,
-    sync_cipher::{
-        ChangeCounts, ChangeIdentity, ChangeKind, CHUNK_SIZE, FILE_HEADER_SIZE, RECORD_HEADER_SIZE,
-    },
+    sync_cipher::{ChangeCounts, ChangeIdentity, ChangeKind, CHUNK_SIZE},
     types::{Coro, SyncEngineIoResult},
     Result,
 };
@@ -91,6 +89,7 @@ impl ChangesFile {
         file: Arc<dyn File>,
         kind: ChangeKind,
         records: usize,
+        plaintext_bytes: usize,
     ) -> Self {
         let size = file.size().expect("test file size");
         let sealed = SealedChanges {
@@ -98,7 +97,7 @@ impl ChangesFile {
             kind,
             counts: ChangeCounts {
                 records: records as u64,
-                bytes: size,
+                bytes: plaintext_bytes as u64,
             },
             size,
         };
@@ -116,12 +115,7 @@ impl ChangesFile {
         let identity = ChangeIdentity::new(kind)?;
         self.pending = Some(self.file.truncate(0, Completion::new_trunc(|_| {}))?);
         self.wait_pending(coro).await?;
-        let offset = if self.crypto.is_some() {
-            self.write(coro, 0, identity.header().to_vec()).await?;
-            FILE_HEADER_SIZE as u64
-        } else {
-            0
-        };
+        let offset = 0;
         self.state = State::Writing {
             identity,
             kind,
@@ -145,27 +139,45 @@ impl ChangesFile {
         else {
             return Err(invalid("change download is not writable"));
         };
-        let record_header = identity.record_header(bytes.len() as u64)?;
+        let length = bytes.len() as u64;
+        identity.validate_record_length(length)?;
         let record_index = counts.records;
         counts.append(bytes.len() as u64)?;
+        let prefix_len = if kind == ChangeKind::Logical {
+            prost::length_delimiter_len(bytes.len())
+        } else {
+            0
+        };
+        let capacity = if self.crypto.is_none() {
+            bytes
+                .len()
+                .checked_add(prefix_len)
+                .ok_or_else(|| invalid("change record length overflow"))?
+        } else {
+            prefix_len
+        };
+        let mut buffer = Vec::with_capacity(capacity);
+        if kind == ChangeKind::Logical {
+            prost::encode_length_delimiter(bytes.len(), &mut buffer)
+                .map_err(|e| invalid(&format!("cannot encode change length: {e}")))?;
+        }
         if let Some(crypto) = self.crypto.clone() {
-            self.write(coro, offset, record_header.to_vec()).await?;
-            offset = checked_add(offset, RECORD_HEADER_SIZE)?;
+            if prefix_len > 0 {
+                self.write(coro, offset, buffer).await?;
+                offset = checked_add(offset, prefix_len)?;
+            }
             for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
-                let stored = identity.seal_chunk(
-                    &crypto,
-                    record_index,
-                    &record_header,
-                    index as u64,
-                    chunk,
-                )?;
+                let stored =
+                    identity.seal_chunk(&crypto, record_index, length, index as u64, chunk)?;
                 let length = stored.len();
                 self.write(coro, offset, stored).await?;
                 offset = checked_add(offset, length)?;
             }
         } else {
-            self.write(coro, offset, bytes.to_vec()).await?;
-            offset = checked_add(offset, bytes.len())?;
+            buffer.extend_from_slice(bytes);
+            let length = buffer.len();
+            self.write(coro, offset, buffer).await?;
+            offset = checked_add(offset, length)?;
         }
         self.state = State::Writing {
             identity,
@@ -176,26 +188,18 @@ impl ChangesFile {
         Ok(())
     }
 
+    /// Seal only in memory: this scratch batch is abandoned after restart, so
+    /// completed writes must be visible to readers but need no durability flush.
     pub(crate) async fn finish<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<SealedChanges> {
         let State::Writing {
             identity,
             kind,
             counts,
-            mut offset,
+            offset,
         } = std::mem::replace(&mut self.state, State::Invalid)
         else {
             return Err(invalid("change download is not writable"));
         };
-        if let Some(crypto) = &self.crypto {
-            let end = identity.seal_end(crypto, counts)?;
-            let length = end.len();
-            self.write(coro, offset, end).await?;
-            offset = checked_add(offset, length)?;
-        }
-        self.pending = Some(
-            self.file
-                .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?,
-        );
         self.wait_pending(coro).await?;
         let sealed = SealedChanges {
             identity,
@@ -221,21 +225,8 @@ impl ChangesFile {
         if self.file.size()? != sealed.size {
             return Err(invalid("change file length has changed"));
         }
-        let (offset, end_offset) = if let Some(crypto) = self.crypto.clone() {
-            let header = self.read_exact(coro, 0, FILE_HEADER_SIZE).await?;
-            sealed.identity.validate_header(&header)?;
-            let end_size = ChangeIdentity::end_size(&crypto);
-            let end_offset = sealed
-                .size
-                .checked_sub(end_size as u64)
-                .filter(|&offset| offset >= FILE_HEADER_SIZE as u64)
-                .ok_or_else(|| invalid("truncated change file"))?;
-            let end = self.read_exact(coro, end_offset, end_size).await?;
-            sealed.identity.validate_end(&crypto, &end, sealed.counts)?;
-            (FILE_HEADER_SIZE as u64, end_offset)
-        } else {
-            (0, sealed.size)
-        };
+        self.wait_pending(coro).await?;
+        let (offset, end_offset) = (0, sealed.size);
         self.state = State::Sealed(sealed.clone());
         Ok(ChangesReader {
             file: self,
@@ -244,8 +235,8 @@ impl ChangesFile {
             end_offset,
             counts: ChangeCounts::default(),
             finished: false,
-            plaintext_buffer: Vec::new(),
-            plaintext_buffer_pos: 0,
+            read_buffer: Vec::new(),
+            read_buffer_pos: 0,
         })
     }
 
@@ -328,8 +319,8 @@ pub(crate) struct ChangesReader<'a> {
     end_offset: u64,
     counts: ChangeCounts,
     finished: bool,
-    plaintext_buffer: Vec<u8>,
-    plaintext_buffer_pos: usize,
+    read_buffer: Vec<u8>,
+    read_buffer_pos: usize,
 }
 
 impl ChangesReader<'_> {
@@ -358,92 +349,61 @@ impl ChangesReader<'_> {
             {
                 return Err(invalid("change file end does not match downloaded records"));
             }
-            if let Some(crypto) = self.file.crypto.clone() {
-                let bytes = self
-                    .file
-                    .read_exact(coro, self.offset, ChangeIdentity::end_size(&crypto))
-                    .await?;
-                self.sealed
-                    .identity
-                    .validate_end(&crypto, &bytes, self.counts)?;
-            }
             self.finished = true;
             return Ok(None);
         }
-        let bytes = if let Some(crypto) = self.file.crypto.clone() {
-            let header_end = checked_add(self.offset, RECORD_HEADER_SIZE)?;
-            if header_end > self.end_offset {
-                return Err(invalid("truncated change record header"));
-            }
-            let header = self
-                .file
-                .read_exact(coro, self.offset, RECORD_HEADER_SIZE)
-                .await?;
-            let header: [u8; RECORD_HEADER_SIZE] =
-                header.try_into().expect("read exact record header");
-            let length = self.sealed.identity.record_length(&header)?;
-            let chunks = length.div_ceil(CHUNK_SIZE as u64);
-            let stored_length = chunks
-                .checked_mul((crypto.tag_size() + crypto.nonce_size()) as u64)
-                .and_then(|overhead| overhead.checked_add(length))
-                .and_then(|size| header_end.checked_add(size))
-                .filter(|&end| end <= self.end_offset)
-                .ok_or_else(|| invalid("change record exceeds file boundary"))?;
-            let mut bytes = Vec::new();
-            self.offset = header_end;
+        let length = match self.sealed.kind {
+            ChangeKind::Pages => 4120,
+            ChangeKind::Logical => self.read_length(coro).await?,
+        };
+        self.sealed.identity.validate_record_length(length)?;
+        if length
+            > self
+                .sealed
+                .counts
+                .bytes
+                .checked_sub(self.counts.bytes)
+                .ok_or_else(|| invalid("change byte count overflow"))?
+        {
+            return Err(invalid("change records exceed downloaded byte count"));
+        }
+        let chunks = length.div_ceil(CHUNK_SIZE as u64);
+        let overhead = self
+            .file
+            .crypto
+            .as_ref()
+            .map_or(0, |c| c.tag_size() + c.nonce_size());
+        let stored_length = chunks
+            .checked_mul(overhead as u64)
+            .and_then(|n| n.checked_add(length))
+            .ok_or_else(|| invalid("change record length overflow"))?;
+        if self
+            .offset
+            .checked_add(stored_length)
+            .filter(|&end| end <= self.end_offset)
+            .is_none()
+        {
+            return Err(invalid("change record exceeds file boundary"));
+        }
+        let length_usize =
+            usize::try_from(length).map_err(|_| invalid("change record length overflow"))?;
+        let mut bytes = Vec::new();
+        if let Some(crypto) = self.file.crypto.clone() {
             for index in 0..chunks {
-                let size = self.sealed.identity.chunk_plaintext_size(&header, index)?
-                    + crypto.tag_size()
-                    + crypto.nonce_size();
-                let stored = self.file.read_exact(coro, self.offset, size).await?;
-                let plaintext = self.sealed.identity.open_chunk(
+                let size = self.sealed.identity.chunk_plaintext_size(length, index)? + overhead;
+                let mut stored = Vec::new();
+                self.read_buffered(coro, size, &mut stored).await?;
+                bytes.extend(self.sealed.identity.open_chunk(
                     &crypto,
                     self.counts.records,
-                    &header,
+                    length,
                     index,
                     &stored,
-                )?;
-                bytes.extend_from_slice(&plaintext);
-                self.offset = checked_add(self.offset, size)?;
+                )?);
             }
-            assert_eq!(self.offset, stored_length);
-            bytes
         } else {
-            let mut prefix = Vec::new();
-            let length = match self.sealed.kind {
-                ChangeKind::Pages => 4120,
-                ChangeKind::Logical => {
-                    let mut length = 0u64;
-                    for shift in (0..70).step_by(7) {
-                        if self.offset >= self.end_offset {
-                            return Err(invalid("truncated change protobuf length"));
-                        }
-                        self.read_plaintext(coro, 1, &mut prefix).await?;
-                        let byte = *prefix.last().expect("read delimiter byte");
-                        if shift == 63 && byte > 1 {
-                            return Err(invalid("change protobuf length overflow"));
-                        }
-                        length |= u64::from(byte & 0x7f) << shift;
-                        if byte & 0x80 == 0 {
-                            break;
-                        }
-                    }
-                    length
-                }
-            };
-            if self
-                .offset
-                .checked_add(length)
-                .filter(|&end| end <= self.end_offset)
-                .is_none()
-            {
-                return Err(invalid("change record exceeds file boundary"));
-            }
-            let length =
-                usize::try_from(length).map_err(|_| invalid("change record length overflow"))?;
-            self.read_plaintext(coro, length, &mut prefix).await?;
-            prefix
-        };
+            self.read_buffered(coro, length_usize, &mut bytes).await?;
+        }
         self.counts.append(bytes.len() as u64)?;
         if self.counts.bytes > self.sealed.counts.bytes {
             return Err(invalid("change records exceed downloaded byte count"));
@@ -451,25 +411,46 @@ impl ChangesReader<'_> {
         Ok(Some(bytes))
     }
 
-    async fn read_plaintext<Ctx>(
+    async fn read_length<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<u64> {
+        let mut length = 0u64;
+        let mut byte = Vec::with_capacity(1);
+        for index in 0..10 {
+            byte.clear();
+            self.read_buffered(coro, 1, &mut byte).await?;
+            let byte = byte[0];
+            if index == 9 && byte > 1 {
+                return Err(invalid("change protobuf length overflow"));
+            }
+            length |= u64::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                if length == 0 || (index > 0 && byte == 0) {
+                    return Err(invalid("noncanonical or zero change protobuf length"));
+                }
+                return Ok(length);
+            }
+        }
+        Err(invalid("unterminated change protobuf length"))
+    }
+
+    async fn read_buffered<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         mut length: usize,
         output: &mut Vec<u8>,
     ) -> Result<()> {
         while length > 0 {
-            if self.plaintext_buffer_pos == self.plaintext_buffer.len() {
+            if self.read_buffer_pos == self.read_buffer.len() {
                 let wanted = (self.end_offset - self.offset).min(READ_BUFFER_SIZE as u64) as usize;
                 if wanted == 0 {
                     return Err(invalid("unexpected EOF in change file"));
                 }
-                self.plaintext_buffer = self.file.read_exact(coro, self.offset, wanted).await?;
-                self.plaintext_buffer_pos = 0;
+                self.read_buffer = self.file.read_exact(coro, self.offset, wanted).await?;
+                self.read_buffer_pos = 0;
             }
-            let count = length.min(self.plaintext_buffer.len() - self.plaintext_buffer_pos);
-            let end = self.plaintext_buffer_pos + count;
-            output.extend_from_slice(&self.plaintext_buffer[self.plaintext_buffer_pos..end]);
-            self.plaintext_buffer_pos = end;
+            let count = length.min(self.read_buffer.len() - self.read_buffer_pos);
+            let end = self.read_buffer_pos + count;
+            output.extend_from_slice(&self.read_buffer[self.read_buffer_pos..end]);
+            self.read_buffer_pos = end;
             self.offset = checked_add(self.offset, count)?;
             length -= count;
         }
@@ -495,7 +476,7 @@ mod tests {
         future::Future,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
-    use turso_core::{CipherMode, EncryptionKey, MemoryIO, OpenFlags, IO};
+    use turso_core::{io::FileSyncType, CipherMode, EncryptionKey, MemoryIO, OpenFlags, IO};
 
     fn crypto() -> EncryptionContext {
         EncryptionContext::new(
@@ -529,7 +510,7 @@ mod tests {
                 changes.reset(&coro, ChangeKind::Logical).await?;
                 let empty = changes.finish(&coro).await?;
                 assert!(empty.is_empty());
-                assert_eq!(file.size()?, if encrypted { 73 } else { 0 });
+                assert_eq!(file.size()?, 0);
                 assert!(changes
                     .open_reader(&coro, &empty)
                     .await?
@@ -539,10 +520,8 @@ mod tests {
                 assert!(changes.finish(&coro).await.is_err());
                 changes.reset(&coro, ChangeKind::Logical).await?;
                 let mut records = Vec::new();
-                for size in [0, 1, 32766, 32768, 100_000] {
-                    let mut record = Vec::new();
-                    prost::encode_length_delimiter(size, &mut record).expect("delimiter");
-                    record.extend(vec![42; size]);
+                for size in [1, 2, 32766, 32768, 100_000] {
+                    let record = vec![42; size];
                     changes.append_record(&coro, &record).await?;
                     records.push(record);
                 }
@@ -569,7 +548,97 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_payload_truncated_end_and_trailing_bytes_fail() {
+    fn logical_disk_format_has_one_delimiter_and_message_only_counts() {
+        for encrypted in [false, true] {
+            let file = memory_file();
+            let mut changes = ChangesFile::new(file.clone(), encrypted.then(crypto));
+            run(|coro| async move {
+                changes.reset(&coro, ChangeKind::Logical).await?;
+                let message = vec![42; CHUNK_SIZE + 1];
+                changes.append_record(&coro, &message).await?;
+                let sealed = changes.finish(&coro).await?;
+                let prefix_len = prost::length_delimiter_len(message.len());
+                assert_eq!(
+                    sealed.counts,
+                    ChangeCounts {
+                        records: 1,
+                        bytes: message.len() as u64
+                    }
+                );
+                assert_eq!(
+                    sealed.size as usize,
+                    prefix_len + message.len() + if encrypted { 2 * 28 } else { 0 }
+                );
+                let stored = changes.read_exact(&coro, 0, sealed.size as usize).await?;
+                let mut input = stored.as_slice();
+                assert_eq!(
+                    prost::decode_length_delimiter(&mut input).unwrap(),
+                    message.len()
+                );
+                if encrypted {
+                    // Decryption returns message bytes, with no nested delimiter.
+                    let first = sealed.identity.open_chunk(
+                        &crypto(),
+                        0,
+                        message.len() as u64,
+                        0,
+                        &input[..CHUNK_SIZE + 28],
+                    )?;
+                    assert_eq!(first, message[..CHUNK_SIZE]);
+                } else {
+                    assert_eq!(input, message);
+                }
+                let mut reopened = ChangesFile::new(file, encrypted.then(crypto));
+                assert!(reopened.sealed().is_err());
+                assert!(reopened.open_reader(&coro, &sealed).await.is_err());
+                reopened.reset(&coro, ChangeKind::Logical).await?;
+                assert!(reopened.finish(&coro).await?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn encrypted_records_reject_reordering_and_old_batch_substitution() {
+        for kind in [ChangeKind::Logical, ChangeKind::Pages] {
+            for old_batch in [false, true] {
+                let mut changes = ChangesFile::new(memory_file(), Some(crypto()));
+                run(|coro| async move {
+                    let length = if kind == ChangeKind::Pages { 4120 } else { 100 };
+                    changes.reset(&coro, kind).await?;
+                    changes.append_record(&coro, &vec![1; length]).await?;
+                    changes.append_record(&coro, &vec![2; length]).await?;
+                    let first = changes.finish(&coro).await?;
+                    let stored = changes.read_exact(&coro, 0, first.size as usize).await?;
+                    let sealed = if old_batch {
+                        changes.reset(&coro, kind).await?;
+                        changes.append_record(&coro, &vec![1; length]).await?;
+                        changes.append_record(&coro, &vec![2; length]).await?;
+                        let sealed = changes.finish(&coro).await?;
+                        changes.write(&coro, 0, stored).await?;
+                        sealed
+                    } else {
+                        let half = stored.len() / 2;
+                        changes
+                            .write(&coro, 0, [&stored[half..], &stored[..half]].concat())
+                            .await?;
+                        first
+                    };
+                    let mut reader = changes.open_reader(&coro, &sealed).await?;
+                    assert!(matches!(
+                        reader.next_record(&coro).await,
+                        Err(Error::AuthenticationFailed)
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_payload_truncation_and_trailing_bytes_fail() {
         for damage in [0, 1, 2] {
             let file = memory_file();
             let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
@@ -580,7 +649,7 @@ mod tests {
                 match damage {
                     0 => {
                         let mut reader = changes.open_reader(&coro, &sealed).await?;
-                        let pos = (FILE_HEADER_SIZE + RECORD_HEADER_SIZE) as u64;
+                        let pos = 1;
                         let original = reader.file.read_exact(&coro, pos, 1).await?[0];
                         reader.file.write(&coro, pos, vec![original ^ 1]).await?;
                         assert!(matches!(
@@ -718,33 +787,39 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_records_share_buffered_reads() {
+    fn plaintext_records_use_single_writes_and_buffered_reads() {
         for kind in [ChangeKind::Logical, ChangeKind::Pages] {
             let file = Arc::new(ControlledFile::new());
             let mut changes = ChangesFile::new(file.clone(), None);
             let records = match kind {
                 ChangeKind::Logical => {
                     // The second delimiter straddles the 64 KiB buffer boundary.
-                    [65532, 128, 200_000, 0]
+                    [65532, 128, 200_000, 1]
                         .into_iter()
                         .chain(std::iter::repeat_n(100, 10_000))
-                        .map(|size| {
-                            let mut record = Vec::new();
-                            prost::encode_length_delimiter(size, &mut record).unwrap();
-                            record.extend(vec![42; size]);
-                            record
-                        })
+                        .map(|size| vec![42; size])
                         .collect::<Vec<_>>()
                 }
                 ChangeKind::Pages => vec![vec![23; 4120]; 100],
             };
-            let size: usize = records.iter().map(Vec::len).sum();
+            let size: usize = records
+                .iter()
+                .map(|r| {
+                    r.len()
+                        + if kind == ChangeKind::Logical {
+                            prost::length_delimiter_len(r.len())
+                        } else {
+                            0
+                        }
+                })
+                .sum();
             run(|coro| async move {
                 changes.reset(&coro, kind).await?;
                 for record in &records {
                     changes.append_record(&coro, record).await?;
                 }
                 let sealed = changes.finish(&coro).await?;
+                assert_eq!(file.writes.lock().unwrap().len(), records.len());
                 let mut reader = changes.open_reader(&coro, &sealed).await?;
                 for record in records {
                     assert_eq!(reader.next_record(&coro).await?, Some(record));
@@ -758,34 +833,47 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_buffer_handles_short_reads_and_invalid_lengths() {
-        let mut valid = Vec::new();
-        prost::encode_length_delimiter(70_000, &mut valid).unwrap();
-        valid.extend(vec![42; 70_000]);
-        for record in [valid, vec![0x80], vec![0xff; 10], vec![10, 42]] {
-            let file = Arc::new(ControlledFile::new());
-            file.read_limit.store(997, Ordering::SeqCst);
-            let mut changes = ChangesFile::new(file, None);
-            run(|coro| async move {
-                changes.reset(&coro, ChangeKind::Logical).await?;
-                changes.append_record(&coro, &record).await?;
-                let sealed = changes.finish(&coro).await?;
-                let mut reader = changes.open_reader(&coro, &sealed).await?;
-                if record.len() > 70_000 {
-                    assert_eq!(reader.next_record(&coro).await?, Some(record));
-                    assert!(reader.next_record(&coro).await?.is_none());
-                } else {
-                    assert!(reader.next_record(&coro).await.is_err());
-                    assert!(reader.next_record(&coro).await.is_err());
-                }
-                Ok(())
-            })
-            .expect("plaintext read validation");
+    fn buffered_short_reads_and_invalid_lengths() {
+        for encrypted in [false, true] {
+            for prefix in [
+                None,
+                Some(vec![0x80]),
+                Some(vec![0xff; 10]),
+                Some(vec![0x81, 0]),
+                Some(vec![0]),
+                Some(vec![0xff, 0xff, 0x7f]),
+            ] {
+                let file = Arc::new(ControlledFile::new());
+                file.read_limit.store(997, Ordering::SeqCst);
+                let mut changes = ChangesFile::new(file.clone(), encrypted.then(crypto));
+                run(|coro| async move {
+                    changes.reset(&coro, ChangeKind::Logical).await?;
+                    let record = vec![42; 70_000];
+                    changes.append_record(&coro, &record).await?;
+                    let mut sealed = changes.finish(&coro).await?;
+                    if let Some(prefix) = &prefix {
+                        assert!(file.truncate(0, Completion::new_trunc(|_| {}))?.succeeded());
+                        changes.write(&coro, 0, prefix.clone()).await?;
+                        sealed.size = prefix.len() as u64;
+                        changes.state = State::Sealed(sealed.clone());
+                    }
+                    let mut reader = changes.open_reader(&coro, &sealed).await?;
+                    if prefix.is_none() {
+                        assert_eq!(reader.next_record(&coro).await?, Some(record));
+                        assert!(reader.next_record(&coro).await?.is_none());
+                    } else {
+                        assert!(reader.next_record(&coro).await.is_err());
+                        assert!(reader.next_record(&coro).await.is_err());
+                    }
+                    Ok(())
+                })
+                .expect("read validation");
+            }
         }
     }
 
     #[test]
-    fn failed_completions_return_errors_without_sealing() {
+    fn write_failures_prevent_sealing_without_requiring_fsync() {
         for write_failure in [true, false] {
             let file = Arc::new(ControlledFile::new());
             let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
@@ -801,8 +889,18 @@ mod tests {
                     changes.append_record(&coro, b"private payload").await?;
                     file.fail_sync.store(true, Ordering::SeqCst);
                 }
-                assert!(changes.finish(&coro).await.is_err());
-                assert!(matches!(changes.state, State::Invalid));
+                if write_failure {
+                    assert!(changes.finish(&coro).await.is_err());
+                    assert!(matches!(changes.state, State::Invalid));
+                } else {
+                    let sealed = changes.finish(&coro).await?;
+                    let mut reader = changes.open_reader(&coro, &sealed).await?;
+                    assert_eq!(
+                        reader.next_record(&coro).await?,
+                        Some(b"private payload".to_vec())
+                    );
+                    assert!(reader.next_record(&coro).await?.is_none());
+                }
                 for write in file.writes.lock().expect("writes").iter() {
                     assert!(!write.windows(15).any(|bytes| bytes == b"private payload"));
                 }
@@ -859,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_reads_and_empty_end_authentication() {
+    fn partial_reads_and_empty_batch_size_validation() {
         let file = Arc::new(ControlledFile::new());
         file.read_limit.store(7, Ordering::SeqCst);
         let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
@@ -873,13 +971,10 @@ mod tests {
             drop(reader);
             changes.reset(&coro, ChangeKind::Logical).await?;
             let empty = changes.finish(&coro).await?;
-            let pos = FILE_HEADER_SIZE as u64 + 1;
-            let byte = changes.read_exact(&coro, pos, 1).await?[0];
-            changes.write(&coro, pos, vec![byte ^ 1]).await?;
-            assert!(matches!(
-                changes.open_reader(&coro, &empty).await,
-                Err(Error::AuthenticationFailed)
-            ));
+            assert_eq!(empty.size, 0);
+            assert!(changes.validate_boundary(&coro).await?);
+            changes.write(&coro, 0, vec![1]).await?;
+            assert!(changes.open_reader(&coro, &empty).await.is_err());
             Ok(())
         })
         .expect("partial reads and empty authentication");
