@@ -265,6 +265,34 @@ fn errors_report_postgres_sqlstates() {
 }
 
 #[test]
+fn array_types_with_more_than_seven_dimensions_are_not_supported() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE DOMAIN posint AS INT").unwrap();
+    conn.execute("CREATE TABLE seven (a INT[][][][][][][])")
+        .unwrap();
+    conn.execute("ALTER TABLE seven ADD COLUMN b posint[][][][][][][]")
+        .unwrap();
+    conn.execute("SELECT '{}'::int[][][][][][][]").unwrap();
+    for sql in [
+        "CREATE TABLE v3 (c4 INT[][][][][][][][])",
+        "CREATE TABLE v3 (c4 posint[][][][][][][][])",
+        "CREATE TABLE v3 (c4 _int4[][][][][][][])",
+        "ALTER TABLE seven ADD COLUMN c int[][][][][][][][]",
+        "SELECT '{}'::int[][][][][][][][]",
+        "SELECT CAST('{}' AS posint[][][][][][][][])",
+        "SELECT * FROM json_to_recordset('[]') AS x(a int[][][][][][][][])",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "0A000", "{sql}: {e:?}");
+        assert_eq!(
+            e.to_string(),
+            "an array type with 8 dimensions (at most 7) is not supported",
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn nested_begin_keeps_the_open_transaction() {
     // PostgreSQL warns "there is already a transaction in progress" for BEGIN
     // inside a transaction block and keeps the transaction.
