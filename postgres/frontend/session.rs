@@ -2,7 +2,6 @@ use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
 use std::num::NonZero;
 use std::str;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
 
@@ -45,7 +44,6 @@ pub struct PgConnection {
 struct PgConnectionInner {
     conn: Arc<Connection>,
     tx: Arc<PgTxState>,
-    allow_file_copy: AtomicBool,
 }
 
 /// The transaction state of a session as PostgreSQL reports it in
@@ -140,23 +138,35 @@ impl PgConnection {
         db: &Arc<turso_core::Database>,
         opts: turso_core::ConnectOpts,
     ) -> crate::Result<Self> {
-        let conn = db.connect_with_hooks(opts, Arc::new(PgSessionState::default()))?;
+        Self::open_session(db, opts, false)
+    }
+
+    /// Opens a session like [`Self::connect_with`] for a client that the
+    /// caller has not authenticated, such as one of the wire server. Every
+    /// session starts as the superuser, so this one is refused
+    /// `COPY ... FROM 'file'`, which reads files on the host.
+    pub fn connect_unauthenticated(
+        db: &Arc<turso_core::Database>,
+        opts: turso_core::ConnectOpts,
+    ) -> crate::Result<Self> {
+        Self::open_session(db, opts, true)
+    }
+
+    fn open_session(
+        db: &Arc<turso_core::Database>,
+        opts: turso_core::ConnectOpts,
+        file_copy_denied: bool,
+    ) -> crate::Result<Self> {
+        let state = Arc::new(PgSessionState::new(file_copy_denied));
+        let conn = db.connect_with_hooks(opts, state)?;
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 tx: Arc::new(PgTxState::default()),
-                allow_file_copy: AtomicBool::new(true),
             }),
         })
-    }
-
-    /// Allows `COPY ... FROM 'file'` to read files on the host. Every session
-    /// starts as the superuser, so the privilege check lets it through; the
-    /// wire server, which does not authenticate clients, turns it off.
-    pub fn set_allow_file_copy(&self, allow: bool) {
-        self.inner.allow_file_copy.store(allow, Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -1619,13 +1629,6 @@ fn try_prepare_special(
     else {
         return Ok(None);
     };
-    if let FrontendStmt::CopyFrom(copy) = &stmt {
-        if !pg_conn.allow_file_copy.load(Ordering::Relaxed) {
-            return Err(LimboError::PermissionDenied(Box::new(
-                PermissionDenied::privilege(Action::Read, Object::File(copy.filename.clone())),
-            )));
-        }
-    }
     let stmt = match stmt {
         FrontendStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
         FrontendStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
@@ -1696,6 +1699,15 @@ fn prepare_set_transaction(
 /// itself, outside the privilege checks of core. Only a superuser may change
 /// schemas or read files, and a superuser owns every object.
 fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<()> {
+    // Checked before the superuser shortcut: an unauthenticated session is
+    // the superuser too.
+    if let FrontendStmt::CopyFrom(stmt) = stmt {
+        if session_state(conn)?.file_copy_denied {
+            return Err(LimboError::PermissionDenied(Box::new(
+                PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone())),
+            )));
+        }
+    }
     if conn.current_role_is_superuser() {
         return Ok(());
     }
@@ -2168,9 +2180,9 @@ fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
 /// `panic = "abort"` in the release profile, abort the process.
 const MAX_COPY_FILE_BYTES: u64 = 1 << 30; // 1 GiB
 
-/// Reads the file of `COPY FROM '<file>'`. Only regular files are read, so a
-/// device or FIFO that never reaches end of file is refused, and the read stops
-/// after `max_bytes`, which also bounds a file that grows while it is read.
+/// Reads the file of `COPY FROM '<file>'`. The read stops after `max_bytes`,
+/// which also bounds a device that never reaches end of file and a file that
+/// grows while it is read.
 fn read_copy_file(filename: &str, max_bytes: u64) -> Result<String> {
     use std::io::Read;
 
@@ -2183,12 +2195,12 @@ fn read_copy_file(filename: &str, max_bytes: u64) -> Result<String> {
             format!("COPY FROM: '{filename}' exceeds the {max_bytes}-byte limit"),
         )
     };
-    // Checked before opening, because opening a FIFO waits for a writer.
     let metadata = std::fs::metadata(filename).map_err(cannot_read)?;
-    if !metadata.is_file() {
-        return Err(LimboError::ParseError(format!(
-            "COPY FROM: '{filename}' is not a regular file"
-        )));
+    if metadata.is_dir() {
+        return Err(sqlstate_error(
+            SQLSTATE_WRONG_OBJECT_TYPE,
+            format!("\"{filename}\" is a directory"),
+        ));
     }
     if metadata.len() > max_bytes {
         return Err(too_large());
@@ -3252,9 +3264,11 @@ mod tests {
     }
 
     #[test]
-    fn copy_from_reads_only_bounded_regular_files() {
+    fn copy_from_reads_a_bounded_file() {
         use super::read_copy_file;
-        use turso_pg_parser::sqlstate::SQLSTATE_PROGRAM_LIMIT_EXCEEDED;
+        use turso_pg_parser::sqlstate::{
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED, SQLSTATE_WRONG_OBJECT_TYPE,
+        };
 
         let path = std::env::temp_dir().join(format!("turso_copy_test_{}.tsv", std::process::id()));
         std::fs::write(&path, "1\tone\n2\ttwo\n").unwrap();
@@ -3267,9 +3281,42 @@ mod tests {
         assert_eq!(sqlstate_of(too_large), SQLSTATE_PROGRAM_LIMIT_EXCEEDED);
 
         let directory = std::env::temp_dir();
-        let not_a_file = read_copy_file(directory.to_str().unwrap(), 1024).unwrap_err();
-        assert!(not_a_file.to_string().contains("not a regular file"));
+        let is_a_directory = read_copy_file(directory.to_str().unwrap(), 1024).unwrap_err();
+        assert_eq!(sqlstate_of(is_a_directory), SQLSTATE_WRONG_OBJECT_TYPE);
 
+        // A device that never ends is cut off at the limit.
+        #[cfg(unix)]
+        {
+            let endless = read_copy_file("/dev/zero", 4).unwrap_err();
+            assert_eq!(sqlstate_of(endless), SQLSTATE_PROGRAM_LIMIT_EXCEEDED);
+        }
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_from_reads_a_fifo() {
+        use super::read_copy_file;
+
+        let path = std::env::temp_dir().join(format!("turso_copy_fifo_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || std::fs::write(path, "1\tone\n").unwrap())
+        };
+
+        assert_eq!(
+            read_copy_file(path.to_str().unwrap(), 1024).unwrap(),
+            "1\tone\n"
+        );
+
+        writer.join().unwrap();
         std::fs::remove_file(&path).unwrap();
     }
 }

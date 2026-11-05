@@ -133,9 +133,9 @@ fn test_copy_from_file_not_found(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_copy_from_file_rejected_when_file_copy_is_off(db: TempDatabase) {
-    let conn = db.connect_postgres();
-    conn.set_allow_file_copy(false);
+fn test_copy_from_file_rejected_for_unauthenticated_session(db: TempDatabase) {
+    let conn =
+        PgConnection::connect_unauthenticated(&db.db, turso_core::ConnectOpts::new()).unwrap();
 
     conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
 
