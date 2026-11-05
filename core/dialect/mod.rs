@@ -360,6 +360,17 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
+    /// Whether `PRAGMA capture_data_changes_conn` may create its change
+    /// tables in a database of this dialect.
+    ///
+    /// The PostgreSQL frontend refuses it: CDC tables are created at run
+    /// time, outside the DDL that maintains the dialect's schema state, so
+    /// the PostgreSQL frontend would have relations missing from its
+    /// relation catalog.
+    fn supports_capture_data_changes(&self) -> bool {
+        true
+    }
+
     /// The namespaces of a database that has never created or dropped one.
     /// They have ids from 1 in this order and no rows until the first
     /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then

@@ -220,6 +220,10 @@ impl Dialect for PostgresDialect {
         false
     }
 
+    fn supports_capture_data_changes(&self) -> bool {
+        false
+    }
+
     fn schema_state_query(&self, schema: &Schema) -> Option<String> {
         crate::classes::schema_state_query(schema)
     }
