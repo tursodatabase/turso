@@ -1289,6 +1289,7 @@ impl Database {
             options.db_opts,
         )?;
         let file = if effective_flags.contains(OpenFlags::ReadOnly)
+            && !is_memory_like(path)
             && !options.db_opts.enable_multiprocess_wal
         {
             match io.open_file(
@@ -2360,7 +2361,7 @@ impl Database {
                     let header_modified = match read_version {
                         Version::Legacy => {
                             if is_readonly {
-                                self.writer_readiness.get_mut().legacy = true;
+                                self.writer_readiness.lock().legacy = true;
                                 tracing::warn!(
                                     "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
                                     self.path
@@ -2533,7 +2534,7 @@ impl Database {
                             self.path
                         );
                         if self.readonly_bootstrap {
-                            self.writer_readiness.get_mut().orphan_wal = true;
+                            self.writer_readiness.lock().orphan_wal = true;
                             // A read-only open must not delete files, so just
                             // detach the WAL. This is the same state a
                             // read-only open reaches when there is no WAL file

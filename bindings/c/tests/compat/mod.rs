@@ -5424,6 +5424,98 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_default_open_falls_back_to_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("permissions.db");
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(x); INSERT INTO t VALUES(1)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+                eprintln!("requires an unprivileged user whose writes are denied by chmod 0444");
+                return;
+            }
+            for keep_reader in [false, true] {
+                let mut reader = ptr::null_mut();
+                if keep_reader {
+                    assert_eq!(
+                        sqlite3_open_v2(name.as_ptr(), &mut reader, 1, ptr::null()),
+                        SQLITE_OK
+                    );
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"BEGIN; SELECT * FROM t".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                }
+                for flags in [None, Some(6), Some(2), Some(1)] {
+                    db = ptr::null_mut();
+                    let rc = match flags {
+                        None => sqlite3_open(name.as_ptr(), &mut db),
+                        Some(flags) => sqlite3_open_v2(name.as_ptr(), &mut db, flags, ptr::null()),
+                    };
+                    assert_eq!(rc, SQLITE_OK, "open flags {flags:?}");
+                    assert_eq!(sqlite3_db_readonly(db, c"main".as_ptr()), 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            db,
+                            c"SELECT * FROM t".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(
+                        sqlite3_exec(
+                            db,
+                            c"INSERT INTO t VALUES(2)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        8
+                    );
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+                if !reader.is_null() {
+                    assert_eq!(sqlite3_close(reader), SQLITE_OK);
+                }
+            }
+            for flags in [None, Some(6), Some(2), Some(1)] {
+                let missing = dir.path().join("missing-parent/db");
+                let name = std::ffi::CString::new(missing.to_str().unwrap()).unwrap();
+                let rc = match flags {
+                    None => sqlite3_open(name.as_ptr(), &mut db),
+                    Some(flags) => sqlite3_open_v2(name.as_ptr(), &mut db, flags, ptr::null()),
+                };
+                assert_eq!(rc, SQLITE_CANTOPEN);
+                assert!(!missing.exists());
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
     #[test]
     fn test_uri_readonly_rejects_write() {
         unsafe {

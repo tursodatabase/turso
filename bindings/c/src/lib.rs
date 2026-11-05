@@ -603,6 +603,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         turso_core::OpenFlags::None
     };
 
+    let mut readonly = parsed.access & SQLITE_OPEN_READONLY != 0;
     let use_shared_memory = use_memory && cache_shared && !effective_filename.is_empty();
 
     let db = if use_shared_memory {
@@ -649,14 +650,30 @@ pub unsafe extern "C" fn sqlite3_open_v2(
                 )
             }
         };
-        match turso_core::Database::open_file_with_flags(
-            io.clone(),
-            &effective_filename,
-            file_open_flags,
-            default_db_opts(),
-            None,
-            Arc::new(SqliteDialect),
-        ) {
+        let open = |flags| {
+            turso_core::Database::open_file_with_flags(
+                io.clone(),
+                &effective_filename,
+                flags,
+                default_db_opts(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+        };
+        let opened = match open(file_open_flags) {
+            Err(LimboError::CompletionError(turso_core::CompletionError::IOError(
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem,
+                "open",
+            )))
+            | Err(LimboError::ReadOnly)
+                if !readonly =>
+            {
+                readonly = true;
+                open(turso_core::OpenFlags::ReadOnly)
+            }
+            result => result,
+        };
+        match opened {
             Ok(db) => db,
             Err(e) => {
                 trace!("error opening database {effective_filename}: {e:?}");
@@ -669,7 +686,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect(ConnectOpts::new().with_readonly(parsed.access & SQLITE_OPEN_READONLY != 0)) {
+    match db.connect(ConnectOpts::new().with_readonly(readonly)) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
