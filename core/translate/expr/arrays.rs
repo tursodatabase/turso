@@ -280,7 +280,6 @@ pub(crate) fn emit_array_decode(
 
 /// The custom type of the elements of array column `col`, or None when they
 /// are of a plain type such as INTEGER, which has no ENCODE or DECODE.
-/// Fails for an element type that is neither.
 fn resolve_array_element_type(
     col: &Column,
     resolver: &Resolver,
@@ -288,11 +287,13 @@ fn resolve_array_element_type(
     match resolver.schema().resolve_type_unchecked(&col.ty_str)? {
         Some(resolved) => Ok(Some(resolved)),
         None if crate::util::is_builtin_strict_type(&col.ty_str) => Ok(None),
-        None => crate::bail_parse_error!(
-            "unknown datatype for array column {}: \"{}\"",
+        // Schema::check_array_element_type refuses unknown element types when
+        // the column is created or altered.
+        None => Err(LimboError::InternalError(format!(
+            "array column {} has element type \"{}\", which is not a known type",
             col.name.as_deref().unwrap_or(""),
             col.ty_str
-        ),
+        ))),
     }
 }
 
