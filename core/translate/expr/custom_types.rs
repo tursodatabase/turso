@@ -234,7 +234,9 @@ pub(super) fn emit_domain_cast_constraints(
 /// after the type name. The result is converted to the kind of the type's
 /// BASE as a STRICT column of the BASE converts it, so a type BASE integer
 /// whose ENCODE gives '5' stores 5, and one whose ENCODE gives 'abc' is an
-/// error. COERCE sees the converted value too. A CAST runs the same.
+/// error. COERCE sees the converted value too. A CAST runs the same. NULL is
+/// left as it is, without running ENCODE; a domain's NOT NULL is checked
+/// afterwards, by the column's NOT NULL constraint or by the CAST.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
@@ -251,6 +253,11 @@ pub(crate) fn emit_store_value(
             resolved.primitive.to_uppercase()
         ),
     };
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
@@ -261,6 +268,7 @@ pub(crate) fn emit_store_value(
         }
     }
     program.emit_insn(convert);
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 

@@ -5,9 +5,9 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -6057,46 +6057,70 @@ fn translate_create_enum(
 
     let type_name = object_name(&enum_stmt.type_name, is_default_schema, "type")?;
 
-    // Extract enum labels
-    let mut labels = Vec::new();
+    // Extract enum labels, checked the way PostgreSQL's EnumValuesCreate
+    // checks them when it inserts them into pg_enum.
+    let mut labels: Vec<String> = Vec::new();
     for val_node in &enum_stmt.vals {
-        if let Some(Node::String(s)) = &val_node.node {
-            labels.push(s.sval.clone());
-        } else {
+        let Some(Node::String(s)) = &val_node.node else {
             return Err(ParseError::ParseError(
                 "ENUM label must be a string literal".into(),
             ));
+        };
+        let label = &s.sval;
+        if label.len() > MAX_IDENTIFIER_BYTES {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_NAME,
+                message: format!("invalid enum label \"{label}\""),
+            });
         }
-    }
-    if labels.is_empty() {
-        return Err(ParseError::ParseError(
-            "ENUM type must have at least one label".into(),
-        ));
+        if labels.contains(label) {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_UNIQUE_VIOLATION,
+                message:
+                    "duplicate key value violates unique constraint \"pg_enum_typid_label_index\""
+                        .into(),
+            });
+        }
+        labels.push(label.clone());
     }
 
     // Build: CASE WHEN value IN ('a','b','c') THEN value
-    //        ELSE RAISE(ABORT, 'invalid input value for enum <name>') END
-    let in_list: Vec<Box<ast::Expr>> = labels
-        .iter()
-        .map(|l| Box::new(ast::Expr::Literal(ast::Literal::String(format!("'{l}'")))))
-        .collect();
+    //        ELSE RAISE(ABORT, 'invalid input value for enum <name>: "' || value || '"') END
+    // An enum with no labels gets an empty IN list, which matches no value.
+    let string = |text: &str| {
+        Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+            "'{}'",
+            text.replace('\'', "''")
+        ))))
+    };
+    let in_list: Vec<Box<ast::Expr>> = labels.iter().map(|l| string(l)).collect();
 
-    let error_msg = format!("invalid input value for enum {type_name}");
+    let value = || Box::new(ast::Expr::Id(exact_name("value")));
+    let error_msg = ast::Expr::Binary(
+        Box::new(ast::Expr::Binary(
+            string(&format!(
+                "invalid input value for enum {}: \"",
+                crate::quote_identifier(&type_name)
+            )),
+            ast::Operator::Concat,
+            value(),
+        )),
+        ast::Operator::Concat,
+        string("\""),
+    );
     let encode = ast::Expr::Case {
         base: None,
         when_then_pairs: vec![(
             Box::new(ast::Expr::InList {
-                lhs: Box::new(ast::Expr::Id(exact_name("value"))),
+                lhs: value(),
                 not: false,
                 rhs: in_list,
             }),
-            Box::new(ast::Expr::Id(exact_name("value"))),
+            value(),
         )],
         else_expr: Some(Box::new(ast::Expr::Raise(
             ast::ResolveType::Abort,
-            Some(Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                "'{error_msg}'"
-            ))))),
+            Some(Box::new(error_msg)),
         ))),
     };
 
@@ -6833,7 +6857,7 @@ pub fn unnamed_index_name<E>(
 }
 
 /// PostgreSQL keeps only the first 63 bytes (NAMEDATALEN - 1) of an
-/// identifier.
+/// identifier, and refuses an enum label longer than that.
 const MAX_IDENTIFIER_BYTES: usize = 63;
 
 /// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
