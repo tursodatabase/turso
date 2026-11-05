@@ -1092,7 +1092,10 @@ mod tests {
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
-        schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},
+        schema::{
+            BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, PrimaryKeyForm, Table,
+            Type,
+        },
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
         translate::{emitter::Resolver, expr_context::TableMetadata, plan::TableReferences},
     };
@@ -1590,7 +1593,7 @@ mod tests {
         let table = Table::BTree(Arc::new(BTreeTable::new(
             0,
             "foo".to_string(),
-            vec![],
+            PrimaryKeyForm::None,
             columns,
             BTreeCharacteristics::empty(),
             vec![],
@@ -1653,7 +1656,7 @@ mod tests {
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "t1".to_string(),
-                vec![],
+                PrimaryKeyForm::None,
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 vec![],
@@ -1691,7 +1694,7 @@ mod tests {
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "t2".to_string(),
-                vec![],
+                PrimaryKeyForm::None,
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 vec![],
@@ -1740,7 +1743,7 @@ mod tests {
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "bar".to_string(),
-                vec![("id".to_string(), SortOrder::Asc)],
+                PrimaryKeyForm::Inline("id".to_string(), SortOrder::Asc),
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 vec![],

@@ -531,35 +531,8 @@ pub fn bind_and_rewrite_expr<'a>(
                                         }
                                     }
 
-                                    // Build arguments: alternating column_name (as string literal), column_value (as column reference)
-                                    let mut args: Vec<Box<ast::Expr>> = Vec::new();
-
-                                    let joined_tables = referenced_tables.joined_tables();
-                                    for table in joined_tables.iter() {
-                                        for (col_idx, col) in table.columns().iter().enumerate() {
-                                            // Skip hidden columns (like rowid in some cases)
-                                            if col.hidden() {
-                                                continue;
-                                            }
-
-                                            // Add column name as a string literal
-                                            let col_name = col.name.clone().unwrap_or_else(|| {
-                                                format!("column{}", col_idx + 1)
-                                            });
-                                            let quoted_col_name = format!("'{col_name}'");
-                                            args.push(Box::new(ast::Expr::Literal(
-                                                ast::Literal::String(quoted_col_name),
-                                            )));
-
-                                            // Add column reference using Expr::Column
-                                            args.push(Box::new(ast::Expr::Column {
-                                                database: None,
-                                                table: table.internal_id,
-                                                column: col_idx,
-                                                is_rowid_alias: col.is_rowid_alias(),
-                                            }));
-                                        }
-                                    }
+                                    let args =
+                                        json_object_star_args(referenced_tables.joined_tables());
 
                                     // Replace FunctionCallStar with expanded FunctionCall
                                     *expr = ast::Expr::FunctionCall {
@@ -1411,4 +1384,138 @@ pub(super) fn validate_custom_type_function_call(
         _ => {}
     }
     Ok(())
+}
+
+/// The arguments `json_object(*)` and `jsonb_object(*)` expand to: for each
+/// visible column, its name as a string literal, then the column itself.
+#[expect(
+    clippy::vec_box,
+    reason = "the result becomes the `args` of `ast::Expr::FunctionCall`, which is a Vec<Box<Expr>>"
+)]
+pub(super) fn json_object_star_args(
+    joined_tables: &[crate::translate::plan::JoinedTable],
+) -> Vec<Box<ast::Expr>> {
+    let mut args: Vec<Box<ast::Expr>> = Vec::new();
+    for table in joined_tables {
+        for (col_idx, col) in table.columns().iter().enumerate() {
+            if col.hidden() {
+                continue;
+            }
+            // Every column we know of has a name: table columns are named by
+            // CREATE TABLE, an unaliased result column gets its expression text as
+            // its name (sqlite/parser/src/parser.rs:3222), and VALUES columns are
+            // named `column<N>` (core/translate/select.rs:871). A column with no
+            // name is a bug, so crash instead of inventing a key.
+            let col_name = col.name.as_ref();
+            turso_assert!(
+                col_name.is_some(),
+                "column has no name to use as a json_object(*) key",
+                { "column": col_idx + 1, "table": table.identifier }
+            );
+            let col_name = col_name.expect("checked by the assertion above");
+            // Literal::String values must be wrapped in single quotes
+            // because sanitize_string() strips the first and last character,
+            // and it turns each '' back into '. So double the quotes in the
+            // name first.
+            args.push(Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                col_name.replace('\'', "''")
+            )))));
+            args.push(Box::new(ast::Expr::Column {
+                database: None,
+                table: table.internal_id,
+                column: col_idx,
+                is_rowid_alias: col.is_rowid_alias(),
+            }));
+        }
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column, PrimaryKeyForm, Table, Type,
+    };
+    use crate::sync::Arc;
+    use crate::translate::plan::{
+        ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan,
+    };
+    use crate::MAIN_DB_ID;
+
+    fn column(name: Option<&str>) -> Column {
+        Column::new(
+            name.map(str::to_string),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    fn joined_table(columns: Vec<Column>) -> JoinedTable {
+        JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            unmatched_right_rows_plan: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
+            identifier: "t".to_string(),
+            has_alias: false,
+            internal_id: ast::TableInternalId::from(1),
+            join_info: None,
+            plan_estimate: None,
+            indexed: None,
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "t".to_string(),
+                PrimaryKeyForm::None,
+                columns,
+                BTreeCharacteristics::HAS_ROWID,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ))),
+        }
+    }
+
+    #[test]
+    fn json_object_star_uses_each_column_name_as_the_key() {
+        let table = joined_table(vec![column(Some("a")), column(Some("1+1"))]);
+        let args = json_object_star_args(&[table]);
+        let keys: Vec<_> = args
+            .iter()
+            .step_by(2)
+            .map(|arg| match arg.as_ref() {
+                ast::Expr::Literal(ast::Literal::String(key)) => key.clone(),
+                other => panic!("expected a string literal key, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, ["'a'", "'1+1'"]);
+    }
+
+    #[test]
+    fn json_object_star_doubles_the_quotes_in_a_column_name() {
+        let table = joined_table(vec![column(Some("'it's'"))]);
+        let args = json_object_star_args(&[table]);
+        let ast::Expr::Literal(ast::Literal::String(key)) = args[0].as_ref() else {
+            panic!("expected a string literal key, got {:?}", args[0]);
+        };
+        assert_eq!(key, "'''it''s'''");
+    }
+
+    #[test]
+    #[should_panic(expected = "column has no name to use as a json_object(*) key")]
+    fn json_object_star_over_a_column_without_a_name_panics() {
+        let table = joined_table(vec![column(Some("a")), column(None)]);
+        let _ = json_object_star_args(&[table]);
+    }
 }

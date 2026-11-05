@@ -2242,13 +2242,18 @@ impl Schema {
         column: &Column,
     ) -> Result<(bool, Vec<CheckConstraint>)> {
         let mut checks = vec![];
-        let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
+        let Some(resolved) = self.resolve_type_unchecked(&column.ty_str)? else {
             return Ok((false, checks));
         };
         if !resolved.is_domain() {
             return Ok((false, checks));
         }
-        let col_name = column.name.as_deref().unwrap_or("").to_string();
+        let Some(col_name) = column.name.clone() else {
+            return Err(LimboError::InternalError(format!(
+                "column of type {} has no name, so the checks of its domain cannot name it",
+                column.ty_str
+            )));
+        };
         for td in &resolved.chain {
             for (i, dc) in td.domain_checks.iter().enumerate() {
                 let rewritten = rewrite_value_to_column(&dc.check, &col_name);
@@ -5443,6 +5448,27 @@ bitflags! {
     }
 }
 
+/// How a table's PRIMARY KEY was declared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrimaryKeyForm {
+    /// The table has no PRIMARY KEY.
+    None,
+    /// Written on the column: `id INTEGER PRIMARY KEY`.
+    Inline(String, SortOrder),
+    /// Written as a table constraint: `PRIMARY KEY (a, b)`.
+    TableConstraint(Vec<(String, SortOrder)>),
+}
+
+impl PrimaryKeyForm {
+    fn into_columns(self) -> Vec<(String, SortOrder)> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Inline(name, order) => vec![(name, order)],
+            Self::TableConstraint(columns) => columns,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GeneratedColGraph {
     /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
@@ -5593,7 +5619,7 @@ impl BTreeTable {
     pub fn new(
         root_page: i64,
         name: String,
-        primary_key_columns: Vec<(String, SortOrder)>,
+        primary_key: PrimaryKeyForm,
         columns: Vec<Column>,
         characteristics: BTreeCharacteristics,
         unique_sets: Vec<UniqueSet>,
@@ -5601,21 +5627,99 @@ impl BTreeTable {
         check_constraints: Vec<CheckConstraint>,
         rowid_alias_conflict_clause: Option<ResolveType>,
     ) -> Self {
-        let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
+        let primary_key_is_inline = matches!(primary_key, PrimaryKeyForm::Inline(..));
+        let primary_key_columns = primary_key.clone().into_columns();
+        for (pk_name, _) in &primary_key_columns {
+            let pk_column = columns.iter().find(|c| {
+                c.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
+            });
+            assert!(
+                pk_column.is_some_and(|c| c.primary_key()),
+                "PRIMARY KEY column {pk_name} is not a primary key column of the table"
+            );
+        }
+        for column in columns.iter().filter(|c| c.primary_key()) {
+            let named_by_form = primary_key_columns.iter().any(|(pk_name, _)| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
+            });
+            assert!(
+                named_by_form,
+                "column {:?} is flagged PRIMARY KEY but the PrimaryKeyForm does not name it",
+                column.name
+            );
+        }
+        assert!(
+            columns
+                .iter()
+                .filter(|c| c.is_rowid_alias())
+                .all(|c| c.primary_key()),
+            "a rowid alias column must be flagged PRIMARY KEY"
+        );
+        assert!(
+            columns.iter().filter(|c| c.is_rowid_alias()).count() <= 1,
+            "a table has at most one rowid alias column"
+        );
         let has_rowid = characteristics.contains(BTreeCharacteristics::HAS_ROWID);
+        assert!(
+            unique_sets.iter().filter(|set| set.is_primary_key).count() <= 1,
+            "a table has at most one PRIMARY KEY unique set"
+        );
+        match unique_sets.iter().find(|set| set.is_primary_key) {
+            Some(set) => {
+                assert!(
+                    primary_key != PrimaryKeyForm::None,
+                    "a PRIMARY KEY unique set needs a PrimaryKeyForm"
+                );
+                assert_eq!(
+                    set.is_inline, primary_key_is_inline,
+                    "the PrimaryKeyForm disagrees with the PRIMARY KEY unique set"
+                );
+                let set_columns: Vec<(&str, SortOrder)> = set
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.sort_order))
+                    .collect();
+                let form_columns: Vec<(&str, SortOrder)> = primary_key_columns
+                    .iter()
+                    .map(|(name, order)| (name.as_str(), *order))
+                    .collect();
+                assert!(
+                    set_columns.len() == form_columns.len()
+                        && set_columns.iter().zip(&form_columns).all(
+                            |((a, a_order), (b, b_order))| {
+                                a.eq_ignore_ascii_case(b) && a_order == b_order
+                            }
+                        ),
+                    "the PrimaryKeyForm names other columns than the PRIMARY KEY unique set"
+                );
+            }
+            // Only a rowid alias PRIMARY KEY has no unique set.
+            None if primary_key != PrimaryKeyForm::None => {
+                let key_is_rowid_alias = has_rowid
+                    && matches!(primary_key_columns.as_slice(), [(pk_name, _)]
+                    if columns.iter().any(|c| {
+                        c.is_rowid_alias()
+                            && c.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
+                    }));
+                assert!(
+                    key_is_rowid_alias,
+                    "a PRIMARY KEY without a unique set must be a rowid alias"
+                );
+            }
+            None => {}
+        }
+        let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
         let logical_to_physical_map =
             Self::build_logical_to_physical_map(&columns, &primary_key_columns, has_rowid);
         let primary_key_constraint_name = unique_sets
             .iter()
             .find(|set| set.is_primary_key)
             .and_then(|set| set.constraint_name.clone());
-        let primary_key_is_inline = unique_sets
-            .iter()
-            .find(|set| set.is_primary_key)
-            .map_or_else(
-                || primary_key_columns.len() == 1 && columns.iter().any(|c| c.primary_key()),
-                |set| set.is_inline,
-            );
         Self {
             root_page,
             declared_name: name.clone(),
@@ -8983,6 +9087,267 @@ mod tests {
 
     fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
         Arc::new(BTreeTable::from_sql(sql, root_page).unwrap())
+    }
+
+    fn unnamed_column(type_name: &str) -> Column {
+        Column::new(
+            None,
+            type_name.to_string(),
+            None,
+            None,
+            Type::Integer,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    fn schema_with_positive_domain() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql(
+                "CREATE DOMAIN pos AS integer CHECK (value > 0)",
+                &SymbolTable::new(),
+            )
+            .unwrap();
+        schema
+    }
+
+    #[test]
+    fn a_domain_column_without_a_name_is_an_error() {
+        let schema = schema_with_positive_domain();
+        let err = schema
+            .column_domain_constraints(&unnamed_column("pos"))
+            .unwrap_err();
+        assert!(
+            matches!(err, LimboError::InternalError(_)),
+            "expected an internal error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_domain_column_with_a_name_gets_the_domain_checks_on_that_name() {
+        let schema = schema_with_positive_domain();
+        let mut column = unnamed_column("pos");
+        column.name = Some("age".to_string());
+        let (not_null, checks) = schema.column_domain_constraints(&column).unwrap();
+        assert!(!not_null);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].column.as_deref(), Some("age"));
+    }
+
+    #[test]
+    fn a_domain_column_whose_type_chain_does_not_resolve_is_an_error() {
+        let mut schema = Schema::new();
+        schema
+            .insert_type_from_sql("CREATE DOMAIN dom_a AS dom_b CHECK (value > 0)")
+            .unwrap();
+        schema
+            .insert_type_from_sql("CREATE DOMAIN dom_b AS dom_a CHECK (value > 0)")
+            .unwrap();
+        let mut column = unnamed_column("dom_a");
+        column.name = Some("age".to_string());
+        let err = schema.column_domain_constraints(&column).unwrap_err();
+        assert!(
+            err.to_string().contains("circular type dependency"),
+            "expected a circular type error, got {err:?}"
+        );
+    }
+
+    fn id_column(is_primary_key: bool) -> Column {
+        Column::new(
+            Some("id".to_string()),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            None,
+            ColDef {
+                flags: if is_primary_key {
+                    ColDefFlags::PrimaryKey
+                } else {
+                    ColDefFlags::empty()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    fn id_rowid_alias_column() -> Column {
+        let mut column = id_column(true);
+        column.set_rowid_alias(true);
+        column
+    }
+
+    fn table_with_primary_key(
+        primary_key: PrimaryKeyForm,
+        columns: std::vec::Vec<Column>,
+        unique_sets: std::vec::Vec<UniqueSet>,
+    ) -> BTreeTable {
+        BTreeTable::new(
+            2,
+            "t".to_string(),
+            primary_key,
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            unique_sets,
+            std::vec::Vec::new(),
+            std::vec::Vec::new(),
+            None,
+        )
+    }
+
+    fn id_asc() -> (String, SortOrder) {
+        ("id".to_string(), SortOrder::Asc)
+    }
+
+    fn primary_key_unique_set(is_inline: bool) -> UniqueSet {
+        UniqueSet {
+            columns: vec![UniqueSetColumn {
+                name: "id".to_string(),
+                sort_order: SortOrder::Asc,
+                collation: None,
+                nulls_order: None,
+            }],
+            is_primary_key: true,
+            is_inline,
+            conflict_clause: None,
+            constraint_name: None,
+        }
+    }
+
+    #[test]
+    fn primary_key_is_inline_only_for_the_inline_form() {
+        let inline = PrimaryKeyForm::Inline("id".to_string(), SortOrder::Asc);
+        let table_level = PrimaryKeyForm::TableConstraint(vec![id_asc()]);
+        let columns = || vec![id_column(true)];
+        assert!(
+            table_with_primary_key(inline.clone(), vec![id_rowid_alias_column()], vec![])
+                .primary_key_is_inline
+        );
+        assert!(
+            table_with_primary_key(inline, columns(), vec![primary_key_unique_set(true)])
+                .primary_key_is_inline
+        );
+        assert!(
+            !table_with_primary_key(table_level, columns(), vec![primary_key_unique_set(false)])
+                .primary_key_is_inline
+        );
+        let none = table_with_primary_key(PrimaryKeyForm::None, vec![id_column(false)], vec![]);
+        assert!(!none.primary_key_is_inline);
+        assert!(none.primary_key_columns.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a primary key column of the table")]
+    fn a_primary_key_naming_a_column_the_table_lacks_is_refused() {
+        table_with_primary_key(
+            PrimaryKeyForm::Inline("id".to_string(), SortOrder::Asc),
+            vec![],
+            vec![],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a primary key column of the table")]
+    fn a_primary_key_naming_a_column_that_is_not_a_primary_key_is_refused() {
+        table_with_primary_key(
+            PrimaryKeyForm::TableConstraint(vec![id_asc()]),
+            vec![id_column(false)],
+            vec![],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "disagrees with the PRIMARY KEY unique set")]
+    fn a_primary_key_form_that_disagrees_with_the_unique_set_is_refused() {
+        table_with_primary_key(
+            PrimaryKeyForm::TableConstraint(vec![id_asc()]),
+            vec![id_column(true)],
+            vec![primary_key_unique_set(true)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a PRIMARY KEY unique set needs a PrimaryKeyForm")]
+    fn a_primary_key_unique_set_without_a_primary_key_form_is_refused() {
+        table_with_primary_key(
+            PrimaryKeyForm::None,
+            vec![id_column(false)],
+            vec![primary_key_unique_set(true)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "names other columns than the PRIMARY KEY unique set")]
+    fn a_primary_key_form_with_other_columns_than_the_unique_set_is_refused() {
+        let mut other_column_set = primary_key_unique_set(false);
+        other_column_set.columns[0].name = "other".to_string();
+        table_with_primary_key(
+            PrimaryKeyForm::TableConstraint(vec![id_asc()]),
+            vec![id_column(true)],
+            vec![other_column_set],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "names other columns than the PRIMARY KEY unique set")]
+    fn a_primary_key_form_with_another_sort_order_than_the_unique_set_is_refused() {
+        let mut descending_set = primary_key_unique_set(false);
+        descending_set.columns[0].sort_order = SortOrder::Desc;
+        table_with_primary_key(
+            PrimaryKeyForm::TableConstraint(vec![id_asc()]),
+            vec![id_column(true)],
+            vec![descending_set],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a PRIMARY KEY without a unique set must be a rowid alias")]
+    fn a_primary_key_without_a_unique_set_that_is_not_a_rowid_alias_is_refused() {
+        table_with_primary_key(
+            PrimaryKeyForm::Inline("id".to_string(), SortOrder::Asc),
+            vec![id_column(true)],
+            vec![],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a table has at most one PRIMARY KEY unique set")]
+    fn two_primary_key_unique_sets_are_refused() {
+        table_with_primary_key(
+            PrimaryKeyForm::TableConstraint(vec![id_asc()]),
+            vec![id_column(true)],
+            vec![primary_key_unique_set(false), primary_key_unique_set(false)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is flagged PRIMARY KEY but the PrimaryKeyForm does not name it")]
+    fn a_primary_key_column_the_form_does_not_name_is_refused() {
+        table_with_primary_key(PrimaryKeyForm::None, vec![id_column(true)], vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a rowid alias column must be flagged PRIMARY KEY")]
+    fn a_rowid_alias_column_that_is_not_a_primary_key_is_refused() {
+        let mut column = id_column(false);
+        column.set_rowid_alias(true);
+        table_with_primary_key(PrimaryKeyForm::None, vec![column], vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a table has at most one rowid alias column")]
+    fn two_rowid_alias_columns_are_refused() {
+        let mut other_rowid_alias = id_rowid_alias_column();
+        other_rowid_alias.name = Some("other".to_string());
+        table_with_primary_key(
+            PrimaryKeyForm::TableConstraint(vec![
+                ("id".to_string(), SortOrder::Asc),
+                ("other".to_string(), SortOrder::Asc),
+            ]),
+            vec![id_rowid_alias_column(), other_rowid_alias],
+            vec![],
+        );
     }
 
     #[test]

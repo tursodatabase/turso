@@ -18,7 +18,7 @@ use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
-    schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
+    schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, PrimaryKeyForm, Table},
     translate::{
         collate::in_subquery_collation,
         compound_select::emit_program_for_compound_select,
@@ -2048,7 +2048,7 @@ fn emit_materialized_subquery_table(
     let ephemeral_table = Arc::new(BTreeTable::new(
         0,
         String::new(),
-        crate::alloc::vec![],
+        PrimaryKeyForm::None,
         columns.try_to_vec()?,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],

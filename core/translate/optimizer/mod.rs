@@ -18,8 +18,8 @@ use crate::{
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
-        ROWID_SENTINEL,
+        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, PrimaryKeyForm,
+        Schema, Table, Type, ROWID_SENTINEL,
     },
     translate::{
         expr::{
@@ -1619,15 +1619,24 @@ fn build_update_write_set_plan(
 ) -> Result<()> {
     let scratch_table_id = program.table_reference_counter.next();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
-    let columns = if is_update_from {
-        update_from_scratch_columns(plan.set_clauses.len())?
+    let (columns, primary_key) = if is_update_from {
+        (
+            update_from_scratch_columns(plan.set_clauses.len())?,
+            PrimaryKeyForm::None,
+        )
     } else {
-        std::iter::once((*ROWID_COLUMN).clone()).try_collect()?
+        // The only column is a rowid alias PRIMARY KEY, as for `rowid INTEGER PRIMARY KEY`.
+        let mut rowid_column = (*ROWID_COLUMN).clone();
+        rowid_column.name = Some("rowid".to_string());
+        (
+            std::iter::once(rowid_column).try_collect()?,
+            PrimaryKeyForm::Inline("rowid".to_string(), SortOrder::Asc),
+        )
     };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
         "ephemeral_scratch".to_string(),
-        crate::alloc::vec![],
+        primary_key,
         columns,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],

@@ -190,3 +190,37 @@ expect {
     {"rowid":"my-rowid","data":999}
 }
 
+
+# The key of a subquery column without an alias is the text of its expression,
+# the name SQLite gives the same column in `SELECT * FROM (SELECT 1+1)`
+# (sqlite3ColumnsFromExprList in select.c). Repeated names get ":N" appended.
+test json_object_star_unaliased_subquery_columns {
+    SELECT json_object(*) FROM (SELECT 1+1, 2+2 AS four, 3, 3);
+}
+expect {
+    {"1+1":2,"four":4,"3":3,"3:1":3}
+}
+
+test json_object_star_unaliased_subquery_join {
+    SELECT json_object(*) FROM (SELECT 1+1) AS a JOIN (SELECT 'x' || 'y') AS b;
+}
+expect {
+    {"1+1":2,"'x' || 'y'":"xy"}
+}
+
+# A quote inside a column name stays a single quote in the key.
+test json_object_star_quote_in_column_name {
+    SELECT json_object(*) FROM (SELECT 'it''s');
+}
+expect {
+    {"'it''s'":"it's"}
+}
+
+test json_object_star_quote_in_table_column_name {
+    CREATE TABLE js_quote_name("a'b" INT);
+    INSERT INTO js_quote_name VALUES(1);
+    SELECT json_object(*) FROM js_quote_name;
+}
+expect {
+    {"a'b":1}
+}

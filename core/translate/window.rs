@@ -1,7 +1,7 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
-use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, PrimaryKeyForm, Table};
 use crate::schema::{RangeOffsets, TypeDef};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -1142,7 +1142,7 @@ impl EmitWindow {
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
             format!("buffer_table_{window_name}"),
-            crate::alloc::vec![],
+            PrimaryKeyForm::None,
             src_columns,
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],

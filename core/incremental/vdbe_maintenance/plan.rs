@@ -222,7 +222,7 @@ fn synthesized_derived_table(
     BTreeTable::new(
         0,
         name.to_string(),
-        crate::alloc::vec![],
+        crate::schema::PrimaryKeyForm::None,
         columns,
         crate::schema::BTreeCharacteristics::empty(),
         crate::alloc::vec![],
@@ -1942,7 +1942,7 @@ mod tests {
         Arc::new(BTreeTable::new(
             1,
             "t".to_string(),
-            crate::alloc::vec![],
+            crate::schema::PrimaryKeyForm::None,
             crate::alloc::vec![],
             crate::schema::BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],

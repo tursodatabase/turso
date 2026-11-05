@@ -2314,37 +2314,7 @@ fn translate_function_call_star_expr(
                 )));
             }
 
-            // Build arguments: alternating column_name (as string literal), column_value (as column reference)
-            let mut args: Vec<Box<ast::Expr>> = Vec::new();
-
-            for table in tables.joined_tables().iter() {
-                for (col_idx, col) in table.columns().iter().enumerate() {
-                    // Skip hidden columns (like rowid in some cases)
-                    if col.hidden() {
-                        continue;
-                    }
-
-                    // Add column name as a string literal
-                    // Note: ast::Literal::String values must be wrapped in single quotes
-                    // because sanitize_string() strips the first and last character
-                    let col_name = col
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("column{}", col_idx + 1));
-                    let quoted_col_name = format!("'{col_name}'");
-                    args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
-                        quoted_col_name,
-                    ))));
-
-                    // Add column reference using Expr::Column
-                    args.push(Box::new(ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    }));
-                }
-            }
+            let args = json_object_star_args(tables.joined_tables());
 
             // Create a synthetic FunctionCall with the expanded arguments
             let synthetic_call = ast::Expr::FunctionCall {

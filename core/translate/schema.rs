@@ -8,9 +8,9 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, Index, PrimaryKeyForm, Schema, SchemaObjectType, StructDef, Table,
+    Type, TypeDef, TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -2513,7 +2513,7 @@ pub fn translate_drop_table(
         let simple_table_rc = Arc::new(BTreeTable::new(
             0, // root_page, not relevant for ephemeral table definition
             "ephemeral_scratch".to_string(),
-            crate::alloc::vec![],
+            PrimaryKeyForm::None,
             columns,
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],

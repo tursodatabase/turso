@@ -2406,7 +2406,7 @@ mod tests {
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
-            Schema, Table, Type,
+            PrimaryKeyForm, Schema, Table, Type,
         },
         stats::AnalyzeStats,
         translate::{
@@ -4338,7 +4338,9 @@ mod tests {
             c.ty,
             None,
             ColDef {
-                flags: ColDefFlags::empty().with(ColDefFlags::RowIdAlias, c.is_rowid_alias),
+                flags: ColDefFlags::empty()
+                    .with(ColDefFlags::RowIdAlias, c.is_rowid_alias)
+                    .with(ColDefFlags::PrimaryKey, c.is_rowid_alias),
                 ..Default::default()
             },
         )
@@ -4368,10 +4370,17 @@ mod tests {
 
     /// Creates a BTreeTable with the given name and columns
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
+        let primary_key = match columns.iter().find(|c| c.is_rowid_alias()) {
+            Some(rowid_alias) => PrimaryKeyForm::Inline(
+                rowid_alias.name.clone().expect("test columns have names"),
+                ast::SortOrder::Asc,
+            ),
+            None => PrimaryKeyForm::None,
+        };
         Arc::new(BTreeTable::new(
             1, // root_page, doesn't matter for tests
             name.to_string(),
-            crate::alloc::vec![],
+            primary_key,
             columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],

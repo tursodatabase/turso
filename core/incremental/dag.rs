@@ -468,7 +468,7 @@ impl DagBuilder {
 mod tests {
     use super::*;
     use crate::function::AggFunc;
-    use crate::schema::BTreeCharacteristics;
+    use crate::schema::{BTreeCharacteristics, PrimaryKeyForm};
     use crate::translate::plan::Distinctness;
 
     fn scan(name: &str, id: usize) -> OpNode {
@@ -476,7 +476,7 @@ mod tests {
             table: Arc::new(BTreeTable::new(
                 id as i64 + 1,
                 name.to_string(),
-                crate::alloc::vec![],
+                PrimaryKeyForm::None,
                 crate::alloc::vec![],
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],

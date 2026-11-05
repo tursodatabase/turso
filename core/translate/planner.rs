@@ -2274,7 +2274,7 @@ fn parse_table(
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
             view_guard.name().to_string(),
-            crate::alloc::vec![],
+            crate::schema::PrimaryKeyForm::None,
             columns,
             crate::schema::BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],

@@ -1,6 +1,6 @@
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
+use crate::schema::{BTreeCharacteristics, BTreeTable, PrimaryKeyForm, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -168,7 +168,7 @@ pub fn translate_create_materialized_view(
     let view_table = Arc::new(BTreeTable::new(
         0, // root_page, will be set to actual root page after creation
         normalized_view_name.clone(),
-        crate::alloc::vec![], // primary_key_columns — materialized views use implicit rowid
+        PrimaryKeyForm::None, // materialized views use implicit rowid
         view_columns,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],

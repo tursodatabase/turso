@@ -1,6 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoVecExt};
 use crate::incremental::dag;
-use crate::schema::{BTreeCharacteristics, BTreeTable, Column};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Column, PrimaryKeyForm};
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -363,7 +363,7 @@ pub(super) fn scratch_table(name: &str, num_columns: usize) -> Result<BTreeTable
     Ok(BTreeTable::new(
         0,
         name.to_string(),
-        crate::alloc::vec![],
+        PrimaryKeyForm::None,
         columns,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],
@@ -391,7 +391,7 @@ pub(super) fn synthesized_view_table(
     Ok(BTreeTable::new(
         root_page,
         view_name.to_string(),
-        crate::alloc::vec![],
+        PrimaryKeyForm::None,
         columns,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],

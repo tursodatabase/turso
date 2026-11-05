@@ -1,7 +1,7 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
-    schema::{BTreeCharacteristics, BTreeTable},
+    schema::{BTreeCharacteristics, BTreeTable, PrimaryKeyForm},
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
@@ -498,7 +498,7 @@ pub(crate) fn emit_materialized_build_inputs(
         let ephemeral_table = Arc::new(BTreeTable::new(
             0,
             format!("hash_build_input_{internal_id}"),
-            crate::alloc::vec![],
+            PrimaryKeyForm::None,
             columns,
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],

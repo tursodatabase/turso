@@ -880,7 +880,8 @@ mod tests {
     use crate::mvcc::yield_hooks::YieldPointMarker;
     use crate::namespace::NamespaceId;
     use crate::schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn,
+        PrimaryKeyForm, Schema, Type,
     };
     use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
@@ -1314,7 +1315,7 @@ mod tests {
         let customers_table = BTreeTable::new(
             2,
             "customers".to_string(),
-            vec![("id".to_string(), ast::SortOrder::Asc)],
+            PrimaryKeyForm::Inline("id".to_string(), ast::SortOrder::Asc),
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -1355,7 +1356,7 @@ mod tests {
         let orders_table = BTreeTable::new(
             3,
             "orders".to_string(),
-            vec![("id".to_string(), ast::SortOrder::Asc)],
+            PrimaryKeyForm::Inline("id".to_string(), ast::SortOrder::Asc),
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -1392,7 +1393,7 @@ mod tests {
         let products_table = BTreeTable::new(
             4,
             "products".to_string(),
-            vec![("id".to_string(), ast::SortOrder::Asc)],
+            PrimaryKeyForm::Inline("id".to_string(), ast::SortOrder::Asc),
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -1427,7 +1428,7 @@ mod tests {
         let logs_table = BTreeTable::new(
             5,
             "logs".to_string(),
-            vec![],
+            PrimaryKeyForm::None,
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
