@@ -37,6 +37,7 @@ test error-values-lists-have-different-lengths {
 expect error {}
 
 test error-insert-values-lists-have-different-lengths {
+    CREATE TABLE t (a int, b int);
     INSERT INTO t VALUES (1), (2, 3), (4);
 }
 @sqlstate 42601
