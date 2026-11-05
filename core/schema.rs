@@ -1,3 +1,8 @@
+mod record;
+pub use record::{
+    schema_record_with_root_page, SchemaRecord, SchemaRowType, SCHEMA_RECORD_COLUMN_COUNT,
+};
+
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
