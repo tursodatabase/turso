@@ -1435,6 +1435,7 @@ pub(super) fn json_object_star_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoSliceExt;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, PrimaryKeyForm, Table, Type,
     };
@@ -1477,11 +1478,11 @@ mod tests {
                 0,
                 "t".to_string(),
                 PrimaryKeyForm::None,
-                columns,
+                columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
                 BTreeCharacteristics::HAS_ROWID,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             ))),
         }

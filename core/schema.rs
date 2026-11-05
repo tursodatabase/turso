@@ -5462,7 +5462,7 @@ pub enum PrimaryKeyForm {
 impl PrimaryKeyForm {
     fn into_columns(self) -> Vec<(String, SortOrder)> {
         match self {
-            Self::None => Vec::new(),
+            Self::None => vec![],
             Self::Inline(name, order) => vec![(name, order)],
             Self::TableConstraint(columns) => columns,
         }
@@ -5679,20 +5679,12 @@ impl BTreeTable {
                     set.is_inline, primary_key_is_inline,
                     "the PrimaryKeyForm disagrees with the PRIMARY KEY unique set"
                 );
-                let set_columns: Vec<(&str, SortOrder)> = set
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.as_str(), c.sort_order))
-                    .collect();
-                let form_columns: Vec<(&str, SortOrder)> = primary_key_columns
-                    .iter()
-                    .map(|(name, order)| (name.as_str(), *order))
-                    .collect();
                 assert!(
-                    set_columns.len() == form_columns.len()
-                        && set_columns.iter().zip(&form_columns).all(
-                            |((a, a_order), (b, b_order))| {
-                                a.eq_ignore_ascii_case(b) && a_order == b_order
+                    set.columns.len() == primary_key_columns.len()
+                        && set.columns.iter().zip(&primary_key_columns).all(
+                            |(set_column, (form_name, form_order))| {
+                                set_column.name.eq_ignore_ascii_case(form_name)
+                                    && set_column.sort_order == *form_order
                             }
                         ),
                     "the PrimaryKeyForm names other columns than the PRIMARY KEY unique set"
@@ -9180,8 +9172,8 @@ mod tests {
 
     fn table_with_primary_key(
         primary_key: PrimaryKeyForm,
-        columns: std::vec::Vec<Column>,
-        unique_sets: std::vec::Vec<UniqueSet>,
+        columns: Vec<Column>,
+        unique_sets: Vec<UniqueSet>,
     ) -> BTreeTable {
         BTreeTable::new(
             2,
@@ -9190,8 +9182,8 @@ mod tests {
             columns,
             BTreeCharacteristics::HAS_ROWID,
             unique_sets,
-            std::vec::Vec::new(),
-            std::vec::Vec::new(),
+            vec![],
+            vec![],
             None,
         )
     }
