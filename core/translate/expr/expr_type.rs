@@ -987,13 +987,14 @@ fn json_extract_type(operand: ExprType, schema: &Schema) -> ExprType {
                 return ExprType::Builtin(BuiltinType::Text);
             }
             match schema.get_type_def_unchecked("json") {
-                Some(json) => ExprType::Custom {
+                Some(json) if json.is_builtin => ExprType::Custom {
                     type_def: Arc::clone(json),
                     params: Vec::new(),
                 },
-                // The result then keeps the operand's type, which can't be
-                // compared either.
-                None => operand,
+                // Built without the json feature, there is no built-in json
+                // type, and a type named json is a user's. The result then
+                // keeps the operand's type, which can't be compared either.
+                Some(_) | None => operand,
             }
         }
         ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::RowValue => {

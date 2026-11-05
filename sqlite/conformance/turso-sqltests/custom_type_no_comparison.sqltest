@@ -577,6 +577,15 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test no-comparison-add-generated-column {
+    CREATE TABLE t(i inet) STRICT;
+    ALTER TABLE t ADD COLUMN g INT AS (i = '10.0.0.1');
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
 test no-comparison-alter-column-in-check-to-inet {
     CREATE TABLE t(c text, n INT, CHECK (c = '10.0.0.1')) STRICT;
     ALTER TABLE t ALTER COLUMN c TO c2 inet;
