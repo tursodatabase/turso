@@ -858,11 +858,11 @@ fn emit_custom_type_cast(
         StrictType::Any => {}
     }
     emit_store_value(program, &resolved, reg, &ty_params, resolver)?;
-    emit_decode(program, chain, reg, resolver)?;
+    emit_decode(program, &resolved, reg, resolver)?;
     // The domain's CHECKs see the value after DECODE, as they do on a
     // column of the domain.
     if is_domain {
-        emit_domain_cast_constraints(program, chain, type_name, reg, resolver)?;
+        emit_domain_cast_constraints(program, &resolved, type_name, reg, resolver)?;
     }
     Ok(())
 }

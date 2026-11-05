@@ -123,6 +123,40 @@ def test_checkpoint():
         assert server.db_sql("SELECT SUM(x) FROM t") == [[f"{1024 * 1023 // 2}"]]
 
 
+def test_sync_operations_from_many_threads():
+    # Sync operations on one connection shared between threads must run one
+    # at a time instead of deadlocking on the sync engine.
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        conn = turso.sync.connect(":memory:", remote_url=server.db_url())
+        conn.execute("INSERT INTO t VALUES ('local')")
+        conn.commit()
+        server.db_sql("INSERT INTO t VALUES ('remote')")
+
+        errors = []
+
+        def sync_all():
+            try:
+                for _ in range(5):
+                    conn.push()
+                    conn.pull()
+                    conn.stats()
+                    conn.checkpoint()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=sync_all) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not any(t.is_alive() for t in threads), "sync operations did not finish"
+        assert not errors, f"concurrent sync operations failed: {errors[0]}"
+
+        assert sorted(conn.execute("SELECT x FROM t").fetchall()) == [("local",), ("remote",)]
+        assert sorted(server.db_sql("SELECT x FROM t")) == [["local"], ["remote"]]
+
+
 def test_partial_sync():
     # turso.setup_logging(level=logging.DEBUG)
 
