@@ -207,8 +207,11 @@ A column cannot be dropped if any of the following conditions are true:
 | The column is named in a partial index WHERE clause | Cannot drop column used in partial index |
 | The column is referenced in a CHECK constraint belonging to another column or the table | Cannot drop column used in CHECK constraint |
 | The column is referenced by a foreign key in another table | Cannot drop column used in foreign key |
+| The column is named in a table-level `FOREIGN KEY (...)` constraint of the table | Unknown column in foreign key definition |
 | The table has only one column | Cannot drop the last remaining column |
 | The column appears in a trigger or view | Cannot drop column referenced by trigger or view |
+
+Column constraints on the dropped column, such as a `CHECK` or a `REFERENCES` clause written in its definition, are removed together with the column.
 
 ### Examples
 

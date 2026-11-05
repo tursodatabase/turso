@@ -5536,6 +5536,8 @@ impl BTreeTable {
                 .as_ref()
                 .is_none_or(|col| normalize_ident(col) != column_name)
         });
+        self.foreign_keys
+            .retain(|fk| !fk.is_inline || normalize_ident(&fk.child_columns[0]) != column_name);
     }
 
     /// Fill in what custom type columns get from their type:
@@ -5792,6 +5794,19 @@ impl BTreeTable {
                     sql.push_str(&check_constraint.sql());
                 }
             }
+
+            for fk in self.foreign_keys.iter().filter(|fk| {
+                fk.is_inline
+                    && normalize_ident(&fk.child_columns[0]) == normalize_ident(column_name)
+            }) {
+                sql.push(' ');
+                if let Some(name) = &fk.constraint_name {
+                    sql.push_str("CONSTRAINT ");
+                    sql.push_str(&quote_ident(name));
+                    sql.push(' ');
+                }
+                push_references_clause(&mut sql, fk);
+            }
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
@@ -5869,7 +5884,7 @@ impl BTreeTable {
             push_table_pk(&mut sql);
         }
 
-        for fk in &self.foreign_keys {
+        for fk in self.foreign_keys.iter().filter(|fk| !fk.is_inline) {
             sql.push_str(", ");
             if let Some(name) = &fk.constraint_name {
                 sql.push_str("CONSTRAINT ");
@@ -6953,6 +6968,7 @@ pub fn create_table(
                             .unwrap_or(RefAct::NoAction),
                         deferred,
                         decl_order: table_fk_order,
+                        is_inline: false,
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
@@ -7417,6 +7433,9 @@ pub struct ForeignKey {
     ///
     /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
     pub decl_order: usize,
+    /// True if declared as a `REFERENCES` column constraint rather than a
+    /// table-level `FOREIGN KEY` constraint.
+    pub is_inline: bool,
 }
 #[inline]
 fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
@@ -7479,6 +7498,7 @@ impl ForeignKey {
                 d.deferrable && matches!(d.init_deferred, Some(InitDeferredPred::InitiallyDeferred))
             }),
             decl_order,
+            is_inline: true,
         })
     }
 

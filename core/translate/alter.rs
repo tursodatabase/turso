@@ -1029,8 +1029,8 @@ pub fn translate_alter_table(
             }
             btree.drop_column_constraints(column_name);
 
-            // Check if column is used in a foreign key constraint (child side)
-            // SQLite does not allow dropping a column that is part of a FK constraint
+            // Check if column is used in a table-level foreign key constraint (child side).
+            // drop_column_constraints already removed a REFERENCES constraint on the column itself.
             let column_name_norm = normalize_ident(column_name);
             for fk in &btree.foreign_keys {
                 if fk.child_columns.contains(&column_name_norm) {
