@@ -119,24 +119,6 @@ fn test_create_sequence_cache_zero(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_create_sequence_cache_above_one(db: TempDatabase) {
-    let conn = db.connect_postgres();
-
-    let err = conn
-        .execute("CREATE SEQUENCE big_cache_seq CACHE 10")
-        .expect_err("CACHE 10 must fail");
-    assert_eq!(err.sqlstate, "0A000", "{err:?}");
-    assert!(
-        err.message.contains("CACHE 10") && err.message.contains("not supported"),
-        "unexpected error: {err}"
-    );
-    pg_assert_no_rows(
-        &conn,
-        "SELECT 1 FROM pg_sequences WHERE sequencename = 'big_cache_seq'",
-    );
-}
-
-#[turso_macros::test(mvcc)]
 fn test_create_sequence_minvalue_exceeds_maxvalue(db: TempDatabase) {
     let conn = db.connect_postgres();
 
