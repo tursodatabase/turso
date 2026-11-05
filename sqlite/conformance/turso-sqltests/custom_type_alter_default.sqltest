@@ -151,21 +151,21 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-index-and-update-use-encoded-default {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
-    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    ALTER TABLE t ADD COLUMN c scaled DEFAULT 5;
     SELECT id, x, c FROM t;
     CREATE INDEX ic ON t(c);
-    SELECT count(*) FROM t WHERE c = 5;
+    SELECT count(*) FROM t WHERE c = 500;
     UPDATE t SET x = 11;
     SELECT id, x, c FROM t;
     PRAGMA integrity_check;
 }
 expect {
-    1|10|5
+    1|10|500
     1
-    1|11|5
+    1|11|500
     ok
 }
 
@@ -227,10 +227,10 @@ expect {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-index-delete {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
-    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    ALTER TABLE t ADD COLUMN c scaled DEFAULT 5;
     CREATE INDEX ic ON t(c);
     DELETE FROM t WHERE id = 1;
     SELECT count(*) FROM t;
@@ -333,3 +333,221 @@ expect {
     2|
     1|5
 }
+
+# CREATE TABLE, ADD COLUMN and ALTER COLUMN refuse the same column types with
+# the same message. The types: an array of a type with an ordering (numeric[]),
+# unknown types, a type missing its parameters or given too many, no type in a
+# STRICT table, and an array or a domain in a non-STRICT table.
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-numeric-array {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b numeric[]) STRICT;
+}
+expect error {
+    arrays of type numeric are not supported, because their elements would not compare in the order of numeric
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-numeric-array {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b numeric[];
+}
+expect error {
+    arrays of type numeric are not supported, because their elements would not compare in the order of numeric
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-numeric-array {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b numeric[];
+}
+expect error {
+    arrays of type numeric are not supported, because their elements would not compare in the order of numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-unknown-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b nosuch) STRICT;
+}
+expect error {
+    unknown datatype for t.b: "nosuch"
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-unknown-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b nosuch;
+}
+expect error {
+    unknown datatype for t.b: "nosuch"
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-unknown-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b nosuch;
+}
+expect error {
+    unknown datatype for t.b: "nosuch"
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-array-of-unknown-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b nosuch[]) STRICT;
+}
+expect error {
+    unknown datatype for array elements: "nosuch"
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-array-of-unknown-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b nosuch[];
+}
+expect error {
+    unknown datatype for array elements: "nosuch"
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-array-of-unknown-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer[]) STRICT;
+    INSERT INTO t VALUES (1, '{1}');
+    ALTER TABLE t ALTER COLUMN a TO b nosuch[];
+}
+expect error {
+    unknown datatype for array elements: "nosuch"
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-type-missing-its-parameter {
+    CREATE TYPE p(value text, m integer) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b p) STRICT;
+}
+expect error {
+    type "p" requires 1 parameter\(s\), got 0
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-type-missing-its-parameter {
+    CREATE TYPE p(value text, m integer) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b p;
+}
+expect error {
+    type "p" requires 1 parameter\(s\), got 0
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-type-missing-its-parameter {
+    CREATE TYPE p(value text, m integer) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b p;
+}
+expect error {
+    type "p" requires 1 parameter\(s\), got 0
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-type-given-too-many-parameters {
+    CREATE TYPE p(value text, m integer) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b p(1, 2)) STRICT;
+}
+expect error {
+    type "p" requires 1 parameter\(s\), got 2
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-type-given-too-many-parameters {
+    CREATE TYPE p(value text, m integer) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b p(1, 2);
+}
+expect error {
+    type "p" requires 1 parameter\(s\), got 2
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-type-given-too-many-parameters {
+    CREATE TYPE p(value text, m integer) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b p(1, 2);
+}
+expect error {
+    type "p" requires 1 parameter\(s\), got 2
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-no-type-in-strict-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b) STRICT;
+}
+expect error {
+    missing datatype for t.b
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-no-type-in-strict-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b;
+}
+expect error {
+    missing datatype for t.b
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-no-type-in-strict-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b;
+}
+expect error {
+    missing datatype for t.b
+}
+
+test create-table-refuses-array-in-non-strict-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b integer[]);
+}
+expect error {
+    array type columns require STRICT tables: t.b
+}
+
+test add-column-refuses-array-in-non-strict-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer);
+    ALTER TABLE t ADD COLUMN b integer[];
+}
+expect error {
+    array type columns require STRICT tables: t.b
+}
+
+test alter-column-refuses-array-in-non-strict-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer);
+    ALTER TABLE t ALTER COLUMN a TO b integer[];
+}
+expect error {
+    array type columns require STRICT tables: t.b
+}
+
+test create-table-refuses-domain-in-non-strict-table {
+    CREATE DOMAIN d AS integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b d);
+}
+expect error {
+    domain type columns require STRICT tables: t.b
+}
+
+test add-column-refuses-domain-in-non-strict-table {
+    CREATE DOMAIN d AS integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer);
+    ALTER TABLE t ADD COLUMN b d;
+}
+expect error {
+    domain type columns require STRICT tables: t.b
+}
+
+test alter-column-refuses-domain-in-non-strict-table {
+    CREATE DOMAIN d AS integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer);
+    ALTER TABLE t ALTER COLUMN a TO b d;
+}
+expect error {
+    domain type columns require STRICT tables: t.b
+}
+

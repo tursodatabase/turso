@@ -227,7 +227,7 @@ avoid this window.
 | PRAGMA case_sensitive_like       | Not Needed | deprecated in SQLite                         |
 | PRAGMA cell_size_check           | ❌ No         |                                              |
 | PRAGMA checkpoint_fullfsync      | ❌ No         |                                              |
-| PRAGMA collation_list            | ❌ No         |                                              |
+| PRAGMA collation_list            | ✅ Yes        |                                              |
 | PRAGMA compile_options           | ❌ No         |                                              |
 | PRAGMA count_changes             | ✅ Yes         |                                              |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |

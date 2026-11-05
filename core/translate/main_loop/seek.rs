@@ -1,4 +1,6 @@
 use super::*;
+use crate::translate::expr::expr_type::TypeEnv;
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
@@ -18,7 +20,7 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
-fn encode_seek_keys_for_custom_types(
+pub(super) fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
     seek_index: &Arc<Index>,
@@ -41,6 +43,10 @@ fn encode_seek_keys_for_custom_types(
             break;
         }
         let idx_col = &seek_index.columns[idx_col_pos];
+        // An expression column holds the expression's value, not a column's.
+        if idx_col.expression().is_some() {
+            continue;
+        }
         let table_col = match columns.get(idx_col.pos_in_table) {
             Some(c) => c,
             None => continue,
@@ -51,26 +57,63 @@ fn encode_seek_keys_for_custom_types(
         else {
             continue;
         };
-        if resolved.chain.iter().all(|td| !td.has_encode_or_coerce()) {
+        // A scan compares the key with the decoded column value. When DECODE
+        // returns the stored value unchanged and the dialect compares strings
+        // as they are, the key is compared as it is, so the seek must not
+        // encode it either. A dialect that converts strings to the column's
+        // type (PostgreSQL: `time_col = '12:00'`) needs the key encoded.
+        let compares_key_as_it_is = !resolver
+            .catalog
+            .dialect
+            .converts_strings_compared_with_custom_types();
+        if (compares_key_as_it_is && resolved.reads_stored_values_unchanged())
+            || resolved.chain.iter().all(|td| td.encode().is_none())
+        {
             continue;
         }
-        // The index holds stored values, so the key goes through the same
-        // ENCODE and COERCE steps as a stored value.
+        // The index holds encoded values, so the key is encoded too. COERCE
+        // does not run: the column's limits apply to what it stores, not to
+        // what it is compared with. `n = 3.504` on a numeric(10,2) column
+        // matches no row instead of matching 3.50.
+        // An array index holds arrays whose elements are encoded. A text key
+        // such as '{1,2}' is parsed into an array first, as when it is stored.
         let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-        crate::translate::expr::emit_store_value(
-            program,
-            &resolved.chain,
-            reg,
-            &table_col.ty_params,
-            resolver,
-        )?;
-        program.preassign_label_to_next_insn(skip_label);
+        if table_col.is_array() {
+            crate::translate::expr::emit_array_leaf_loop(
+                program,
+                reg,
+                table_col.array_dimensions(),
+                crate::translate::expr::ArrayInput::TextIfArray,
+                |program, leaf_reg| emit_seek_key_encode(program, &resolved, leaf_reg, resolver),
+            )?;
+        } else {
+            emit_seek_key_encode(program, &resolved, reg, resolver)?;
+        }
     }
+    Ok(())
+}
+
+/// Emits the ENCODE of each of `chain`'s types on the key in `reg`. NULL is
+/// left as it is.
+fn emit_seek_key_encode(
+    program: &mut ProgramBuilder,
+    resolved: &crate::schema::ResolvedType,
+    reg: usize,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    crate::translate::expr::emit_encode_for_comparison(
+        program,
+        &resolved.chain,
+        resolved.storage_class()?,
+        reg,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -180,8 +223,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
                     // find the rows whose key component is NULL.
-                    if !expr.is_nonnull(self.tables)
-                        && !self.seek_def.is_null_matching_key_component(i)
+                    if !expr.is_nonnull(
+                        &TableMetadata::new(Some(self.tables)),
+                        &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
+                    ) && !self.seek_def.is_null_matching_key_component(i)
                     {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
@@ -353,7 +398,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         });
                     }
                 }
-                if !expr.is_nonnull(self.tables) {
+                if !expr.is_nonnull(
+                    &TableMetadata::new(Some(self.tables)),
+                    &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
+                ) {
                     self.program.emit_insn(Insn::IsNull {
                         reg: last_reg,
                         target_pc: self.loop_end,

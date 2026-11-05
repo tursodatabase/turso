@@ -754,6 +754,19 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ConvertToType {
+                reg,
+                storage_class,
+                description,
+            } => (
+                "ConvertToType",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(crate::types::StrictType::Stores(*storage_class).name()),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,
@@ -761,10 +774,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                format!("{} ({})", data.target, data.element_type),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -805,19 +815,6 @@ pub fn insn_to_row(
                 "MakeArray",
                 *start_reg as i64,
                 *count as i64,
-                *dest as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::MakeArrayDynamic {
-                start_reg,
-                count_reg,
-                dest,
-            } => (
-                "MakeArrayDynamic",
-                *start_reg as i64,
-                *count_reg as i64,
                 *dest as i64,
                 Value::build_text(""),
                 0,
@@ -871,19 +868,6 @@ pub fn insn_to_row(
                 *src_reg as i64,
                 *dest as i64,
                 *expected_tag as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::RegCopyOffset {
-                src,
-                base,
-                offset_reg,
-            } => (
-                "RegCopyOffset",
-                *src as i64,
-                *base as i64,
-                *offset_reg as i64,
                 Value::build_text(""),
                 0,
                 String::new(),
@@ -1400,7 +1384,6 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
-                comparator: _,
             } => (
                 "AggInverse",
                 0,
@@ -1492,8 +1475,8 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        let coll_str = match collation {
-                            CollationSeq::Binary => format!("{sign}B"),
+                        let coll_str = match *collation {
+                            CollationSeq::BINARY => format!("{sign}B"),
                             coll => format!("{sign}{coll}"),
                         };
                         match nulls {
@@ -2106,6 +2089,20 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
+            Insn::AddRole {
+                db,
+                id_reg,
+                name,
+                superuser,
+            } => (
+                "AddRole",
+                *db as i64,
+                *id_reg as i64,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
+            ),
             Insn::DropView {
                 db,
                 namespace: _,
@@ -2345,6 +2342,7 @@ pub fn insn_to_row(
                 auto_commit,
                 rollback,
                 concurrent,
+                read_only: _,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,

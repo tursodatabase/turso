@@ -1156,6 +1156,31 @@ expect pattern {
 }
 
 @cross-check-integrity
+test alter-table-rename-column-updates-self-referencing-foreign-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT UNIQUE, p TEXT REFERENCES t(b));
+    INSERT INTO t VALUES (1, 'x', NULL);
+    ALTER TABLE t RENAME b TO c;
+    ALTER TABLE t ADD d INTEGER;
+    INSERT INTO t VALUES (2, 'y', 'x', 0);
+    SELECT sql FROM sqlite_schema WHERE type = 'table';
+}
+expect pattern {
+    CREATE TABLE t\s*\(.*REFERENCES t\s*\(c\).*\)
+}
+
+test alter-table-rename-column-keeps-self-referencing-foreign-key-enforced {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT UNIQUE, p TEXT REFERENCES t(b));
+    INSERT INTO t VALUES (1, 'x', NULL);
+    ALTER TABLE t RENAME b TO c;
+    INSERT INTO t VALUES (2, 'y', 'missing');
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
 test fail-alter-table-drop-column-expr-index-multi-col {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(a + c, substr(b, 1, 1));
@@ -3611,4 +3636,32 @@ test alter-table-rename-table-updates-view-limit-and-window {
 expect {
     1
     1
+}
+
+# The missing-table check on triggers follows SQLite's name resolution order:
+# a query level's FROM clause resolves before its SELECT list, so the FROM
+# table is the one the error names. SQLite qualifies the name (main.x) and
+# turso does not, so the expectation is the table name alone. A subquery
+# inside a named WINDOW frame bound is not checked, which is what SQLite does
+# too.
+
+test alter-table-reports-the-from-table-before-a-result-column-subquery {
+    CREATE TABLE t(a,b);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT (SELECT 1 FROM missing_in_subquery) FROM missing_in_from; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    missing_in_from
+}
+
+test alter-table-ignores-a-subquery-in-a-named-window-frame-bound {
+    CREATE TABLE t(a,b);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT sum(x) OVER w FROM u WINDOW w AS (ROWS BETWEEN 1 PRECEDING AND (SELECT 1 FROM missing_in_frame) FOLLOWING); END;
+    ALTER TABLE t RENAME TO t2;
+    SELECT 'ok';
+}
+expect {
+    ok
 }

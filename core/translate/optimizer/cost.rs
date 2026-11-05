@@ -33,7 +33,7 @@ pub fn where_node_steps(expr: &ast::Expr) -> usize {
         ast::Expr::Case {
             when_then_pairs, ..
         } => when_then_pairs.len().max(1),
-        ast::Expr::Register(_)
+        ast::Expr::Register { .. }
         | ast::Expr::Collate(..)
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Id(_)

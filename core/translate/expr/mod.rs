@@ -1,10 +1,13 @@
-use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{comparison_collation, first_collation, CollationSeq};
+use super::collate::{
+    check_collate_operand, check_expr_collation, comparison_collation, first_collation,
+    in_list_collation, CollationSeq,
+};
 use super::emitter::Resolver;
 use super::expr_context::{ExprContext, ExprProperties};
 use super::optimizer::Optimizable;
@@ -24,10 +27,10 @@ use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
-    insn::{CmpInsFlags, InsertFlags, Insn},
+    insn::{CmpInsFlags, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
@@ -42,6 +45,7 @@ mod binding;
 pub(crate) use binding::validate_function_tail;
 mod columns;
 mod condition;
+mod custom_type_operators;
 mod custom_types;
 mod emission;
 pub(crate) mod expr_type;
@@ -63,6 +67,8 @@ use binding::*;
 use columns::*;
 #[allow(unused_imports)]
 use condition::*;
+#[allow(unused_imports)]
+use custom_type_operators::*;
 #[allow(unused_imports)]
 use custom_types::*;
 #[allow(unused_imports)]
@@ -87,16 +93,25 @@ pub(crate) use affinity::{
     StorageClassMask,
 };
 pub(crate) use arrays::{
-    emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
+    emit_array_decode, emit_array_leaf_loop, emit_custom_type_decode_columns,
+    emit_custom_type_encode_columns, ArrayInput,
 };
+pub(crate) use binary::{row_value_component_expr, row_value_len};
+pub(crate) use binding::check_custom_types;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
+pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
+pub(crate) use custom_type_operators::{
+    check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
+};
 pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
+    emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
+pub(crate) use custom_types::{runs_custom_type_function, takes_input_of_type};
 pub use emission::{
     emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,
 };
@@ -105,6 +120,7 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
+pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
@@ -113,9 +129,10 @@ pub use utils::{
     unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
+pub(crate) use walk::expression_can_fail_on_input;
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
-    walk_expr, walk_expr_mut, WalkControl,
+    expr_references_outer_query, expr_references_subquery_id, walk_expr, walk_expr_mut,
+    WalkControl,
 };

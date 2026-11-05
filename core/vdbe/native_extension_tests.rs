@@ -5,8 +5,8 @@ use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
 use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
 use crate::{
-    Completion, ConnectOpts, Connection, Database, IOResult, LimboError, MemoryIO, Numeric,
-    OpenOptions, Register, Result, SqliteDialect, Statement, StepResult, Value,
+    Completion, ConnectOpts, Connection, Database, EngineDialect, IOResult, LimboError, MemoryIO,
+    Numeric, OpenOptions, Register, Result, Statement, StepResult, Value,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -25,7 +25,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
         ));
     }
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "null_to_nine".into(),
                 FunctionArity::OneOf(&[1, 3]),
@@ -67,8 +67,41 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 }
 
 #[test]
+fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(EngineDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "typed_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    Nine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "untyped_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    NullToNine,
+                )
+                .unwrap(),
+            ),
+    );
+
+    conn.execute("CREATE TABLE typed (x INTEGER CHECK (x = typed_nine(NULL))) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO typed VALUES (9)").unwrap();
+    assert!(conn.execute("INSERT INTO typed VALUES (8)").is_err());
+    assert!(conn
+        .execute("CREATE TABLE untyped (x INTEGER CHECK (x = untyped_nine(NULL))) STRICT")
+        .is_err());
+}
+
+#[test]
 fn native_scalar_borrows_the_same_registers_across_io() {
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
     let args = [
         Register::Value(Value::from_i64(7)),
         Register::Value(Value::from_i64(3)),
@@ -95,7 +128,7 @@ fn native_scalar_borrows_the_same_registers_across_io() {
 #[test]
 fn native_scalar_receives_each_executing_connection() {
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "connection_changes".into(),
                 FunctionArity::Exact(1),
@@ -125,7 +158,7 @@ fn native_scalar_receives_each_executing_connection() {
 fn native_scalar_connection_context_survives_io_and_helper_queries() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let plain = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "connection_context_read".into(),
                 FunctionArity::Exact(1),
@@ -200,6 +233,8 @@ struct ConnectionContextCall {
 }
 
 impl ScalarCall for ConnectionContextCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if integer(args[0].get_value()) == 0 {
             let context = connection.context::<AtomicI64>().ok_or_else(|| {
@@ -231,7 +266,7 @@ impl ScalarCall for ConnectionContextCall {
 #[test]
 fn native_scalar_preserves_unmatched_outer_join_rows() {
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "null_to_nine".into(),
                 FunctionArity::Exact(1),
@@ -261,7 +296,7 @@ fn native_scalar_preserves_unmatched_outer_join_rows() {
 fn native_scalar_helper_queries_resume_with_independent_call_state() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "nested_sum".into(),
                 FunctionArity::Exact(1),
@@ -296,7 +331,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
             for cancellation in ["reset", "drop", "error", "io_error", "interrupt"] {
                 let queue = Arc::new(Mutex::new(Vec::new()));
                 let conn = connection(
-                    OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+                    OpenOptions::new(Arc::new(EngineDialect)).extension_function(
                         ExternalFunc::new_native_scalar(
                             "nested_sum".into(),
                             FunctionArity::Exact(1),
@@ -440,7 +475,7 @@ fn io_error_in_a_read_statement_rolls_back_the_transaction() {
     for mode in ["wal", "mvcc"] {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let conn = connection(
-            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            OpenOptions::new(Arc::new(EngineDialect)).extension_function(
                 ExternalFunc::new_native_scalar(
                     "gated_seven".into(),
                     FunctionArity::Exact(1),
@@ -506,6 +541,8 @@ struct GatedSevenCall {
 }
 
 impl ScalarCall for GatedSevenCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -537,6 +574,8 @@ struct RegisterProbeCall {
 }
 
 impl ScalarCall for RegisterProbeCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         assert_eq!(args.as_ptr() as usize, self.args_address);
         if let Some(io) = self.gate.wait() {
@@ -560,10 +599,31 @@ impl ScalarFunction for ConnectionChanges {
 }
 
 impl ScalarCall for ConnectionChanges {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(Value::from_i64(
             connection.changes() * 10 + integer(args[0].get_value()),
         )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Nine;
+
+impl ScalarFunction for Nine {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for Nine {
+    type Output = i64;
+
+    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<i64> {
+        Ok(IOResult::Done(9))
     }
 }
 
@@ -581,6 +641,8 @@ impl ScalarFunction for NullToNine {
 struct NullToNineCall;
 
 impl ScalarCall for NullToNineCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(match args[0].get_value() {
             Value::Null => Value::from_i64(9),
@@ -594,7 +656,7 @@ fn extension_constructors_validate_argument_counts() {
     for (argc, valid) in [(-2, false), (-1, true), (0, true), (2, true)] {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let functions = [
-            ExternalFunc::new_scalar("c_double".into(), argc, true, 0, c_double, None, None),
+            ExternalFunc::new_scalar("c_double".into(), argc, true, 0, c_double, None, None, None),
             ExternalFunc::new_aggregate(
                 "c_aggregate".into(),
                 argc,
@@ -635,7 +697,7 @@ fn extension_constructors_validate_argument_counts() {
                 let function = result.unwrap();
                 assert_eq!(function.func.arg_counts(), vec![argc]);
                 let options =
-                    OpenOptions::new(Arc::new(SqliteDialect)).extension_function(function);
+                    OpenOptions::new(Arc::new(EngineDialect)).extension_function(function);
                 assert_eq!(options.native_extensions.functions.len(), 1);
                 assert_eq!(
                     options.native_extensions.functions[0].func.arg_counts(),
@@ -650,7 +712,7 @@ fn extension_constructors_validate_argument_counts() {
 
 #[test]
 fn rejected_c_functions_leave_context_ownership_with_the_caller() {
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
     let api = unsafe { conn._build_turso_ext() };
     let name = std::ffi::CString::new("rejected").unwrap();
     let function_count = conn.syms.read().functions.len();
@@ -712,6 +774,7 @@ fn rejected_c_functions_leave_context_ownership_with_the_caller() {
                         c_double,
                         Some(drop_context),
                         None,
+                        None,
                     )
                 };
                 assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
@@ -735,7 +798,7 @@ fn scalar_calls_resume_independently_and_create_once() {
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "DeLaYeD".into(),
                 FunctionArity::Exact(2),
@@ -772,7 +835,7 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -800,7 +863,7 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -829,7 +892,7 @@ fn failed_completion_releases_the_pending_scalar() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -863,7 +926,7 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let dropped = Arc::new(AtomicUsize::new(0));
         let conn = connection(
-            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            OpenOptions::new(Arc::new(EngineDialect)).extension_function(
                 ExternalFunc::new_native_scalar(
                     "delayed".into(),
                     FunctionArity::Exact(2),
@@ -942,7 +1005,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
@@ -992,7 +1055,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
 fn native_variadic_aggregates_use_callsite_argument_count() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 -1,
@@ -1068,7 +1131,7 @@ fn pending_aggregates_release_state_on_reset_and_failed_completion() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
@@ -1112,7 +1175,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             Value::from_slice(&[0, 17, 255]).unwrap(),
         ];
         let calls = Arc::new(AtomicUsize::new(0));
-        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
             "argument_module",
             VTabKind::VirtualTable,
             ArgumentsModule {
@@ -1149,7 +1212,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
 #[test]
 fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "argument_module",
         VTabKind::VirtualTable,
         ArgumentsModule {
@@ -1157,13 +1220,20 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
                 Value::from_text("alpha"),
                 Value::from_text("73"),
                 Value::from_text("-4.25"),
+                Value::from_text("'a''b'"),
+                Value::from_text(r#""a,b'c""#),
+                Value::from_text(r#"tokenize="unicode61 tokenchars '_'""#),
             ],
             addresses: None,
             calls: calls.clone(),
         },
     ));
-    conn.execute("CREATE VIRTUAL TABLE arguments USING argument_module(alpha, 73, -4.25)")
-        .unwrap();
+    let args =
+        r#"(, alpha ,, 73 /* c */, -4.25, 'a''b',, "a,b'c", tokenize="unicode61 tokenchars '_'")"#;
+    conn.execute(format!(
+        "CREATE VIRTUAL TABLE arguments USING argument_module{args}"
+    ))
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     let mut schema = crate::schema::Schema::new();
     schema
@@ -1172,7 +1242,9 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
             "reloaded",
             "reloaded",
             0,
-            Some("CREATE VIRTUAL TABLE reloaded USING argument_module(alpha, 73, -4.25)"),
+            Some(&format!(
+                "create virtual table reloaded using argument_module{args}"
+            )),
             &conn.syms.read(),
             &mut crate::alloc::vec![],
             &mut crate::HashMap::default(),
@@ -1180,7 +1252,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
             &mut crate::HashMap::default(),
             &mut crate::HashMap::default(),
             &|_| None,
-            &SqliteDialect,
+            &EngineDialect,
         )
         .unwrap();
     assert!(matches!(
@@ -1195,7 +1267,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
 
 #[test]
 fn c_module_creation_converts_core_arguments_at_the_callback() {
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
     let api = unsafe { conn._build_turso_ext() };
     let code = unsafe { CArgumentsModule::register_CArgumentsModule(&api) };
     unsafe { conn._free_extension_ctx(api) };
@@ -1249,7 +1321,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
 fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)]));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -1281,7 +1353,7 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
 fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl() {
     for mvcc in [false, true] {
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
             "native_rows",
             VTabKind::TableValuedFunction,
             RowsModule {
@@ -1330,7 +1402,7 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
             Database::open(
                 io.clone(),
                 &path,
-                OpenOptions::new(Arc::new(SqliteDialect))
+                OpenOptions::new(Arc::new(EngineDialect))
                     .db_opts(
                         crate::DatabaseOpts::new()
                             .with_views(true)
@@ -1377,7 +1449,7 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
 #[test]
 fn native_table_functions_survive_temp_table_rollback() {
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -1409,7 +1481,7 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
             writable: false,
         };
         let conn = connection(
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .native_module("restricted_rows", kind, module.clone())
                 .native_module("allowed_rows", kind, InnocuousModule(module)),
         );
@@ -1448,7 +1520,7 @@ fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
         writable: false,
     };
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
+        OpenOptions::new(Arc::new(EngineDialect))
             .db_opts(crate::DatabaseOpts::new().with_attach(true))
             .native_module("rows", VTabKind::VirtualTable, InnocuousModule(module)),
     );
@@ -1473,7 +1545,7 @@ fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
 #[test]
 fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         InnocuousModule(RowsModule {
@@ -1508,7 +1580,7 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1558,7 +1630,7 @@ fn abandoned_native_write_does_not_apply_the_pending_update() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1602,7 +1674,7 @@ fn failed_native_write_rolls_back_earlier_rows() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 13), (2, 27)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1638,7 +1710,7 @@ fn pending_native_write_blocks_another_writer_and_commit() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1683,7 +1755,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let options = OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+    let options = OpenOptions::new(Arc::new(EngineDialect)).extension_function(
         ExternalFunc::new_native_scalar(
             "delayed".into(),
             FunctionArity::Exact(2),
@@ -1722,7 +1794,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
 fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -1788,7 +1860,7 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
 fn c_extensions_still_execute_with_native_registration() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
+        OpenOptions::new(Arc::new(EngineDialect))
             .extension_function(
                 ExternalFunc::new_native_aggregate(
                     "WeIgHtEd".into(),
@@ -1801,8 +1873,17 @@ fn c_extensions_still_execute_with_native_registration() {
                 .unwrap(),
             )
             .extension_function(
-                ExternalFunc::new_scalar("C_OpEn_DoUbLe".into(), 1, true, 0, c_double, None, None)
-                    .unwrap(),
+                ExternalFunc::new_scalar(
+                    "C_OpEn_DoUbLe".into(),
+                    1,
+                    true,
+                    0,
+                    c_double,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
             ),
     );
     let other = conn.db.connect(ConnectOpts::new()).unwrap();
@@ -1866,7 +1947,7 @@ fn c_extensions_still_execute_with_native_registration() {
 #[test]
 fn c_and_native_tables_share_cursor_dispatch() {
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -2021,6 +2102,8 @@ struct DelayedCall {
 }
 
 impl ScalarCall for DelayedCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -2065,6 +2148,8 @@ struct NestedSumCall {
 }
 
 impl ScalarCall for NestedSumCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if self.statement.is_none() {
             self.statement = Some(connection.prepare_internal("SELECT x FROM input_values")?);
@@ -2566,4 +2651,141 @@ unsafe extern "C" fn c_double(
     assert_eq!(argc, 1);
     let value = unsafe { &*argv }.to_integer().unwrap();
     turso_ext::Value::from_integer(value * 2)
+}
+
+/// Every built-in extension scalar function that declares a return type, with
+/// arguments for which it returns a value that is not NULL.
+const DECLARED_FUNCTION_CALLS: &[(&str, &str)] = &[
+    ("time_now", ""),
+    ("time_date", "2011, 11, 18"),
+    ("make_date", "2011, 11, 18"),
+    ("make_timestamp", "2011, 11, 18, 15, 56, 35"),
+    ("time_get_year", "time_date(2011, 11, 18)"),
+    ("time_get_month", "time_date(2011, 11, 18)"),
+    ("time_get_day", "time_date(2011, 11, 18)"),
+    ("time_get_hour", "time_date(2011, 11, 18)"),
+    ("time_get_minute", "time_date(2011, 11, 18)"),
+    ("time_get_second", "time_date(2011, 11, 18)"),
+    ("time_get_nano", "time_date(2011, 11, 18)"),
+    ("time_get_weekday", "time_date(2011, 11, 18)"),
+    ("time_get_yearday", "time_date(2011, 11, 18)"),
+    ("time_get_isoyear", "time_date(2011, 11, 18)"),
+    ("time_get_isoweek", "time_date(2011, 11, 18)"),
+    ("time_unix", "1321631795"),
+    ("to_timestamp", "1321631795"),
+    ("time_milli", "1321631795666"),
+    ("time_micro", "1321631795666777"),
+    ("time_nano", "1321631795666777888"),
+    ("time_to_unix", "time_unix(1321631795)"),
+    ("time_to_milli", "time_unix(1321631795)"),
+    ("time_to_micro", "time_unix(1321631795)"),
+    ("time_to_nano", "time_unix(1321631795)"),
+    (
+        "time_after",
+        "time_date(2011, 11, 19), time_date(2011, 11, 18)",
+    ),
+    (
+        "time_before",
+        "time_date(2011, 11, 18), time_date(2011, 11, 19)",
+    ),
+    (
+        "time_compare",
+        "time_date(2011, 11, 18), time_date(2011, 11, 19)",
+    ),
+    (
+        "time_equal",
+        "time_date(2011, 11, 18), time_date(2011, 11, 18)",
+    ),
+    ("dur_ns", ""),
+    ("dur_us", ""),
+    ("dur_ms", ""),
+    ("dur_s", ""),
+    ("dur_m", ""),
+    ("dur_h", ""),
+    ("time_add", "time_date(2025, 1, 1), 3600000000000"),
+    ("time_add_date", "time_date(2011, 11, 18), 5"),
+    (
+        "time_sub",
+        "time_date(2011, 11, 19), time_date(2011, 11, 18)",
+    ),
+    ("time_since", "time_date(2011, 11, 18)"),
+    ("time_until", "time_date(2011, 11, 18)"),
+    (
+        "time_trunc",
+        "time_date(2011, 11, 18, 15, 56, 35), 3600000000000",
+    ),
+    (
+        "time_round",
+        "time_date(2011, 11, 18, 15, 56, 35), 3600000000000",
+    ),
+    ("time_fmt_iso", "time_date(2011, 11, 18)"),
+    ("time_fmt_datetime", "time_date(2011, 11, 18)"),
+    ("time_fmt_date", "time_date(2011, 11, 18)"),
+    ("time_fmt_time", "time_date(2011, 11, 18)"),
+    ("time_parse", "'2011-11-18T15:56:35Z'"),
+    ("uuid4_str", ""),
+    ("gen_random_uuid", ""),
+    ("uuid4", ""),
+    ("uuid7_str", ""),
+    ("uuid7", ""),
+    ("uuid7_timestamp_ms", "uuid7()"),
+    ("uuid_str", "uuid4()"),
+    ("uuid_blob", "uuid4_str()"),
+    ("regexp", "'a+', 'caat'"),
+];
+
+#[test]
+fn declared_return_type_of_extension_functions_matches_what_they_return() {
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
+    let declared: Vec<(String, ReturnType)> = conn
+        .syms
+        .read()
+        .functions
+        .iter()
+        .filter_map(|(name, func)| func.func.return_type().map(|t| (name.clone(), t)))
+        .collect();
+    assert!(!declared.is_empty());
+
+    for (name, return_type) in &declared {
+        let args = DECLARED_FUNCTION_CALLS
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} declares {return_type:?}: add a call for it to DECLARED_FUNCTION_CALLS"
+                )
+            })
+            .1;
+        let expected = match return_type {
+            ReturnType::Integer => "integer",
+            ReturnType::Real => "real",
+            ReturnType::Text => "text",
+            ReturnType::Blob => "blob",
+            other => panic!("{name} declares {other:?}, which this test cannot check"),
+        };
+        let sql = format!("SELECT typeof({name}({args}))");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+                StepResult::Done => break,
+                StepResult::IO => stmt._io().step().unwrap(),
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        let rows: Vec<Vec<Value>> = rows;
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_text(expected)]],
+            "{sql}: declared {return_type:?}"
+        );
+    }
+
+    for (name, _) in DECLARED_FUNCTION_CALLS {
+        assert!(
+            declared.iter().any(|(n, _)| n == name),
+            "{name} is in DECLARED_FUNCTION_CALLS but declares no return type"
+        );
+    }
 }

@@ -17,7 +17,10 @@ fn transaction_of_one_client_is_not_visible_to_another() {
     query(&mut client1, "INSERT INTO t VALUES (1)");
 
     assert_eq!(query(&mut client2, "SELECT count(*) FROM t"), vec!["0"]);
-    assert!(query_error(&mut client2, "COMMIT").contains("no transaction is active"));
+    // COMMIT outside a transaction block succeeds like in PostgreSQL, and
+    // must not end the other client's open transaction.
+    query(&mut client2, "COMMIT");
+    assert_eq!(query(&mut client2, "SELECT count(*) FROM t"), vec!["0"]);
     query(&mut client1, "COMMIT");
     assert_eq!(query(&mut client2, "SELECT count(*) FROM t"), vec!["1"]);
 }

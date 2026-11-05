@@ -635,6 +635,10 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.set_foreign_keys_enabled(false);
                 state.target_conn.set_check_constraints_ignored(true);
                 state.target_conn.wal_auto_actions_disable();
+                // The source rows are read as stored values (the SELECT is an
+                // internal helper statement), so they are written without
+                // ENCODE. SQLite's VACUUM copies the records unchanged too.
+                state.target_conn.set_writes_stored_values(true);
 
                 // Wrap all operations in a single write transaction so helper
                 // statements share one durable target build and cleanup can
@@ -762,21 +766,16 @@ pub(crate) fn vacuum_target_build_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
-                // System tables (sqlite_stat1, __turso_internal_types, etc.) have
-                // reserved name prefixes that translate_create_table rejects for
-                // user SQL. Temporarily mark the target connection as nested during
-                // prepare() so the reserved-name check is bypassed at compile
-                // time. The guard is only for prepare: keeping it during step()
+                // Temporarily mark the target connection as nested during prepare()
+                // so that checks for new user SQL do not reject a table the database
+                // already has: the reserved names of system tables (sqlite_stat1,
+                // __turso_internal_types, etc.) and a COLLATE on a type with its own
+                // order. The guard is only for prepare: keeping it during step()
                 // would make this CREATE TABLE look nested, so its Transaction
                 // opcode would skip write setup.
-                let is_system = replay_bypasses_reserved_names(&entry.name);
-                if is_system {
-                    state.target_conn.start_nested();
-                }
+                state.target_conn.start_nested();
                 let target_stmt = state.target_conn.prepare(&sql);
-                if is_system {
-                    state.target_conn.end_nested();
-                }
+                state.target_conn.end_nested();
                 let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateTable {
                     target_schema_stmt: Box::new(target_stmt),
@@ -1057,8 +1056,15 @@ pub(crate) fn vacuum_target_build_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible; those of a stored
-                // namespace carry a mangled name.
-                let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &entry.sql)?;
+                // namespace carry a mangled name. They are prepared as nested
+                // so that checks for new user SQL, such as the reserved-name
+                // check and the one rejecting qualified columns, do not reject
+                // an index the database already has. As for system tables, the
+                // guard is only for prepare.
+                state.target_conn.start_nested();
+                let target_stmt = state.target_conn.prepare(&entry.sql);
+                state.target_conn.end_nested();
+                let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1918,7 +1924,7 @@ fn vacuum_in_place_step(
                     })?;
                     // acquire the exclusive lock on the mvcc
                     let mut guard = MvccVacuumGuard::acquire(connection.clone(), mv_store.clone())?;
-                    if mv_store.has_uncheckpointed_log()? {
+                    if mv_store.has_uncheckpointed_log() {
                         return Err(LimboError::TxError(
                             "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
                         ).into());
@@ -2587,7 +2593,7 @@ mod tests {
     use crate::storage::pager::Page;
     use crate::util::IOExt;
     use crate::vdbe::execute::TransactionYieldPoint;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{
         Buffer, Clock, Completion, ConnectOpts, DatabaseOpts, File, MemoryIO, MonotonicInstant,
         OpenFlags, WallClockInstant, IO,
@@ -2904,7 +2910,7 @@ mod tests {
     #[test]
     fn replace_shared_schema_after_vacuum_replaces_wrapped_schema_cookie() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
 
         db.with_schema_mut(|schema| {
             schema.schema_version = u32::MAX;
@@ -2926,7 +2932,7 @@ mod tests {
     #[test]
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
         let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
@@ -2961,7 +2967,7 @@ mod tests {
     #[test]
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
         let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
@@ -3013,7 +3019,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
         // Source is uninitialized so its header reserved_space isn't usable.
@@ -3090,7 +3096,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3138,7 +3144,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
         source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
@@ -3160,7 +3166,7 @@ mod tests {
             OpenFlags::Create,
             vacuum_target_opts_from_source(&source_db),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new())?;
         mirror_symbols(&source_conn, &target_conn);
@@ -3223,7 +3229,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3269,7 +3275,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3312,7 +3318,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
@@ -3366,7 +3372,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new())?;
         target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
@@ -3422,7 +3428,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
 
@@ -3458,7 +3464,7 @@ mod tests {
                 cipher: CipherMode::Aes256Gcm.to_string(),
                 hexkey: key_hex.to_string(),
             }),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         let reserved_space = source_conn
@@ -3491,7 +3497,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new())?;
         target_conn.execute("CREATE TABLE seed(x)")?;

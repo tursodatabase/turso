@@ -891,6 +891,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Begin {
             typ: transtype,
             name: self.parse_transopt()?,
+            access_mode: None,
         })
     }
 
@@ -1007,6 +1008,9 @@ impl<'a> Parser<'a> {
 
     fn parse_vtab_arg(&mut self) -> Result<String> {
         let start_idx = self.offset();
+        // Like SQLite, an argument ends at its last token, so whitespace and
+        // comments before the next comma or `)` are not part of it.
+        let mut end_idx = start_idx;
 
         loop {
             match self.peek_no_eof()?.token_type {
@@ -1033,12 +1037,7 @@ impl<'a> Parser<'a> {
                     self.eat_no_eof()?;
                 }
             }
-        }
-
-        // minus 1 because lexer already consumed TK_COMMA or TK_RP
-        let end_idx = self.offset();
-        if start_idx == end_idx {
-            return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
+            end_idx = self.offset();
         }
 
         Ok(from_bytes(&self.lexer.input[start_idx..end_idx]))
@@ -1057,18 +1056,13 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_LP);
                     let mut result = vec![];
                     loop {
-                        if self.peek_no_eof()?.token_type == TK_RP {
-                            break; // handle empty args case
-                        }
-
-                        result.push(self.parse_vtab_arg()?);
-                        let tok = peek_expect!(self, TK_COMMA, TK_RP);
-                        match tok.token_type {
+                        // Like SQLite, an argument with no tokens, as in `(a,,b)`, is skipped.
+                        match self.peek_no_eof()?.token_type {
                             TK_COMMA => {
                                 eat_assert!(self, TK_COMMA);
                             }
                             TK_RP => break,
-                            _ => unreachable!(),
+                            _ => result.push(self.parse_vtab_arg()?),
                         }
                     }
 
@@ -3664,6 +3658,8 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
+                    // Only the first option may be missing; a comma always needs an option after it.
+                    peek_expect!(self, TK_WITHOUT, TK_ID);
                     self.parse_table_option(&mut result)?;
                 }
                 _ => break,
@@ -5065,6 +5061,13 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
+                            // Only the built-in types have arithmetic operators.
+                            if op != "<" {
+                                return Err(Error::ParseError(format!(
+                                    "CREATE TYPE does not accept OPERATOR '{op}': only \
+                                     OPERATOR '<' is supported"
+                                )));
+                            }
                             // Three syntaxes:
                             // 1. OPERATOR 'op' func_name          (named)
                             // 2. OPERATOR 'op' (type) -> func_name (old named)
@@ -5116,6 +5119,15 @@ impl<'a> Parser<'a> {
                                 // End of statement or semicolon: naked operator
                                 None
                             };
+                            // A plain OPERATOR '<' lets the type be sorted, by its
+                            // stored value. A function for it would never be called.
+                            if op == "<" && func_name.is_some() {
+                                return Err(Error::ParseError(
+                                    "OPERATOR '<' takes no function: a type that declares it \
+                                     sorts by its stored value"
+                                        .to_owned(),
+                                ));
+                            }
                             operators.push(TypeOperator { op, func_name });
                         }
                         _ => break,
@@ -5798,6 +5810,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: None,
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5805,6 +5818,7 @@ mod tests {
                 vec![Cmd::Explain(Stmt::Begin {
                     typ: None,
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5813,6 +5827,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Text,
                 }],
@@ -5823,6 +5838,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Json,
                 }],
@@ -5833,6 +5849,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Json,
                 }],
@@ -5843,6 +5860,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Text,
                 }],
@@ -5852,6 +5870,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: None,
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5859,6 +5878,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Deferred),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5866,6 +5886,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Immediate),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5873,6 +5894,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5880,6 +5902,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Deferred),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5887,6 +5910,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Immediate),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5894,6 +5918,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5901,6 +5926,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
                     name: Some(Name::from_string("'my_transaction'")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5908,6 +5934,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5915,6 +5942,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5922,6 +5950,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
                     name: Some(Name::from_string("'my_transaction'")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5930,14 +5959,17 @@ mod tests {
                     Cmd::Stmt(Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     }),
                     Cmd::Stmt(Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     }),
                     Cmd::Stmt(Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     }),
                 ],
             ),
@@ -12822,6 +12854,46 @@ mod tests {
                         "x".to_owned(),
                         "tokenize = '''porter'' ''ascii'''".to_owned(),
                     ],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar(, a,, ,b,)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec!["a".to_owned(), "b".to_owned()],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar( alpha , 73 /* c */, f( x ) -- c\n)"
+                    .as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec!["alpha".to_owned(), "73".to_owned(), "f( x )".to_owned()],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar(,)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec![],
                 }))],
             ),
             // parse delete

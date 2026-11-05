@@ -5,7 +5,7 @@ use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata}
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
-        collate::{comparison_collation, CollationSeq},
+        collate::{comparison_collation, in_list_collation, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
             WalkControl,
@@ -165,10 +165,9 @@ impl Constraint {
         };
         let mut affinity = Affinity::Blob;
         if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
-            // The resolver matters here: a scalar subquery's affinity is only
-            // known through it. Without it, `text_col < (SELECT int_col ...)`
-            // would take the TEXT side's affinity and the seek would compare
-            // the integer as text.
+            // `text_col < (SELECT int_col ...)` must use the subquery column's
+            // affinity. With the TEXT side's affinity alone, the seek would
+            // compare the integer as text.
             affinity = match resolver {
                 Some(resolver) => {
                     comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver))
@@ -242,7 +241,7 @@ impl Constraint {
         });
         self.collation
             .is_none_or(|collation| collation == col.collation())
-            && self.satisfies_index_affinity(col.affinity())
+            && self.satisfies_index_affinity(col.comparison_affinity())
     }
 
     /// Whether an index key column can serve this term: a seek compares keys
@@ -331,10 +330,11 @@ pub(super) fn automatic_index_terms(
         let column = &columns[term
             .table_col_pos
             .expect("a term that can drive an index seek has a column")];
-        let has_custom_type = schema
-            .get_type_def(&column.ty_str, table.table.is_strict())
-            .is_some();
-        !has_custom_type || term.operator == ast::Operator::Equals.into()
+        if schema.column_is_lossy(column, table.table.is_strict()) {
+            return false;
+        }
+        !column.index_order_differs_from_value_order(schema, table.table.is_strict())
+            || term.operator == ast::Operator::Equals.into()
     };
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
@@ -587,7 +587,7 @@ pub(super) fn add_implied_column_equalities(
             || left_collation != right_collation
             || !matches!(
                 left_collation,
-                CollationSeq::Binary | CollationSeq::NoCase | CollationSeq::Rtrim
+                CollationSeq::BINARY | CollationSeq::NOCASE | CollationSeq::RTRIM
             )
         {
             continue;
@@ -736,6 +736,10 @@ pub fn constraints_from_where_clause(
     resolver: &Resolver,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
+    // A term's collation is the same for every table it constrains, and
+    // deciding it means working out the types of its operands, so each term's
+    // collation is decided at most once, the first time a table needs it.
+    let mut term_collations: Vec<Option<CollationSeq>> = vec![None; where_clause.len()];
 
     // For each table, collect all the Constraints and all potential index candidates that may use them.
     for table_reference in table_references.joined_tables() {
@@ -839,12 +843,15 @@ pub fn constraints_from_where_clause(
                         comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
                     });
                 let cmp_collation = match operator.as_ast_operator() {
-                    Some(op) if op.is_comparison() => Some(comparison_collation(
-                        lhs,
-                        rhs,
-                        &ExprContext::new(Some(table_references), resolver),
-                        &resolver.catalog,
-                    )?),
+                    Some(op) if op.is_comparison() => {
+                        Some(decide_once(&mut term_collations[i], || {
+                            comparison_collation(
+                                lhs,
+                                rhs,
+                                &ExprContext::new(Some(table_references), resolver),
+                            )
+                        })?)
+                    }
                     _ => None,
                 };
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
@@ -1100,9 +1107,13 @@ pub fn constraints_from_where_clause(
                     lhs,
                     &TableMetadata::new(Some(table_references)),
                 ));
-                // `x IN (y1, ..., yN)` compares with the collation of x alone.
-                let cmp_collation =
-                    Some(ExprContext::new(Some(table_references), resolver).expr_collation(lhs)?);
+                let cmp_collation = Some(decide_once(&mut term_collations[i], || {
+                    in_list_collation(
+                        lhs,
+                        rhs,
+                        &ExprContext::new(Some(table_references), resolver),
+                    )
+                })?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -1314,21 +1325,14 @@ pub fn constraints_from_where_clause(
                     }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        // Custom type columns encode values as blobs. Blob ordering (memcmp)
-                        // doesn't necessarily match the custom type's semantic ordering, so
-                        // range constraints (>, <, >=, <=) can't use the index. Equality (=)
-                        // still works because encoded(A) == encoded(B) iff A == B.
-                        if schema
-                            .get_type_def(
-                                &constrained_column.ty_str,
-                                table_reference.table.is_strict(),
-                            )
-                            .is_some()
-                            && constraint.operator != ast::Operator::Equals.into()
+                        if constrained_column.index_order_differs_from_value_order(
+                            schema,
+                            table_reference.table.is_strict(),
+                        ) && constraint.operator != ast::Operator::Equals.into()
                         {
                             continue;
                         }
-                        let idx_col_aff = constrained_column.affinity();
+                        let idx_col_aff = constrained_column.comparison_affinity();
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
@@ -1379,6 +1383,19 @@ pub fn constraints_from_where_clause(
     }
 
     Ok(constraints)
+}
+
+/// The collation in `slot`, deciding it with `decide` if it is not decided yet.
+fn decide_once(
+    slot: &mut Option<CollationSeq>,
+    decide: impl FnOnce() -> Result<CollationSeq>,
+) -> Result<CollationSeq> {
+    if let Some(collation) = *slot {
+        return Ok(collation);
+    }
+    let collation = decide()?;
+    *slot = Some(collation);
+    Ok(collation)
 }
 
 /// The collation `x IN (SELECT y ...)` compares with. The subquery's ephemeral
@@ -1756,7 +1773,7 @@ pub(super) fn partial_index_predicate_terms(
     // query WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
-    rewrite_between_exprs(&mut bound).ok()?;
+    rewrite_between_exprs(&mut bound, None).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
@@ -2225,7 +2242,6 @@ pub(crate) fn summarize_binary_term_for_index(
         lhs,
         rhs,
         &ExprContext::new(Some(table_references), resolver),
-        &resolver.catalog,
     )
     .ok()?;
 
@@ -2303,7 +2319,6 @@ pub(crate) fn analyze_binary_term_for_index(
         lhs,
         rhs,
         &ExprContext::new(Some(table_references), resolver),
-        &resolver.catalog,
     )
     .ok()?;
 
@@ -2484,7 +2499,7 @@ fn find_best_index_for_constraint(
         .table
         .columns()
         .get(col_pos)
-        .is_some_and(|column| column.affinity().index_affinity_ok(affinity))
+        .is_some_and(|column| column.comparison_affinity().index_affinity_ok(affinity))
     {
         return (None, vec![]);
     }

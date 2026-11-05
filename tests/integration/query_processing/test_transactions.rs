@@ -180,7 +180,7 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     // should fail
     assert!(conn
         .execute("begin")
-        .inspect_err(|e| assert!(matches!(e, LimboError::TxError(_))))
+        .inspect_err(|e| assert!(matches!(e, LimboError::TransactionAlreadyActive)))
         .is_err());
     conn.execute("insert into t values (1)")?;
     conn.execute("commit")?;
@@ -188,6 +188,74 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     if let StepResult::Row = stmt.step()? {
         let row = stmt.row().unwrap();
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
+    }
+
+    Ok(())
+}
+
+fn query_scalar_i64(conn: &Arc<Connection>, sql: &str) -> Result<i64> {
+    let mut stmt = conn.query(sql)?.unwrap();
+    match stmt.step()? {
+        StepResult::Row => {
+            let row = stmt.row().unwrap();
+            match row.get::<&Value>(0).unwrap() {
+                Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(*v),
+                v => panic!("expected integer, got {v:?}"),
+            }
+        }
+        _ => panic!("expected row from {sql}"),
+    }
+}
+
+fn query_scalar_text(conn: &Arc<Connection>, sql: &str) -> Result<String> {
+    let mut stmt = conn.query(sql)?.unwrap();
+    match stmt.step()? {
+        StepResult::Row => {
+            let row = stmt.row().unwrap();
+            match row.get::<&Value>(0).unwrap() {
+                Value::Text(v) => Ok(v.as_str().to_string()),
+                v => panic!("expected text, got {v:?}"),
+            }
+        }
+        _ => panic!("expected row from {sql}"),
+    }
+}
+
+#[turso_macros::test]
+fn test_database_full_rolls_back_explicit_transaction(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("PRAGMA auto_vacuum = 0")?;
+    conn.execute("CREATE TABLE filler (fill)")?;
+    conn.execute("PRAGMA max_page_count = 50")?;
+
+    let initial_page_count = query_scalar_i64(&conn, "PRAGMA page_count")?;
+
+    for _ in 0..3 {
+        conn.execute("BEGIN")?;
+
+        loop {
+            match conn.execute("INSERT INTO filler (fill) VALUES (randomblob(5000))") {
+                Ok(_) => {}
+                Err(LimboError::DatabaseFull) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let integrity = query_scalar_text(&conn, "PRAGMA integrity_check")?;
+        assert_eq!(
+            integrity, "ok",
+            "integrity_check failed after DatabaseFull rollback"
+        );
+
+        let page_count = query_scalar_i64(&conn, "PRAGMA page_count")?;
+        assert_eq!(
+            page_count, initial_page_count,
+            "page count must revert to pre-BEGIN value after DatabaseFull rollback"
+        );
+
+        let _ = conn.execute("COMMIT");
     }
 
     Ok(())
@@ -469,6 +537,34 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDat
             vec![Value::from_i64(4)]
         ]
     );
+}
+
+#[turso_macros::test]
+/// A failed read statement must not roll back the open transaction. SQLite
+/// keeps the transaction and its savepoints after a runtime error, so
+/// ROLLBACK TO can recover and COMMIT can persist the surviving writes.
+fn test_read_error_keeps_transaction_and_savepoints(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let result = conn.execute("SELECT abs(-9223372036854775808)");
+    assert!(matches!(result, Err(LimboError::IntegerOverflow)));
+    assert!(
+        !conn.get_auto_commit(),
+        "a failed read statement must leave the transaction open"
+    );
+
+    conn.execute("ROLLBACK TO s").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("SELECT a FROM t").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
 }
 
 #[turso_macros::test]

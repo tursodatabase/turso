@@ -1143,7 +1143,7 @@ pub(super) fn emit_autoindex(
         .columns
         .iter()
         .take(num_seek_keys)
-        .all(|col| col.collation == CollationSeq::Binary)
+        .all(|col| col.collation == CollationSeq::BINARY)
         && seek_def.start.op.eq_only()
         && (0..num_seek_keys).all(|i| !seek_def.is_null_matching_key_component(i));
     if use_bloom_filter {

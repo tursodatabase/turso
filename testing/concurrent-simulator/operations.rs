@@ -473,9 +473,8 @@ impl Operation {
 mod tests {
     use std::sync::Arc;
 
-    use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, StepResult,
-    };
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, StepResult};
+    use turso_sqlite::SqliteDialect;
 
     use super::*;
 

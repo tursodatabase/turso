@@ -1,23 +1,46 @@
-use std::{cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
+use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
+use smallvec::SmallVec;
 use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
+    schema::Schema,
     sync::{Arc, LazyLock, RwLock, Weak},
-    translate::{catalog::CatalogContext, expr_context::ExprProperties},
+    translate::{
+        catalog::CatalogContext,
+        emitter::Resolver,
+        expr::{
+            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            row_value_component_expr, row_value_len,
+        },
+        expr_context::{ExprContext, ExprProperties},
+        plan::{Plan, SelectPlan, TableReferences},
+    },
+    type_ordering::TypeOrdering,
     types::ValueRef,
     vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
 };
 
-/// **Pre defined collation sequences**\
-/// Collating functions only matter when comparing string values.
-/// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
+/// How two values compare.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum CollationSeq {
+    /// SQLite's comparison: values of different kinds order as NULL, numbers,
+    /// text, blobs; numbers compare numerically, blobs byte by byte, and two
+    /// texts with the text collation.
+    Text(TextCollation),
+    /// The order of a custom type, such as numeric's order by value. It
+    /// decides how every pair of values compares. A comparison gets it when an
+    /// operand's type has an order.
+    Type(TypeOrdering),
+}
+
+/// How two texts compare under SQLite's comparison.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub enum TextCollation {
     Binary,
     NoCase,
     Rtrim,
@@ -46,17 +69,12 @@ struct CustomCollations {
 }
 
 impl CollationSeq {
-    pub fn new(collation: &str) -> crate::Result<Self> {
-        match crate::util::normalize_ident(collation).as_str() {
-            "binary" => return Ok(Self::Binary),
-            "nocase" => return Ok(Self::NoCase),
-            "rtrim" => return Ok(Self::Rtrim),
-            _ => {}
-        }
+    pub const BINARY: Self = Self::Text(TextCollation::Binary);
+    pub const NOCASE: Self = Self::Text(TextCollation::NoCase);
+    pub const RTRIM: Self = Self::Text(TextCollation::Rtrim);
 
-        LocaleCollationRegistry::global()
-            .get_or_register(collation)
-            .map(Self::Locale)
+    pub fn new(collation: &str) -> crate::Result<Self> {
+        TextCollation::new(collation).map(Self::Text)
     }
 
     /// The collation for comparing values the engine made itself: rowids,
@@ -65,7 +83,7 @@ impl CollationSeq {
     /// [comparison_collation] or [expr_collation] instead, so the two kinds of
     /// comparison look different in the code.
     pub const fn for_internal_values() -> Self {
-        Self::Binary
+        Self::BINARY
     }
 
     /// The value [Self::to_bits] never returns for a built-in or locale
@@ -78,26 +96,43 @@ impl CollationSeq {
     #[inline]
     pub const fn to_bits(self) -> u16 {
         match self {
-            Self::Binary => 1,
-            Self::NoCase => 2,
-            Self::Rtrim => 3,
-            Self::Locale(id) => id.to_bits(),
-            Self::Custom(_) => Self::NO_COLLATION_BITS,
+            Self::Text(TextCollation::Binary) => 1,
+            Self::Text(TextCollation::NoCase) => 2,
+            Self::Text(TextCollation::Rtrim) => 3,
+            Self::Text(TextCollation::Locale(id)) => id.to_bits(),
+            Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
+            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering as u16,
         }
     }
+
+    /// Type orderings take the numbers from here up to the first number of a
+    /// locale collation.
+    const FIRST_TYPE_ORDERING_BITS: u16 = 4;
 
     /// The collation [Self::to_bits] turned into `bits`. Any other value,
     /// including [Self::NO_COLLATION_BITS], is an error.
     pub fn from_bits(bits: u16) -> Result<Self> {
         match bits {
-            1 => Ok(Self::Binary),
-            2 => Ok(Self::NoCase),
-            3 => Ok(Self::Rtrim),
+            1 => Ok(Self::BINARY),
+            2 => Ok(Self::NOCASE),
+            3 => Ok(Self::RTRIM),
+            bits if (Self::FIRST_TYPE_ORDERING_BITS..LocaleCollationId::FIRST_STORAGE_BIT)
+                .contains(&bits) =>
+            {
+                let ordering = TypeOrdering::ALL
+                    .get(usize::from(bits - Self::FIRST_TYPE_ORDERING_BITS))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("no collation has the number {bits}"))
+                    })?;
+                Ok(Self::Type(*ordering))
+            }
             bits if bits >= LocaleCollationId::FIRST_STORAGE_BIT
                 && LocaleCollationRegistry::global()
                     .is_registered(LocaleCollationId::from_bits(bits)) =>
             {
-                Ok(Self::Locale(LocaleCollationId::from_bits(bits)))
+                Ok(Self::Text(TextCollation::Locale(
+                    LocaleCollationId::from_bits(bits),
+                )))
             }
             bits => Err(LimboError::InternalError(format!(
                 "no collation has the number {bits}"
@@ -107,7 +142,7 @@ impl CollationSeq {
 
     #[inline]
     pub const fn is_custom(self) -> bool {
-        matches!(self, Self::Custom(_))
+        matches!(self, Self::Text(TextCollation::Custom(_)))
     }
 
     /// Whether values can be hashed so that values this collation calls equal
@@ -118,63 +153,34 @@ impl CollationSeq {
         !self.is_custom()
     }
 
-    /// Gives a new custom collation a number and returns the
-    /// [ExternalCollation] that `new_external` makes for it. Comparisons with
-    /// the collation call that ExternalCollation's callback.
-    pub(crate) fn new_custom(
-        new_external: impl FnOnce(Self) -> ExternalCollation,
-    ) -> Arc<ExternalCollation> {
-        let mut registry = CUSTOM_COLLATIONS.write();
-        let number = registry.next_number;
-        registry.next_number = number
-            .checked_add(1)
-            .expect("a process registers fewer than 2^32 custom collations");
-        let external = Arc::new(new_external(Self::Custom(number)));
-        registry.by_number.insert(number, Arc::downgrade(&external));
-        external
-    }
-
-    /// Removes a custom collation whose [ExternalCollation] is being dropped.
-    pub(crate) fn remove_custom(self) {
-        let Self::Custom(number) = self else {
-            panic!("{self:?} is not a custom collation");
-        };
-        CUSTOM_COLLATIONS.write().by_number.remove(&number);
-    }
-
-    fn external(self) -> Arc<ExternalCollation> {
-        let Self::Custom(number) = self else {
-            panic!("{self:?} is not a custom collation");
-        };
-        // The read lock is released before the returned Arc can be dropped,
-        // because dropping the last Arc takes the write lock.
-        CUSTOM_COLLATIONS
-            .read()
-            .by_number
-            .get(&number)
-            .and_then(Weak::upgrade)
-            .expect("a plan or program keeps its custom collations alive")
-    }
-
     pub fn name(self) -> String {
         match self {
-            Self::Binary => "Binary".to_string(),
-            Self::NoCase => "NoCase".to_string(),
-            Self::Rtrim => "RTrim".to_string(),
-            Self::Locale(id) => LocaleCollationRegistry::global().name(id),
-            Self::Custom(_) => self.external().name.clone(),
+            Self::Text(collation) => collation.name(),
+            Self::Type(ordering) => ordering.name().to_string(),
         }
     }
 
-    /// Orders two values. Values of different kinds order as NULL, numbers,
-    /// text, blobs; two texts compare with this collation.
+    /// Orders two values. With a type's order, as the type orders them.
+    /// Otherwise values of different kinds order as NULL, numbers, text,
+    /// blobs, and two texts compare with the text collation.
     #[inline(always)]
     pub fn compare(self, lhs: ValueRef, rhs: ValueRef) -> Ordering {
-        match (lhs, rhs) {
-            (ValueRef::Text(lhs), ValueRef::Text(rhs)) => {
-                self.compare_strings(lhs.as_str(), rhs.as_str())
+        match (self, lhs, rhs) {
+            (Self::Type(ordering), _, _) => ordering.compare(lhs, rhs),
+            (Self::Text(collation), ValueRef::Text(lhs), ValueRef::Text(rhs)) => {
+                collation.compare_strings(lhs.as_str(), rhs.as_str())
             }
-            _ => lhs.cmp(&rhs),
+            (Self::Text(_), _, _) => lhs.cmp(&rhs),
+        }
+    }
+
+    /// [Self::compare] for the two sides of a comparison operator, which
+    /// fails where the type's [TypeOrdering::compare_operands] does.
+    #[inline(always)]
+    pub fn compare_operands(self, lhs: ValueRef, rhs: ValueRef) -> Result<Ordering> {
+        match self {
+            Self::Type(ordering) => ordering.compare_operands(lhs, rhs),
+            Self::Text(_) => Ok(self.compare(lhs, rhs)),
         }
     }
 
@@ -182,6 +188,10 @@ impl CollationSeq {
     /// equal hash the same. Integers hash like the equal REAL, so 10 and 10.0
     /// land in the same bucket.
     pub fn hash_value(self, value: ValueRef, hasher: &mut impl Hasher) {
+        let collation = match self {
+            Self::Type(ordering) => return ordering.hash(value, hasher),
+            Self::Text(collation) => collation,
+        };
         const NULL_HASH: u8 = 0;
         const INT_HASH: u8 = 1;
         const FLOAT_HASH: u8 = 2;
@@ -206,12 +216,66 @@ impl CollationSeq {
             }
             ValueRef::Text(text) => {
                 hasher.write_u8(TEXT_HASH);
-                self.hash_text(text.as_str(), hasher);
+                collation.hash_text(text.as_str(), hasher);
             }
             ValueRef::Blob(blob) => {
                 hasher.write_u8(BLOB_HASH);
                 hasher.write(blob);
             }
+        }
+    }
+}
+
+impl TextCollation {
+    /// Gives a new custom collation a number and returns the
+    /// [ExternalCollation] that `new_external` makes for it. Comparisons with
+    /// the collation call that ExternalCollation's callback.
+    pub(crate) fn new_custom(
+        new_external: impl FnOnce(Self) -> ExternalCollation,
+    ) -> Arc<ExternalCollation> {
+        let mut registry = CUSTOM_COLLATIONS.write();
+        let number = registry.next_number;
+        registry.next_number = number
+            .checked_add(1)
+            .expect("a process registers fewer than 2^32 custom collations");
+        let external = Arc::new(new_external(Self::Custom(number)));
+        registry.by_number.insert(number, Arc::downgrade(&external));
+        external
+    }
+
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
+    /// Removes a custom collation whose [ExternalCollation] is being dropped.
+    pub(crate) fn remove_custom(self) {
+        let Self::Custom(number) = self else {
+            panic!("{self:?} is not a custom collation");
+        };
+        CUSTOM_COLLATIONS.write().by_number.remove(&number);
+    }
+
+    /// The collation named in a COLLATE clause.
+    pub fn new(collation: &str) -> crate::Result<Self> {
+        match crate::util::normalize_ident(collation).as_str() {
+            "binary" => return Ok(Self::Binary),
+            "nocase" => return Ok(Self::NoCase),
+            "rtrim" => return Ok(Self::Rtrim),
+            _ => {}
+        }
+
+        LocaleCollationRegistry::global()
+            .get_or_register(collation)
+            .map(Self::Locale)
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Self::Binary => "Binary".to_string(),
+            Self::NoCase => "NoCase".to_string(),
+            Self::Rtrim => "RTrim".to_string(),
+            Self::Locale(id) => LocaleCollationRegistry::global().name(id),
+            Self::Custom(number) => custom_collation(number).name.clone(),
         }
     }
 
@@ -237,39 +301,56 @@ impl CollationSeq {
     }
 
     #[inline(always)]
-    fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
-        match *self {
-            Self::Binary => Self::binary_cmp(lhs, rhs),
-            Self::NoCase => Self::nocase_cmp(lhs, rhs),
-            Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
+    fn compare_strings(self, lhs: &str, rhs: &str) -> Ordering {
+        match self {
+            Self::Binary => binary_cmp(lhs, rhs),
+            Self::NoCase => nocase_cmp(lhs, rhs),
+            Self::Rtrim => rtrim_cmp(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
-            Self::Custom(_) => self.external().compare(lhs, rhs),
+            Self::Custom(number) => custom_collation(number).compare(lhs, rhs),
         }
     }
+}
 
-    #[inline(always)]
-    fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.cmp(rhs)
-    }
+fn custom_collation(number: u32) -> Arc<ExternalCollation> {
+    // The read lock is released before the returned Arc can be dropped,
+    // because dropping the last Arc takes the write lock.
+    CUSTOM_COLLATIONS
+        .read()
+        .by_number
+        .get(&number)
+        .and_then(Weak::upgrade)
+        .expect("a plan or program keeps its custom collations alive")
+}
 
-    #[inline(always)]
-    fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
-            let left = left.to_ascii_lowercase();
-            let right = right.to_ascii_lowercase();
-            if left != right {
-                return left.cmp(&right);
-            }
-            if left == 0 {
-                return lhs.len().cmp(&rhs.len());
-            }
+#[inline(always)]
+fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
+    lhs.cmp(rhs)
+}
+
+#[inline(always)]
+fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
+    for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+        let left = left.to_ascii_lowercase();
+        let right = right.to_ascii_lowercase();
+        if left != right {
+            return left.cmp(&right);
         }
-        lhs.len().cmp(&rhs.len())
+        if left == 0 {
+            return lhs.len().cmp(&rhs.len());
+        }
     }
+    lhs.len().cmp(&rhs.len())
+}
 
-    #[inline(always)]
-    fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+#[inline(always)]
+fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
+    lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+}
+
+impl std::fmt::Display for TextCollation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
     }
 }
 
@@ -283,7 +364,8 @@ impl std::fmt::Display for CollationSeq {
 pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
-    const FIRST_STORAGE_BIT: u16 = 4;
+    const FIRST_STORAGE_BIT: u16 =
+        CollationSeq::FIRST_TYPE_ORDERING_BITS + TypeOrdering::ALL.len() as u16;
 
     fn from_index(index: usize) -> Result<Self> {
         if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
@@ -394,7 +476,12 @@ impl LocaleCollationRegistry {
 /// The collation a comparison between `lhs` and `rhs` uses. This and
 /// [expr_collation] are the only places that decide a collation from
 /// expressions; every comparison, sort key, grouping key and hash key gets its
-/// collation from one of them. The rules are SQLite's
+/// collation from one of them.
+///
+/// When an operand's type has its own order (numeric and arrays), the
+/// comparison uses that order. An
+/// explicit COLLATE next to such an operand, or two operands with different
+/// orders, is an error, as in PostgreSQL. Otherwise the rules are SQLite's
 /// (`sqlite3BinaryCompareCollSeq`):
 ///
 /// 1. If an operand contains a COLLATE operator anywhere outside a subquery,
@@ -407,10 +494,9 @@ impl LocaleCollationRegistry {
 pub fn comparison_collation(
     lhs: &Expr,
     rhs: &Expr,
-    metadata: &impl ExprProperties,
-    catalog: &CatalogContext<'_>,
+    context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
-    comparison_collation_across_queries(lhs, metadata, rhs, metadata, catalog)
+    comparison_collation_across_queries(lhs, context, rhs, context)
 }
 
 /// [comparison_collation] for `x IN (SELECT y ...)` and other comparisons
@@ -418,33 +504,93 @@ pub fn comparison_collation(
 /// looked up in its own tables.
 pub fn comparison_collation_across_queries(
     lhs: &Expr,
-    lhs_metadata: &impl ExprProperties,
+    lhs_context: &ExprContext<'_, '_>,
     rhs: &Expr,
-    rhs_metadata: &impl ExprProperties,
-    catalog: &CatalogContext<'_>,
+    rhs_context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    let catalog = lhs_context.catalog();
     let collation = if has_collate_operator(lhs) {
-        expr_collation_if_any(lhs, lhs_metadata, catalog)?
+        expr_collation_if_any(lhs, lhs_context, catalog)?
     } else if has_collate_operator(rhs) {
-        expr_collation_if_any(rhs, rhs_metadata, catalog)?
+        expr_collation_if_any(rhs, rhs_context, catalog)?
     } else {
-        match expr_collation_if_any(lhs, lhs_metadata, catalog)? {
+        match expr_collation_if_any(lhs, lhs_context, catalog)? {
             Some(collation) => Some(collation),
-            None => expr_collation_if_any(rhs, rhs_metadata, catalog)?,
+            None => expr_collation_if_any(rhs, rhs_context, catalog)?,
         }
     };
-    Ok(collation.unwrap_or(CollationSeq::Binary))
+    Ok(CollationSeq::Text(
+        collation.unwrap_or(TextCollation::Binary),
+    ))
+}
+
+/// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
+/// right operand is column `column` of `query`. The column's type is the one
+/// [query_column_type] gives it, which in a compound SELECT comes from every
+/// SELECT, not only from `rhs`, the column of the rightmost SELECT. `rhs`
+/// gives the text collation, as in SQLite.
+pub fn in_subquery_collation(
+    lhs: &Expr,
+    lhs_tables: Option<&TableReferences>,
+    query: &Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let rhs = &query.select_result_columns()[column].expr;
+    let lhs_context = ExprContext::new(lhs_tables, resolver);
+    let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
+    let types = [
+        type_of(lhs, &lhs_context.type_env()),
+        query_column_type(query, column, resolver),
+    ];
+    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
+    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
+}
+
+/// The collation that `x IN (y1, ..., yN)` compares with. When x or any item
+/// has a type with an order, every comparison uses that order, so
+/// `'10.0' IN (n)` agrees with `'10.0' = n`. Otherwise the text collation is
+/// the one of x alone, as in SQLite.
+pub fn in_list_collation(
+    lhs: &Expr,
+    rhs: &[Box<Expr>],
+    context: &ExprContext<'_, '_>,
+) -> Result<CollationSeq> {
+    let operands = std::iter::once(lhs)
+        .chain(rhs.iter().map(|item| item.as_ref()))
+        .map(|expr| (expr, context));
+    if let Some(ordering) = common_type_ordering(operands)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    expr_text_collation(lhs, context, context.catalog()).map(CollationSeq::Text)
 }
 
 /// The collation of one expression, BINARY when it has none. Sort, grouping,
-/// DISTINCT, compound select, window partition and index keys use it, and so
-/// does `x IN (y1, ..., yN)`, which compares with the collation of x alone.
-pub fn expr_collation(
+/// DISTINCT, compound select, window partition and index keys use it. An
+/// expression whose type has an order uses that order.
+pub fn expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<CollationSeq> {
+    if let Some(ordering) = common_type_ordering([(expr, context)])? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    expr_text_collation(expr, context, context.catalog()).map(CollationSeq::Text)
+}
+
+/// The text collation of an expression by SQLite's rules alone, BINARY when
+/// it has none. A subquery or view column stores it apart from the order of
+/// its type (see `Column::text_collation`), so that `CAST(col AS text)` in the
+/// outer query, whose type has no order, compares with the text collation.
+pub(crate) fn expr_text_collation(
     expr: &Expr,
     metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
-) -> Result<CollationSeq> {
-    Ok(expr_collation_if_any(expr, metadata, catalog)?.unwrap_or(CollationSeq::Binary))
+) -> Result<TextCollation> {
+    Ok(expr_collation_if_any(expr, metadata, catalog)?.unwrap_or(TextCollation::Binary))
 }
 
 /// The collation of the first expression that has one, BINARY when none has.
@@ -453,17 +599,330 @@ pub fn expr_collation(
 /// arguments with the collation of the first argument that has one (functions
 /// marked `SQLITE_FUNC_NEEDCOLL`), and a compound SELECT compares a result
 /// column with the collation of the leftmost SELECT whose column has one.
-/// Each expression comes with the tables its columns refer to.
-pub fn first_collation<'a, M: ExprProperties>(
-    exprs: impl IntoIterator<Item = (&'a Expr, M)>,
-    catalog: &CatalogContext<'_>,
+/// Each expression comes with the context its columns refer to. As in
+/// [comparison_collation], an expression whose type has an order decides.
+pub fn first_collation<'a, 'c, 's: 'c>(
+    exprs: impl IntoIterator<Item = (&'a Expr, ExprContext<'c, 's>)> + Clone,
 ) -> Result<CollationSeq> {
-    for (expr, metadata) in exprs {
-        if let Some(collation) = expr_collation_if_any(expr, &metadata, catalog)? {
+    if let Some(ordering) = common_type_ordering(exprs.clone())? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    first_text_collation(exprs).map(CollationSeq::Text)
+}
+
+/// The collation that column `column` of a compound SELECT compares with,
+/// where `arms` are its SELECTs, by the rule of [first_collation]: a SELECT
+/// whose column has an order decides, so `SELECT n FROM t UNION SELECT 10`
+/// compares in numeric order and keeps one of `10.00` and `10`. Otherwise the
+/// text collation of the leftmost SELECT whose column has one, as in SQLite's
+/// `multiSelectCollSeq`.
+pub fn compound_column_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    first_collation(compound_column_exprs(arms, column, resolver))
+}
+
+/// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
+/// where `arms` are its SELECTs. The COLLATE applies to the column of every
+/// SELECT, so it is an error when any of them has a type that takes none, as
+/// in a comparison.
+pub fn compound_order_by_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    explicit_collation: TextCollation,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    common_ordering_of(compound_column_exprs(arms, column, resolver), true)?;
+    Ok(CollationSeq::Text(explicit_collation))
+}
+
+/// Column `column` of every SELECT in `arms`, each with the context its
+/// columns refer to.
+fn compound_column_exprs<'a, 's>(
+    arms: &'a [&'a SelectPlan],
+    column: usize,
+    resolver: &'a Resolver<'s>,
+) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
+    arms.iter().map(move |select| {
+        (
+            &select.result_columns[column].expr,
+            ExprContext::new(Some(&select.table_references), resolver),
+        )
+    })
+}
+
+/// The text collation of the first expression that has one, BINARY when none
+/// has.
+pub(crate) fn first_text_collation<'a, 'c, 's: 'c>(
+    exprs: impl IntoIterator<Item = (&'a Expr, ExprContext<'c, 's>)>,
+) -> Result<TextCollation> {
+    for (expr, context) in exprs {
+        if let Some(collation) = expr_collation_if_any(expr, &context, context.catalog())? {
             return Ok(collation);
         }
     }
-    Ok(CollationSeq::Binary)
+    Ok(TextCollation::Binary)
+}
+
+/// The order that values compared with each other use when one of them has a
+/// type with an order. Text collations do not apply to such types, so an
+/// explicit COLLATE among them is an error, and so are two different orders:
+/// PostgreSQL has no operator that compares numeric with an array. An
+/// explicit COLLATE is also an error when any of the values has a custom type
+/// that takes no COLLATE, such as `d = '2024-01-02' COLLATE nocase` for a
+/// date column d.
+fn common_type_ordering<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
+    exprs: impl IntoIterator<Item = (&'a Expr, C)> + Clone,
+) -> Result<Option<TypeOrdering>> {
+    let has_collate = exprs
+        .clone()
+        .into_iter()
+        .any(|(expr, _)| has_collate_operator(expr));
+    common_ordering_of(exprs, has_collate)
+}
+
+/// The one order among the types of `exprs`, as [common_type_ordering]
+/// decides it. `has_collate` says whether a COLLATE applies to the values.
+fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
+    exprs: impl IntoIterator<Item = (&'a Expr, C)>,
+    has_collate: bool,
+) -> Result<Option<TypeOrdering>> {
+    // Most comparisons have two operands; keep their types off the heap.
+    let mut types: SmallVec<[ExprType; 2]> = SmallVec::new();
+    let mut schema = None;
+    for (expr, context) in exprs {
+        let context: ExprContext<'c, 's> = *context.borrow();
+        types.push(type_of(expr, &context.type_env()));
+        schema.get_or_insert(context.schema());
+    }
+    match schema {
+        Some(schema) => common_ordering(&types, schema, has_collate),
+        None => Ok(None),
+    }
+}
+
+/// The one order among values of `types`, as [common_type_ordering] decides
+/// it. `has_collate` says whether a COLLATE applies to the values. Every
+/// COLLATE that applies to a value is checked here, through [operand_order].
+fn common_ordering(
+    types: &[ExprType],
+    schema: &Schema,
+    has_collate: bool,
+) -> Result<Option<TypeOrdering>> {
+    let mut found: Option<(TypeOrdering, &ExprType)> = None;
+    let mut array_of_unknown_elements = None;
+    for ty in types {
+        let ordering = match operand_order(ty, schema, has_collate)? {
+            OperandOrder::None => continue,
+            OperandOrder::ArrayOfUnknownElements => {
+                array_of_unknown_elements.get_or_insert(ty);
+                continue;
+            }
+            OperandOrder::Type(ordering) => ordering,
+        };
+        match found {
+            None => found = Some((ordering, ty)),
+            Some((other, _)) if other == ordering => found = Some((ordering, ty)),
+            Some((_, other_ty)) => return Err(cannot_compare(other_ty, ty)),
+        }
+    }
+    match (found, array_of_unknown_elements) {
+        (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
+        (Some((other, other_ty)), Some(array_ty))
+            if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) =>
+        {
+            Err(cannot_compare(other_ty, array_ty))
+        }
+        (found, _) => Ok(found.map(|(ordering, _)| ordering)),
+    }
+}
+
+/// How the values of a table or index column of type `ty` compare: the order
+/// of its type when it has one, otherwise the explicit COLLATE, if any. A type
+/// with its own order doesn't accept a COLLATE, and neither does a custom type
+/// that isn't text.
+pub(crate) fn key_collation(
+    explicit_collation: Option<TextCollation>,
+    ty: &ExprType,
+    schema: &Schema,
+) -> Result<Option<CollationSeq>> {
+    let ordering = common_ordering(
+        std::slice::from_ref(ty),
+        schema,
+        explicit_collation.is_some(),
+    )?;
+    Ok(match ordering {
+        Some(ordering) => Some(CollationSeq::Type(ordering)),
+        None => explicit_collation.map(CollationSeq::Text),
+    })
+}
+
+/// Fails when `operand`, the operand of a COLLATE operator, has a type that
+/// takes no COLLATE, such as `d COLLATE nocase` for a date d.
+pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    common_ordering_of([(operand, context)], true).map(|_| ())
+}
+
+/// Fails when `expr` itself, not counting its operands, applies a COLLATE to
+/// a type that takes none or compares two types with different orders. These
+/// are the errors that compiling `expr` would give, found by the same
+/// checks, so that `WHERE 0 AND d = 'x' COLLATE nocase` fails like
+/// `WHERE d = 'x' COLLATE nocase` for a date d.
+pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    match expr {
+        Expr::Collate(operand, _) => check_collate_operand(operand, context),
+        Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
+        // Compiled as `lhs >= start AND lhs <= end`.
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            check_comparison(lhs, start, context)?;
+            check_comparison(lhs, end, context)
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            let operands =
+                std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
+            common_type_ordering(operands.map(|expr| (expr, context)))?;
+            Ok(())
+        }
+        // Compiled as `base = when` for each WHEN.
+        Expr::Case {
+            base: Some(base),
+            when_then_pairs,
+            ..
+        } => when_then_pairs
+            .iter()
+            .try_for_each(|(when, _)| check_comparison(base, when, context)),
+        Expr::FunctionCall { name, args, .. } => {
+            let func = context
+                .catalog()
+                .resolve_function(name.as_str(), args.len())?;
+            if func.is_some_and(|func| func.needs_collation()) {
+                common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
+            }
+            Ok(())
+        }
+        // These compare a value with the values of a subquery, whose types are
+        // known only once it is planned. Planning it checks the comparison
+        // through [in_subquery_collation].
+        Expr::InSelect { .. } | Expr::InTable { .. } | Expr::SubqueryResult { .. } => Ok(()),
+        // These compare nothing with a collation.
+        Expr::Binary(..)
+        | Expr::Case { base: None, .. }
+        | Expr::Cast { .. }
+        | Expr::Column { .. }
+        | Expr::Default
+        | Expr::DoublyQualified(..)
+        | Expr::Exists(_)
+        | Expr::FieldAccess { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Id(_)
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::MergedColumn(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Parenthesized(_)
+        | Expr::Qualified(..)
+        | Expr::Raise(..)
+        | Expr::Register { .. }
+        | Expr::RowId { .. }
+        | Expr::Subquery(_)
+        | Expr::Unary(..)
+        | Expr::Variable(_) => Ok(()),
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+    }
+}
+
+/// The check of [check_expr_collation] for `lhs` compared with `rhs`. Row
+/// values, as in `(SELECT d, 1) = ('x' COLLATE nocase, 1)`, compare element by
+/// element, each pair with its own collation, split as code generation splits
+/// them.
+fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    let len = row_value_len(lhs)?.max(row_value_len(rhs)?);
+    if len > 1 {
+        for idx in 0..len {
+            let lhs = row_value_component_expr(lhs, idx)?;
+            let rhs = row_value_component_expr(rhs, idx)?;
+            check_comparison(&lhs, &rhs, context)?;
+        }
+        return Ok(());
+    }
+    common_type_ordering([(lhs, context), (rhs, context)])?;
+    Ok(())
+}
+
+/// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
+/// types take one: `date`, `uuid` and a type with an integer base don't,
+/// `varchar` and a type with a text base do. No array takes one, because
+/// arrays compare element by element without a collation, so the COLLATE
+/// would be ignored. SQLite's own types all take one.
+fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
+    let accepts = match ty {
+        ExprType::Custom { type_def, .. } => schema.type_accepts_collate(type_def)?,
+        ExprType::Array { .. } => false,
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null => true,
+        // Nothing says the value is text, as in `(d * 2) COLLATE nocase` when no
+        // function runs `*` for a date d.
+        ExprType::Unknown => false,
+        // Checked again once the type is known: `(SELECT d) COLLATE nocase` is
+        // checked as a date when it is compiled.
+        ExprType::NotKnownYet => true,
+        // A COLLATE inside a row value, as in `(1, s COLLATE nocase) = (SELECT
+        // 1, 'a')`, applies to one of its values, and that value is checked as
+        // the operand of its own COLLATE.
+        ExprType::RowValue => true,
+    };
+    if accepts {
+        return Ok(());
+    }
+    Err(LimboError::ParseError(format!(
+        "collations are not supported by type {ty}"
+    )))
+}
+
+fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {
+    LimboError::ParseError(format!("cannot compare type {a} with type {b}"))
+}
+
+/// The order a value brings to a comparison with other values.
+#[derive(Clone, Copy)]
+enum OperandOrder {
+    /// The value's type has no order.
+    None,
+    Type(TypeOrdering),
+    /// An array whose element type nothing declares, such as `ARRAY[x]` over a
+    /// column without a type. It compares with the order of the other values'
+    /// array type, or as an array of numbers when there is none.
+    ArrayOfUnknownElements,
+}
+
+/// The order a value of type `ty` brings to a comparison. `has_collate` says
+/// whether a COLLATE applies to the compared values; it is an error when `ty`
+/// takes none.
+fn operand_order(ty: &ExprType, schema: &Schema, has_collate: bool) -> Result<OperandOrder> {
+    if has_collate {
+        check_type_accepts_collate(ty, schema)?;
+    }
+    if ty.is_array_of_unknown_elements() {
+        return Ok(OperandOrder::ArrayOfUnknownElements);
+    }
+    Ok(match type_ordering(ty, schema) {
+        // The values compare in the type's order, which no COLLATE changes, so
+        // a COLLATE here would be ignored.
+        Some(_) if has_collate => {
+            return Err(LimboError::ParseError(format!(
+                "collations are not supported by type {ty}"
+            )))
+        }
+        Some(ordering) => OperandOrder::Type(ordering),
+        None => OperandOrder::None,
+    })
 }
 
 /// The collation of one expression, or None when it has none (SQLite's
@@ -478,11 +937,11 @@ fn expr_collation_if_any(
     expr: &Expr,
     metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
-) -> Result<Option<CollationSeq>> {
+) -> Result<Option<TextCollation>> {
     match expr {
         Expr::Column { table, column, .. } => metadata.column_collation(*table, *column),
         Expr::RowId { .. } => Ok(None),
-        Expr::Register(register) => Ok(metadata.register_collation(*register)),
+        Expr::Register { register, .. } => Ok(metadata.register_collation(*register)),
         Expr::Variable(variable) => variable
             .col_collation
             .as_deref()
@@ -519,8 +978,8 @@ fn expr_collation_if_any(
 
 /// A column has its declared collation, BINARY when it declares none. A rowid
 /// alias (INTEGER PRIMARY KEY) is the rowid and has none, as in SQLite.
-pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<CollationSeq> {
-    (!column.is_rowid_alias()).then(|| column.collation())
+pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<TextCollation> {
+    (!column.is_rowid_alias()).then(|| column.text_collation().unwrap_or(TextCollation::Binary))
 }
 
 /// Whether the expression contains a COLLATE operator outside of a subquery
@@ -610,7 +1069,7 @@ fn for_each_operand<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         Expr::MergedColumn(_)
         | Expr::Column { .. }
         | Expr::RowId { .. }
-        | Expr::Register(_)
+        | Expr::Register { .. }
         | Expr::DoublyQualified(..)
         | Expr::Exists(_)
         | Expr::FunctionCallStar { .. }
@@ -643,33 +1102,36 @@ mod tests {
     #[test]
     fn test_locale_collation_names() {
         assert!(matches!(
-            CollationSeq::new("fr-FR").unwrap(),
-            CollationSeq::Locale(_)
+            TextCollation::new("fr-FR").unwrap(),
+            TextCollation::Locale(_)
         ));
         assert!(matches!(
-            CollationSeq::new("es-u-co-trad").unwrap(),
-            CollationSeq::Locale(_)
+            TextCollation::new("es-u-co-trad").unwrap(),
+            TextCollation::Locale(_)
         ));
         assert!(matches!(
-            CollationSeq::new("en-u-kf-upper").unwrap(),
-            CollationSeq::Locale(_)
+            TextCollation::new("en-u-kf-upper").unwrap(),
+            TextCollation::Locale(_)
         ));
         assert!(matches!(
-            CollationSeq::new("en-US-u-kf-upper").unwrap(),
-            CollationSeq::Locale(_)
+            TextCollation::new("en-US-u-kf-upper").unwrap(),
+            TextCollation::Locale(_)
         ));
-        assert!(CollationSeq::new("compile_options").is_err());
+        assert!(TextCollation::new("compile_options").is_err());
     }
 
     #[test]
     fn collation_bits_round_trip_and_unknown_bits_are_an_error() {
         let locale = CollationSeq::new("fr-FR").unwrap();
         for collation in [
-            CollationSeq::Binary,
-            CollationSeq::NoCase,
-            CollationSeq::Rtrim,
+            CollationSeq::BINARY,
+            CollationSeq::NOCASE,
+            CollationSeq::RTRIM,
             locale,
-        ] {
+        ]
+        .into_iter()
+        .chain(TypeOrdering::ALL.map(CollationSeq::Type))
+        {
             assert_eq!(
                 CollationSeq::from_bits(collation.to_bits()).unwrap(),
                 collation
@@ -681,16 +1143,16 @@ mod tests {
 
     #[test]
     fn test_locale_collation_compare() {
-        let traditional_spanish = CollationSeq::new("es-u-co-trad").unwrap();
+        let traditional_spanish = TextCollation::new("es-u-co-trad").unwrap();
         assert_eq!(
             traditional_spanish.compare_strings("pollo", "polvo"),
             Ordering::Greater
         );
 
-        let upper_first = CollationSeq::new("en-u-kf-upper").unwrap();
+        let upper_first = TextCollation::new("en-u-kf-upper").unwrap();
         assert_eq!(upper_first.compare_strings("A", "a"), Ordering::Less);
 
-        let upper_first_us = CollationSeq::new("en-US-u-kf-upper").unwrap();
+        let upper_first_us = TextCollation::new("en-US-u-kf-upper").unwrap();
         assert_eq!(upper_first_us.compare_strings("A", "a"), Ordering::Less);
     }
 
@@ -699,9 +1161,9 @@ mod tests {
         // A plain column has its declared collation, BINARY when it declares none.
         for collation in [
             None,
-            Some(CollationSeq::Binary),
-            Some(CollationSeq::NoCase),
-            Some(CollationSeq::Rtrim),
+            Some(TextCollation::Binary),
+            Some(TextCollation::NoCase),
+            Some(TextCollation::Rtrim),
         ] {
             let table_references =
                 get_table_references_single_table_single_column_with_collation(collation);
@@ -717,18 +1179,18 @@ mod tests {
                 &Resolver::empty_for_tests().catalog,
             )
             .unwrap();
-            assert_eq!(collseq, Some(collation.unwrap_or(CollationSeq::Binary)));
+            assert_eq!(collseq, Some(collation.unwrap_or(TextCollation::Binary)));
         }
     }
 
     #[test]
     fn expr_collation_single_table_single_column_with_collate() {
         let table_references = get_table_references_single_table_single_column_with_collation(
-            Some(CollationSeq::Binary),
+            Some(TextCollation::Binary),
         );
         // col COLLATE RTRIM, col COLLATE NOCASE, col COLLATE BINARY
         for collation in ["RTRIM", "NOCASE", "BINARY"] {
-            let expected_collation = CollationSeq::new(collation).unwrap();
+            let expected_collation = TextCollation::new(collation).unwrap();
             let expr = Expr::Collate(
                 Box::new(Expr::Column {
                     database: None,
@@ -751,7 +1213,7 @@ mod tests {
     #[test]
     fn expr_collation_multiple_collate_leftmost_wins() {
         let table_references = get_table_references_single_table_single_column_with_collation(
-            Some(CollationSeq::Binary),
+            Some(TextCollation::Binary),
         );
         // (col COLLATE NOCASE) COLLATE RTRIM -- RTRIM wins as it is the leftmost AST node with a COLLATE
         let inner = Expr::Collate(
@@ -773,13 +1235,13 @@ mod tests {
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
-        assert_eq!(collseq, Some(CollationSeq::Rtrim));
+        assert_eq!(collseq, Some(TextCollation::Rtrim));
     }
 
     #[test]
     fn expr_collation_unary_plus_and_cast_still_column() {
         let table_references = get_table_references_single_table_single_column_with_collation(
-            Some(CollationSeq::NoCase),
+            Some(TextCollation::NoCase),
         );
         // Unary plus on column
         let expr_plus = Expr::unary(
@@ -797,7 +1259,7 @@ mod tests {
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
-        assert_eq!(collseq_plus, Some(CollationSeq::NoCase));
+        assert_eq!(collseq_plus, Some(TextCollation::NoCase));
 
         // CAST(column AS TEXT)
         let cast_ty = Some(turso_parser::ast::Type {
@@ -820,13 +1282,13 @@ mod tests {
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
-        assert_eq!(collseq_cast, Some(CollationSeq::NoCase));
+        assert_eq!(collseq_cast, Some(TextCollation::NoCase));
     }
 
     #[test]
     fn expr_collation_explicit_collate_anywhere_in_operand() {
         let table_references = get_table_references_two_tables_single_column_with_collations(
-            Some(CollationSeq::NoCase),
+            Some(TextCollation::NoCase),
             None,
         );
         // RTRIM wins because it's an explicit COLLATE even though it appears on the right side of the expression
@@ -847,14 +1309,14 @@ mod tests {
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
-        assert_eq!(collseq, Some(CollationSeq::Rtrim));
+        assert_eq!(collseq, Some(TextCollation::Rtrim));
     }
 
     #[test]
     fn expr_collation_column_plus_column_has_none() {
         let table_references = get_table_references_two_tables_single_column_with_collations(
-            Some(CollationSeq::NoCase),
-            Some(CollationSeq::Rtrim),
+            Some(TextCollation::NoCase),
+            Some(TextCollation::Rtrim),
         );
         // col1 + col2 has no collation: as in SQLite, an operator only passes on a
         // collation from an operand that contains an explicit COLLATE.
@@ -899,7 +1361,7 @@ mod tests {
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
-        assert_eq!(collseq, Some(CollationSeq::NoCase));
+        assert_eq!(collseq, Some(TextCollation::NoCase));
     }
 
     #[test]
@@ -918,7 +1380,7 @@ mod tests {
     #[test]
     fn expr_collation_rowid_has_none_even_with_declared_collation() {
         let table_references = get_table_references_single_table_rowid_alias_with_collation(Some(
-            CollationSeq::NoCase,
+            TextCollation::NoCase,
         ));
         let expr = Expr::RowId {
             database: None,
@@ -939,7 +1401,7 @@ mod tests {
     fn comparison_collation_nocase_column_vs_binary_default() {
         // LHS has NOCASE column, RHS has no collation → NOCASE
         let table_refs = get_table_references_two_tables_single_column_with_collations(
-            Some(CollationSeq::NoCase),
+            Some(TextCollation::NoCase),
             None,
         );
         let lhs = Expr::Column {
@@ -958,11 +1420,10 @@ mod tests {
             comparison_collation(
                 &lhs,
                 &rhs,
-                &TableMetadata::new(Some(&table_refs)),
-                &Resolver::empty_for_tests().catalog
+                &ExprContext::new(Some(&table_refs), &Resolver::empty_for_tests())
             )
             .unwrap(),
-            CollationSeq::NoCase
+            CollationSeq::NOCASE
         );
         // Swapped: the LHS column is still a column, so its default BINARY
         // collation wins over the NOCASE column on the RHS.
@@ -970,11 +1431,10 @@ mod tests {
             comparison_collation(
                 &rhs,
                 &lhs,
-                &TableMetadata::new(Some(&table_refs)),
-                &Resolver::empty_for_tests().catalog
+                &ExprContext::new(Some(&table_refs), &Resolver::empty_for_tests())
             )
             .unwrap(),
-            CollationSeq::Binary
+            CollationSeq::BINARY
         );
     }
 
@@ -983,7 +1443,7 @@ mod tests {
         // A column inside a function call is not a column operand, so the
         // NOCASE column on the other side supplies the collation.
         let table_refs = get_table_references_two_tables_single_column_with_collations(
-            Some(CollationSeq::NoCase),
+            Some(TextCollation::NoCase),
             None,
         );
         let nocase_column = Expr::Column {
@@ -1012,11 +1472,10 @@ mod tests {
             comparison_collation(
                 &function_of_binary_column,
                 &nocase_column,
-                &TableMetadata::new(Some(&table_refs)),
-                &Resolver::empty_for_tests().catalog
+                &ExprContext::new(Some(&table_refs), &Resolver::empty_for_tests())
             )
             .unwrap(),
-            CollationSeq::NoCase
+            CollationSeq::NOCASE
         );
     }
 
@@ -1025,7 +1484,7 @@ mod tests {
         // "+column" and "(column)" still count as columns, so the BINARY
         // column on the LHS wins over the NOCASE column on the RHS.
         let table_refs = get_table_references_two_tables_single_column_with_collations(
-            Some(CollationSeq::NoCase),
+            Some(TextCollation::NoCase),
             None,
         );
         let nocase_column = Expr::Column {
@@ -1047,11 +1506,10 @@ mod tests {
             comparison_collation(
                 &wrapped_binary_column,
                 &nocase_column,
-                &TableMetadata::new(Some(&table_refs)),
-                &Resolver::empty_for_tests().catalog
+                &ExprContext::new(Some(&table_refs), &Resolver::empty_for_tests())
             )
             .unwrap(),
-            CollationSeq::Binary
+            CollationSeq::BINARY
         );
     }
 
@@ -1059,7 +1517,7 @@ mod tests {
     fn comparison_collation_explicit_beats_column() {
         // LHS column is NOCASE, but RHS has explicit RTRIM → RTRIM wins
         let table_refs = get_table_references_two_tables_single_column_with_collations(
-            Some(CollationSeq::NoCase),
+            Some(TextCollation::NoCase),
             None,
         );
         let lhs = Expr::Column {
@@ -1081,11 +1539,10 @@ mod tests {
             comparison_collation(
                 &lhs,
                 &rhs,
-                &TableMetadata::new(Some(&table_refs)),
-                &Resolver::empty_for_tests().catalog
+                &ExprContext::new(Some(&table_refs), &Resolver::empty_for_tests())
             )
             .unwrap(),
-            CollationSeq::Rtrim
+            CollationSeq::RTRIM
         );
     }
 
@@ -1108,18 +1565,17 @@ mod tests {
             comparison_collation(
                 &lhs,
                 &rhs,
-                &TableMetadata::new(Some(&table_refs)),
-                &Resolver::empty_for_tests().catalog
+                &ExprContext::new(Some(&table_refs), &Resolver::empty_for_tests())
             )
             .unwrap(),
-            CollationSeq::Binary
+            CollationSeq::BINARY
         );
     }
 
     // Helpers //
 
     fn get_table_references_single_table_single_column_with_collation(
-        collation: Option<CollationSeq>,
+        collation: Option<TextCollation>,
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
@@ -1165,8 +1621,8 @@ mod tests {
     }
 
     fn get_table_references_two_tables_single_column_with_collations(
-        left: Option<CollationSeq>,
-        right: Option<CollationSeq>,
+        left: Option<TextCollation>,
+        right: Option<TextCollation>,
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
         // Left table t1(id=1)
@@ -1249,7 +1705,7 @@ mod tests {
     }
 
     fn get_table_references_single_table_rowid_alias_with_collation(
-        collation: Option<CollationSeq>,
+        collation: Option<TextCollation>,
     ) -> TableReferences {
         use turso_parser::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
@@ -1294,5 +1750,176 @@ mod tests {
             ))),
         });
         table_references
+    }
+}
+
+/// Every query here compares, sorts or hashes only values of a type with its
+/// own order. No instruction of its program may use a text collation: if one
+/// does, some code path took the collation from the text rules instead of
+/// from the value's type, and would compare '10.00' before '9.50'.
+#[cfg(test)]
+mod typed_value_order_tests {
+    use super::CollationSeq;
+    use crate::sync::Arc;
+    use crate::vdbe::{builder::CursorType, insn::Insn};
+    use crate::{
+        ConnectOpts, Connection, Database, DatabaseOpts, EngineDialect, MemoryIO, OpenFlags, IO,
+    };
+
+    /// Each query, with the number of its instructions that compare values the
+    /// engine made itself (row counters, sequence numbers) with BINARY.
+    const QUERIES: &[(&str, usize)] = &[
+        // comparisons
+        ("SELECT n FROM t WHERE n > 1.5", 0),
+        ("SELECT n FROM t WHERE n BETWEEN 1.5 AND 2", 0),
+        ("SELECT n FROM t WHERE a = '{1}'", 0),
+        ("SELECT n FROM t WHERE b < '{x}'", 0),
+        ("SELECT n FROM t WHERE n = (SELECT max(m) FROM u)", 0),
+        ("SELECT n > 1.5, nullif(n, 2), n IS 1.5 FROM t", 0),
+        // IN
+        ("SELECT n FROM t WHERE n IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n NOT IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u UNION SELECT n FROM t)", 0),
+        ("SELECT n FROM t WHERE a IN (SELECT a FROM t)", 0),
+        // CASE
+        ("SELECT CASE n WHEN 1.5 THEN 1 WHEN 2 THEN 2 END FROM t", 0),
+        ("SELECT n FROM t ORDER BY CASE WHEN a IS NULL THEN n ELSE n END", 0),
+        // ORDER BY
+        ("SELECT n FROM t ORDER BY n", 0),
+        ("SELECT n FROM t ORDER BY a DESC, b", 0),
+        ("SELECT n FROM t ORDER BY likely(n), coalesce(n, 1)", 0),
+        ("SELECT n + 1 AS x FROM t ORDER BY x", 0),
+        // GROUP BY
+        ("SELECT n FROM t GROUP BY n", 0),
+        ("SELECT a, b FROM t GROUP BY a, b", 0),
+        ("SELECT n FROM t GROUP BY n HAVING n > 1", 0),
+        // DISTINCT
+        ("SELECT DISTINCT n FROM t", 0),
+        ("SELECT DISTINCT a, b FROM t", 0),
+        ("SELECT count(DISTINCT n) FROM t", 0),
+        // compound
+        ("SELECT n FROM t UNION SELECT m FROM u", 0),
+        ("SELECT n FROM t INTERSECT SELECT m FROM u", 0),
+        ("SELECT n FROM t EXCEPT SELECT m FROM u", 0),
+        // The sorter's last key is the sequence number of the row.
+        ("SELECT n FROM t UNION ALL SELECT m FROM u ORDER BY 1", 1),
+        ("SELECT a FROM t UNION SELECT a FROM t", 0),
+        // window
+        ("SELECT min(n) OVER (PARTITION BY a ORDER BY b) FROM t", 0),
+        ("SELECT max(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t", 0),
+        ("SELECT n FROM t ORDER BY lag(n) OVER (ORDER BY a)", 0),
+        // Two comparisons of the frame's row numbers.
+        ("SELECT n FROM t ORDER BY first_value(b) OVER (ORDER BY n)", 2),
+        // min/max
+        ("SELECT min(n), max(a), min(b) FROM t", 0),
+        ("SELECT max(n, 2), min(n, 1.5) FROM t", 0),
+        // join
+        ("SELECT t.n FROM t JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t LEFT JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t, u WHERE t.n > u.m", 0),
+        ("SELECT t.n FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.m = t.n)", 0),
+        // A value without a type compared with typed values.
+        ("SELECT n FROM t WHERE 1.5 IN (n, 2)", 0),
+        ("SELECT n FROM t WHERE '{1}' IN (a)", 0),
+        // Registers that stand for columns.
+        (
+            "INSERT INTO w VALUES (1, '{1}', 1.5) ON CONFLICT(k) DO UPDATE \
+             SET a = excluded.a WHERE excluded.a > w.a AND excluded.n > w.n",
+            0,
+        ),
+        ("UPDATE w SET a = '{2}'", 0),
+        ("INSERT INTO w VALUES (2, '{1}', 1.5) RETURNING a > '{0}', n > 1.5", 0),
+        // Array function results.
+        ("SELECT n FROM t WHERE b = ARRAY['9'] OR array_append(a, 1) > a", 0),
+        ("SELECT n FROM t WHERE string_to_array('9', ',') = b", 0),
+        // A compound subquery in FROM.
+        ("SELECT x FROM (SELECT n AS x FROM t UNION ALL SELECT m FROM u) WHERE x > 1.5", 0),
+        ("SELECT DISTINCT x FROM (SELECT 1 AS x UNION ALL SELECT n FROM t)", 0),
+        // Automatic indexes.
+        ("SELECT t.n FROM t, u WHERE t.n = u.m AND u.m > 1", 0),
+    ];
+
+    #[test]
+    fn no_text_collation_on_typed_values() {
+        let conn = connection_with_typed_tables();
+        let mut failures = Vec::new();
+        for &(sql, internal_comparisons) in QUERIES {
+            let stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let program = &stmt.get_program().prepared;
+            let instructions = program
+                .insns
+                .iter()
+                .filter(|(insn, _)| compares_values(insn))
+                .flat_map(|(insn, _)| {
+                    insn.collations()
+                        .into_iter()
+                        .map(move |collation| (format!("{insn:?}"), collation))
+                });
+            let index_keys = program
+                .cursor_ref
+                .iter()
+                .filter_map(|(_, cursor_type)| match cursor_type {
+                    CursorType::BTreeIndex(index) if index.ephemeral => Some(index),
+                    _ => None,
+                })
+                .flat_map(|index| {
+                    index.columns.iter().map(move |column| {
+                        (
+                            format!("key {} of index {}", column.name, index.name),
+                            column.collation,
+                        )
+                    })
+                });
+            let with_text_collation: Vec<String> = instructions
+                .chain(index_keys)
+                .filter(|(_, collation)| matches!(collation, CollationSeq::Text(_)))
+                .map(|(place, _)| place)
+                .collect();
+            if with_text_collation.len() != internal_comparisons {
+                failures.push(format!("{sql}\n    {}", with_text_collation.join("\n    ")));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "comparisons of typed values that use a text collation:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Functions and aggregates that never compare values carry an unused
+    /// BINARY collation.
+    fn compares_values(insn: &Insn) -> bool {
+        match insn {
+            Insn::Function { func, .. } => func.func.needs_collation(),
+            Insn::AggStep { data } => data.func.compares_values(),
+            _ => true,
+        }
+    }
+
+    fn connection_with_typed_tables() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE w(k int PRIMARY KEY, a integer[], n numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER w_grew AFTER UPDATE ON w WHEN NEW.a > OLD.a AND NEW.n > OLD.n \
+             BEGIN SELECT 1; END",
+        )
+        .unwrap();
+        conn
     }
 }

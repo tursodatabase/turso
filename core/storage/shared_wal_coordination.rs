@@ -1172,10 +1172,6 @@ impl MappedSharedWalCoordination {
                 continue;
             }
             let slot_index_u32 = slot_index as u32;
-            let _ = self.file.shared_wal_unlock_byte(
-                Self::process_lock_offset_for_reader(slot_index_u32),
-                self.lock_kind(),
-            );
             self.reader_frames()[slot_index].store(UNUSED_READER_FRAME, Ordering::Release);
             if self.uses_linux_ofd_locking() {
                 self.reader_owners()[slot_index].store(UNOWNED_LOCK, Ordering::Release);
@@ -1195,6 +1191,11 @@ impl MappedSharedWalCoordination {
             let word_idx = slot_index >> 6;
             let bit = slot_index & 63;
             self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
+            // Unlock last, as in `unregister_reader`.
+            let _ = self.file.shared_wal_unlock_byte(
+                Self::process_lock_offset_for_reader(slot_index_u32),
+                self.lock_kind(),
+            );
         }
     }
 
@@ -2166,34 +2167,31 @@ impl MappedSharedWalCoordination {
             "reader slot released by non-owner",
             { "slot_index": slot.slot_index, "expected_owner": slot.owner.raw(), "current_owner": current_owner, "local_reader_count": local.reader_locks[slot.slot_index as usize] }
         );
-        if self.uses_linux_ofd_locking() {
-            self.file
-                .shared_wal_unlock_byte(
-                    Self::process_lock_offset_for_reader(slot.slot_index),
-                    self.lock_kind(),
-                )
-                .expect("failed to release shared WAL reader slot lock");
-        } else {
-            self.with_process_local_ownership(|entry| {
-                entry.unregister_reader(slot.slot_index, slot.owner)
-            });
-            self.release_supplemental_byte_lock(Self::process_lock_offset_for_reader(
-                slot.slot_index,
-            ));
-            Self::release_shared_owner_slot(
-                &self.reader_owners()[slot.slot_index as usize],
-                slot.owner,
-            );
-        }
         local.reader_locks[slot.slot_index as usize] -= 1;
         self.reader_frames()[slot.slot_index as usize]
             .store(UNUSED_READER_FRAME, Ordering::Release);
         if self.uses_linux_ofd_locking() {
             self.reader_owners()[slot.slot_index as usize].store(UNOWNED_LOCK, Ordering::Release);
+        } else {
+            Self::release_shared_owner_slot(
+                &self.reader_owners()[slot.slot_index as usize],
+                slot.owner,
+            );
+            self.with_process_local_ownership(|entry| {
+                entry.unregister_reader(slot.slot_index, slot.owner)
+            });
         }
         let word_idx = (slot.slot_index >> 6) as usize;
         let bit = slot.slot_index & 63;
         self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
+        // Unlock last. Once the lock byte is free, another process may reclaim
+        // the slot and register its own reader in it.
+        self.file
+            .shared_wal_unlock_byte(
+                Self::process_lock_offset_for_reader(slot.slot_index),
+                self.lock_kind(),
+            )
+            .expect("failed to release shared WAL reader slot lock");
     }
 
     /// Drop one snapshot-scoped reader reference, releasing the slot on the final ref.
@@ -4555,6 +4553,7 @@ mod tests {
                         Some(mapped.register_reader(mapped.owner_record(), 23).unwrap());
                 }
             }))),
+            after_unlock: Mutex::new(None),
         });
         let mapped = Arc::new(mapped);
         mapping.set(Arc::downgrade(&mapped)).unwrap();
@@ -4573,9 +4572,73 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_after_unregister_unlocks_keeps_its_slot() {
+        reader_registered_after_release_unlocks_keeps_its_slot(|mapped, reader| {
+            mapped.unregister_reader(reader);
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_after_drop_unlocks_keeps_its_slot() {
+        reader_registered_after_release_unlocks_keeps_its_slot(|mapped, _reader| {
+            drop(mapped);
+        });
+    }
+
+    /// Another process repairs and registers a reader right after `release`
+    /// unlocks the slot's lock byte. The slot must keep the new owner.
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    fn reader_registered_after_release_unlocks_keeps_its_slot(
+        release: impl FnOnce(MappedSharedWalCoordination, SharedReaderSlot),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mut releasing = create_mapping(&path);
+        let other_process = Arc::new(create_mapping(&path));
+        assert!(releasing.uses_linux_ofd_locking());
+        let released = releasing
+            .register_reader(releasing.owner_record(), 17)
+            .unwrap();
+
+        let registered = Arc::new(Mutex::new(None));
+        let file = releasing.file.clone();
+        releasing.file = Arc::new(ReaderRegistrationDuringProbeFile {
+            file,
+            before_probe: Mutex::new(None),
+            after_unlock: Mutex::new(Some(Box::new({
+                let other_process = other_process.clone();
+                let registered = registered.clone();
+                move || {
+                    other_process.repair_transient_state_for_exclusive_open();
+                    *registered.lock() = Some(
+                        other_process
+                            .register_reader(other_process.owner_record(), 23)
+                            .unwrap(),
+                    );
+                }
+            }))),
+        });
+
+        release(releasing, released);
+
+        let reader = registered.lock().take().unwrap();
+        assert_eq!(reader.slot_index, released.slot_index);
+        assert_eq!(
+            other_process.reader_owner(reader.slot_index),
+            Some(reader.owner)
+        );
+        assert_eq!(other_process.min_active_reader_frame(), Some(23));
+        other_process.unregister_reader(reader);
+        assert_eq!(other_process.min_active_reader_frame(), None);
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
     struct ReaderRegistrationDuringProbeFile {
         file: Arc<dyn File>,
         before_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        after_unlock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     #[cfg(all(target_os = "linux", not(shuttle)))]
@@ -4627,7 +4690,12 @@ mod tests {
         }
 
         fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
-            self.file.shared_wal_unlock_byte(offset, kind)
+            self.file.shared_wal_unlock_byte(offset, kind)?;
+            let after_unlock = self.after_unlock.lock().take();
+            if let Some(after_unlock) = after_unlock {
+                after_unlock();
+            }
+            Ok(())
         }
     }
 }

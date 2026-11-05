@@ -101,12 +101,14 @@ pub enum Stmt {
         /// password
         key: Option<Box<Expr>>,
     },
-    /// `BEGIN`: tx type, tx name
+    /// `BEGIN`: tx type, tx name, access mode
     Begin {
         // transaction type
         typ: Option<TransactionType>,
         // transaction name
         name: Option<Name>,
+        // READ ONLY or READ WRITE (None = use connection default, i.e. READ WRITE)
+        access_mode: Option<AccessMode>,
     },
     /// `COMMIT`/`END`: tx name
     Commit {
@@ -199,6 +201,11 @@ pub enum Stmt {
         type_name: String,
         /// type body
         body: CreateTypeBody,
+    },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: String,
     },
     /// `CREATE DOMAIN`
     CreateDomain {
@@ -456,9 +463,15 @@ pub enum Expr {
     },
     /// binary expression
     Binary(Box<Expr>, Operator, Box<Expr>),
-    /// Register reference for DBSP expression compilation
-    /// This is not part of SQL syntax but used internally for incremental computation
-    Register(usize),
+    /// A value already in a register, e.g. a column reference that the compiler
+    /// replaced with the register holding the column's value. Not SQL syntax.
+    Register {
+        /// The register.
+        register: usize,
+        /// The custom type of the decoded column value the register holds, so
+        /// that operators on it work as they do on the column.
+        custom_type: Option<Box<Type>>,
+    },
     /// `CASE` expression
     Case {
         /// operand
@@ -487,8 +500,8 @@ pub enum Expr {
         base: Box<Expr>,
         /// field or variant name
         field: Name,
-        /// pre-resolved field/variant index (populated during binding)
-        resolved: Option<FieldAccessResolution>,
+        /// the field or variant, found when the expression is bound
+        resolved: FieldAccessResolution,
     },
     /// call to a built-in function
     FunctionCall {
@@ -655,8 +668,9 @@ impl Default for Expr {
 pub struct Variable {
     pub index: NonZeroU32,
     pub name: Option<Box<str>>,
-    /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
-    pub col_type: Option<Box<str>>,
+    /// The custom type of the decoded column value this parameter holds: a
+    /// trigger's NEW and OLD columns in its body.
+    pub custom_type: Option<Box<Type>>,
     /// Collation of the source column, if the variable stands for a column
     /// (trigger NEW/OLD rewrite). Comparisons of the variable use it like
     /// they use a column's collation.
@@ -673,7 +687,7 @@ impl Variable {
         Self {
             index,
             name: None,
-            col_type: None,
+            custom_type: None,
             col_collation: None,
             numbered: false,
         }
@@ -684,23 +698,23 @@ impl Variable {
         Self {
             index,
             name: None,
-            col_type: None,
+            custom_type: None,
             col_collation: None,
             numbered: true,
         }
     }
 
-    /// A variable that stands for a column with the given declared type and
+    /// A variable that stands for a column with the given custom type and
     /// collation.
-    pub fn for_column(index: NonZeroU32, col_type: &str, col_collation: Option<&str>) -> Self {
+    pub fn for_column(
+        index: NonZeroU32,
+        custom_type: Option<Type>,
+        col_collation: Option<&str>,
+    ) -> Self {
         Self {
             index,
             name: None,
-            col_type: if col_type.is_empty() {
-                None
-            } else {
-                Some(col_type.into())
-            },
+            custom_type: custom_type.map(Box::new),
             col_collation: col_collation.map(Into::into),
             numbered: false,
         }
@@ -710,7 +724,7 @@ impl Variable {
         Self {
             index,
             name: Some(name.into()),
-            col_type: None,
+            custom_type: None,
             col_collation: None,
             numbered: false,
         }
@@ -756,6 +770,14 @@ impl Expr {
 
     pub fn binary(lhs: Expr, operator: Operator, rhs: Expr) -> Expr {
         Expr::Binary(Box::new(lhs), operator, Box::new(rhs))
+    }
+
+    /// A register that holds no custom-type value.
+    pub fn register(register: usize) -> Expr {
+        Expr::Register {
+            register,
+            custom_type: None,
+        }
     }
 
     pub fn not_null(expr: Expr) -> Expr {
@@ -1465,9 +1487,9 @@ pub enum AlterTableBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeOperator {
-    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    /// operator symbol: "+", "-", "*", "/", "%"
     pub op: String,
-    /// function name to call, or None for naked operators (use base type comparison)
+    /// function name to call, or None for naked operators (use the base type's operator)
     pub func_name: Option<String>,
 }
 
@@ -1936,6 +1958,8 @@ pub enum PragmaName {
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// List the collating sequences defined for the connection
+    CollationList,
     /// When ON, each INSERT, UPDATE and DELETE returns one row with the
     /// number of rows it changed.
     CountChanges,
@@ -2245,6 +2269,14 @@ pub enum TransactionType {
     Exclusive,
     /// `CONCURRENT`,
     Concurrent,
+}
+
+/// Transaction access mode (orthogonal to locking type).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
 }
 
 /// Upsert clause

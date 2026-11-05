@@ -1,0 +1,11 @@
+@database :memory:
+
+# Roles are only available through the PostgreSQL frontend. SQLite has no
+# CREATE ROLE statement, so it must stay a syntax error here.
+
+test create-role-is-a-syntax-error {
+    CREATE ROLE alice;
+}
+expect error {
+    ROLE
+}

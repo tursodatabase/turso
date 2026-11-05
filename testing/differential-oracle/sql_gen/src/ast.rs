@@ -1789,7 +1789,12 @@ impl fmt::Display for Literal {
                 if r.is_infinite() || r.is_nan() {
                     write!(f, "NULL")
                 } else {
-                    write!(f, "{r}")
+                    let value = r.to_string();
+                    write!(f, "{value}")?;
+                    if !value.contains(['.', 'e', 'E']) {
+                        write!(f, ".0")?;
+                    }
+                    Ok(())
                 }
             }
             Literal::Text(s) => {
@@ -1818,7 +1823,17 @@ pub struct BinaryOpExpr {
 
 impl fmt::Display for BinaryOpExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}", self.left, self.op, self.right)
+        if matches!(self.left, Expr::BinaryOp(_)) {
+            write!(f, "({})", self.left)?;
+        } else {
+            write!(f, "{}", self.left)?;
+        }
+        write!(f, " {} ", self.op)?;
+        if matches!(self.right, Expr::BinaryOp(_)) {
+            write!(f, "({})", self.right)
+        } else {
+            write!(f, "{}", self.right)
+        }
     }
 }
 
@@ -2365,6 +2380,56 @@ mod tests {
         assert_eq!(Literal::Text("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(Literal::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
+    }
+
+    #[test]
+    fn real_literal_display_preserves_type_and_value() {
+        for value in [
+            0.0,
+            -0.0,
+            1.0,
+            -42.0,
+            3.5,
+            1e20,
+            1e-20,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            let sql = Literal::Real(value).to_string();
+            assert!(sql.contains(['.', 'e', 'E']), "{sql} is an integer literal");
+            assert_eq!(sql.parse::<f64>().unwrap().to_bits(), value.to_bits());
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(Literal::Real(value).to_string(), "NULL");
+        }
+    }
+
+    #[test]
+    fn binary_op_display_preserves_left_operand_grouping() {
+        let expr = BinaryOpExpr {
+            left: Expr::BinaryOp(Box::new(BinaryOpExpr {
+                left: Expr::Literal(Literal::Integer(1)),
+                op: BinOp::Add,
+                right: Expr::Literal(Literal::Integer(2)),
+            })),
+            op: BinOp::Mul,
+            right: Expr::Literal(Literal::Integer(3)),
+        };
+        assert_eq!(expr.to_string(), "(1 + 2) * 3");
+    }
+
+    #[test]
+    fn binary_op_display_preserves_right_operand_grouping() {
+        let expr = BinaryOpExpr {
+            left: Expr::Literal(Literal::Integer(9)),
+            op: BinOp::Sub,
+            right: Expr::BinaryOp(Box::new(BinaryOpExpr {
+                left: Expr::Literal(Literal::Integer(3)),
+                op: BinOp::Sub,
+                right: Expr::Literal(Literal::Integer(1)),
+            })),
+        };
+        assert_eq!(expr.to_string(), "9 - (3 - 1)");
     }
 
     #[test]

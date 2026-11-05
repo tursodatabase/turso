@@ -23,4 +23,4 @@ info:
 ---
 QUERY PLAN
 |--SCAN employees AS e1
-`--SEARCH e2 USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH e2 USING INTEGER PRIMARY KEY (rowid>?)

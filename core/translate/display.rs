@@ -38,7 +38,7 @@ fn fmt_order_by_item(
 /// Build SQLite-style constraint annotation string for an index seek.
 /// e.g. "(label=? AND fromId>?)"
 pub(crate) fn seek_constraint_annotation(
-    index: &crate::schema::Index,
+    index: Option<&crate::schema::Index>,
     seek_def: &SeekDef,
 ) -> String {
     let parts = super::eqp::seek_constraint_parts(index, seek_def);
@@ -164,9 +164,15 @@ impl Display for SelectPlan {
                         Search::RowidEq { .. }
                         | Search::Seek { index: None, .. }
                         | Search::InSeek { index: None, .. } => {
+                            let constraints = match search {
+                                Search::Seek { seek_def, .. } => {
+                                    seek_constraint_annotation(None, seek_def)
+                                }
+                                _ => " (rowid=?)".to_string(),
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
+                                "{indent}SEARCH {} USING INTEGER PRIMARY KEY{constraints}{left_join_suffix}",
                                 reference.identifier
                             )?;
                         }
@@ -174,7 +180,7 @@ impl Display for SelectPlan {
                             index: Some(index),
                             seek_def,
                         } => {
-                            let constraints = seek_constraint_annotation(index, seek_def);
+                            let constraints = seek_constraint_annotation(Some(index), seek_def);
                             let covering = if reference.utilizes_covering_index() {
                                 "COVERING "
                             } else {
@@ -279,9 +285,15 @@ impl Display for DeletePlan {
                     Search::RowidEq { .. }
                     | Search::Seek { index: None, .. }
                     | Search::InSeek { index: None, .. } => {
+                        let constraints = match search {
+                            Search::Seek { seek_def, .. } => {
+                                seek_constraint_annotation(None, seek_def)
+                            }
+                            _ => " (rowid=?)".to_string(),
+                        };
                         writeln!(
                             f,
-                            "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                            "{}SEARCH {} USING INTEGER PRIMARY KEY{constraints}",
                             indent, reference.identifier
                         )?;
                     }
@@ -393,9 +405,15 @@ impl fmt::Display for UpdatePlan {
                     Search::RowidEq { .. }
                     | Search::Seek { index: None, .. }
                     | Search::InSeek { index: None, .. } => {
+                        let constraints = match search {
+                            Search::Seek { seek_def, .. } => {
+                                seek_constraint_annotation(None, seek_def)
+                            }
+                            _ => " (rowid=?)".to_string(),
+                        };
                         writeln!(
                             f,
-                            "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                            "{}SEARCH {} USING INTEGER PRIMARY KEY{constraints}",
                             indent, reference.identifier
                         )?;
                     }

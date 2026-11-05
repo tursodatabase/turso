@@ -311,7 +311,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 m.is_rowid_alias,
                                 &field_name,
                                 m.type_def,
-                            );
+                            )?;
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
@@ -467,7 +467,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                         col.is_rowid_alias(),
                                         &field_name,
                                         type_def.unwrap(),
-                                    );
+                                    )?;
                                     referenced_tables.mark_column_used(tbl_id, col_idx);
                                     return Ok(WalkControl::Continue);
                                 } else {
@@ -598,11 +598,47 @@ pub fn bind_and_rewrite_expr<'a>(
                     )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
                 }
+                // INSERT replaces a DEFAULT in VALUES with the column's default
+                // before binding, so any DEFAULT left is misplaced.
+                Expr::Default => {
+                    crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
+                }
                 _ => {}
             }
             Ok(WalkControl::Continue)
         },
     )?;
+    check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
+}
+
+/// Fails when `expr` uses an operator that no function of its operands' types
+/// runs, such as `d * 2` for a date d, applies a COLLATE to a type that takes
+/// none, or compares two types with different orders. This runs on every
+/// expression a statement binds, so it also catches what the planner never
+/// compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are
+/// bound only once the binding walk is done, so these are further walks.
+pub(crate) fn check_custom_types(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    // Only custom types and arrays refuse an operator, a COLLATE or a
+    // comparison. Without custom types enabled there are neither: the type
+    // registry is empty and arrays are refused.
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let context = ExprContext::new(tables, resolver);
+    // Operators first: `(d * 2) COLLATE nocase` fails because `*` does not
+    // exist for a date, not because its result has no type.
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_custom_operator(expr, &context.type_env())?;
+        Ok(WalkControl::Continue)
+    })?;
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_expr_collation(expr, &context)?;
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
@@ -616,7 +652,20 @@ pub(crate) fn validate_function_tail(
     if !has_order_by && filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
     }
-    match resolver.resolve_function(name, arg_count)? {
+    let func = match resolver.resolve_function(name, arg_count) {
+        Ok(func) => func,
+        // SQLite reports OVER on a scalar function before a wrong argument count.
+        Err(err) if filter_over.over_clause.is_some() => {
+            match crate::dialect::engine::resolve_builtin_function_name(name, arg_count) {
+                Ok(Some(Func::Scalar(_))) => {
+                    crate::bail_parse_error!("{} may not be used as a window function", name)
+                }
+                _ => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    match func {
         Some(Func::Agg(_) | Func::Window(_)) | None => Ok(()),
         Some(Func::External(func)) if func.func.is_aggregate() => Ok(()),
         _ if has_order_by => {
@@ -1047,7 +1096,7 @@ pub(super) fn resolve_typedef_from_column(
         ast::Expr::Column { table, column, .. } => {
             resolve_column_type_str(*table, *column, referenced_tables, resolver)?
         }
-        ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
+        ast::Expr::Variable(var) => var.custom_type.as_ref()?.name.clone(),
         _ => return None,
     };
     let td = resolver.schema().get_type_def_unchecked(&ty_str)?;
@@ -1184,16 +1233,33 @@ pub(super) fn find_custom_type_column<'a>(
 }
 
 /// Build an `Expr::FieldAccess { base: Expr::Column { ... }, field, resolved }` node,
-/// pre-resolving the field index via `resolve_field_access`.
+/// resolving the field index via `resolve_field_access`. Fails when `td` has no
+/// such field or variant.
 pub(super) fn make_field_access_expr(
     table_id: TableInternalId,
     col_idx: usize,
     is_rowid_alias: bool,
     field_name: &str,
     td: &crate::schema::TypeDef,
-) -> Expr {
-    let resolved = resolve_field_access(td, field_name);
-    Expr::FieldAccess {
+) -> Result<Expr> {
+    let Some(resolved) = resolve_field_access(td, field_name) else {
+        if td.is_struct() {
+            crate::bail_parse_error!(
+                "no such field '{}' in struct type '{}'",
+                field_name,
+                td.name
+            );
+        }
+        if td.is_union() {
+            crate::bail_parse_error!(
+                "no such variant '{}' in union type '{}'",
+                field_name,
+                td.name
+            );
+        }
+        crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
+    };
+    Ok(Expr::FieldAccess {
         base: Box::new(Expr::Column {
             database: None,
             table: table_id,
@@ -1202,7 +1268,7 @@ pub(super) fn make_field_access_expr(
         }),
         field: ast::Name::from_bytes(field_name.as_bytes()),
         resolved,
-    }
+    })
 }
 
 /// Try to resolve `col_name.mid_name.leaf_name` as 2-level deep field access
@@ -1234,13 +1300,18 @@ pub(super) fn try_resolve_nested_field_access<'a>(
                 .map(|(_, f)| f.type_name.as_str())
         });
 
-    let has_leaf = inner_type_name
-        .and_then(|tn| resolver.schema().get_type_def_unchecked(tn))
-        .is_some_and(|itd| itd.find_struct_field(leaf_name).is_some());
-
-    if !has_leaf {
+    let inner_td = inner_type_name.and_then(|tn| resolver.schema().get_type_def_unchecked(tn));
+    let Some((mid_resolution, leaf_resolution)) = inner_td.and_then(|inner_td| {
+        let leaf_index = inner_td.find_struct_field(leaf_name)?.0;
+        Some((
+            resolve_field_access(td, mid_name)?,
+            ast::FieldAccessResolution::StructField {
+                field_index: leaf_index,
+            },
+        ))
+    }) else {
         return Ok(None);
-    }
+    };
 
     let nested_expr = Expr::FieldAccess {
         base: Box::new(Expr::FieldAccess {
@@ -1251,10 +1322,10 @@ pub(super) fn try_resolve_nested_field_access<'a>(
                 is_rowid_alias: m.is_rowid_alias,
             }),
             field: ast::Name::from_bytes(mid_name.as_bytes()),
-            resolved: None,
+            resolved: mid_resolution,
         }),
         field: ast::Name::from_bytes(leaf_name.as_bytes()),
-        resolved: None,
+        resolved: leaf_resolution,
     };
 
     Ok(Some((nested_expr, m.table_id, m.col_idx)))
@@ -1271,67 +1342,6 @@ pub(super) fn resolve_field_access(
         Some(ast::FieldAccessResolution::UnionVariant { tag_index: tag_idx })
     } else {
         None
-    }
-}
-
-/// Recursively resolve the output TypeDef of an expression.
-///
-/// For `Expr::Column`, returns the column's declared custom type.
-/// For `Expr::FieldAccess`, recurses into the base to find the parent type,
-/// then looks up what type the accessed field/variant produces.
-/// Returns `None` for expressions that don't produce a known custom type.
-pub(super) fn resolve_expr_output_type<'a>(
-    expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &'a Resolver<'a>,
-) -> crate::Result<&'a crate::schema::TypeDef> {
-    match expr {
-        ast::Expr::Column { table, column, .. } => {
-            let Some(referenced_tables) = referenced_tables else {
-                crate::bail_parse_error!("cannot resolve type: no table context");
-            };
-            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table) else {
-                crate::bail_parse_error!("cannot resolve type: table not found");
-            };
-            let col = &tbl.columns()[*column];
-            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
-                crate::bail_parse_error!(
-                    "column '{}' has type '{}' which is not a known struct or union type",
-                    col.name.as_deref().unwrap_or("?"),
-                    col.ty_str
-                );
-            };
-            Ok(td)
-        }
-        ast::Expr::FieldAccess { base, field, .. } => {
-            let parent_td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-            let field_name = normalize_ident(field.as_str());
-            // Find what type this field/variant produces
-            let inner_type_name =
-                if let Some((_, variant)) = parent_td.find_union_variant(&field_name) {
-                    &variant.type_name
-                } else if let Some((_, f)) = parent_td.find_struct_field(&field_name) {
-                    &f.type_name
-                } else {
-                    let kind = if parent_td.is_union() {
-                        "variant"
-                    } else {
-                        "field"
-                    };
-                    crate::bail_parse_error!("no such {} '{}' in type", kind, field_name);
-                };
-            let Some(td) = resolver.schema().get_type_def_unchecked(inner_type_name) else {
-                crate::bail_parse_error!(
-                    "'{}' resolves to type '{}' which is not a known type",
-                    field_name,
-                    inner_type_name
-                );
-            };
-            Ok(td)
-        }
-        _ => {
-            crate::bail_parse_error!("expression does not produce a known custom type");
-        }
     }
 }
 

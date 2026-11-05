@@ -1,17 +1,19 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{first_collation, CollationSeq};
+use crate::translate::collate::{compound_column_collation, CollationSeq};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
-use crate::translate::expr_context::ExprContext;
-use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
+use crate::translate::order_by::sorter_insert;
+use crate::translate::plan::{
+    CompoundOrderByKey, EvalAt, Plan, QueryDestination, SelectPlan, SubqueryOrigin,
+};
 use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
@@ -50,6 +52,16 @@ pub fn emit_program_for_compound_select(
         false,
     ));
 
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &right_most_ctx.resolver,
+        &mut right_most.non_from_clause_subqueries,
+        &[],
+        None,
+        EvalAt::BeforeLoop,
+        |subquery| matches!(subquery.origin, SubqueryOrigin::SelectLimitOffset),
+    )?;
+
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
     // When ORDER BY is present, LIMIT/OFFSET apply to the final sorted output, not intermediate results.
@@ -78,7 +90,7 @@ pub fn emit_program_for_compound_select(
                         }
                     }
                     _ => {
-                        _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+                        _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver)?;
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg,
@@ -116,7 +128,7 @@ pub fn emit_program_for_compound_select(
                             offset_expr,
                             reg,
                             &right_most_ctx.resolver,
-                        );
+                        )?;
                     }
                 }
                 program.add_comment(program.offset(), "OFFSET counter");
@@ -814,29 +826,21 @@ fn create_collection_index(
     Ok((cursor_id, index))
 }
 
-/// The collation of one result column of a compound SELECT: that of the
-/// leftmost SELECT whose column has one, as in SQLite's `multiSelectCollSeq`.
 /// The collation of each compound result column. Every ephemeral index of the
 /// compound, including those of nested arms, uses it, as SQLite's
-/// multiSelectCollSeq does: the first explicit collation among all the arms.
+/// multiSelectCollSeq does.
 fn compound_collations(
     left: &[(SelectPlan, CompoundOperator)],
     right_most: &SelectPlan,
     resolver: &Resolver,
 ) -> crate::Result<Vec<CollationSeq>> {
-    let selects = left.iter().map(|(select, _)| select).chain([right_most]);
+    let arms: Vec<&SelectPlan> = left
+        .iter()
+        .map(|(select, _)| select)
+        .chain([right_most])
+        .collect();
     (0..right_most.result_columns.len())
-        .map(|column| {
-            first_collation(
-                selects.clone().map(|select| {
-                    (
-                        &select.result_columns[column].expr,
-                        ExprContext::new(Some(&select.table_references), resolver),
-                    )
-                }),
-                &resolver.catalog,
-            )
-        })
+        .map(|column| compound_column_collation(&arms, column, resolver))
         .collect()
 }
 
@@ -877,7 +881,7 @@ fn emit_compound_order_by(
         // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
         .chain(std::iter::once((
             SortOrder::Asc,
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
             None,
         )))
         .try_collect()?;
@@ -906,28 +910,11 @@ fn emit_compound_order_by(
     let sorter_column_count = order_by.len() + 1 + non_dedup_count;
 
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
-    // Resolve custom type comparators for ORDER BY columns (e.g. numeric(10,2) needs
-    // NumericLt to sort correctly instead of default blob/text comparison).
-    let comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> = order_by
-        .iter()
-        .map(|(col_idx, _, _, _)| {
-            program.result_columns.get(*col_idx).and_then(|rc| {
-                custom_type_comparator(
-                    &rc.expr,
-                    &program.table_references,
-                    &right_most_ctx.resolver,
-                )
-            })
-        })
-        // No comparator needed for the sequence tie-breaker column
-        .chain(std::iter::once(None))
-        .try_collect()?;
     program.emit_insn(Insn::SorterOpen {
         data: Box::new(SorterOpenData {
             cursor_id: sort_cursor,
             columns: order_collations_nulls.len(),
             order_collations_nulls,
-            comparators,
         }),
     });
 
@@ -1034,7 +1021,7 @@ fn emit_compound_order_by(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver);
+                    _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver)?;
                     program.add_comment(program.offset(), "LIMIT counter");
                     program.emit_insn(Insn::MustBeInt {
                         reg,
@@ -1061,7 +1048,7 @@ fn emit_compound_order_by(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver)?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");

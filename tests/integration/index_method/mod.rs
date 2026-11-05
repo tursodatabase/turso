@@ -31,6 +31,7 @@ use turso_core::{
 };
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, ExecRows, TempDatabase};
+use turso_sqlite::SqliteDialect;
 
 fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> turso_core::types::IOResultOr<T>) -> Result<T> {
     loop {
@@ -66,7 +67,7 @@ fn fts_test_stats(
             index_name: index_name.to_string(),
             columns: columns
                 .iter()
-                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::Binary))
+                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
                 .collect(),
             parameters: HashMap::default(),
         })
@@ -189,7 +190,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -281,7 +282,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -373,7 +374,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -706,8 +707,8 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
             columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::Binary),
-                IndexColumn::new("body", 2, CollationSeq::Binary),
+                IndexColumn::new("title", 1, CollationSeq::BINARY),
+                IndexColumn::new("body", 2, CollationSeq::BINARY),
             ],
             parameters: HashMap::default(),
         })
@@ -757,8 +758,8 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
             columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::Binary),
-                IndexColumn::new("body", 2, CollationSeq::Binary),
+                IndexColumn::new("title", 1, CollationSeq::BINARY),
+                IndexColumn::new("body", 2, CollationSeq::BINARY),
             ],
             parameters: HashMap::default(),
         })
@@ -3135,7 +3136,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         flags,
         opts,
         None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
+        std::sync::Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -3161,7 +3162,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         flags,
         opts,
         None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
+        std::sync::Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -5117,7 +5118,7 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
-            columns: vec![IndexColumn::new("content", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -6781,7 +6782,8 @@ fn fts_dump_backing_rows_tool() {
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
-    use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect};
+    use turso_core::{Database, DatabaseOpts, OpenFlags};
+    use turso_sqlite::SqliteDialect;
     // Multiprocess WAL needs an IO backend with shared-memory coordination.
     // The default platform IO has it on unix but not on Windows (only the
     // IOCP backend does there), and the open below refuses without it.

@@ -3790,6 +3790,76 @@ expect {
     {"a":[1,2,3,4]}
 }
 
+# Appending to the root array must grow the root array header by the size of
+# the appended value. An empty array or object is one byte, the same size as
+# the placeholder written before the value, so a header that misses the
+# placeholder byte drops the appended value.
+test json_set_array_append_empty_container_at_root {
+    SELECT json_set('["i1"]', '$[#]', json('[]')),
+           json(jsonb_set('["i1"]', '$[#]', json('[]'))),
+           json_set('[1]', '$[#]', json('{}')),
+           json_set('[]', '$[#]', json('[]')),
+           json_insert('[1]', '$[#]', json('[]')),
+           json_set('[1]', '$[1]', json('[]')),
+           json_insert('[1]', '$[1]', json('{}'));
+}
+expect {
+    ["i1",[]]|["i1",[]]|[1,{}]|[[]]|[1,[]]|[1,[]]|[1,{}]
+}
+
+test jsonb_set_array_append_at_root_header_size {
+    SELECT hex(jsonb_set('[1]', '$[#]', 5)),
+           hex(jsonb_set('[1]', '$[#]', json('[2]'))),
+           hex(jsonb_insert('[1]', '$[#]', json('[]'))),
+           hex(jsonb_set('[1,2,3,4,5]', '$[#]', 6)),
+           hex(jsonb_set('[1,2,3,4,5]', '$[5]', json('[]'), '$[#]', json('{}')));
+}
+expect {
+    4B13311335|5B13312B1332|3B13310B|CB0C133113321333133413351336|CB0C133113321333133413350B0C
+}
+
+test json_set_array_append_at_root_then_key {
+    SELECT json_set('[1]', '$[#].a', json('[]')),
+           json(jsonb_set('[1]', '$[#].a', 5));
+}
+expect {
+    [1,{"a":[]}]|[1,{"a":5}]
+}
+
+# An array index after another array index must not turn an empty object that
+# is already in the document into an array: SQLite leaves the document
+# unchanged.
+test json_set_array_index_into_existing_empty_object {
+    SELECT json_set('[{}]', '$[0][#]', 1),
+           json_set('[{}]', '$[0][0]', 1),
+           json_set('[{}]', '$[#-1][#]', 1),
+           json_insert('[{}]', '$[0][#]', 1),
+           json(jsonb_set('[{}]', '$[0][#]', 1)),
+           json(jsonb_insert('[{}]', '$[0][#]', 1)),
+           json(jsonb_set(x'2bcc00', '$[0][#]', 1)),
+           json_set('[[{}]]', '$[0][0][#]', 1),
+           json_set('{"a":[{}]}', '$.a[0][#]', 1);
+}
+expect {
+    [{}]|[{}]|[{}]|[{}]|[{}]|[{}]|[{}]|[[{}]]|{"a":[{}]}
+}
+
+# A path that creates nested arrays creates each one as an array directly, and
+# every new array header counts the array created inside it.
+test jsonb_set_nested_array_append_creates_arrays {
+    SELECT hex(jsonb_set('[]', '$[#][#]', 1)),
+           hex(jsonb_set('[]', '$[0][0][0]', 1)),
+           hex(jsonb_set('[]', '$[#][#][#][#]', 1)),
+           hex(jsonb_insert('[[]]', '$[0][#][#]', json('[]'))),
+           hex(jsonb_set('{"a":[]}', '$.a[#][#][#]', 1)),
+           hex(jsonb_set('[[1,2,3,4,5,6,7,8,9]]', '$[0][#][#]', 1)),
+           json_set('{}', '$.a[0][#][#]', 1),
+           json_set('[]', '$[#].a[#]', 2);
+}
+expect {
+    3B2B1331|4B3B2B1331|5B4B3B2B1331|3B2B1B0B|7C17614B3B2B1331|CB17CB151331133213331334133513361337133813392B1331|{"a":[[[1]]]}|[{"a":[2]}]
+}
+
 # A BLOB argument is read as JSONB, so every element type, payload size and
 # text byte in it is caller-controlled. Validation used to be skipped whenever
 # the payload exceeded 7 bytes, which let arbitrary bytes reach

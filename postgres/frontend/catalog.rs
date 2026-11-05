@@ -8,14 +8,17 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
-    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
-    Value,
+    security::roles::{Role, RoleCatalog, RoleId},
+    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
+    Result, Statement, Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::{RefAct, SortOrder};
+use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
+use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
+use turso_sqlite::SqliteDialect;
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -46,7 +49,7 @@ impl Dialect for PostgresDialect {
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
-            return turso_core::dialect::sqlite::parse(sql);
+            return turso_core::dialect::engine::parse(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
@@ -61,9 +64,9 @@ impl Dialect for PostgresDialect {
             None => sql.len(),
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        match translator.translate(&parse_result) {
-            Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
-            Err(_) => turso_core::dialect::sqlite::parse(sql),
+        match translator.translate_with_prereqs(&parse_result) {
+            Ok(translated) => Ok((Some(translated.cmd), consumed)),
+            Err(_) => turso_core::dialect::engine::parse(sql),
         }
     }
 
@@ -101,7 +104,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::sqlite::parse_table_sql_ast(sql);
+            return turso_core::dialect::engine::parse_table_sql_ast(sql);
         };
 
         let parse_result =
@@ -120,7 +123,7 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::sqlite::table_sql_for_replay(sql);
+            return turso_core::dialect::engine::table_sql_for_replay(sql);
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -164,11 +167,11 @@ impl Dialect for PostgresDialect {
     }
 
     fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
-        turso_core::dialect::sqlite::SqliteDialect.format_rewritten_table_sql(stmt)
+        SqliteDialect.format_rewritten_table_sql(stmt)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::engine::register_builtin_catalog(schema, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -178,7 +181,13 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+        // random() is a native function (see functions.rs) because it returns
+        // a double, not SQLite's integer. Skipping the builtin lets that one
+        // be found.
+        if name.eq_ignore_ascii_case("random") {
+            return Ok(None);
+        }
+        turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -189,16 +198,15 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn random_value(&self, bits: i64) -> Value {
-        let mantissa = (bits as u64) >> 11;
-        Value::from_f64(mantissa as f64 / (1_u64 << 53) as f64)
-    }
-
     fn binds_names_at_create(&self) -> bool {
         true
     }
 
     fn supports_namespaces(&self) -> bool {
+        true
+    }
+
+    fn supports_roles(&self) -> bool {
         true
     }
 
@@ -214,11 +222,27 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn constraint_errors_show_values(&self) -> bool {
+        true
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
 
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
+        true
+    }
+
+    fn allows_qualified_columns_in_index_terms(&self) -> bool {
+        true
+    }
+
+    fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
 }
@@ -773,9 +797,34 @@ impl SnapshotRows for PgAttributeTable {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns the "turso" superuser and the built-in database owner role.
-/// TODO: replace with real role data when authentication is implemented.
+const SUPERUSER_OID: i64 = 10;
+const USER_ROLE_OID_START: i64 = 16384;
+
+/// Returns the PostgreSQL OID of a role. The built-in superuser has the OID
+/// of the PostgreSQL bootstrap superuser, and `public` has OID 0, as in
+/// PostgreSQL's access control lists.
+pub(crate) fn role_oid(id: RoleId) -> i64 {
+    match id {
+        RoleId::SUPERUSER => SUPERUSER_OID,
+        RoleId::PUBLIC => 0,
+        _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// The roles that PostgreSQL has: its bootstrap superuser, which is the
+/// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.
+/// `public` is not a role in PostgreSQL, only a name for [RoleId::PUBLIC] in
+/// access control lists.
+pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> + '_ {
+    let superuser = Role {
+        id: RoleId::SUPERUSER,
+        name: BOOTSTRAP_SUPERUSER_NAME.to_string(),
+        superuser: true,
+    };
+    std::iter::once(superuser).chain(roles.iter().cloned())
+}
+
+/// Virtual table implementation for pg_catalog.pg_roles.
 #[derive(Debug)]
 struct PgRolesTable;
 
@@ -799,40 +848,51 @@ impl SnapshotRows for PgRolesTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![
-            vec![
-                Value::from_i64(10),        // oid
-                Value::build_text("turso"), // rolname
-                Value::from_i64(1),         // rolsuper
-                Value::from_i64(1),         // rolinherit
-                Value::from_i64(1),         // rolcreaterole
-                Value::from_i64(1),         // rolcreatedb
-                Value::from_i64(1),         // rolcanlogin
-                Value::from_i64(1),         // rolreplication
-                Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-                Value::Null,                // rolpassword (never exposed)
-                Value::Null,                // rolvaliduntil
-                Value::from_i64(1),         // rolbypassrls
-                Value::Null,                // rolconfig
-            ],
-            vec![
-                Value::from_i64(PG_DATABASE_OWNER_OID),
-                Value::build_text("pg_database_owner"),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(-1),
-                Value::Null,
-                Value::Null,
-                Value::from_i64(0),
-                Value::Null,
-            ],
-        ]
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows: Vec<_> = postgres_roles(&conn.role_catalog())
+            .map(|role| role_row(&role))
+            .collect();
+        // The owner of the public schema, which PostgreSQL makes for every
+        // database.
+        rows.push(vec![
+            Value::from_i64(PG_DATABASE_OWNER_OID),
+            Value::build_text("pg_database_owner"),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(-1),
+            Value::Null,
+            Value::Null,
+            Value::from_i64(0),
+            Value::Null,
+        ]);
+        rows
     }
+}
+
+/// `CREATE ROLE` creates roles that cannot log in, so only the built-in
+/// superuser can.
+fn role_row(role: &Role) -> Vec<Value> {
+    let superuser = Value::from_i64(role.superuser as i64);
+    let can_login = role.id == RoleId::SUPERUSER;
+    vec![
+        Value::from_i64(role_oid(role.id)),   // oid
+        Value::build_text(role.name.clone()), // rolname
+        superuser.clone(),                    // rolsuper
+        Value::from_i64(1),                   // rolinherit
+        superuser.clone(),                    // rolcreaterole
+        superuser.clone(),                    // rolcreatedb
+        Value::from_i64(can_login as i64),    // rolcanlogin
+        superuser.clone(),                    // rolreplication
+        Value::from_i64(-1),                  // rolconnlimit (-1 = no limit)
+        Value::Null,                          // rolpassword (never exposed)
+        Value::Null,                          // rolvaliduntil
+        superuser,                            // rolbypassrls
+        Value::Null,                          // rolconfig
+    ]
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -1172,7 +1232,7 @@ impl SnapshotRows for PgTablesTable {
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                 Value::Text(btree.declared_name.clone().into()),                   // tablename
-                Value::Text("turso".into()),                                       // tableowner
+                Value::build_text(BOOTSTRAP_SUPERUSER_NAME),                       // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
                 Value::from_i64(0),                                                // hasrules
@@ -2072,7 +2132,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::build_text(render_expr(&chk.expr)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2122,10 +2182,10 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),                 // oid
+                        Value::from_i64(table_oid),                   // adrelid
+                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
+                        Value::build_text(render_expr(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -2241,16 +2301,16 @@ impl SnapshotRows for PgSequencesTable {
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
                     Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
+                    Value::build_text(seq_name), // sequencename
+                    Value::build_text(BOOTSTRAP_SUPERUSER_NAME), // sequenceowner
+                    Value::build_text("bigint"), // data_type
+                    Value::from_i64(seq.start_value), // start_value
+                    Value::from_i64(seq.min_value), // min_value
+                    Value::from_i64(seq.max_value), // max_value
+                    Value::from_i64(seq.increment_by), // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    Value::from_i64(1),          // cache_size (PG default; Turso doesn't cache)
+                    Value::from_i64(last_val),   // last_value
                 ]);
             }
         }
@@ -3770,7 +3830,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
+                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
             }
             constraint_oid += 1;
         }
@@ -3794,6 +3854,22 @@ fn constraint_column_list<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn render_expr(expr: &ast::Expr) -> String {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            if args.is_empty() {
+                if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
+                    *expr = ast::Expr::Id(ast::Name::from_string(keyword));
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("rewriting role functions does not fail");
+    expr.to_string()
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
@@ -4002,6 +4078,26 @@ mod tests {
     }
 
     #[test]
+    fn dialect_parse_preserves_explain_command() {
+        use turso_parser::ast::{Cmd, EqpFormat};
+
+        for sql in ["EXPLAIN SELECT 7", "EXPLAIN SELECT 7::text"] {
+            let (cmd, consumed) = PostgresDialect.parse(sql).unwrap();
+            assert_eq!(consumed, sql.len());
+            assert!(
+                matches!(
+                    cmd,
+                    Some(Cmd::ExplainQueryPlan {
+                        format: EqpFormat::Text,
+                        ..
+                    })
+                ),
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
     fn primary_key_index_prefixes_colliding_names() {
         let mut schema = Schema::new();
         let public = NamespaceId::new(1);
@@ -4038,7 +4134,7 @@ mod tests {
         let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Parse error: PostgreSQL does not support WITHOUT ROWID table 't'"
+            "PostgreSQL does not support WITHOUT ROWID table 't'"
         );
         assert!(PostgresDialect
             .parse_table_sql("CREATE TABLE t(a TEXT PRIMARY KEY, b)", 2)
@@ -4610,7 +4706,7 @@ mod tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new(),
             None,
-            Arc::new(turso_core::SqliteDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

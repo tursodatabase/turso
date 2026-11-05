@@ -268,6 +268,11 @@ Supported common connection string keywords include:
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
 | `Sync Interval` | Embedded replica automatic pull interval in seconds. `0` disables automatic sync. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
+| `BinaryGUID` | Defaults to `False`: a `Guid` parameter binds as 36-character uppercase TEXT, as in Microsoft.Data.Sqlite. Set `True` to bind an untyped `Guid` as a 16-byte BLOB (`Guid.ToByteArray()`). A parameter typed as `DbType.Guid` or `SqliteType.Text`, which is what EF Core sends, binds as TEXT either way. `GetGuid` reads both forms. |
+
+`TursoConnection` accepts the same `BinaryGUID=True` opt-in, and a `TursoParameter` typed as `DbType.Guid` stays TEXT
+there too. `TursoParameter` has no untyped state, so its default `DbType.String` counts as untyped. A `TursoParameter`
+whose `DbType` is `DbType.Binary` binds a `Guid` as a BLOB without the option.
 
 ## SQLite-compatible facade coverage
 

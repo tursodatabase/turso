@@ -125,6 +125,7 @@ sqlite+turso:///db.db?isolation_level=IMMEDIATE
 
 Query parameters:
 - `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `timeout` - Seconds to wait for a database locked by another connection before raising `OperationalError` (default: 5.0, like `sqlite3.connect`)
 - `experimental_features` - Comma-separated feature flags
 
 ### Async Local Dialect (`sqlite+aioturso://`)
@@ -137,6 +138,7 @@ sqlite+aioturso:///db.db?isolation_level=IMMEDIATE
 
 Query parameters:
 - `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `timeout` - Seconds to wait for a database locked by another connection before raising `OperationalError` (default: 5.0, like `sqlite3.connect`)
 - `experimental_features` - Comma-separated feature flags
 
 ### Sync Dialect (`sqlite+turso_sync://`)
@@ -152,6 +154,7 @@ Query parameters:
 - `long_poll_timeout_ms` - Long poll timeout in milliseconds
 - `bootstrap_if_empty` - Bootstrap from remote if local empty (default: true)
 - `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `timeout` - Seconds to wait for a database locked by another connection before raising `OperationalError` (default: 5.0, like `sqlite3.connect`)
 - `experimental_features` - Comma-separated feature flags
 
 URL validation:

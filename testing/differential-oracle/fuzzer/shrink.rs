@@ -19,11 +19,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use turso_core::{ConnectOpts, Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database};
 use turso_parser::ast::{
     Cmd, Expr, InsertBody, Literal, OneSelect, ResultColumn, Select, SelectTable, Stmt,
 };
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 use crate::memory::MemorySimIO;
 use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};

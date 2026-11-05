@@ -53,7 +53,7 @@ pub(super) fn translate_like_base(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
         }
@@ -85,7 +85,7 @@ pub(super) fn translate_like_base(
                 func: FuncCtx {
                     func,
                     arg_count,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
         }
@@ -211,6 +211,7 @@ pub(super) fn translate_sequence_function(
             None => (resolver.resolve_existing_sequence(&name)?, name),
         }
     };
+    crate::translate::roles::check_sequence_change(resolver, &normalized_name)?;
     let database_id = namespace.database_id;
     let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
     let runtime_args = qualify_sequence_argument(args, resolver);
