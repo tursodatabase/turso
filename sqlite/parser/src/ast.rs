@@ -748,6 +748,10 @@ pub enum SubqueryType {
     RowValue {
         result_reg_start: usize,
         num_regs: usize,
+        /// When a second row is an error, the register that counts the
+        /// subquery's rows: 0, 1, or NULL for more than one. Reading the
+        /// result raises the error if it is NULL.
+        row_count_reg: Option<usize>,
     },
     /// IN subquery; result is stored in an ephemeral index.
     /// Example: `x <NOT> IN (SELECT ...)`

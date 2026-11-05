@@ -715,6 +715,9 @@ pub enum QueryDestination {
         result_reg_start: usize,
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
+        /// The register that counts the stored rows, when a second row is an
+        /// error (see [ast::SubqueryType::RowValue]).
+        row_count_reg: Option<usize>,
     },
     /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
     /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.

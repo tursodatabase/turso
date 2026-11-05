@@ -231,6 +231,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a subquery used as an expression, such as `x = (SELECT ...)`,
+    /// raises an error when it returns more than one row.
+    ///
+    /// PostgreSQL raises SQLSTATE 21000. SQLite uses the first row.
+    fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.

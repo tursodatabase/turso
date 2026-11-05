@@ -431,6 +431,7 @@ pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } if *num_regs > 1 && idx < *num_regs => Ok(Cow::Owned(Expr::SubqueryResult {
             subquery_id: *subquery_id,
@@ -439,6 +440,7 @@ pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_
             query_type: ast::SubqueryType::RowValue {
                 result_reg_start: result_reg_start + idx,
                 num_regs: 1,
+                row_count_reg: *row_count_reg,
             },
         })),
         _ => Ok(Cow::Borrowed(expr)),

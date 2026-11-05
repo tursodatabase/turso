@@ -524,8 +524,19 @@ fn translate_subquery_result_expr(
         SubqueryType::RowValue {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
             assert_register_range_allocated(program, target_register, *num_regs)?;
+            if let Some(row_count_reg) = *row_count_reg {
+                program.emit_insn(Insn::HaltIfNull {
+                    constraint_info: None,
+                    target_reg: row_count_reg,
+                    err_code: SQLITE_ERROR,
+                    description: "more than one row returned by a subquery used as an expression"
+                        .to_string(),
+                    on_error: None,
+                });
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: *result_reg_start,
                 dst_reg: target_register,

@@ -218,6 +218,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
+        true
+    }
+
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }
