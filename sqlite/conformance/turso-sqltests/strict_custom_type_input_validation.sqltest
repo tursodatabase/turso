@@ -415,20 +415,57 @@ expect {
 }
 
 # A key that doesn't convert to the BASE is compared as it is, as for a
-# STRICT INTEGER column: integers sort before text.
+# STRICT INTEGER column: integers sort before text. The text is built with ||
+# because a literal would be read as a value of the type.
 test index-and-scan-agree-on-a-key-that-does-not-convert {
     CREATE TYPE iv BASE integer ENCODE value DECODE value OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
     INSERT INTO t VALUES (1, 5), (2, 10);
     CREATE INDEX i ON t(c);
-    SELECT 'eq', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c = 'abc'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c = 'abc');
-    SELECT 'lt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c < 'abc'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c < 'abc');
-    SELECT 'gt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c > 'abc'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c > 'abc');
+    SELECT 'eq', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c = 'ab' || 'c'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c = 'ab' || 'c');
+    SELECT 'lt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c < 'ab' || 'c'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c < 'ab' || 'c');
+    SELECT 'gt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c > 'ab' || 'c'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c > 'ab' || 'c');
 }
 expect {
     eq||
     lt|1,2|1,2
     gt||
+}
+
+# A literal is read as a value of the type, as INSERT reads it, so one that is
+# not an integer is an error, by a scan and through an index.
+test literal-that-does-not-convert-is-an-error-scan {
+    CREATE TYPE iv BASE integer ENCODE value DECODE value OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 10);
+    SELECT id FROM t WHERE c < 'abc';
+}
+expect error {
+    cannot store TEXT value as type iv
+}
+
+test literal-that-does-not-convert-is-an-error-index {
+    CREATE TYPE iv BASE integer ENCODE value DECODE value OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 10);
+    CREATE INDEX i ON t(c);
+    SELECT id FROM t INDEXED BY i WHERE c = 'abc';
+}
+expect error {
+    cannot store TEXT value as type iv
+}
+
+test literal-that-converts-finds-same-rows-with-and-without-index {
+    CREATE TYPE iv BASE integer ENCODE value DECODE value OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 10);
+    CREATE INDEX i ON t(c);
+    SELECT 'eq', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c = '10'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c = '10');
+    SELECT 'lt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c < '9'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c < '9');
+}
+expect {
+    eq|2|2
+    lt|1|1
 }
 
 test cast-to-domain-converts-as-its-base {

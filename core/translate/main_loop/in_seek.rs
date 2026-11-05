@@ -107,8 +107,9 @@ pub(super) fn emit_in_seek_key(
             table_references,
             index,
             seek_reg,
-            1,
+            [None],
             0,
+            None,
             resolver,
         )?;
     }
@@ -187,20 +188,14 @@ pub(super) fn open_in_seek_source_cursor(
                     NoConstantOptReason::InListEphemeral,
                 )?;
                 if let Some(index) = index {
-                    // ENCODE gets the value the scan compares: `1.0` with
-                    // INTEGER affinity is `1`, which boolean accepts.
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: val_reg,
-                        count: std::num::NonZeroUsize::MIN,
-                        affinities: affinity_str.clone(),
-                    });
                     encode_seek_keys_for_custom_types(
                         program,
                         table_references,
                         index,
                         val_reg,
-                        1,
+                        [Some(value)],
                         0,
+                        Some(&affinity_str),
                         resolver,
                     )?;
                 }

@@ -54,6 +54,160 @@ pub(super) fn emit_custom_type_operator(
     Ok(Some(result_reg))
 }
 
+/// Translates `operand`, which is compared with `other`, into `reg`. A string
+/// literal or parameter compared with a value of a custom type is read as a
+/// value of the type, as PostgreSQL reads it: it is stored as a column of the
+/// type stores it, then read back. So `ts = '2024-01-05T09:31'` compares ts
+/// with '2024-01-05 09:31:00', and a text the type does not accept is an
+/// error.
+pub(crate) fn translate_compared_operand(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+        Some(resolved) => translate_untyped_operand_as(
+            program,
+            referenced_tables,
+            operand,
+            &resolved,
+            reg,
+            resolver,
+        ),
+        None => translate_expr(program, referenced_tables, operand, reg, resolver),
+    }
+}
+
+/// Translates the two operands of a comparison into `lhs_reg` and `rhs_reg`.
+/// See [translate_compared_operand].
+pub(crate) fn translate_compared_pair(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    lhs_reg: usize,
+    rhs_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    translate_compared_operand(program, referenced_tables, lhs, rhs, lhs_reg, resolver)?;
+    translate_compared_operand(program, referenced_tables, rhs, lhs, rhs_reg, resolver)?;
+    Ok(())
+}
+
+/// Translates the string literal or parameter `operand` into `reg` as a value
+/// of `resolved`: stored as a column of the type stores it, then read back.
+pub(crate) fn translate_untyped_operand_as(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    // The operand is a constant, so its conversion is computed once with it.
+    let constant_span = (!program.constant_span_is_open()).then(|| program.constant_span_start());
+    translate_expr(program, referenced_tables, operand, reg, resolver)?;
+    emit_untyped_operand_store(program, resolved, reg, resolver)?;
+    emit_decode(program, resolved, reg, resolver)?;
+    if let Some(span) = constant_span {
+        program.constant_span_end(span);
+    }
+    Ok(reg)
+}
+
+/// The type a string literal or parameter compared with `other` is read as,
+/// or None when it is compared as written.
+pub(crate) fn untyped_operand_type(
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    read_untyped_operand_as(operand, resolver.schema(), || {
+        Ok(type_of(other, &TypeEnv::new(referenced_tables, resolver)))
+    })
+}
+
+/// The type a string literal or parameter compared with a value of
+/// `other_type` is read as, or None when it is compared as written. Scans and
+/// index seeks both decide here, so they read the same rows.
+pub(crate) fn read_untyped_operand_as(
+    operand: &ast::Expr,
+    schema: &crate::schema::Schema,
+    other_type: impl FnOnce() -> Result<ExprType>,
+) -> Result<Option<ResolvedType>> {
+    if !is_untyped_operand(operand) || schema.type_registry.is_empty() {
+        return Ok(None);
+    }
+    let type_def = match other_type()? {
+        ExprType::Custom { type_def, .. } => type_def,
+        // An array compares in its own order, which converts the other operand.
+        ExprType::Array { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        // `value` in a type's ENCODE, DECODE or CHECK, which is compiled
+        // without its type.
+        | ExprType::NotKnownYet => return Ok(None),
+    };
+    let resolved = schema
+        .resolve_type_unchecked(&type_def.name)?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("type {} does not resolve", type_def.name))
+        })?;
+    Ok(converts_untyped_operands(&resolved).then_some(resolved))
+}
+
+/// Whether `expr` takes its type from the value it is compared with: a string
+/// literal, or a parameter. A parameter that stands for a column, such as a
+/// foreign key's parent key, carries the column's type or collation and holds
+/// the column's value.
+fn is_untyped_operand(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::String(_)) => true,
+        ast::Expr::Variable(variable) => {
+            variable.custom_type.is_none() && variable.col_collation.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a string literal or parameter compared with a value of `resolved`
+/// is converted to the type. A type with its own order, such as numeric,
+/// converts the other operand when it compares instead, and a type without
+/// ENCODE or DECODE reads a value as it is written.
+fn converts_untyped_operands(resolved: &ResolvedType) -> bool {
+    resolved.ordering().is_none()
+        && (resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.encode().is_some())
+            || !resolved.decode_returns_value_unchanged())
+}
+
+/// Stores the string literal or parameter in `reg` as a value of `resolved`,
+/// as INSERT stores it in a column of the type. NULL is left as it is.
+pub(crate) fn emit_untyped_operand_store(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let skip_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_null,
+    });
+    emit_store_value(program, resolved, reg, &[], resolver)?;
+    program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT)
 /// from the row's stored values in `column_regs`. Reading a custom-type column
 /// in the expression decodes it, so the expression sees the user's values.

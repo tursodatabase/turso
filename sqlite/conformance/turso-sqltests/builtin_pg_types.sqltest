@@ -645,25 +645,47 @@ expect {
 
 @requires strict "uses STRICT tables"
 test date-compare-with-other-text-with-and-without-index {
+    -- The text is read as a date, as in PostgreSQL: '2026-10-08T00:00' is
+    -- the date 2026-10-08.
     CREATE TABLE a(d date) STRICT;
     CREATE TABLE b(d date) STRICT;
     CREATE INDEX b_d ON b(d);
     INSERT INTO a VALUES ('2026-10-08');
     INSERT INTO b VALUES ('2026-10-08');
     SELECT
-        (SELECT count(*) FROM a WHERE d = 'zzz'),
-        (SELECT count(*) FROM b WHERE d = 'zzz'),
         (SELECT count(*) FROM a WHERE d = '2026-10-08T00:00'),
         (SELECT count(*) FROM b WHERE d = '2026-10-08T00:00'),
-        (SELECT count(*) FROM a WHERE d IN ('zzz', '2026-10-08')),
-        (SELECT count(*) FROM b WHERE d IN ('zzz', '2026-10-08'));
+        (SELECT count(*) FROM a WHERE d IN ('2026-10-07', '2026-10-08')),
+        (SELECT count(*) FROM b WHERE d IN ('2026-10-07', '2026-10-08'));
 }
 expect {
-    0|0|0|0|1|1
+    1|1|1|1
+}
+
+@requires strict "uses STRICT tables"
+test date-compare-with-text-that-is-not-a-date-scan {
+    CREATE TABLE a(d date) STRICT;
+    INSERT INTO a VALUES ('2026-10-08');
+    SELECT count(*) FROM a WHERE d = 'zzz';
+}
+expect error {
+    invalid date value
+}
+
+@requires strict "uses STRICT tables"
+test date-compare-with-text-that-is-not-a-date-index {
+    CREATE TABLE b(d date) STRICT;
+    CREATE INDEX b_d ON b(d);
+    INSERT INTO b VALUES ('2026-10-08');
+    SELECT count(*) FROM b WHERE d IN ('zzz', '2026-10-08');
+}
+expect error {
+    invalid date value
 }
 
 @requires strict "uses STRICT tables"
 test timestamp-compare-with-other-text-with-and-without-index {
+    -- The text is read as a timestamp, as in PostgreSQL.
     CREATE TABLE t1(ts timestamp) STRICT;
     CREATE TABLE t2(ts timestamp) STRICT;
     CREATE INDEX t2_ts ON t2(ts);
@@ -676,5 +698,5 @@ test timestamp-compare-with-other-text-with-and-without-index {
         (SELECT count(*) FROM t2 WHERE ts >= '2026-10-08T12:00');
 }
 expect {
-    0|0|0|0
+    1|1|1|1
 }

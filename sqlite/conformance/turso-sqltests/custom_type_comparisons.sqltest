@@ -1293,3 +1293,235 @@ test cmp-numeric-with-non-number-text-index {
 expect error {
     invalid input syntax for type numeric: "abc"
 }
+
+@requires strict "uses STRICT tables"
+test cmp-time-with-text-same-rows-with-and-without-index {
+    -- A text compared with a time is converted to a time first, as in
+    -- PostgreSQL: '10:00' is '10:00:00'. Every query runs before and after
+    -- the indexes exist, so the expected rows are listed twice. LIKE and GLOB
+    -- match the text as written.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time, ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '09:30', '2024-01-05 09:30'), (2, '10:00', '2024-01-05 10:00'), (3, '23:59:59', '2024-01-06 00:00'), (4, NULL, NULL);
+    SELECT 'eq', id FROM t WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM t WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM t WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM t WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM t WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM t WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM t WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM t WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM t WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM t WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM t WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM t WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    SELECT 'like', id FROM t WHERE tm LIKE '10:00' ORDER BY id;
+    SELECT 'glob', id FROM t WHERE tm GLOB '10:00' ORDER BY id;
+    CREATE INDEX t_tm ON t(tm);
+    CREATE INDEX t_ts ON t(ts);
+    SELECT 'eq', id FROM t WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM t WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM t WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM t WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM t WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM t WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM t WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM t WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM t WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM t WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM t WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM t WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    SELECT 'like', id FROM t WHERE tm LIKE '10:00' ORDER BY id;
+    SELECT 'glob', id FROM t WHERE tm GLOB '10:00' ORDER BY id;
+}
+expect {
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-time-with-text-delete-and-update {
+    -- DELETE and UPDATE find their rows with the converted text, by a scan
+    -- and through an index.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tm time) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, tm time) STRICT;
+    CREATE INDEX b_tm ON b(tm);
+    INSERT INTO a VALUES (1, '09:30'), (2, '10:00'), (3, '23:59:59'), (4, NULL);
+    INSERT INTO b SELECT * FROM a;
+    DELETE FROM a WHERE tm < '09:45';
+    DELETE FROM b WHERE tm < '09:45';
+    UPDATE a SET id = 20 WHERE tm = '10:00';
+    UPDATE b SET id = 20 WHERE tm = '10:00';
+    SELECT 'a', id, tm FROM a ORDER BY id;
+    SELECT 'b', id, tm FROM b ORDER BY id;
+}
+expect {
+    a|3|23:59:59
+    a|4|
+    a|20|10:00:00
+    b|3|23:59:59
+    b|4|
+    b|20|10:00:00
+}
+
+@requires strict "uses STRICT tables"
+test cmp-time-with-invalid-text-is-an-error {
+    -- A text that is not a time can't be compared with one.
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('10:00');
+    SELECT count(*) FROM t WHERE tm < 'garbage';
+}
+expect error {
+    invalid time value
+}
+
+@requires strict "uses STRICT tables"
+test cmp-user-type-with-text-uses-encode-and-decode {
+    -- The text is converted with the type's ENCODE and DECODE, so 'ABC'
+    -- compares as 'abc', the value the column reads as.
+    CREATE TYPE lc(value text) BASE text ENCODE lower(value) DECODE value;
+    CREATE TABLE t(c lc) STRICT;
+    INSERT INTO t VALUES ('ABC');
+    SELECT count(*) FROM t WHERE c = 'ABC';
+    SELECT count(*) FROM t WHERE c IN ('Abc', 'x');
+}
+expect {
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-timestamp-with-text-in-partial-index-where {
+    -- The index's WHERE compares ts with a text. INSERT, UPDATE and DELETE
+    -- convert the text alike, so they agree on which rows the index holds,
+    -- and a query with the same WHERE uses the index.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE INDEX i ON t(ts) WHERE ts = '2024-01-05T09:31';
+    INSERT INTO t VALUES (1, '2024-01-05 09:31:00'), (2, '2024-01-06 00:00:00');
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE ts = '2024-01-05T09:31';
+    SELECT 'before', id FROM t WHERE ts = '2024-01-05T09:31';
+    UPDATE t SET ts = '2024-01-05 09:31:00' WHERE id = 2;
+    UPDATE t SET ts = '2024-01-07 00:00:00' WHERE id = 1;
+    SELECT 'updated', id FROM t WHERE ts = '2024-01-05T09:31';
+    DELETE FROM t WHERE id = 2;
+    SELECT 'deleted', count(*) FROM t WHERE ts = '2024-01-05T09:31';
+    PRAGMA integrity_check;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX i (ts=?)
+    before|1
+    updated|2
+    deleted|0
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test cmp-timestamp-with-text-in-expression-index {
+    -- The index holds the result of comparing ts with a text. INSERT, UPDATE
+    -- and DELETE compute it alike, so the index agrees with the table.
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE INDEX ei ON e((ts = '2024-01-05T09:31'));
+    INSERT INTO e VALUES (1, '2024-01-05 09:31:00'), (2, '2024-01-06 00:00:00');
+    SELECT 'before', id FROM e WHERE (ts = '2024-01-05T09:31') = 1;
+    UPDATE e SET ts = '2024-01-05 09:31:00' WHERE id = 2;
+    UPDATE e SET ts = '2024-01-07 00:00:00' WHERE id = 1;
+    SELECT 'updated', id FROM e WHERE (ts = '2024-01-05T09:31') = 1;
+    DELETE FROM e WHERE id = 2;
+    SELECT 'deleted', count(*) FROM e WHERE (ts = '2024-01-05T09:31') = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    before|1
+    updated|2
+    deleted|0
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test cmp-time-expression-index-with-text-same-rows-with-and-without-index {
+    -- An index on CAST(x AS time) holds times, so a text compared with the
+    -- expression is read as a time by the seek as by the scan: '10:00' is
+    -- '10:00:00'.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text) STRICT;
+    INSERT INTO t VALUES (1, '10:00'), (2, '09:30:00');
+    SELECT 'eq', id FROM t WHERE CAST(x AS time) = '10:00' ORDER BY id;
+    SELECT 'in', id FROM t WHERE CAST(x AS time) IN ('10:00', '09:30') ORDER BY id;
+    CREATE INDEX i ON t(CAST(x AS time));
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE CAST(x AS time) = '10:00';
+    SELECT 'eq', id FROM t WHERE CAST(x AS time) = '10:00' ORDER BY id;
+    SELECT 'in', id FROM t WHERE CAST(x AS time) IN ('10:00', '09:30') ORDER BY id;
+}
+expect {
+    eq|1
+    in|1
+    in|2
+    1|0|0|SEARCH t USING INDEX i (CAST (x AS time)=?)
+    eq|1
+    in|1
+    in|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-expression-index-holds-decoded-values {
+    -- An index on CAST(x AS tcents) holds the decoded value 5, not the stored
+    -- 500, so the seek key '5' is encoded and then decoded, as the scan reads it.
+    CREATE TYPE tcents(value text) BASE integer ENCODE CAST(value AS integer) * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text) STRICT;
+    INSERT INTO t VALUES (1, '5'), (2, '7');
+    SELECT 'eq', id FROM t WHERE CAST(x AS tcents) = '5' ORDER BY id;
+    CREATE INDEX i ON t(CAST(x AS tcents));
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE CAST(x AS tcents) = '5';
+    SELECT 'eq', id FROM t WHERE CAST(x AS tcents) = '5' ORDER BY id;
+}
+expect {
+    eq|1
+    1|0|0|SEARCH t USING INDEX i (CAST (x AS tcents)=?)
+    eq|1
+}

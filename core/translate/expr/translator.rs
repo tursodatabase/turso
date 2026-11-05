@@ -651,19 +651,40 @@ fn translate_case_expr(
         )?;
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            when_expr,
-            expr_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        let when_type = match base {
+            Some(base_expr) => {
+                untyped_operand_type(when_expr, base_expr, referenced_tables, resolver)?
+            }
+            None => None,
+        };
+        // A WHEN value read as a value of the base's type gets its own
+        // register, so its conversion is computed once.
+        let when_reg = match when_type {
+            Some(resolved) => {
+                let reg = program.alloc_register();
+                translate_untyped_operand_as(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    &resolved,
+                    reg,
+                    resolver,
+                )?
+            }
+            None => translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                when_expr,
+                expr_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?,
+        };
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
                 lhs: base_reg,
-                rhs: expr_reg,
+                rhs: when_reg,
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
                 flags: CmpInsFlags::default()
@@ -683,7 +704,7 @@ fn translate_case_expr(
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
-                reg: expr_reg,
+                reg: when_reg,
                 target_pc: next_case_label,
                 jump_if_null: true,
             }),
@@ -1786,8 +1807,20 @@ fn translate_function_call_expr(
                     // since translate_expr may allocate internal registers.
                     let first_reg = program.alloc_register();
                     let second_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], first_reg, resolver)?;
-                    translate_expr(program, referenced_tables, &args[1], second_reg, resolver)?;
+                    if matches!(srf, ScalarFunc::Nullif) {
+                        translate_compared_pair(
+                            program,
+                            referenced_tables,
+                            &args[0],
+                            &args[1],
+                            first_reg,
+                            second_reg,
+                            resolver,
+                        )?;
+                    } else {
+                        translate_expr(program, referenced_tables, &args[0], first_reg, resolver)?;
+                        translate_expr(program, referenced_tables, &args[1], second_reg, resolver)?;
+                    }
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg: first_reg,
