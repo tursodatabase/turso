@@ -13,7 +13,7 @@ use crate::{
         catalog::CatalogContext,
         emitter::Resolver,
         expr::{
-            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            expr_type::{query_column_type, type_of, type_ordering, ExprType, TypeEnv},
             row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
@@ -771,21 +771,29 @@ pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_
 /// checks, so that `WHERE 0 AND d = 'x' COLLATE nocase` fails like
 /// `WHERE d = 'x' COLLATE nocase` for a date d.
 pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    check_expr_collation_in(expr, &context.type_env())
+}
+
+/// [check_expr_collation] for an expression whose columns have the types
+/// `env` gives them.
+pub(crate) fn check_expr_collation_in(expr: &Expr, env: &TypeEnv) -> Result<()> {
     match expr {
-        Expr::Collate(operand, _) => check_collate_operand(operand, context),
-        Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
+        Expr::Collate(operand, _) => {
+            common_ordering(&[type_of(operand, env)], env.schema(), true)?;
+            Ok(())
+        }
+        Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, env),
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
             lhs, start, end, ..
         } => {
-            check_comparison(lhs, start, context)?;
-            check_comparison(lhs, end, context)
+            check_comparison(lhs, start, env)?;
+            check_comparison(lhs, end, env)
         }
         Expr::InList { lhs, rhs, .. } => {
             let operands =
                 std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
-            common_type_ordering(operands.map(|expr| (expr, context)))?;
-            Ok(())
+            check_operands_ordering(operands, env)
         }
         // Compiled as `base = when` for each WHEN.
         Expr::Case {
@@ -794,13 +802,11 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             ..
         } => when_then_pairs
             .iter()
-            .try_for_each(|(when, _)| check_comparison(base, when, context)),
+            .try_for_each(|(when, _)| check_comparison(base, when, env)),
         Expr::FunctionCall { name, args, .. } => {
-            let func = context
-                .catalog()
-                .resolve_function(name.as_str(), args.len())?;
+            let func = env.resolve_function(name.as_str(), args.len())?;
             if func.is_some_and(|func| func.needs_collation()) {
-                common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
+                check_operands_ordering(args.iter().map(|arg| arg.as_ref()), env)?;
             }
             Ok(())
         }
@@ -843,17 +849,32 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
 /// values, as in `(SELECT d, 1) = ('x' COLLATE nocase, 1)`, compare element by
 /// element, each pair with its own collation, split as code generation splits
 /// them.
-fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+fn check_comparison(lhs: &Expr, rhs: &Expr, env: &TypeEnv) -> Result<()> {
     let len = row_value_len(lhs)?.max(row_value_len(rhs)?);
     if len > 1 {
         for idx in 0..len {
             let lhs = row_value_component_expr(lhs, idx)?;
             let rhs = row_value_component_expr(rhs, idx)?;
-            check_comparison(&lhs, &rhs, context)?;
+            check_comparison(&lhs, &rhs, env)?;
         }
         return Ok(());
     }
-    common_type_ordering([(lhs, context), (rhs, context)])?;
+    check_operands_ordering([lhs, rhs], env)
+}
+
+/// Fails where [common_type_ordering] fails for `operands`, compared with
+/// each other.
+fn check_operands_ordering<'a>(
+    operands: impl IntoIterator<Item = &'a Expr> + Clone,
+    env: &TypeEnv,
+) -> Result<()> {
+    let has_collate = operands.clone().into_iter().any(has_collate_operator);
+    // Most comparisons have two operands; keep their types off the heap.
+    let types: SmallVec<[ExprType; 2]> = operands
+        .into_iter()
+        .map(|operand| type_of(operand, env))
+        .collect();
+    common_ordering(&types, env.schema(), has_collate)?;
     Ok(())
 }
 
