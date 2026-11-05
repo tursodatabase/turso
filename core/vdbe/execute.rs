@@ -10634,7 +10634,9 @@ pub fn op_function(
             | ScalarFunc::RandomBlob
             | ScalarFunc::Sign
             | ScalarFunc::Soundex
-            | ScalarFunc::ZeroBlob => {
+            | ScalarFunc::ZeroBlob
+            | ScalarFunc::SqliteCompileOptionUsed
+            | ScalarFunc::SqliteCompileOptionGet => {
                 let reg_value = state.registers[*start_reg].borrow_mut().get_value();
                 let result = match scalar_func {
                     ScalarFunc::Sign => reg_value.exec_sign(),
@@ -10654,6 +10656,8 @@ pub fn op_function(
                     }
                     ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
+                    ScalarFunc::SqliteCompileOptionUsed => reg_value.exec_compileoption_used(),
+                    ScalarFunc::SqliteCompileOptionGet => reg_value.exec_compileoption_get()?,
                     _ => unreachable!(),
                 };
                 // this is a `match` instead of `unwrap_or_else` because on the current pinned

@@ -977,6 +977,8 @@ pub enum ScalarFunc {
     SqliteVersion,
     TursoVersion,
     SqliteSourceId,
+    SqliteCompileOptionUsed,
+    SqliteCompileOptionGet,
     UnixEpoch,
     JulianDay,
     Hex,
@@ -1112,6 +1114,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::SqliteVersion => false,
             ScalarFunc::TursoVersion => false,
             ScalarFunc::SqliteSourceId => false,
+            ScalarFunc::SqliteCompileOptionUsed => false,
+            ScalarFunc::SqliteCompileOptionGet => false,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
             ScalarFunc::Hex => true,
@@ -1234,6 +1238,7 @@ impl ScalarFunc {
             | Self::Sign
             | Self::Subtype
             | Self::Unicode
+            | Self::SqliteCompileOptionUsed
             | Self::GetByte
             | Self::ConnTxnId
             | Self::IsAutocommit
@@ -1275,6 +1280,7 @@ impl ScalarFunc {
             | Self::SqliteVersion
             | Self::TursoVersion
             | Self::SqliteSourceId
+            | Self::SqliteCompileOptionGet
             | Self::Hex
             | Self::Printf
             | Self::TableColumnsJsonArray
@@ -1375,6 +1381,8 @@ impl Display for ScalarFunc {
             Self::SqliteVersion => "sqlite_version",
             Self::TursoVersion => "turso_version",
             Self::SqliteSourceId => "sqlite_source_id",
+            Self::SqliteCompileOptionUsed => "sqlite_compileoption_used",
+            Self::SqliteCompileOptionGet => "sqlite_compileoption_get",
             Self::JulianDay => "julianday",
             Self::UnixEpoch => "unixepoch",
             Self::Hex => "hex",
@@ -1510,6 +1518,8 @@ impl ScalarFunc {
             | Self::Unistr
             | Self::Upper
             | Self::ZeroBlob
+            | Self::SqliteCompileOptionUsed
+            | Self::SqliteCompileOptionGet
             | Self::Likely
             | Self::Unlikely
             | Self::SequenceWatermark => &[1],

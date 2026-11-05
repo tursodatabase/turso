@@ -117,6 +117,8 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | `total_changes()` | Returns the total number of rows modified since the database connection was opened |
 | `sqlite_version()` | Returns the version string `"3.42.0"` |
 | `sqlite_source_id()` | Returns the source identifier string for the SQLite-compatible engine |
+| `sqlite_compileoption_used(X)` | Returns 1 if X names a SQLite compile-time option this build has (such as `ENABLE_MATH_FUNCTIONS`), otherwise 0 |
+| `sqlite_compileoption_get(N)` | Returns the N-th compile-time option this build has, or NULL when N is out of range |
 | `turso_version()` | Returns the Turso engine version string (e.g. `"0.7.0"`) |
 | `load_extension(X)` | Loads a Turso-native extension from the shared library at path X |
 
@@ -531,6 +533,23 @@ Returns the SQLite-compatible version string.
 
 ```sql
 SELECT sqlite_version();  -- '3.42.0'
+```
+
+### sqlite_compileoption_used(X)
+
+Returns 1 if X names a SQLite compile-time option that this build has, otherwise 0. The name is matched without regard to case, an `SQLITE_` prefix is ignored, and a name without `=value` matches the option with any value. Turso reports only the options whose features it provides, such as `ENABLE_MATH_FUNCTIONS` and `ENABLE_PERCENTILE`.
+
+```sql
+SELECT sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS');  -- 1
+SELECT sqlite_compileoption_used('ENABLE_FTS5');            -- 0
+```
+
+### sqlite_compileoption_get(N)
+
+Returns the N-th (counting from 0) compile-time option of this build, or NULL when N is out of range.
+
+```sql
+SELECT sqlite_compileoption_get(0);  -- 'ENABLE_MATH_FUNCTIONS'
 ```
 
 ### turso_version()
