@@ -392,6 +392,7 @@ fn resolve_check_expr_type(
             }
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
+        ast::Expr::Collate(inner, _) => resolve_check_expr_type(inner, columns, resolver),
         ast::Expr::FunctionCall { name, args, .. } => {
             if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                 resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
