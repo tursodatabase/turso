@@ -107,28 +107,6 @@ expect error {
     of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\([cd] AS text\) instead
 }
 
-# A TEMP table finds its column types in the main database, like any other
-# table, so the same rule applies to it.
-@requires strict "uses STRICT tables"
-test lossy-create-index-on-temp-table {
-    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
-    CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, c lossy_ci) STRICT;
-    CREATE INDEX temp.i ON t(c);
-}
-expect error {
-    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
-}
-
-@requires strict "uses STRICT tables"
-test lossy-alter-column-type-of-a-temp-table-key {
-    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
-    CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, c text, UNIQUE(c)) STRICT;
-    ALTER TABLE temp.t ALTER COLUMN c TO d lossy_ci;
-}
-expect error {
-    column 'd' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(d AS text\) instead
-}
-
 @requires strict "uses STRICT tables"
 test array-of-lossy-type-index {
     CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';

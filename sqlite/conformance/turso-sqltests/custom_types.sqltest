@@ -584,24 +584,22 @@ expect error {
 
 @requires strict "uses STRICT tables"
 @skip-if mvcc "attach is not supported for mvcc"
-test drop-type-in-use-by-attached-table {
+test attached-table-cannot-use-type {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.p(id INTEGER PRIMARY KEY, amount cents) STRICT;
-    DROP TYPE cents;
 }
 expect error {
-    cannot drop type cents: used by column amount in table p
+    column p.amount of database aux cannot have type cents: custom types and domains can only be used in the main database
 }
 
 @requires strict "uses STRICT tables"
-test drop-type-in-use-by-temp-table {
+test temp-table-cannot-use-type {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TEMP TABLE p(id INTEGER PRIMARY KEY, amount cents) STRICT;
-    DROP TYPE cents;
 }
 expect error {
-    cannot drop type cents: used by column amount in table p
+    column p.amount of database temp cannot have type cents: custom types and domains can only be used in the main database
 }
 
 @requires strict "uses STRICT tables"
@@ -715,14 +713,13 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test drop-type-in-use-by-temp-view {
+test temp-view-cannot-cast-to-type {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE j(z integer) STRICT;
     CREATE TEMP VIEW v AS SELECT CAST(z AS cents) AS c FROM j;
-    DROP TYPE cents;
 }
 expect error {
-    cannot drop type cents: used by view v
+    view v casts to type cents in database temp: custom types and domains can only be used in the main database
 }
 
 @requires strict "uses STRICT tables"
@@ -820,15 +817,14 @@ expect error {
 
 @requires strict "uses STRICT tables"
 @skip-if mvcc "attach is not supported for mvcc"
-test drop-type-in-use-by-attached-index {
+test attached-index-cannot-cast-to-type {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.j(z integer) STRICT;
     CREATE INDEX aux.ji ON j(CAST(z AS cents));
-    DROP TYPE cents;
 }
 expect error {
-    cannot drop type cents: used by index ji
+    index ji casts to type cents in database aux: custom types and domains can only be used in the main database
 }
 
 @requires strict "uses STRICT tables"
