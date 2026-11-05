@@ -126,7 +126,7 @@ Before opening a PR, read the "PR Workflow" document linked above.
 ## Benchmark Naming
 
 - Criterion benchmark functions use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
-- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior. In CodSpeed builds it also makes each measurement call the benchmarked closure 100 times, because one call of a small function is too sensitive to cache misses. It accepts only `bench_local` and `bench_local_values` (after `with_inputs`).
+- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior. Their bencher parameter is `turso_benches::Bencher`, also in helpers it is passed to. In CodSpeed builds it makes each measurement call the benchmarked closure 100 times, because one call of a small function is too sensitive to cache misses. It offers only `bench_local` and `with_inputs(..).bench_local_values`.
 
 ## Core Principles
 

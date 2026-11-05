@@ -15,9 +15,10 @@
 //! Run with:
 //!   cargo bench --bench prepare_benchmark
 
-use divan::{black_box, AllocProfiler, Bencher};
+use divan::{black_box, AllocProfiler};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
+use turso_benches::Bencher;
 use turso_core::{ConnectOpts, Connection, Database, MemoryIO, StepResult};
 use turso_sqlite::SqliteDialect;
 

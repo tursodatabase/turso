@@ -1,4 +1,5 @@
-use divan::{black_box, Bencher};
+use divan::black_box;
+use turso_benches::Bencher;
 use turso_core::types::Value;
 use turso_core::vdbe::CollationSeq;
 
