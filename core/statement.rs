@@ -65,6 +65,10 @@ pub(crate) enum StatementOrigin {
     InternalHelper,
     Subprogram,
     EngineMetadataRead,
+    /// A schema write of the engine's own, such as a frontend creating its
+    /// internal tables at open: engine SQL semantics like
+    /// [`StatementOrigin::EngineMetadataRead`], run as a top-level statement.
+    EngineSchemaWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +90,10 @@ impl StatementOrigin {
     /// Whether the statement counts toward
     /// `Connection::n_active_root_statements`.
     pub(crate) const fn is_top_level(self) -> bool {
-        matches!(self, Self::Root | Self::EngineMetadataRead)
+        matches!(
+            self,
+            Self::Root | Self::EngineMetadataRead | Self::EngineSchemaWrite
+        )
     }
 }
 

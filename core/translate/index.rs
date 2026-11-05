@@ -1,4 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
+use crate::dialect::RelationChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -44,7 +45,7 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -162,6 +163,9 @@ pub fn translate_create_index(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
+    if schema::relation_name_is_taken(resolver, namespace, &idx_name, if_not_exists)? {
+        return Ok(());
+    }
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
     let schema_unique = resolver.with_schema(database_id, |s| {
@@ -353,6 +357,20 @@ pub fn translate_create_index(
         root_page_reg,
         Some(sql),
     )?;
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[RelationChange::Create {
+                namespace: namespace.id,
+                name: idx_name.clone(),
+                kind: crate::schema::RelationKind::Index,
+                table: Some(tbl_name),
+            }],
+        )?;
+    }
 
     emit_refill_index(
         program,
@@ -1416,6 +1434,7 @@ pub fn translate_drop_index(
     qualified_name: &QualifiedName,
     resolver: &Resolver,
     if_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let idx_name = normalize_ident(qualified_name.name.as_str());
@@ -1479,6 +1498,18 @@ pub fn translate_drop_index(
         database_id,
         Some(SQLITE_TABLEID),
     )?;
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[RelationChange::Drop {
+                namespace: namespace.id,
+                name: idx_name.clone(),
+            }],
+        )?;
+    }
 
     // According to sqlite should emit Null instruction
     // but why?

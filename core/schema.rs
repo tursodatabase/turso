@@ -1117,6 +1117,23 @@ pub fn is_system_table(table_name: &str) -> bool {
         .any(|prefix| table_name.to_lowercase().starts_with(prefix))
 }
 
+/// Whether a relation of kind `kind` named `name` is the user's, as against
+/// the engine's. Tables and views named `sqlite_*` or `__turso_internal_*`
+/// are the engine's. A sequence may be named `sqlite_*`, since only its
+/// backing table could collide with the engine's tables and that has a
+/// prefix of its own. The `sqlite_autoindex_*` indexes of a user's table
+/// are the user's, as PostgreSQL gives constraint indexes `pg_class` rows.
+pub fn is_user_relation_name(kind: RelationKind, name: &str) -> bool {
+    match kind {
+        RelationKind::Table | RelationKind::View | RelationKind::MaterializedView => {
+            !is_system_table(name)
+        }
+        RelationKind::Sequence | RelationKind::Index => name
+            .get(..TURSO_INTERNAL_PREFIX.len())
+            .is_none_or(|prefix| !prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX)),
+    }
+}
+
 /// Check if a table is one of the internal tables that store a materialized
 /// view's state, of any storage version.
 pub fn is_materialized_view_state_table(table_name: &str) -> bool {
@@ -1282,6 +1299,23 @@ pub struct Schema {
 
     /// The roles of the database. Copies of the schema share them.
     pub roles: Arc<RoleCatalog>,
+
+    /// Schema state of the database's dialect, opaque to core: what the
+    /// dialect's [`crate::Dialect::build_schema_state`] built from its own
+    /// schema table, such as the PostgreSQL frontend's relation catalog.
+    /// None when the dialect keeps none. Copies of the schema share it.
+    pub dialect_schema: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// What kind of relation a schema object is, for the relations that
+/// [`Schema::user_relations`] lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+    Index,
 }
 
 /// Materialized views the loader read before the names of the namespaces,
@@ -1534,6 +1568,7 @@ impl Schema {
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
             roles: Arc::default(),
+            dialect_schema: None,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1675,6 +1710,76 @@ impl Schema {
     pub(crate) fn unname_namespace(&mut self, id: NamespaceId) {
         if let Some(objects) = self.namespaces.get_mut(&id) {
             objects.name = None;
+        }
+    }
+
+    /// The relations a user made: every user table, view, materialized
+    /// view, sequence and index, in every namespace. Engine tables
+    /// (`sqlite_*`, `__turso_internal_*`), virtual tables and their indexes
+    /// are not among them; the automatic `sqlite_autoindex_*` indexes of
+    /// user tables are.
+    pub fn user_relations(&self) -> Vec<(NamespaceId, String, RelationKind)> {
+        let mut relations = vec![];
+        for (namespace, objects) in &self.namespaces {
+            for (name, table) in &objects.tables {
+                let kind = if objects.materialized_view_names.contains(name) {
+                    RelationKind::MaterializedView
+                } else {
+                    RelationKind::Table
+                };
+                if !is_user_relation_name(kind, name) || table.btree().is_none() {
+                    continue;
+                }
+                relations.push((*namespace, name.clone(), kind));
+            }
+            for name in objects.views.keys() {
+                if !is_user_relation_name(RelationKind::View, name) {
+                    continue;
+                }
+                relations.push((*namespace, name.clone(), RelationKind::View));
+            }
+            for name in objects.sequences.keys() {
+                if !is_user_relation_name(RelationKind::Sequence, name) {
+                    continue;
+                }
+                relations.push((*namespace, name.clone(), RelationKind::Sequence));
+            }
+            for (table_name, indexes) in &objects.indexes {
+                if !is_user_relation_name(RelationKind::Table, table_name) {
+                    continue;
+                }
+                for index in indexes {
+                    if !is_user_relation_name(RelationKind::Index, &index.name)
+                        || index.is_backing_btree_index()
+                    {
+                        continue;
+                    }
+                    relations.push((*namespace, index.name.clone(), RelationKind::Index));
+                }
+            }
+        }
+        relations
+    }
+
+    /// What kind of relation `name` of `namespace` is, whichever kind has
+    /// the name: a materialized view before its backing table, then a
+    /// table, view, sequence or index. None when no relation has it.
+    pub fn relation_kind(&self, namespace: NamespaceId, name: &str) -> Option<RelationKind> {
+        if self.is_materialized_view(namespace, name) {
+            Some(RelationKind::MaterializedView)
+        } else if self.get_table(namespace, name).is_some() {
+            Some(RelationKind::Table)
+        } else if self.get_view(namespace, name).is_some() {
+            Some(RelationKind::View)
+        } else if self.get_sequence(namespace, name).is_some() {
+            Some(RelationKind::Sequence)
+        } else if self
+            .indexes(namespace)
+            .any(|index| index.name.eq_ignore_ascii_case(name))
+        {
+            Some(RelationKind::Index)
+        } else {
+            None
         }
     }
 
@@ -5008,6 +5113,7 @@ impl TryClone for Schema {
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             roles: self.roles.clone(),
+            dialect_schema: self.dialect_schema.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,

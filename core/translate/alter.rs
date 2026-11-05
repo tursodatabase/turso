@@ -1,8 +1,10 @@
 use crate::alloc::TursoIteratorExt;
+use crate::dialect::RelationChange;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::types::StrictType;
+use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -13,7 +15,7 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        check_column_type, validate_check_expr, validate_default_expr,
+        self, check_column_type, validate_check_expr, validate_default_expr,
         validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
@@ -1495,6 +1497,9 @@ pub fn translate_alter_table(
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
 
+            // Under a dialect whose relation names are unique across kinds,
+            // a name any relation has is taken, as for CREATE.
+            schema::relation_name_is_taken(resolver, namespace, &normalized_new_name, false)?;
             // Views whose SQL failed to load are absent from the schema maps
             // but their rows are still in sqlite_schema, so the name is taken.
             let new_name_taken = resolver.with_schema(database_id, |s| {
@@ -1675,6 +1680,36 @@ pub fn translate_alter_table(
                     &mangled_table_name,
                     &mangled_new_name,
                 );
+            }
+
+            if schema::dialect_relation_hooks_apply(connection, database_id)? {
+                // Automatic indexes are renamed with the table, because
+                // their names embed it.
+                let mut changes = vec![RelationChange::Rename {
+                    namespace: namespace.id,
+                    old_name: normalized_old_name,
+                    new_name: normalized_new_name,
+                }];
+                for index in &table_indexes {
+                    let Some(new_name) = renamed_automatic_index_name(
+                        &index.name,
+                        &mangled_table_name,
+                        &mangled_new_name,
+                    ) else {
+                        continue;
+                    };
+                    changes.push(RelationChange::Rename {
+                        namespace: namespace.id,
+                        old_name: index.name.clone(),
+                        new_name,
+                    });
+                }
+                resolver.catalog.dialect.translate_relation_changes(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    &changes,
+                )?;
             }
 
             for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {

@@ -58,6 +58,10 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
         | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
         ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
         ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
+        ast::Stmt::AlterSequenceOwnedBy { seq_name, .. } => PermissionDenied::owner(
+            Action::Alter,
+            Object::Sequence(seq_name.name.as_str().to_string()),
+        ),
         ast::Stmt::CreateType { .. } | ast::Stmt::CreateDomain { .. } => {
             PermissionDenied::privilege(
                 Action::Create,

@@ -879,6 +879,21 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::AlterSequenceOwnedBy { seq_name, owner } => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_ID, Some("SEQUENCE"))?;
+                seq_name.to_tokens(s, context)?;
+                s.append(TK_ID, Some("OWNED"))?;
+                s.append(TK_BY, None)?;
+                match owner {
+                    Some((table, column)) => {
+                        table.to_tokens(s, context)?;
+                        s.append(TK_DOT, None)?;
+                        column.to_tokens(s, context)
+                    }
+                    None => s.append(TK_ID, Some("NONE")),
+                }
+            }
             Self::CreateSchema { name } => {
                 s.append(TK_CREATE, None)?;
                 s.append(TK_ID, Some("SCHEMA"))?;

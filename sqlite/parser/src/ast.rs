@@ -366,6 +366,15 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `ALTER SEQUENCE name OWNED BY { table.column | NONE }`: PostgreSQL's
+    /// link from a sequence to the column that draws from it, which makes
+    /// the sequence belong to the table. Not SQLite syntax; a frontend
+    /// builds it, as the PostgreSQL frontend does for a `serial` column.
+    AlterSequenceOwnedBy {
+        seq_name: QualifiedName,
+        /// The table and its column, or None for `OWNED BY NONE`.
+        owner: Option<(QualifiedName, Name)>,
+    },
     /// `CREATE SCHEMA`: a namespace stored in the main database. Only a
     /// frontend that supports namespaces builds this statement; the SQLite
     /// parser has no such syntax.
