@@ -806,7 +806,9 @@ pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_
 /// Fails when the values of `key`, an ORDER BY or DISTINCT key, can't be
 /// compared. Planning checks every key the query has, so that a key the
 /// planner later drops is refused too, as in PostgreSQL: `j` in `ORDER BY id,
-/// j` for a rowid `id`, or an ORDER BY inside `EXISTS (...)`.
+/// j` for a rowid `id`, or an ORDER BY inside `EXISTS (...)`. A scalar
+/// subquery is not planned yet here, so its type is not known and it passes;
+/// if the planner drops it, it is never checked (#11455).
 pub(crate) fn check_sort_key(key: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
     common_type_ordering([(key, context)]).map(|_| ())
 }
