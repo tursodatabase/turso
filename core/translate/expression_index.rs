@@ -1,10 +1,17 @@
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, get_expr_affinity, walk_expr, walk_expr_mut, BindingBehavior,
+    WalkControl,
 };
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 use crate::translate::planner::ROWID_STRS;
-use crate::{schema::Index, sync::Arc, Result};
+use crate::vdbe::affinity::Affinity;
+use crate::{
+    schema::{Index, IndexColumn},
+    sync::Arc,
+    LimboError, Result,
+};
 use turso_parser::ast;
 use turso_parser::ast::TableInternalId;
 
@@ -61,6 +68,33 @@ pub fn normalize_expr_for_index_matching(
     };
     let _ = walk_expr_mut(&mut expr, &mut normalize);
     expr
+}
+
+/// The affinity of an index key column: the affinity of its table column, or
+/// of its expression for an expression column, as SQLite's `whereScanInit`
+/// sets `idxaff`. An index on `upper(c)` has no affinity, because a function
+/// call has none.
+pub fn index_column_affinity(
+    index_column: &IndexColumn,
+    table_reference: &JoinedTable,
+) -> Result<Affinity> {
+    let Some(expr) = index_column.expression() else {
+        let column = table_reference
+            .table
+            .get_column_at(index_column.pos_in_table)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index column {} is not a column of table {}",
+                    index_column.name,
+                    table_reference.table.get_name()
+                ))
+            })?;
+        return Ok(column.comparison_affinity());
+    };
+    // The expression's column names need no binding: an expression's affinity
+    // comes from a column only when the column is the whole expression, and
+    // CREATE INDEX stores `c`, `(c)` and `c COLLATE x` as plain columns.
+    Ok(get_expr_affinity(expr, &TableMetadata::new(None)))
 }
 
 /// Determine whether an expression references columns from exactly one table

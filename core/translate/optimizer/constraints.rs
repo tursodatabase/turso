@@ -10,7 +10,7 @@ use crate::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
             WalkControl,
         },
-        expression_index::normalize_expr_for_index_matching,
+        expression_index::{index_column_affinity, normalize_expr_for_index_matching},
         plan::{
             is_non_null_literal, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
             NonFromClauseSubquery, Plan, QueryDestination, SubqueryState, TableReferences,
@@ -93,12 +93,7 @@ pub struct Constraint {
     /// `sqlite3IndexAffinityOk` check can run without re-resolving the
     /// WhereTerm at every index-selection callsite.
     ///
-    /// `None` for forms whose comparison affinity has no single resolved value:
-    /// FTS MATCH and virtual-table push-downs (operators outside SQLite's
-    /// comparison set), and row-value IN (`(a,b) IN (...)`, which SQLite
-    /// handles per-LHS-column via `sqlite3VectorFieldSubexpr` — Turso does
-    /// not yet plumb per-column affinity into the index-selection path, so
-    /// such constraints fall through to scans).
+    /// `None` for LIKE, which is not a comparison and cannot drive a seek.
     pub comparison_affinity: Option<Affinity>,
     /// Whether this constraint's seek key can be NULL and still match rows.
     /// True only for `IS` whose constraining value is not known to be
@@ -215,14 +210,13 @@ impl Constraint {
     }
 
     /// Returns true when an index column with affinity `idx_aff` can satisfy
-    /// this constraint per SQLite's `sqlite3IndexAffinityOk`. Constraints
-    /// whose form has no SQLite-defined comparison affinity (FTS MATCH,
-    /// virtual-table push-downs, row-value IN) carry `None` and bypass the
-    /// check — those paths handle types themselves.
+    /// this constraint per SQLite's `sqlite3IndexAffinityOk`. A constraint
+    /// with no comparison affinity (LIKE) is not a comparison, so no index
+    /// column can serve it.
     pub fn satisfies_index_affinity(&self, idx_aff: Affinity) -> bool {
         match self.comparison_affinity {
             Some(comparison_aff) => idx_aff.index_affinity_ok(comparison_aff),
-            None => true,
+            None => false,
         }
     }
 
@@ -244,12 +238,27 @@ impl Constraint {
             && self.satisfies_index_affinity(col.comparison_affinity())
     }
 
-    /// Whether an index key column can serve this term: a seek compares keys
-    /// with the key column's collation, so it must be the collation the term
-    /// compares with (SQLite's `azColl` check in `whereScanNext`).
-    pub fn index_column_can_serve(&self, index_column: &IndexColumn) -> bool {
-        self.collation
-            .is_none_or(|collation| collation == index_column.collation)
+    /// Whether an index key column can serve this term, checked as SQLite's
+    /// `whereScanNext` checks it. A seek compares keys with the key column's
+    /// collation, so it must be the collation the term compares with. And the
+    /// key column's affinity must suit the term's comparison affinity
+    /// (`sqlite3IndexAffinityOk`). An index on `upper(c)` has no affinity, so
+    /// it cannot serve `upper(c) = 1`: the comparison turns the text '1' into
+    /// the number 1 and matches, but a seek for 1 among text keys finds
+    /// nothing.
+    pub fn index_column_can_serve(
+        &self,
+        index_column: &IndexColumn,
+        table_reference: &JoinedTable,
+    ) -> Result<bool> {
+        if self
+            .collation
+            .is_some_and(|collation| collation != index_column.collation)
+        {
+            return Ok(false);
+        }
+        let index_column_affinity = index_column_affinity(index_column, table_reference)?;
+        Ok(self.satisfies_index_affinity(index_column_affinity))
     }
 }
 
@@ -1206,16 +1215,10 @@ pub fn constraints_from_where_clause(
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
                     // `sqlite3CompareAffinity` — that result is already cached on
-                    // `SubqueryType::In::affinity_str`. For a single-LHS-column
-                    // IN it is the first character; row-value IN has no single
-                    // resolved affinity and is left as `None`.
-                    let is_row_value = matches!(
-                        unwrap_parens(lhs_expr.as_ref()).ok(),
-                        Some(ast::Expr::Parenthesized(exprs)) if exprs.len() != 1
-                    );
-                    let cmp_aff = (!is_row_value)
-                        .then(|| affinity_str.chars().next().map(Affinity::from_char))
-                        .flatten();
+                    // `SubqueryType::In::affinity_str`. A constraint is made
+                    // only for a single LHS column below, whose affinity is
+                    // the first character.
+                    let cmp_aff = affinity_str.chars().next().map(Affinity::from_char);
                     let cmp_collation = Some(in_subquery_collation(subquery)?);
 
                     match lhs_expr.as_ref() {
@@ -1317,10 +1320,10 @@ pub fn constraints_from_where_clause(
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
-                    // An index seek compares keys with the index column's
-                    // collation, so the index serves the term only when that
-                    // is the collation the term compares with.
-                    if !constraint.index_column_can_serve(&index.columns[position_in_index]) {
+                    if !constraint.index_column_can_serve(
+                        &index.columns[position_in_index],
+                        table_reference,
+                    )? {
                         continue;
                     }
                     if let Some(table_col_pos) = constraint.table_col_pos {
@@ -1330,10 +1333,6 @@ pub fn constraints_from_where_clause(
                             table_reference.table.is_strict(),
                         ) && constraint.operator != ast::Operator::Equals.into()
                         {
-                            continue;
-                        }
-                        let idx_col_aff = constrained_column.comparison_affinity();
-                        if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
                     }

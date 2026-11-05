@@ -627,14 +627,10 @@ pub(super) fn choose_best_in_seek_candidate(
 
             // The seek compares with the index's collation, and `open_loop`
             // removes duplicate IN values with it, so it must be the
-            // collation the IN compares with.
-            if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
-                if !constraint.index_column_can_serve(&index.columns[0]) {
-                    continue;
-                }
-                let constrained_column = &rhs_table.table.columns()[col_pos];
-                let idx_aff = constrained_column.comparison_affinity();
-                if !constraint.satisfies_index_affinity(idx_aff) {
+            // collation the IN compares with. The index's affinity must also
+            // suit the IN's comparison affinity.
+            if let Some(index) = &candidate.index {
+                if !constraint.index_column_can_serve(&index.columns[0], rhs_table)? {
                     continue;
                 }
             }
