@@ -2668,21 +2668,6 @@ fn view_merged_column(first_column: &ViewColumn) -> ViewColumn {
     }
 }
 
-fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<String, usize>) {
-    let name = column
-        .column
-        .name
-        .clone()
-        .unwrap_or_else(|| "?".to_string());
-    let count = counts.entry(normalize_ident(&name)).or_insert(0);
-    if *count > 0 {
-        column.column.name = Some(format!("{name}:{count}"));
-    } else {
-        column.column.name = Some(name);
-    }
-    *count += 1;
-}
-
 fn extract_view_columns_inner(
     namespace: NamespaceId,
     select_stmt: &ast::Select,
@@ -2693,7 +2678,6 @@ fn extract_view_columns_inner(
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
-    let mut column_name_counts = HashMap::default();
 
     let ast::OneSelect::Select {
         from,
@@ -2721,7 +2705,6 @@ fn extract_view_columns_inner(
                     .unwrap_or_else(|| expr.to_string());
                 let mut column = view_result_column(expr, &sources);
                 column.column.name = Some(name);
-                deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
             }
             ast::ResultColumn::Star => {
@@ -2736,10 +2719,7 @@ fn extract_view_columns_inner(
                         ),
                     });
                 }
-                for mut column in expanded {
-                    deduplicate_view_column_name(&mut column, &mut column_name_counts);
-                    columns.push(column);
-                }
+                columns.extend(expanded);
             }
             ast::ResultColumn::TableStar(table_ref) => {
                 let qualifier = normalize_ident(table_ref.as_str());
@@ -2754,16 +2734,42 @@ fn extract_view_columns_inner(
                         .iter()
                         .filter(|column| !column.column.hidden())
                     {
-                        let mut column = view_star_column(&sources, source_index, source_column);
-                        deduplicate_view_column_name(&mut column, &mut column_name_counts);
-                        columns.push(column);
+                        columns.push(view_star_column(&sources, source_index, source_column));
                     }
                 }
             }
         }
     }
 
+    for column in &mut columns {
+        column.column.name.get_or_insert_with(|| "?".to_string());
+    }
+    name_derived_columns(columns.iter_mut().map(|column| &mut column.column.name));
     Ok(ViewColumnSchema { tables, columns })
+}
+
+/// Gives the columns of a subquery, CTE, view or CREATE TABLE AS their final
+/// names, as SQLite's `sqlite3ColumnsFromExprList` does: a name that repeats
+/// an earlier one, ignoring case and any `:<digits>` suffix, gets the first
+/// free `:<count>` suffix.
+pub(crate) fn name_derived_columns<'a>(names: impl IntoIterator<Item = &'a mut Option<String>>) {
+    let mut used_names = HashSet::default();
+    for name in names.into_iter().flatten() {
+        let base_name = strip_numbered_suffix(name).to_string();
+        let mut count = 0;
+        while !used_names.insert(name.to_lowercase()) {
+            count += 1;
+            *name = format!("{base_name}:{count}");
+        }
+    }
+}
+
+fn strip_numbered_suffix(name: &str) -> &str {
+    let without_digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    match without_digits.strip_suffix(':') {
+        Some(base_name) if !base_name.is_empty() => base_name,
+        _ => name,
+    }
 }
 
 pub(crate) fn extract_cte_columns(

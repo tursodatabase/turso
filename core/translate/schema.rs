@@ -1,5 +1,4 @@
 use crate::sync::Arc;
-use crate::HashMap;
 use crate::LimboError;
 
 use crate::ext::VTabImpl;
@@ -940,21 +939,14 @@ fn derive_ctas_schema(
         _ => None,
     };
 
-    // Collect names first, then deduplicate using SQLite's :N suffix convention.
-    let mut names: Vec<String> = result_columns
+    let mut names: Vec<Option<String>> = result_columns
         .iter()
-        .map(|col| col.name_or_expr(table_refs))
+        .map(|col| Some(col.name_or_expr(table_refs)))
         .collect();
-
-    let mut seen: HashMap<String, usize> = HashMap::default();
-    for name in &mut names {
-        let lower = name.to_lowercase();
-        let count = seen.entry(lower).or_insert(0);
-        if *count > 0 {
-            *name = format!("{name}:{count}");
-        }
-        *count += 1;
-    }
+    crate::util::name_derived_columns(&mut names);
+    let names = names
+        .into_iter()
+        .map(|name| name.expect("every CTAS column has a name"));
 
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
