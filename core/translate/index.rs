@@ -1166,8 +1166,7 @@ pub(crate) fn expression_type_ordering(
 }
 
 /// Fails when an index expression over `table`'s columns has a type whose
-/// values can't be compared. CREATE INDEX and ALTER COLUMN check this, not
-/// loading the schema, so a database with such an index still opens.
+/// values can't be compared.
 pub(crate) fn check_index_expression_has_comparison(
     expr: &Expr,
     table: &BTreeTable,
@@ -1175,7 +1174,7 @@ pub(crate) fn check_index_expression_has_comparison(
     syms: &SymbolTable,
 ) -> crate::Result<()> {
     let ty = expression_type(expr, table, schema, syms)?;
-    match type_without_comparison(&ty, schema) {
+    match type_without_comparison(&ty, schema)? {
         Some(type_def) => Err(no_comparison_error(&ty, type_def)),
         None => Ok(()),
     }

@@ -1,5 +1,7 @@
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
-use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
+use turso_core::{
+    ConstraintKind, ConstraintViolation, DialectError, LimboError, NoComparisonError, Value,
+};
 use turso_pg_parser::sqlstate::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -289,12 +291,12 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("cannot drop type")
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
-    } else if msg.starts_with("values of type ") && msg.contains(" cannot be compared; ") {
-        SQLSTATE_UNDEFINED_FUNCTION
-    } else if msg.starts_with("column '") && msg.contains(" cannot be a key: values of type ") {
-        SQLSTATE_UNDEFINED_OBJECT
-    } else if msg.starts_with("arrays of type ") && msg.contains(" cannot be compared") {
-        SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if let Some(kind) = NoComparisonError::of_message(msg) {
+        match kind {
+            NoComparisonError::Compare => SQLSTATE_UNDEFINED_FUNCTION,
+            NoComparisonError::Key => SQLSTATE_UNDEFINED_OBJECT,
+            NoComparisonError::Array => SQLSTATE_FEATURE_NOT_SUPPORTED,
+        }
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("no such table")
@@ -518,18 +520,6 @@ mod tests {
                 SQLSTATE_UNDEFINED_COLUMN,
             ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
-            (
-                "values of type inet cannot be compared; to compare their text, CAST them to text",
-                SQLSTATE_UNDEFINED_FUNCTION,
-            ),
-            (
-                "column 'k' of type 'jsonb' cannot be a key: values of type jsonb cannot be compared",
-                SQLSTATE_UNDEFINED_OBJECT,
-            ),
-            (
-                "arrays of type jsonb are not supported, because values of type jsonb cannot be compared",
-                SQLSTATE_FEATURE_NOT_SUPPORTED,
-            ),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
             (

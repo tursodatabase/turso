@@ -513,7 +513,7 @@ pub fn comparison_collation_across_queries(
     // Code generation for `c IS NULL` asks for a collation too. Any comparison
     // with NULL has the same result under every collation. Binding refuses the
     // ones PostgreSQL refuses, such as `j = NULL` (see [check_expr_collation]).
-    if compares_null_with_value_without_comparison(lhs, lhs_context, rhs, rhs_context) {
+    if compares_null_with_value_without_comparison(lhs, lhs_context, rhs, rhs_context)? {
         return Ok(CollationSeq::BINARY);
     }
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
@@ -750,9 +750,9 @@ fn common_ordering(
 /// How the values of a table or index column of type `ty` compare: the order
 /// of its type when it has one, otherwise the explicit COLLATE, if any. A type
 /// with its own order doesn't accept a COLLATE, and neither does a custom type
-/// that isn't text. A key of a type whose values can't be compared is refused
-/// when the table or index is created (see [Schema::check_column_can_be_key]),
-/// not here, so that a database that has one still opens.
+/// that isn't text. This gives every column of a table one, so a key of a
+/// type whose values can't be compared is refused by the callers that know it
+/// is a key (see [Schema::check_key_column_has_comparison]).
 pub(crate) fn key_collation(
     explicit_collation: Option<TextCollation>,
     ty: &ExprType,
@@ -791,14 +791,16 @@ pub(crate) fn check_sort_key(key: &Expr, context: &ExprContext<'_, '_>) -> Resul
 pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
     match expr {
         Expr::Collate(operand, _) => check_collate_operand(operand, context),
-        // `j IS NULL` compares no values, so it works on every type, as in
-        // PostgreSQL. `j = NULL` is refused, as in PostgreSQL.
-        Expr::Binary(lhs, Operator::Is | Operator::IsNot, rhs)
-            if compares_null_with_value_without_comparison(lhs, context, rhs, context) =>
-        {
-            Ok(())
+        Expr::Binary(lhs, op, rhs) if op.is_comparison() => {
+            // `j IS NULL` compares no values, so it works on every type, as in
+            // PostgreSQL. `j = NULL` is refused, as in PostgreSQL.
+            if matches!(op, Operator::Is | Operator::IsNot)
+                && compares_null_with_value_without_comparison(lhs, context, rhs, context)?
+            {
+                return Ok(());
+            }
+            check_comparison(lhs, rhs, context)
         }
-        Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
             lhs, start, end, ..
@@ -890,16 +892,16 @@ fn compares_null_with_value_without_comparison(
     lhs_context: &ExprContext<'_, '_>,
     rhs: &Expr,
     rhs_context: &ExprContext<'_, '_>,
-) -> bool {
-    let compares_with_null = |operand: &Expr, other: &Expr, other_context: &ExprContext| {
-        matches!(operand, Expr::Literal(Literal::Null))
-            && type_without_comparison(
-                &type_of(other, &other_context.type_env()),
-                other_context.schema(),
-            )
-            .is_some()
-    };
-    compares_with_null(lhs, rhs, rhs_context) || compares_with_null(rhs, lhs, lhs_context)
+) -> Result<bool> {
+    let compares_with_null =
+        |operand: &Expr, other: &Expr, other_context: &ExprContext| -> Result<bool> {
+            if !matches!(operand, Expr::Literal(Literal::Null)) {
+                return Ok(false);
+            }
+            let ty = type_of(other, &other_context.type_env());
+            Ok(type_without_comparison(&ty, other_context.schema())?.is_some())
+        };
+    Ok(compares_with_null(lhs, rhs, rhs_context)? || compares_with_null(rhs, lhs, lhs_context)?)
 }
 
 /// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
@@ -953,7 +955,7 @@ enum OperandOrder {
 /// comparison, sort key, grouping key and hash key asks for the order of its
 /// operands here.
 fn operand_order(ty: &ExprType, schema: &Schema, has_collate: bool) -> Result<OperandOrder> {
-    if let Some(type_def) = type_without_comparison(ty, schema) {
+    if let Some(type_def) = type_without_comparison(ty, schema)? {
         // A COLLATE on such a value gets the COLLATE error, as in PostgreSQL.
         if has_collate {
             check_type_accepts_collate(ty, schema)?;
@@ -1003,8 +1005,74 @@ pub(crate) fn no_comparison_error(ty: &ExprType, type_def: &TypeDef) -> LimboErr
         "to compare their text, CAST them to text"
     };
     LimboError::ParseError(format!(
-        "values of type {}{brackets} cannot be compared; {instead}",
-        type_def.name
+        "{}; {instead}",
+        values_cannot_be_compared(&format!("{}{brackets}", type_def.name))
+    ))
+}
+
+/// The errors for values whose type can't be compared. Their text is built
+/// here only, from the parts [NoComparisonError::of_message] looks for, so
+/// that a frontend can tell them apart, as the PostgreSQL one does to report
+/// their SQLSTATE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoComparisonError {
+    /// Comparing, sorting or grouping values: `values of type json cannot be
+    /// compared; to compare their text, CAST them to text`.
+    Compare,
+    /// A key on a column of the type: `column 'j' of type 'json' cannot be a
+    /// key: values of type json cannot be compared`.
+    Key,
+    /// An array of the type: `arrays of type json are not supported, because
+    /// values of type json cannot be compared`.
+    Array,
+}
+
+const VALUES_OF_TYPE: &str = "values of type ";
+const CANNOT_BE_COMPARED: &str = " cannot be compared";
+const KEY_COLUMN: &str = "column '";
+const CANNOT_BE_A_KEY: &str = " cannot be a key: ";
+const ARRAYS_OF_TYPE: &str = "arrays of type ";
+
+impl NoComparisonError {
+    /// Which of these errors `message` is, if any.
+    pub fn of_message(message: &str) -> Option<Self> {
+        if message.starts_with(VALUES_OF_TYPE) && message.contains(CANNOT_BE_COMPARED) {
+            Some(Self::Compare)
+        } else if message.starts_with(KEY_COLUMN)
+            && message.contains(&format!("{CANNOT_BE_A_KEY}{VALUES_OF_TYPE}"))
+        {
+            Some(Self::Key)
+        } else if message.starts_with(ARRAYS_OF_TYPE) && message.contains(CANNOT_BE_COMPARED) {
+            Some(Self::Array)
+        } else {
+            None
+        }
+    }
+}
+
+/// `values of type <type_name> cannot be compared`
+fn values_cannot_be_compared(type_name: &str) -> String {
+    format!("{VALUES_OF_TYPE}{type_name}{CANNOT_BE_COMPARED}")
+}
+
+/// The error for a key on `column`, declared as `declared_type`, whose values
+/// of type `type_name` can't be compared.
+pub(crate) fn no_comparison_key_error(
+    column: &str,
+    declared_type: &str,
+    type_name: &str,
+) -> LimboError {
+    LimboError::ParseError(format!(
+        "{KEY_COLUMN}{column}' of type '{declared_type}'{CANNOT_BE_A_KEY}{}",
+        values_cannot_be_compared(type_name)
+    ))
+}
+
+/// The error for an array of `type_name`, whose values can't be compared.
+pub(crate) fn no_comparison_array_error(type_name: &str) -> LimboError {
+    LimboError::ParseError(format!(
+        "{ARRAYS_OF_TYPE}{type_name} are not supported, because {}",
+        values_cannot_be_compared(type_name)
     ))
 }
 

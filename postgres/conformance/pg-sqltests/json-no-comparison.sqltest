@@ -61,6 +61,22 @@ test json-order-by-after-primary-key-errors {
 @sqlstate 42883
 expect error {}
 
+test json-arrow-on-subquery-compare-errors {
+    CREATE TABLE t(j json);
+    INSERT INTO t VALUES ('{"a":1}');
+    SELECT 1 FROM t WHERE (SELECT j FROM t) -> 'a' = '1';
+}
+@sqlstate 42883
+expect error {}
+
+test json-order-by-arrow-on-subquery-errors {
+    CREATE TABLE t(j json);
+    INSERT INTO t VALUES ('{"a":1}');
+    SELECT 1 FROM t ORDER BY (SELECT j FROM t) -> 'a';
+}
+@sqlstate 42883
+expect error {}
+
 test json-order-by-in-exists-errors {
     CREATE TABLE t(j json);
     INSERT INTO t VALUES ('{}');
