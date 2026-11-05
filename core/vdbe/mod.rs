@@ -2731,6 +2731,10 @@ impl Program {
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
+                    Ok(InsnFunctionStepResult::Interrupt) => {
+                        state.interrupt();
+                        program.interrupted_during_step(state, pager)
+                    }
                     Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
