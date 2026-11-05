@@ -309,9 +309,13 @@ jobs:
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Run benchmarks (excluding TPC-H)
-        uses: CodSpeedHQ/action@v4.17.0
+        uses: CodSpeedHQ/action@v5.6.3
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
+          # mimalloc returns unused memory to the OS on a 10 ms timer, so whether
+          # that work lands inside a measurement depends on wall-clock time.
+          # -1 turns the timer off.
+          MIMALLOC_PURGE_DELAY: "-1"
         with:
           mode: simulation
           # The CodSpeed runner runs this line with `bash -c`, so the quotes
@@ -369,9 +373,13 @@ jobs:
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Run benchmarks (excluding TPC-H)
-        uses: CodSpeedHQ/action@v4.17.0
+        uses: CodSpeedHQ/action@v5.6.3
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
+          # mimalloc returns unused memory to the OS on a 10 ms timer, so whether
+          # that work lands inside a measurement depends on wall-clock time.
+          # -1 turns the timer off.
+          MIMALLOC_PURGE_DELAY: "-1"
         with:
           mode: simulation
           # The CodSpeed runner runs this line with `bash -c`, so the quotes
@@ -419,7 +427,7 @@ jobs:
   #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark
 
   #     - name: Run TPC-H benchmark
-  #       uses: CodSpeedHQ/action@v4.17.0
+  #       uses: CodSpeedHQ/action@v5.6.3
   #       with:
   #         mode: simulation
   #         run: cargo codspeed run --bench tpc_h_benchmark
