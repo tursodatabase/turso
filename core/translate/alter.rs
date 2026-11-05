@@ -1311,7 +1311,7 @@ pub fn translate_alter_table(
                 default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             }
             if btree.is_strict {
-                column.resolve_custom_type(resolver.schema());
+                column.resolve_custom_type(resolver.schema())?;
                 let ty = column_type(&column, true, resolver.schema());
                 key_collation(column.text_collation(), &ty, resolver.schema())?;
             }
@@ -2010,7 +2010,7 @@ pub fn translate_alter_table(
                         )?;
                     }
                 }
-                table.resolve_custom_types(resolver.schema());
+                table.resolve_custom_types(resolver.schema())?;
                 let column = &table.columns()[column_index];
                 let ty = column_type(column, table.is_strict, resolver.schema());
                 key_collation(column.text_collation(), &ty, resolver.schema())?;

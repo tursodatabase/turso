@@ -1284,7 +1284,7 @@ impl Limbo {
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_truncation_indicator("…")
-            .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+            .load_preset("││──├─┼┤│    ┬┴┌┐└┘");
 
         if num_columns > 0 {
             let header = column_names

@@ -84,6 +84,10 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
+        "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "bigint out of range",
+        ))?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -886,57 +890,97 @@ fn push_json_string(string: &str, out: &mut String) {
 }
 
 fn exec_textlike(args: &[Register]) -> Result<Option<Boolean>> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Null))
-    {
+    let (Some(text), Some(pattern)) = (
+        args[0].get_value().cast_text_ref(),
+        args[1].get_value().cast_text_ref(),
+    ) else {
         return Ok(None);
-    }
-    let text: Vec<char> = args[0].get_value().to_string().chars().collect();
-    let pattern: Vec<char> = args[1].get_value().to_string().chars().collect();
+    };
     Ok(Some(Boolean(like_matches(&text, &pattern)?)))
 }
 
-/// PostgreSQL's LIKE: case-sensitive, `%` and `_` wildcards, and `\` makes the
-/// next pattern character literal. On a mismatch, the last `%` absorbs one more
-/// text character and matching resumes after it.
-fn like_matches(text: &[char], pattern: &[char]) -> Result<bool> {
+/// PostgreSQL's LIKE (MatchText in like_match.c): case-sensitive, `%` and `_`
+/// wildcards, and `\` makes the next pattern character literal. Literals are
+/// compared byte by byte, and `_` steps over one UTF-8 character. A `%` with
+/// the wildcards after it is skipped at once; on a later mismatch, matching
+/// resumes after it at the next text position that starts with the literal
+/// following it. Only the last `%` needs this: once the pattern after it
+/// reaches another `%`, no other position for the earlier one can do better.
+fn like_matches(text: &str, pattern: &str) -> Result<bool> {
+    let next_char = |t: usize| t + text[t..].chars().next().map_or(1, char::len_utf8);
+    let trailing_escape = || {
+        sqlstate_error(
+            SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+            "LIKE pattern must not end with escape character",
+        )
+    };
+    let (text_bytes, pattern_bytes) = (text.as_bytes(), pattern.as_bytes());
     let (mut p, mut t) = (0, 0);
-    let mut backtrack: Option<(usize, usize)> = None;
-    while t < text.len() {
-        let step = match pattern.get(p) {
-            Some('%') => {
-                backtrack = Some((p, t));
-                p += 1;
-                continue;
-            }
-            Some('_') => Some(1),
-            Some('\\') => match pattern.get(p + 1) {
-                Some(&c) => (c == text[t]).then_some(2),
-                None => {
-                    return Err(sqlstate_error(
-                        SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-                        "LIKE pattern must not end with escape character",
-                    ));
-                }
-            },
-            Some(&c) => (c == text[t]).then_some(1),
-            None => None,
-        };
-        match (step, backtrack) {
-            (Some(step), _) => {
-                p += step;
-                t += 1;
-            }
-            (None, Some((percent_p, percent_t))) => {
-                p = percent_p + 1;
-                t = percent_t + 1;
-                backtrack = Some((percent_p, t));
-            }
-            (None, None) => return Ok(false),
+    // The pattern position after the last `%` and the text position from
+    // which to look for its next match.
+    let mut resume: Option<(usize, usize)> = None;
+    loop {
+        if t == text.len() {
+            return Ok(pattern_bytes[p..].iter().all(|&b| b == b'%'));
         }
+        let matched = match pattern_bytes.get(p) {
+            Some(b'%') => {
+                p += 1;
+                while let Some(&wildcard @ (b'%' | b'_')) = pattern_bytes.get(p) {
+                    if wildcard == b'_' {
+                        if t == text.len() {
+                            return Ok(false);
+                        }
+                        t = next_char(t);
+                    }
+                    p += 1;
+                }
+                match &pattern_bytes[p..] {
+                    [] => return Ok(true),
+                    [b'\\'] => return Err(trailing_escape()),
+                    _ => {}
+                }
+                resume = Some((p, t));
+                false
+            }
+            Some(b'_') => {
+                p += 1;
+                t = next_char(t);
+                true
+            }
+            Some(b'\\') => {
+                let Some(&literal) = pattern_bytes.get(p + 1) else {
+                    return Err(trailing_escape());
+                };
+                p += 2;
+                t += 1;
+                literal == text_bytes[t - 1]
+            }
+            Some(&literal) => {
+                p += 1;
+                t += 1;
+                literal == text_bytes[t - 1]
+            }
+            None => false,
+        };
+        if matched {
+            continue;
+        }
+        let Some((resume_p, search_from)) = resume else {
+            return Ok(false);
+        };
+        let first = match pattern_bytes[resume_p] {
+            b'\\' => pattern_bytes[resume_p + 1],
+            literal => literal,
+        };
+        // `first` starts a character, so a text byte equal to it does too.
+        let Some(offset) = text_bytes[search_from..].iter().position(|&b| b == first) else {
+            return Ok(false);
+        };
+        p = resume_p;
+        t = search_from + offset;
+        resume = Some((resume_p, t + 1));
     }
-    Ok(pattern[p..].iter().all(|&c| c == '%'))
 }
 
 /// Rewrites a `LIKE ... ESCAPE` pattern to use `\` as the escape character,

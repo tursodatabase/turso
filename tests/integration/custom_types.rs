@@ -370,6 +370,247 @@ mod tests {
         );
     }
 
+    /// CREATE TYPE refuses a DECODE whose kind can't be worked out, so a
+    /// stored type with one must not open and compare by a guessed kind.
+    #[test]
+    fn test_reopen_fails_when_stored_type_reads_as_no_known_kind() {
+        let err = reopen_after_storing_type_sql(
+            "CREATE TYPE r(value any) BASE integer ENCODE value DECODE round(value)",
+        );
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value DECODE of type r returns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CREATE DOMAIN refuses a base type that does not exist yet, so a stored
+    /// domain based on itself must not open and use its values as a guessed kind.
+    #[test]
+    fn test_reopen_fails_when_stored_type_stores_no_known_kind() {
+        let err = reopen_after_storing_type_sql("CREATE DOMAIN r AS r");
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell the kinds of type r: it names itself"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CREATE DOMAIN refuses a base type that is neither a STRICT column type
+    /// nor a registered type, so a stored one must not open as a guessed kind.
+    #[test]
+    fn test_reopen_fails_when_stored_domain_is_based_on_an_unknown_name() {
+        let err = reopen_after_storing_type_sql("CREATE DOMAIN r AS foo");
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value type r stores"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An earlier version could store a DECODE that reads a type parameter.
+    /// A parameter holds the argument written in the column's type, which
+    /// is not converted to the parameter's type, so its kind is not known.
+    #[test]
+    fn test_reopen_fails_when_stored_decode_reads_a_type_parameter() {
+        let err = reopen_after_storing_type_sql(
+            "CREATE TYPE r(value any, p integer) BASE text ENCODE value DECODE p",
+        );
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value DECODE of type r returns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An earlier version could store a type whose ENCODE casts to itself.
+    /// Its kinds would depend on themselves, so the database does not open.
+    #[test]
+    fn test_reopen_fails_when_stored_type_casts_to_itself() {
+        let err = reopen_after_storing_type_sql(
+            "CREATE TYPE r BASE integer ENCODE CAST(value AS r) DECODE value",
+        );
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell the kinds of type r: it names itself"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CREATE TYPE refuses a type whose name another type already casts to,
+    /// so two types casting to each other can only come from stored SQL.
+    #[test]
+    fn test_reopen_fails_when_stored_types_cast_to_each_other() {
+        let (_temp_dir, path) = database_with_stored_types_a_and_b(
+            "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a)",
+        );
+        let err = open_error(&path);
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell the kinds of types a, b: they name each other"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The kinds of a type stored before a type its DECODE casts to are
+    /// worked out after that type's.
+    #[test]
+    fn test_reopen_with_type_stored_before_the_type_it_casts_to() {
+        let (_temp_dir, path) = database_with_stored_types_a_and_b(
+            "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS integer)",
+        );
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.start_nested();
+        let names: Vec<(String,)> = conn.exec_rows(
+            "SELECT name FROM __turso_internal_types WHERE name IN ('a', 'b') ORDER BY rowid",
+        );
+        conn.end_nested();
+        assert_eq!(names, vec![("a".to_string(),), ("b".to_string(),)]);
+        // a reads as b's kind, integer, so 10 > 9 although the text '10' < '9'.
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c > 9");
+        assert_eq!(rows, vec![(1,)]);
+    }
+
+    /// A type in an attached database counts when creating or dropping a type
+    /// it casts to, as it does in main: creating b would change what a's
+    /// CAST(value AS b) gives, and dropping b would leave a casting to nothing.
+    #[test]
+    fn test_type_in_attached_database_that_casts_to_a_type_of_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            )
+            .unwrap();
+            conn.close().unwrap();
+        }
+        let opts = custom_types.with_attach(true);
+        let db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+        let conn = db.connect_limbo();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let err = conn
+            .execute(
+                "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot create type b: type a already casts to it"),
+            "unexpected error: {err}"
+        );
+
+        conn.execute("DETACH aux").unwrap();
+        conn.execute(
+            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
+        )
+        .unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let err = conn.execute("DROP TYPE b").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot drop type b: type a depends on it"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Returns the error from opening a database storing `type_sql` as the
+    /// SQL of type `r` (see database_with_stored_type_sql).
+    fn reopen_after_storing_type_sql(type_sql: &str) -> String {
+        let (_temp_dir, path) = database_with_stored_type_sql(type_sql);
+        open_error(&path)
+    }
+
+    fn open_error(path: &std::path::Path) -> String {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        match turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        ) {
+            Ok(_) => panic!("open must fail for {}", path.display()),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// Creates type `r` and a table `t(a r)` holding one row, then replaces
+    /// the stored SQL of `r` with `type_sql`, as an earlier version could
+    /// have stored it.
+    fn database_with_stored_type_sql(type_sql: &str) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_stored_type_sql.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE r(value any) BASE text ENCODE value DECODE CAST(value AS real)",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t(a r) STRICT").unwrap();
+            conn.execute("INSERT INTO t VALUES ('10')").unwrap();
+            replace_stored_type_sql(&conn, "r", type_sql);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        (temp_dir, path)
+    }
+
+    /// Creates types `a` and `b`, in that order, and a table
+    /// `t(id INTEGER PRIMARY KEY, c a)` holding the text values '10' and '9'.
+    /// Then replaces the stored SQL of the types with `a_sql` and `b_sql`.
+    fn database_with_stored_types_a_and_b(
+        a_sql: &str,
+        b_sql: &str,
+    ) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_stored_types_a_and_b.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            for name in ["a", "b"] {
+                conn.execute(format!(
+                    "CREATE TYPE {name}(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS text)"
+                ))
+                .unwrap();
+            }
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, '10'), (2, '9')")
+                .unwrap();
+            replace_stored_type_sql(&conn, "a", a_sql);
+            replace_stored_type_sql(&conn, "b", b_sql);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        (temp_dir, path)
+    }
+
+    fn replace_stored_type_sql(conn: &Arc<turso_core::Connection>, name: &str, type_sql: &str) {
+        conn.start_nested();
+        let stmt = conn.prepare(format!(
+            "UPDATE __turso_internal_types SET sql = '{type_sql}' WHERE name = '{name}'"
+        ));
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
+    }
+
     #[test]
     fn test_schema_reparse_fails_when_stored_custom_type_does_not_parse() {
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
@@ -1196,6 +1437,165 @@ mod tests {
         ))
         .unwrap();
         (db, conn)
+    }
+
+    /// CREATE TYPE refuses a DECODE whose kind of value it can't tell. Every
+    /// other type's column compares like a plain column of the kind its DECODE
+    /// gives, holding the decoded values: with BASE text and DECODE
+    /// CAST(value AS real), '10.0' > 9.6 although the text '10.0' < '9.6'.
+    #[test]
+    fn test_decode_kind_decides_comparisons() {
+        // Each DECODE, and the column type of a plain table that compares the
+        // same way, or None when CREATE TYPE must refuse it.
+        let shapes: &[(&str, Option<&str>)] = &[
+            ("json_extract(value, '$')", None),
+            ("CAST(json_extract(value, '$') AS real)", Some("REAL")),
+            ("CAST(value AS real)", Some("REAL")),
+            ("CAST(value AS integer)", Some("INTEGER")),
+            ("CAST(value AS numeric)", Some("NUMERIC")),
+            ("CASE WHEN value = '' THEN 0 ELSE value END", None),
+            (
+                "CASE WHEN value = '' THEN 0.0 ELSE CAST(value AS real) END",
+                Some("REAL"),
+            ),
+            ("coalesce(value, 0)", None),
+            ("coalesce(CAST(value AS integer), 0)", Some("INTEGER")),
+            ("iif(value = '', NULL, CAST(value AS real))", Some("REAL")),
+            ("ifnull(value, 'x')", Some("TEXT")),
+            ("lower(value)", Some("TEXT")),
+            ("value * 1.0", Some("REAL")),
+            ("round(value, 2)", Some("REAL")),
+            ("value + 0", Some("NUMERIC")),
+            ("NULL", None),
+            ("CAST(value AS int_text)", Some("INTEGER")),
+            ("CAST(value AS real_domain)", Some("REAL")),
+            ("CAST(value AS numeric(10, 2))", None),
+        ];
+        // Valid JSON, so that json_extract accepts each of them.
+        let values = [
+            "'10.0'", "'9.5'", "'100'", "'2e1'", "'-3'", "'0.50'", "NULL",
+        ];
+        let literals = ["9.6", "10", "'10'", "0", "-3", "'9.5'"];
+
+        for mvcc in [false, true] {
+            let db = TempDatabase::builder()
+                .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE int_text(value any) BASE text \
+                 ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS integer)",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TYPE real_text(value any) BASE text \
+                 ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real)",
+            )
+            .unwrap();
+            conn.execute("CREATE DOMAIN real_domain AS real_text")
+                .unwrap();
+
+            for (i, (decode, kind)) in shapes.iter().enumerate() {
+                let context = format!("mvcc={mvcc}, DECODE {decode}");
+                let create_type = format!(
+                    "CREATE TYPE k{i}(value any) BASE text \
+                     ENCODE CAST({decode} AS text) DECODE {decode}"
+                );
+                let Some(kind) = kind else {
+                    assert_that!(conn.execute(&create_type))
+                        .named(&context)
+                        .err()
+                        .display_string()
+                        .contains("wrap it in CAST(... AS <type>)");
+                    continue;
+                };
+                conn.execute(&create_type)
+                    .unwrap_or_else(|e| panic!("{context}: {e}"));
+                conn.execute(format!(
+                    "CREATE TABLE t{i}(id INTEGER PRIMARY KEY, c k{i}) STRICT"
+                ))
+                .unwrap();
+                for (id, value) in values.iter().enumerate() {
+                    conn.execute(format!("INSERT INTO t{i} VALUES ({id}, {value})"))
+                        .unwrap_or_else(|e| panic!("{context}: {e}"));
+                }
+                conn.execute(format!(
+                    "CREATE TABLE p{i}(id INTEGER PRIMARY KEY, c {kind})"
+                ))
+                .unwrap();
+                conn.execute(format!("INSERT INTO p{i} SELECT id, c FROM t{i}"))
+                    .unwrap();
+
+                let mut conditions = Vec::new();
+                for literal in literals {
+                    for op in ["<", "=", ">"] {
+                        conditions.push(format!("c {op} {literal}"));
+                    }
+                    conditions.push(format!("c IN ({literal}, 100)"));
+                }
+                let compare_with_plain_table = || {
+                    for condition in &conditions {
+                        let got: Vec<(i64,)> = conn.exec_rows(&format!(
+                            "SELECT id FROM t{i} WHERE {condition} ORDER BY id"
+                        ));
+                        let expected: Vec<(i64,)> = conn.exec_rows(&format!(
+                            "SELECT id FROM p{i} WHERE {condition} ORDER BY id"
+                        ));
+                        assert_eq!(got, expected, "{context}: WHERE {condition}");
+                    }
+                    let got: Vec<(i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT a.id, b.id FROM t{i} a, t{i} b WHERE a.c < b.c ORDER BY 1, 2"
+                    ));
+                    let expected: Vec<(i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT a.id, b.id FROM p{i} a, p{i} b WHERE a.c < b.c ORDER BY 1, 2"
+                    ));
+                    assert_eq!(got, expected, "{context}: a.c < b.c");
+                };
+                compare_with_plain_table();
+            }
+            conn.close().unwrap();
+        }
+    }
+
+    /// A type whose DECODE casts to another type reads as that type's kind:
+    /// here `a` reads as a real, because `b`'s DECODE gives a real, although
+    /// both store text. This holds after reopening too, when the kinds are
+    /// worked out as the types load.
+    #[test]
+    fn test_decode_kind_follows_the_type_it_casts_to() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("decode_kind_cast_type.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        // As reals, 10.0 > 9.6 > 9.0. As text, '10' < '9' < '9.6'.
+        let check = |conn: &Arc<turso_core::Connection>, context: &str| {
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c < 9.6 ORDER BY id");
+            assert_eq!(rows, vec![(2,)], "{context}: WHERE c < 9.6");
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c > 9 ORDER BY id");
+            assert_eq!(rows, vec![(1,)], "{context}: WHERE c > 9");
+        };
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS real)",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, '10'), (2, '9')")
+                .unwrap();
+            check(&conn, "same session");
+            conn.close().unwrap();
+        }
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        check(&conn, "after reopen");
+        conn.close().unwrap();
     }
 
     /// A RANGE frame with an offset over a custom type takes only the offset

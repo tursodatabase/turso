@@ -20203,7 +20203,7 @@ fn test_create_type_visible_to_second_connection_under_mvcc() {
     // conn1: define a custom type
     let conn1 = db.connect();
     conn1
-        .execute("CREATE TYPE my_uint(value any) BASE text ENCODE my_uint_enc(value) DECODE my_uint_dec(value)")
+        .execute("CREATE TYPE my_uint(value any) BASE text ENCODE my_uint_enc(value) DECODE CAST(my_uint_dec(value) AS text)")
         .unwrap();
     conn1.close().unwrap();
 
