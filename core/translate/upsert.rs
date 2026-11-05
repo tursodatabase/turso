@@ -628,8 +628,9 @@ pub fn emit_upsert(
     // case-insensitively), so record both per register for the conflicting
     // row image and its rowid. The excluded (insertion) registers are
     // already recorded by the enclosing INSERT translation, except for the
-    // decoded copies made for STRICT custom-type tables. Cleared wholesale
-    // at the end of the enclosing INSERT translation.
+    // decoded copies made for STRICT custom-type tables. A decoded copy
+    // compares by the kind of value DECODE gives, not by how it is stored.
+    // Cleared wholesale at the end of the enclosing INSERT translation.
     let is_strict = table.btree().is_some_and(|bt| bt.is_strict);
     for (idx, col) in table.columns().iter().enumerate() {
         if col.is_rowid_alias() {
@@ -637,15 +638,21 @@ pub fn emit_upsert(
             // the image register for the alias column is never referenced.
             continue;
         }
-        let register_column = RegisterColumn::table_column(col, is_strict, resolver.schema());
-        let reg = layout.to_register(expr_current_start, idx);
+        let decoded_column =
+            RegisterColumn::decoded_table_column(col, is_strict, resolver.schema());
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
                 .register_columns
-                .insert(excluded_reg, register_column.clone());
+                .insert(excluded_reg, decoded_column.clone());
         }
-        resolver.register_columns.insert(reg, register_column);
+        let current_column = match decoded_current_start {
+            Some(_) => decoded_column,
+            None => RegisterColumn::table_column(col, is_strict, resolver.schema()),
+        };
+        resolver
+            .register_columns
+            .insert(layout.to_register(expr_current_start, idx), current_column);
     }
     resolver
         .register_columns

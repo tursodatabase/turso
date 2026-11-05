@@ -16,6 +16,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::type_ordering::TypeOrdering;
+use crate::types::{StorageClass, StrictType};
 use crate::vdbe::affinity::Affinity;
 use crate::{Result, SymbolTable};
 
@@ -54,7 +55,7 @@ pub(crate) enum ExprType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuiltinType {
+pub enum BuiltinType {
     Integer,
     Real,
     /// A decimal number written in the statement, such as `0.5` or `1e3`. SQLite
@@ -72,6 +73,16 @@ pub(crate) enum BuiltinType {
 }
 
 impl BuiltinType {
+    pub(crate) fn affinity(self) -> Affinity {
+        match self {
+            Self::Integer => Affinity::Integer,
+            Self::Real | Self::Decimal => Affinity::Real,
+            Self::Numeric => Affinity::Numeric,
+            Self::Text => Affinity::Text,
+            Self::Blob | Self::Any => Affinity::Blob,
+        }
+    }
+
     /// The name SQLite gives the type, so that SQLite's NUMERIC, whose values are
     /// integers or reals, isn't mistaken for the custom numeric type. A decimal
     /// written in the statement is a REAL to SQLite.
@@ -185,6 +196,13 @@ pub(crate) enum TypeEnv<'a> {
         schema: &'a Schema,
         syms: &'a SymbolTable,
     },
+    /// The DECODE of a custom type. `value` is the stored value, a value of
+    /// the type's BASE.
+    TypeBody {
+        value: ExprType,
+        schema: &'a Schema,
+        syms: &'a SymbolTable,
+    },
 }
 
 impl<'a> TypeEnv<'a> {
@@ -207,7 +225,7 @@ impl<'a> TypeEnv<'a> {
     pub(crate) fn schema(&self) -> &Schema {
         match self {
             Self::Statement { resolver, .. } => resolver.schema(),
-            Self::Table { schema, .. } => schema,
+            Self::Table { schema, .. } | Self::TypeBody { schema, .. } => schema,
         }
     }
 
@@ -217,7 +235,7 @@ impl<'a> TypeEnv<'a> {
             Self::Statement { resolver, .. } => resolver.resolve_function(name, arg_count),
             // The schema is read without the connection's dialect. Both
             // dialects resolve built-in functions the same way.
-            Self::Table { syms, .. } => {
+            Self::Table { syms, .. } | Self::TypeBody { syms, .. } => {
                 match crate::dialect::engine::resolve_builtin_function(name, arg_count)? {
                     Some(func) => Ok(Some(func)),
                     None => Ok(syms.resolve_function(name, arg_count).map(Func::External)),
@@ -229,15 +247,29 @@ impl<'a> TypeEnv<'a> {
     fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
-            Self::Table { .. } => None,
+            Self::Table { .. } | Self::TypeBody { .. } => None,
         }
     }
 
     fn resolver(&self) -> Option<&Resolver<'a>> {
         match self {
             Self::Statement { resolver, .. } => Some(resolver),
-            Self::Table { .. } => None,
+            Self::Table { .. } | Self::TypeBody { .. } => None,
         }
+    }
+
+    /// The type of a name in a CREATE TYPE body: `value` or a parameter.
+    /// Anywhere else a name is not bound yet.
+    fn name_type(&self, name: &str) -> ExprType {
+        let Self::TypeBody { value, .. } = self else {
+            return ExprType::NotKnownYet;
+        };
+        if name.eq_ignore_ascii_case("value") {
+            return value.clone();
+        }
+        // A type parameter holds the argument written in the column's type,
+        // such as numeric(10, 2), unconverted, so its kind is not known.
+        ExprType::Unknown
     }
 
     fn self_table_column_type(&self, column: usize) -> Option<ExprType> {
@@ -255,6 +287,7 @@ impl<'a> TypeEnv<'a> {
                 table.is_strict,
                 schema,
             )),
+            Self::TypeBody { .. } => None,
         }
     }
 }
@@ -289,7 +322,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ast::UnaryOperator::Negative => {
                 let inner_type = type_of(inner, env);
                 custom_operator_type(expr, core::slice::from_ref(&inner_type), env)
-                    .unwrap_or_else(|| negated_type(inner_type, env.schema()))
+                    .unwrap_or_else(|| negated_type(inner_type))
             }
             ast::UnaryOperator::Positive => {
                 unreachable!("without_wrappers looks through unary +")
@@ -335,30 +368,53 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             resolved: resolution,
             ..
         } => field_type(&type_of(base, env), resolution, env.schema()),
-        // Expressions whose value is never a custom-type value. SQLite's affinity
-        // gives their built-in type.
+        // Like a comparison, these give 1, 0 or NULL. `x LIKE p` and `x GLOB p`
+        // call like() and glob(), which do the same.
         ast::Expr::Between { .. }
         | ast::Expr::InList { .. }
         | ast::Expr::InSelect { .. }
         | ast::Expr::InTable { .. }
         | ast::Expr::IsNull(_)
         | ast::Expr::NotNull(_)
-        | ast::Expr::Like { .. }
+        | ast::Expr::Like {
+            op: ast::LikeOperator::Like | ast::LikeOperator::Glob,
+            ..
+        }
         | ast::Expr::Exists(_)
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
             ..
-        }
-        | ast::Expr::FunctionCallStar { .. }
-        | ast::Expr::Raise(..)
+        } => ExprType::Builtin(BuiltinType::Integer),
+        // `x REGEXP p` calls regexp(p, x), which an extension may define.
+        ast::Expr::Like {
+            op: ast::LikeOperator::Regexp,
+            lhs,
+            rhs,
+            ..
+        } => function_type(
+            &ast::Name::exact(String::from("regexp")),
+            &[rhs.clone(), lhs.clone()],
+            env,
+        ),
+        // MATCH is only allowed as an FTS index query, which gives no value.
+        ast::Expr::Like {
+            op: ast::LikeOperator::Match,
+            ..
+        } => ExprType::Unknown,
+        // RAISE stops the statement and gives no value, so like NULL it adds no
+        // kind to a CASE or coalesce: `coalesce(CAST(value AS integer),
+        // RAISE(ABORT, 'bad'))` is an integer.
+        ast::Expr::Raise(..) => ExprType::Null,
+        // Expressions whose value is never a custom-type value. SQLite's affinity
+        // gives their built-in type.
+        ast::Expr::FunctionCallStar { .. }
         // `CAST(x AS)`, a SQLite cast with no type name.
         | ast::Expr::Cast {
             type_name: None, ..
         } => affinity_type(expr, env),
-        // Not bound or planned yet: names, subqueries and `DEFAULT`.
-        ast::Expr::Id(_)
-        | ast::Expr::Name(_)
-        | ast::Expr::Qualified(..)
+        ast::Expr::Id(name) | ast::Expr::Name(name) => env.name_type(name.as_str()),
+        // Not bound or planned yet: subqueries and `DEFAULT`.
+        ast::Expr::Qualified(..)
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Subquery(_)
         | ast::Expr::Default => ExprType::NotKnownYet,
@@ -413,10 +469,7 @@ fn register_column_type(expr: &ast::Expr, env: &TypeEnv) -> Option<ExprType> {
         return None;
     };
     let column = env.resolver()?.register_columns.get(register)?;
-    Some(sqlite_operand_type(
-        column.column_type.clone(),
-        env.schema(),
-    ))
+    Some(stored_operand_type(column.column_type.clone()))
 }
 
 /// The expression inside parentheses, COLLATE and unary `+`, which give their
@@ -635,7 +688,7 @@ fn field_type(
                 type_def: Arc::clone(type_def),
                 params: Vec::new(),
             },
-            None => builtin_type_of_affinity(Affinity::affinity(name)),
+            None => ExprType::Builtin(builtin_type_of_affinity(Affinity::affinity(name))),
         },
         None => ExprType::Unknown,
     }
@@ -648,8 +701,9 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
     match ty {
         ExprType::Custom { type_def, .. } => schema.type_ordering(type_def),
         ExprType::Array { element, .. } => {
+            // Elements compare by their stored form.
             let element_is_text = matches!(
-                sqlite_operand_type(element.as_ref().clone(), schema),
+                stored_operand_type(element.as_ref().clone()),
                 ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped
             );
             Some(if element_is_text {
@@ -681,8 +735,10 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
         }
         // An array column stores blobs, so its affinity says nothing about its
         // elements; the declared element type does.
-        None if column.is_array() => builtin_type_of_affinity(Affinity::affinity(&column.ty_str)),
-        None => builtin_type_of_affinity(column.affinity()),
+        None if column.is_array() => {
+            ExprType::Builtin(builtin_type_of_affinity(Affinity::affinity(&column.ty_str)))
+        }
+        None => ExprType::Builtin(builtin_type_of_affinity(column.affinity())),
     };
     ExprType::array(scalar, column.array_dimensions())
 }
@@ -694,7 +750,11 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
         None => match Affinity::of_written_type(&name) {
             // A CAST to BLOB always gives a blob.
             Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
-            affinity => builtin_type_of_affinity(affinity),
+            affinity @ (Affinity::Integer
+            | Affinity::Real
+            | Affinity::Numeric
+            | Affinity::Text
+            | Affinity::None) => ExprType::Builtin(builtin_type_of_affinity(affinity)),
         },
     };
     ExprType::array(scalar, type_name.array_dimensions)
@@ -751,8 +811,8 @@ fn binary_type(
             custom_operator_type(expr, &types, env).unwrap_or_else(|| {
                 let [lhs_type, rhs_type] = types;
                 arithmetic_type(
-                    &sqlite_operand_type(lhs_type, env.schema()),
-                    &sqlite_operand_type(rhs_type, env.schema()),
+                    &sqlite_operand_type(lhs_type),
+                    &sqlite_operand_type(rhs_type),
                 )
             })
         }
@@ -785,7 +845,11 @@ fn binary_type(
             }
             ExprType::Builtin(BuiltinType::Text)
         }
-        Operator::ArrowRight | Operator::ArrowRightShift => affinity_type(expr, env),
+        // `->` gives the JSON text of what it extracts, or NULL (SQLite's
+        // json.c registers it with JSON_JSON, "Result is always JSON").
+        Operator::ArrowRight => ExprType::Builtin(BuiltinType::Text),
+        // `->>` gives the SQL value it extracts, whose kind varies.
+        Operator::ArrowRightShift => affinity_type(expr, env),
     }
 }
 
@@ -802,43 +866,159 @@ fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> 
 }
 
 /// The type an operand has for SQLite's own arithmetic. A custom value that no
-/// function of its type runs goes to SQLite's operator as a value of the type it
-/// is stored as: `smallint * 2` is an integer. A decimal written in the
+/// function of its type runs goes to SQLite's operator as the kind of value its
+/// type reads as: `smallint * 2` is an integer. A decimal written in the
 /// statement is a REAL to SQLite.
-pub(super) fn sqlite_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
+pub(super) fn sqlite_operand_type(ty: ExprType) -> ExprType {
+    operand_type(ty, read_type)
+}
+
+/// Like [`sqlite_operand_type`], for a value in its stored form: a custom
+/// value is a value of the type it is stored as.
+fn stored_operand_type(ty: ExprType) -> ExprType {
+    operand_type(ty, stored_type)
+}
+
+/// The type an operand has for SQLite's own arithmetic, where `custom_type`
+/// gives the type of a custom value.
+fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) -> ExprType {
     match &ty {
-        ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
+        ExprType::Custom { type_def, .. } => custom_type(type_def),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
-        _ => ty,
+        ExprType::Builtin(_)
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::NotKnownYet
+        | ExprType::RowValue => ty,
     }
+}
+
+/// The built-in type of the values a custom type reads as.
+fn read_type(type_def: &TypeDef) -> ExprType {
+    ExprType::Builtin(type_def.value_type())
 }
 
 /// The type of `-x` and `abs(x)`. Negating a decimal written in the statement
 /// gives a decimal, as `-0.5` is one.
-fn negated_type(ty: ExprType, schema: &Schema) -> ExprType {
+fn negated_type(ty: ExprType) -> ExprType {
     match ty {
         ExprType::Builtin(BuiltinType::Decimal) => ty,
-        ty => arithmetic_type(
+        ExprType::Builtin(_)
+        | ExprType::Custom { .. }
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::NotKnownYet
+        | ExprType::RowValue => arithmetic_type(
             &ExprType::Builtin(BuiltinType::Integer),
-            &sqlite_operand_type(ty, schema),
+            &sqlite_operand_type(ty),
         ),
     }
 }
 
-/// The built-in type a custom type's values are stored as: its base type, after
-/// following domains and custom types built on other custom types.
-pub(crate) fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
-    let Ok(Some(resolved)) = schema.resolve_type_unchecked(&type_def.name) else {
-        return ExprType::Builtin(BuiltinType::Any);
-    };
-    ExprType::Builtin(match resolved.primitive.to_ascii_lowercase().as_str() {
-        "integer" => BuiltinType::Integer,
-        "real" => BuiltinType::Real,
-        "numeric" => BuiltinType::Numeric,
-        "text" => BuiltinType::Text,
-        "blob" => BuiltinType::Blob,
-        _ => BuiltinType::Any,
-    })
+/// The built-in type a custom type's values are stored as.
+fn stored_type(type_def: &TypeDef) -> ExprType {
+    ExprType::Builtin(type_def.stored_type())
+}
+
+/// The kind of value a custom type or domain reads as, worked out when the
+/// type is registered: the kind its DECODE gives, or without a DECODE the
+/// kind of its BASE. A domain reads as the type it is based on. `None` when
+/// the kind can't be worked out, such as a DECODE that gives a text or an integer
+/// depending on the value.
+pub(crate) fn value_type(
+    type_def: &TypeDef,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> Option<BuiltinType> {
+    let base = base_value_type(type_def.base(), schema)?;
+    match decode_type(type_def, base, schema, syms) {
+        Some(ty) => value_kind(&ty, schema),
+        None => Some(base),
+    }
+}
+
+/// The type of a custom type's DECODE, in which `value` is a value of the
+/// type's BASE, whose kind is `base`. None without a DECODE, or when DECODE
+/// gives `value` unchanged.
+pub(crate) fn decode_type(
+    type_def: &TypeDef,
+    base: BuiltinType,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> Option<ExprType> {
+    if type_def.decode_returns_value_unchanged() {
+        return None;
+    }
+    let decode = type_def.decode()?;
+    Some(type_of(
+        decode,
+        &TypeEnv::TypeBody {
+            value: ExprType::Builtin(base),
+            schema,
+            syms,
+        },
+    ))
+}
+
+/// The kind of value a BASE holds: that of a type it names, or of a SQLite type.
+pub(crate) fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
+    match schema.get_type_def_unchecked(base) {
+        Some(type_def) => Some(type_def.value_type()),
+        None => primitive_value_type(base),
+    }
+}
+
+/// The kind of value a type stores: that of its BASE, which is a SQLite type
+/// or, for a domain, the type the domain is based on.
+pub(crate) fn stored_value_type(type_def: &TypeDef, schema: &Schema) -> Option<BuiltinType> {
+    match schema.get_type_def_unchecked(type_def.base()) {
+        Some(base) => Some(base.stored_type()),
+        None => primitive_value_type(type_def.base()),
+    }
+}
+
+/// The kind of value a BASE such as `integer` holds. A BASE is stored like a
+/// STRICT column, so None for ANY and for a name a STRICT column can't be
+/// declared with.
+pub(crate) fn primitive_value_type(primitive: &str) -> Option<BuiltinType> {
+    match StrictType::named(primitive)? {
+        StrictType::Stores(StorageClass::Integer) => Some(BuiltinType::Integer),
+        StrictType::Stores(StorageClass::Real) => Some(BuiltinType::Real),
+        StrictType::Stores(StorageClass::Text) => Some(BuiltinType::Text),
+        StrictType::Stores(StorageClass::Blob) => Some(BuiltinType::Blob),
+        StrictType::Any => None,
+    }
+}
+
+/// The kind of value an expression of type `ty` gives, for a DECODE. None
+/// when it varies, and for a value of a type with its own order, such as
+/// numeric: such a value only compares correctly in that order.
+pub(crate) fn value_kind(ty: &ExprType, schema: &Schema) -> Option<BuiltinType> {
+    match ty {
+        ExprType::Builtin(BuiltinType::Any)
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::NotKnownYet
+        | ExprType::RowValue => None,
+        ExprType::Builtin(BuiltinType::Decimal) => Some(BuiltinType::Real),
+        ExprType::Builtin(
+            builtin @ (BuiltinType::Integer
+            | BuiltinType::Real
+            | BuiltinType::Numeric
+            | BuiltinType::Text
+            | BuiltinType::Blob),
+        ) => Some(*builtin),
+        ExprType::Untyped => Some(BuiltinType::Text),
+        ExprType::Array { .. } => Some(BuiltinType::Blob),
+        ExprType::Custom { type_def, .. } => match schema.type_ordering(type_def) {
+            Some(_) => None,
+            None => Some(type_def.value_type()),
+        },
+    }
 }
 
 /// The result of SQLite's arithmetic: `INTEGER + INTEGER` is an integer, an
@@ -922,7 +1102,7 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
         ResultType::NumberOfTheFirstArgumentsType => match first_argument() {
-            Some(ty) => negated_type(ty, env.schema()),
+            Some(ty) => negated_type(ty),
             None => any,
         },
         ResultType::AbsOfTheFirstArgument => match first_argument() {
@@ -931,13 +1111,18 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             }
             // abs of a custom type has the type of `-x`, so numeric's operators
             // still apply to `n + abs(n)`.
-            Some(ty) => negated_type(ty, env.schema()),
+            Some(ty) => negated_type(ty),
             None => any,
         },
         ResultType::RealForARealArgument => {
             let is_real =
                 |arg: &ast::Expr| matches!(type_of(arg, env), ExprType::Builtin(BuiltinType::Real));
-            if args.iter().any(|arg| is_real(arg)) {
+            // A text or blob is not an exact number, so it is converted to a real.
+            let first_is_not_a_number = matches!(
+                first_argument(),
+                Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob))
+            );
+            if first_is_not_a_number || args.iter().any(|arg| is_real(arg)) {
                 ExprType::Builtin(BuiltinType::Real)
             } else {
                 any
@@ -1080,10 +1265,7 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         (
             a @ ExprType::Builtin(Integer | Real | Decimal | Numeric),
             b @ ExprType::Builtin(Integer | Real | Decimal | Numeric),
-        ) => arithmetic_type(
-            &sqlite_operand_type(a, schema),
-            &sqlite_operand_type(b, schema),
-        ),
+        ) => arithmetic_type(&sqlite_operand_type(a), &sqlite_operand_type(b)),
         (
             ExprType::Custom {
                 type_def,
@@ -1128,17 +1310,17 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             params: Vec::new(),
         },
         // Mixed with anything else, a custom type that does not compute with
-        // exact numbers is a value of the type it is stored as:
+        // exact numbers is a value of the kind its type reads as:
         // coalesce(smallint_column, 0) is an integer, and
         // coalesce(numeric_column, bigint_column) is a numeric.
         (a, b) if lacks_exact_numbers(&a) || lacks_exact_numbers(&b) => common_scalar_type(
-            stored_type_unless_exact_numbers(a, schema),
-            stored_type_unless_exact_numbers(b, schema),
+            read_type_unless_exact_numbers(a),
+            read_type_unless_exact_numbers(b),
             schema,
         ),
         // Two different types that compute with exact numbers.
         (ExprType::Custom { type_def, .. }, other) | (other, ExprType::Custom { type_def, .. }) => {
-            common_scalar_type(stored_type(&type_def, schema), other, schema)
+            common_scalar_type(read_type(&type_def), other, schema)
         }
         _ => ExprType::Builtin(BuiltinType::Any),
     }
@@ -1148,12 +1330,17 @@ fn lacks_exact_numbers(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if !type_def.computes_with_exact_numbers())
 }
 
-fn stored_type_unless_exact_numbers(ty: ExprType, schema: &Schema) -> ExprType {
+fn read_type_unless_exact_numbers(ty: ExprType) -> ExprType {
     match &ty {
-        ExprType::Custom { type_def, .. } if lacks_exact_numbers(&ty) => {
-            stored_type(type_def, schema)
-        }
-        _ => ty,
+        ExprType::Custom { type_def, .. } if lacks_exact_numbers(&ty) => read_type(type_def),
+        ExprType::Custom { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::NotKnownYet
+        | ExprType::RowValue => ty,
     }
 }
 
@@ -1162,7 +1349,7 @@ fn is_domain(ty: &ExprType) -> bool {
 }
 
 /// The type a domain is based on, without parameters: the first custom type
-/// under the domain, or the built-in type it is stored as. Other types are
+/// under the domain, or the built-in type it reads as. Other types are
 /// returned unchanged.
 pub(crate) fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
     let ExprType::Custom { type_def, .. } = &ty else {
@@ -1176,7 +1363,7 @@ pub(crate) fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
             type_def,
             params: Vec::new(),
         },
-        None => stored_type(type_def, schema),
+        None => read_type(type_def),
     }
 }
 
@@ -1187,17 +1374,18 @@ fn affinity_type(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         Some(resolver) => get_expr_affinity(expr, &super::ExprContext::new(env.tables(), resolver)),
         None => get_expr_affinity(expr, &TableMetadata::new(env.tables())),
     };
-    builtin_type_of_affinity(affinity)
+    ExprType::Builtin(builtin_type_of_affinity(affinity))
 }
 
-fn builtin_type_of_affinity(affinity: Affinity) -> ExprType {
-    ExprType::Builtin(match affinity {
+/// The kind of value a column with `affinity` holds. A blob column holds any kind.
+fn builtin_type_of_affinity(affinity: Affinity) -> BuiltinType {
+    match affinity {
         Affinity::Integer => BuiltinType::Integer,
         Affinity::Real => BuiltinType::Real,
         Affinity::Numeric => BuiltinType::Numeric,
         Affinity::Text => BuiltinType::Text,
         Affinity::Blob | Affinity::None => BuiltinType::Any,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1401,6 +1589,34 @@ mod tests {
         );
     }
 
+    /// CREATE TYPE accepts a DECODE only when this gives a kind.
+    #[test]
+    fn value_kind_of_every_type() {
+        let schema = test_schema();
+        let cases = [
+            (builtin(BuiltinType::Integer), Some(BuiltinType::Integer)),
+            (builtin(BuiltinType::Real), Some(BuiltinType::Real)),
+            (builtin(BuiltinType::Decimal), Some(BuiltinType::Real)),
+            (builtin(BuiltinType::Numeric), Some(BuiltinType::Numeric)),
+            (builtin(BuiltinType::Text), Some(BuiltinType::Text)),
+            (builtin(BuiltinType::Blob), Some(BuiltinType::Blob)),
+            (builtin(BuiltinType::Any), None),
+            (ExprType::Untyped, Some(BuiltinType::Text)),
+            (ExprType::Null, None),
+            (ExprType::Unknown, None),
+            (
+                ExprType::array(builtin(BuiltinType::Integer), 1),
+                Some(BuiltinType::Blob),
+            ),
+            (custom("cents", &[]), Some(BuiltinType::Integer)),
+            // numeric compares in its own order, which no affinity gives.
+            (custom("numeric", &["10", "2"]), None),
+        ];
+        for (ty, expected) in cases {
+            assert_eq!(value_kind(&ty, &schema), expected, "{ty:?}");
+        }
+    }
+
     fn parse_expr(sql: &str) -> ast::Expr {
         let select_sql = format!("SELECT {sql}");
         let mut parser = Parser::new(select_sql.as_bytes());
@@ -1435,6 +1651,7 @@ mod tests {
         schema
             .add_type_from_sql(
                 "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+                &SymbolTable::new(),
             )
             .unwrap();
         schema
