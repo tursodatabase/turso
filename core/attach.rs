@@ -601,6 +601,7 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
+                    db.schema.lock().check_has_only_builtin_types(alias)?;
                     self.has_non_main_pagers.store(true, Ordering::Release);
                     let database_id = self
                         .attached_databases

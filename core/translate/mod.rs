@@ -172,24 +172,48 @@ pub fn translate(
         roles::check_statement_privileges(&stmt)?;
     }
 
-    match stmt {
+    let translated = match stmt {
         // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(
-                &resolver,
-                &name,
-                body,
-                pager,
-                connection.clone(),
-                &mut program,
-            )?;
-        }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        ast::Stmt::Pragma { name, body } => pragma::translate_pragma(
+            &resolver,
+            &name,
+            body,
+            pager,
+            connection.clone(),
+            &mut program,
+        ),
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input),
     };
+    // Checked even when translation failed: a type that is missing from main
+    // can make translation fail with a less clear error first.
+    check_other_databases_have_only_builtin_types(&resolver, &program)?;
+    translated?;
 
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
+}
+
+/// Fails when the statement reads or writes a database other than main that
+/// has a type or domain of its own. ATTACH refuses such a database, and this
+/// catches one that gained a type after it was attached.
+fn check_other_databases_have_only_builtin_types(
+    resolver: &Resolver,
+    program: &ProgramBuilder,
+) -> Result<()> {
+    for database_id in program.accessed_databases() {
+        if database_id == crate::MAIN_DB_ID {
+            continue;
+        }
+        let database_name = resolver
+            .catalog
+            .namespace_name(database_id)
+            .expect("a database the statement accesses has a name");
+        resolver.with_schema(database_id, |schema| {
+            schema.check_has_only_builtin_types(&database_name)
+        })?;
+    }
+    Ok(())
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

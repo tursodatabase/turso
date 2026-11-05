@@ -2225,6 +2225,13 @@ impl ProgramBuilder {
         Ok(())
     }
 
+    /// The databases the statement reads or writes, each once or twice.
+    pub(crate) fn accessed_databases(&self) -> impl Iterator<Item = usize> + '_ {
+        self.read_databases
+            .iter()
+            .chain(self.write_databases.iter())
+    }
+
     pub const fn begin_concurrent_operation(&mut self) {
         self.txn_mode = TransactionMode::Concurrent;
     }

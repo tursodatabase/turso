@@ -586,6 +586,7 @@ For the full set of array functions (`array_agg`, `array_append`, `array_contain
 
 - **STRICT tables only**: Custom type names are ignored in non-STRICT tables. The column uses standard type affinity rules instead.
 - **Cannot drop while in use**: A type cannot be dropped with DROP TYPE while any table has a column of that type.
+- **Main database only**: Types live in the main database. A table in an attached database or a `TEMP` table cannot have a column of a type you created: `CREATE TABLE aux.t(c cents) STRICT` fails with `column t.c of database aux cannot have type cents: custom types and domains can only be used in the main database`. ATTACH refuses a database that has its own types, with `database aux has type cents: ...`. Built-in types such as `json`, `jsonb`, `numeric` and `inet` work in every database.
 
 <Note>
 If a non-STRICT table was created with a type name that did not exist at the time (e.g., `CREATE TABLE t(x mytype)`), and a custom type with that name is created afterwards (`CREATE TYPE mytype ...`), the type's ENCODE/DECODE logic will **not** be retroactively applied to the existing table. This is not a bug: non-STRICT tables treat all type names as plain affinity hints regardless of whether a matching custom type exists. STRICT tables prevent this scenario because they reject unknown type names at CREATE TABLE time.

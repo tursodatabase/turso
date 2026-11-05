@@ -475,11 +475,11 @@ mod tests {
         assert_eq!(rows, vec![(1,)]);
     }
 
-    /// A type in an attached database counts when creating or dropping a type
-    /// it casts to, as it does in main: creating b would change what a's
-    /// CAST(value AS b) gives, and dropping b would leave a casting to nothing.
+    /// A stored expression of an attached database counts when creating a
+    /// type it casts to, as it does in main: creating b would change what the
+    /// index on CAST(x AS b) gives.
     #[test]
-    fn test_type_in_attached_database_that_casts_to_a_type_of_main() {
+    fn test_index_in_attached_database_that_casts_to_a_new_type() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");
         let main_path = temp_dir.path().join("main.db");
@@ -487,10 +487,8 @@ mod tests {
         {
             let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
-            )
-            .unwrap();
+            conn.execute("CREATE TABLE t(x text)").unwrap();
+            conn.execute("CREATE INDEX i ON t(CAST(x AS b))").unwrap();
             conn.close().unwrap();
         }
         let opts = custom_types.with_attach(true);
@@ -505,22 +503,209 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("cannot create type b: type a already casts to it"),
+            err.contains("cannot create type b: index i already casts to it"),
             "unexpected error: {err}"
         );
+    }
 
-        conn.execute("DETACH aux").unwrap();
-        conn.execute(
-            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
-        )
-        .unwrap();
+    /// Statements look custom types up in main only. An attached database
+    /// with a type of its own would have its values read with main's type of
+    /// the same name: aux stores 5 cents as 500, and main's cents would read
+    /// 500 back as 71. So ATTACH refuses it.
+    #[test]
+    fn test_attach_refuses_database_with_its_own_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TABLE t(c cents) STRICT").unwrap();
+            conn.execute("INSERT INTO t VALUES (5)").unwrap();
+            conn.close().unwrap();
+        }
+        let db =
+            TempDatabase::new_with_existent_with_opts(&main_path, custom_types.with_attach(true));
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 7 DECODE value / 7")
+            .unwrap();
+        let err = conn
+            .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "database aux has type cents: custom types and domains can only be used in the main database"
+            ),
+            "unexpected error: {err}"
+        );
+        let err = conn
+            .execute("INSERT INTO aux.t VALUES (9)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no such table: aux.t"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A database that gains a type after it was attached is refused by the
+    /// next statement that uses it, before a value of the type is read or
+    /// written with main's type of the same name.
+    #[test]
+    fn test_attached_database_that_gains_a_type_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let aux_db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+        let aux_conn = aux_db.connect_limbo();
+        aux_conn
+            .execute("CREATE TABLE plain(x integer) STRICT")
+            .unwrap();
+
+        let db =
+            TempDatabase::new_with_existent_with_opts(&main_path, custom_types.with_attach(true));
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 7 DECODE value / 7")
+            .unwrap();
         conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
             .unwrap();
-        let err = conn.execute("DROP TYPE b").unwrap_err().to_string();
-        assert!(
-            err.contains("cannot drop type b: type a depends on it"),
-            "unexpected error: {err}"
-        );
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM aux.plain");
+        assert_eq!(rows, vec![(0,)]);
+
+        aux_conn
+            .execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        aux_conn.execute("CREATE TABLE t(c cents) STRICT").unwrap();
+        aux_conn.execute("INSERT INTO t VALUES (5)").unwrap();
+
+        for sql in ["SELECT c FROM aux.t", "INSERT INTO aux.t VALUES (9)"] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            assert!(
+                err.contains(
+                    "database aux has type cents: custom types and domains can only be used in the main database"
+                ),
+                "unexpected error for {sql}: {err}"
+            );
+        }
+        let rows: Vec<(i64,)> = aux_conn.exec_rows("SELECT c FROM t");
+        assert_eq!(rows, vec![(5,)]);
+        conn.execute("DETACH aux").unwrap();
+    }
+
+    /// A table of an attached or the temp database can't have a column of a
+    /// type of main, as its values would be read with whatever type of that
+    /// name main has when the database is used.
+    #[test]
+    fn test_tables_outside_main_cannot_use_types_of_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db =
+            TempDatabase::new_with_existent_with_opts(&main_path, custom_types.with_attach(true));
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE DOMAIN pos AS integer CHECK (value > 0)")
+            .unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x integer) STRICT")
+            .unwrap();
+        conn.execute("CREATE TEMP TABLE tt(x integer) STRICT")
+            .unwrap();
+
+        for (sql, column, database, ty) in [
+            ("CREATE TABLE aux.u(c cents) STRICT", "u.c", "aux", "cents"),
+            (
+                "CREATE TABLE aux.u(c cents[]) STRICT",
+                "u.c",
+                "aux",
+                "cents",
+            ),
+            ("CREATE TABLE aux.u(p pos) STRICT", "u.p", "aux", "pos"),
+            (
+                "CREATE TEMP TABLE u(c cents) STRICT",
+                "u.c",
+                "temp",
+                "cents",
+            ),
+            (
+                "ALTER TABLE aux.t ADD COLUMN c cents",
+                "t.c",
+                "aux",
+                "cents",
+            ),
+            (
+                "ALTER TABLE aux.t ALTER COLUMN x TO y cents",
+                "t.y",
+                "aux",
+                "cents",
+            ),
+            ("ALTER TABLE tt ADD COLUMN c cents", "tt.c", "temp", "cents"),
+        ] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            let expected = format!(
+                "column {column} of database {database} cannot have type {ty}: custom types and domains can only be used in the main database"
+            );
+            assert!(err.contains(&expected), "unexpected error for {sql}: {err}");
+        }
+        let err = conn
+            .execute("CREATE TYPE aux.c2 BASE integer ENCODE value DECODE value")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+    }
+
+    /// Built-in types are the same in every database, so tables of attached
+    /// and temp databases can use them.
+    #[test]
+    fn test_builtin_types_work_outside_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(j jsonb) STRICT").unwrap();
+            conn.execute(r#"INSERT INTO t VALUES ('{"a":1}')"#).unwrap();
+            conn.close().unwrap();
+        }
+        let db =
+            TempDatabase::new_with_existent_with_opts(&main_path, custom_types.with_attach(true));
+        let conn = db.connect_limbo();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        conn.execute(r#"INSERT INTO aux.t VALUES ('{"b":2}')"#)
+            .unwrap();
+        conn.execute("CREATE TABLE aux.u(j jsonb, n numeric(5, 2)) STRICT")
+            .unwrap();
+        conn.execute(r#"INSERT INTO aux.u VALUES ('{"c":3}', 1.5)"#)
+            .unwrap();
+        conn.execute("CREATE TEMP TABLE tt(j jsonb) STRICT")
+            .unwrap();
+        conn.execute(r#"INSERT INTO tt VALUES ('{"d":4}')"#)
+            .unwrap();
+
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT j FROM aux.t ORDER BY rowid");
+        assert_eq!(rows, vec![(r#"{"a":1}"#.into(),), (r#"{"b":2}"#.into(),)]);
+        let rows: Vec<(String, String)> = conn.exec_rows("SELECT j, n FROM aux.u");
+        assert_eq!(rows, vec![(r#"{"c":3}"#.into(), "1.50".into())]);
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT j FROM tt");
+        assert_eq!(rows, vec![(r#"{"d":4}"#.into(),)]);
+
+        conn.execute("DETACH aux").unwrap();
+        conn.close().unwrap();
+        let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+        let conn = db.connect_limbo();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT j FROM t ORDER BY rowid");
+        assert_eq!(rows, vec![(r#"{"a":1}"#.into(),), (r#"{"b":2}"#.into(),)]);
     }
 
     /// Returns the error from opening a database storing `type_sql` as the

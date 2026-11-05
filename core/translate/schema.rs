@@ -684,6 +684,7 @@ fn can_compare(lty: &CheckExprType, rty: &CheckExprType, resolver: &CatalogConte
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
+    database_id: usize,
     resolver: &CatalogContext,
     is_nested: bool,
 ) -> Result<()> {
@@ -740,7 +741,7 @@ fn validate(
         let is_strict = options.contains_strict();
 
         for c in columns {
-            check_column_type(c, table_name, is_strict, resolver.schema())?;
+            check_column_type(c, table_name, is_strict, database_id, resolver)?;
         }
 
         // In STRICT tables, validate that CHECK constraint comparisons have
@@ -806,13 +807,15 @@ fn validate(
 
 /// Refuses a column type that a table cannot have. CREATE TABLE, ADD COLUMN
 /// and ALTER COLUMN all call this, so ALTER cannot give a column a type that
-/// CREATE TABLE refuses.
+/// CREATE TABLE refuses. `database_id` is the database the table is in.
 pub(crate) fn check_column_type(
     column: &ast::ColumnDefinition,
     table_name: &str,
     is_strict: bool,
-    schema: &Schema,
+    database_id: usize,
+    catalog: &CatalogContext,
 ) -> Result<()> {
+    let schema = catalog.schema();
     let Some(col_type) = &column.col_type else {
         if is_strict {
             bail_parse_error!("missing datatype for {}.{}", table_name, column.col_name);
@@ -858,6 +861,20 @@ pub(crate) fn check_column_type(
             type_name
         );
     };
+    // Statements look custom types up in main only. See
+    // Schema::check_has_only_builtin_types.
+    if database_id != MAIN_DB_ID && !td.is_builtin {
+        let database_name = catalog
+            .namespace_name(database_id)
+            .expect("the database a table is created in has a name");
+        bail_parse_error!(
+            "column {}.{} of database {} cannot have type {}: custom types and domains can only be used in the main database",
+            table_name,
+            column.col_name,
+            database_name,
+            td.name
+        );
+    }
     // A type with parameters besides `value` needs each one given, as in `p(10)`.
     let expected = td.user_params().count();
     if expected > 0 {
@@ -1255,6 +1272,7 @@ pub fn translate_create_table(
     validate(
         &body,
         &normalized_tbl_name,
+        database_id,
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
