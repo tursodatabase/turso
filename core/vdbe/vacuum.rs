@@ -428,6 +428,110 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
     Ok(())
 }
 
+/// Where a file-backed `VACUUM INTO` builds its copy: a temporary file
+/// beside the destination, moved over it once the copy is complete and
+/// synced. The target is committed in batches, so until then the file is a
+/// valid database holding only some of the rows. Built under the
+/// destination's own name, that is what a statement that fails or a process
+/// that dies partway would leave behind — and a retry would refuse the
+/// "existing" output. This way the destination path only ever holds a
+/// complete copy, as it did when the whole copy was one transaction.
+///
+/// A destination that already exists — an empty file — may be open
+/// elsewhere: attached on this connection, or created by another process
+/// that waits for it. The copy must land in that file, so it is built there
+/// directly, as it always was; only that copy can be left partial.
+pub(crate) struct VacuumIntoTempOutput {
+    io: Arc<dyn crate::IO>,
+    temp_path: String,
+    dest_path: String,
+}
+
+impl VacuumIntoTempOutput {
+    const SUFFIX: &'static str = "-vacuum";
+
+    /// The temporary file for a copy to `dest_path`, after removing what an
+    /// attempt that died partway left there; None when the destination
+    /// already exists and the copy has to be built in it.
+    pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Option<Self>> {
+        let this = Self {
+            io,
+            temp_path: format!("{dest_path}{}", Self::SUFFIX),
+            dest_path: dest_path.to_string(),
+        };
+        this.remove_temp_files()?;
+        if std::fs::metadata(dest_path).is_ok() {
+            return Ok(None);
+        }
+        Ok(Some(this))
+    }
+
+    /// The path the copy is built at.
+    pub fn temp_path(&self) -> &str {
+        &self.temp_path
+    }
+
+    /// Removes the temporary copy and the files the engine keeps beside a
+    /// database: its WAL, shm and MVCC logical log.
+    pub fn remove_temp_files(&self) -> Result<()> {
+        remove_file_if_exists(&*self.io, &self.temp_path)?;
+        for sidecar in ["-wal", "-shm", "-log"] {
+            remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
+        }
+        Ok(())
+    }
+
+    /// Moves the finished copy to the destination. The copy was
+    /// checkpointed under `SyncMode::Full` and closed, so the file is
+    /// self-contained and synced and its WAL is empty; the WAL and shm are
+    /// dropped and an MVCC copy's logical log moves with it. The move is a
+    /// rename, so the destination goes from absent (or empty) to complete
+    /// in one step, and the directory is synced so the name is durable.
+    pub fn install(&self) -> Result<()> {
+        for sidecar in ["-wal", "-shm"] {
+            remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
+        }
+        std::fs::rename(&self.temp_path, &self.dest_path)
+            .map_err(|e| crate::error::io_error(e, "rename"))?;
+        let temp_log = format!("{}-log", self.temp_path);
+        if std::fs::metadata(&temp_log).is_ok() {
+            std::fs::rename(&temp_log, format!("{}-log", self.dest_path))
+                .map_err(|e| crate::error::io_error(e, "rename"))?;
+        }
+        sync_parent_dir(&self.dest_path)
+    }
+}
+
+fn remove_file_if_exists(io: &dyn crate::IO, path: &str) -> Result<()> {
+    match io.remove_file(path) {
+        Err(LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => Ok(()),
+        result => result,
+    }
+}
+
+/// Syncs the directory holding `path`, so that a rename into it is durable.
+/// Directories cannot be synced on Windows, and need not be.
+fn sync_parent_dir(path: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| crate::error::io_error(e, "sync"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Copy functions, vtab modules, and index methods from one connection to
 /// another so that schema replay on the target sees the same symbols as
 /// the source.
