@@ -512,7 +512,7 @@ pub struct ConnectOpts {
 )]
 impl ConnectOpts {
     /// Creates settings for a connection without encryption and without an
-    /// external page codec.
+    /// external page codec. Read-only access inherits the original database creator's restriction.
     pub fn new() -> Self {
         Self {
             readonly: None,
@@ -521,6 +521,8 @@ impl ConnectOpts {
         }
     }
 
+    /// Sets this connection's read-only restriction. Setting `false` cannot make
+    /// storage opened read-only by the database creator writable.
     pub fn with_readonly(mut self, readonly: bool) -> Self {
         self.readonly = Some(readonly);
         self
