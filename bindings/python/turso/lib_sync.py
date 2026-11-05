@@ -377,12 +377,13 @@ class ConnectionSync(_Connection):
         sync: PyTursoSyncDatabase,
         http_ctx: _HttpContext,
         isolation_level: Optional[str] = "DEFERRED",
+        timeout: float = 5.0,
     ) -> None:
         # Provide extra_io hook so statements can make progress with sync engine (partial sync)
         def _extra_io() -> None:
             _drain_sync_io(sync, http_ctx, current_op=None)
 
-        super().__init__(conn, isolation_level=isolation_level, extra_io=_extra_io)
+        super().__init__(conn, isolation_level=isolation_level, timeout=timeout, extra_io=_extra_io)
         self._sync: PyTursoSyncDatabase = sync
         self._http_ctx: _HttpContext = http_ctx
 
@@ -436,6 +437,7 @@ def connect_sync(
     partial_sync_experimental: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    timeout: float = 5.0,
     remote_encryption_key: Optional[str] = None,
     remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
     push_operations_threshold: Optional[int] = None,
@@ -452,7 +454,7 @@ def connect_sync(
     - long_poll_timeout_ms: timeout for long polling during pull
     - bootstrap_if_empty: if True and db empty, bootstrap from remote during create()
     - partial_sync_experimental: EXPERIMENTAL partial sync configuration
-    - experimental_features, isolation_level: passed to underlying connection
+    - experimental_features, isolation_level, timeout: passed to underlying connection
     - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
     - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
     - push_operations_threshold: optional cap on the number of CDC operations packed into a single
@@ -525,4 +527,6 @@ def connect_sync(
         raise Misuse("sync connect did not return a connection")
 
     # Wrap into ConnectionSync that integrates sync IO into DB operations
-    return ConnectionSync(conn_obj, sync=sync_db, http_ctx=http_ctx, isolation_level=isolation_level)
+    return ConnectionSync(
+        conn_obj, sync=sync_db, http_ctx=http_ctx, isolation_level=isolation_level, timeout=timeout
+    )

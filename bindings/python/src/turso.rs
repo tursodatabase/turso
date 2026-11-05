@@ -270,6 +270,12 @@ impl PyTursoConnection {
     pub fn interrupt(&self) {
         self.connection.interrupt();
     }
+    /// Set how long (in milliseconds) a statement waits for a lock held by another
+    /// connection before it fails with [`Busy`]. A value of `0` disables waiting.
+    pub fn set_busy_timeout(&self, milliseconds: u64) {
+        self.connection
+            .set_busy_timeout(std::time::Duration::from_millis(milliseconds));
+    }
     /// Set the maximum time (in milliseconds) a single statement may run before it
     /// is interrupted and raises [`Interrupt`]. A value of `0` disables the timeout.
     pub fn set_query_timeout(&self, milliseconds: u64) {

@@ -384,9 +384,14 @@ class Connection:
         conn: PyTursoConnection,
         *,
         isolation_level: Optional[str] = "DEFERRED",
+        timeout: float = 5.0,
         extra_io: Optional[Callable[[], None]] = None,
     ) -> None:
         self._open_conn: Optional[PyTursoConnection] = conn
+        # Like sqlite3: a zero, negative or NaN timeout fails at once on a locked
+        # database, and the wait is capped at the largest C int of milliseconds.
+        milliseconds = timeout * 1000
+        conn.set_busy_timeout(int(min(milliseconds, 2**31 - 1)) if milliseconds > 0 else 0)
         # autocommit behavior:
         # - True: SQLite autocommit mode; commit/rollback are no-ops.
         # - False: PEP 249 compliant: ensure a transaction is always open.
@@ -1278,6 +1283,7 @@ class EncryptionOpts:
 
 def connect(
     database: str,
+    timeout: float = 5.0,
     *,
     experimental_features: Optional[str] = None,
     vfs: Optional[str] = None,
@@ -1292,6 +1298,8 @@ def connect(
     - database: path or identifier of the database.
     - experimental_features: comma-separated list of features to enable.
     - isolation_level: one of "DEFERRED" (default), "IMMEDIATE", "EXCLUSIVE", or None.
+    - timeout: seconds a statement waits for a lock held by another connection
+      before raising OperationalError("database is locked"), as in sqlite3.connect.
     """
     try:
         cfg = PyTursoDatabaseConfig(
@@ -1304,7 +1312,7 @@ def connect(
         )
         db: PyTursoDatabase = py_turso_database_open(cfg)
         conn: PyTursoConnection = db.connect()
-        return Connection(conn, isolation_level=isolation_level, extra_io=extra_io)
+        return Connection(conn, isolation_level=isolation_level, timeout=timeout, extra_io=extra_io)
     except Exception as exc:  # noqa: BLE001
         raise _map_turso_exception(exc)
 
