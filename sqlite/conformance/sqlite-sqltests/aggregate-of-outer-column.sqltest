@@ -126,3 +126,83 @@ test outer-aggregate-in-a-table-function-argument-is-an-error {
 expect error {
     misuse of aggregate: json_group_array()
 }
+
+# An aggregate's argument is evaluated for each input row, before the outer
+# query has computed an aggregate moved up to it from a subquery in that
+# argument. So an outer aggregate in a subquery in another aggregate's argument
+# is an error, as in SQLite.
+test outer-aggregate-in-an-in-subquery-in-an-aggregate-argument-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT max(a IN (SELECT sum(b))) FROM t;
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test outer-aggregate-in-an-in-subquery-in-a-grouped-aggregate-argument-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT max(a IN (SELECT avg(b))) FROM t GROUP BY a;
+}
+expect error {
+    misuse of aggregate: avg()
+}
+
+test outer-aggregate-in-a-scalar-subquery-in-an-aggregate-argument-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT max((SELECT sum(b))) FROM t;
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test outer-aggregate-in-a-compared-subquery-in-an-aggregate-argument-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT max(a = (SELECT sum(b))) FROM t;
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test outer-aggregate-in-a-subquery-in-an-aggregate-filter-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT count(*) FILTER (WHERE a IN (SELECT sum(b))) FROM t;
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test outer-aggregate-in-a-subquery-in-a-having-aggregate-argument-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT a FROM t GROUP BY a HAVING max((SELECT sum(b)));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test outer-aggregate-in-a-subquery-in-an-order-by-aggregate-argument-is-an-error {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2);
+    SELECT a FROM t GROUP BY a ORDER BY max((SELECT sum(b)));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+# EXISTS never evaluates its result columns, so the outer aggregate in them is
+# not read and SQLite gives no error.
+@cross-check-integrity
+test outer-aggregate-in-an-exists-result-column-in-an-aggregate-argument {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 2), (3, 4), (1, 5);
+    SELECT a, max(EXISTS (SELECT sum(b) WHERE a > 1)) FROM t GROUP BY a;
+}
+expect {
+    1|0
+    3|1
+}
