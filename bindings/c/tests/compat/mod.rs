@@ -569,6 +569,176 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_finalizes_when_another_expression_fails() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = [0_i32; 3];
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"cleanup_track".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    calls.as_mut_ptr().cast(),
+                    None,
+                    Some(cleanup_track_step),
+                    Some(failing_aggregate_final)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"cleanup_boom".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(cleanup_boom),
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(sqlite3_prepare_v2(db,
+                c"WITH input(x) AS (VALUES(1),(2)) SELECT cleanup_track(x), sum(cleanup_boom(x)) FROM input".as_ptr(),
+                -1, &mut statement, ptr::null_mut()), SQLITE_OK);
+            assert_eq!(sqlite3_step(statement), SQLITE_ERROR);
+            assert!(std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                .to_str()
+                .unwrap()
+                .contains("separate scalar failed"));
+            sqlite3_finalize(statement);
+            assert_eq!(calls, [1, 1, 1]);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, [1, 1, 1]);
+        }
+    }
+
+    #[test]
+    fn aggregate_finalizes_once_after_success_and_reset() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = [0_i32; 3];
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"cleanup_success".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    calls.as_mut_ptr().cast(),
+                    None,
+                    Some(cleanup_track_step),
+                    Some(failing_aggregate_final)
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"WITH input(x) AS (VALUES(1),(2)) SELECT cleanup_success(x) FROM input"
+                        .as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            for run in 1..=2 {
+                assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+                assert_eq!(sqlite3_column_int(statement, 0), 42);
+                assert_eq!(sqlite3_step(statement), SQLITE_DONE);
+                assert_eq!(calls, [run * 2, run, 2]);
+                assert_eq!(sqlite3_reset(statement), SQLITE_OK);
+                assert_eq!(calls, [run * 2, run, 2]);
+            }
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(calls, [4, 2, 2]);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn aggregate_finalizes_after_interruption_and_can_be_reused() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = [0_i32; 3];
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"cleanup_interrupt".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    calls.as_mut_ptr().cast(),
+                    None,
+                    Some(cleanup_interrupt_step),
+                    Some(failing_aggregate_final)
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"WITH RECURSIVE input(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM input WHERE x<10000) SELECT cleanup_interrupt(x) FROM input"
+                        .as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            for run in 1..=2 {
+                let previous_steps = calls[0];
+                assert_eq!(sqlite3_step(statement), SQLITE_INTERRUPT);
+                sqlite3_reset(statement);
+                assert!(calls[0] > previous_steps);
+                assert_eq!(calls[1], run);
+                assert_eq!(calls[2], calls[0] - previous_steps);
+            }
+            let after_reset = calls;
+            sqlite3_finalize(statement);
+            assert_eq!(calls, after_reset);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn cleanup_interrupt_step(
+        context: *mut libc::c_void,
+        argc: i32,
+        argv: *mut *mut libc::c_void,
+    ) {
+        cleanup_track_step(context, argc, argv);
+        sqlite3_interrupt(sqlite3_context_db_handle(context).cast());
+    }
+
+    unsafe extern "C" fn cleanup_track_step(
+        context: *mut libc::c_void,
+        _argc: i32,
+        _argv: *mut *mut libc::c_void,
+    ) {
+        let calls = sqlite3_user_data(context).cast::<i32>();
+        *calls += 1;
+        let state =
+            sqlite3_aggregate_context(context, std::mem::size_of::<i32>() as i32).cast::<i32>();
+        if !state.is_null() {
+            *state += 1;
+        }
+    }
+
+    unsafe extern "C" fn cleanup_boom(
+        context: *mut libc::c_void,
+        _argc: i32,
+        _argv: *mut *mut libc::c_void,
+    ) {
+        sqlite3_result_error(context, c"separate scalar failed".as_ptr(), -1);
+    }
+
+    #[test]
     fn test_libversion() {
         unsafe {
             let version = sqlite3_libversion();

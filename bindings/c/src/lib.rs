@@ -267,8 +267,9 @@ impl sqlite3 {
 }
 
 pub struct sqlite3_stmt {
-    pub(crate) db: Arc<sqlite3>,
+    // Aggregate finalizers may use the database handle while the statement is dropped.
     pub(crate) stmt: turso_core::Statement,
+    pub(crate) db: Arc<sqlite3>,
     /// NUL-terminated copy of the statement's SQL, backing sqlite3_sql():
     /// the returned pointer must stay valid until finalize.
     pub(crate) sql: CString,
@@ -3258,7 +3259,6 @@ unsafe extern "C" fn agg_step(
         arg_ptrs.as_mut_ptr(),
     );
     if sctx.result.value_type() == turso_ext::ValueType::Error {
-        agg_finalize(context, ctx).__free_internal_type();
         return sctx.result;
     }
     sctx.result.__free_internal_type();
@@ -4049,6 +4049,81 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn deferred_close_keeps_handle_alive_during_aggregate_cleanup() {
+        struct Cleanup {
+            handle: std::sync::Weak<sqlite3>,
+            final_calls: usize,
+            handle_alive: bool,
+        }
+        unsafe extern "C" fn step(ctx: *mut ffi::c_void, _argc: i32, _argv: *mut *mut ffi::c_void) {
+            sqlite3_aggregate_context(ctx, 4);
+        }
+        unsafe extern "C" fn final_(ctx: *mut ffi::c_void) {
+            let cleanup = &mut *sqlite3_user_data(ctx).cast::<Cleanup>();
+            cleanup.final_calls += 1;
+            if let Some(handle) = cleanup.handle.upgrade() {
+                let db = sqlite3_context_db_handle(ctx).cast::<sqlite3>();
+                cleanup.handle_alive = std::ptr::eq(db, Arc::as_ptr(&handle));
+                sqlite3_changes(db);
+            }
+            sqlite3_result_int(ctx, 42);
+        }
+        unsafe extern "C" fn fail(ctx: *mut ffi::c_void, _argc: i32, _argv: *mut *mut ffi::c_void) {
+            sqlite3_result_error(ctx, c"separate scalar failed".as_ptr(), -1);
+        }
+        type Step = unsafe extern "C" fn(*mut ffi::c_void, i32, *mut *mut ffi::c_void);
+        type Final = unsafe extern "C" fn(*mut ffi::c_void);
+        type Opaque = unsafe extern "C" fn();
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let handle = sqlite3::clone_from_raw(db);
+            let mut cleanup = Cleanup {
+                handle: Arc::downgrade(&handle),
+                final_calls: 0,
+                handle_alive: false,
+            };
+            drop(handle);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"deferred_track".as_ptr(),
+                    1,
+                    1,
+                    (&mut cleanup as *mut Cleanup).cast(),
+                    None,
+                    Some(std::mem::transmute::<Step, Opaque>(step)),
+                    Some(std::mem::transmute::<Final, Opaque>(final_))
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"deferred_fail".as_ptr(),
+                    1,
+                    1,
+                    ptr::null_mut(),
+                    Some(std::mem::transmute::<Step, Opaque>(fail)),
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut stmt = ptr::null_mut();
+            assert_eq!(sqlite3_prepare_v2(db,
+                c"WITH input(x) AS (VALUES(1),(2)) SELECT deferred_track(x), sum(deferred_fail(x)) FROM input".as_ptr(),
+                -1, &mut stmt, ptr::null_mut()), SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ERROR);
+            assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+            sqlite3_finalize(stmt);
+            assert_eq!(cleanup.final_calls, 1);
+            assert!(cleanup.handle_alive);
+            assert!(cleanup.handle.upgrade().is_none());
+        }
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3

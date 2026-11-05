@@ -107,8 +107,17 @@ impl ExtFunc {
                 crate::native_ext::step_aggregate(&mut registers[acc_reg], function.as_ref(), &args)
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(&mut registers[acc_reg]).clone();
-                let args: Vec<_> = registers[start_reg..start_reg + aggregate.argc]
+                let (context, state, argc, step, value_destructor) = {
+                    let aggregate = self.c_aggregate(&mut registers[acc_reg]);
+                    (
+                        aggregate.context,
+                        aggregate.state,
+                        aggregate.argc,
+                        aggregate.step_fn,
+                        aggregate.value_destructor,
+                    )
+                };
+                let args: Vec<_> = registers[start_reg..start_reg + argc]
                     .iter()
                     .map(|arg| arg.get_value().to_ffi())
                     .collect();
@@ -117,18 +126,8 @@ impl ExtFunc {
                 } else {
                     args.as_ptr()
                 };
-                let result = unsafe {
-                    (aggregate.step_fn)(
-                        aggregate.context,
-                        aggregate.state,
-                        aggregate.argc as i32,
-                        argv,
-                    )
-                };
-                if let Err(err) = finish_call(result, aggregate.value_destructor, args) {
-                    if let Some(destructor) = aggregate.aggregate_destructor {
-                        unsafe { destructor(aggregate.state as usize) };
-                    }
+                let result = unsafe { step(context, state, argc as i32, argv) };
+                if let Err(err) = finish_call(result, value_destructor, args) {
                     registers[acc_reg].set_null();
                     return Err(err.into());
                 }
@@ -144,14 +143,16 @@ impl ExtFunc {
                 crate::native_ext::finalize_aggregate(accumulator, function.as_ref())
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(accumulator).clone();
-                accumulator.set_null();
-                let result = unsafe { (aggregate.finalize_fn)(aggregate.context, aggregate.state) };
-                let value = finish_call(result, aggregate.value_destructor, Vec::new());
-                if let Some(destructor) = aggregate.aggregate_destructor {
-                    unsafe { destructor(aggregate.state as usize) };
-                }
-                value.map(IOResult::Done).map_err(Into::into)
+                self.c_aggregate(accumulator);
+                let Register::Aggregate(aggregate) =
+                    std::mem::replace(accumulator, Register::Value(Value::Null))
+                else {
+                    unreachable!("C aggregate requires C accumulator state");
+                };
+                aggregate
+                    .compute_external()
+                    .map(IOResult::Done)
+                    .map_err(Into::into)
             }
             _ => unreachable!("scalar function called in aggregate context"),
         }
@@ -180,6 +181,7 @@ impl ExtFunc {
                 finalize_fn: *finalize,
                 aggregate_destructor: *aggregate_destructor,
                 value_destructor: *value_destructor,
+                finalized: false,
             }));
         }
         let Register::Aggregate(AggContext::External(aggregate)) = accumulator else {

@@ -1100,6 +1100,7 @@ fn live_aggregate_accumulators_cannot_be_copied() {
         finalize_fn: unused_aggregate_finalize,
         aggregate_destructor: None,
         value_destructor: None,
+        finalized: true,
     }));
     for source in [&builtin, &external, &original] {
         assert!(catch_unwind(AssertUnwindSafe(|| source.try_clone())).is_err());
