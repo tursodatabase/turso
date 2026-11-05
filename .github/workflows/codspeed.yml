@@ -24,6 +24,10 @@ env:
   # made up most of the build time. CodSpeed compares each PR against main
   # built the same way, so the comparison does not need LTO.
   CARGO_PROFILE_BENCH_LTO: "false"
+  # mimalloc returns unused memory to the OS on a 10 ms timer, so whether
+  # that work lands inside a measurement depends on wall-clock time.
+  # -1 turns the timer off.
+  MIMALLOC_PURGE_DELAY: "-1"
 
 jobs:
   memory:
@@ -312,10 +316,6 @@ jobs:
         uses: CodSpeedHQ/action@v5.6.3
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
-          # mimalloc returns unused memory to the OS on a 10 ms timer, so whether
-          # that work lands inside a measurement depends on wall-clock time.
-          # -1 turns the timer off.
-          MIMALLOC_PURGE_DELAY: "-1"
         with:
           mode: simulation
           # The CodSpeed runner runs this line with `bash -c`, so the quotes
@@ -376,10 +376,6 @@ jobs:
         uses: CodSpeedHQ/action@v5.6.3
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
-          # mimalloc returns unused memory to the OS on a 10 ms timer, so whether
-          # that work lands inside a measurement depends on wall-clock time.
-          # -1 turns the timer off.
-          MIMALLOC_PURGE_DELAY: "-1"
         with:
           mode: simulation
           # The CodSpeed runner runs this line with `bash -c`, so the quotes
