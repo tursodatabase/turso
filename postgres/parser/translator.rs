@@ -1665,11 +1665,22 @@ impl PostgreSQLTranslator {
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
+        let mut expected_len: Option<usize> = None;
         // First pass: compute the default mask across ALL rows.
         // A column is "all defaults" only if every row has DEFAULT for that position.
         let mut default_mask: Vec<bool> = Vec::new();
         for (row_idx, row_node) in values_lists.iter().enumerate() {
             if let Some(Node::List(list)) = &row_node.node {
+                if let Some(expected_len) = expected_len {
+                    if list.items.len() != expected_len {
+                        return Err(ParseError::ParseError(
+                            "VALUES lists must all be the same length".into(),
+                        ));
+                    }
+                } else {
+                    expected_len = Some(list.items.len());
+                }
+
                 if row_idx == 0 {
                     default_mask = list
                         .items
@@ -1709,13 +1720,6 @@ impl PostgreSQLTranslator {
                     ));
                 }
             }
-        }
-
-        let expected_len = rows[0].len();
-        if rows.iter().any(|row| row.len() != expected_len) {
-            return Err(ParseError::ParseError(
-                "VALUES lists must all be the same length".into(),
-            ));
         }
 
         Ok((rows, default_mask))
@@ -11351,6 +11355,20 @@ mod tests {
     #[test]
     fn reject_insert_values_with_different_row_lengths() {
         let sql = "INSERT INTO t VALUES (1), (2, 3), (4)";
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains("VALUES lists must all be the same length"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_insert_values_with_default_and_different_row_lengths() {
+        let sql = "INSERT INTO t (a, b) VALUES (1, DEFAULT), (2)";
         let parsed = crate::parse(sql).unwrap();
         let err = PostgreSQLTranslator::new()
             .translate(&parsed)

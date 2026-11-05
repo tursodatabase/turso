@@ -43,6 +43,13 @@ test error-insert-values-lists-have-different-lengths {
 @sqlstate 42601
 expect error {}
 
+test error-insert-values-default-and-short-row {
+    CREATE TABLE t (a int, b int);
+    INSERT INTO t (a, b) VALUES (1, DEFAULT), (2);
+}
+@sqlstate 42601
+expect error {}
+
 test error-aborts-rest-of-batch {
     CREATE TABLE t (a int);
     INSERT INTO t VALUES (1);
