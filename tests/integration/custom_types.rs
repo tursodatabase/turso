@@ -634,6 +634,44 @@ mod tests {
             .contains("malformed database schema");
     }
 
+    /// An array column whose stored value is not an array is a damaged
+    /// database. Reading it through DECODE must fail, not loop forever.
+    #[test]
+    fn test_decode_of_array_column_holding_a_non_array_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("array_column_holding_integer.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE d1(value integer) BASE integer DECODE value - 1")
+                .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b integer) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+
+            // Turso has no writable_schema pragma. Use the same schema-write
+            // bypass as VACUUM during prepare, then execute normally.
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE sqlite_schema \
+                 SET sql = 'CREATE TABLE t(id INTEGER PRIMARY KEY, b d1[]) STRICT' \
+                 WHERE name = 't'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let mut stmt = conn.prepare("SELECT b FROM t").unwrap();
+        assert_that!(stmt.run_collect_rows())
+            .err()
+            .display_string()
+            .contains("expected an array, but the value is not an array");
+    }
+
     /// After reopening, schema changes (CREATE TABLE) that use a previously
     /// defined custom type must still work. The type must survive the schema
     /// change and new tables must encode/decode correctly.
@@ -2801,6 +2839,307 @@ mod tests {
                 }
             }
             conn.close().unwrap();
+        }
+    }
+
+    /// An array of a custom type holds the values its elements read as, the
+    /// same values a column of the type holds. For every kind of element type,
+    /// each way of writing or building an array is checked against a column
+    /// `w` of the element type that the same statement writes. A type whose
+    /// ENCODE and DECODE don't undo each other (`ENCODE value + 1`) changes `w`
+    /// on every write, and must change the array's elements the same way.
+    #[test]
+    fn test_arrays_hold_the_values_of_their_elements() {
+        struct Kind {
+            setup: String,
+            /// The element type as written in a column, such as `varchar(5)`.
+            ty: String,
+            name: String,
+            sample: &'static str,
+        }
+        let builtin = |ty: &str, sample| Kind {
+            setup: String::new(),
+            ty: ty.to_string(),
+            name: ty.split('(').next().unwrap().to_string(),
+            sample,
+        };
+        let mut kinds = vec![
+            builtin("integer", "7"),
+            builtin("text", "'x'"),
+            builtin("real", "1.5"),
+            builtin("blob", "x'01'"),
+            builtin("bigint", "7"),
+            builtin("smallint", "7"),
+            builtin("varchar(5)", "'abc'"),
+            builtin("bytea", "x'01'"),
+            builtin("cidr", "'10.0.0.0/8'"),
+            builtin("macaddr", "'08:00:2b:01:02:03'"),
+            builtin("macaddr8", "'08:00:2b:01:02:03:04:05'"),
+            builtin("uuid", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"),
+            builtin("boolean", "1"),
+            builtin("date", "'2024-01-02'"),
+            builtin("time", "'10:00:00'"),
+            builtin("timestamp", "'2024-01-02 10:00:00'"),
+            builtin("timestamptz", "'2024-01-02 10:00:00'"),
+            builtin("json", "'{}'"),
+            builtin("jsonb", "'{}'"),
+            builtin("inet", "'10.0.0.1'"),
+            builtin("numeric(10,2)", "1.5"),
+        ];
+        // User types with every combination of no, an unchanging and a changing
+        // ENCODE and DECODE, and a domain over each.
+        let encodes = [None, Some("value"), Some("value + 1")];
+        let decodes = [None, Some("value"), Some("value - 1")];
+        for (i, encode) in encodes.iter().enumerate() {
+            for (j, decode) in decodes.iter().enumerate() {
+                let name = format!("t_e{i}_d{j}");
+                let mut create = format!("CREATE TYPE {name}(value integer) BASE integer");
+                if let Some(encode) = encode {
+                    create.push_str(&format!(" ENCODE {encode}"));
+                }
+                if let Some(decode) = decode {
+                    create.push_str(&format!(" DECODE {decode}"));
+                }
+                kinds.push(Kind {
+                    setup: create.clone(),
+                    ty: name.clone(),
+                    name: name.clone(),
+                    sample: "7",
+                });
+                kinds.push(Kind {
+                    setup: format!("{create}; CREATE DOMAIN dom_{name} AS {name}"),
+                    ty: format!("dom_{name}"),
+                    name: format!("dom_{name}"),
+                    sample: "7",
+                });
+            }
+        }
+        // Stored forms that sort in the opposite order of the values.
+        let negated = "CREATE TYPE t_neg(value integer) BASE integer ENCODE -value DECODE -value";
+        kinds.push(Kind {
+            setup: negated.to_string(),
+            ty: "t_neg".to_string(),
+            name: "t_neg".to_string(),
+            sample: "7",
+        });
+        kinds.push(Kind {
+            setup: format!("{negated}; CREATE DOMAIN dom_t_neg AS t_neg"),
+            ty: "dom_t_neg".to_string(),
+            name: "dom_t_neg".to_string(),
+            sample: "7",
+        });
+        for (base, sample) in [
+            ("integer", "7"),
+            ("uuid", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"),
+            ("date", "'2024-01-02'"),
+        ] {
+            kinds.push(Kind {
+                setup: format!("CREATE DOMAIN dom_{base} AS {base}"),
+                ty: format!("dom_{base}"),
+                name: format!("dom_{base}"),
+                sample,
+            });
+        }
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        let registered: Vec<(String,)> = conn.exec_rows("PRAGMA list_types");
+        for (signature,) in registered {
+            let name = signature.split('(').next().unwrap().to_lowercase();
+            assert!(
+                name == "any" || kinds.iter().any(|kind| kind.name == name),
+                "built-in type {name} is not tried"
+            );
+        }
+
+        for kind in &kinds {
+            let db = TempDatabase::builder().with_opts(opts).build();
+            let conn = db.connect_limbo();
+            let ty = &kind.ty;
+            let s = kind.sample;
+            for sql in kind.setup.split(';').filter(|sql| !sql.trim().is_empty()) {
+                conn.execute(sql).unwrap();
+            }
+            let create = format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v {ty}, w {ty}, a {ty}[], m {ty}[][]) STRICT"
+            );
+            if kind.name == "numeric" {
+                // numeric's order is not the order of its stored values.
+                assert_that!(conn.execute(&create))
+                    .err()
+                    .display_string()
+                    .contains("arrays of type numeric are not supported");
+                continue;
+            }
+            conn.execute(&create).unwrap();
+            let run = |sql: &str| {
+                conn.execute(sql)
+                    .unwrap_or_else(|e| panic!("{ty}: {sql}: {e}"));
+            };
+            let all_true = |sql: &str, count: usize| {
+                let rows = crate::common::limbo_exec_rows(&conn, sql);
+                let expected = vec![vec![rusqlite::types::Value::Integer(1); count]];
+                assert_eq!(rows, expected, "{ty}: {sql}");
+            };
+            let check = |step: &str| {
+                all_true(
+                    &format!(
+                        "SELECT a = ARRAY[w], a[1] = w, m[1] = ARRAY[w], m[1][1] = w, \
+                         CAST(a AS {ty}[]) = ARRAY[CAST(w AS {ty})], \
+                         (SELECT array_agg(t2.w) = t.a FROM t t2) FROM t -- after {step}"
+                    ),
+                    6,
+                )
+            };
+
+            run(&format!(
+                "INSERT INTO t VALUES (1, {s}, {s}, ARRAY[{s}], ARRAY[ARRAY[{s}]])"
+            ));
+            check("INSERT");
+            run("UPDATE t SET w = v, a = ARRAY[v], m = ARRAY[ARRAY[v]]");
+            check("UPDATE from another column");
+            run("UPDATE t SET w = w, a = a, m = m");
+            check("UPDATE of each column to itself");
+            run(&format!(
+                "INSERT INTO t(id, v) VALUES (1, {s}) \
+                 ON CONFLICT(id) DO UPDATE SET w = w, a = a, m = m"
+            ));
+            check("UPSERT of each column to itself");
+            run(&format!(
+                "INSERT INTO t(id, v) VALUES (1, {s}) ON CONFLICT(id) DO UPDATE SET v = v"
+            ));
+            check("UPSERT of another column");
+            run("VACUUM");
+            check("VACUUM");
+            all_true("UPDATE t SET w = w, a = a, m = m RETURNING a = ARRAY[w]", 1);
+            check("UPDATE with RETURNING");
+
+            run(&format!("CREATE TABLE log(w {ty}, a {ty}[]) STRICT"));
+            run("CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.w, NEW.a); END");
+            run("UPDATE t SET v = v");
+            all_true("SELECT a = ARRAY[w] FROM log", 1);
+
+            // A key on an array follows the element type's key rule: when an
+            // index on the element type is accepted, so is one on the array,
+            // and when it is refused because the type's DECODE can read
+            // different stored values back as the same value, so is the array.
+            // An index on a type with no OPERATOR '<' is refused before that
+            // check runs, and one on an array of it, such as cidr[], is accepted
+            // because of a bug that is also on main.
+            let element_index = conn.execute("CREATE INDEX tw ON t(w)");
+            let array_index = conn.execute("CREATE INDEX ta ON t(a)");
+            let refused_with = |result: &turso_core::Result<()>, message: &str| matches!(result, Err(e) if e.to_string().contains(message));
+            let indexes =
+                format!("{ty}: index on {ty}: {element_index:?}, on {ty}[]: {array_index:?}");
+            if element_index.is_ok() {
+                assert!(array_index.is_ok(), "{indexes}");
+            } else if refused_with(&element_index, "cannot be a key") {
+                assert!(refused_with(&array_index, "cannot be a key"), "{indexes}");
+            } else {
+                assert!(refused_with(&element_index, "OPERATOR '<'"), "{indexes}");
+            }
+            if element_index.is_ok() {
+                all_true("SELECT count(*) FROM t WHERE w = (SELECT w FROM t)", 1);
+            }
+            let element_index_works = array_index.is_ok();
+            if element_index_works {
+                all_true(
+                    "SELECT count(*) FROM t WHERE a = ARRAY[(SELECT w FROM t)]",
+                    1,
+                );
+                // A key that is not an array matches no row, as in a scan.
+                all_true("SELECT count(*) = 0 FROM t WHERE a = 'x'", 1);
+            }
+
+            // Elements sort and compare by their values, with and without an
+            // index, for types whose values are numbers: 7 sorts before 8.
+            if s == "7" {
+                run(&format!(
+                    "CREATE TABLE o(id INTEGER PRIMARY KEY, a {ty}[]) STRICT"
+                ));
+                run("INSERT INTO o VALUES (1, ARRAY[7]), (2, ARRAY[8])");
+                let sorts_by_value = |step: &str| {
+                    for (sql, expected) in [
+                        (
+                            "SELECT group_concat(id) FROM (SELECT id FROM o ORDER BY a[1])",
+                            "1,2",
+                        ),
+                        (
+                            "SELECT group_concat(id) FROM (SELECT id FROM o ORDER BY a)",
+                            "1,2",
+                        ),
+                        (
+                            "SELECT group_concat(o1.id || '<' || o2.id) \
+                             FROM o o1, o o2 WHERE o1.a < o2.a",
+                            "1<2",
+                        ),
+                    ] {
+                        let rows: Vec<(String,)> = conn.exec_rows(sql);
+                        assert_eq!(rows, vec![(expected.to_string(),)], "{ty}: {sql} ({step})");
+                    }
+                    // A sort key that is also a result column is read back
+                    // from the sorter.
+                    assert_eq!(
+                        crate::common::limbo_exec_rows(&conn, "SELECT a FROM o ORDER BY a"),
+                        crate::common::limbo_exec_rows(&conn, "SELECT a FROM o ORDER BY id"),
+                        "{ty}: SELECT a FROM o ORDER BY a ({step})"
+                    );
+                };
+                sorts_by_value("without an index");
+                if element_index_works {
+                    run("CREATE INDEX oa ON o(a)");
+                    sorts_by_value("with an index");
+                }
+            }
+
+            run("UPDATE t SET w = w, a = array_append(a, w)");
+            all_true("SELECT a = ARRAY[w, w] FROM t", 1);
+
+            run(&format!(
+                "CREATE TABLE d(id INTEGER PRIMARY KEY, dw {ty} DEFAULT ({s}), \
+                 da {ty}[] DEFAULT (ARRAY[{s}])) STRICT"
+            ));
+            run("INSERT INTO d(id) VALUES (1)");
+            all_true("SELECT da = ARRAY[dw] FROM d", 1);
+            // ADD COLUMN takes only a constant default, so the array is
+            // written as text, such as '{"x"}'. Blobs have no text form.
+            // integer[] and real[] are skipped because of a bug that is also on
+            // main: ADD COLUMN checks their text default as if it were an
+            // integer or a real, and refuses it.
+            let text_array = match s.as_bytes()[0] {
+                _ if ty == "integer" || ty == "real" => None,
+                b'\'' => Some(format!("'{{\"{}\"}}'", &s[1..s.len() - 1])),
+                b'x' => None,
+                _ => Some(format!("'{{{s}}}'")),
+            };
+            if let Some(text_array) = text_array {
+                run(&format!(
+                    "ALTER TABLE d ADD COLUMN dx {ty}[] DEFAULT {text_array}"
+                ));
+                all_true("SELECT dx = ARRAY[dw] FROM d", 1);
+            }
+
+            run(&format!(
+                "CREATE TABLE g(id INTEGER PRIMARY KEY, w {ty}, \
+                 gv {ty} AS (w) VIRTUAL, av {ty}[] AS (ARRAY[w]) VIRTUAL) STRICT"
+            ));
+            run(&format!("INSERT INTO g(id, w) VALUES (1, {s})"));
+            all_true("SELECT av = ARRAY[gv], av[1] = gv FROM g", 2);
+
+            let base = match s.as_bytes()[0] {
+                b'\'' => "text",
+                b'x' => "blob",
+                _ if s.contains('.') => "real",
+                _ => "integer",
+            };
+            run(&format!(
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, y {base}, x {base}[]) STRICT"
+            ));
+            run(&format!("INSERT INTO b VALUES (1, {s}, ARRAY[{s}])"));
+            run(&format!("ALTER TABLE b ALTER COLUMN y TO y2 {ty}"));
+            run(&format!("ALTER TABLE b ALTER COLUMN x TO x2 {ty}[]"));
+            all_true("SELECT x2 = ARRAY[y2] FROM b", 1);
         }
     }
 }

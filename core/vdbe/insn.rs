@@ -414,10 +414,37 @@ pub struct ArrayEncodeData {
     /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
     pub element_kind: crate::types::StrictType,
-    /// The number of dimensions the column declares: 2 for INTEGER[][].
+    /// The number of dimensions of the array: 2 for INTEGER[][].
     pub dimensions: u32,
-    pub table_name: Arc<str>,
-    pub col_name: Arc<str>,
+    pub target: ArrayEncodeTarget,
+}
+
+/// Where the array an ArrayEncode builds goes, which its error for a value
+/// that is not an array names.
+#[derive(Debug, Clone)]
+pub enum ArrayEncodeTarget {
+    /// Column `col_name` of table `table_name`.
+    Column {
+        table_name: Arc<str>,
+        col_name: Arc<str>,
+    },
+    /// The result of a CAST to an array type.
+    Cast,
+    /// The key of an index lookup on an array column.
+    IndexKey,
+}
+
+impl std::fmt::Display for ArrayEncodeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column {
+                table_name,
+                col_name,
+            } => write!(f, "column {table_name}.{col_name}"),
+            Self::Cast => write!(f, "a cast"),
+            Self::IndexKey => write!(f, "an index key"),
+        }
+    }
 }
 
 /// Data for HashDistinct instruction (boxed to keep Insn small).
@@ -1027,14 +1054,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Create an array from contiguous registers (dynamic count).
-    /// Like MakeArray but count is read from count_reg at runtime.
-    MakeArrayDynamic {
-        start_reg: usize,
-        count_reg: usize,
-        dest: usize,
-    },
-
     /// Extract a field from a struct blob by field index.
     /// If src_reg is NULL, dest = NULL.
     StructField {
@@ -1068,16 +1087,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Copy a register value to a dynamically-computed destination.
-    /// ```text
-    /// dest = registers[base + registers[offset_reg]]
-    /// registers[base + registers[offset_reg]] = registers[src]
-    /// ```
-    RegCopyOffset {
-        src: usize,
-        base: usize,
-        offset_reg: usize,
-    },
     /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
     /// of the cursor's current table row into `dest` (as a blob), following overflow
     /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
@@ -2483,12 +2492,10 @@ impl InsnVariants {
             InsnVariants::ArrayElement => execute::op_array_element,
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
-            InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
             InsnVariants::StructField => execute::op_struct_field,
             InsnVariants::UnionPack => execute::op_union_pack,
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
-            InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::BlobRead => execute::op_blob_read,
             InsnVariants::BlobWrite => execute::op_blob_write,
             InsnVariants::BlobLen => execute::op_blob_len,
