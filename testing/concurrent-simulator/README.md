@@ -15,7 +15,7 @@ With `--swarm`, the seed of each run also picks these settings:
 
 Two rules apply to the workloads:
 
-- A workload that checks results always stays on. Examples are `PRAGMA integrity_check` and the reads that the properties examine.
+- A read workload that checks results always stays on, for example `PRAGMA integrity_check`. A write workload, such as `nextval`, can be off. Then the run does not use that feature.
 - If BEGIN stays on, COMMIT or ROLLBACK also stays on. Otherwise, a transaction never ends.
 
 A flag that you give keeps its value.

@@ -13,10 +13,7 @@ use std::ops::RangeInclusive;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::workloads::{
-    BeginWorkload, CommitWorkload, CurrValWorkload, FtsMatchWorkload, IntegrityCheckWorkload,
-    RollbackWorkload, SimpleSelectWorkload, Workload,
-};
+use crate::workloads::{BeginWorkload, CommitWorkload, RollbackWorkload, Workload};
 
 /// The simulation uses stream 0 of the seed. The swarm uses other streams, so
 /// its choices are independent of the random values of the simulation.
@@ -76,8 +73,9 @@ impl SwarmConfig {
     /// weight of each other workload by 1/4, 1/2, 1, 2 or 4. A workload that
     /// is off stays in the list with weight 0. Two rules apply:
     ///
-    /// - A workload that checks results always stays on. Without it, the run
-    ///   cannot find the bugs that the check finds.
+    /// - A read workload that checks results ([`Workload::checks_results`])
+    ///   always stays on. Without it, the run cannot find the bugs that the
+    ///   check finds.
     /// - If BEGIN stays on, COMMIT or ROLLBACK also stays on. Otherwise a
     ///   transaction never ends, and it blocks all other writers.
     pub fn pick_workloads(
@@ -87,7 +85,7 @@ impl SwarmConfig {
         assert!(
             workloads
                 .iter()
-                .any(|(_, workload)| checks_results(workload.as_ref())),
+                .any(|(_, workload)| workload.checks_results()),
             "swarm testing needs a workload that checks results"
         );
         let mut rng = seeded_stream(self.seed, WORKLOAD_STREAM);
@@ -95,7 +93,7 @@ impl SwarmConfig {
         let mut workloads: Vec<(u32, Box<dyn Workload>)> = workloads
             .into_iter()
             .map(|(weight, workload)| {
-                let on = rng.random_bool(0.5) || checks_results(workload.as_ref());
+                let on = rng.random_bool(0.5) || workload.checks_results();
                 let weight = if on { scale(weight, &mut rng) } else { 0 };
                 (weight, workload)
             })
@@ -139,14 +137,6 @@ fn scale(weight: u32, rng: &mut ChaCha8Rng) -> u32 {
     (weight * pick(rng, &WEIGHT_QUARTERS)).div_ceil(4)
 }
 
-/// The workloads whose results a property checks.
-fn checks_results(workload: &dyn Workload) -> bool {
-    is::<IntegrityCheckWorkload>(workload)
-        || is::<SimpleSelectWorkload>(workload)
-        || is::<FtsMatchWorkload>(workload)
-        || is::<CurrValWorkload>(workload)
-}
-
 fn is_on<W: Workload>(workloads: &[(u32, Box<dyn Workload>)]) -> bool {
     workloads
         .iter()
@@ -163,7 +153,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::workloads::{DeleteWorkload, SimpleInsertWorkload, WalCheckpointWorkload};
+    use crate::workloads::{
+        CurrValWorkload, DeleteWorkload, FtsMatchWorkload, IntegrityCheckWorkload, NextValWorkload,
+        SimpleInsertWorkload, SimpleSelectWorkload, WalCheckpointWorkload,
+    };
 
     fn workloads() -> Vec<(u32, Box<dyn Workload>)> {
         vec![
@@ -241,7 +234,7 @@ mod tests {
                 .iter()
                 .filter(|weights| weights[index] > 0)
                 .count();
-            if checks_results(workload.as_ref()) {
+            if workload.checks_results() {
                 assert_eq!(runs_on, 100, "{} must stay on", workload.name());
             } else {
                 assert!(
@@ -250,6 +243,23 @@ mod tests {
                     workload.name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn only_read_workloads_that_check_results_always_stay_on() {
+        let reads: [&dyn Workload; 4] = [
+            &IntegrityCheckWorkload,
+            &SimpleSelectWorkload,
+            &FtsMatchWorkload,
+            &CurrValWorkload,
+        ];
+        for workload in reads {
+            assert!(workload.checks_results(), "{}", workload.name());
+        }
+        let writes: [&dyn Workload; 2] = [&NextValWorkload, &SimpleInsertWorkload];
+        for workload in writes {
+            assert!(!workload.checks_results(), "{}", workload.name());
         }
     }
 

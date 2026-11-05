@@ -47,6 +47,14 @@ impl GenerationContext for WorkloadContext<'_> {
 pub trait Workload: Any + Send + Sync {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation>;
 
+    /// True for a read-only workload whose results a property examines. Swarm
+    /// testing never turns such a workload off. A write workload, such as
+    /// NextVal, can be off even if a property examines its results. Then the run
+    /// does not use that feature, so there is nothing to examine.
+    fn checks_results(&self) -> bool {
+        false
+    }
+
     /// The type name without its module path and `Workload` suffix, for example `Begin`.
     fn name(&self) -> &'static str {
         let path = std::any::type_name::<Self>();
@@ -87,6 +95,10 @@ impl Workload for IntegrityCheckWorkload {
             return None;
         }
         Some(Operation::IntegrityCheck)
+    }
+
+    fn checks_results(&self) -> bool {
+        true
     }
 }
 
@@ -129,6 +141,10 @@ impl Workload for SimpleSelectWorkload {
         };
 
         Some(Operation::SimpleSelect { table_name, key })
+    }
+
+    fn checks_results(&self) -> bool {
+        true
     }
 }
 
@@ -704,6 +720,10 @@ impl Workload for CurrValWorkload {
         let seq_name = ctx.sim_state.sequences.pick(rng)?.0.clone();
         Some(Operation::CurrVal { seq_name })
     }
+
+    fn checks_results(&self) -> bool {
+        true
+    }
 }
 
 /// Call nextval() on a random existing sequence.
@@ -953,6 +973,10 @@ impl Workload for FtsMatchWorkload {
         Some(Operation::CompareFtsResults {
             word: word.to_string(),
         })
+    }
+
+    fn checks_results(&self) -> bool {
+        true
     }
 }
 
