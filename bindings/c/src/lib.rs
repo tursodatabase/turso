@@ -3,7 +3,7 @@
 
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
@@ -20,7 +20,7 @@ static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 /// `sqlite_search_count`.
 #[no_mangle]
 #[allow(non_upper_case_globals)]
-pub static mut sqlite3_search_count: ffi::c_int = 0;
+pub static sqlite3_search_count: AtomicI32 = AtomicI32::new(0);
 
 /// Test-only export of core's SQLite varint encoder for the TCL harness's
 /// btree_varint_test command (upstream test3.c). `buf` must have room for
@@ -65,12 +65,6 @@ fn default_db_opts() -> DatabaseOpts {
             .with_autovacuum(true);
     }
     opts
-}
-
-macro_rules! stub {
-    () => {
-        todo!("{} is not implemented", stringify!($fn));
-    };
 }
 
 /* generic error-codes */
@@ -273,8 +267,9 @@ impl sqlite3 {
 }
 
 pub struct sqlite3_stmt {
-    pub(crate) db: Arc<sqlite3>,
+    // Aggregate finalizers may use the database handle while the statement is dropped.
     pub(crate) stmt: turso_core::Statement,
+    pub(crate) db: Arc<sqlite3>,
     /// NUL-terminated copy of the statement's SQL, backing sqlite3_sql():
     /// the returned pointer must stay valid until finalize.
     pub(crate) sql: CString,
@@ -343,6 +338,9 @@ pub struct SqliteContext {
     pub(crate) result: ExtValue,
     pub(crate) p_app: *mut ffi::c_void,
     pub(crate) db: *mut sqlite3,
+    /// Per-group accumulator for an aggregate step/final call, null for a
+    /// scalar context. Backs sqlite3_aggregate_context.
+    pub(crate) agg: *mut turso_ext::AggCtx,
 }
 
 // SAFETY: SqliteContext is only used single-threaded within a function call.
@@ -386,6 +384,7 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
         result: ExtValue::null(),
         p_app: p_app as *mut ffi::c_void,
         db: db as *mut sqlite3,
+        agg: std::ptr::null_mut(),
     };
 
     x_func(
@@ -524,16 +523,20 @@ pub unsafe extern "C" fn sqlite3_open(
         Ok(s) => s,
         Err(_) => return SQLITE_MISUSE,
     };
-    let io: Arc<dyn turso_core::IO> = match filename_str {
-        ":memory:" => Arc::new(turso_core::MemoryIO::new()),
-        _ => match turso_core::PlatformIO::new() {
+    // An empty filename requests a private temporary database, backed here
+    // by a private in-memory database (see sqlite3_open_v2).
+    let is_memory = filename_str == ":memory:" || filename_str.is_empty();
+    let io: Arc<dyn turso_core::IO> = if is_memory {
+        Arc::new(turso_core::MemoryIO::new())
+    } else {
+        match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
             Err(_) => return SQLITE_CANTOPEN,
-        },
+        }
     };
     match turso_core::Database::open_file_with_flags(
         io.clone(),
-        filename_str,
+        if is_memory { ":memory:" } else { filename_str },
         turso_core::OpenFlags::default(),
         default_db_opts(),
         None,
@@ -541,9 +544,10 @@ pub unsafe extern "C" fn sqlite3_open(
     ) {
         Ok(db) => {
             let conn = db.connect(ConnectOpts::new()).unwrap();
-            let filename = match filename_str {
-                ":memory:" => CString::new("".to_string()).unwrap(),
-                _ => CString::from(filename_cstr),
+            let filename = if is_memory {
+                CString::new("".to_string()).unwrap()
+            } else {
+                CString::from(filename_cstr)
             };
             *db_out = sqlite3::new(io, db, conn, filename).into_raw();
             SQLITE_OK
@@ -633,6 +637,13 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
         percent_decode(raw_path).ok_or(())?
     };
 
+    // An empty URI path (e.g. "file:?cache=shared") requests a private
+    // temporary database, backed by an in-memory one as elsewhere.
+    let path = if path.is_empty() {
+        ":memory:".to_string()
+    } else {
+        path
+    };
     let mut is_memory = path == ":memory:";
     let mut cache_shared = false;
     if let Some(query) = query {
@@ -856,6 +867,10 @@ pub unsafe extern "C" fn sqlite3_db_filename(
     inner.filename.as_ptr()
 }
 
+// Unimplemented entry points return their contract's failure value (or a
+// harmless no-op where the contract has no failure signal) instead of
+// panicking: a panic across the extern "C" boundary aborts the host
+// process.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_trace_v2(
     _db: *mut sqlite3,
@@ -865,7 +880,7 @@ pub unsafe extern "C" fn sqlite3_trace_v2(
     >,
     _context: *mut ffi::c_void,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1247,7 +1262,9 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let current = stmt.stmt.metrics().search_count;
     let delta = current - stmt.prev_search_count;
     stmt.prev_search_count = current;
-    sqlite3_search_count = sqlite3_search_count.saturating_add(delta as ffi::c_int);
+    let _ = sqlite3_search_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_add(delta as ffi::c_int))
+    });
     rc
 }
 
@@ -1463,7 +1480,7 @@ pub unsafe extern "C" fn sqlite3_serialize(
     _out_bytes: *mut ffi::c_int,
     _flags: ffi::c_uint,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1474,7 +1491,7 @@ pub unsafe extern "C" fn sqlite3_deserialize(
     _in_bytes: ffi::c_int,
     _flags: ffi::c_uint,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1715,7 +1732,7 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
-    stub!();
+    std::thread::sleep(std::time::Duration::from_millis(_ms.max(0) as u64));
 }
 
 #[no_mangle]
@@ -1724,7 +1741,7 @@ pub unsafe extern "C" fn sqlite3_limit(
     _id: ffi::c_int,
     _new_value: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    -1
 }
 
 #[no_mangle]
@@ -1810,7 +1827,7 @@ pub unsafe extern "C" fn sqlite3_backup_init(
     _source_db: *mut sqlite3,
     _source_name: *const ffi::c_char,
 ) -> *mut ffi::c_void {
-    stub!();
+    std::ptr::null_mut()
 }
 
 #[no_mangle]
@@ -1818,22 +1835,22 @@ pub unsafe extern "C" fn sqlite3_backup_step(
     _backup: *mut ffi::c_void,
     _n_pages: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_remaining(_backup: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_pagecount(_backup: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_finish(_backup: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+    SQLITE_OK
 }
 
 /// Returns the statement's original SQL text. The pointer is owned by the
@@ -2835,10 +2852,23 @@ pub unsafe extern "C" fn sqlite3_result_error(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_aggregate_context(
-    _context: *mut ffi::c_void,
-    _n: ffi::c_int,
+    context: *mut ffi::c_void,
+    n: ffi::c_int,
 ) -> *mut ffi::c_void {
-    stub!();
+    if context.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ctx = &mut *(context as *mut SqliteContext);
+    if ctx.agg.is_null() {
+        return std::ptr::null_mut();
+    }
+    let agg = &mut *ctx.agg;
+    // First request with n > 0 zero-allocates the per-group buffer; later
+    // requests return the same pointer, as SQLite does.
+    if agg.state.is_null() && n > 0 {
+        agg.state = libc::calloc(1, n as usize);
+    }
+    agg.state
 }
 
 // `unsafe_op_in_unsafe_fn`: opt this FFI entry point out of the legacy rule that an
@@ -3062,44 +3092,21 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
     }
 }
 
+/// The pre-v2 registration entry point: identical to
+/// sqlite3_create_collation_v2 without a destructor.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_create_collation_v2(
+pub unsafe extern "C" fn sqlite3_create_collation(
     db: *mut sqlite3,
     name: *const ffi::c_char,
-    _enc: ffi::c_int,
+    enc: ffi::c_int,
     context: *mut ffi::c_void,
-    cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    destroy: Option<unsafe extern "C" fn()>,
+    cmp: Option<sqlite3_collation_compare>,
 ) -> ffi::c_int {
-    if db.is_null() || name.is_null() {
-        return SQLITE_MISUSE;
-    }
-    let name = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => return SQLITE_MISUSE,
-    };
-    let inner = (*db).inner.lock().unwrap();
-    let Some(cmp) = cmp else {
-        inner.conn.unregister_external_collation(&name);
-        return SQLITE_OK;
-    };
-    let bridge = Box::new(CollationBridge {
-        context,
-        cmp: std::mem::transmute::<unsafe extern "C" fn() -> ffi::c_int, CollationCompareFn>(cmp),
-        destroy: destroy.map(|f| {
-            std::mem::transmute::<unsafe extern "C" fn(), unsafe extern "C" fn(*mut ffi::c_void)>(f)
-        }),
-    });
-    inner.conn.register_external_collation(
-        name,
-        Box::into_raw(bridge) as usize,
-        collation_bridge_compare,
-        Some(collation_bridge_destroy),
-    );
-    SQLITE_OK
+    sqlite3_create_collation_v2(db, name, enc, context, cmp, None)
 }
 
-type CollationCompareFn = unsafe extern "C" fn(
+/// SQLite's collation comparator: (pArg, nLeft, pLeft, nRight, pRight) -> int.
+pub type sqlite3_collation_compare = unsafe extern "C" fn(
     *mut ffi::c_void,
     ffi::c_int,
     *const ffi::c_void,
@@ -3107,13 +3114,19 @@ type CollationCompareFn = unsafe extern "C" fn(
     *const ffi::c_void,
 ) -> ffi::c_int;
 
+/// Bridges one registered collation from turso_core's comparator ABI to the
+/// SQLite one. Boxed and handed to core as the opaque context; the trampoline
+/// and destructor below reconstitute it.
 struct CollationBridge {
-    context: *mut ffi::c_void,
-    cmp: CollationCompareFn,
+    cmp: sqlite3_collation_compare,
+    p_app: *mut ffi::c_void,
     destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 }
 
-unsafe extern "C" fn collation_bridge_compare(
+/// turso_core's comparator passes (context, lptr, llen, rptr, rlen); SQLite's
+/// comparator wants (pArg, llen, lptr, rlen, rptr), so the arguments are
+/// reordered here.
+unsafe extern "C" fn collation_trampoline(
     context: usize,
     left_ptr: *const u8,
     left_len: usize,
@@ -3122,7 +3135,7 @@ unsafe extern "C" fn collation_bridge_compare(
 ) -> i32 {
     let bridge = &*(context as *const CollationBridge);
     (bridge.cmp)(
-        bridge.context,
+        bridge.p_app,
         left_len as ffi::c_int,
         left_ptr as *const ffi::c_void,
         right_len as ffi::c_int,
@@ -3130,11 +3143,210 @@ unsafe extern "C" fn collation_bridge_compare(
     )
 }
 
-unsafe extern "C" fn collation_bridge_destroy(context: usize) {
+/// Frees the boxed CollationBridge, first running the caller's xDestroy on
+/// its application data.
+unsafe extern "C" fn collation_ctx_destructor(context: usize) {
     let bridge = Box::from_raw(context as *mut CollationBridge);
     if let Some(destroy) = bridge.destroy {
-        destroy(bridge.context);
+        destroy(bridge.p_app);
     }
+}
+
+/// Registers a user collation. A NULL comparator unregisters the name, as in
+/// SQLite. `enc` is accepted and ignored: turso_core is UTF-8 only.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_collation_v2(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    _enc: ffi::c_int,
+    context: *mut ffi::c_void,
+    cmp: Option<sqlite3_collation_compare>,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+) -> ffi::c_int {
+    if db.is_null() || name.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db: &sqlite3 = &*db;
+    let inner = match db.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    match cmp {
+        None => {
+            inner.conn.unregister_external_collation(&name);
+            // A destructor supplied with a NULL comparator still owns the
+            // application data.
+            if let Some(destroy) = destroy {
+                destroy(context);
+            }
+        }
+        Some(cmp) => {
+            let bridge = Box::into_raw(Box::new(CollationBridge {
+                cmp,
+                p_app: context,
+                destroy,
+            }));
+            inner.conn.register_external_collation(
+                name,
+                bridge as usize,
+                collation_trampoline,
+                Some(collation_ctx_destructor),
+            );
+        }
+    }
+    SQLITE_OK
+}
+
+/// The pre-v2 registration entry point: identical to
+/// sqlite3_create_function_v2 without a destructor.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_function(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    n_args: ffi::c_int,
+    enc: ffi::c_int,
+    context: *mut ffi::c_void,
+    func: Option<unsafe extern "C" fn()>,
+    step: Option<unsafe extern "C" fn()>,
+    final_: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    sqlite3_create_function_v2(db, name, n_args, enc, context, func, step, final_, None)
+}
+
+/// Bridges one registered aggregate to turso_core's init/step/finalize ABI.
+/// Boxed and passed as the registration `context`, shared read-only across
+/// groups; the per-group accumulator lives in the AggCtx that init allocates
+/// and finalize frees, reachable from xStep/xFinal via
+/// sqlite3_aggregate_context.
+struct AggBridge {
+    step: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+    final_: unsafe extern "C" fn(*mut ffi::c_void),
+    p_app: *mut ffi::c_void,
+    db: *mut sqlite3,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+}
+
+unsafe extern "C" fn agg_init(_context: usize) -> *mut turso_ext::AggCtx {
+    Box::into_raw(Box::new(turso_ext::AggCtx {
+        state: std::ptr::null_mut(),
+    }))
+}
+
+unsafe extern "C" fn agg_step(
+    context: usize,
+    ctx: *mut turso_ext::AggCtx,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let bridge = &*(context as *const AggBridge);
+    let mut arg_ptrs: Vec<*mut ffi::c_void> = (0..argc as usize)
+        .map(|i| argv.add(i) as *mut ffi::c_void)
+        .collect();
+    let mut sctx = SqliteContext {
+        result: ExtValue::null(),
+        p_app: bridge.p_app,
+        db: bridge.db,
+        agg: ctx,
+    };
+    (bridge.step)(
+        &mut sctx as *mut SqliteContext as *mut ffi::c_void,
+        argc,
+        arg_ptrs.as_mut_ptr(),
+    );
+    if sctx.result.value_type() == turso_ext::ValueType::Error {
+        return sctx.result;
+    }
+    sctx.result.__free_internal_type();
+    ExtValue::null()
+}
+
+unsafe extern "C" fn agg_finalize(context: usize, ctx: *mut turso_ext::AggCtx) -> ExtValue {
+    let bridge = &*(context as *const AggBridge);
+    let mut sctx = SqliteContext {
+        result: ExtValue::null(),
+        p_app: bridge.p_app,
+        db: bridge.db,
+        agg: ctx,
+    };
+    (bridge.final_)(&mut sctx as *mut SqliteContext as *mut ffi::c_void);
+    // xFinal is called once per init; free the per-group buffer and AggCtx.
+    if !ctx.is_null() {
+        let agg = Box::from_raw(ctx);
+        if !agg.state.is_null() {
+            libc::free(agg.state);
+        }
+    }
+    sctx.result
+}
+
+/// Called by core when the aggregate is removed: free the shared bridge and
+/// run the caller's xDestroy on its application data.
+unsafe extern "C" fn agg_ctx_destructor(context: usize) {
+    let bridge = Box::from_raw(context as *mut AggBridge);
+    if let Some(destroy) = bridge.destroy {
+        destroy(bridge.p_app);
+    }
+}
+
+/// Registers an aggregate (xStep + xFinal) via turso_core's aggregate ABI.
+unsafe fn register_aggregate(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    n_args: ffi::c_int,
+    context: *mut ffi::c_void,
+    step_raw: unsafe extern "C" fn(),
+    final_raw: unsafe extern "C" fn(),
+    destroy_raw: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    let step: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
+        std::mem::transmute(step_raw);
+    let final_: unsafe extern "C" fn(*mut ffi::c_void) = std::mem::transmute(final_raw);
+    let destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)> =
+        destroy_raw.map(|f| std::mem::transmute(f));
+
+    let name_c = match CStr::from_ptr(name).to_str() {
+        Ok(s) => match CString::new(s) {
+            Ok(c) => c,
+            Err(_) => return SQLITE_MISUSE,
+        },
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    let bridge = Box::into_raw(Box::new(AggBridge {
+        step,
+        final_,
+        p_app: context,
+        db,
+        destroy,
+    }));
+
+    let db_ref = &*db;
+    let inner = db_ref.inner.lock().unwrap();
+    let api = inner.conn._build_turso_ext();
+    let rc = (api.register_aggregate_function)(
+        api.ctx,
+        name_c.as_ptr(),
+        n_args,
+        bridge as usize,
+        agg_init,
+        agg_step,
+        agg_finalize,
+        Some(agg_ctx_destructor),
+        None,
+        None,
+    );
+    inner.conn._free_extension_ctx(api);
+
+    if rc != turso_ext::ResultCode::OK {
+        drop(Box::from_raw(bridge));
+        return SQLITE_ERROR;
+    }
+    SQLITE_OK
 }
 
 #[no_mangle]
@@ -3152,10 +3364,15 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     if db.is_null() || name.is_null() {
         return SQLITE_MISUSE;
     }
-    // Only scalar functions (xFunc) are supported for now; skip aggregate registration.
+    // An aggregate provides xStep + xFinal and no xFunc.
     let x_func_raw = match func {
         Some(f) => f,
-        None => return SQLITE_OK,
+        None => match (_step, _final_) {
+            (Some(step), Some(final_)) => {
+                return register_aggregate(db, name, _n_args, context, step, final_, _destroy);
+            }
+            _ => return SQLITE_OK,
+        },
     };
     // Cast the opaque fn() pointer to the real scalar callback signature.
     let x_func: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
@@ -3247,7 +3464,7 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
     _x_inverse: Option<unsafe extern "C" fn()>,
     _destroy: Option<unsafe extern "C" fn()>,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 /// Returns the error message for the most recent failed API call to connection.
@@ -3740,7 +3957,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
-        LimboError::Busy => SQLITE_BUSY,
+        LimboError::Busy | LimboError::WriteWriteConflict => SQLITE_BUSY,
         // SQLite reports operations on an expired blob handle (its row's table was
         // written after sqlite3_blob_open) as SQLITE_ABORT.
         LimboError::BlobHandleExpired => SQLITE_ABORT,
@@ -3755,15 +3972,40 @@ fn limbo_err_code(err: &LimboError) -> i32 {
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
+        let err_msg = sqlite_bare_message(&err);
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     code
 }
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
+/// SQLite's sqlite3_errmsg returns a bare message ("no such table: t"),
+/// while turso_core's Display decorates errors with a category prefix
+/// ("Parse error: ...") that the CLI relies on. Strip a leading
+/// "<Category> error: " so the C API matches SQLite; other consumers keep
+/// the decorated form.
+fn sqlite_bare_message(err: &LimboError) -> String {
+    const PREFIXES: [&str; 8] = [
+        "Parse error: ",
+        "Transaction error: ",
+        "Runtime error: ",
+        "Planning error: ",
+        "Locking error: ",
+        "Conversion error: ",
+        "Extension error: ",
+        "Internal error: ",
+    ];
+    let msg = err.to_string();
+    for p in PREFIXES {
+        if let Some(rest) = msg.strip_prefix(p) {
+            return rest.to_string();
+        }
+    }
+    msg
+}
+
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}"))
+    set_db_err_msg(db, limbo_err_code(&err), &sqlite_bare_message(&err))
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {
@@ -3807,6 +4049,81 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn deferred_close_keeps_handle_alive_during_aggregate_cleanup() {
+        struct Cleanup {
+            handle: std::sync::Weak<sqlite3>,
+            final_calls: usize,
+            handle_alive: bool,
+        }
+        unsafe extern "C" fn step(ctx: *mut ffi::c_void, _argc: i32, _argv: *mut *mut ffi::c_void) {
+            sqlite3_aggregate_context(ctx, 4);
+        }
+        unsafe extern "C" fn final_(ctx: *mut ffi::c_void) {
+            let cleanup = &mut *sqlite3_user_data(ctx).cast::<Cleanup>();
+            cleanup.final_calls += 1;
+            if let Some(handle) = cleanup.handle.upgrade() {
+                let db = sqlite3_context_db_handle(ctx).cast::<sqlite3>();
+                cleanup.handle_alive = std::ptr::eq(db, Arc::as_ptr(&handle));
+                sqlite3_changes(db);
+            }
+            sqlite3_result_int(ctx, 42);
+        }
+        unsafe extern "C" fn fail(ctx: *mut ffi::c_void, _argc: i32, _argv: *mut *mut ffi::c_void) {
+            sqlite3_result_error(ctx, c"separate scalar failed".as_ptr(), -1);
+        }
+        type Step = unsafe extern "C" fn(*mut ffi::c_void, i32, *mut *mut ffi::c_void);
+        type Final = unsafe extern "C" fn(*mut ffi::c_void);
+        type Opaque = unsafe extern "C" fn();
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let handle = sqlite3::clone_from_raw(db);
+            let mut cleanup = Cleanup {
+                handle: Arc::downgrade(&handle),
+                final_calls: 0,
+                handle_alive: false,
+            };
+            drop(handle);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"deferred_track".as_ptr(),
+                    1,
+                    1,
+                    (&mut cleanup as *mut Cleanup).cast(),
+                    None,
+                    Some(std::mem::transmute::<Step, Opaque>(step)),
+                    Some(std::mem::transmute::<Final, Opaque>(final_))
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"deferred_fail".as_ptr(),
+                    1,
+                    1,
+                    ptr::null_mut(),
+                    Some(std::mem::transmute::<Step, Opaque>(fail)),
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut stmt = ptr::null_mut();
+            assert_eq!(sqlite3_prepare_v2(db,
+                c"WITH input(x) AS (VALUES(1),(2)) SELECT deferred_track(x), sum(deferred_fail(x)) FROM input".as_ptr(),
+                -1, &mut stmt, ptr::null_mut()), SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ERROR);
+            assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+            sqlite3_finalize(stmt);
+            assert_eq!(cleanup.final_calls, 1);
+            assert!(cleanup.handle_alive);
+            assert!(cleanup.handle.upgrade().is_none());
+        }
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
