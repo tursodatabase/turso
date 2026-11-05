@@ -1228,6 +1228,9 @@ pub struct ColumnDefStmt {
     pub unique: bool,
     pub default: Option<Expr>,
     pub check: Option<Expr>,
+    /// `GENERATED ALWAYS AS (<expr>) STORED`. `None` means a regular column.
+    /// When this is `Some`, `default`, `not_null`, and `unique` must all be unset.
+    pub generated: Option<Expr>,
 }
 
 impl fmt::Display for ColumnDefStmt {
@@ -1238,20 +1241,26 @@ impl fmt::Display for ColumnDefStmt {
             write!(f, " PRIMARY KEY")?;
         }
 
-        if self.not_null && !self.primary_key {
-            write!(f, " NOT NULL")?;
-        }
+        if self.generated.is_none() {
+            if self.not_null && !self.primary_key {
+                write!(f, " NOT NULL")?;
+            }
 
-        if self.unique && !self.primary_key {
-            write!(f, " UNIQUE")?;
-        }
+            if self.unique && !self.primary_key {
+                write!(f, " UNIQUE")?;
+            }
 
-        if let Some(default) = &self.default {
-            write!(f, " DEFAULT ({default})")?;
+            if let Some(default) = &self.default {
+                write!(f, " DEFAULT ({default})")?;
+            }
         }
 
         if let Some(check) = &self.check {
             write!(f, " CHECK ({check})")?;
+        }
+
+        if let Some(expr) = &self.generated {
+            write!(f, " GENERATED ALWAYS AS ({expr}) STORED")?;
         }
 
         Ok(())
@@ -1295,7 +1304,7 @@ pub enum AlterTableAction {
     /// RENAME TO new_name
     RenameTo(String),
     /// ADD COLUMN column_def
-    AddColumn(ColumnDefStmt),
+    AddColumn(Box<ColumnDefStmt>),
     /// DROP COLUMN column_name
     DropColumn(String),
     /// RENAME COLUMN old_name TO new_name
@@ -3252,6 +3261,7 @@ mod tests {
                 unique: false,
                 default: None,
                 check: None,
+                generated: None,
             }],
             if_not_exists: false,
             strict: false,
