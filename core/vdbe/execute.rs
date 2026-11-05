@@ -18196,7 +18196,7 @@ pub fn op_alter_column(
         let new_column = table
             .btree()
             .expect("only btree tables can be altered")
-            .column_for_alter(*column_index, definition);
+            .column_for_alter(*column_index, definition, schema);
         (old_column_name, table.is_strict(), new_column)
     });
     let new_column = new_column?;

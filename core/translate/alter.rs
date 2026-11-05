@@ -1845,7 +1845,7 @@ pub fn translate_alter_table(
                             resolver.schema(),
                         )?;
                         let replacement_column =
-                            btree.column_for_alter(column_index, &definition)?;
+                            btree.column_for_alter(column_index, &definition, resolver.schema())?;
                         let old_column = &btree.columns()[column_index];
                         // Switching between a rowid alias and a key with an automatic
                         // index would need that index created or dropped.
@@ -1969,7 +1969,6 @@ pub fn translate_alter_table(
                         )?;
                     }
                 }
-                table.resolve_custom_types(resolver.schema())?;
                 let column = &table.columns()[column_index];
                 let ty = column_type(column, table.is_strict, resolver.schema());
                 key_collation(column.text_collation(), &ty, resolver.schema())?;
