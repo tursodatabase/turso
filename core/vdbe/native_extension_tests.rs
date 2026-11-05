@@ -65,6 +65,77 @@ fn native_scalar_overloads_prefer_exact_then_finite_then_variadic() {
 }
 
 #[test]
+fn native_scalar_signature_replacement_wins_equal_specificity() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(EngineDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "native_replaced_overlap".into(),
+                    FunctionArity::OneOf(&[1, 2]),
+                    false,
+                    NullToNine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "native_replaced_overlap".into(),
+                    FunctionArity::OneOf(&[1, 3]),
+                    false,
+                    Nine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "native_replaced_overlap".into(),
+                    FunctionArity::OneOf(&[2, 1]),
+                    false,
+                    ConstantScalar(30),
+                )
+                .unwrap(),
+            ),
+    );
+    for (sql, expected) in [
+        ("SELECT native_replaced_overlap(7)", 30),
+        ("SELECT native_replaced_overlap(7,8)", 30),
+        ("SELECT native_replaced_overlap(7,8,9)", 9),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected)]]
+        );
+    }
+    let mut listed = conn
+        .get_syms_functions()
+        .into_iter()
+        .filter(|(name, _, _, _)| name == "native_replaced_overlap")
+        .map(|(_, _, argc, _)| argc)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(listed, vec![1, 1, 2, 3]);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConstantScalar(i64);
+
+impl ScalarFunction for ConstantScalar {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for ConstantScalar {
+    type Output = i64;
+
+    fn step(&mut self, _: &Arc<Connection>, _: &[Register]) -> IOResultOr<i64> {
+        Ok(IOResult::Done(self.0))
+    }
+}
+
+#[test]
 fn native_scalar_accepts_only_declared_argument_counts() {
     for arity in [
         FunctionArity::OneOf(&[]),

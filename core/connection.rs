@@ -5334,7 +5334,11 @@ impl SymbolTable {
     pub fn has_function_signature(&self, name: &str, argc: i32) -> bool {
         self.functions
             .get(&crate::util::normalize_ident(name))
-            .is_some_and(|bucket| bucket.iter().any(|entry| entry.arg_counts == [argc]))
+            .is_some_and(|bucket| {
+                bucket
+                    .iter()
+                    .any(|entry| entry.arg_counts == [argc] && entry.function.is_some())
+            })
     }
 
     pub fn insert_function(&mut self, name: String, function: Arc<function::ExternalFunc>) {
@@ -5352,14 +5356,8 @@ impl SymbolTable {
 
     fn insert_function_registration(&mut self, name: String, registration: FunctionRegistration) {
         let bucket = self.functions.entry(name).or_default();
-        if let Some(old) = bucket
-            .iter_mut()
-            .find(|old| old.arg_counts == registration.arg_counts)
-        {
-            *old = registration;
-        } else {
-            bucket.push(registration);
-        }
+        bucket.retain(|old| old.arg_counts != registration.arg_counts);
+        bucket.push(registration);
     }
 
     pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {

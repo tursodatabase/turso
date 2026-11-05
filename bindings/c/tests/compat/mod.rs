@@ -543,6 +543,73 @@ mod tests {
     }
 
     #[test]
+    fn scalar_deleted_signature_can_be_registered_during_an_active_statement() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, variadic) = scalar_register(db, c"scalar_deleted_active", -1, 99);
+            assert_eq!(rc, SQLITE_OK);
+            let (rc, old) = scalar_register(db, c"scalar_deleted_active", 1, 10);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_deleted_active".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let mut deleted = ptr::null_mut();
+            assert_ne!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT scalar_deleted_active(7)".as_ptr(),
+                    -1,
+                    &mut deleted,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            let active = scalar_prepare(db, "SELECT 1 UNION ALL SELECT 2");
+            assert_eq!(sqlite3_step(active), SQLITE_ROW);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_deleted_active".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let (rc, new) = scalar_register(db, c"scalar_deleted_active", 1, 20);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_step(active), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(active, 0), 2);
+            assert_eq!(sqlite3_step(active), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(active), SQLITE_OK);
+            scalar_query(db, "SELECT scalar_deleted_active(7)", 20);
+            scalar_query(db, "SELECT scalar_deleted_active(7,8)", 99);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(variadic.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
     fn scalar_active_replacement_is_busy_and_destroys_rejected_userdata() {
         unsafe {
             let mut db = ptr::null_mut();
