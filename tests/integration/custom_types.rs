@@ -182,6 +182,45 @@ mod tests {
         assert_eq!(rows, vec![(0,)]);
     }
 
+    /// Earlier versions stored a quoted name such as `"pos"` in
+    /// __turso_internal_types. DROP must still remove that row, or the domain
+    /// comes back after reopening.
+    #[test]
+    fn test_drop_removes_type_stored_with_quoted_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("quoted_type_name_row.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE DOMAIN pos AS integer CHECK (value > 0)")
+                .unwrap();
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE __turso_internal_types SET name = '\"pos\"', \
+                 sql = 'CREATE DOMAIN \"pos\" AS integer CHECK (value > 0)' WHERE name = 'pos'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("DROP DOMAIN pos").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM __turso_internal_types");
+        assert_eq!(rows, vec![(0,)]);
+        conn.execute("CREATE DOMAIN pos AS text").unwrap();
+    }
+
     /// Indexes on custom-type columns must keep their order after reopening:
     /// the stored-value order of a user type, and numeric's own order, both for
     /// column indexes and for expression indexes.
