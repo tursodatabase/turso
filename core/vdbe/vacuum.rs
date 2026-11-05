@@ -470,6 +470,38 @@ pub(crate) struct VacuumTargetBuildConfig {
     pub target_auto_vacuum_mode: AutoVacuumMode,
     /// Whether to copy the source MVCC metadata table into the target image.
     pub copy_mvcc_metadata_table: bool,
+    /// Commit the target every so many copied rows / bytes instead of
+    /// building it in one write transaction. The commit path re-reads every
+    /// page a transaction spilled and holds a WAL frame per page until the
+    /// batch is submitted, so one transaction for the whole copy costs about
+    /// twice the database size in memory. `None` keeps the single transaction
+    /// (the in-place VACUUM temp image is copied back page-wise and relies
+    /// on it).
+    pub commit_every: Option<VacuumCommitBatch>,
+}
+
+/// Batch bounds for [`VacuumTargetBuildConfig::commit_every`]: the target
+/// is committed when either is reached.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VacuumCommitBatch {
+    pub rows: u64,
+    pub bytes: u64,
+    /// Committed batches between `TRUNCATE` checkpoints of the target WAL.
+    /// The in-memory frame index (`frame_cache`) holds an entry per frame
+    /// until the log is reset, and auto-actions are off on the target, so
+    /// without a periodic reset it — and the `-wal` file — grow with the
+    /// copy.
+    pub checkpoint_every_batches: u32,
+}
+
+impl VacuumCommitBatch {
+    /// What `VACUUM INTO` uses: a commit costs ~2 × its data in memory, so
+    /// this bounds the copy's peak at a few tens of MB whatever the size.
+    pub const VACUUM_INTO: Self = Self {
+        rows: 20_000,
+        bytes: 8 * 1024 * 1024,
+        checkpoint_every_batches: 8,
+    };
 }
 
 /// Context for the vacuum target build. Holds the target connection and all
@@ -477,6 +509,11 @@ pub(crate) struct VacuumTargetBuildConfig {
 pub(crate) struct VacuumTargetBuildContext {
     target_conn: Arc<Connection>,
     phase: VacuumTargetBuildPhase,
+    /// Rows and bytes copied since the target was last committed, and
+    /// commits since its WAL was last truncated.
+    batch_rows: u64,
+    batch_bytes: u64,
+    batches_since_checkpoint: u32,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
     /// Storage-backed tables to CREATE (excludes sqlite_sequence).
@@ -494,6 +531,9 @@ impl VacuumTargetBuildContext {
         Self {
             target_conn,
             phase: VacuumTargetBuildPhase::Init,
+            batch_rows: 0,
+            batch_bytes: 0,
+            batches_since_checkpoint: 0,
             schema_entries: Vec::new(),
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
@@ -757,8 +797,17 @@ pub(crate) fn vacuum_target_build_step(
                             }
                         })?;
                     }
-                    // Done creating tables, start copying data
-                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
+                    // Done creating tables. A batched build creates the
+                    // indexes now (SQLite's vacuum.c order) so their pages
+                    // are committed by the row batches; one CREATE INDEX
+                    // over the copied data would be a transaction the size
+                    // of the index. A single-transaction build keeps the
+                    // index-after-data order for speed.
+                    state.phase = if config.commit_every.is_some() {
+                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
+                    } else {
+                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
+                    };
                     continue;
                 }
 
@@ -819,8 +868,13 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
-                    // Done copying all tables, proceed to deferred indexes.
-                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 };
+                    // Done copying all tables: deferred indexes, unless the
+                    // batched build created them up front.
+                    state.phase = if config.commit_every.is_some() {
+                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
+                    } else {
+                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
+                    };
                     continue;
                 }
 
@@ -972,8 +1026,14 @@ pub(crate) fn vacuum_target_build_step(
                     for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
+                        state.batch_bytes += match &value {
+                            crate::Value::Text(t) => t.as_str().len() as u64,
+                            crate::Value::Blob(b) => b.len() as u64,
+                            _ => 8,
+                        };
                         target_insert_stmt.bind_at(index, value)?;
                     }
+                    state.batch_rows += 1;
 
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
@@ -1016,6 +1076,37 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("INSERT statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // Bound the target transaction: commit and reopen once
+                    // the batch is full, so the commit path never has to
+                    // re-read more than a batch's worth of spilled pages.
+                    if let Some(batch) = config.commit_every {
+                        if state.batch_rows >= batch.rows || state.batch_bytes >= batch.bytes {
+                            state.target_conn.execute("COMMIT")?;
+                            // Keep the target's shared schema at the version
+                            // just committed, as the final commit does, so
+                            // that no statement on the target sees a newer
+                            // cookie on disk and reparses the schema from
+                            // it: a reparse would lose what only the
+                            // connection holds — the mirrored custom types
+                            // and the names of the namespaces, whose rows
+                            // may not be copied yet.
+                            state.target_conn.publish_schema_if_newer();
+                            state.batches_since_checkpoint += 1;
+                            if state.batches_since_checkpoint >= batch.checkpoint_every_batches {
+                                // Nothing reads the target while it is built,
+                                // so the truncate always completes.
+                                state
+                                    .target_conn
+                                    .checkpoint(crate::CheckpointMode::Truncate {
+                                        upper_bound_inclusive: None,
+                                    })?;
+                                state.batches_since_checkpoint = 0;
+                            }
+                            state.target_conn.execute("BEGIN IMMEDIATE")?;
+                            state.batch_rows = 0;
+                            state.batch_bytes = 0;
+                        }
+                    }
                     // Go back to get next row from source
                     state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
@@ -1046,8 +1137,13 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
                 if idx >= entries_len {
-                    // Done creating indexes, move to post-data objects
-                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: 0 };
+                    // Done creating indexes: the rows next in a batched
+                    // build, otherwise the post-data objects.
+                    state.phase = if config.commit_every.is_some() {
+                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
+                    } else {
+                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
+                    };
                     continue;
                 }
 
@@ -2031,6 +2127,7 @@ fn vacuum_in_place_step(
                     target_mvcc_enabled: false,
                     target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
                     copy_mvcc_metadata_table: source_db.mvcc_enabled(),
+                    commit_every: None,
                 };
 
                 let target_build_context = VacuumTargetBuildContext::new(new_temp_db.conn.clone());
@@ -3180,6 +3277,7 @@ mod tests {
             target_mvcc_enabled: source_db.mvcc_enabled(),
             target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
             copy_mvcc_metadata_table: false,
+            commit_every: None,
         };
 
         let injector = OneShotTransactionYieldInjector::new();
