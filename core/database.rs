@@ -1289,6 +1289,7 @@ impl Database {
             options.db_opts,
         )?;
         let file = if effective_flags.contains(OpenFlags::ReadOnly)
+            && !is_memory_like(path)
             && !options.db_opts.enable_multiprocess_wal
         {
             match io.open_file(

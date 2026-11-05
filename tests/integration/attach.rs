@@ -440,6 +440,45 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
 }
 
 #[turso_macros::test]
+fn test_readonly_main_can_attach_private_memory(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let writer = db.connect_limbo();
+    writer.execute("CREATE TABLE main_t(x); INSERT INTO main_t VALUES (7)")?;
+    let conn = db.db.connect(ConnectOpts::new().with_readonly(true))?;
+    conn.execute("ATTACH ':memory:' AS aux")?;
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM aux.sqlite_schema"),
+        vec![row![0]]
+    );
+    assert!(conn
+        .execute("ATTACH ':memory:' AS aux")
+        .unwrap_err()
+        .to_string()
+        .contains("already"));
+    assert!(matches!(
+        conn.execute("CREATE TABLE aux.t(x)"),
+        Err(turso_core::LimboError::ReadOnly)
+    ));
+    conn.execute("CREATE TEMP TABLE local_t(x); INSERT INTO local_t SELECT x FROM main_t")?;
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT x FROM local_t"),
+        vec![row![7]]
+    );
+    assert!(matches!(
+        conn.execute("INSERT INTO main_t VALUES (8)"),
+        Err(turso_core::LimboError::ReadOnly)
+    ));
+    let missing = db.path.with_extension("missing-attach.db");
+    assert!(conn
+        .execute(format!("ATTACH '{}' AS disk", missing.display()))
+        .is_err());
+    assert!(!missing.exists());
+    conn.execute("DETACH aux")?;
+    conn.execute("ATTACH ':memory:' AS aux")?;
+    Ok(())
+}
+
+#[turso_macros::test]
 fn test_attach_rejects_fresh_read_only_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
