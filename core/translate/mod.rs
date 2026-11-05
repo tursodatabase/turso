@@ -172,22 +172,21 @@ pub fn translate(
         roles::check_statement_privileges(&stmt)?;
     }
 
-    let translated = match stmt {
+    match stmt {
         // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma { name, body } => pragma::translate_pragma(
-            &resolver,
-            &name,
-            body,
-            pager,
-            connection.clone(),
-            &mut program,
-        ),
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input),
+        ast::Stmt::Pragma { name, body } => {
+            pragma::translate_pragma(
+                &resolver,
+                &name,
+                body,
+                pager,
+                connection.clone(),
+                &mut program,
+            )?;
+        }
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
-    // Checked even when translation failed: a type that is missing from main
-    // can make translation fail with a less clear error first.
     check_other_databases_have_only_builtin_types(&resolver, &program)?;
-    translated?;
 
     program.epilogue(schema);
 
