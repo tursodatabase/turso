@@ -2568,16 +2568,14 @@ fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<
                 ..
             } = e
             {
-                if filter_over.over_clause.is_some() {
-                    return Ok(WalkControl::Continue);
-                }
-                if let Ok(Some(crate::function::Func::Agg(func))) =
-                    crate::function::Func::resolve_function(name.as_str(), args.len())
-                {
-                    if !select.aggregates.iter().any(|a| a.original_expr == *e) {
-                        found = Some(func.to_string());
-                        return Ok(WalkControl::SkipChildren);
-                    }
+                let is_plain_aggregate = filter_over.over_clause.is_none()
+                    && matches!(
+                        crate::function::Func::resolve_function(name.as_str(), args.len()),
+                        Ok(Some(crate::function::Func::Agg(_)))
+                    );
+                if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
+                    found = Some(name.as_str().to_string());
+                    return Ok(WalkControl::SkipChildren);
                 }
             }
             Ok(WalkControl::Continue)
