@@ -8,7 +8,7 @@ use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::NamespaceId;
-use crate::schema::{Schema, Sequence, Table};
+use crate::schema::{Schema, SchemaRecord, Sequence, Table};
 use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::map::Entry;
 use crate::skiplist::SkipMap;
@@ -10378,8 +10378,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
                                     continue;
                                 };
-                                let schema_record =
-                                    crate::schema::SchemaRecord::decode(record.get_payload())?;
+                                let schema_record = SchemaRecord::decode(record.get_payload())?;
                                 if schema_record.is_btree_table_or_index()
                                     && schema_record.root_page > 0
                                 {
