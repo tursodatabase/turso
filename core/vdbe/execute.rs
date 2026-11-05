@@ -303,6 +303,9 @@ pub enum InsnFunctionStepResult {
     IO,
     Row,
     Step,
+    /// A trigger or foreign key action the instruction runs was interrupted,
+    /// so the statement stops as interrupted too.
+    Interrupt,
 }
 
 pub fn op_init(
@@ -6086,6 +6089,7 @@ pub fn op_program(
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
+                    statement.set_query_deadline(state.query_deadline);
                     let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
@@ -6103,7 +6107,20 @@ pub fn op_program(
                                 return Ok(state.suspend_on_io(io));
                             }
                             StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
+                            StepResult::Interrupt => {
+                                // The subprogram already aborted itself when it stopped.
+                                finish_subprogram(
+                                    program,
+                                    &mut state.metrics,
+                                    &mut statement,
+                                    is_trigger,
+                                    true,
+                                    saved_last_insert_rowid,
+                                    saved_last_changes_value,
+                                );
+                                return Ok(InsnFunctionStepResult::Interrupt);
+                            }
+                            StepResult::Busy => {
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
@@ -20362,7 +20379,11 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO)
         }
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+        Ok(
+            InsnFunctionStepResult::Done
+            | InsnFunctionStepResult::Row
+            | InsnFunctionStepResult::Interrupt,
+        ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
