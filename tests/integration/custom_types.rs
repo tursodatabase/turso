@@ -659,7 +659,8 @@ mod tests {
             .execute("CREATE TYPE aux.c2 BASE integer ENCODE value DECODE value")
             .unwrap_err()
             .to_string();
-        assert!(!err.is_empty());
+        // CREATE TYPE takes a plain name, so a type is always created in main.
+        assert!(err.contains("expected BASE keyword"), "{err}");
     }
 
     /// Built-in types are the same in every database, so tables of attached
