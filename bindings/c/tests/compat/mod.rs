@@ -33,6 +33,9 @@ struct sqlite3_stmt {
     link(name = "turso_sqlite3", kind = "raw-dylib")
 )]
 extern "C" {
+    fn sqlite3_user_data(context: *mut libc::c_void) -> *mut libc::c_void;
+    fn sqlite3_aggregate_context(context: *mut libc::c_void, bytes: i32) -> *mut libc::c_void;
+    fn sqlite3_result_error(context: *mut libc::c_void, message: *const libc::c_char, len: i32);
     fn sqlite3_create_function(
         db: *mut sqlite3,
         name: *const libc::c_char,
@@ -40,8 +43,8 @@ extern "C" {
         enc: i32,
         context: *mut libc::c_void,
         func: Option<unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void)>,
-        step: Option<unsafe extern "C" fn()>,
-        final_: Option<unsafe extern "C" fn()>,
+        step: Option<unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void)>,
+        final_: Option<unsafe extern "C" fn(*mut libc::c_void)>,
     ) -> i32;
     fn sqlite3_create_collation(
         db: *mut sqlite3,
@@ -496,6 +499,73 @@ mod tests {
             assert_eq!(sqlite3_close(second), SQLITE_OK);
             assert_eq!(sqlite3_close(first), SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn aggregate_step_error_stops_execution_and_finalizes_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = [0_i32; 3];
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"failing_aggregate".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    calls.as_mut_ptr().cast(),
+                    None,
+                    Some(failing_aggregate_step),
+                    Some(failing_aggregate_final),
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"WITH input(x) AS (VALUES (1), (2)) SELECT failing_aggregate(x) FROM input"
+                        .as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(statement), SQLITE_ERROR);
+            assert_eq!(sqlite3_errcode(db), SQLITE_ERROR);
+            assert!(std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                .to_str()
+                .unwrap()
+                .contains("aggregate step failed"));
+            assert_eq!(calls, [1, 1, 1]);
+            sqlite3_finalize(statement);
+            assert_eq!(calls, [1, 1, 1]);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn failing_aggregate_step(
+        context: *mut libc::c_void,
+        _argc: i32,
+        _argv: *mut *mut libc::c_void,
+    ) {
+        let calls = sqlite3_user_data(context).cast::<i32>();
+        *calls += 1;
+        let state =
+            sqlite3_aggregate_context(context, std::mem::size_of::<i32>() as i32).cast::<i32>();
+        if !state.is_null() {
+            *state += 1;
+        }
+        sqlite3_result_error(context, c"aggregate step failed".as_ptr(), -1);
+    }
+
+    unsafe extern "C" fn failing_aggregate_final(context: *mut libc::c_void) {
+        let calls = sqlite3_user_data(context).cast::<i32>();
+        *calls.add(1) += 1;
+        let state = sqlite3_aggregate_context(context, 0).cast::<i32>();
+        *calls.add(2) = if state.is_null() { -1 } else { *state };
+        sqlite3_result_int(context, 42);
     }
 
     #[test]

@@ -2231,7 +2231,7 @@ pub unsafe extern "C" fn sqlite3_column_name(
         return std::ptr::null();
     };
 
-    let binding = stmt.stmt.get_column_name(idx as usize).into_owned();
+    let binding = stmt.stmt.get_column_name(idx).into_owned();
     let val = binding.as_str();
 
     if val.is_empty() {
@@ -3257,7 +3257,11 @@ unsafe extern "C" fn agg_step(
         argc,
         arg_ptrs.as_mut_ptr(),
     );
-    // Aggregate step produces no value; state lives in the AggCtx.
+    if sctx.result.value_type() == turso_ext::ValueType::Error {
+        agg_finalize(context, ctx).__free_internal_type();
+        return sctx.result;
+    }
+    sctx.result.__free_internal_type();
     ExtValue::null()
 }
 
