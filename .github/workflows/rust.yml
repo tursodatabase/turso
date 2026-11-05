@@ -793,6 +793,22 @@ jobs:
           - name: multiprocess-kill (4/4)
             iterations: 2
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          # Swarm testing: each iteration picks its workloads, connection
+          # count and fault probabilities from its seed. The log shows the
+          # picked settings, and the same seed repeats the run. Pull requests
+          # use the seeds 1 to `iterations`, which pass on main, so a failure
+          # on a pull request comes from its change. All other runs (pushes
+          # to main and manual runs) use random seeds to try new settings.
+          # There, a failure is a bug to investigate, and it does not block
+          # an unrelated pull request.
+          - name: in-process-swarm
+            iterations: 100
+            args: "--mode fast --swarm"
+            swarm: true
+          - name: in-process-mvcc-swarm
+            iterations: 50
+            args: "--mode fast --enable-mvcc --swarm"
+            swarm: true
     steps:
       - uses: actions/checkout@v4
       - name: Download turso_whopper
@@ -805,6 +821,8 @@ jobs:
       - name: Run turso_whopper (${{ matrix.toolchain }}, ${{ matrix.profile.name }})
         env:
           WHOPPER_ARGS: ${{ matrix.profile.args }}
+          FIXED_SEEDS: ${{ github.event_name == 'pull_request' && matrix.profile.swarm || false }}
+          REPRO_CARGO: ${{ matrix.toolchain == 'nightly' && 'RUSTFLAGS="--cfg nightly" cargo +nightly-2025-12-17' || 'cargo' }}
         run: |
           # A single whopper run drives its connections serially (one blocking
           # step at a time), so it only keeps about one core busy. Run
@@ -813,11 +831,16 @@ jobs:
           seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
             i="$1"
             log="whopper-run-$i.log"
+            if [ "$FIXED_SEEDS" = true ]; then
+              export SEED="$i"
+            fi
             if ./target/release/turso_whopper $WHOPPER_ARGS >"$log" 2>&1; then
               echo "iteration $i ok: $(grep -m1 "^seed = " "$log")"
             else
-              echo "iteration $i FAILED ($(grep -m1 "^seed = " "$log")):"
+              seed=$(grep -m1 "^seed = " "$log" | cut -d" " -f3)
+              echo "iteration $i FAILED (seed = $seed):"
               cat "$log"
+              echo "Reproduce with: SEED=$seed $REPRO_CARGO run --release -p turso_whopper -- $WHOPPER_ARGS"
               exit 255
             fi
           ' _

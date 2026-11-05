@@ -40,6 +40,12 @@ To repeat a run, use the same seed and the same flags:
 SEED=14 cargo run --release -p turso_whopper -- --mode fast --swarm
 ```
 
+CI runs in-process swarm profiles for WAL and MVCC on stable and nightly Rust.
+On pull requests, iteration N uses seed N, so each pull request tests the same settings.
+On pushes to main, each iteration uses a new random seed.
+If an iteration fails, the log ends with the command that repeats the run.
+CI does not run swarm profiles in multiprocess mode, because some of these runs take about one hour.
+
 ## FTS in WAL and MVCC
 
 These profiles test full-text search (FTS) in WAL and MVCC.
