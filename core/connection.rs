@@ -577,6 +577,13 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// How many unfinished statements have opened a transaction with a
+    /// `Transaction` instruction, that is, read or write a database file.
+    /// SQLite's `db->nVdbeRead`.
+    pub(crate) n_active_read_statements: AtomicI32,
+    /// How many of `n_active_read_statements` free a b-tree
+    /// (`PreparedProgram::destroys_btree`), as DROP TABLE and DROP INDEX do.
+    pub(crate) n_active_destroy_statements: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection

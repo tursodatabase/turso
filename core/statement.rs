@@ -459,6 +459,7 @@ impl Statement {
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
+            self.state.stop_counting_as_reader(conn);
             let previous = self
                 .program
                 .connection
@@ -738,6 +739,7 @@ impl Statement {
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
                 }
+                self.state.stop_counting_as_reader(&self.program.connection);
                 self.state.reset(None, None);
             }
         }
@@ -1649,6 +1651,7 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted(statement_failed);
         }
+        self.state.stop_counting_as_reader(&self.program.connection);
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
