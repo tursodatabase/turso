@@ -509,6 +509,49 @@ expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared
 }
 
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-join-on {
+    CREATE TABLE n(a inet) STRICT;
+    CREATE TABLE m(x int) STRICT;
+    INSERT INTO n VALUES ('::1');
+    INSERT INTO m VALUES (1);
+    SELECT count(*) FROM n JOIN m ON ARRAY['0:0:0:0:0:0:0:1'] @> n.a;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-overlap-in-having {
+    CREATE TABLE m(x int) STRICT;
+    INSERT INTO m VALUES (1);
+    SELECT count(*) FROM m GROUP BY x HAVING ARRAY['0:0:0:0:0:0:0:1'] && ARRAY[CAST('::1' AS inet)];
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-partial-index-where {
+    CREATE TABLE n(id int, a inet) STRICT;
+    CREATE INDEX i ON n(id) WHERE ARRAY['0:0:0:0:0:0:0:1'] @> a;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test no-comparison-array-contains-in-trigger-body-where {
+    CREATE TABLE n(id int, a inet) STRICT;
+    CREATE TABLE log(x int) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON n BEGIN DELETE FROM log WHERE ARRAY['0:0:0:0:0:0:0:1'] @> NEW.a; END;
+    INSERT INTO n VALUES (1, '::1');
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
 # A column DEFAULT, UPSERT's DO UPDATE and a trigger's WHEN are compiled
 # without being bound with their column types, so code generation refuses
 # them. PostgreSQL gives 1 or true for each of these.
