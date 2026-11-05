@@ -1672,10 +1672,15 @@ fn resolve_upserts(
     for (position, (_, label, upsert)) in upsert_actions.iter_mut().enumerate() {
         // Like SQLite, only compile an action that some constraint check can
         // jump to, so its SET clause and UPDATE triggers are never resolved
-        // when the INSERT cannot conflict.
-        let reachable = constraints.constraints_to_check.iter().any(|(_, handler)| {
-            handler.or(constraints.upsert_catch_all_position) == Some(position)
-        });
+        // when the INSERT cannot conflict. A non-unique index never conflicts.
+        let reachable = constraints
+            .constraints_to_check
+            .iter()
+            .any(|(target, handler)| {
+                let can_conflict =
+                    !matches!(target, ResolvedUpsertTarget::Index(index) if !index.unique);
+                can_conflict && handler.or(constraints.upsert_catch_all_position) == Some(position)
+            });
         if !reachable {
             continue;
         }
