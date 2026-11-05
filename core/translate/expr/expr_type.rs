@@ -979,19 +979,14 @@ fn binary_type(
 /// another type whose values can't be compared, such as inet, the result keeps
 /// that type, so comparing it is refused too. An operand whose type isn't
 /// known yet gives a result whose type isn't known yet, typed again once it
-/// is. An operand whose type doesn't resolve gives that type, so that
-/// comparing the result reports why.
+/// is.
 fn json_extract_type(operand: ExprType, schema: &Schema) -> ExprType {
     match &operand {
         ExprType::NotKnownYet => ExprType::NotKnownYet,
         ExprType::Unknown => ExprType::Unknown,
         ExprType::Custom { type_def, .. } => match schema.resolve_type_unchecked(&type_def.name) {
             Ok(Some(resolved)) => {
-                let is_json = resolved
-                    .chain
-                    .iter()
-                    .any(|td| td.is_builtin && matches!(td.name.as_str(), "json" | "jsonb"));
-                if !is_json {
+                if !resolved.chain.iter().any(|td| td.is_builtin_json()) {
                     return text_unless_no_comparison(operand, schema);
                 }
                 match schema.get_type_def_unchecked("json") {
@@ -1004,7 +999,8 @@ fn json_extract_type(operand: ExprType, schema: &Schema) -> ExprType {
                     ),
                 }
             }
-            Ok(None) | Err(_) => operand,
+            Ok(None) => unreachable!("type {}: {EXPR_TYPE_RESOLVES}", type_def.name),
+            Err(err) => unreachable!("{err}: {EXPR_TYPE_RESOLVES}"),
         },
         ExprType::Array { .. } => text_unless_no_comparison(operand, schema),
         ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::RowValue => {
@@ -1014,12 +1010,12 @@ fn json_extract_type(operand: ExprType, schema: &Schema) -> ExprType {
 }
 
 /// The type of `operand -> key` for an operand that isn't json: text, unless
-/// values of the operand's type can't be compared or its type doesn't resolve.
-/// Then the result keeps that type, so comparing it is refused.
+/// values of the operand's type can't be compared. Then the result keeps that
+/// type, so comparing it is refused.
 fn text_unless_no_comparison(operand: ExprType, schema: &Schema) -> ExprType {
-    match type_without_comparison(&operand, schema) {
-        Ok(None) => ExprType::Builtin(BuiltinType::Text),
-        Ok(Some(_)) | Err(_) => operand,
+    match expr_type_without_comparison(&operand, schema) {
+        None => ExprType::Builtin(BuiltinType::Text),
+        Some(_) => operand,
     }
 }
 
@@ -1424,10 +1420,9 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // A type whose values cannot be compared stays that type when mixed with
         // any other one, even one nothing declares, so that comparing the result
         // is refused instead of comparing stored text: coalesce(inet_column,
-        // cidr_column) is an inet, as in PostgreSQL. A type that doesn't
-        // resolve stays too, so that comparing the result reports why.
-        (a, _) if !matches!(type_without_comparison(&a, schema), Ok(None)) => a,
-        (_, b) if !matches!(type_without_comparison(&b, schema), Ok(None)) => b,
+        // cidr_column) is an inet, as in PostgreSQL.
+        (a, _) if expr_type_without_comparison(&a, schema).is_some() => a,
+        (_, b) if expr_type_without_comparison(&b, schema).is_some() => b,
         (ExprType::Unknown | ExprType::RowValue, _)
         | (_, ExprType::Unknown | ExprType::RowValue) => ExprType::Unknown,
         (ExprType::NotKnownYet, _) | (_, ExprType::NotKnownYet) => ExprType::NotKnownYet,
@@ -1502,6 +1497,25 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         _ => ExprType::Builtin(BuiltinType::Any),
     }
 }
+
+/// [type_without_comparison] for the type of an expression typed with
+/// `schema`. See [EXPR_TYPE_RESOLVES] for why it doesn't fail.
+fn expr_type_without_comparison<'a>(ty: &'a ExprType, schema: &Schema) -> Option<&'a Arc<TypeDef>> {
+    match type_without_comparison(ty, schema) {
+        Ok(type_def) => type_def,
+        Err(err) => unreachable!("{err}: {EXPR_TYPE_RESOLVES}"),
+    }
+}
+
+/// Why the custom type of an expression always resolves in the schema the
+/// expression is typed with. It was looked up in that schema, so it is
+/// registered there. Following its base types fails only on a circular
+/// chain, which nothing creates: CREATE DOMAIN refuses a base type that
+/// does not exist yet and DROP TYPE a type another type is based on
+/// (translate_create_domain and translate_drop_type in translate/schema.rs),
+/// and loading the schema refuses stored types that are based on each other
+/// (Schema::update_value_types).
+const EXPR_TYPE_RESOLVES: &str = "the type of an expression comes from the schema it is typed with, and CREATE DOMAIN, DROP TYPE and loading the schema refuse a circular chain of base types";
 
 fn lacks_exact_numbers(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if !type_def.computes_with_exact_numbers())

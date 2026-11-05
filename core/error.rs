@@ -31,6 +31,18 @@ impl ConstraintKind {
     }
 }
 
+/// What a statement did with values whose type can't be compared, such as
+/// json or inet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoComparisonKind {
+    /// Compared, sorted or grouped them: `j = '{}'`, `ORDER BY j`.
+    Compare,
+    /// Made a key of a column of the type: `j json UNIQUE`, an index on `j`.
+    Key,
+    /// Made an array of the type: `json[]`, `ARRAY[j]`.
+    Array,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConstraintViolation {
     pub kind: ConstraintKind,
@@ -92,6 +104,14 @@ pub enum LimboError {
     SequenceExhausted { name: String, ascending: bool },
     #[error("{0}")]
     ParseError(String),
+    /// A statement or a stored schema uses values whose type can't be
+    /// compared in a way that compares them. `message` may start with where
+    /// the error is, such as the table whose schema is loading.
+    #[error("{message}")]
+    NoComparison {
+        kind: NoComparisonKind,
+        message: String,
+    },
     /// Boxed: the parser error is ~96 bytes inline and would dominate
     /// `LimboError`'s size, which rides in every hot-path `Result`.
     #[error(transparent)]
@@ -285,6 +305,20 @@ impl LimboError {
             _ => return self.sqlite_result_code(),
         };
         code as i32
+    }
+
+    /// This error with `context` in front of its message, as in `cannot load
+    /// table 't': values of type json cannot be compared`. A
+    /// [LimboError::NoComparison] stays one, so that its kind is not lost;
+    /// any other error becomes a parse error.
+    pub(crate) fn within(self, context: &str) -> LimboError {
+        match self {
+            Self::NoComparison { kind, message } => Self::NoComparison {
+                kind,
+                message: format!("{context}: {message}"),
+            },
+            other => Self::ParseError(format!("{context}: {other}")),
+        }
     }
 }
 

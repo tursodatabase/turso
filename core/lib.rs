@@ -144,6 +144,7 @@ pub use dialect::Dialect;
 pub(crate) use dialect::EngineDialect;
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
+    NoComparisonKind,
 };
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
@@ -176,7 +177,6 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
-pub use translate::collate::NoComparisonError;
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
