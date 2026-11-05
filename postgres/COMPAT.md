@@ -141,7 +141,9 @@ fails undoes its own changes.
 ## Data Types, Functions, & Operators
 
 Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
-`INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
+`INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
+`<table>_<column>_seq`, or, when a relation of the schema has that name,
+the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
 smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,

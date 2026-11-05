@@ -1,4 +1,5 @@
 mod catalog;
+mod classes;
 mod copy;
 mod dialect;
 mod domain;
