@@ -1,4 +1,4 @@
-use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
@@ -93,7 +93,8 @@ pub(crate) use affinity::{
     StorageClassMask,
 };
 pub(crate) use arrays::{
-    emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
+    emit_array_decode, emit_array_leaf_loop, emit_custom_type_decode_columns,
+    emit_custom_type_encode_columns, ArrayInput,
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
 pub(crate) use binding::check_custom_types;

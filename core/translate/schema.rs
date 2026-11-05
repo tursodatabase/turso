@@ -740,73 +740,7 @@ fn validate(
         let is_strict = options.contains_strict();
 
         for c in columns {
-            if let Some(ref col_type) = c.col_type {
-                let type_name = &column_declared_type(&col_type.name);
-                let is_builtin = is_builtin_strict_type(&col_type.name);
-
-                // Array columns require STRICT tables because the encode/decode
-                // pipeline is only emitted for STRICT tables.
-                if col_type.is_array() && !is_strict {
-                    bail_parse_error!(
-                        "array type columns require STRICT tables: {}.{}",
-                        table_name,
-                        c.col_name
-                    );
-                }
-                if col_type.is_array() {
-                    resolver.schema().check_array_element_type(type_name)?;
-                }
-
-                // Domain types require STRICT tables because domain constraints
-                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
-                if !is_builtin && !is_strict {
-                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
-                    if let Some(td) = type_def {
-                        if td.is_domain {
-                            bail_parse_error!(
-                                "domain type columns require STRICT tables: {}.{}",
-                                table_name,
-                                c.col_name
-                            );
-                        }
-                    }
-                }
-
-                if !is_builtin && is_strict {
-                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
-                    {
-                        match type_def {
-                            None => {
-                                bail_parse_error!(
-                                    "unknown datatype for {}.{}: \"{}\"",
-                                    table_name,
-                                    c.col_name,
-                                    type_name
-                                );
-                            }
-                            Some(td) if td.user_params().next().is_some() => {
-                                // Parametric type: verify the column provides the right
-                                // number of user parameters (excluding `value`).
-                                let provided = match &col_type.size {
-                                    Some(ast::TypeSize::TypeSize(_, _)) => 2,
-                                    Some(ast::TypeSize::MaxSize(_)) => 1,
-                                    None => 0,
-                                };
-                                let expected = td.user_params().count();
-                                if provided != expected {
-                                    bail_parse_error!(
-                                        "type \"{}\" requires {} parameter(s), got {}",
-                                        type_name,
-                                        expected,
-                                        provided
-                                    );
-                                }
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                }
-            }
+            check_column_type(c, table_name, is_strict, resolver.schema())?;
         }
 
         // In STRICT tables, validate that CHECK constraint comparisons have
@@ -866,6 +800,80 @@ fn validate(
             table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
+    }
+    Ok(())
+}
+
+/// Refuses a column type that a table cannot have. CREATE TABLE, ADD COLUMN
+/// and ALTER COLUMN all call this, so ALTER cannot give a column a type that
+/// CREATE TABLE refuses.
+pub(crate) fn check_column_type(
+    column: &ast::ColumnDefinition,
+    table_name: &str,
+    is_strict: bool,
+    schema: &Schema,
+) -> Result<()> {
+    let Some(col_type) = &column.col_type else {
+        if is_strict {
+            bail_parse_error!("missing datatype for {}.{}", table_name, column.col_name);
+        }
+        return Ok(());
+    };
+    let type_name = &column_declared_type(&col_type.name);
+    let is_builtin = is_builtin_strict_type(&col_type.name);
+
+    if col_type.is_array() {
+        // Arrays are encoded and decoded only in STRICT tables.
+        if !is_strict {
+            bail_parse_error!(
+                "array type columns require STRICT tables: {}.{}",
+                table_name,
+                column.col_name
+            );
+        }
+        schema.check_array_element_type(type_name)?;
+    }
+    if is_builtin {
+        return Ok(());
+    }
+
+    let type_def = schema.get_type_def_unchecked(type_name);
+    if !is_strict {
+        // Domain constraints (CHECK, NOT NULL, DEFAULT) are enforced only in
+        // STRICT tables. Any other name is a plain declared type with an affinity.
+        if type_def.is_some_and(|td| td.is_domain) {
+            bail_parse_error!(
+                "domain type columns require STRICT tables: {}.{}",
+                table_name,
+                column.col_name
+            );
+        }
+        return Ok(());
+    }
+    let Some(td) = type_def else {
+        bail_parse_error!(
+            "unknown datatype for {}.{}: \"{}\"",
+            table_name,
+            column.col_name,
+            type_name
+        );
+    };
+    // A type with parameters besides `value` needs each one given, as in `p(10)`.
+    let expected = td.user_params().count();
+    if expected > 0 {
+        let provided = match &col_type.size {
+            Some(ast::TypeSize::TypeSize(_, _)) => 2,
+            Some(ast::TypeSize::MaxSize(_)) => 1,
+            None => 0,
+        };
+        if provided != expected {
+            bail_parse_error!(
+                "type \"{}\" requires {} parameter(s), got {}",
+                type_name,
+                expected,
+                provided
+            );
+        }
     }
     Ok(())
 }

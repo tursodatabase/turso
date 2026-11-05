@@ -131,6 +131,9 @@ pub fn emit_stored_column(
     resolver: &Resolver,
 ) -> Result<()> {
     let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
+    // A row written before ADD COLUMN reads the column's default, which must be
+    // turned into what the column stores: an array is stored as a record blob,
+    // and a custom type stores what its ENCODE and COERCE return.
     let encoded_default = match table.as_ref() {
         Some(table) => {
             let column = &table.columns()[column_index];
@@ -139,6 +142,9 @@ pub fn emit_stored_column(
                 .resolve_type(&column.ty_str, table.is_strict)?;
             match (column.default.as_ref(), custom_type) {
                 (Some(default_expr), Some(_)) => Some((table, column, default_expr)),
+                (Some(default_expr), None) if column.is_array() => {
+                    Some((table, column, default_expr))
+                }
                 // A plain column's default is stored as written; without a
                 // DEFAULT, a row written before ADD COLUMN reads NULL.
                 (Some(_), None) | (None, _) => None,

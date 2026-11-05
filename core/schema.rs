@@ -495,9 +495,17 @@ impl ResolvedType {
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
-        self.chain.iter().all(|td| {
-            matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
-        })
+        self.chain
+            .iter()
+            .all(|td| matches!(td.kind, TypeDefKind::Custom { .. }))
+            && self.decode_returns_value_unchanged()
+    }
+
+    /// Whether every type in the chain has no DECODE, or `DECODE value`.
+    pub fn decode_returns_value_unchanged(&self) -> bool {
+        self.chain
+            .iter()
+            .all(|td| td.decode_returns_value_unchanged())
     }
 
     /// Find the first DEFAULT expression in the type chain (child first, then ancestors).
@@ -8232,9 +8240,21 @@ impl Column {
     /// Whether an index on this column is ordered differently from how its
     /// values compare. A custom type without an ordering is indexed by its
     /// stored form, which does not sort like the values the column reads as,
-    /// so such an index can serve `=` but not a range or ORDER BY.
+    /// so such an index can serve `=` but not a range or ORDER BY. An array
+    /// holds the values of its elements and is indexed by their stored forms,
+    /// so it follows its element type.
     pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
-        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
+        let ordering = if self.is_array() {
+            match schema.resolve_type(&self.ty_str, is_strict) {
+                Ok(resolved) => resolved.and_then(|resolved| resolved.ordering()),
+                // Resolving fails only for a circular type chain or when out of
+                // memory. Answer "differs", so the index serves only `=`.
+                Err(_) => return true,
+            }
+        } else {
+            self.type_ordering
+        };
+        ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
     }
     /// Fill in what a column of a STRICT table gets from its custom type: the
     /// type, affinity and key order of the type it is stored as. Every path
