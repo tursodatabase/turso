@@ -161,6 +161,23 @@ expect {
     cherry
 }
 
+# An array of rev sorts by its elements' values too. Stored, the elements are
+# ananab (1) < elppa (2) < yrrehc (3); read back, apple (2) < banana (1) < cherry (3).
+@requires strict "uses STRICT tables"
+test order-by-array-sorts-by-element-value {
+    CREATE TYPE reva BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TABLE t_reva(id INTEGER PRIMARY KEY, a reva[]) STRICT;
+    INSERT INTO t_reva VALUES (1, ARRAY['banana']), (2, ARRAY['apple']), (3, ARRAY['cherry']);
+    SELECT group_concat(id) FROM (SELECT id FROM t_reva ORDER BY a);
+    SELECT group_concat(id) FROM (SELECT id FROM t_reva ORDER BY a DESC);
+    SELECT a[1] FROM t_reva ORDER BY a LIMIT 1;
+}
+expect {
+    2,1,3
+    3,1,2
+    apple
+}
+
 @requires strict "uses STRICT tables"
 test order-by-sorts-by-value-non-monotonic-desc {
     CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);

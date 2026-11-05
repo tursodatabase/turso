@@ -3022,11 +3022,7 @@ mod tests {
 
             // A key on an array follows the element type's key rule: when an
             // index on the element type is accepted, so is one on the array,
-            // and when it is refused because the type's DECODE can read
-            // different stored values back as the same value, so is the array.
-            // An index on a type with no OPERATOR '<' is refused before that
-            // check runs, and one on an array of it, such as cidr[], is accepted
-            // because of a bug that is also on main.
+            // and when it is refused, so is the one on the array.
             let element_index = conn.execute("CREATE INDEX tw ON t(w)");
             let array_index = conn.execute("CREATE INDEX ta ON t(a)");
             let refused_with = |result: &turso_core::Result<()>, message: &str| matches!(result, Err(e) if e.to_string().contains(message));
@@ -3034,10 +3030,9 @@ mod tests {
                 format!("{ty}: index on {ty}: {element_index:?}, on {ty}[]: {array_index:?}");
             if element_index.is_ok() {
                 assert!(array_index.is_ok(), "{indexes}");
-            } else if refused_with(&element_index, "cannot be a key") {
-                assert!(refused_with(&array_index, "cannot be a key"), "{indexes}");
             } else {
-                assert!(refused_with(&element_index, "OPERATOR '<'"), "{indexes}");
+                assert!(refused_with(&element_index, "cannot be a key"), "{indexes}");
+                assert!(refused_with(&array_index, "cannot be a key"), "{indexes}");
             }
             if element_index.is_ok() {
                 all_true("SELECT count(*) FROM t WHERE w = (SELECT w FROM t)", 1);
