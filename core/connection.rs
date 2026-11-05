@@ -4515,8 +4515,19 @@ impl Connection {
         callback: crate::ContextCollationFunction,
         context_destructor: Option<crate::ContextDestructor>,
     ) {
+        drop(self.replace_external_collation(name, context, callback, context_destructor));
+    }
+
+    /// Registers a collation and returns its previous owner for destruction after caller locks are released.
+    pub fn replace_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: crate::ContextCollationFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+    ) -> Option<Arc<function::ExternalCollation>> {
         let normalized_name = crate::util::normalize_ident(&name);
-        self.syms.write().collations.insert(
+        let previous = self.syms.write().collations.insert(
             normalized_name.clone(),
             function::ExternalCollation::new(
                 normalized_name,
@@ -4526,18 +4537,27 @@ impl Connection {
             ),
         );
         self.bump_prepare_context_generation();
+        previous
     }
 
     pub fn unregister_external_collation(&self, name: &str) {
-        if self
+        drop(self.remove_external_collation(name));
+    }
+
+    /// Removes a collation and returns its owner for destruction after caller locks are released.
+    pub fn remove_external_collation(
+        &self,
+        name: &str,
+    ) -> Option<Arc<function::ExternalCollation>> {
+        let previous = self
             .syms
             .write()
             .collations
-            .remove(&crate::util::normalize_ident(name))
-            .is_some()
-        {
+            .remove(&crate::util::normalize_ident(name));
+        if previous.is_some() {
             self.bump_prepare_context_generation();
         }
+        previous
     }
 
     /// The custom collations registered on this connection. A program keeps

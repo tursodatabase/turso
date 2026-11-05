@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+use std::collections::HashMap;
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -203,6 +204,7 @@ struct sqlite3Inner {
     pub(crate) p_err: Option<CString>,
     pub(crate) filename: CString,
     pub(crate) stmt_list: *mut sqlite3_stmt,
+    inactive_collations: HashMap<String, InactiveCollation>,
     /// Set when the caller opened "" and we created a private on-disk
     /// database for it; the file is removed when the handle goes away.
     pub(crate) temp_path: Option<std::path::PathBuf>,
@@ -249,6 +251,7 @@ impl sqlite3 {
             p_err: None,
             filename,
             stmt_list: std::ptr::null_mut(),
+            inactive_collations: HashMap::new(),
             temp_path: None,
         };
         Self {
@@ -706,6 +709,7 @@ unsafe fn failed_open(db_out: *mut *mut sqlite3, code: i32, message: &str) -> i3
         p_err: None,
         filename: CString::default(),
         stmt_list: std::ptr::null_mut(),
+        inactive_collations: HashMap::new(),
         temp_path: None,
     };
     set_db_err_msg(&mut inner, code, message);
@@ -728,8 +732,9 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
-    {
-        let mut inner = (*db).inner.lock().unwrap();
+    let handle = sqlite3::clone_from_raw(db);
+    let inactive = {
+        let mut inner = handle.inner.lock().unwrap();
         if inner.e_open_state == SQLITE_STATE_ZOMBIE {
             return SQLITE_MISUSE;
         }
@@ -741,7 +746,10 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
             );
             return SQLITE_BUSY;
         }
-    }
+        inner.e_open_state = SQLITE_STATE_ZOMBIE;
+        std::mem::take(&mut inner.inactive_collations)
+    };
+    drop(inactive);
     drop(Arc::from_raw(db));
     SQLITE_OK
 }
@@ -752,15 +760,20 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
-    {
-        let mut inner = (*db).inner.lock().unwrap();
+    let handle = sqlite3::clone_from_raw(db);
+    let inactive = {
+        let mut inner = handle.inner.lock().unwrap();
         if inner.e_open_state == SQLITE_STATE_ZOMBIE {
             return SQLITE_MISUSE;
         }
-        if !inner.stmt_list.is_null() {
-            inner.e_open_state = SQLITE_STATE_ZOMBIE;
+        inner.e_open_state = SQLITE_STATE_ZOMBIE;
+        if inner.stmt_list.is_null() {
+            std::mem::take(&mut inner.inactive_collations)
+        } else {
+            HashMap::new()
         }
-    }
+    };
+    drop(inactive);
     drop(Arc::from_raw(db));
     SQLITE_OK
 }
@@ -1125,6 +1138,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
         return SQLITE_MISUSE;
     }
     let stmt_ref = &mut *stmt;
+    let handle = stmt_ref.db.clone();
 
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
@@ -1155,7 +1169,16 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
         }
     }
     stmt_ref.clear_text_cache();
-    let _ = Box::from_raw(stmt);
+    drop(Box::from_raw(stmt));
+    let inactive = {
+        let mut inner = handle.inner.lock().unwrap();
+        if inner.e_open_state == SQLITE_STATE_ZOMBIE && inner.stmt_list.is_null() {
+            std::mem::take(&mut inner.inactive_collations)
+        } else {
+            HashMap::new()
+        }
+    };
+    drop(inactive);
     result
 }
 
@@ -3106,6 +3129,19 @@ unsafe extern "C" fn collation_ctx_destructor(context: usize) {
     }
 }
 
+struct InactiveCollation {
+    context: *mut ffi::c_void,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+}
+
+impl Drop for InactiveCollation {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.destroy {
+            unsafe { destroy(self.context) };
+        }
+    }
+}
+
 /// Registers a user collation. A NULL comparator unregisters the name, as in
 /// SQLite. `enc` is accepted and ignored: turso_core is UTF-8 only.
 #[no_mangle]
@@ -3120,27 +3156,27 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     if db.is_null() || name.is_null() {
         return SQLITE_MISUSE;
     }
-    let db: &sqlite3 = &*db;
-    let inner = match db.inner.lock() {
+    let handle = sqlite3::clone_from_raw(db);
+    let mut inner = match handle.inner.lock() {
         Ok(guard) => guard,
         Err(_) => return SQLITE_MISUSE,
     };
-    let Some(conn) = inner.connection() else {
+    let Some(conn) = inner.connection().cloned() else {
         return SQLITE_MISUSE;
     };
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return SQLITE_MISUSE,
     };
-
-    match cmp {
+    let key = name.to_ascii_lowercase();
+    // Keep the two registries consistent before allowing destructor reentry.
+    let previous_inactive = inner.inactive_collations.remove(&key);
+    let previous_active = match cmp {
         None => {
-            conn.unregister_external_collation(&name);
-            // A destructor supplied with a NULL comparator still owns the
-            // application data.
-            if let Some(destroy) = destroy {
-                destroy(context);
-            }
+            inner
+                .inactive_collations
+                .insert(key, InactiveCollation { context, destroy });
+            conn.remove_external_collation(&name)
         }
         Some(cmp) => {
             let bridge = Box::into_raw(Box::new(CollationBridge {
@@ -3148,14 +3184,17 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
                 p_app: context,
                 destroy,
             }));
-            conn.register_external_collation(
+            conn.replace_external_collation(
                 name,
                 bridge as usize,
                 collation_trampoline,
                 Some(collation_ctx_destructor),
-            );
+            )
         }
-    }
+    };
+    drop(inner);
+    drop(previous_active);
+    drop(previous_inactive);
     SQLITE_OK
 }
 

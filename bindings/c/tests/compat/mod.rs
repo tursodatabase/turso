@@ -61,6 +61,22 @@ extern "C" {
             ) -> i32,
         >,
     ) -> i32;
+    fn sqlite3_create_collation_v2(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        enc: i32,
+        context: *mut libc::c_void,
+        compare: Option<
+            unsafe extern "C" fn(
+                *mut libc::c_void,
+                i32,
+                *const libc::c_void,
+                i32,
+                *const libc::c_void,
+            ) -> i32,
+        >,
+        destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    ) -> i32;
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
     fn sqlite3_close(db: *mut sqlite3) -> i32;
@@ -828,6 +844,349 @@ mod tests {
             assert!(calls > 0);
             assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn count_collation_destroy(context: *mut libc::c_void) {
+        *(context as *mut i32) += 1;
+    }
+
+    #[test]
+    fn null_collation_owner_survives_until_close() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_collation_v2(
+                    db,
+                    c"inactive".as_ptr(),
+                    SQLITE_UTF8,
+                    (&mut calls as *mut i32).cast(),
+                    None,
+                    Some(count_collation_destroy)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(calls, 0, "registration must retain the new owner");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    struct CollationOwnerProbe {
+        db: *mut sqlite3,
+        calls: i32,
+        reenter: bool,
+        closing: bool,
+    }
+
+    unsafe extern "C" fn probe_collation_destroy(context: *mut libc::c_void) {
+        let probe = &mut *context.cast::<CollationOwnerProbe>();
+        probe.calls += 1;
+        if probe.reenter {
+            assert_eq!(sqlite3_changes(probe.db), 0);
+            if probe.closing && !cfg!(feature = "sqlite3") {
+                let mut rejected = 0_i32;
+                assert_eq!(
+                    sqlite3_create_collation_v2(
+                        probe.db,
+                        c"rejected".as_ptr(),
+                        SQLITE_UTF8,
+                        (&mut rejected as *mut i32).cast(),
+                        None,
+                        Some(count_collation_destroy)
+                    ),
+                    SQLITE_MISUSE
+                );
+                assert_eq!(rejected, 0);
+            }
+        }
+    }
+
+    unsafe fn register_inactive(probe: &mut CollationOwnerProbe, name: &std::ffi::CStr) {
+        assert_eq!(
+            sqlite3_create_collation_v2(
+                probe.db,
+                name.as_ptr(),
+                SQLITE_UTF8,
+                (probe as *mut CollationOwnerProbe).cast(),
+                None,
+                Some(probe_collation_destroy)
+            ),
+            SQLITE_OK
+        );
+    }
+
+    #[test]
+    fn null_collation_deferred_close_retains_owner() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut probe = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: false,
+                closing: false,
+            };
+            register_inactive(&mut probe, c"inactive");
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_BUSY);
+            assert_eq!(probe.calls, 0);
+            assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+            assert_eq!(probe.calls, 0);
+            #[cfg(not(feature = "sqlite3"))]
+            {
+                let mut rejected = 0_i32;
+                assert_eq!(
+                    sqlite3_create_collation_v2(
+                        db,
+                        c"inactive".as_ptr(),
+                        SQLITE_UTF8,
+                        (&mut rejected as *mut i32).cast(),
+                        None,
+                        Some(count_collation_destroy)
+                    ),
+                    SQLITE_MISUSE
+                );
+                assert_eq!(rejected, 0);
+            }
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(probe.calls, 1);
+        }
+    }
+
+    #[test]
+    fn null_collation_replacement_releases_each_owner() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut first = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: false,
+                closing: false,
+            };
+            let mut second = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: false,
+                closing: false,
+            };
+            register_inactive(&mut first, c"INACTIVE");
+            register_inactive(&mut second, c"inactive");
+            // SQLite overwrites an already-NULL owner's destructor without calling it.
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(first.calls, 1);
+            #[cfg(feature = "sqlite3")]
+            assert_eq!(first.calls, 0);
+            assert_eq!(second.calls, 0);
+            assert_eq!(
+                sqlite3_create_collation(
+                    db,
+                    c"InAcTiVe".as_ptr(),
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(compare_collation_probe)
+                ),
+                SQLITE_OK
+            );
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(second.calls, 1);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT 'a' COLLATE inactive < 'b'".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_create_collation(
+                    db,
+                    c"inactive".as_ptr(),
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT 'a' COLLATE inactive < 'b'".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_ERROR
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn compare_collation_probe(
+        _: *mut libc::c_void,
+        _: i32,
+        _: *const libc::c_void,
+        _: i32,
+        _: *const libc::c_void,
+    ) -> i32 {
+        -1
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn rejected_collation_registration_keeps_caller_owner() {
+        unsafe {
+            let mut calls = 0_i32;
+            assert_eq!(
+                sqlite3_create_collation_v2(
+                    ptr::null_mut(),
+                    c"inactive".as_ptr(),
+                    SQLITE_UTF8,
+                    (&mut calls as *mut i32).cast(),
+                    None,
+                    Some(count_collation_destroy)
+                ),
+                SQLITE_MISUSE
+            );
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(
+                sqlite3_create_collation_v2(
+                    db,
+                    ptr::null(),
+                    SQLITE_UTF8,
+                    (&mut calls as *mut i32).cast(),
+                    None,
+                    Some(count_collation_destroy)
+                ),
+                SQLITE_MISUSE
+            );
+            assert_eq!(calls, 0);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 0);
+        }
+    }
+
+    #[test]
+    fn null_collation_destructor_reentry_child() {
+        if std::env::var_os("TURSO_COLLATION_REENTRY_CHILD").is_none() {
+            return;
+        }
+        unsafe {
+            for mode in 0..5 {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+                let mut probe = CollationOwnerProbe {
+                    db,
+                    calls: 0,
+                    reenter: true,
+                    closing: mode != 3,
+                };
+                if mode == 4 {
+                    probe.closing = false;
+                    assert_eq!(
+                        sqlite3_create_collation_v2(
+                            db,
+                            c"inactive".as_ptr(),
+                            SQLITE_UTF8,
+                            (&mut probe as *mut CollationOwnerProbe).cast(),
+                            Some(compare_collation_probe),
+                            Some(probe_collation_destroy)
+                        ),
+                        SQLITE_OK
+                    );
+                    let mut removed_owner = 0_i32;
+                    assert_eq!(
+                        sqlite3_create_collation_v2(
+                            db,
+                            c"inactive".as_ptr(),
+                            SQLITE_UTF8,
+                            (&mut removed_owner as *mut i32).cast(),
+                            None,
+                            Some(count_collation_destroy)
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(probe.calls, 1);
+                    assert_eq!(removed_owner, 0);
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                    assert_eq!(removed_owner, 1);
+                    continue;
+                }
+                register_inactive(&mut probe, c"inactive");
+                assert_eq!(probe.calls, 0);
+                if mode == 2 {
+                    let mut stmt = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT 1".as_ptr(),
+                            -1,
+                            &mut stmt,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+                    assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                } else if mode == 3 {
+                    assert_eq!(
+                        sqlite3_create_collation(
+                            db,
+                            c"inactive".as_ptr(),
+                            SQLITE_UTF8,
+                            ptr::null_mut(),
+                            Some(compare_collation_probe)
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                } else if mode == 1 {
+                    assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+                } else {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+                #[cfg(not(feature = "sqlite3"))]
+                assert_eq!(probe.calls, 1);
+                #[cfg(feature = "sqlite3")]
+                assert_eq!(probe.calls, if mode == 3 { 0 } else { 1 });
+            }
+        }
+    }
+
+    #[test]
+    fn null_collation_destructor_reentry_is_bounded() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::null_collation_destructor_reentry_child",
+                "--nocapture",
+            ])
+            .env("TURSO_COLLATION_REENTRY_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("collation destructor reentry timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
