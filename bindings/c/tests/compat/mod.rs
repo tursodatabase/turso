@@ -33,6 +33,31 @@ struct sqlite3_stmt {
     link(name = "turso_sqlite3", kind = "raw-dylib")
 )]
 extern "C" {
+    fn sqlite3_create_function(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        n_args: i32,
+        enc: i32,
+        context: *mut libc::c_void,
+        func: Option<unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void)>,
+        step: Option<unsafe extern "C" fn()>,
+        final_: Option<unsafe extern "C" fn()>,
+    ) -> i32;
+    fn sqlite3_create_collation(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        enc: i32,
+        context: *mut libc::c_void,
+        compare: Option<
+            unsafe extern "C" fn(
+                *mut libc::c_void,
+                i32,
+                *const libc::c_void,
+                i32,
+                *const libc::c_void,
+            ) -> i32,
+        >,
+    ) -> i32;
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
     fn sqlite3_close(db: *mut sqlite3) -> i32;
@@ -195,6 +220,8 @@ extern "C" {
     fn sqlite3_context_db_handle(context: *mut libc::c_void) -> *mut libc::c_void;
 }
 
+const SQLITE_BUSY: i32 = 5;
+const SQLITE_CONSTRAINT: i32 = 19;
 const SQLITE_OK: i32 = 0;
 const SQLITE_ERROR: i32 = 1;
 const SQLITE_MISUSE: i32 = 21;
@@ -223,6 +250,253 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn turso_version_stays_the_engine_version_after_schema_creation() {
+        unsafe {
+            for filename in [c":memory:", c"turso-version-test.db"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = if filename == c":memory:" {
+                    std::ffi::CString::new(":memory:").unwrap()
+                } else {
+                    std::ffi::CString::new(temp.path().join("version.db").to_str().unwrap())
+                        .unwrap()
+                };
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+                for phase in 0..3 {
+                    if phase == 1 {
+                        assert_eq!(
+                            sqlite3_exec(
+                                db,
+                                c"CREATE TABLE example(id INTEGER)".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut()
+                            ),
+                            SQLITE_OK
+                        );
+                    } else if phase == 2 {
+                        assert_eq!(sqlite3_close(db), SQLITE_OK);
+                        assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+                    }
+                    let mut statement = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT turso_version()".as_ptr(),
+                            -1,
+                            &mut statement,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+                    let version = std::ffi::CStr::from_ptr(
+                        sqlite3_column_text(statement, 0) as *const libc::c_char
+                    );
+                    assert_eq!(
+                        version.to_str().unwrap(),
+                        env!("CARGO_PKG_VERSION"),
+                        "phase {phase}"
+                    );
+                    assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+                }
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_scalar_function_registration_executes_callback() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"legacy_answer".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(legacy_answer),
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT legacy_answer()".as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(statement, 0), 42);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn legacy_answer(
+        context: *mut libc::c_void,
+        _argc: i32,
+        _argv: *mut *mut libc::c_void,
+    ) {
+        sqlite3_result_int(context, 42);
+    }
+
+    #[test]
+    fn legacy_collation_registration_passes_context_to_callback() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_collation(
+                    db,
+                    c"legacy_reverse".as_ptr(),
+                    SQLITE_UTF8,
+                    &mut calls as *mut i32 as *mut libc::c_void,
+                    Some(legacy_reverse)
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT 'a' COLLATE legacy_reverse < 'b'".as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(statement, 0), 0);
+            assert!(calls > 0);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn legacy_reverse(
+        context: *mut libc::c_void,
+        left_len: i32,
+        left: *const libc::c_void,
+        right_len: i32,
+        right: *const libc::c_void,
+    ) -> i32 {
+        *(context as *mut i32) += 1;
+        let left = std::slice::from_raw_parts(left as *const u8, left_len as usize);
+        let right = std::slice::from_raw_parts(right as *const u8, right_len as usize);
+        match right.cmp(left) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    #[test]
+    fn exec_failure_updates_connection_error_state() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE example(id INTEGER PRIMARY KEY); INSERT INTO example VALUES(1)"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO example VALUES(1)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_CONSTRAINT
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT);
+            let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                .to_str()
+                .unwrap();
+            assert!(message.contains("UNIQUE"), "{message}");
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT 1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn mvcc_exec_conflict_sets_busy_error_on_connection() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path =
+                std::ffi::CString::new(dir.path().join("conflict.db").to_str().unwrap()).unwrap();
+            let mut first = ptr::null_mut();
+            let mut second = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut first), SQLITE_OK);
+            assert_eq!(sqlite3_exec(first, c"PRAGMA journal_mode=mvcc; CREATE TABLE example(id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO example VALUES(1,0)".as_ptr(), None, ptr::null_mut(), ptr::null_mut()), SQLITE_OK);
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut second), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    first,
+                    c"BEGIN CONCURRENT; UPDATE example SET value=1 WHERE id=1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    second,
+                    c"BEGIN CONCURRENT; UPDATE example SET value=2 WHERE id=1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_BUSY
+            );
+            assert_eq!(sqlite3_errcode(second), SQLITE_BUSY);
+            assert_eq!(
+                sqlite3_exec(
+                    first,
+                    c"COMMIT".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(second), SQLITE_OK);
+            assert_eq!(sqlite3_close(first), SQLITE_OK);
+        }
+    }
 
     #[test]
     fn test_libversion() {
