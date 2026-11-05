@@ -3313,8 +3313,8 @@ unsafe fn register_aggregate(
         Err(_) => return SQLITE_MISUSE,
     };
 
-    let db_ref = &*db;
-    let inner = db_ref.inner.lock().unwrap();
+    let handle = sqlite3::clone_from_raw(db);
+    let inner = handle.inner.lock().unwrap();
     let Some(conn) = inner.connection() else {
         return SQLITE_MISUSE;
     };
@@ -3343,7 +3343,8 @@ unsafe fn register_aggregate(
     conn._free_extension_ctx(api);
 
     if rc != turso_ext::ResultCode::OK {
-        drop(Box::from_raw(bridge));
+        drop(inner);
+        agg_ctx_destructor(bridge as usize);
         return SQLITE_ERROR;
     }
     SQLITE_OK
@@ -3364,8 +3365,9 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     if db.is_null() || name.is_null() {
         return SQLITE_MISUSE;
     }
+    let handle = sqlite3::clone_from_raw(db);
     {
-        let inner = (*db).inner.lock().unwrap();
+        let inner = handle.inner.lock().unwrap();
         let Some(conn) = inner.connection() else {
             drop(inner);
             if let Some(destroy) = _destroy {
@@ -3414,7 +3416,14 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
                 }
                 return SQLITE_OK;
             }
-            _ => return SQLITE_MISUSE,
+            _ => {
+                if let Some(destroy) = _destroy {
+                    let destroy: unsafe extern "C" fn(*mut ffi::c_void) =
+                        std::mem::transmute(destroy);
+                    destroy(context);
+                }
+                return SQLITE_MISUSE;
+            }
         },
     };
     // Cast the opaque fn() pointer to the real scalar callback signature.
@@ -3438,8 +3447,7 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
         destroy: destroy_fn,
     }));
 
-    let db_ref = &*db;
-    let inner = db_ref.inner.lock().unwrap();
+    let inner = handle.inner.lock().unwrap();
     let Some(conn) = inner.connection() else {
         return SQLITE_MISUSE;
     };
@@ -3457,7 +3465,8 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     conn._free_extension_ctx(api);
 
     if rc != turso_ext::ResultCode::OK {
-        drop(Box::from_raw(bridge));
+        drop(inner);
+        scalar_ctx_destructor(bridge as usize);
         return SQLITE_ERROR;
     }
 

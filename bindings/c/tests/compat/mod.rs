@@ -533,6 +533,163 @@ mod tests {
         }
     }
 
+    unsafe fn reject_aggregate_registration(
+        db: *mut sqlite3,
+        context: *mut libc::c_void,
+        destroy: unsafe extern "C" fn(*mut libc::c_void),
+    ) -> i32 {
+        sqlite3_create_function_v2(
+            db,
+            c"aggregate_rejected".as_ptr(),
+            -2,
+            SQLITE_UTF8,
+            context,
+            None,
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(signature_aggregate_step)),
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(signature_aggregate_final)),
+            Some(destroy),
+        )
+    }
+
+    unsafe fn reject_partial_aggregate(
+        db: *mut sqlite3,
+        context: *mut libc::c_void,
+        final_only: bool,
+        destroy: unsafe extern "C" fn(*mut libc::c_void),
+    ) -> i32 {
+        let step = std::mem::transmute::<
+            unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+            unsafe extern "C" fn(),
+        >(signature_aggregate_step);
+        let final_ = std::mem::transmute::<
+            unsafe extern "C" fn(*mut libc::c_void),
+            unsafe extern "C" fn(),
+        >(signature_aggregate_final);
+        sqlite3_create_function_v2(
+            db,
+            c"partial_aggregate".as_ptr(),
+            1,
+            SQLITE_UTF8,
+            context,
+            None,
+            if final_only { None } else { Some(step) },
+            if final_only { Some(final_) } else { None },
+            Some(destroy),
+        )
+    }
+
+    #[test]
+    fn incomplete_aggregate_registration_destroys_userdata_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for final_only in [false, true] {
+                assert_ne!(
+                    reject_partial_aggregate(
+                        db,
+                        (&mut calls as *mut i32).cast(),
+                        final_only,
+                        count_collation_destroy
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(calls, if final_only { 2 } else { 1 });
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn aggregate_failed_registration_destroys_userdata_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_ne!(
+                reject_aggregate_registration(
+                    db,
+                    (&mut calls as *mut i32).cast(),
+                    count_collation_destroy
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn rejected_function_destructor_reentry_child() {
+        if std::env::var_os("TURSO_REJECTED_FUNCTION_CHILD").is_none() {
+            return;
+        }
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut probe = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: true,
+                closing: false,
+            };
+            assert_ne!(
+                reject_aggregate_registration(
+                    db,
+                    (&mut probe as *mut CollationOwnerProbe).cast(),
+                    probe_collation_destroy
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(probe.calls, 1);
+            assert_ne!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_reentry_rejected".as_ptr(),
+                    -2,
+                    SQLITE_UTF8,
+                    (&mut probe as *mut CollationOwnerProbe).cast(),
+                    Some(signature_aggregate_step),
+                    None,
+                    None,
+                    Some(probe_collation_destroy)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(probe.calls, 2);
+            for final_only in [false, true] {
+                assert_ne!(
+                    reject_partial_aggregate(
+                        db,
+                        (&mut probe as *mut CollationOwnerProbe).cast(),
+                        final_only,
+                        probe_collation_destroy
+                    ),
+                    SQLITE_OK
+                );
+            }
+            assert_eq!(probe.calls, 4);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(probe.calls, 4);
+        }
+    }
+
+    #[test]
+    fn rejected_function_destructor_reentry_is_bounded() {
+        bounded_destructor_child(
+            "tests::rejected_function_destructor_reentry_child",
+            "TURSO_REJECTED_FUNCTION_CHILD",
+        );
+    }
+
     #[test]
     fn scalar_prepared_replacement_keeps_userdata_alive() {
         unsafe {
@@ -1166,13 +1323,16 @@ mod tests {
 
     #[test]
     fn null_collation_destructor_reentry_is_bounded() {
+        bounded_destructor_child(
+            "tests::null_collation_destructor_reentry_child",
+            "TURSO_COLLATION_REENTRY_CHILD",
+        );
+    }
+
+    fn bounded_destructor_child(test: &str, flag: &str) {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::null_collation_destructor_reentry_child",
-                "--nocapture",
-            ])
-            .env("TURSO_COLLATION_REENTRY_CHILD", "1")
+            .args(["--exact", test, "--nocapture"])
+            .env(flag, "1")
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1184,7 +1344,7 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap();
                 child.wait().unwrap();
-                panic!("collation destructor reentry timed out");
+                panic!("destructor reentry timed out: {test}");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

@@ -60,7 +60,7 @@ fn native_scalar_overloads_prefer_exact_then_finite_then_variadic() {
         .filter(|(name, _, _, _)| name == "native_overload")
         .map(|(_, _, argc, _)| argc)
         .collect::<Vec<_>>();
-    listed.sort();
+    listed.sort_unstable();
     assert_eq!(listed, vec![-1, 1, 1, 3]);
 }
 
@@ -112,7 +112,7 @@ fn native_scalar_signature_replacement_wins_equal_specificity() {
         .filter(|(name, _, _, _)| name == "native_replaced_overlap")
         .map(|(_, _, argc, _)| argc)
         .collect::<Vec<_>>();
-    listed.sort();
+    listed.sort_unstable();
     assert_eq!(listed, vec![1, 1, 2, 3]);
 }
 
