@@ -187,13 +187,23 @@ fn time_date_internal(args: &[Value]) -> Value {
     }
 
     if args.len() == 8 {
-        let offset_sec = ok_tri!(args[7].to_integer()) as i32;
-        seconds -= offset_sec as i64;
+        let offset_sec = ok_tri!(args[7].to_integer());
+        if i32::try_from(offset_sec).is_err() {
+            return Value::null();
+        }
+        seconds = match seconds.checked_sub(offset_sec) {
+            Some(s) => s,
+            None => return Value::null(),
+        };
     }
 
+    let (Ok(year), Ok(month)) = (i32::try_from(year), i32::try_from(month)) else {
+        return Value::null();
+    };
+
     let t = Time::time_date(
-        year as i32,
-        month as i32,
+        year,
+        month,
         day,
         hour,
         minutes,
@@ -708,7 +718,10 @@ fn time_add(args: &[Value]) -> Value {
 
     let d = Duration::from(d);
 
-    t.add_duration(d).into_blob()
+    match t.add_duration(d) {
+        Some(t) => t.into_blob(),
+        None => Value::null(),
+    }
 }
 
 #[scalar(name = "time_add_date")]
@@ -750,7 +763,11 @@ fn time_add_date(args: &[Value]) -> Value {
         days = ok_tri!(args[3].to_integer());
     }
 
-    let t: Time = tri!(t.time_add_date(years as i32, months as i32, days));
+    let (Ok(years), Ok(months)) = (i32::try_from(years), i32::try_from(months)) else {
+        return Value::error_with_message(TimeError::CreationError.to_string());
+    };
+
+    let t: Time = tri!(t.time_add_date(years, months, days));
 
     t.into_blob()
 }
@@ -1021,4 +1038,33 @@ fn time_parse(args: &[Value]) -> Value {
         .unwrap();
 
     Time::from_datetime(dt.and_utc()).into_blob()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ints(v: &[i64]) -> Vec<Value> {
+        v.iter().map(|&i| Value::from_integer(i)).collect()
+    }
+
+    #[test]
+    fn time_date_overflowing_args_return_null() {
+        // seconds - offset_sec overflows i64
+        let v = time_date_internal(&ints(&[2000, 1, 1, 0, 0, i64::MIN, 0, 1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        let v = time_date_internal(&ints(&[2024, 1, 1, 0, 0, i64::MAX, 0, -1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        // year / month that don't fit in i32 must not be truncated
+        let v = time_date_internal(&ints(&[4294969297, 1, 1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        let v = time_date_internal(&ints(&[2024, 4294967297, 1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        // offset that doesn't fit in i32
+        let v = time_date_internal(&ints(&[2024, 1, 1, 0, 0, 0, 0, 4294967296]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        // sanity: normal call still returns a blob
+        let v = time_date_internal(&ints(&[2024, 1, 1, 0, 0, 0, 0, 3600]));
+        assert_eq!(v.value_type(), ValueType::Blob);
+    }
 }
