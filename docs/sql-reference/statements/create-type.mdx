@@ -174,6 +174,8 @@ SELECT * FROM t WHERE d = '2024-01-02' COLLATE nocase;
 -- Parse error: collations are not supported by type date
 ```
 
+A CHECK constraint that applies a COLLATE in one of these ways is refused when the table is created, with the same error, such as `CREATE TABLE t(d date, CHECK (d COLLATE nocase = '2024-01-02')) STRICT`. A COLLATE on a text value in a CHECK constraint works as in SQLite.
+
 Columns of SQLite's own types, and all columns of a table that is not STRICT, take any COLLATE as in SQLite. A value whose type nothing declares, such as `a + 1` for an array `a`, takes none: it fails with `collations are not supported by type unknown`.
 
 ### Arithmetic
