@@ -386,6 +386,14 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
+Changing `query_only` does not change the access permission selected when a
+connection opens. In the SQLite C API, a `file:` URI with `mode=ro` keeps the
+main database read-only even after `PRAGMA query_only=0`; private TEMP tables
+remain writable. `mode=rw` requires an existing file, and `mode=rwc` permits
+creating one. URI modes can restrict the caller's open flags but cannot add
+write or creation permission.
+
+
 ### full_column_names / short_column_names
 
 Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean.
@@ -619,6 +627,9 @@ PRAGMA wal_checkpoint;
 ```
 
 A checkpoint writes pages from the WAL file back to the database file.
+
+On a read-only connection, this pragma leaves the database and WAL unchanged
+and returns `(0, -1, -1)`.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 

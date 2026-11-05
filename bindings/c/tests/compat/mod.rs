@@ -61,10 +61,28 @@ extern "C" {
             ) -> i32,
         >,
     ) -> i32;
+    fn sqlite3_create_collation_v2(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        enc: i32,
+        context: *mut libc::c_void,
+        compare: Option<
+            unsafe extern "C" fn(
+                *mut libc::c_void,
+                i32,
+                *const libc::c_void,
+                i32,
+                *const libc::c_void,
+            ) -> i32,
+        >,
+        destroy: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    ) -> i32;
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
     fn sqlite3_close(db: *mut sqlite3) -> i32;
+    fn sqlite3_close_v2(db: *mut sqlite3) -> i32;
     fn sqlite3_open(filename: *const libc::c_char, db: *mut *mut sqlite3) -> i32;
+    fn sqlite3_db_readonly(db: *mut sqlite3, db_name: *const libc::c_char) -> i32;
     fn sqlite3_db_filename(db: *mut sqlite3, db_name: *const libc::c_char) -> *const libc::c_char;
     fn sqlite3_exec(
         db: *mut sqlite3,
@@ -81,6 +99,7 @@ extern "C" {
         errmsg: *mut *mut libc::c_char,
     ) -> i32;
     fn sqlite3_errcode(db: *mut sqlite3) -> i32;
+    fn sqlite3_extended_errcode(db: *mut sqlite3) -> i32;
     fn sqlite3_errmsg(db: *mut sqlite3) -> *const libc::c_char;
     fn sqlite3_free(ptr: *mut libc::c_void);
     fn sqlite3_prepare_v2(
@@ -93,6 +112,22 @@ extern "C" {
     fn sqlite3_step(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> i32;
+    fn sqlite3_blob_open(
+        db: *mut sqlite3,
+        database: *const libc::c_char,
+        table: *const libc::c_char,
+        column: *const libc::c_char,
+        rowid: i64,
+        flags: i32,
+        output: *mut *mut libc::c_void,
+    ) -> i32;
+    fn libsql_wal_insert_frame(
+        db: *mut sqlite3,
+        frame_no: u32,
+        frame: *const u8,
+        frame_len: u32,
+        conflict: *mut i32,
+    ) -> i32;
     fn sqlite3_wal_checkpoint(db: *mut sqlite3, db_name: *const libc::c_char) -> i32;
     fn sqlite3_wal_checkpoint_v2(
         db: *mut sqlite3,
@@ -254,6 +289,585 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 mod tests {
     use super::*;
 
+    struct ScalarData {
+        db: *mut sqlite3,
+        value: i64,
+        destroyed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    unsafe extern "C" fn scalar_value(ctx: *mut libc::c_void, _: i32, _: *mut *mut libc::c_void) {
+        let data = &*sqlite3_user_data(ctx).cast::<ScalarData>();
+        if sqlite3_context_db_handle(ctx).cast::<sqlite3>() != data.db {
+            sqlite3_result_error(ctx, c"wrong callback database".as_ptr(), -1);
+        } else {
+            sqlite3_result_int64(ctx, data.value);
+        }
+    }
+
+    unsafe extern "C" fn scalar_destroy(data: *mut libc::c_void) {
+        let data = Box::from_raw(data.cast::<ScalarData>());
+        data.destroyed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe fn scalar_register(
+        db: *mut sqlite3,
+        name: &std::ffi::CStr,
+        argc: i32,
+        value: i64,
+    ) -> (i32, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let destroyed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let data = Box::into_raw(Box::new(ScalarData {
+            db,
+            value,
+            destroyed: destroyed.clone(),
+        }));
+        (
+            sqlite3_create_function_v2(
+                db,
+                name.as_ptr(),
+                argc,
+                SQLITE_UTF8,
+                data.cast(),
+                Some(scalar_value),
+                None,
+                None,
+                Some(scalar_destroy),
+            ),
+            destroyed,
+        )
+    }
+
+    unsafe fn scalar_prepare(db: *mut sqlite3, sql: &str) -> *mut sqlite3_stmt {
+        let sql = std::ffi::CString::new(sql).unwrap();
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK,
+            "{sql:?}"
+        );
+        stmt
+    }
+
+    unsafe fn scalar_query(db: *mut sqlite3, sql: &str, expected: i64) {
+        let stmt = scalar_prepare(db, sql);
+        assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(stmt, 0), expected);
+        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+    }
+
+    #[test]
+    fn scalar_registrations_have_no_process_capacity_limit() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for n in 0..64 {
+                let name = std::ffi::CString::new(format!("scalar_many_{n}")).unwrap();
+                assert_eq!(
+                    scalar_register(db, &name, 0, n).0,
+                    SQLITE_OK,
+                    "registration {n}"
+                );
+            }
+            for n in 0..64 {
+                scalar_query(db, &format!("SELECT scalar_many_{n}()"), n);
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn scalar_signatures_replace_and_delete_independently() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, zero) = scalar_register(db, c"scalar_overload", 0, 10);
+            assert_eq!(rc, SQLITE_OK);
+            let (rc, one) = scalar_register(db, c"scalar_overload", 1, 11);
+            assert_eq!(rc, SQLITE_OK);
+            let (rc, variadic) = scalar_register(db, c"scalar_overload", -1, 99);
+            assert_eq!(rc, SQLITE_OK);
+            scalar_query(db, "SELECT scalar_overload()", 10);
+            scalar_query(db, "SELECT scalar_overload(7)", 11);
+            scalar_query(db, "SELECT scalar_overload(7,8)", 99);
+            assert_eq!(scalar_register(db, c"scalar_overload", 1, 21).0, SQLITE_OK);
+            assert_eq!(one.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(zero.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(variadic.load(std::sync::atomic::Ordering::SeqCst), 0);
+            scalar_query(db, "SELECT scalar_overload(7)", 21);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_overload".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut deleted = ptr::null_mut();
+            assert_ne!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT scalar_overload(7)".as_ptr(),
+                    -1,
+                    &mut deleted,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            scalar_query(db, "SELECT scalar_overload(7,8)", 99);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_overload".as_ptr(),
+                    -1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut stmt = ptr::null_mut();
+            assert_ne!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT scalar_overload(7)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            scalar_query(db, "SELECT scalar_overload()", 10);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(zero.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(variadic.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_fixed_arity_wins_in_both_registration_orders() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for (name, reverse) in [(c"scalar_order_a", false), (c"scalar_order_b", true)] {
+                let mut registrations = vec![(0, 10), (1, 11), (-1, 99)];
+                if reverse {
+                    registrations.reverse();
+                }
+                for (argc, value) in registrations {
+                    assert_eq!(scalar_register(db, name, argc, value).0, SQLITE_OK);
+                }
+                let name = name.to_str().unwrap();
+                scalar_query(db, &format!("SELECT {name}()"), 10);
+                scalar_query(db, &format!("SELECT {name}(7)"), 11);
+                scalar_query(db, &format!("SELECT {name}(7,8)"), 99);
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn scalar_and_aggregate_share_registration_signature() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, destroyed) = scalar_register(db, c"scalar_then_aggregate", 1, 10);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"scalar_then_aggregate".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    Some(signature_aggregate_step),
+                    Some(signature_aggregate_final)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            scalar_query(
+                db,
+                "WITH data(x) AS (VALUES (1), (2)) SELECT scalar_then_aggregate(x) FROM data",
+                77,
+            );
+            assert_eq!(
+                scalar_register(db, c"scalar_then_aggregate", 1, 20).0,
+                SQLITE_OK
+            );
+            scalar_query(db, "SELECT scalar_then_aggregate(1)", 20);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn signature_aggregate_step(
+        _: *mut libc::c_void,
+        _: i32,
+        _: *mut *mut libc::c_void,
+    ) {
+    }
+    unsafe extern "C" fn signature_aggregate_final(ctx: *mut libc::c_void) {
+        sqlite3_result_int64(ctx, 77);
+    }
+
+    #[test]
+    fn scalar_failed_registration_destroys_userdata_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, destroyed) = scalar_register(db, c"scalar_rejected", -2, 1);
+            assert_ne!(rc, SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    unsafe fn reject_aggregate_registration(
+        db: *mut sqlite3,
+        context: *mut libc::c_void,
+        destroy: unsafe extern "C" fn(*mut libc::c_void),
+    ) -> i32 {
+        sqlite3_create_function_v2(
+            db,
+            c"aggregate_rejected".as_ptr(),
+            -2,
+            SQLITE_UTF8,
+            context,
+            None,
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(signature_aggregate_step)),
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(signature_aggregate_final)),
+            Some(destroy),
+        )
+    }
+
+    unsafe fn reject_partial_aggregate(
+        db: *mut sqlite3,
+        context: *mut libc::c_void,
+        final_only: bool,
+        destroy: unsafe extern "C" fn(*mut libc::c_void),
+    ) -> i32 {
+        let step = std::mem::transmute::<
+            unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+            unsafe extern "C" fn(),
+        >(signature_aggregate_step);
+        let final_ = std::mem::transmute::<
+            unsafe extern "C" fn(*mut libc::c_void),
+            unsafe extern "C" fn(),
+        >(signature_aggregate_final);
+        sqlite3_create_function_v2(
+            db,
+            c"partial_aggregate".as_ptr(),
+            1,
+            SQLITE_UTF8,
+            context,
+            None,
+            if final_only { None } else { Some(step) },
+            if final_only { Some(final_) } else { None },
+            Some(destroy),
+        )
+    }
+
+    #[test]
+    fn incomplete_aggregate_registration_destroys_userdata_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for final_only in [false, true] {
+                assert_ne!(
+                    reject_partial_aggregate(
+                        db,
+                        (&mut calls as *mut i32).cast(),
+                        final_only,
+                        count_collation_destroy
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(calls, if final_only { 2 } else { 1 });
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn aggregate_failed_registration_destroys_userdata_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_ne!(
+                reject_aggregate_registration(
+                    db,
+                    (&mut calls as *mut i32).cast(),
+                    count_collation_destroy
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn rejected_function_destructor_reentry_child() {
+        if std::env::var_os("TURSO_REJECTED_FUNCTION_CHILD").is_none() {
+            return;
+        }
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut probe = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: true,
+                closing: false,
+            };
+            assert_ne!(
+                reject_aggregate_registration(
+                    db,
+                    (&mut probe as *mut CollationOwnerProbe).cast(),
+                    probe_collation_destroy
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(probe.calls, 1);
+            assert_ne!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_reentry_rejected".as_ptr(),
+                    -2,
+                    SQLITE_UTF8,
+                    (&mut probe as *mut CollationOwnerProbe).cast(),
+                    Some(signature_aggregate_step),
+                    None,
+                    None,
+                    Some(probe_collation_destroy)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(probe.calls, 2);
+            for final_only in [false, true] {
+                assert_ne!(
+                    reject_partial_aggregate(
+                        db,
+                        (&mut probe as *mut CollationOwnerProbe).cast(),
+                        final_only,
+                        probe_collation_destroy
+                    ),
+                    SQLITE_OK
+                );
+            }
+            assert_eq!(probe.calls, 4);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(probe.calls, 4);
+        }
+    }
+
+    #[test]
+    fn rejected_function_destructor_reentry_is_bounded() {
+        bounded_destructor_child(
+            "tests::rejected_function_destructor_reentry_child",
+            "TURSO_REJECTED_FUNCTION_CHILD",
+        );
+    }
+
+    #[test]
+    fn scalar_prepared_replacement_keeps_userdata_alive() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, old) = scalar_register(db, c"scalar_prepared", 0, 10);
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = scalar_prepare(db, "SELECT scalar_prepared()");
+            let (rc, new) = scalar_register(db, c"scalar_prepared", 0, 20);
+            assert_eq!(rc, SQLITE_OK);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 0);
+            #[cfg(feature = "sqlite3")]
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 20);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_deferred_close_keeps_callback_database_alive() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, destroyed) = scalar_register(db, c"scalar_deferred", 0, 42);
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = scalar_prepare(db, "SELECT scalar_deferred()");
+            assert_eq!(sqlite3_close(db), SQLITE_BUSY);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 42);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_deleted_signature_can_be_registered_during_an_active_statement() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, variadic) = scalar_register(db, c"scalar_deleted_active", -1, 99);
+            assert_eq!(rc, SQLITE_OK);
+            let (rc, old) = scalar_register(db, c"scalar_deleted_active", 1, 10);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_deleted_active".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let mut deleted = ptr::null_mut();
+            assert_ne!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT scalar_deleted_active(7)".as_ptr(),
+                    -1,
+                    &mut deleted,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            let active = scalar_prepare(db, "SELECT 1 UNION ALL SELECT 2");
+            assert_eq!(sqlite3_step(active), SQLITE_ROW);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_deleted_active".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let (rc, new) = scalar_register(db, c"scalar_deleted_active", 1, 20);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_step(active), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(active, 0), 2);
+            assert_eq!(sqlite3_step(active), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(active), SQLITE_OK);
+            scalar_query(db, "SELECT scalar_deleted_active(7)", 20);
+            scalar_query(db, "SELECT scalar_deleted_active(7,8)", 99);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(variadic.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_active_replacement_is_busy_and_destroys_rejected_userdata() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, old) = scalar_register(db, c"scalar_active", 0, 10);
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = scalar_prepare(
+                db,
+                "SELECT scalar_active() UNION ALL SELECT scalar_active()",
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let (rc, rejected) = scalar_register(db, c"scalar_active", 0, 20);
+            assert_eq!(rc, SQLITE_BUSY);
+            assert_eq!(rejected.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_active".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_BUSY
+            );
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 10);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            scalar_query(db, "SELECT scalar_active()", 10);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_registrations_are_connection_local() {
+        unsafe {
+            let (mut a, mut b) = (ptr::null_mut(), ptr::null_mut());
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut a), SQLITE_OK);
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut b), SQLITE_OK);
+            let (rc, a_destroyed) = scalar_register(a, c"scalar_shared", 0, 111);
+            assert_eq!(rc, SQLITE_OK);
+            let prepared = scalar_prepare(a, "SELECT scalar_shared()");
+            let (rc, b_destroyed) = scalar_register(b, c"scalar_shared", 0, 222);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(sqlite3_step(prepared), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(prepared, 0), 111);
+            assert_eq!(sqlite3_finalize(prepared), SQLITE_OK);
+            scalar_query(a, "SELECT scalar_shared()", 111);
+            scalar_query(b, "SELECT scalar_shared()", 222);
+            let (rc, replacement) = scalar_register(b, c"scalar_shared", 0, 333);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(b_destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(a_destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            scalar_query(b, "SELECT scalar_shared()", 333);
+            assert_eq!(sqlite3_close(b), SQLITE_OK);
+            assert_eq!(replacement.load(std::sync::atomic::Ordering::SeqCst), 1);
+            scalar_query(a, "SELECT scalar_shared()", 111);
+            assert_eq!(sqlite3_close(a), SQLITE_OK);
+            assert_eq!(a_destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
     #[test]
     #[cfg(not(feature = "sqlite3"))]
     fn turso_version_stays_the_engine_version_after_schema_creation() {
@@ -387,6 +1001,352 @@ mod tests {
             assert!(calls > 0);
             assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn count_collation_destroy(context: *mut libc::c_void) {
+        *(context as *mut i32) += 1;
+    }
+
+    #[test]
+    fn null_collation_owner_survives_until_close() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_collation_v2(
+                    db,
+                    c"inactive".as_ptr(),
+                    SQLITE_UTF8,
+                    (&mut calls as *mut i32).cast(),
+                    None,
+                    Some(count_collation_destroy)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(calls, 0, "registration must retain the new owner");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    struct CollationOwnerProbe {
+        db: *mut sqlite3,
+        calls: i32,
+        reenter: bool,
+        closing: bool,
+    }
+
+    unsafe extern "C" fn probe_collation_destroy(context: *mut libc::c_void) {
+        let probe = &mut *context.cast::<CollationOwnerProbe>();
+        probe.calls += 1;
+        if probe.reenter {
+            assert_eq!(sqlite3_changes(probe.db), 0);
+            if probe.closing && !cfg!(feature = "sqlite3") {
+                let mut rejected = 0_i32;
+                assert_eq!(
+                    sqlite3_create_collation_v2(
+                        probe.db,
+                        c"rejected".as_ptr(),
+                        SQLITE_UTF8,
+                        (&mut rejected as *mut i32).cast(),
+                        None,
+                        Some(count_collation_destroy)
+                    ),
+                    SQLITE_MISUSE
+                );
+                assert_eq!(rejected, 0);
+            }
+        }
+    }
+
+    unsafe fn register_inactive(probe: &mut CollationOwnerProbe, name: &std::ffi::CStr) {
+        assert_eq!(
+            sqlite3_create_collation_v2(
+                probe.db,
+                name.as_ptr(),
+                SQLITE_UTF8,
+                (probe as *mut CollationOwnerProbe).cast(),
+                None,
+                Some(probe_collation_destroy)
+            ),
+            SQLITE_OK
+        );
+    }
+
+    #[test]
+    fn null_collation_deferred_close_retains_owner() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut probe = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: false,
+                closing: false,
+            };
+            register_inactive(&mut probe, c"inactive");
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_BUSY);
+            assert_eq!(probe.calls, 0);
+            assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+            assert_eq!(probe.calls, 0);
+            #[cfg(not(feature = "sqlite3"))]
+            {
+                let mut rejected = 0_i32;
+                assert_eq!(
+                    sqlite3_create_collation_v2(
+                        db,
+                        c"inactive".as_ptr(),
+                        SQLITE_UTF8,
+                        (&mut rejected as *mut i32).cast(),
+                        None,
+                        Some(count_collation_destroy)
+                    ),
+                    SQLITE_MISUSE
+                );
+                assert_eq!(rejected, 0);
+            }
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(probe.calls, 1);
+        }
+    }
+
+    #[test]
+    fn null_collation_replacement_releases_each_owner() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut first = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: false,
+                closing: false,
+            };
+            let mut second = CollationOwnerProbe {
+                db,
+                calls: 0,
+                reenter: false,
+                closing: false,
+            };
+            register_inactive(&mut first, c"INACTIVE");
+            register_inactive(&mut second, c"inactive");
+            // SQLite overwrites an already-NULL owner's destructor without calling it.
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(first.calls, 1);
+            #[cfg(feature = "sqlite3")]
+            assert_eq!(first.calls, 0);
+            assert_eq!(second.calls, 0);
+            assert_eq!(
+                sqlite3_create_collation(
+                    db,
+                    c"InAcTiVe".as_ptr(),
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(compare_collation_probe)
+                ),
+                SQLITE_OK
+            );
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(second.calls, 1);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT 'a' COLLATE inactive < 'b'".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_create_collation(
+                    db,
+                    c"inactive".as_ptr(),
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT 'a' COLLATE inactive < 'b'".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_ERROR
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn compare_collation_probe(
+        _: *mut libc::c_void,
+        _: i32,
+        _: *const libc::c_void,
+        _: i32,
+        _: *const libc::c_void,
+    ) -> i32 {
+        -1
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn rejected_collation_registration_keeps_caller_owner() {
+        unsafe {
+            let mut calls = 0_i32;
+            assert_eq!(
+                sqlite3_create_collation_v2(
+                    ptr::null_mut(),
+                    c"inactive".as_ptr(),
+                    SQLITE_UTF8,
+                    (&mut calls as *mut i32).cast(),
+                    None,
+                    Some(count_collation_destroy)
+                ),
+                SQLITE_MISUSE
+            );
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(
+                sqlite3_create_collation_v2(
+                    db,
+                    ptr::null(),
+                    SQLITE_UTF8,
+                    (&mut calls as *mut i32).cast(),
+                    None,
+                    Some(count_collation_destroy)
+                ),
+                SQLITE_MISUSE
+            );
+            assert_eq!(calls, 0);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(calls, 0);
+        }
+    }
+
+    #[test]
+    fn null_collation_destructor_reentry_child() {
+        if std::env::var_os("TURSO_COLLATION_REENTRY_CHILD").is_none() {
+            return;
+        }
+        unsafe {
+            for mode in 0..5 {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+                let mut probe = CollationOwnerProbe {
+                    db,
+                    calls: 0,
+                    reenter: true,
+                    closing: mode != 3,
+                };
+                if mode == 4 {
+                    probe.closing = false;
+                    assert_eq!(
+                        sqlite3_create_collation_v2(
+                            db,
+                            c"inactive".as_ptr(),
+                            SQLITE_UTF8,
+                            (&mut probe as *mut CollationOwnerProbe).cast(),
+                            Some(compare_collation_probe),
+                            Some(probe_collation_destroy)
+                        ),
+                        SQLITE_OK
+                    );
+                    let mut removed_owner = 0_i32;
+                    assert_eq!(
+                        sqlite3_create_collation_v2(
+                            db,
+                            c"inactive".as_ptr(),
+                            SQLITE_UTF8,
+                            (&mut removed_owner as *mut i32).cast(),
+                            None,
+                            Some(count_collation_destroy)
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(probe.calls, 1);
+                    assert_eq!(removed_owner, 0);
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                    assert_eq!(removed_owner, 1);
+                    continue;
+                }
+                register_inactive(&mut probe, c"inactive");
+                assert_eq!(probe.calls, 0);
+                if mode == 2 {
+                    let mut stmt = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT 1".as_ptr(),
+                            -1,
+                            &mut stmt,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+                    assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                } else if mode == 3 {
+                    assert_eq!(
+                        sqlite3_create_collation(
+                            db,
+                            c"inactive".as_ptr(),
+                            SQLITE_UTF8,
+                            ptr::null_mut(),
+                            Some(compare_collation_probe)
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                } else if mode == 1 {
+                    assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+                } else {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+                #[cfg(not(feature = "sqlite3"))]
+                assert_eq!(probe.calls, 1);
+                #[cfg(feature = "sqlite3")]
+                assert_eq!(probe.calls, if mode == 3 { 0 } else { 1 });
+            }
+        }
+    }
+
+    #[test]
+    fn null_collation_destructor_reentry_is_bounded() {
+        bounded_destructor_child(
+            "tests::null_collation_destructor_reentry_child",
+            "TURSO_COLLATION_REENTRY_CHILD",
+        );
+    }
+
+    fn bounded_destructor_child(test: &str, flag: &str) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(flag, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("destructor reentry timed out: {test}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -762,11 +1722,180 @@ mod tests {
     #[test]
     fn test_open_not_found() {
         unsafe {
-            let mut db = ptr::null_mut();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("absent/local.db");
+            let filename = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            for use_v2 in [false, true] {
+                for close_v2 in [false, true] {
+                    let mut db = ptr::dangling_mut();
+                    let rc = if use_v2 {
+                        sqlite3_open_v2(filename.as_ptr(), &mut db, 6, ptr::null())
+                    } else {
+                        sqlite3_open(filename.as_ptr(), &mut db)
+                    };
+                    assert_eq!(rc, SQLITE_CANTOPEN);
+                    assert!(!db.is_null(), "failed open must return an error handle");
+                    assert_ne!(
+                        db,
+                        ptr::dangling_mut(),
+                        "open must replace the output pointer"
+                    );
+                    assert_eq!(sqlite3_errcode(db), SQLITE_CANTOPEN);
+                    assert_eq!(sqlite3_extended_errcode(db), SQLITE_CANTOPEN);
+                    let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                        .to_str()
+                        .unwrap();
+                    assert!(!message.is_empty());
+                    assert_ne!(message, "out of memory");
+                    assert_eq!(sqlite3_errcode(db), SQLITE_CANTOPEN);
+                    assert_eq!(
+                        if close_v2 {
+                            sqlite3_close_v2(db)
+                        } else {
+                            sqlite3_close(db)
+                        },
+                        SQLITE_OK
+                    );
+                    assert!(!path.exists());
+                    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_null_error_introspection() {
+        unsafe {
+            assert_eq!(sqlite3_errcode(ptr::null_mut()), 7);
+            assert_eq!(sqlite3_extended_errcode(ptr::null_mut()), 7);
             assert_eq!(
-                sqlite3_open(c"not-found/local.db".as_ptr(), &mut db),
-                SQLITE_CANTOPEN
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(ptr::null_mut())),
+                c"out of memory"
             );
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn test_failed_open_operations() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("absent/local.db");
+            let filename = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(filename.as_ptr(), &mut db), SQLITE_CANTOPEN);
+            assert!(!db.is_null());
+            let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_owned();
+            let mut stmt = ptr::dangling_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_MISUSE
+            );
+            assert!(stmt.is_null());
+            for sql in [c"", c"SELECT 1"] {
+                assert_eq!(
+                    sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                    SQLITE_MISUSE
+                );
+            }
+            assert_eq!(sqlite3_db_readonly(db, c"main".as_ptr()), -1);
+            assert_eq!(sqlite3_changes64(db), 0);
+            assert_eq!(sqlite3_total_changes64(db), 0);
+            assert_eq!(sqlite3_last_insert_rowid(db), 0);
+            assert_eq!(sqlite3_get_autocommit(db), 1);
+            assert_eq!(
+                sqlite3_busy_handler(db, None, ptr::null_mut()),
+                SQLITE_MISUSE
+            );
+            assert_eq!(sqlite3_busy_timeout(db, 1), SQLITE_MISUSE);
+            sqlite3_progress_handler(db, 1, None, ptr::null_mut());
+            sqlite3_interrupt(db);
+            assert_eq!(
+                sqlite3_create_collation(db, c"unused".as_ptr(), 1, ptr::null_mut(), None),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"unused".as_ptr(),
+                    0,
+                    1,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    c"main".as_ptr(),
+                    c"unused".as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_MISUSE
+            );
+            let mut blob = ptr::dangling_mut();
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"unused".as_ptr(),
+                    c"unused".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_MISUSE
+            );
+            assert!(blob.is_null());
+            let (rc, destroyed) = scalar_register(db, c"failed_registration", 0, 1);
+            assert_eq!(rc, SQLITE_MISUSE);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(sqlite3_wal_checkpoint(db, ptr::null()), SQLITE_MISUSE);
+            let mut frame_count = 0;
+            assert_eq!(libsql_wal_frame_count(db, &mut frame_count), SQLITE_MISUSE);
+            assert_eq!(
+                libsql_wal_get_frame(db, 1, ptr::null_mut(), 0),
+                SQLITE_MISUSE
+            );
+            assert_eq!(libsql_wal_disable_checkpoint(db), SQLITE_MISUSE);
+            assert_eq!(
+                libsql_wal_insert_frame(db, 1, ptr::null(), 0, ptr::null_mut()),
+                SQLITE_MISUSE
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_CANTOPEN);
+            assert_eq!(sqlite3_extended_errcode(db), SQLITE_CANTOPEN);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                message.as_c_str()
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn test_open_invalid_input_clears_output() {
+        unsafe {
+            for use_v2 in [false, true] {
+                let mut db = ptr::dangling_mut();
+                let rc = if use_v2 {
+                    sqlite3_open_v2(ptr::null(), &mut db, 6, ptr::null())
+                } else {
+                    sqlite3_open(ptr::null(), &mut db)
+                };
+                assert_eq!(rc, SQLITE_MISUSE);
+                assert!(db.is_null());
+            }
         }
     }
 
@@ -4023,6 +5152,467 @@ mod tests {
                 "file::memory: data persisted — not truly in-memory (rc={rc})"
             );
             assert_eq!(sqlite3_close(db2), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_uri_memory_access_modes() {
+        unsafe {
+            for flags in [1, 2, 6] {
+                for (name, readonly) in [
+                    (c":memory:", flags == 1),
+                    (c"file://", flags == 1),
+                    (c"file://localhost", flags == 1),
+                    (c"file::memory:?mode=ro", true),
+                    (c"file:private-access?mode=memory", false),
+                    (c"file:private-access?mode=ro&mode=memory", false),
+                ] {
+                    let mut db = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_open_v2(
+                            name.as_ptr(),
+                            &mut db,
+                            flags | SQLITE_OPEN_URI,
+                            ptr::null()
+                        ),
+                        SQLITE_OK
+                    );
+                    let expected = if readonly { 8 } else { SQLITE_OK };
+                    assert_eq!(
+                        sqlite3_exec(
+                            db,
+                            c"CREATE TABLE t(x)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        expected,
+                        "{name:?} flags={flags}"
+                    );
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_uri_empty_filename_stays_private() {
+        unsafe {
+            let name = c"file:?mode=memory&cache=shared";
+            let mut first = ptr::null_mut();
+            let mut second = ptr::null_mut();
+            for db in [&mut first, &mut second] {
+                assert_eq!(
+                    sqlite3_open_v2(name.as_ptr(), db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+            }
+            assert_eq!(
+                sqlite3_exec(
+                    first,
+                    c"CREATE TABLE private_table(x)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    second,
+                    c"SELECT * FROM private_table".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_ERROR
+            );
+            assert_eq!(sqlite3_close(first), SQLITE_OK);
+            assert_eq!(sqlite3_close(second), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_uri_legacy_reader_writer_open_busy_retry() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy.db");
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut seed = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut seed), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    seed,
+                    c"CREATE TABLE t(x); INSERT INTO t VALUES(1)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(seed), SQLITE_OK);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[18] = 1;
+            bytes[19] = 1;
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::remove_file(format!("{}-wal", path.display())).unwrap();
+            let uri = std::ffi::CString::new(format!("file:{}?mode=ro", path.display())).unwrap();
+            let mut reader = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut reader, 6 | SQLITE_OPEN_URI, ptr::null()),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    reader,
+                    c"BEGIN; SELECT * FROM t".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            let mut writer = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_BUSY);
+            assert!(!writer.is_null());
+            assert_eq!(sqlite3_errcode(writer), SQLITE_BUSY);
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    reader,
+                    c"COMMIT".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    reader,
+                    c"SELECT * FROM t".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_uri_access_permissions() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("permissions.db");
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut seed = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut seed), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    seed,
+                    c"CREATE TABLE t(x)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(seed), SQLITE_OK);
+            for flags in [1, 2, 6] {
+                for (query, mode) in [
+                    ("mode=ro", 1),
+                    ("mode=rw", 2),
+                    ("mode=rwc", 6),
+                    ("m%6fde=r%6f", 1),
+                    ("mode=ro#&mode=rwc", 1),
+                ] {
+                    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+                    let uri =
+                        std::ffi::CString::new(format!("file:{}?{query}", path.display())).unwrap();
+                    let mut db = ptr::null_mut();
+                    let expected = if mode > flags { 3 } else { SQLITE_OK };
+                    assert_eq!(
+                        sqlite3_open_v2(
+                            uri.as_ptr(),
+                            &mut db,
+                            flags | SQLITE_OPEN_URI,
+                            ptr::null()
+                        ),
+                        expected,
+                        "flags={flags} {query}"
+                    );
+                    assert!(!db.is_null());
+                    if expected == SQLITE_OK {
+                        assert_eq!(
+                            sqlite3_db_readonly(db, c"main".as_ptr()),
+                            i32::from(mode == 1)
+                        );
+                    } else {
+                        assert_eq!(sqlite3_errcode(db), expected);
+                    }
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+            }
+            for (query, expected) in [
+                ("mode=bad", 1),
+                ("mode=rw&mode=rwc", 3),
+                ("mode=ro&mode=rw", 3),
+                ("cache=bad", 1),
+            ] {
+                let uri =
+                    std::ffi::CString::new(format!("file:{}?{query}", path.display())).unwrap();
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    expected,
+                    "{query}"
+                );
+                assert!(!db.is_null());
+                assert_eq!(sqlite3_errcode(db), expected);
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+            for flags in [0, 3, 4, 5, 7] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(name.as_ptr(), &mut db, flags, ptr::null()),
+                    SQLITE_MISUSE
+                );
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+            for mode in ["ro", "rw", "rwc"] {
+                let missing = dir.path().join(format!("missing-{mode}.db"));
+                let uri = std::ffi::CString::new(format!("file:{}?mode={mode}", missing.display()))
+                    .unwrap();
+                let mut db = ptr::null_mut();
+                let expected = if mode == "rwc" {
+                    SQLITE_OK
+                } else {
+                    SQLITE_CANTOPEN
+                };
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    expected
+                );
+                assert_eq!(missing.exists(), mode == "rwc");
+                assert!(!db.is_null());
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+            let missing = dir.path().join("plain-rw.db");
+            let name = std::ffi::CString::new(missing.to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(name.as_ptr(), &mut db, 2, ptr::null()),
+                SQLITE_CANTOPEN
+            );
+            assert!(!missing.exists());
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_uri_readonly_rejects_write() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("readonly.db");
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut writer = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"CREATE TABLE t(x); INSERT INTO t VALUES(1)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+            let uri = std::ffi::CString::new(format!("file:{}?mode=ro", path.display())).unwrap();
+            let mut reader = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    uri.as_ptr(),
+                    &mut reader,
+                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                    ptr::null()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_db_readonly(reader, c"main".as_ptr()), 1);
+            assert_eq!(
+                sqlite3_exec(
+                    reader,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                8
+            );
+            let mut log = 123;
+            let mut checkpointed = 456;
+            assert_eq!(
+                sqlite3_wal_checkpoint_v2(reader, ptr::null(), 3, &mut log, &mut checkpointed),
+                SQLITE_OK
+            );
+            assert_eq!((log, checkpointed), (-1, -1));
+            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_uri_readonly_live_handles() {
+        unsafe {
+            for readonly_first in [false, true] {
+                for close_reader_first in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("mixed.db");
+                    let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                    let mut seed = ptr::null_mut();
+                    assert_eq!(sqlite3_open(name.as_ptr(), &mut seed), SQLITE_OK);
+                    assert_eq!(
+                        sqlite3_exec(
+                            seed,
+                            c"CREATE TABLE t(x); INSERT INTO t VALUES(1)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_close(seed), SQLITE_OK);
+                    let uri = std::ffi::CString::new(format!(
+                        "file:{}?m%6fde=r%6f#ignored?mode=rwc",
+                        path.display()
+                    ))
+                    .unwrap();
+                    let mut reader = ptr::null_mut();
+                    let mut writer = ptr::null_mut();
+                    let open_reader = |reader: &mut *mut sqlite3| {
+                        sqlite3_open_v2(
+                            uri.as_ptr(),
+                            reader,
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                            ptr::null(),
+                        )
+                    };
+                    if readonly_first {
+                        assert_eq!(open_reader(&mut reader), SQLITE_OK);
+                        assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+                    } else {
+                        assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+                        assert_eq!(open_reader(&mut reader), SQLITE_OK);
+                    }
+                    assert_eq!(sqlite3_db_readonly(reader, c"main".as_ptr()), 1);
+                    assert_eq!(sqlite3_db_readonly(writer, c"main".as_ptr()), 0);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"PRAGMA query_only=OFF".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    for sql in [
+                        c"CREATE TEMP TABLE local(x)",
+                        c"INSERT INTO local VALUES(1)",
+                    ] {
+                        let rc = sqlite3_exec(
+                            reader,
+                            sql.as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                        );
+                        assert_eq!(
+                            rc,
+                            SQLITE_OK,
+                            "{:?}: {:?}",
+                            sql,
+                            std::ffi::CStr::from_ptr(sqlite3_errmsg(reader))
+                        );
+                    }
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"INSERT INTO t VALUES(2)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        8
+                    );
+                    assert_eq!(
+                        sqlite3_exec(
+                            writer,
+                            c"INSERT INTO t VALUES(2)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    let mut stmt = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            reader,
+                            c"SELECT count(*) FROM t".as_ptr(),
+                            -1,
+                            &mut stmt,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                    assert_eq!(sqlite3_column_int64(stmt, 0), 2);
+                    assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                    if close_reader_first {
+                        assert_eq!(sqlite3_close(reader), SQLITE_OK);
+                        assert_eq!(
+                            sqlite3_exec(
+                                writer,
+                                c"INSERT INTO t VALUES(3)".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut()
+                            ),
+                            SQLITE_OK
+                        );
+                        assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                    } else {
+                        assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                        assert_eq!(
+                            sqlite3_exec(
+                                reader,
+                                c"SELECT * FROM t".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut()
+                            ),
+                            SQLITE_OK
+                        );
+                        assert_eq!(sqlite3_close(reader), SQLITE_OK);
+                    }
+                }
+            }
         }
     }
 

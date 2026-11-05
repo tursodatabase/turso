@@ -230,6 +230,7 @@ pub struct OpenOptions {
     /// process-wide registry keys on the default WAL for a path.
     wal_path: Option<String>,
     flags: OpenFlags,
+    readonly_main_writable: bool,
     db_opts: DatabaseOpts,
     pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
@@ -250,6 +251,7 @@ impl OpenOptions {
             storage: None,
             wal_path: None,
             flags: OpenFlags::default(),
+            readonly_main_writable: false,
             db_opts: DatabaseOpts::default(),
             native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
@@ -499,6 +501,7 @@ enum StatsRefresh {
 /// [`Database::connect_async`].
 #[derive(Clone)]
 pub struct ConnectOpts {
+    readonly: Option<bool>,
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
 }
@@ -509,12 +512,20 @@ pub struct ConnectOpts {
 )]
 impl ConnectOpts {
     /// Creates settings for a connection without encryption and without an
-    /// external page codec.
+    /// external page codec. Read-only access inherits the original database creator's restriction.
     pub fn new() -> Self {
         Self {
+            readonly: None,
             encryption_key: None,
             page_codec: None,
         }
+    }
+
+    /// Sets this connection's read-only restriction. Setting `false` cannot make
+    /// storage opened read-only by the database creator writable.
+    pub fn with_readonly(mut self, readonly: bool) -> Self {
+        self.readonly = Some(readonly);
+        self
     }
 
     /// Sets the key used to open an encrypted database. Use this when the key
@@ -701,6 +712,8 @@ pub struct Database<
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
+    readonly_bootstrap: bool,
+    writer_readiness: Mutex<WriterReadiness>,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
     pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
@@ -797,6 +810,14 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
     }
 }
 
+#[derive(Default)]
+struct WriterReadiness {
+    ready: bool,
+    legacy: bool,
+    orphan_wal: bool,
+    retained_wal_files: Vec<Arc<dyn crate::io::File>>,
+}
+
 impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
@@ -866,6 +887,11 @@ impl Database {
             dialect,
             io: io.clone(),
             open_flags: flags,
+            readonly_bootstrap: flags.contains(OpenFlags::ReadOnly),
+            writer_readiness: Mutex::new(WriterReadiness {
+                ready: !flags.contains(OpenFlags::ReadOnly),
+                ..WriterReadiness::default()
+            }),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
@@ -1234,6 +1260,9 @@ impl Database {
                             .to_string(),
                     ));
                 }
+                if !options.flags.contains(OpenFlags::ReadOnly) {
+                    db.ensure_writable_ready()?;
+                }
                 return Ok(Some(db));
             }
         }
@@ -1259,7 +1288,28 @@ impl Database {
             options.flags,
             options.db_opts,
         )?;
-        let file = io.open_file(path, effective_flags, true)?;
+        let file = if effective_flags.contains(OpenFlags::ReadOnly)
+            && !options.db_opts.enable_multiprocess_wal
+        {
+            match io.open_file(
+                path,
+                effective_flags & !OpenFlags::ReadOnly & !OpenFlags::Create,
+                true,
+            ) {
+                Ok(file) => {
+                    options.readonly_main_writable = true;
+                    file
+                }
+                Err(LimboError::CompletionError(CompletionError::IOError(
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem,
+                    _,
+                )))
+                | Err(LimboError::LockingError(_)) => io.open_file(path, effective_flags, true)?,
+                Err(error) => return Err(error),
+            }
+        } else {
+            io.open_file(path, effective_flags, true)?
+        };
 
         // 3. legacy open re-checks after `open_file()` in case a multiprocess
         //    authority appeared between the initial probe and the actual open
@@ -1395,6 +1445,9 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            if !options.flags.contains(OpenFlags::ReadOnly) {
+                                db.ensure_writable_ready()?;
+                            }
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1427,6 +1480,7 @@ impl Database {
             storage,
             flags,
             options.db_opts,
+            options.readonly_main_writable,
             options.encryption.clone(),
             options.durable_storage.clone(),
             options.page_codec.clone(),
@@ -1508,6 +1562,7 @@ impl Database {
             storage,
             options.flags,
             options.db_opts,
+            options.readonly_main_writable,
             options.encryption.clone(),
             options.durable_storage.clone(),
             options.page_codec.clone(),
@@ -1529,6 +1584,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        readonly_main_writable: bool,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
@@ -1551,6 +1607,7 @@ impl Database {
             db_file,
             flags,
             opts,
+            readonly_main_writable,
             encryption_opts,
             durable_storage,
             page_codec,
@@ -1573,6 +1630,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        readonly_main_writable: bool,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
@@ -1646,11 +1704,24 @@ impl Database {
                             db.shared_wal.read().metadata.enabled.load(Ordering::SeqCst);
                         let mv_store_enabled = db.get_mv_store().is_some();
                         assert!(
-                            db.is_readonly() || wal_enabled || mv_store_enabled,
+                            db.readonly_bootstrap
+                                || db.is_readonly()
+                                || wal_enabled
+                                || mv_store_enabled,
                             "Either WAL or MVStore must be enabled"
                         );
                     }
-                    let _ = &mut db;
+                    if readonly_main_writable
+                        && db.readonly_bootstrap
+                        && db.get_mv_store().is_none()
+                        && !db.opts.enable_multiprocess_wal
+                        && db.page_codec_id.is_none()
+                        && matches!(db.encryption_cipher_mode.get(), CipherMode::None)
+                        && (pager.get_auto_vacuum_mode() == AutoVacuumMode::None
+                            || db.opts.enable_autovacuum)
+                    {
+                        db.open_flags &= !OpenFlags::ReadOnly;
+                    }
 
                     // Wrap db in Arc before connecting
                     let db = Arc::new(db);
@@ -1659,8 +1730,11 @@ impl Database {
                     let conn = db._connect(
                         false,
                         Some(pager.clone()),
-                        state.encryption_key.clone(),
-                        page_codec.clone(),
+                        ConnectOpts {
+                            encryption_key: state.encryption_key.clone(),
+                            page_codec: page_codec.clone(),
+                            readonly: Some(db.readonly_bootstrap),
+                        },
                         ConnectionContext::default(),
                         StatsRefresh::Blocking,
                     )?;
@@ -1765,6 +1839,7 @@ impl Database {
                     if state.mvcc_convert_stmt.is_some()
                         || (db.opts.enable_mvcc
                             && db.get_mv_store().is_none()
+                            && !db.readonly_bootstrap
                             && !db.open_flags.contains(OpenFlags::ReadOnly))
                     {
                         if state.mvcc_convert_stmt.is_none() {
@@ -1786,8 +1861,11 @@ impl Database {
                             state.mvcc_bootstrap_conn = Some(db._connect(
                                 true,
                                 Some(pager.clone()),
-                                state.encryption_key.clone(),
-                                page_codec.clone(),
+                                ConnectOpts {
+                                    encryption_key: state.encryption_key.clone(),
+                                    page_codec: page_codec.clone(),
+                                    readonly: Some(false),
+                                },
                                 ConnectionContext::default(),
                                 StatsRefresh::Blocking,
                             )?);
@@ -1868,6 +1946,75 @@ impl Database {
                 }
             }
         }
+    }
+
+    fn ensure_writable_ready(&self) -> Result<()> {
+        if self.is_readonly() {
+            return Err(LimboError::ReadOnly);
+        }
+        let mut readiness = self.writer_readiness.lock();
+        if readiness.ready {
+            return Ok(());
+        }
+        if self.opts.enable_multiprocess_wal
+            || self.page_codec_id.is_some()
+            || !matches!(self.encryption_cipher_mode.get(), CipherMode::None)
+        {
+            return Err(LimboError::InvalidArgument(
+                "readonly storage activation requires an unencrypted default WAL database".into(),
+            ));
+        }
+        let pager = self._init(None, None)?;
+        let wal = self.build_wal(
+            self.shared_wal.read().last_checksum_and_max_frame(),
+            pager.buffer_pool.clone(),
+        )?;
+        if readiness.legacy && self.db_file.size()? > 0 {
+            wal.begin_vacuum_blocking_tx()?;
+            if let Err(error) = wal.try_begin_vacuum_checkpoint_lock() {
+                wal.end_write_tx();
+                wal.release_vacuum_lock();
+                return Err(error);
+            }
+            let result: Result<()> = (|| {
+                let header = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
+                header.borrow_mut().read_version = RawVersion::from(Version::Wal);
+                header.borrow_mut().write_version = RawVersion::from(Version::Wal);
+                let completion =
+                    storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page(), None)?;
+                self.io.wait_for_completion(completion)?;
+                let completion = self.db_file.sync(
+                    Completion::new_sync(|_| {}),
+                    crate::io::FileSyncType::FullFsync,
+                )?;
+                self.io.wait_for_completion(completion)?;
+                self.shared_wal
+                    .read()
+                    .metadata
+                    .transaction_count
+                    .fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })();
+            wal.release_vacuum_checkpoint_lock();
+            wal.end_write_tx();
+            wal.release_vacuum_lock();
+            result?;
+        }
+        readiness.legacy = false;
+        if readiness.orphan_wal {
+            self.io.remove_file(&self.wal_path)?;
+            readiness.orphan_wal = false;
+        }
+        let file = self
+            .io
+            .open_file(&self.wal_path, OpenFlags::Create, false)?;
+        let mut shared = self.shared_wal.write();
+        if let Some(previous) = shared.runtime.file.replace(file) {
+            readiness.retained_wal_files.push(previous);
+        }
+        shared.metadata.enabled.store(true, Ordering::Release);
+        readiness.ready = true;
+        Ok(())
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
@@ -2213,6 +2360,7 @@ impl Database {
                     let header_modified = match read_version {
                         Version::Legacy => {
                             if is_readonly {
+                                self.writer_readiness.get_mut().legacy = true;
                                 tracing::warn!(
                                     "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
                                     self.path
@@ -2308,7 +2456,11 @@ impl Database {
                                 *driver = Some(WalFileShared::open_shared_if_exists_begin(
                                     &self.io,
                                     &self.wal_path,
-                                    self.open_flags,
+                                    if self.readonly_bootstrap {
+                                        self.open_flags
+                                    } else {
+                                        self.open_flags | OpenFlags::Create
+                                    },
                                 )?);
                             }
                             return_if_io!(driver.as_mut().expect("driver initialized above").poll())
@@ -2319,7 +2471,11 @@ impl Database {
                             // synchronously here, so the blocking shims are
                             // fine. (Driver field is unused on host.)
                             let _ = &driver;
-                            let flags = self.open_flags;
+                            let flags = if self.readonly_bootstrap {
+                                self.open_flags
+                            } else {
+                                self.open_flags | OpenFlags::Create
+                            };
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
                                 if !authority.frame_index_overflowed() {
@@ -2376,7 +2532,8 @@ impl Database {
                             self.wal_path,
                             self.path
                         );
-                        if self.open_flags.contains(OpenFlags::ReadOnly) {
+                        if self.readonly_bootstrap {
+                            self.writer_readiness.get_mut().orphan_wal = true;
                             // A read-only open must not delete files, so just
                             // detach the WAL. This is the same state a
                             // read-only open reaches when there is no WAL file
@@ -2509,8 +2666,7 @@ impl Database {
             let mvcc_bootstrap_conn = self._connect(
                 true,
                 None,
-                None,
-                None,
+                ConnectOpts::new().with_readonly(false),
                 ConnectionContext::default(),
                 StatsRefresh::Blocking,
             )?;
@@ -2572,14 +2728,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            opts.encryption_key,
-            opts.page_codec,
-            context,
-            StatsRefresh::Blocking,
-        )
+        self._connect(false, None, opts, context, StatsRefresh::Blocking)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2615,8 +2764,7 @@ impl Database {
                 let conn = self._connect(
                     false,
                     None,
-                    opts.encryption_key,
-                    opts.page_codec,
+                    opts,
                     ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
@@ -2640,11 +2788,16 @@ impl Database {
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
-        encryption_key: Option<EncryptionKey>,
-        page_codec: Option<Arc<dyn PageCodec>>,
+        opts: ConnectOpts,
         context: ConnectionContext,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
+        let readonly = opts.readonly.unwrap_or(self.readonly_bootstrap);
+        let encryption_key = opts.encryption_key;
+        let page_codec = opts.page_codec;
+        if !readonly && !self.is_readonly() {
+            self.ensure_writable_ready()?;
+        }
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
                 "database requires an external page codec".to_string(),
@@ -2677,6 +2830,7 @@ impl Database {
             encryption_key,
             default_cache_size,
             context,
+            readonly,
         )?;
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
@@ -2700,6 +2854,7 @@ impl Database {
             encryption_key,
             default_cache_size,
             ConnectionContext::default(),
+            self.readonly_bootstrap,
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2714,10 +2869,12 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
         context: ConnectionContext,
+        readonly: bool,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
+            main_readonly: readonly,
             context: context.value,
             hooks: context.hooks,
             pager: ArcSwap::new(pager),
@@ -3390,11 +3547,12 @@ impl Database {
         let wal_enabled = shared_wal.metadata.enabled.load(Ordering::SeqCst);
         let last_checksum_and_max_frame = shared_wal.last_checksum_and_max_frame();
         drop(shared_wal);
-        let pager_wal: Option<Arc<dyn Wal>> = if wal_enabled {
-            Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
-        } else {
-            None
-        };
+        let pager_wal: Option<Arc<dyn Wal>> =
+            if wal_enabled || (self.readonly_bootstrap && !self.is_readonly()) {
+                Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
+            } else {
+                None
+            };
 
         let pager = Pager::new(
             self.db_file.clone(),
@@ -3648,6 +3806,7 @@ pub(crate) struct AttachedDatabase {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
     pub(crate) sync_mode: SyncMode,
+    pub(crate) readonly: bool,
 }
 
 /// The databases of a connection other than main and temp, by database id.
@@ -3683,6 +3842,7 @@ impl DatabaseCatalog {
                 db,
                 pager,
                 sync_mode: SyncMode::Full,
+                readonly: false,
             },
         );
         idx
