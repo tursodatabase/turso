@@ -13,6 +13,58 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 
 #[test]
+fn native_scalar_overloads_prefer_exact_then_finite_then_variadic() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(EngineDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "native_overload".into(),
+                    FunctionArity::OneOf(&[1, 3]),
+                    false,
+                    NullToNine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "native_overload".into(),
+                    FunctionArity::Exact(1),
+                    false,
+                    Nine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "native_overload".into(),
+                    FunctionArity::Variadic,
+                    false,
+                    Nine,
+                )
+                .unwrap(),
+            ),
+    );
+    for (sql, expected) in [
+        ("SELECT native_overload(7)", 9),
+        ("SELECT native_overload(7,8)", 9),
+        ("SELECT native_overload(7,8,9)", 7),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected)]]
+        );
+    }
+    let mut listed = conn
+        .get_syms_functions()
+        .into_iter()
+        .filter(|(name, _, _, _)| name == "native_overload")
+        .map(|(_, _, argc, _)| argc)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(listed, vec![-1, 1, 1, 3]);
+}
+
+#[test]
 fn native_scalar_accepts_only_declared_argument_counts() {
     for arity in [
         FunctionArity::OneOf(&[]),
@@ -2743,7 +2795,12 @@ fn declared_return_type_of_extension_functions_matches_what_they_return() {
         .read()
         .functions
         .iter()
-        .filter_map(|(name, func)| func.func.return_type().map(|t| (name.clone(), t)))
+        .flat_map(|(name, functions)| {
+            functions
+                .iter()
+                .filter_map(|entry| entry.function.as_ref())
+                .filter_map(move |func| func.func.return_type().map(|t| (name.clone(), t)))
+        })
         .collect();
     assert!(!declared.is_empty());
 

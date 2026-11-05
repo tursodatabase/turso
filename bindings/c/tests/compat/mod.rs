@@ -64,6 +64,7 @@ extern "C" {
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
     fn sqlite3_close(db: *mut sqlite3) -> i32;
+    fn sqlite3_close_v2(db: *mut sqlite3) -> i32;
     fn sqlite3_open(filename: *const libc::c_char, db: *mut *mut sqlite3) -> i32;
     fn sqlite3_db_filename(db: *mut sqlite3, db_name: *const libc::c_char) -> *const libc::c_char;
     fn sqlite3_exec(
@@ -253,6 +254,361 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod tests {
     use super::*;
+
+    struct ScalarData {
+        db: *mut sqlite3,
+        value: i64,
+        destroyed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    unsafe extern "C" fn scalar_value(ctx: *mut libc::c_void, _: i32, _: *mut *mut libc::c_void) {
+        let data = &*sqlite3_user_data(ctx).cast::<ScalarData>();
+        if sqlite3_context_db_handle(ctx).cast::<sqlite3>() != data.db {
+            sqlite3_result_error(ctx, c"wrong callback database".as_ptr(), -1);
+        } else {
+            sqlite3_result_int64(ctx, data.value);
+        }
+    }
+
+    unsafe extern "C" fn scalar_destroy(data: *mut libc::c_void) {
+        let data = Box::from_raw(data.cast::<ScalarData>());
+        data.destroyed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe fn scalar_register(
+        db: *mut sqlite3,
+        name: &std::ffi::CStr,
+        argc: i32,
+        value: i64,
+    ) -> (i32, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let destroyed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let data = Box::into_raw(Box::new(ScalarData {
+            db,
+            value,
+            destroyed: destroyed.clone(),
+        }));
+        (
+            sqlite3_create_function_v2(
+                db,
+                name.as_ptr(),
+                argc,
+                SQLITE_UTF8,
+                data.cast(),
+                Some(scalar_value),
+                None,
+                None,
+                Some(scalar_destroy),
+            ),
+            destroyed,
+        )
+    }
+
+    unsafe fn scalar_prepare(db: *mut sqlite3, sql: &str) -> *mut sqlite3_stmt {
+        let sql = std::ffi::CString::new(sql).unwrap();
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK,
+            "{sql:?}"
+        );
+        stmt
+    }
+
+    unsafe fn scalar_query(db: *mut sqlite3, sql: &str, expected: i64) {
+        let stmt = scalar_prepare(db, sql);
+        assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(stmt, 0), expected);
+        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+    }
+
+    #[test]
+    fn scalar_registrations_have_no_process_capacity_limit() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for n in 0..64 {
+                let name = std::ffi::CString::new(format!("scalar_many_{n}")).unwrap();
+                assert_eq!(
+                    scalar_register(db, &name, 0, n).0,
+                    SQLITE_OK,
+                    "registration {n}"
+                );
+            }
+            for n in 0..64 {
+                scalar_query(db, &format!("SELECT scalar_many_{n}()"), n);
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn scalar_signatures_replace_and_delete_independently() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, zero) = scalar_register(db, c"scalar_overload", 0, 10);
+            assert_eq!(rc, SQLITE_OK);
+            let (rc, one) = scalar_register(db, c"scalar_overload", 1, 11);
+            assert_eq!(rc, SQLITE_OK);
+            let (rc, variadic) = scalar_register(db, c"scalar_overload", -1, 99);
+            assert_eq!(rc, SQLITE_OK);
+            scalar_query(db, "SELECT scalar_overload()", 10);
+            scalar_query(db, "SELECT scalar_overload(7)", 11);
+            scalar_query(db, "SELECT scalar_overload(7,8)", 99);
+            assert_eq!(scalar_register(db, c"scalar_overload", 1, 21).0, SQLITE_OK);
+            assert_eq!(one.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(zero.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(variadic.load(std::sync::atomic::Ordering::SeqCst), 0);
+            scalar_query(db, "SELECT scalar_overload(7)", 21);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_overload".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut deleted = ptr::null_mut();
+            assert_ne!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT scalar_overload(7)".as_ptr(),
+                    -1,
+                    &mut deleted,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            scalar_query(db, "SELECT scalar_overload(7,8)", 99);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_overload".as_ptr(),
+                    -1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut stmt = ptr::null_mut();
+            assert_ne!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT scalar_overload(7)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            scalar_query(db, "SELECT scalar_overload()", 10);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(zero.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(variadic.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_fixed_arity_wins_in_both_registration_orders() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for (name, reverse) in [(c"scalar_order_a", false), (c"scalar_order_b", true)] {
+                let mut registrations = vec![(0, 10), (1, 11), (-1, 99)];
+                if reverse {
+                    registrations.reverse();
+                }
+                for (argc, value) in registrations {
+                    assert_eq!(scalar_register(db, name, argc, value).0, SQLITE_OK);
+                }
+                let name = name.to_str().unwrap();
+                scalar_query(db, &format!("SELECT {name}()"), 10);
+                scalar_query(db, &format!("SELECT {name}(7)"), 11);
+                scalar_query(db, &format!("SELECT {name}(7,8)"), 99);
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn scalar_and_aggregate_share_registration_signature() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, destroyed) = scalar_register(db, c"scalar_then_aggregate", 1, 10);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"scalar_then_aggregate".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    Some(signature_aggregate_step),
+                    Some(signature_aggregate_final)
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            scalar_query(
+                db,
+                "WITH data(x) AS (VALUES (1), (2)) SELECT scalar_then_aggregate(x) FROM data",
+                77,
+            );
+            assert_eq!(
+                scalar_register(db, c"scalar_then_aggregate", 1, 20).0,
+                SQLITE_OK
+            );
+            scalar_query(db, "SELECT scalar_then_aggregate(1)", 20);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn signature_aggregate_step(
+        _: *mut libc::c_void,
+        _: i32,
+        _: *mut *mut libc::c_void,
+    ) {
+    }
+    unsafe extern "C" fn signature_aggregate_final(ctx: *mut libc::c_void) {
+        sqlite3_result_int64(ctx, 77);
+    }
+
+    #[test]
+    fn scalar_failed_registration_destroys_userdata_once() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, destroyed) = scalar_register(db, c"scalar_rejected", -2, 1);
+            assert_ne!(rc, SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_prepared_replacement_keeps_userdata_alive() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, old) = scalar_register(db, c"scalar_prepared", 0, 10);
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = scalar_prepare(db, "SELECT scalar_prepared()");
+            let (rc, new) = scalar_register(db, c"scalar_prepared", 0, 20);
+            assert_eq!(rc, SQLITE_OK);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 0);
+            #[cfg(feature = "sqlite3")]
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 20);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_deferred_close_keeps_callback_database_alive() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, destroyed) = scalar_register(db, c"scalar_deferred", 0, 42);
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = scalar_prepare(db, "SELECT scalar_deferred()");
+            assert_eq!(sqlite3_close(db), SQLITE_BUSY);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 42);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_active_replacement_is_busy_and_destroys_rejected_userdata() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let (rc, old) = scalar_register(db, c"scalar_active", 0, 10);
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = scalar_prepare(
+                db,
+                "SELECT scalar_active() UNION ALL SELECT scalar_active()",
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let (rc, rejected) = scalar_register(db, c"scalar_active", 0, 20);
+            assert_eq!(rc, SQLITE_BUSY);
+            assert_eq!(rejected.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"scalar_active".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_BUSY
+            );
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 10);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            scalar_query(db, "SELECT scalar_active()", 10);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_registrations_are_connection_local() {
+        unsafe {
+            let (mut a, mut b) = (ptr::null_mut(), ptr::null_mut());
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut a), SQLITE_OK);
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut b), SQLITE_OK);
+            let (rc, a_destroyed) = scalar_register(a, c"scalar_shared", 0, 111);
+            assert_eq!(rc, SQLITE_OK);
+            let prepared = scalar_prepare(a, "SELECT scalar_shared()");
+            let (rc, b_destroyed) = scalar_register(b, c"scalar_shared", 0, 222);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(sqlite3_step(prepared), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(prepared, 0), 111);
+            assert_eq!(sqlite3_finalize(prepared), SQLITE_OK);
+            scalar_query(a, "SELECT scalar_shared()", 111);
+            scalar_query(b, "SELECT scalar_shared()", 222);
+            let (rc, replacement) = scalar_register(b, c"scalar_shared", 0, 333);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(b_destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(a_destroyed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            scalar_query(b, "SELECT scalar_shared()", 333);
+            assert_eq!(sqlite3_close(b), SQLITE_OK);
+            assert_eq!(replacement.load(std::sync::atomic::Ordering::SeqCst), 1);
+            scalar_query(a, "SELECT scalar_shared()", 111);
+            assert_eq!(sqlite3_close(a), SQLITE_OK);
+            assert_eq!(a_destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     #[cfg(not(feature = "sqlite3"))]
