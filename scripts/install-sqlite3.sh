@@ -10,13 +10,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 INSTALL_DIR="${INSTALL_DIR:-$PROJECT_ROOT/.sqlite3}"
 
-# The version comes from versions.json. SQLITE_VERSION is the number form that
+# The version comes from sqlite/version. SQLITE_VERSION is the number form that
 # sqlite.org uses in file names: 3.50.4 becomes 3500400.
 if [ -z "${SQLITE_VERSION:-}" ]; then
-    IFS=. read -r major minor patch <<< "$(jq -r .sqlite.version "$PROJECT_ROOT/versions.json")"
+    version=$(cat "$PROJECT_ROOT/sqlite/version")
+    IFS=. read -r major minor patch <<< "$version"
     SQLITE_VERSION=$(printf '%d%02d%02d00' "$major" "$minor" "$patch")
 fi
-SQLITE_YEAR="${SQLITE_YEAR:-$(jq -r .sqlite.release_year "$PROJECT_ROOT/versions.json")}"
+# sqlite.org keeps each release in a folder named after its release year.
+# Change this when sqlite/version moves to a release from another year.
+SQLITE_YEAR="${SQLITE_YEAR:-2025}"
 
 # Detect OS and architecture
 detect_platform() {

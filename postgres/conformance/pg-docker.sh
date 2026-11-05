@@ -11,13 +11,13 @@
 # `up` from your own shell and then give the agent the printed PG_DSN.
 #
 # Settings (environment variables):
-#   POSTGRES_VERSION  server version, default postgres.version in versions.json
+#   POSTGRES_VERSION  server version, default in postgres/version
 #   PG_CONTAINER      container name, default turso-pg
 #   PG_PORT           port on 127.0.0.1, default 54329
 set -euo pipefail
 
-VERSIONS_FILE="$(dirname "${BASH_SOURCE[0]}")/../../versions.json"
-POSTGRES_VERSION="${POSTGRES_VERSION:-$(jq -r .postgres.version "$VERSIONS_FILE")}"
+VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/../version"
+POSTGRES_VERSION="${POSTGRES_VERSION:-$(cat "$VERSION_FILE")}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:$POSTGRES_VERSION}"
 PG_CONTAINER="${PG_CONTAINER:-turso-pg}"
 PG_PORT="${PG_PORT:-54329}"

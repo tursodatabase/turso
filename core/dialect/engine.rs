@@ -22,10 +22,9 @@ use turso_ext::VTabKind;
 
 /// SQLite version reported by compatibility APIs.
 ///
-/// This must equal `sqlite.version` in `versions.json`, which
-/// `scripts/install-sqlite3.sh` reads; a test checks that, and that
-/// [`SQLITE_VERSION_NUMBER`] matches. Keep README.md and COMPAT.md in sync
-/// when bumping it.
+/// This must equal `sqlite/version`, which `scripts/install-sqlite3.sh`
+/// reads; a test checks that, and that [`SQLITE_VERSION_NUMBER`] matches.
+/// Keep README.md and COMPAT.md in sync when bumping it.
 pub const SQLITE_VERSION: &str = "3.50.4";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
@@ -624,18 +623,14 @@ pub(crate) fn resolve_builtin_function_name(
 mod tests {
     use super::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 
-    /// The constants cannot read `versions.json` while building, because the
+    /// The constants cannot read `sqlite/version` while building, because the
     /// file is outside this crate and would be missing from the published
     /// package. This test fails when they differ from it.
     #[test]
-    fn sqlite_version_constants_match_versions_json() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../versions.json");
-        let text =
-            std::fs::read_to_string(path).expect("versions.json should be at the repository root");
-        let versions: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let version = versions["sqlite"]["version"]
-            .as_str()
-            .expect("sqlite.version should be a string");
+    fn sqlite_version_constants_match_sqlite_version_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../sqlite/version");
+        let text = std::fs::read_to_string(path).expect("sqlite/version should exist");
+        let version = text.trim();
 
         assert_eq!(SQLITE_VERSION, version);
 
@@ -644,7 +639,7 @@ mod tests {
             .map(|part| part.parse().unwrap())
             .collect::<Vec<_>>()
             .try_into()
-            .expect("sqlite.version should have three parts, like 3.50.4");
+            .expect("sqlite/version should have three parts, like 3.50.4");
         assert_eq!(
             SQLITE_VERSION_NUMBER,
             major * 1_000_000 + minor * 1_000 + patch

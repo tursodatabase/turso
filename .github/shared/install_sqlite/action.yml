@@ -5,7 +5,7 @@ runs:
   using: "composite"
   steps:
     - name: Install SQLite
-      # The version comes from versions.json (read by scripts/install-sqlite3.sh).
+      # The version comes from sqlite/version (read by scripts/install-sqlite3.sh).
       run: |
         "$GITHUB_WORKSPACE/scripts/install-sqlite3.sh"
         echo "$GITHUB_WORKSPACE/.sqlite3" >> "$GITHUB_PATH"

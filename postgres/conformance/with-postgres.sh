@@ -9,11 +9,11 @@
 #
 # To test against another PostgreSQL version, set POSTGRES_VERSION, for
 # example POSTGRES_VERSION=17. To change the version for everyone, change
-# postgres.version in versions.json at the repository root.
+# postgres/version.
 set -euo pipefail
 
-VERSIONS_FILE="$(dirname "${BASH_SOURCE[0]}")/../../versions.json"
-POSTGRES_VERSION="${POSTGRES_VERSION:-$(jq -r .postgres.version "$VERSIONS_FILE")}"
+VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/../version"
+POSTGRES_VERSION="${POSTGRES_VERSION:-$(cat "$VERSION_FILE")}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:$POSTGRES_VERSION}"
 
 if [[ -n "${PG_DSN:-}" ]]; then
