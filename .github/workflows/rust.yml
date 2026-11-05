@@ -503,10 +503,14 @@ jobs:
   # same PR always generates the same SQL, a green run stays green, and a
   # failure blocks the merge and reproduces exactly. All other runs (pushes to
   # main and manual runs) use new random seeds, where a failure is a bug to
-  # investigate and does not block an unrelated pull request.
+  # investigate and does not block an unrelated pull request. A failure on main
+  # is filed as an issue.
   differential-fuzzer:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
     env:
       DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
     strategy:
@@ -528,6 +532,8 @@ jobs:
       - name: Build differential_fuzzer
         run: cargo build -p differential-fuzzer --bin differential_fuzzer
       - name: Run differential_fuzzer on ${{ github.event_name == 'pull_request' && 'fixed' || 'random' }} seeds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Reproduce a failure locally with:
           #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
@@ -552,6 +558,12 @@ jobs:
               echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
             fi
             if [ "$exit_code" -ne 0 ]; then
+              if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+                gh issue create --label fuzzing \
+                  --title "differential fuzzer ${{ matrix.profile }} failure seed $seed" \
+                  --body "$(printf 'Exit code %s in %s/%s/actions/runs/%s\n\n```\ncargo run -p differential-fuzzer --bin differential_fuzzer -- --seed %s --profile %s -n 1000\n```\n' \
+                    "$exit_code" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$seed" "${{ matrix.profile }}")"
+              fi
               exit "$exit_code"
             fi
           done
