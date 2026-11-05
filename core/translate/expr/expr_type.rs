@@ -726,12 +726,12 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
 pub(crate) fn type_without_comparison<'a>(
     ty: &'a ExprType,
     schema: &Schema,
-) -> Option<&'a Arc<TypeDef>> {
-    match ty {
+) -> Result<Option<&'a Arc<TypeDef>>> {
+    Ok(match ty {
         ExprType::Custom { type_def, .. } => {
-            (!schema.type_has_comparison(type_def)).then_some(type_def)
+            (!schema.type_has_comparison(type_def)?).then_some(type_def)
         }
-        ExprType::Array { element, .. } => type_without_comparison(element, schema),
+        ExprType::Array { element, .. } => return type_without_comparison(element, schema),
         ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null => None,
         // An expression whose type nothing declares never holds a stored value
         // of a type that can't be compared: it is the input `value` of a type's
@@ -748,7 +748,7 @@ pub(crate) fn type_without_comparison<'a>(
         // A row value such as `(j, 1)` compares its values one by one, and each
         // of them is checked.
         ExprType::RowValue => None,
-    }
+    })
 }
 
 /// Fails when `expr` itself, not counting its operands, puts a value whose
@@ -836,7 +836,7 @@ pub(crate) fn check_array_arguments<'a>(
 /// without asking how their type compares, and an array built from untyped
 /// arguments has no element type for `=` to check.
 pub(crate) fn check_array_element_compares(element: &ExprType, schema: &Schema) -> Result<()> {
-    match type_without_comparison(element, schema) {
+    match type_without_comparison(element, schema)? {
         Some(type_def) => schema.check_array_element_type(&type_def.name),
         None => Ok(()),
     }
@@ -974,32 +974,52 @@ fn binary_type(
 
 /// The type of `operand -> key`. SQLite's `->` gives the JSON text of what it
 /// extracts, or NULL (json.c registers it with JSON_JSON, "Result is always
-/// JSON"). As in PostgreSQL, on a value whose type can't be compared, such as
-/// json or jsonb, it gives a json value, whose comparisons are refused, rather
-/// than text compared by its characters. An operand whose type isn't known
-/// yet gives a result whose type isn't known yet, typed again once it is.
+/// JSON"). As in PostgreSQL, on a json or jsonb value, or a domain over one,
+/// it gives a json value rather than text compared by its characters. On
+/// another type whose values can't be compared, such as inet, the result keeps
+/// that type, so comparing it is refused too. An operand whose type isn't
+/// known yet gives a result whose type isn't known yet, typed again once it
+/// is. An operand whose type doesn't resolve gives that type, so that
+/// comparing the result reports why.
 fn json_extract_type(operand: ExprType, schema: &Schema) -> ExprType {
     match &operand {
         ExprType::NotKnownYet => ExprType::NotKnownYet,
         ExprType::Unknown => ExprType::Unknown,
-        ExprType::Custom { .. } | ExprType::Array { .. } => {
-            if type_without_comparison(&operand, schema).is_none() {
-                return ExprType::Builtin(BuiltinType::Text);
+        ExprType::Custom { type_def, .. } => match schema.resolve_type_unchecked(&type_def.name) {
+            Ok(Some(resolved)) => {
+                let is_json = resolved
+                    .chain
+                    .iter()
+                    .any(|td| td.is_builtin && matches!(td.name.as_str(), "json" | "jsonb"));
+                if !is_json {
+                    return text_unless_no_comparison(operand, schema);
+                }
+                match schema.get_type_def_unchecked("json") {
+                    Some(json) if json.is_builtin => ExprType::Custom {
+                        type_def: Arc::clone(json),
+                        params: Vec::new(),
+                    },
+                    Some(_) | None => unreachable!(
+                        "the built-in json and jsonb types are registered together (bootstrap_builtin_types)"
+                    ),
+                }
             }
-            match schema.get_type_def_unchecked("json") {
-                Some(json) if json.is_builtin => ExprType::Custom {
-                    type_def: Arc::clone(json),
-                    params: Vec::new(),
-                },
-                // Built without the json feature, there is no built-in json
-                // type, and a type named json is a user's. The result then
-                // keeps the operand's type, which can't be compared either.
-                Some(_) | None => operand,
-            }
-        }
+            Ok(None) | Err(_) => operand,
+        },
+        ExprType::Array { .. } => text_unless_no_comparison(operand, schema),
         ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::RowValue => {
             ExprType::Builtin(BuiltinType::Text)
         }
+    }
+}
+
+/// The type of `operand -> key` for an operand that isn't json: text, unless
+/// values of the operand's type can't be compared or its type doesn't resolve.
+/// Then the result keeps that type, so comparing it is refused.
+fn text_unless_no_comparison(operand: ExprType, schema: &Schema) -> ExprType {
+    match type_without_comparison(&operand, schema) {
+        Ok(None) => ExprType::Builtin(BuiltinType::Text),
+        Ok(Some(_)) | Err(_) => operand,
     }
 }
 
@@ -1404,9 +1424,10 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // A type whose values cannot be compared stays that type when mixed with
         // any other one, even one nothing declares, so that comparing the result
         // is refused instead of comparing stored text: coalesce(inet_column,
-        // cidr_column) is an inet, as in PostgreSQL.
-        (a, _) if type_without_comparison(&a, schema).is_some() => a,
-        (_, b) if type_without_comparison(&b, schema).is_some() => b,
+        // cidr_column) is an inet, as in PostgreSQL. A type that doesn't
+        // resolve stays too, so that comparing the result reports why.
+        (a, _) if !matches!(type_without_comparison(&a, schema), Ok(None)) => a,
+        (_, b) if !matches!(type_without_comparison(&b, schema), Ok(None)) => b,
         (ExprType::Unknown | ExprType::RowValue, _)
         | (_, ExprType::Unknown | ExprType::RowValue) => ExprType::Unknown,
         (ExprType::NotKnownYet, _) | (_, ExprType::NotKnownYet) => ExprType::NotKnownYet,
@@ -1724,7 +1745,9 @@ mod tests {
     fn only_json_like_types_and_their_arrays_lack_a_comparison() {
         let schema = test_schema();
         let lacks_comparison = |ty: ExprType| {
-            type_without_comparison(&ty, &schema).map(|type_def| type_def.name.clone())
+            type_without_comparison(&ty, &schema)
+                .unwrap()
+                .map(|type_def| type_def.name.clone())
         };
         let json = Some("json".to_string());
         assert_eq!(lacks_comparison(custom("json", &[])), json);

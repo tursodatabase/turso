@@ -2094,13 +2094,14 @@ impl Schema {
     }
 
     /// Whether values of `type_def` can be compared: neither it nor any type it
-    /// is based on lacks a comparison (see [TypeDef::has_comparison]). A type
-    /// that can't be resolved has none.
-    pub fn type_has_comparison(&self, type_def: &TypeDef) -> bool {
-        match self.resolve_type_unchecked(&type_def.name) {
-            Ok(Some(resolved)) => resolved.chain.iter().all(|td| td.has_comparison()),
-            Ok(None) | Err(_) => false,
-        }
+    /// is based on lacks a comparison (see [TypeDef::has_comparison]).
+    pub fn type_has_comparison(&self, type_def: &TypeDef) -> crate::Result<bool> {
+        let resolved = self
+            .resolve_type_unchecked(&type_def.name)?
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("type {} is not registered", type_def.name))
+            })?;
+        Ok(resolved.chain.iter().all(|td| td.has_comparison()))
     }
 
     /// Whether values of `type_def` take a COLLATE. See
@@ -2139,12 +2140,10 @@ impl Schema {
         }
         // Array functions such as array_position and @> compare elements
         // without asking how their type compares.
-        if !self.type_has_comparison(type_def) {
-            crate::bail_parse_error!(
-                "arrays of type {} are not supported, because values of type {} cannot be compared",
-                type_def.name,
-                type_def.name
-            );
+        if !self.type_has_comparison(type_def)? {
+            return Err(crate::translate::collate::no_comparison_array_error(
+                &type_def.name,
+            ));
         }
         Ok(())
     }
@@ -2195,16 +2194,18 @@ impl Schema {
     ) -> crate::Result<()> {
         use crate::translate::expr::expr_type::{column_type, type_without_comparison};
         let ty = column_type(column, is_strict, self);
-        let Some(type_def) = type_without_comparison(&ty, self) else {
+        let Some(type_def) = type_without_comparison(&ty, self)? else {
             return Ok(());
         };
-        crate::bail_parse_error!(
-            "column '{}' of type '{}{}' cannot be a key: values of type {} cannot be compared",
+        Err(crate::translate::collate::no_comparison_key_error(
             column.name.as_deref().unwrap_or_default(),
-            column.ty_str,
-            "[]".repeat(column.array_dimensions() as usize),
-            type_def.name
-        );
+            &format!(
+                "{}{}",
+                column.ty_str,
+                "[]".repeat(column.array_dimensions() as usize)
+            ),
+            &type_def.name,
+        ))
     }
 
     /// Whether different stored values of the column might read back as the same
@@ -4118,14 +4119,130 @@ impl Schema {
             pending
                 .dbsp_state_index_roots
                 .extend(dbsp_state_index_roots);
-            return self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled);
+        } else {
+            self.populate_materialized_views(
+                materialized_view_info,
+                dbsp_state_roots,
+                dbsp_state_index_roots,
+            )?;
         }
-        self.populate_materialized_views(
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-        )?;
-        self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled)
+        self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled)?;
+        self.check_stored_comparisons(syms)
+    }
+
+    /// Refuses a stored table or index that compares values of a type that
+    /// can't be compared, such as json: a UNIQUE, PRIMARY KEY or FOREIGN KEY
+    /// column, an index column or expression, or a comparison in a CHECK
+    /// constraint, generated column or partial index WHERE clause. CREATE
+    /// TABLE, CREATE INDEX and ALTER TABLE refuse these, but a database written
+    /// by an older Turso may have them, and a key on such a column compares
+    /// the stored bytes.
+    fn check_stored_comparisons(&self, syms: &SymbolTable) -> Result<()> {
+        // Every type whose values can't be compared is a custom type, and
+        // without custom types the schema has none (Schema::new).
+        if !self.custom_types_enabled {
+            return Ok(());
+        }
+        let database_schemas = RwLock::new(HashMap::default());
+        let temp_database = RwLock::new(None);
+        let attached_databases = RwLock::new(crate::DatabaseCatalog::new());
+        let qualifiers = crate::Qualifiers::default();
+        // The schema is read without the connection's dialect. Binding an
+        // expression over one table resolves its names the same way in both
+        // dialects.
+        let resolver = Resolver::new(
+            self,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &qualifiers,
+            syms,
+            self.custom_types_enabled,
+            crate::translate::emitter::DoubleQuotedDml::Enabled,
+            Arc::new(crate::dialect::EngineDialect),
+            None,
+        );
+        for (namespace, objects) in &self.namespaces {
+            let namespace = crate::NamespaceRef {
+                database_id: crate::MAIN_DB_ID,
+                id: *namespace,
+            };
+            for table in objects.tables.values() {
+                // A virtual table has no keys, CHECK constraints or indexes.
+                let Some(table) = table.btree() else {
+                    continue;
+                };
+                let indexes = objects.indexes.get(&normalize_ident(&table.name));
+                self.check_stored_table_comparisons(
+                    &table,
+                    indexes.into_iter().flatten(),
+                    &resolver,
+                    namespace,
+                )
+                .map_err(|err| {
+                    LimboError::ParseError(format!("cannot load table '{}': {err}", table.name))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// See [Schema::check_stored_comparisons].
+    fn check_stored_table_comparisons<'a>(
+        &self,
+        table: &BTreeTable,
+        indexes: impl Iterator<Item = &'a Arc<Index>>,
+        resolver: &Resolver,
+        namespace: crate::NamespaceRef,
+    ) -> Result<()> {
+        use crate::translate::index::check_index_expression_has_comparison;
+        use crate::translate::schema::bind_stored_expr;
+        let within =
+            |what: String| move |err: LimboError| LimboError::ParseError(format!("{what}: {err}"));
+        for column in &table.columns {
+            if table.is_key_column(column) {
+                self.check_key_column_has_comparison(column, table.is_strict)?;
+            }
+            if let Some(expr) = column.generated_expr() {
+                bind_stored_expr(table, expr, resolver, namespace).map_err(within(format!(
+                    "generated column '{}'",
+                    column.name.as_deref().unwrap_or_default()
+                )))?;
+            }
+        }
+        for check in &table.check_constraints {
+            bind_stored_expr(table, &check.expr, resolver, namespace)
+                .map_err(within(check.sql()))?;
+        }
+        for index in indexes {
+            for index_column in &index.columns {
+                match index_column.expression() {
+                    Some(expr) => {
+                        let in_expr = within(format!("index '{}' on {expr}", index.name));
+                        check_index_expression_has_comparison(
+                            expr,
+                            table,
+                            self,
+                            resolver.catalog.symbol_table,
+                        )
+                        .map_err(&in_expr)?;
+                        bind_stored_expr(table, expr, resolver, namespace).map_err(in_expr)?;
+                    }
+                    None => self
+                        .check_key_column_has_comparison(
+                            &table.columns[index_column.pos_in_table],
+                            table.is_strict,
+                        )
+                        .map_err(within(format!("index '{}'", index.name)))?,
+                }
+            }
+            if let Some(where_clause) = &index.where_clause {
+                bind_stored_expr(table, where_clause, resolver, namespace).map_err(within(
+                    format!("index '{}' WHERE {where_clause}", index.name),
+                ))?;
+            }
+        }
+        Ok(())
     }
 
     /// Refuse a schema that uses custom types when they are not enabled.
@@ -9078,6 +9195,19 @@ mod tests {
                 "built-in type {name} is missing from builtin_has_comparison"
             );
         }
+    }
+
+    #[test]
+    fn asking_whether_a_type_that_does_not_resolve_has_a_comparison_fails() {
+        let mut schema = Schema::new();
+        schema.insert_type_from_sql("CREATE DOMAIN a AS b").unwrap();
+        schema.insert_type_from_sql("CREATE DOMAIN b AS a").unwrap();
+        let a = Arc::clone(schema.get_type_def_unchecked("a").unwrap());
+        let err = schema.type_has_comparison(&a).unwrap_err();
+        assert!(
+            err.to_string().contains("circular type dependency"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

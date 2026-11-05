@@ -249,6 +249,8 @@ fn errors_report_postgres_sqlstates() {
     conn.execute("CREATE SEQUENCE s_exhaust START 2 INCREMENT 1 MINVALUE 1 MAXVALUE 2")
         .unwrap();
     conn.execute("SELECT nextval('s_exhaust')").unwrap();
+    conn.execute("CREATE TABLE t_json (j json, a inet)")
+        .unwrap();
     for (sql, code) in [
         ("SELECTT 1", "42601"),
         ("SELECT * FROM no_such_table_xyz", "42P01"),
@@ -258,6 +260,10 @@ fn errors_report_postgres_sqlstates() {
         ("SELECT abs(-9223372036854775808)", "22003"),
         ("SELECT zeroblob(1000000001)", "22001"),
         ("SELECT nextval('s_exhaust')", "2200H"),
+        ("SELECT j = j FROM t_json", "42883"),
+        ("SELECT a < a FROM t_json", "42883"),
+        ("CREATE TABLE t_key (j jsonb UNIQUE)", "42704"),
+        ("CREATE TABLE t_array (a jsonb[])", "0A000"),
     ] {
         let e = exec_err(&conn, sql);
         assert_eq!(e.sqlstate, code, "wrong SQLSTATE for: {sql}, got {e:?}");

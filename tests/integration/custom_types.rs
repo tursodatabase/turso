@@ -1428,33 +1428,87 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// CREATE INDEX refuses an index on a json expression, but a database that
-    /// already has one, made by an earlier version, must still open.
+    /// CREATE TABLE and CREATE INDEX refuse a key, an index or a CHECK that
+    /// compares json values, so a stored schema that has one, written by an
+    /// earlier version, must not load.
     #[test]
-    fn test_open_file_with_index_on_json_expression() {
-        let tmp_dir = TempDir::new().unwrap();
-        let path = tmp_dir.path().join("json_expression_index.db");
-        let sqlite = rusqlite::Connection::open(&path).unwrap();
-        sqlite
-            .execute_batch(
-                "CREATE TABLE t(j TEXT);
-                 CREATE INDEX x ON t(j);
-                 PRAGMA writable_schema = ON;
-                 UPDATE sqlite_schema SET sql = 'CREATE TABLE t(j json) STRICT'
-                  WHERE name = 't';
-                 UPDATE sqlite_schema SET sql = 'CREATE INDEX x ON t((j -> ''x''))'
-                  WHERE name = 'x';",
-            )
-            .unwrap();
-        drop(sqlite);
+    fn test_open_file_that_compares_json_values_fails() {
+        // (table sql, index sql, expected error)
+        let cases = [
+            (
+                "CREATE TABLE t(j json UNIQUE) STRICT",
+                None,
+                "cannot load table 't': column 'j' of type 'json' cannot be a key: values of type json cannot be compared",
+            ),
+            (
+                "CREATE TABLE t(j json) STRICT",
+                Some("CREATE INDEX x ON t(j)"),
+                "cannot load table 't': index 'x': column 'j' of type 'json' cannot be a key: values of type json cannot be compared",
+            ),
+            (
+                "CREATE TABLE t(j json) STRICT",
+                Some("CREATE INDEX x ON t((j -> 'x'))"),
+                "cannot load table 't': index 'x' on (j -> 'x'): values of type json cannot be compared",
+            ),
+            (
+                "CREATE TABLE t(i INTEGER, j json) STRICT",
+                Some("CREATE INDEX x ON t(i) WHERE j = '[]'"),
+                "cannot load table 't': index 'x' WHERE j = '[]': values of type json cannot be compared",
+            ),
+            (
+                "CREATE TABLE t(j json CHECK (j <> '[]')) STRICT",
+                None,
+                "cannot load table 't': CHECK(j <> '[]'): values of type json cannot be compared",
+            ),
+            (
+                "CREATE TABLE t(j json, g INTEGER AS (j = '[]')) STRICT",
+                None,
+                "cannot load table 't': generated column 'g': values of type json cannot be compared",
+            ),
+        ];
+        for (table_sql, index_sql, expected) in cases {
+            let tmp_dir = TempDir::new().unwrap();
+            let path = tmp_dir.path().join("compares_json.db");
+            let sqlite = rusqlite::Connection::open(&path).unwrap();
+            // Write a schema of the same shape, then swap in the SQL that
+            // CREATE TABLE and CREATE INDEX now refuse.
+            let plain_table_sql = table_sql.replace(" json", " TEXT").replace(" STRICT", "");
+            sqlite.execute_batch(&plain_table_sql).unwrap();
+            sqlite.execute_batch("PRAGMA writable_schema = ON").unwrap();
+            sqlite
+                .execute(
+                    "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+                    [table_sql],
+                )
+                .unwrap();
+            if let Some(index_sql) = index_sql {
+                sqlite.execute_batch("CREATE INDEX x ON t(j)").unwrap();
+                sqlite
+                    .execute(
+                        "UPDATE sqlite_schema SET sql = ?1 WHERE name = 'x'",
+                        [index_sql],
+                    )
+                    .unwrap();
+            }
+            drop(sqlite);
 
-        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
-        let conn = db.connect_limbo();
-        conn.execute(r#"INSERT INTO t VALUES ('{"x":1}')"#).unwrap();
-        let rows: Vec<(String,)> = conn.exec_rows("SELECT j FROM t");
-        assert_eq!(rows, vec![(r#"{"x":1}"#.to_string(),)]);
-        conn.execute("DROP INDEX x").unwrap();
+            let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let result = turso_core::Database::open_file_with_flags(
+                io,
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new().with_custom_types(true),
+                None,
+                Arc::new(SqliteDialect),
+            );
+            let Err(err) = result else {
+                panic!("open must fail for {table_sql} {index_sql:?}");
+            };
+            assert!(
+                err.to_string().contains(expected),
+                "{table_sql} {index_sql:?}: unexpected error: {err}"
+            );
+        }
     }
 
     fn database_with_table_of_type(ty: &str) -> (TempDatabase, Arc<turso_core::Connection>) {

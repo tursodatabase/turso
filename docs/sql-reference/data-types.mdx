@@ -187,6 +187,8 @@ SELECT id FROM docs WHERE CAST(body AS text) = '{"a":1}';
 -- 1
 ```
 
+Older Turso versions allowed some of these. A database written by one of them with such a key or index, or with a `CHECK`, generated column or partial index `WHERE` that compares these values, fails to open with an error that names the table, for example `cannot load table 'docs': column 'body' of type 'json' cannot be a key: values of type json cannot be compared`.
+
 For the full custom types reference including ENCODE/DECODE/COERCE, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
 
 ### Composite Types: STRUCT and UNION

@@ -1265,11 +1265,7 @@ pub fn translate_create_table(
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
-    // VACUUM creates the tables the database already has as nested
-    // statements, and those may break this rule.
-    if !connection.is_nested_stmt() {
-        bind_check_and_generated_exprs(&table, resolver, namespace)?;
-    }
+    bind_check_and_generated_exprs(&table, resolver, namespace)?;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 
@@ -1602,6 +1598,26 @@ pub(crate) fn bind_check_and_generated_exprs(
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> Result<()> {
+    let checks = table.check_constraints.iter().map(|check| &check.expr);
+    let generated = table
+        .columns()
+        .iter()
+        .filter_map(|column| column.generated_expr());
+    for expr in checks.chain(generated) {
+        bind_stored_expr(table, expr, resolver, namespace)?;
+    }
+    Ok(())
+}
+
+/// Binds `expr`, an expression over the columns of `table` that the schema
+/// stores, such as a CHECK constraint, a generated column, or an index
+/// expression or WHERE clause.
+pub(crate) fn bind_stored_expr(
+    table: &BTreeTable,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+) -> Result<()> {
     let table = Arc::new(table.clone());
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
@@ -1626,21 +1642,14 @@ pub(crate) fn bind_check_and_generated_exprs(
         }],
         vec![],
     );
-    let checks = table.check_constraints.iter().map(|check| &check.expr);
-    let generated = table
-        .columns()
-        .iter()
-        .filter_map(|column| column.generated_expr());
-    for expr in checks.chain(generated) {
-        let mut expr = expr.clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(&mut table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-    }
+    let mut expr = expr.clone();
+    bind_and_rewrite_expr(
+        &mut expr,
+        Some(&mut table_references),
+        None,
+        resolver,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )?;
     Ok(())
 }
 
