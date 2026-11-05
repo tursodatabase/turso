@@ -966,29 +966,40 @@ fn binary_type(
             }
             ExprType::Builtin(BuiltinType::Text)
         }
-        // `->` gives the JSON text of what it extracts, or NULL (SQLite's
-        // json.c registers it with JSON_JSON, "Result is always JSON"). As in
-        // PostgreSQL, on a json or jsonb value that is a json value, whose
-        // comparisons are refused, rather than text compared by its characters.
-        Operator::ArrowRight => json_extract_type(&type_of(lhs, env), env.schema())
-            .unwrap_or(ExprType::Builtin(BuiltinType::Text)),
+        Operator::ArrowRight => json_extract_type(type_of(lhs, env), env.schema()),
         // `->>` gives the SQL value it extracts, whose kind varies.
         Operator::ArrowRightShift => affinity_type(expr, env),
     }
 }
 
-/// The json type when `operand` is a value whose type cannot be compared, such
-/// as json or jsonb.
-fn json_extract_type(operand: &ExprType, schema: &Schema) -> Option<ExprType> {
-    type_without_comparison(operand, schema)?;
-    Some(match schema.get_type_def_unchecked("json") {
-        Some(json) => ExprType::Custom {
-            type_def: Arc::clone(json),
-            params: Vec::new(),
-        },
-        // The result then keeps the operand's type, which can't be compared either.
-        None => operand.clone(),
-    })
+/// The type of `operand -> key`. SQLite's `->` gives the JSON text of what it
+/// extracts, or NULL (json.c registers it with JSON_JSON, "Result is always
+/// JSON"). As in PostgreSQL, on a value whose type can't be compared, such as
+/// json or jsonb, it gives a json value, whose comparisons are refused, rather
+/// than text compared by its characters. An operand whose type isn't known
+/// yet gives a result whose type isn't known yet, typed again once it is.
+fn json_extract_type(operand: ExprType, schema: &Schema) -> ExprType {
+    match &operand {
+        ExprType::NotKnownYet => ExprType::NotKnownYet,
+        ExprType::Unknown => ExprType::Unknown,
+        ExprType::Custom { .. } | ExprType::Array { .. } => {
+            if type_without_comparison(&operand, schema).is_none() {
+                return ExprType::Builtin(BuiltinType::Text);
+            }
+            match schema.get_type_def_unchecked("json") {
+                Some(json) => ExprType::Custom {
+                    type_def: Arc::clone(json),
+                    params: Vec::new(),
+                },
+                // The result then keeps the operand's type, which can't be
+                // compared either.
+                None => operand,
+            }
+        }
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::RowValue => {
+            ExprType::Builtin(BuiltinType::Text)
+        }
+    }
 }
 
 /// The type of the operator expression `expr` when a custom type's function runs

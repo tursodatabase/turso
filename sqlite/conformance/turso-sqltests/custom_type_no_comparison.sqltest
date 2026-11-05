@@ -267,6 +267,24 @@ expect error {
     values of type json cannot be compared
 }
 
+@requires strict "uses STRICT tables"
+test no-comparison-json-arrow-on-subquery {
+    CREATE TABLE t(j jsonb) STRICT;
+    SELECT 1 FROM t WHERE (SELECT j FROM t) -> 'a' = '1';
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-order-by-arrow-on-subquery {
+    CREATE TABLE t(j jsonb) STRICT;
+    SELECT 1 FROM t ORDER BY (SELECT j FROM t) -> 'a';
+}
+expect error {
+    values of type json cannot be compared
+}
+
 # ============================================================================
 # Keys and indexes
 # ============================================================================

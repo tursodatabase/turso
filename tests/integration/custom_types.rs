@@ -2972,6 +2972,13 @@ mod tests {
                     .contains("arrays of type numeric are not supported");
                 continue;
             }
+            if TYPES_WITHOUT_COMPARISON.contains(&kind.name.as_str()) {
+                assert_that!(conn.execute(&create)).err().display_string().contains(format!(
+                    "arrays of type {} are not supported, because values of type {} cannot be compared",
+                    kind.name, kind.name
+                ));
+                continue;
+            }
             conn.execute(&create).unwrap();
             let run = |sql: &str| {
                 conn.execute(sql)
