@@ -798,11 +798,11 @@ fn translate_cast_expr(
                 StrictType::Any => {}
             }
             emit_store_value(program, &resolved, target_register, &ty_params, resolver)?;
-            emit_decode(program, chain, target_register, resolver)?;
+            emit_decode(program, &resolved, target_register, resolver)?;
             // The domain's CHECKs see the value after DECODE, as they do on a
             // column of the domain.
             if is_domain {
-                emit_domain_cast_constraints(program, chain, tn, target_register, resolver)?;
+                emit_domain_cast_constraints(program, &resolved, tn, target_register, resolver)?;
             }
             return Ok(target_register);
         }
@@ -1996,10 +1996,10 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::ArrayAppend
+                ScalarFunc::ArrayLength
+                | ScalarFunc::ArrayAppend
                 | ScalarFunc::ArrayPrepend
                 | ScalarFunc::ArrayCat
-                | ScalarFunc::ArrayLength
                 | ScalarFunc::ArrayRemove
                 | ScalarFunc::ArrayContains
                 | ScalarFunc::ArrayPosition

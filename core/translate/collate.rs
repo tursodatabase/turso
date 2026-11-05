@@ -775,6 +775,14 @@ pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_
     common_ordering_of([(operand, context)], true).map(|_| ())
 }
 
+/// Fails when the values of `key`, an ORDER BY or DISTINCT key, can't be
+/// compared. Planning checks every key the query has, so that a key the
+/// planner later drops is refused too, as in PostgreSQL: `j` in `ORDER BY id,
+/// j` for a rowid `id`, or an ORDER BY inside `EXISTS (...)`.
+pub(crate) fn check_sort_key(key: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    common_type_ordering([(key, context)]).map(|_| ())
+}
+
 /// Fails when `expr` itself, not counting its operands, applies a COLLATE to
 /// a type that takes none or compares two types with different orders. These
 /// are the errors that compiling `expr` would give, found by the same

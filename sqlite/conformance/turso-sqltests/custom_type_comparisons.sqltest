@@ -560,28 +560,183 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-date-window-range-offset {
-    -- A RANGE offset frame on a date ORDER BY value moves by days with
-    -- date's `-` and `+`, as `d - 1` does.
-    CREATE TABLE t(d date) STRICT;
-    INSERT INTO t VALUES ('2024-01-01'), ('2024-01-02'), ('2024-01-04'), (NULL);
-    SELECT 'p1', d, count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY d IS NULL, d;
-    SELECT 'f1', d, count(*) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY d IS NULL, d;
-    SELECT 'desc', d, count(*) OVER (ORDER BY d DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY d IS NULL, d;
+test cmp-bigint-window-range-offset {
+    -- bigint and smallint take integer RANGE offsets, also a CAST to
+    -- bigint or smallint. Expected rows are from PostgreSQL.
+    CREATE TABLE t(b bigint) STRICT;
+    INSERT INTO t VALUES (1), (2), (4), (NULL);
+    CREATE TABLE s(x smallint) STRICT;
+    INSERT INTO s VALUES (1), (3), (4);
+    SELECT 'p1', b, count(*) OVER (ORDER BY b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY b IS NULL, b;
+    SELECT 'f2', b, count(*) OVER (ORDER BY b DESC RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM t ORDER BY b IS NULL, b;
+    SELECT 's', x, count(*) OVER (ORDER BY x RANGE BETWEEN CAST(1 AS bigint) PRECEDING AND CAST(1 AS smallint) FOLLOWING) FROM s ORDER BY x;
 }
 expect {
-    p1|2024-01-01|1
-    p1|2024-01-02|2
-    p1|2024-01-04|1
+    p1|1|1
+    p1|2|2
+    p1|4|1
     p1||1
-    f1|2024-01-01|2
-    f1|2024-01-02|1
-    f1|2024-01-04|1
-    f1||1
-    desc|2024-01-01|2
-    desc|2024-01-02|1
-    desc|2024-01-04|1
-    desc||1
+    f2|1|1
+    f2|2|2
+    f2|4|2
+    f2||1
+    s|1|1
+    s|3|2
+    s|4|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-bigint-window-range-decimal-offset-is-an-error {
+    -- PostgreSQL has no RANGE offset of type numeric over a bigint.
+    CREATE TABLE t(b bigint) STRICT;
+    SELECT count(*) OVER (ORDER BY b RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type bigint and offset type numeric; cast the offset to integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-window-range-real-offset-is-an-error {
+    -- A REAL offset over a numeric would be inexact. PostgreSQL refuses a
+    -- double precision offset there too.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    SELECT count(*) OVER (ORDER BY n RANGE BETWEEN CAST(1.5 AS REAL) PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type numeric and an offset of SQLite type REAL; cast the offset to integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-window-range-mixed-case-offset-is-an-error {
+    -- A CASE that mixes SQLite types may hold a REAL, as this one does.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    SELECT count(*) OVER (ORDER BY n RANGE BETWEEN CASE WHEN 1 THEN CAST(0.1 AS REAL) ELSE 'a' END PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type numeric and an offset of SQLite type ANY; cast the offset to integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-window-range-string-offset-read-as-column-type {
+    -- A string offset is read as the column's type when the statement runs,
+    -- as in PostgreSQL: '1' is the integer 1 over a bigint, and '1.5' is an
+    -- exact numeric over a numeric.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 2, 2.5), (3, 4, 4);
+    SELECT 'b', b, count(*) OVER (ORDER BY b RANGE BETWEEN '1' PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'n', n, count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND '1.5' FOLLOWING) FROM t ORDER BY id;
+}
+expect {
+    b|1|1
+    b|2|2
+    b|4|1
+    n|1.00|2
+    n|2.50|2
+    n|4.00|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-bigint-window-range-decimal-string-offset-is-an-error {
+    -- '1.5' read as a bigint is not an integer.
+    CREATE TABLE t(b bigint) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT count(*) OVER (ORDER BY b RANGE BETWEEN '1.5' PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    frame starting offset must be a non-negative integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-window-range-domain-offset-checked-as-its-base-type {
+    -- An offset of a domain over integer is an integer offset.
+    CREATE DOMAIN pos AS integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1, 1), (2, 2, 2.5, 2), (3, 4, 4, 4);
+    SELECT 'b', count(*) OVER (ORDER BY b RANGE BETWEEN CAST(1 AS pos) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'n', count(*) OVER (ORDER BY n RANGE BETWEEN CAST(1 AS pos) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'i', count(*) OVER (ORDER BY i RANGE BETWEEN CAST(1 AS pos) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+}
+expect {
+    b|1
+    b|2
+    b|1
+    n|1
+    n|1
+    n|1
+    i|1
+    i|2
+    i|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-window-range-offset-is-an-error {
+    -- In PostgreSQL a date takes only interval RANGE offsets, and Turso has
+    -- no interval type.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-domain-window-range-offset-names-base-type {
+    -- A domain takes the RANGE offsets of its base type, and the error
+    -- names the base type, as in PostgreSQL.
+    CREATE DOMAIN day AS date;
+    CREATE TABLE t(d day) STRICT;
+    SELECT count(*) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-user-type-window-range-offset-is-an-error {
+    -- A type made with CREATE TYPE has no + or -, so it takes no RANGE
+    -- offset, whatever its base.
+    CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(c cents) STRICT;
+    SELECT count(*) OVER (ORDER BY c RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type cents
+}
+
+@requires strict "uses STRICT tables"
+test cmp-sqlite-type-window-range-offset-unchanged {
+    -- SQLite's own types keep SQLite's rule, also in a STRICT table: any
+    -- number is an offset, and values that aren't numbers have no distance.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, i integer, x text) STRICT;
+    INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 4, 'c');
+    SELECT 'i', i, count(*) OVER (ORDER BY i RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    -- A bigint is a plain integer, so it is an offset here too.
+    SELECT 'big', i, count(*) OVER (ORDER BY i RANGE BETWEEN CAST(1 AS bigint) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'x', x, count(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+}
+expect {
+    i|1|1
+    i|2|2
+    i|4|1
+    big|1|1
+    big|2|2
+    big|4|1
+    x|a|1
+    x|b|1
+    x|c|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-sqlite-type-window-range-custom-type-offset-is-an-error {
+    -- i + CAST(1 AS numeric(5,2)) is a numeric, which doesn't compare with
+    -- i's integers: the frame would hold the wrong rows.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, i integer) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    SELECT count(*) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CAST(1 AS numeric(5,2)) FOLLOWING) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for offset type numeric over a value without a custom type; cast the offset to integer or real
 }
 
 @requires strict "uses STRICT tables"
@@ -606,6 +761,50 @@ test cmp-array-window-range-offset-is-an-error {
 }
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type integer\[\]
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-operator-result-window-range-offset {
+    -- date - date is a number of days, an integer, so it takes RANGE offsets.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t(d) VALUES ('2026-01-01'), ('2026-01-02'), ('2026-01-04');
+    SELECT count(*) OVER (ORDER BY d - CAST('2026-01-01' AS date) RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-operator-date-result-window-range-offset-is-an-error {
+    -- date + 1 is a date, which takes no RANGE offsets.
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) OVER (ORDER BY d + 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-missing-operator-window-range-offset-is-an-error {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) OVER (ORDER BY d * d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    operator does not exist: date \* date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-operator-window-range-offset-is-an-error {
+    -- Nothing declares the type of + on an array, so the value takes no RANGE
+    -- offsets.
+    CREATE TABLE t(a integer[]) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    SELECT count(*) OVER (ORDER BY a + 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type unknown
 }
 
 @requires strict "uses STRICT tables"

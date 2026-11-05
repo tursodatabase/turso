@@ -142,7 +142,16 @@ SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
 
 A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`). So is a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN` and `ALTER TABLE ALTER COLUMN`, or in `CREATE INDEX`. A database that already has such a column keeps working, and the column sorts by the type's order.
 
-A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) computes its bounds with numeric's `+` and `-` when the `ORDER BY` value is a numeric. For arrays, such a frame is an error.
+A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) allows an offset only where PostgreSQL allows one:
+
+| `ORDER BY` value | Allowed offset types |
+|---|---|
+| `smallint`, `bigint` | `integer`, `smallint`, `bigint` |
+| `numeric` | `integer`, `smallint`, `bigint`, `numeric` (a decimal such as `1.5`) |
+| any other custom type (such as `date`), an array, or a value with no known type | none |
+| a SQLite type (`INTEGER`, `REAL`, ...) | any value that is not a custom type, an array or a value with no known type, as in SQLite, and `smallint` or `bigint` values |
+
+A parameter or a string offset (`'1'`) is read as the column's type when the statement runs. A domain counts as the type it is based on. When the `ORDER BY` value is a numeric, the bounds are computed with numeric's `+` and `-`.
 
 Other types compare the values the column reads as in `=`, `<` and the other operators, with SQLite's rules. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
 

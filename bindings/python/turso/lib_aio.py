@@ -343,6 +343,7 @@ class Cursor:
 # same signature as in the lib.py
 def connect(
     database: str,
+    timeout: float = 5.0,
     *,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
@@ -354,6 +355,7 @@ def connect(
             database,
             experimental_features=experimental_features,
             isolation_level=isolation_level,
+            timeout=timeout,
             extra_io=extra_io,
         )
         return conn

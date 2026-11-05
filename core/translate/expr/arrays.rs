@@ -134,7 +134,7 @@ pub(super) fn emit_array_encode(
 ) -> Result<()> {
     let resolved = resolver.schema().resolve_type_unchecked(&col.ty_str)?;
     if let Some(resolved) = &resolved {
-        if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
+        if resolved.has_encode_or_coerce() {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
                 data: Box::new(ArrayEncodeData {
@@ -243,10 +243,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             continue;
         };
 
-        // Check if any type in the chain has not_null — if so, don't skip NULLs
-        let any_not_null = resolved.chain.iter().any(|td| td.not_null);
-
-        let skip_label = if !any_not_null {
+        let skip_label = if !resolved.not_null() {
             // Skip NULL values: jump over encode if NULL
             let label = program.allocate_label();
             program.emit_insn(Insn::IsNull {
@@ -300,7 +297,7 @@ pub(crate) fn emit_custom_type_decode_columns(
             continue;
         }
         if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
-            emit_decode(program, &resolved.chain, reg, resolver)?;
+            emit_decode(program, &resolved, reg, resolver)?;
         }
     }
     Ok(())

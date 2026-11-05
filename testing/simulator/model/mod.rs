@@ -507,9 +507,11 @@ impl Query {
         matches!(self, Self::Insert(..) | Self::Update(..) | Self::Delete(..))
     }
 
+    /// Statements that write to the database. nextval and setval write the
+    /// sequence's backing table.
     #[inline]
     pub fn is_write(&self) -> bool {
-        self.is_ddl() || self.is_dml()
+        self.is_ddl() || self.is_dml() || matches!(self, Self::Nextval(..) | Self::Setval(..))
     }
 
     #[inline]

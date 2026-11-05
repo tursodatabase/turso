@@ -8,7 +8,9 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
+use crate::translate::collate::{
+    check_sort_key, compound_order_by_collation, CollationSeq, TextCollation,
+};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -708,7 +710,19 @@ fn prepare_one_select_plan(
                     resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
+                check_sort_key(
+                    &o.expr,
+                    &ExprContext::new(Some(&plan.table_references), resolver),
+                )?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+            }
+            if plan.distinctness.is_distinct() {
+                for column in &plan.result_columns {
+                    check_sort_key(
+                        &column.expr,
+                        &ExprContext::new(Some(&plan.table_references), resolver),
+                    )?;
+                }
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
