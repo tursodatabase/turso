@@ -410,6 +410,110 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
     Ok(())
 }
 
+/// Where a file-backed `VACUUM INTO` builds its copy: a temporary file
+/// beside the destination, moved over it once the copy is complete and
+/// synced. The target is committed in batches, so until then the file is a
+/// valid database holding only some of the rows. Built under the
+/// destination's own name, that is what a statement that fails or a process
+/// that dies partway would leave behind — and a retry would refuse the
+/// "existing" output. This way the destination path only ever holds a
+/// complete copy, as it did when the whole copy was one transaction.
+///
+/// A destination that already exists — an empty file — may be open
+/// elsewhere: attached on this connection, or created by another process
+/// that waits for it. The copy must land in that file, so it is built there
+/// directly, as it always was; only that copy can be left partial.
+pub(crate) struct VacuumIntoTempOutput {
+    io: Arc<dyn crate::IO>,
+    temp_path: String,
+    dest_path: String,
+}
+
+impl VacuumIntoTempOutput {
+    const SUFFIX: &'static str = "-vacuum";
+
+    /// The temporary file for a copy to `dest_path`, after removing what an
+    /// attempt that died partway left there; None when the destination
+    /// already exists and the copy has to be built in it.
+    pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Option<Self>> {
+        let this = Self {
+            io,
+            temp_path: format!("{dest_path}{}", Self::SUFFIX),
+            dest_path: dest_path.to_string(),
+        };
+        this.remove_temp_files()?;
+        if std::fs::metadata(dest_path).is_ok() {
+            return Ok(None);
+        }
+        Ok(Some(this))
+    }
+
+    /// The path the copy is built at.
+    pub fn temp_path(&self) -> &str {
+        &self.temp_path
+    }
+
+    /// Removes the temporary copy and the files the engine keeps beside a
+    /// database: its WAL, shm and MVCC logical log.
+    pub fn remove_temp_files(&self) -> Result<()> {
+        remove_file_if_exists(&*self.io, &self.temp_path)?;
+        for sidecar in ["-wal", "-shm", "-log"] {
+            remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
+        }
+        Ok(())
+    }
+
+    /// Moves the finished copy to the destination. The copy was
+    /// checkpointed under `SyncMode::Full` and closed, so the file is
+    /// self-contained and synced and its WAL is empty; the WAL and shm are
+    /// dropped and an MVCC copy's logical log moves with it. The move is a
+    /// rename, so the destination goes from absent (or empty) to complete
+    /// in one step, and the directory is synced so the name is durable.
+    pub fn install(&self) -> Result<()> {
+        for sidecar in ["-wal", "-shm"] {
+            remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
+        }
+        std::fs::rename(&self.temp_path, &self.dest_path)
+            .map_err(|e| crate::error::io_error(e, "rename"))?;
+        let temp_log = format!("{}-log", self.temp_path);
+        if std::fs::metadata(&temp_log).is_ok() {
+            std::fs::rename(&temp_log, format!("{}-log", self.dest_path))
+                .map_err(|e| crate::error::io_error(e, "rename"))?;
+        }
+        sync_parent_dir(&self.dest_path)
+    }
+}
+
+fn remove_file_if_exists(io: &dyn crate::IO, path: &str) -> Result<()> {
+    match io.remove_file(path) {
+        Err(LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => Ok(()),
+        result => result,
+    }
+}
+
+/// Syncs the directory holding `path`, so that a rename into it is durable.
+/// Directories cannot be synced on Windows, and need not be.
+fn sync_parent_dir(path: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| crate::error::io_error(e, "sync"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Copy functions, vtab modules, and index methods from one connection to
 /// another so that schema replay on the target sees the same symbols as
 /// the source.
@@ -3721,6 +3825,322 @@ mod tests {
             after <= BOUND_MIB,
             "VACUUM INTO of a {file_mib} MiB database drove the process peak RSS to \
              {after} MiB (bound {BOUND_MIB} MiB)"
+        );
+        Ok(())
+    }
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    /// What the files of a copy go through in [`FailingWritesIo`].
+    struct FailingWritesState {
+        /// The destination path: it and the files the engine keeps beside
+        /// it (its temporary copy, WALs, shm) are the ones that fail.
+        prefix: String,
+        /// Bytes the files under `prefix` accept before writes fail.
+        budget: AtomicU64,
+        written: AtomicU64,
+        tripped: AtomicBool,
+        /// Whether the failure is the process dying rather than an I/O
+        /// error it can handle.
+        killed: bool,
+    }
+
+    impl FailingWritesState {
+        fn covers(&self, path: &str) -> bool {
+            path.starts_with(&self.prefix)
+        }
+
+        fn admit_write(&self, len: u64) -> Result<()> {
+            if self.tripped.load(StdOrdering::SeqCst) {
+                return Err(injected_failure("pwrite"));
+            }
+            let total = self.written.fetch_add(len, StdOrdering::SeqCst) + len;
+            if total > self.budget.load(StdOrdering::SeqCst) {
+                self.tripped.store(true, StdOrdering::SeqCst);
+                return Err(injected_failure("pwrite"));
+            }
+            Ok(())
+        }
+
+        /// Whether the process is dead, as far as these files can tell.
+        fn dead(&self) -> bool {
+            self.killed && self.tripped.load(StdOrdering::SeqCst)
+        }
+    }
+
+    fn injected_failure(op: &'static str) -> LimboError {
+        LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::Other,
+            op,
+        ))
+    }
+
+    /// The platform IO, except that the files under a prefix accept only so
+    /// many bytes of writes before every write there fails — a disk filling
+    /// up, or a file size limit, partway through a `VACUUM INTO`. In killed
+    /// mode nothing under the prefix can be written, synced or removed once
+    /// the budget is spent: what the file system sees of a process that
+    /// died partway is that what it wrote stays and no cleanup runs.
+    struct FailingWritesIo {
+        inner: Arc<crate::io::PlatformIO>,
+        state: Arc<FailingWritesState>,
+    }
+
+    impl FailingWritesIo {
+        fn new(prefix: &str, budget: u64, killed: bool) -> Result<Arc<Self>> {
+            Ok(Arc::new(Self {
+                inner: Arc::new(crate::io::PlatformIO::new()?),
+                state: Arc::new(FailingWritesState {
+                    prefix: prefix.to_string(),
+                    budget: AtomicU64::new(budget),
+                    written: AtomicU64::new(0),
+                    tripped: AtomicBool::new(false),
+                    killed,
+                }),
+            }))
+        }
+
+        /// Room again: the disk was freed, the limit raised.
+        fn lift(&self) {
+            self.state.budget.store(u64::MAX, StdOrdering::SeqCst);
+            self.state.tripped.store(false, StdOrdering::SeqCst);
+        }
+
+        fn tripped(&self) -> bool {
+            self.state.tripped.load(StdOrdering::SeqCst)
+        }
+    }
+
+    impl Clock for FailingWritesIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for FailingWritesIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            if !self.state.covers(path) {
+                return Ok(inner);
+            }
+            Ok(Arc::new(FailingWritesFile {
+                inner,
+                state: self.state.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            if self.state.covers(path) && self.state.dead() {
+                return Err(injected_failure("remove_file"));
+            }
+            self.inner.remove_file(path)
+        }
+
+        fn step(&self) -> Result<()> {
+            self.inner.step()
+        }
+
+        fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.drain_completions(completions)
+        }
+
+        fn cancel(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.cancel(completions)
+        }
+
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            self.inner.file_id(path)
+        }
+    }
+
+    struct FailingWritesFile {
+        inner: Arc<dyn File>,
+        state: Arc<FailingWritesState>,
+    }
+
+    impl File for FailingWritesFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.state.admit_write(buffer.len() as u64)?;
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.state
+                .admit_write(buffers.iter().map(|b| b.len() as u64).sum())?;
+            self.inner.pwritev(pos, buffers, c)
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            if self.state.dead() {
+                return Err(injected_failure("sync"));
+            }
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            if self.state.dead() {
+                return Err(injected_failure("truncate"));
+            }
+            self.inner.truncate(len, c)
+        }
+    }
+
+    /// Rows of the atomicity fixture: three batches of the batched build.
+    const ATOMICITY_FIXTURE_ROWS: i64 = 60_000;
+    /// Writes the copy's files accept: enough for the first batch to
+    /// commit (about 1 MiB of WAL frames), not for all three.
+    const ATOMICITY_WRITE_BUDGET: u64 = 2 * 1024 * 1024;
+
+    fn open_file_db(
+        io: Arc<dyn crate::IO>,
+        path: &str,
+    ) -> Result<(Arc<Database>, Arc<Connection>)> {
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new())?;
+        Ok((db, conn))
+    }
+
+    fn create_atomicity_fixture(conn: &Arc<Connection>) -> Result<()> {
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT NOT NULL)")?;
+        conn.execute("CREATE INDEX t_k ON t(k)")?;
+        conn.execute(format!(
+            "INSERT INTO t(k) SELECT 'key-' || value FROM generate_series(1, {ATOMICITY_FIXTURE_ROWS})"
+        ))?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    fn scalar(conn: &Arc<Connection>, sql: &str) -> Result<crate::Value> {
+        let rows = conn.prepare(sql)?.run_collect_rows()?;
+        Ok(rows[0][0].clone())
+    }
+
+    /// Asserts that `path` holds a complete copy of the fixture: it passes
+    /// integrity_check and has every row and the index.
+    fn assert_complete_copy(path: &str) -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let (_db, conn) = open_file_db(io, path)?;
+        assert_eq!(
+            scalar(&conn, "PRAGMA integrity_check")?,
+            crate::Value::from_text("ok")
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT count(*) FROM t")?.as_int(),
+            Some(ATOMICITY_FIXTURE_ROWS)
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT count(*) FROM t INDEXED BY t_k WHERE k > ''")?.as_int(),
+            Some(ATOMICITY_FIXTURE_ROWS)
+        );
+        Ok(())
+    }
+
+    /// A `VACUUM INTO` that fails partway, after at least one batch of the
+    /// copy was committed, must leave no copy at the destination — the whole
+    /// copy or nothing, as when it was one transaction and as SQLite — and a
+    /// retry to the same path must then succeed.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_that_fails_after_a_batch_commit_leaves_no_copy() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let io = FailingWritesIo::new(dest, ATOMICITY_WRITE_BUDGET, false)?;
+        let (_db, conn) = open_file_db(io.clone(), source_path.to_str().unwrap())?;
+        create_atomicity_fixture(&conn)?;
+
+        let err = conn
+            .execute(format!("VACUUM INTO '{dest}'"))
+            .expect_err("the copy's writes fail once the budget is spent");
+        assert!(io.tripped(), "the failure was not the injected one: {err}");
+        assert!(
+            !dest_path.exists(),
+            "a failed VACUUM INTO left a copy at the destination"
+        );
+        assert!(
+            !dir.path().join("copy.db-vacuum").exists(),
+            "a failed VACUUM INTO left its temporary copy behind"
+        );
+
+        io.lift();
+        conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        assert_complete_copy(dest)
+    }
+
+    /// A process killed partway through a `VACUUM INTO` — after at least one
+    /// batch of the copy was committed — leaves whatever it had written and
+    /// runs no cleanup. The destination must still hold no copy, and a retry
+    /// to the same path, by a new process, must succeed, sweeping what the
+    /// killed one left.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_killed_after_a_batch_commit_leaves_no_copy_and_can_be_retried() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let source = source_path.to_str().unwrap();
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let temp_path = dir.path().join("copy.db-vacuum");
+        let io = FailingWritesIo::new(dest, ATOMICITY_WRITE_BUDGET, true)?;
+        let (db, conn) = open_file_db(io.clone(), source)?;
+        create_atomicity_fixture(&conn)?;
+
+        let err = conn
+            .execute(format!("VACUUM INTO '{dest}'"))
+            .expect_err("the process dies once the budget is spent");
+        assert!(io.tripped(), "the failure was not the injected one: {err}");
+        assert!(
+            !dest_path.exists(),
+            "a killed VACUUM INTO left a copy at the destination"
+        );
+        assert!(
+            temp_path.exists(),
+            "the killed process could not have removed its temporary copy"
+        );
+        // The process is gone.
+        drop(conn);
+        drop(db);
+        drop(io);
+
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let (_db, conn) = open_file_db(io, source)?;
+        conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        assert_complete_copy(dest)?;
+        assert!(
+            !temp_path.exists(),
+            "the retry left the killed attempt's temporary copy behind"
         );
         Ok(())
     }

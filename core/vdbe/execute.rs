@@ -20262,6 +20262,10 @@ pub(crate) struct VacuumIntoOpContext {
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
     _output_db: Option<Arc<Database>>,
+    /// The temporary file a file-backed copy is built in, moved to the
+    /// destination once complete and removed on failure. None for an
+    /// in-memory output.
+    temp_output: Option<crate::vdbe::vacuum::VacuumIntoTempOutput>,
     /// Configuration for the shared vacuum target build state machine.
     target_build_config: Option<VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
@@ -20353,6 +20357,15 @@ fn cleanup_op_vacuum_into(
 
     vacuum_state.target_build_context = None;
     vacuum_state._output_db = None;
+    // The destination was never touched; what the failed attempt built is
+    // in the temporary file, which goes.
+    if let Err(err) = vacuum_state
+        .temp_output
+        .take()
+        .map_or(Ok(()), |temp_output| temp_output.remove_temp_files())
+    {
+        tracing::warn!("VACUUM INTO could not remove its temporary copy: {err}");
+    }
 
     if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
         let pager = connection.pager.load();
@@ -20519,24 +20532,47 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                let (io, dest_path): (Arc<dyn crate::IO>, String) = if output_in_memory {
+                // A file-backed copy is written through the source database's
+                // IO, so a database on io_uring, or under a test IO, copies
+                // through it as well; a source that lives in memory has no file
+                // IO, so its copy goes through the platform's. The copy is
+                // built in a temporary file beside the destination and moved
+                // there once complete, unless the destination already exists
+                // (see VacuumIntoTempOutput).
+                let (io, build_path, temp_output): (
+                    Arc<dyn crate::IO>,
+                    String,
+                    Option<crate::vdbe::vacuum::VacuumIntoTempOutput>,
+                ) = if output_in_memory {
                     (
                         Arc::new(crate::MemoryIO::new()),
                         crate::util::MEMORY_PATH.to_string(),
-                    )
-                } else if crate::is_memory_like(&target.path) {
-                    (
-                        Arc::new(crate::io::PlatformIO::new()?),
-                        format!("./{}", target.path),
+                        None,
                     )
                 } else {
-                    (Arc::new(crate::io::PlatformIO::new()?), target.path)
+                    let io: Arc<dyn crate::IO> = if source_db.is_in_memory_db() {
+                        Arc::new(crate::io::PlatformIO::new()?)
+                    } else {
+                        source_db.io.clone()
+                    };
+                    let dest_path = if crate::is_memory_like(&target.path) {
+                        format!("./{}", target.path)
+                    } else {
+                        target.path
+                    };
+                    let temp_output =
+                        crate::vdbe::vacuum::VacuumIntoTempOutput::prepare(io.clone(), &dest_path)?;
+                    let build_path = temp_output
+                        .as_ref()
+                        .map_or(dest_path, |temp_output| temp_output.temp_path().to_string());
+                    (io, build_path, temp_output)
                 };
+                vacuum_state.temp_output = temp_output;
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
-                        &dest_path,
+                        &build_path,
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
@@ -20544,7 +20580,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,
-                        &dest_path,
+                        &build_path,
                         OpenFlags::Create,
                         output_opts,
                         None,
@@ -20612,6 +20648,18 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .as_ref()
                     .expect("VacuumTargetBuildContext must be set in FinalizeOutput state");
                 crate::vdbe::vacuum::finalize_vacuum_into_output(target_build_context)?;
+                // The copy is complete and synced: close it, then move it to
+                // the destination. Until the move the destination is untouched,
+                // and a failure here removes the temporary copy like any
+                // earlier failure.
+                vacuum_state.target_build_context = None;
+                vacuum_state._output_db = None;
+                if let Some(temp_output) = vacuum_state.temp_output.take() {
+                    if let Err(err) = temp_output.install() {
+                        vacuum_state.temp_output = Some(temp_output);
+                        return Err(err.into());
+                    }
+                }
                 vacuum_state.phase = VacuumIntoOpPhase::Done;
                 continue;
             }
