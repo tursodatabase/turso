@@ -1054,7 +1054,6 @@ pub(super) fn emit_binary_condition_insn(
             if is_array(lhs_expr, referenced_tables, resolver)
                 || is_array(rhs_expr, referenced_tables, resolver)
             {
-                check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,
@@ -1071,7 +1070,6 @@ pub(super) fn emit_binary_condition_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
-            check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
@@ -1100,6 +1098,9 @@ fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: 
     type_of(expr, &TypeEnv::new(referenced_tables, resolver)).is_array()
 }
 
+/// The array check of binding (see `check_expr_array_arguments`), for
+/// expressions compiled without being bound with their column types: a column
+/// DEFAULT, UPSERT's DO UPDATE and a trigger's WHEN.
 fn check_array_operands(
     lhs: &Expr,
     rhs: &Expr,
