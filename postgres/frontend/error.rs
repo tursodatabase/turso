@@ -386,9 +386,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg == "invalid date value" || msg == "invalid timestamp value" {
-        SQLSTATE_INVALID_DATETIME_FORMAT
-    } else if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE

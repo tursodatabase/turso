@@ -536,6 +536,7 @@ pub(crate) fn resolve_builtin_function_name(
         "boolean_to_int" => Ok(Some(Func::Scalar(ScalarFunc::BooleanToInt))),
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
+        "temporal_encode" => Ok(Some(Func::Scalar(ScalarFunc::TemporalEncode))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
         "numeric_fit" => Ok(Some(Func::Scalar(ScalarFunc::NumericFit))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
