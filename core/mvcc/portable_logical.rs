@@ -5,6 +5,7 @@ use crate::mvcc::persistent_storage::logical_log::{
     PROTO_WIRE_VARINT,
 };
 use crate::schema::{SchemaRecord, SchemaRowType};
+use crate::Result;
 use std::collections::{HashMap, HashSet};
 
 const TX_FIELD_STRING_TABLE: u64 = 12;
