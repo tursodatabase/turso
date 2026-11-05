@@ -1848,6 +1848,35 @@ expect {
     0
 }
 
+test where-in-on-indexed-columns-returns-a-row-once-for-two-spellings-of-its-value {
+    CREATE TABLE in_spellings(id int, t time, tz timetz, ts timestamp, u uuid, b boolean);
+    INSERT INTO in_spellings VALUES
+        (1, '12:00:00', '12:00:00', '2024-01-01 00:00:00', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
+        (2, '13:00:00', '13:00:00', '2024-01-02 00:00:00', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE INDEX in_spellings_t ON in_spellings (t);
+    CREATE INDEX in_spellings_tz ON in_spellings (tz);
+    CREATE INDEX in_spellings_ts ON in_spellings (ts);
+    CREATE INDEX in_spellings_u ON in_spellings (u);
+    CREATE INDEX in_spellings_b ON in_spellings (b);
+    SELECT t FROM in_spellings WHERE t IN ('12:00:00', '12:00');
+    SELECT count(*) FROM in_spellings WHERE tz IN ('12:00:00', '12:00');
+    SELECT count(*) FROM in_spellings WHERE ts IN ('2024-01-01 00:00:00', '2024-01-01 00:00');
+    SELECT count(*) FROM in_spellings WHERE u IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+    SELECT count(*) FROM in_spellings WHERE b IN ('t', 'true', 'yes');
+    SELECT count(*) FROM in_spellings WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' OR u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT id FROM in_spellings WHERE t IN ('12:00:00', '12:00') OR u IN ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') ORDER BY id;
+}
+expect {
+    12:00:00
+    1
+    1
+    1
+    1
+    1
+    1
+    2
+}
+
 test window-range-offset-over-bigint-and-numeric {
     CREATE TABLE range_offsets(b bigint, n numeric(10, 2));
     INSERT INTO range_offsets VALUES (1, 1), (2, 2.5), (4, 4);
