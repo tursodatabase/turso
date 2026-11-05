@@ -15,15 +15,15 @@ use crate::schema::{
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::catalog::CatalogContext;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{check_expr_collation_in, CollationSeq};
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
 use crate::translate::expr::expr_type::{
-    base_value_type, decode_type, iif_values, value_type, ExprType,
+    base_value_type, decode_type, iif_values, value_type, ExprType, TypeEnv,
 };
-use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr::{takes_input_of_type, walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -799,9 +799,57 @@ fn validate(
             }
             table.resolve_custom_types(resolver.schema())?;
             table.check_collates_are_allowed(resolver.schema())?;
+            check_collations_in_check_constraints(&table, resolver)?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
     }
+    Ok(())
+}
+
+/// Fails when a CHECK constraint applies a COLLATE to a value whose type
+/// takes none, as `d COLLATE nocase` and `d = 'x' COLLATE nocase` do for a
+/// date d. Every INSERT would fail to compile such a CHECK, so the table is
+/// refused when it is created, with the error a SELECT gives.
+fn check_collations_in_check_constraints(
+    table: &BTreeTable,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    let env = TypeEnv::over_table(table, resolver.schema(), resolver.symbol_table);
+    for check in &table.check_constraints {
+        let mut expr = check.expr.clone();
+        bind_check_columns(&mut expr, table)?;
+        walk_expr(&expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            check_expr_collation_in(e, &env)?;
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(())
+}
+
+/// Binds the names in a CHECK expression of `table` to its columns, or to the
+/// rowid for rowid, oid and _rowid_ when no column has that name.
+fn bind_check_columns(expr: &mut ast::Expr, table: &BTreeTable) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Id(name) | ast::Expr::Name(name) | ast::Expr::Qualified(_, name) = e {
+            if let Some((column, col)) = table.get_column(name.as_str()) {
+                *e = ast::Expr::Column {
+                    database: None,
+                    table: ast::TableInternalId::SELF_TABLE,
+                    column,
+                    is_rowid_alias: col.is_rowid_alias(),
+                };
+            } else if ROWID_STRS
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(name.as_str()))
+            {
+                *e = ast::Expr::RowId {
+                    database: None,
+                    table: ast::TableInternalId::SELF_TABLE,
+                };
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
