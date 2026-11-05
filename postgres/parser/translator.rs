@@ -6167,10 +6167,12 @@ fn pg_type_name_to_ast_type(
         _ => &pg_type,
     };
 
+    let array_dimensions = type_name.array_bounds.len() as u32;
+    check_array_dimensions(array_dimensions)?;
     Ok(ast::Type {
         name: name.to_string(),
         size: None,
-        array_dimensions: type_name.array_bounds.len() as u32,
+        array_dimensions,
     })
 }
 
@@ -6244,7 +6246,20 @@ fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, Pars
     if !typmods.is_empty() && mapping.type_params.is_empty() {
         return Err(not_supported(format!("a type modifier on {pg_type}")));
     }
+    check_array_dimensions(mapping.array_dimensions)?;
     Ok(mapping)
+}
+
+/// PostgreSQL accepts any number of `[]` in a type name, but a Turso column
+/// or cast holds at most [ast::MAX_ARRAY_DIMENSIONS].
+fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
+    if dimensions > ast::MAX_ARRAY_DIMENSIONS {
+        return Err(not_supported(format!(
+            "an array type with {dimensions} dimensions (at most {})",
+            ast::MAX_ARRAY_DIMENSIONS
+        )));
+    }
+    Ok(())
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
