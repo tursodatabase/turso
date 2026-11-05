@@ -245,6 +245,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `sum()` and `avg()` count their infinite inputs apart from
+    /// the total of the finite ones.
+    ///
+    /// PostgreSQL does, so a moving window frame gives a finite result again
+    /// once its infinite values leave it. SQLite adds them to the total.
+    /// Removing a row from a window frame adds its negation, so once an
+    /// infinite value leaves, the total is `Inf - Inf`, which is NaN, and
+    /// the result stays NULL.
+    fn sum_counts_infinite_inputs(&self) -> bool {
+        false
+    }
+
     /// Whether a quoted string compared with a value of a custom type is
     /// first converted to that type, the way it would be when stored.
     ///
