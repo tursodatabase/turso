@@ -636,10 +636,11 @@ pub fn compound_column_collation(
 /// The collation of column `column` of a UNION ALL, where `arms` are its
 /// SELECTs, when no ORDER BY sorts by it. UNION ALL keeps every row, so the
 /// column's values are never compared and may have a type that has no
-/// comparison, such as json. The SELECTs' columns must still have types with
-/// one order, as in [compound_column_collation]: `SELECT n FROM t UNION ALL
-/// SELECT a FROM t` for a numeric n and an integer[] a is an error, as in
-/// PostgreSQL.
+/// comparison, such as json. Columns whose types have an order must still
+/// agree on it, as in [compound_column_collation]: `SELECT n FROM t UNION ALL
+/// SELECT a FROM t` for a numeric n and an integer[] a is an error. A type
+/// with no comparison has no order, so json may sit beside numeric here,
+/// which PostgreSQL refuses.
 pub fn union_all_column_collation(
     arms: &[&SelectPlan],
     column: usize,

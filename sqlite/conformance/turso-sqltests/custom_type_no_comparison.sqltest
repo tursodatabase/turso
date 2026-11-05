@@ -196,7 +196,7 @@ expect {
 }
 
 # UNION ALL doesn't compare a column it doesn't sort by, but the SELECTs'
-# columns must still have types with one order, as in PostgreSQL.
+# columns' types must still agree on their order.
 @requires strict "uses STRICT tables"
 test no-comparison-union-all-numeric-with-array {
     CREATE TABLE t(n numeric(10,2), a integer[]) STRICT;
@@ -494,6 +494,16 @@ test no-comparison-array-contains-value {
     CREATE TABLE n(a inet) STRICT;
     INSERT INTO n VALUES ('::1');
     SELECT array_contains(ARRAY['0:0:0:0:0:0:0:1'], a) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-where {
+    CREATE TABLE n(a inet) STRICT;
+    INSERT INTO n VALUES ('::1');
+    SELECT count(*) FROM n WHERE ARRAY['0:0:0:0:0:0:0:1'] @> a;
 }
 expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared
