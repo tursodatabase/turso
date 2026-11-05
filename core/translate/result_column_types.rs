@@ -109,10 +109,11 @@ fn custom_type_info(
 
 fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
     match ty {
-        BuiltinType::Integer => Some("INTEGER"),
-        BuiltinType::Real | BuiltinType::Decimal => Some("REAL"),
-        BuiltinType::Numeric => Some("NUMERIC"),
-        BuiltinType::Text => Some("TEXT"),
+        BuiltinType::Integer
+        | BuiltinType::Real
+        | BuiltinType::Decimal
+        | BuiltinType::Numeric
+        | BuiltinType::Text => Some(ty.sqlite_name()),
         BuiltinType::Blob | BuiltinType::Any => None,
     }
 }

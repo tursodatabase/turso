@@ -82,6 +82,20 @@ impl BuiltinType {
             Self::Blob | Self::Any => Affinity::Blob,
         }
     }
+
+    /// The name SQLite gives the type, so that SQLite's NUMERIC, whose values are
+    /// integers or reals, isn't mistaken for the custom numeric type. A decimal
+    /// written in the statement is a REAL to SQLite.
+    pub(crate) fn sqlite_name(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real | Self::Decimal => "REAL",
+            Self::Numeric => "NUMERIC",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
 }
 
 impl ExprType {
@@ -1337,7 +1351,7 @@ fn is_domain(ty: &ExprType) -> bool {
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it reads as. Other types are
 /// returned unchanged.
-fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
+pub(crate) fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
     let ExprType::Custom { type_def, .. } = &ty else {
         return ty;
     };

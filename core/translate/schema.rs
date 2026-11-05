@@ -3607,6 +3607,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         not_null: _,
         is_domain: _,
         accepts_collate: _,
+        range_offsets: _,
         sql: _,
         domain_checks,
         kind,

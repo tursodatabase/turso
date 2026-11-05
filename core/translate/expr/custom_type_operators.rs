@@ -20,13 +20,9 @@ pub(crate) fn custom_operator_call(
     expr: &ast::Expr,
     env: &TypeEnv,
 ) -> Result<Option<OperatorCall>> {
-    let Some((_, operands)) = decided_operator(expr, env) else {
+    let Some(types) = operand_types(expr, env) else {
         return Ok(None);
     };
-    let types: Vec<ExprType> = operands
-        .iter()
-        .map(|operand| type_of(operand, env))
-        .collect();
     find_operator_call(expr, &types, env)
 }
 
@@ -35,17 +31,25 @@ pub(crate) fn custom_operator_call(
 /// operand whose type is not known yet, such as a subquery that is not planned
 /// yet, leaves the decision to a check once it is known.
 pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
-    let Some((_, operands)) = decided_operator(expr, env) else {
+    let Some(types) = operand_types(expr, env) else {
         return Ok(());
     };
-    let types: Vec<ExprType> = operands
-        .iter()
-        .map(|operand| type_of(operand, env))
-        .collect();
     if types.iter().any(|ty| matches!(ty, ExprType::NotKnownYet)) {
         return Ok(());
     }
     find_operator_call(expr, &types, env).map(|_| ())
+}
+
+/// The types of the operands of `expr`, in order, when it is an operator that
+/// custom types decide (see [decided_operator]).
+fn operand_types(expr: &ast::Expr, env: &TypeEnv) -> Option<Vec<ExprType>> {
+    let (_, operands) = decided_operator(expr, env)?;
+    Some(
+        operands
+            .iter()
+            .map(|operand| type_of(operand, env))
+            .collect(),
+    )
 }
 
 /// The function that runs the operator expression `expr` when an operand is a

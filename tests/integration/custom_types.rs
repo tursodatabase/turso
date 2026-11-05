@@ -1390,6 +1390,473 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// A RANGE frame with an offset over a custom type takes only the offset
+    /// types PostgreSQL's `in_range` functions take: integers over smallint
+    /// and bigint, integers and numerics over numeric, and nothing over any
+    /// other custom type. Tries every kind of column type with every kind of
+    /// offset, as a PRECEDING and a FOLLOWING bound, at the start and end of
+    /// the frame, in both orders. An accepted frame counts the same rows as a
+    /// subquery that applies the offset with `+` and `-`. SQLite's own types
+    /// keep SQLite's rules.
+    #[test]
+    fn test_range_offsets_only_on_types_postgres_allows() {
+        /// What kind of number a type is to PostgreSQL's `in_range` functions.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Number {
+            Integer,
+            Numeric,
+            None,
+        }
+        /// The `in_range` pairs PostgreSQL has for numbers: an integer column
+        /// takes integer offsets, and a numeric column takes integer and
+        /// numeric offsets.
+        fn takes(column: Number, offset: Number) -> bool {
+            matches!(
+                (column, offset),
+                (Number::Integer, Number::Integer)
+                    | (Number::Numeric, Number::Integer | Number::Numeric)
+            )
+        }
+        enum Offsets {
+            /// A SQLite type, or a domain over one: SQLite's rules apply.
+            Sqlite,
+            /// A custom type of this kind of number. A refused offset gets an
+            /// error that names the type `name`.
+            Takes { name: &'static str, number: Number },
+        }
+        struct Kind {
+            ty: &'static str,
+            strict: bool,
+            /// The window's ORDER BY value, written over the column `c`.
+            order: &'static str,
+            /// Three distinct values, inserted for kinds that take offsets.
+            values: [&'static str; 3],
+            offsets: Offsets,
+        }
+        let kind = |ty, values, offsets| Kind {
+            ty,
+            strict: true,
+            order: "c",
+            values,
+            offsets,
+        };
+        // An ORDER BY value that isn't a column, over an integer column.
+        let sqlite_order = |order| Kind {
+            ty: "integer",
+            strict: true,
+            order,
+            values: ["1", "2", "4"],
+            offsets: Offsets::Sqlite,
+        };
+        let takes_kind = |name, number| Offsets::Takes { name, number };
+        let none = |name| takes_kind(name, Number::None);
+        let no_values = ["NULL", "NULL", "NULL"];
+        let kinds = [
+            kind("integer", ["1", "2", "4"], Offsets::Sqlite),
+            kind("real", ["1.0", "2.5", "4.0"], Offsets::Sqlite),
+            kind("text", ["'a'", "'b'", "'c'"], Offsets::Sqlite),
+            kind("any", ["1", "'x'", "4"], Offsets::Sqlite),
+            kind("blob", ["x'01'", "x'02'", "x'04'"], Offsets::Sqlite),
+            kind("pos", ["1", "2", "4"], Offsets::Sqlite),
+            Kind {
+                ty: "date",
+                strict: false,
+                order: "c",
+                values: ["1", "2", "4"],
+                offsets: Offsets::Sqlite,
+            },
+            // SQLite's CAST to numeric, a decimal, a string, NULL, and a CAST
+            // without a type name.
+            sqlite_order("CAST(c AS numeric)"),
+            sqlite_order("0.5"),
+            sqlite_order("'a'"),
+            sqlite_order("NULL"),
+            sqlite_order("CAST(c AS)"),
+            kind(
+                "smallint",
+                ["1", "2", "4"],
+                takes_kind("smallint", Number::Integer),
+            ),
+            kind(
+                "bigint",
+                ["1", "2", "4"],
+                takes_kind("bigint", Number::Integer),
+            ),
+            kind(
+                "big",
+                ["1", "2", "4"],
+                takes_kind("bigint", Number::Integer),
+            ),
+            kind(
+                "numeric(10, 2)",
+                ["1", "2.5", "4"],
+                takes_kind("numeric", Number::Numeric),
+            ),
+            kind(
+                "amount",
+                ["1", "2.5", "4"],
+                takes_kind("numeric", Number::Numeric),
+            ),
+            // Types without an order, such as json and inet, are left out:
+            // ORDER BY refuses them before the frame is looked at.
+            kind("date", no_values, none("date")),
+            kind("day", no_values, none("date")),
+            kind("time", no_values, none("time")),
+            kind("timestamp", no_values, none("timestamp")),
+            kind("timestamptz", no_values, none("timestamptz")),
+            kind("boolean", no_values, none("boolean")),
+            kind("uuid", no_values, none("uuid")),
+            kind("varchar(10)", no_values, none("varchar")),
+            kind("bytea", no_values, none("bytea")),
+            kind("cents", no_values, none("cents")),
+            kind("label", no_values, none("label")),
+            kind("integer[]", no_values, none("integer[]")),
+            // Values built from a custom column with an operator: `date - date`
+            // is an integer, and `date + 1` is a date.
+            Kind {
+                ty: "date",
+                strict: true,
+                order: "c - c",
+                values: ["'2026-01-01'", "'2026-01-02'", "'2026-01-04'"],
+                offsets: Offsets::Sqlite,
+            },
+            Kind {
+                order: "c + 1",
+                ..kind("date", no_values, none("date"))
+            },
+            // `+` on an array gives a value whose type nothing declares, which
+            // may be a custom type's value.
+            Kind {
+                order: "c + 1",
+                ..kind("integer[]", no_values, none("unknown"))
+            },
+            // SQLite's CAST without a type name gives a SQLite number, also
+            // from a custom type's value.
+            Kind {
+                ty: "numeric(10, 2)",
+                strict: true,
+                order: "CAST(c AS)",
+                values: ["1", "2.5", "4"],
+                offsets: Offsets::Sqlite,
+            },
+        ];
+        enum OffsetType {
+            /// Known when the statement is prepared. An error names it `name`.
+            Known {
+                name: &'static str,
+                custom: bool,
+                number: Number,
+            },
+            /// A string or a parameter, read as the column's type when the
+            /// statement runs.
+            ColumnType { integer: bool },
+            /// Accepted wherever the column type takes offsets, and then fails
+            /// when the statement runs.
+            Null,
+        }
+        /// What a window over a kind with an offset does.
+        enum Expected {
+            /// Fails when prepared, with this error.
+            Refused(String),
+            /// Anything but a refusal, as SQLite's rules decide.
+            SqliteRules,
+            /// Fails when the statement runs, with this error.
+            FailsWhenRun(&'static str),
+            /// Counts the same rows as a subquery that applies the offset with
+            /// `+` and `-`.
+            SameAsSubquery,
+        }
+        let known = |name, number| OffsetType::Known {
+            name,
+            custom: false,
+            number,
+        };
+        let custom = |name, number| OffsetType::Known {
+            name,
+            custom: true,
+            number,
+        };
+        // (offset, its type, the value bound to ?1). A CAST to numeric without
+        // arguments is SQLite's CAST, whose result may be an integer or a real,
+        // so it is not a number PostgreSQL's numeric takes.
+        let offsets = [
+            ("1", known("integer", Number::Integer), None),
+            ("1.5", known("numeric", Number::Numeric), None),
+            ("CAST(1.5 AS REAL)", known("real", Number::None), None),
+            ("x'01'", known("blob", Number::None), None),
+            ("CAST(1 AS TEXT)", known("text", Number::None), None),
+            // SQLite's CAST without a type name, whose type is SQLite's ANY.
+            ("CAST(1 AS)", known("any", Number::None), None),
+            // `+` on an array, whose type nothing declares.
+            (
+                "CAST('{1}' AS integer[]) + 1",
+                custom("unknown", Number::None),
+                None,
+            ),
+            // A CASE that mixes SQLite types has SQLite's type ANY, and here
+            // holds a real.
+            (
+                "CASE WHEN 1 THEN CAST(0.5 AS REAL) ELSE 'a' END",
+                known("any", Number::None),
+                None,
+            ),
+            // An offset that is not a constant is NULL, as in SQLite.
+            ("(SELECT 1)", OffsetType::Null, None),
+            (
+                "CAST('{1}' AS integer[])",
+                custom("integer[]", Number::None),
+                None,
+            ),
+            ("CAST(1 AS numeric)", known("numeric", Number::None), None),
+            ("'1'", OffsetType::ColumnType { integer: true }, None),
+            ("'1.5'", OffsetType::ColumnType { integer: false }, None),
+            (
+                "?1",
+                OffsetType::ColumnType { integer: true },
+                Some(turso_core::Value::from_i64(1)),
+            ),
+            (
+                "?1",
+                OffsetType::ColumnType { integer: false },
+                Some(turso_core::Value::build_text("1.5")),
+            ),
+            ("NULL", OffsetType::Null, None),
+            (
+                "CAST(1 AS smallint)",
+                custom("smallint", Number::Integer),
+                None,
+            ),
+            ("CAST(1 AS bigint)", custom("bigint", Number::Integer), None),
+            (
+                "CAST(1 AS numeric(5, 2))",
+                custom("numeric", Number::Numeric),
+                None,
+            ),
+            ("CAST(1 AS boolean)", custom("boolean", Number::None), None),
+            // A domain offset is checked as the type it is based on.
+            ("CAST(1 AS pos)", known("integer", Number::Integer), None),
+            ("CAST(1 AS big)", custom("bigint", Number::Integer), None),
+            (
+                "CAST('2026-01-01' AS day)",
+                custom("date", Number::None),
+                None,
+            ),
+        ];
+        // (frame, the rows it holds for the row `t` when ordered ascending,
+        // and when ordered descending). `{k}` is the offset.
+        let frames = [
+            (
+                "{k} PRECEDING AND CURRENT ROW",
+                "u.c >= t.c - {k} AND u.c <= t.c",
+                "u.c <= t.c + {k} AND u.c >= t.c",
+            ),
+            (
+                "CURRENT ROW AND {k} FOLLOWING",
+                "u.c >= t.c AND u.c <= t.c + {k}",
+                "u.c <= t.c AND u.c >= t.c - {k}",
+            ),
+            (
+                "{k} FOLLOWING AND UNBOUNDED FOLLOWING",
+                "u.c >= t.c + {k}",
+                "u.c <= t.c - {k}",
+            ),
+            (
+                "UNBOUNDED PRECEDING AND {k} PRECEDING",
+                "u.c <= t.c - {k}",
+                "u.c >= t.c + {k}",
+            ),
+        ];
+        let counts = |conn: &Arc<turso_core::Connection>,
+                      sql: &str,
+                      param: &Option<turso_core::Value>|
+         -> turso_core::Result<Vec<i64>> {
+            let mut stmt = conn.prepare(sql)?;
+            if let Some(param) = param {
+                stmt.bind_at(1.try_into().unwrap(), param.clone())?;
+            }
+            let mut rows = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                rows.push(row.get::<i64>(0)?);
+                Ok(())
+            })?;
+            Ok(rows)
+        };
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+             CREATE TYPE label(value text) BASE text ENCODE value DECODE value OPERATOR '<';
+             CREATE DOMAIN pos AS integer;
+             CREATE DOMAIN big AS bigint;
+             CREATE DOMAIN amount AS numeric;
+             CREATE DOMAIN day AS date;",
+        )
+        .unwrap();
+        for (n, kind) in kinds.iter().enumerate() {
+            let table = format!("t{n}");
+            let strict = if kind.strict { " STRICT" } else { "" };
+            conn.execute(format!(
+                "CREATE TABLE {table}(id INTEGER PRIMARY KEY, c {}){strict}",
+                kind.ty
+            ))
+            .unwrap();
+            if !matches!(
+                kind.offsets,
+                Offsets::Takes {
+                    number: Number::None,
+                    ..
+                }
+            ) {
+                for value in kind.values {
+                    conn.execute(format!("INSERT INTO {table}(c) VALUES ({value})"))
+                        .unwrap();
+                }
+            }
+            for (offset, offset_type, param) in &offsets {
+                for (frame, asc_rows, desc_rows) in frames {
+                    for (order, rows) in [("ASC", asc_rows), ("DESC", desc_rows)] {
+                        let window = format!(
+                            "SELECT count(*) OVER (ORDER BY {} {order} RANGE BETWEEN {frame}) \
+                             FROM {table} t ORDER BY id",
+                            kind.order
+                        )
+                        .replace("{k}", offset);
+                        let context =
+                            format!("type {} (strict={}): {window}", kind.ty, kind.strict);
+                        let expected = match (&kind.offsets, offset_type) {
+                            // Over a SQLite value, an offset of a custom type
+                            // other than smallint and bigint is refused: adding
+                            // it gives a value of that type, which doesn't
+                            // compare with SQLite's numbers.
+                            (
+                                Offsets::Sqlite,
+                                OffsetType::Known {
+                                    name,
+                                    custom: true,
+                                    number: Number::None | Number::Numeric,
+                                },
+                            ) => Expected::Refused(format!(
+                                "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type {name} over a value without a custom type"
+                            )),
+                            (
+                                Offsets::Sqlite,
+                                OffsetType::Known {
+                                    custom: true,
+                                    number: Number::Integer,
+                                    ..
+                                }
+                                | OffsetType::Known {
+                                    custom: false,
+                                    number: Number::None | Number::Integer | Number::Numeric,
+                                    ..
+                                }
+                                | OffsetType::ColumnType { .. }
+                                | OffsetType::Null,
+                            ) => Expected::SqliteRules,
+                            (
+                                Offsets::Takes {
+                                    name,
+                                    number: Number::None,
+                                },
+                                _,
+                            ) => Expected::Refused(format!(
+                                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name}"
+                            )),
+                            (
+                                Offsets::Takes {
+                                    name,
+                                    number: number @ (Number::Integer | Number::Numeric),
+                                },
+                                OffsetType::Known {
+                                    name: offset_type,
+                                    custom,
+                                    number: offset_number,
+                                },
+                            ) => {
+                                if takes(*number, *offset_number) {
+                                    Expected::SameAsSubquery
+                                } else if !*custom && *offset_number == Number::None {
+                                    // SQLite's own types, such as REAL and
+                                    // SQLite's NUMERIC.
+                                    Expected::Refused(format!(
+                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and an offset of SQLite type {}",
+                                        offset_type.to_ascii_uppercase()
+                                    ))
+                                } else {
+                                    Expected::Refused(format!(
+                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"
+                                    ))
+                                }
+                            }
+                            (
+                                Offsets::Takes {
+                                    number: Number::Integer | Number::Numeric,
+                                    ..
+                                },
+                                OffsetType::Null,
+                            ) => Expected::FailsWhenRun("offset must be a non-negative"),
+                            (
+                                Offsets::Takes {
+                                    number: Number::Integer,
+                                    ..
+                                },
+                                OffsetType::ColumnType { integer: false },
+                            ) => Expected::FailsWhenRun("offset must be a non-negative integer"),
+                            (
+                                Offsets::Takes {
+                                    number: Number::Numeric,
+                                    ..
+                                },
+                                OffsetType::ColumnType { integer: false },
+                            )
+                            | (
+                                Offsets::Takes {
+                                    number: Number::Integer | Number::Numeric,
+                                    ..
+                                },
+                                OffsetType::ColumnType { integer: true },
+                            ) => Expected::SameAsSubquery,
+                        };
+                        let result = counts(&conn, &window, param);
+                        match expected {
+                            Expected::Refused(refusal) => {
+                                let error = match conn.prepare(&window) {
+                                    Ok(_) => panic!("{context}: expected an error"),
+                                    Err(error) => error.to_string(),
+                                };
+                                assert!(error.contains(&refusal), "{context}: {error}");
+                            }
+                            Expected::SqliteRules => {
+                                if let Err(error) = result {
+                                    assert!(
+                                        !error.to_string().contains("is not supported for"),
+                                        "{context}: {error}"
+                                    );
+                                }
+                            }
+                            Expected::FailsWhenRun(message) => {
+                                let error = result.expect_err(&context).to_string();
+                                assert!(error.contains(message), "{context}: {error}");
+                            }
+                            Expected::SameAsSubquery => {
+                                let expected_sql = format!(
+                                    "SELECT (SELECT count(*) FROM {table} u WHERE {rows}) \
+                                     FROM {table} t ORDER BY id"
+                                )
+                                .replace("{k}", offset);
+                                let expected = counts(&conn, &expected_sql, param)
+                                    .unwrap_or_else(|e| panic!("{expected_sql}: {e}"));
+                                let actual = result.unwrap_or_else(|e| panic!("{context}: {e}"));
+                                assert_eq!(actual, expected, "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Every way of storing a value of a custom type stores what a STRICT column
     /// of the type's BASE stores when given the ENCODE result: the same kind and
     /// value, or an error naming the same kind. CAST gives that value too.

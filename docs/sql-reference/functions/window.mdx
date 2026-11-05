@@ -62,7 +62,16 @@ where `<start>` and `<end>` (or the shorthand `<bound>`) are one of:
 | `UNBOUNDED FOLLOWING` | The last row of the partition |
 
 - `ROWS` counts individual physical rows.
-- `RANGE` compares the `ORDER BY` value: `<n> PRECEDING` includes every row whose ordering value is at least the current value minus `n`. When the `ORDER BY` value is a `numeric`, the bounds are computed with numeric arithmetic. An offset on a value of another custom type with an order, such as an array, is an error.
+- `RANGE` compares the `ORDER BY` value: `<n> PRECEDING` includes every row whose ordering value is at least the current value minus `n`. With [custom types](/sql-reference/statements/create-type), an offset is allowed only where PostgreSQL allows one:
+
+  | `ORDER BY` value | Allowed offset types |
+  |---|---|
+  | `smallint`, `bigint` | `integer`, `smallint`, `bigint` |
+  | `numeric` | `integer`, `smallint`, `bigint`, `numeric` (a decimal such as `1.5`) |
+  | any other custom type, an array, or a value with no known type (such as `a + 1` over an array column `a`) | none |
+  | a SQLite type (`INTEGER`, `REAL`, ...) | any value that is not a custom type, an array or a value with no known type, as in SQLite, and `smallint` or `bigint` values |
+
+  For example, `ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW` over a `date` column is an error, because PostgreSQL needs an `interval` offset there and Turso has no `interval` type. A parameter such as `?`, or a string such as `'1'`, is read as the column's type when the statement runs, as in PostgreSQL: over a `bigint` column `'1.5'` is an error, and over a `numeric` column it is the exact decimal 1.5. A domain, as the `ORDER BY` value or as the offset, counts as the type it is based on. When the `ORDER BY` value is a `numeric`, the bounds are computed with numeric arithmetic.
 - `GROUPS` counts peer groups (sets of rows that are equal on the `ORDER BY` expression).
 
 Example — a three-row moving window:
