@@ -1129,6 +1129,131 @@ fn test_readonly_mvcc_db_can_be_read() {
     assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
+#[test]
+fn test_readonly_first_writer_activation_preserves_readers() {
+    for legacy in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("activation.db");
+        if legacy {
+            create_legacy_db(&path);
+        } else {
+            create_wal_db(&path);
+        }
+        let original = std::fs::read(&path).unwrap();
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let open = |flags| {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                flags,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+        };
+        let db = open(OpenFlags::ReadOnly).unwrap();
+        let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        reader.execute("BEGIN").unwrap();
+        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, vec![(1,)]);
+        let writer_db = if legacy {
+            assert!(matches!(
+                open(OpenFlags::None),
+                Err(turso_core::LimboError::Busy)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            reader.execute("COMMIT").unwrap();
+            open(OpenFlags::None).unwrap()
+        } else {
+            open(OpenFlags::None).unwrap()
+        };
+        assert!(Arc::ptr_eq(&db, &writer_db));
+        let writer = writer_db
+            .connect(ConnectOpts::new().with_readonly(false))
+            .unwrap();
+        writer
+            .execute("INSERT INTO t(val) VALUES ('writer')")
+            .unwrap();
+        if !legacy {
+            match writer.checkpoint(turso_core::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            }) {
+                Ok(result) => assert_eq!(result.wal_total_backfilled, 0),
+                Err(turso_core::LimboError::Busy) => {}
+                Err(error) => panic!("unexpected checkpoint error: {error}"),
+            }
+            let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+            assert_eq!(rows, vec![(1,)]);
+            reader.execute("COMMIT").unwrap();
+        }
+        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, vec![(2,)]);
+        let checkpoint_rows: Vec<(i64, i64, i64)> =
+            reader.exec_rows("PRAGMA wal_checkpoint(TRUNCATE)");
+        assert_eq!(checkpoint_rows, vec![(0, -1, -1)]);
+        assert!(matches!(
+            reader.checkpoint(turso_core::CheckpointMode::Truncate {
+                upper_bound_inclusive: None
+            }),
+            Err(turso_core::LimboError::ReadOnly)
+        ));
+        reader.close().unwrap();
+        writer
+            .execute("INSERT INTO t(val) VALUES ('survivor')")
+            .unwrap();
+        writer.close().unwrap();
+        assert_eq!(read_header_versions(&path), (2, 2));
+    }
+}
+
+#[test]
+fn test_readonly_orphan_wal_is_preserved_until_writer_open() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("source.db");
+    let sqlite = rusqlite::Connection::open(&source).unwrap();
+    sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
+    sqlite
+        .execute_batch("CREATE TABLE orphan(x); INSERT INTO orphan VALUES(99)")
+        .unwrap();
+    let orphan = std::fs::read(format!("{}-wal", source.display())).unwrap();
+    assert!(orphan.len() > 32);
+    let path = dir.path().join("empty.db");
+    let wal_path = format!("{}-wal", path.display());
+    std::fs::write(&path, []).unwrap();
+    std::fs::write(&wal_path, &orphan).unwrap();
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let open = |flags| {
+        Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            flags,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+    };
+    let db = open(OpenFlags::ReadOnly).unwrap();
+    let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("PRAGMA schema_version");
+    assert_eq!(rows, vec![(0,)]);
+    assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
+    assert_eq!(std::fs::read(&wal_path).unwrap(), orphan);
+    let writable = open(OpenFlags::None).unwrap();
+    assert!(Arc::ptr_eq(&db, &writable));
+    let writer = writable
+        .connect(ConnectOpts::new().with_readonly(false))
+        .unwrap();
+    writer
+        .execute("CREATE TABLE fresh(x); INSERT INTO fresh VALUES(1)")
+        .unwrap();
+    assert!(writer.prepare("SELECT * FROM orphan").is_err());
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT x FROM fresh");
+    assert_eq!(rows, vec![(1,)]);
+    reader.close().unwrap();
+    writer.close().unwrap();
+}
+
 fn read_text_encoding(db_path: &Path) -> u32 {
     let bytes = std::fs::read(db_path).expect("Failed to read database file");
     assert!(

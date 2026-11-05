@@ -574,6 +574,12 @@ pub fn op_checkpoint(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    if program.connection.is_readonly(*database) {
+        set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let pager = program.get_pager_from_database_index(database)?;
     // Like SQLite, refuse only when this connection's open transaction has already
     // read or written the database. After a plain BEGIN nothing is held yet, so the
@@ -599,11 +605,11 @@ pub fn op_checkpoint(
         // helper statement is alive on the connection would let a checkpoint
         // clobber a suspended statement that holds one (e.g. a pragma vtab
         // cursor's stored helper).
-        state.explicit_checkpoint_guard = Some(
-            program
-                .connection
-                .begin_explicit_checkpoint(pager.clone(), true)?,
-        );
+        state.explicit_checkpoint_guard = Some(program.connection.begin_explicit_checkpoint(
+            pager.clone(),
+            true,
+            *database,
+        )?);
     }
 
     // In autocommit mode, this statement can still hold an implicit read tx.

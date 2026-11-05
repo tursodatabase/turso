@@ -567,8 +567,8 @@ fn translate_statement(
     };
 
     if is_write {
-        if is_dml {
-            // DML translators register their actual write database. Keep a
+        if is_dml || program.has_write_database() {
+            // DML and schema translators register their actual write database. Keep a
             // main read transaction to coordinate connection-level autocommit,
             // without upgrading an unrelated main snapshot for attached-only
             // writes.
