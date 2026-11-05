@@ -24,7 +24,7 @@ use crate::{
     type_ordering::TypeOrdering,
     types::ValueRef,
     vdbe::hash_table::normalized_f64_bits,
-    LimboError, Numeric, Result,
+    LimboError, NoComparisonKind, Numeric, Result,
 };
 
 /// How two values compare.
@@ -1004,55 +1004,13 @@ pub(crate) fn no_comparison_error(ty: &ExprType, type_def: &TypeDef) -> LimboErr
     } else {
         "to compare their text, CAST them to text"
     };
-    LimboError::ParseError(format!(
-        "{}; {instead}",
-        values_cannot_be_compared(&format!("{}{brackets}", type_def.name))
-    ))
-}
-
-/// The errors for values whose type can't be compared. Their text is built
-/// here only, from the parts [NoComparisonError::of_message] looks for, so
-/// that a frontend can tell them apart, as the PostgreSQL one does to report
-/// their SQLSTATE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NoComparisonError {
-    /// Comparing, sorting or grouping values: `values of type json cannot be
-    /// compared; to compare their text, CAST them to text`.
-    Compare,
-    /// A key on a column of the type: `column 'j' of type 'json' cannot be a
-    /// key: values of type json cannot be compared`.
-    Key,
-    /// An array of the type: `arrays of type json are not supported, because
-    /// values of type json cannot be compared`.
-    Array,
-}
-
-const VALUES_OF_TYPE: &str = "values of type ";
-const CANNOT_BE_COMPARED: &str = " cannot be compared";
-const KEY_COLUMN: &str = "column '";
-const CANNOT_BE_A_KEY: &str = " cannot be a key: ";
-const ARRAYS_OF_TYPE: &str = "arrays of type ";
-
-impl NoComparisonError {
-    /// Which of these errors `message` is, if any.
-    pub fn of_message(message: &str) -> Option<Self> {
-        if message.starts_with(VALUES_OF_TYPE) && message.contains(CANNOT_BE_COMPARED) {
-            Some(Self::Compare)
-        } else if message.starts_with(KEY_COLUMN)
-            && message.contains(&format!("{CANNOT_BE_A_KEY}{VALUES_OF_TYPE}"))
-        {
-            Some(Self::Key)
-        } else if message.starts_with(ARRAYS_OF_TYPE) && message.contains(CANNOT_BE_COMPARED) {
-            Some(Self::Array)
-        } else {
-            None
-        }
+    LimboError::NoComparison {
+        kind: NoComparisonKind::Compare,
+        message: format!(
+            "values of type {}{brackets} cannot be compared; {instead}",
+            type_def.name
+        ),
     }
-}
-
-/// `values of type <type_name> cannot be compared`
-fn values_cannot_be_compared(type_name: &str) -> String {
-    format!("{VALUES_OF_TYPE}{type_name}{CANNOT_BE_COMPARED}")
 }
 
 /// The error for a key on `column`, declared as `declared_type`, whose values
@@ -1062,18 +1020,22 @@ pub(crate) fn no_comparison_key_error(
     declared_type: &str,
     type_name: &str,
 ) -> LimboError {
-    LimboError::ParseError(format!(
-        "{KEY_COLUMN}{column}' of type '{declared_type}'{CANNOT_BE_A_KEY}{}",
-        values_cannot_be_compared(type_name)
-    ))
+    LimboError::NoComparison {
+        kind: NoComparisonKind::Key,
+        message: format!(
+            "column '{column}' of type '{declared_type}' cannot be a key: values of type {type_name} cannot be compared"
+        ),
+    }
 }
 
 /// The error for an array of `type_name`, whose values can't be compared.
 pub(crate) fn no_comparison_array_error(type_name: &str) -> LimboError {
-    LimboError::ParseError(format!(
-        "{ARRAYS_OF_TYPE}{type_name} are not supported, because {}",
-        values_cannot_be_compared(type_name)
-    ))
+    LimboError::NoComparison {
+        kind: NoComparisonKind::Array,
+        message: format!(
+            "arrays of type {type_name} are not supported, because values of type {type_name} cannot be compared"
+        ),
+    }
 }
 
 /// The collation of one expression, or None when it has none (SQLite's

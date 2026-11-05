@@ -342,6 +342,12 @@ fn builtin_has_comparison(type_name: &str) -> bool {
     }
 }
 
+/// Built-in types whose values are json documents. `->` on any other type
+/// gives text, unless values of the type can't be compared.
+fn builtin_is_json(type_name: &str) -> bool {
+    matches!(type_name, "json" | "jsonb")
+}
+
 /// The kind of value a built-in type reads as. uuid, jsonb and numeric store
 /// blobs and DECODE them to text. The built-in types are registered before any
 /// connection's functions, so the kind of `uuid_str(value)` can't be worked
@@ -718,6 +724,13 @@ impl TypeDef {
             }
             TypeDefKind::Struct(_) | TypeDefKind::Union(_) => false,
         }
+    }
+
+    /// Whether values of the type are json documents: it is the built-in json
+    /// or jsonb type. A domain over one of them is not; see
+    /// [ResolvedType::chain] for the types it is based on.
+    pub fn is_builtin_json(&self) -> bool {
+        self.is_builtin && builtin_is_json(&self.name.to_lowercase())
     }
 
     /// Whether ORDER BY and CREATE INDEX accept values of the type. A type
@@ -4179,9 +4192,7 @@ impl Schema {
                     &resolver,
                     namespace,
                 )
-                .map_err(|err| {
-                    LimboError::ParseError(format!("cannot load table '{}': {err}", table.name))
-                })?;
+                .map_err(|err| err.within(&format!("cannot load table '{}'", table.name)))?;
             }
         }
         Ok(())
@@ -4197,8 +4208,7 @@ impl Schema {
     ) -> Result<()> {
         use crate::translate::index::check_index_expression_has_comparison;
         use crate::translate::schema::bind_stored_expr;
-        let within =
-            |what: String| move |err: LimboError| LimboError::ParseError(format!("{what}: {err}"));
+        let within = |what: String| move |err: LimboError| err.within(&what);
         for column in &table.columns {
             if table.is_key_column(column) {
                 self.check_key_column_has_comparison(column, table.is_strict)?;

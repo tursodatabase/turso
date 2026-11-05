@@ -1,6 +1,6 @@
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{
-    ConstraintKind, ConstraintViolation, DialectError, LimboError, NoComparisonError, Value,
+    ConstraintKind, ConstraintViolation, DialectError, LimboError, NoComparisonKind, Value,
 };
 use turso_pg_parser::sqlstate::*;
 
@@ -234,6 +234,14 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
+        // PostgreSQL: "could not identify an equality operator", "data type
+        // jsonb has no default operator class for access method btree". It
+        // has arrays of these types, which Turso doesn't support yet.
+        LimboError::NoComparison { kind, .. } => match kind {
+            NoComparisonKind::Compare => SQLSTATE_UNDEFINED_FUNCTION,
+            NoComparisonKind::Key => SQLSTATE_UNDEFINED_OBJECT,
+            NoComparisonKind::Array => SQLSTATE_FEATURE_NOT_SUPPORTED,
+        },
         LimboError::SqlError(msg) => sql_error_sqlstate(msg),
         LimboError::PlanningError(_) => SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION,
         LimboError::DivisionByZero => SQLSTATE_DIVISION_BY_ZERO,
@@ -291,12 +299,6 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("cannot drop type")
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
-    } else if let Some(kind) = NoComparisonError::of_message(msg) {
-        match kind {
-            NoComparisonError::Compare => SQLSTATE_UNDEFINED_FUNCTION,
-            NoComparisonError::Key => SQLSTATE_UNDEFINED_OBJECT,
-            NoComparisonError::Array => SQLSTATE_FEATURE_NOT_SUPPORTED,
-        }
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("no such table")

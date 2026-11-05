@@ -453,6 +453,21 @@ mod tests {
         );
     }
 
+    /// CREATE DOMAIN refuses a base type that does not exist yet and DROP
+    /// TYPE a type a domain is based on, so domains based on each other can
+    /// only come from stored SQL. Typing an expression assumes they don't load.
+    #[test]
+    fn test_reopen_fails_when_stored_domains_are_based_on_each_other() {
+        let (_temp_dir, path) =
+            database_with_stored_types_a_and_b("CREATE DOMAIN a AS b", "CREATE DOMAIN b AS a");
+        let err = open_error(&path);
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell the kinds of types a, b: they name each other"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// The kinds of a type stored before a type its DECODE casts to are
     /// worked out after that type's.
     #[test]
@@ -1430,43 +1445,51 @@ mod tests {
 
     /// CREATE TABLE and CREATE INDEX refuse a key, an index or a CHECK that
     /// compares json values, so a stored schema that has one, written by an
-    /// earlier version, must not load.
+    /// earlier version, must not load. The error keeps its kind, so the
+    /// PostgreSQL frontend reports the same SQLSTATE as for the statement.
     #[test]
     fn test_open_file_that_compares_json_values_fails() {
-        // (table sql, index sql, expected error)
+        use turso_core::NoComparisonKind::{Compare, Key};
+        // (table sql, index sql, expected kind, expected error)
         let cases = [
             (
                 "CREATE TABLE t(j json UNIQUE) STRICT",
                 None,
+                Key,
                 "cannot load table 't': column 'j' of type 'json' cannot be a key: values of type json cannot be compared",
             ),
             (
                 "CREATE TABLE t(j json) STRICT",
                 Some("CREATE INDEX x ON t(j)"),
+                Key,
                 "cannot load table 't': index 'x': column 'j' of type 'json' cannot be a key: values of type json cannot be compared",
             ),
             (
                 "CREATE TABLE t(j json) STRICT",
                 Some("CREATE INDEX x ON t((j -> 'x'))"),
+                Compare,
                 "cannot load table 't': index 'x' on (j -> 'x'): values of type json cannot be compared",
             ),
             (
                 "CREATE TABLE t(i INTEGER, j json) STRICT",
                 Some("CREATE INDEX x ON t(i) WHERE j = '[]'"),
+                Compare,
                 "cannot load table 't': index 'x' WHERE j = '[]': values of type json cannot be compared",
             ),
             (
                 "CREATE TABLE t(j json CHECK (j <> '[]')) STRICT",
                 None,
+                Compare,
                 "cannot load table 't': CHECK(j <> '[]'): values of type json cannot be compared",
             ),
             (
                 "CREATE TABLE t(j json, g INTEGER AS (j = '[]')) STRICT",
                 None,
+                Compare,
                 "cannot load table 't': generated column 'g': values of type json cannot be compared",
             ),
         ];
-        for (table_sql, index_sql, expected) in cases {
+        for (table_sql, index_sql, expected_kind, expected) in cases {
             let tmp_dir = TempDir::new().unwrap();
             let path = tmp_dir.path().join("compares_json.db");
             let sqlite = rusqlite::Connection::open(&path).unwrap();
@@ -1505,8 +1528,9 @@ mod tests {
                 panic!("open must fail for {table_sql} {index_sql:?}");
             };
             assert!(
-                err.to_string().contains(expected),
-                "{table_sql} {index_sql:?}: unexpected error: {err}"
+                matches!(&err, turso_core::LimboError::NoComparison { kind, message }
+                    if *kind == expected_kind && message.contains(expected)),
+                "{table_sql} {index_sql:?}: unexpected error: {err:?}"
             );
         }
     }
