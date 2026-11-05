@@ -1,7 +1,7 @@
 use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::{RoleCatalog, RoleId};
@@ -1187,23 +1187,21 @@ fn exec_age(args: &[Register]) -> Result<Value> {
 }
 
 /// Reads a timestamp in the form the timestamp type stores, `YYYY-MM-DD
-/// HH:MM:SS[.f]`, or a date in the form the date type stores, `YYYY-MM-DD`,
-/// as midnight of that day, since PostgreSQL casts a date to a timestamp.
-/// The timestamp type keeps an hour of 24 as written, so `24:00:00` is
-/// midnight at the end of the day.
+/// HH:MM:SS[.f]`, the form the timestamptz type stores, the same in UTC
+/// followed by `+00`, or a date in the form the date type stores,
+/// `YYYY-MM-DD`, as midnight of that day, since PostgreSQL casts a date to a
+/// timestamp.
 fn parse_timestamp(text: &str) -> Result<NaiveDateTime> {
-    let (text_without_hour_24, extra_days) = match text.split_once(" 24:") {
-        Some((date, time)) => (format!("{date} 00:{time}"), 1),
-        None => (text.to_string(), 0),
+    let text_in_utc = match text.strip_suffix("+00") {
+        Some(timestamp) => timestamp,
+        None => text,
     };
-    NaiveDateTime::parse_from_str(&text_without_hour_24, "%Y-%m-%d %H:%M:%S%.f")
+    NaiveDateTime::parse_from_str(text_in_utc, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| {
-            NaiveDate::parse_from_str(&text_without_hour_24, "%Y-%m-%d")
+            NaiveDate::parse_from_str(text_in_utc, "%Y-%m-%d")
                 .map(|date| date.and_time(NaiveTime::MIN))
         })
-        .ok()
-        .and_then(|timestamp| timestamp.checked_add_signed(TimeDelta::days(extra_days)))
-        .ok_or_else(|| {
+        .map_err(|_| {
             LimboError::InvalidArgument(format!(
                 "invalid input syntax for type timestamp: \"{text}\""
             ))
