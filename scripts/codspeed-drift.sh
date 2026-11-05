@@ -4,18 +4,24 @@
 # CodSpeed compares each commit with the one before it, and its check does not
 # block merging, so a big slowdown can be merged unnoticed and many small ones
 # can add up without any single commit standing out. This script compares the
-# newest CodSpeed run on main with the run where the previous report stopped and
+# newest CodSpeed runs on main with the runs where the previous report stopped and
 # writes a markdown report:
 #
 # - New: benchmarks at least THRESHOLD slower in this window. For each one the
 #   script searches the window's commits for the first one that has at least
 #   half of the slowdown, and names it and its pull request.
 # - Still slower: rows of the previous report whose box nobody ticked, checked
-#   again against the run from before they got slower.
+#   again against the runs from before they got slower.
 # - Faster again: rows of the previous report that are no longer slower.
 #
+# Each end of a comparison is the runs of several consecutive main commits, and a
+# benchmark's change is the median over pairs of runs, one from each end. Each
+# commit's build lays out code in the binary differently, which changes cache
+# misses and moves some benchmarks by up to ~8% with no change to their code. A
+# real slowdown is in every run after its commit; a layout move is in few of them.
+#
 # The previous report is the newest GitHub issue this script created. Its rows
-# and the commit it stopped at are kept in a JSON comment at the end of its body.
+# and the runs it stopped at are kept in a JSON comment at the end of its body.
 #
 # Usage:
 #   scripts/codspeed-drift.sh             # print the report
@@ -31,7 +37,8 @@
 #   CODSPEED_DRIFT_NOT_BEFORE  Main commit. Runs before it are never compared,
 #                              because a change to CodSpeed or to the benchmark
 #                              harness changed every value at that commit.
-#   CODSPEED_DRIFT_HEAD        Use this main commit instead of the newest one.
+#   CODSPEED_DRIFT_RUNS        Runs at each end of a comparison. Default 5.
+#   CODSPEED_DRIFT_HEAD        End at this main commit instead of the newest one.
 #   CODSPEED_DRIFT_PREVIOUS    Use the issue body in this file as the previous
 #                              open report instead of looking it up on GitHub.
 #   REPO                       GitHub repository, default tursodatabase/turso.
@@ -43,13 +50,16 @@ repo=${REPO:-tursodatabase/turso}
 threshold=${CODSPEED_DRIFT_THRESHOLD:-0.05}
 days=${CODSPEED_DRIFT_DAYS:-7}
 not_before=${CODSPEED_DRIFT_NOT_BEFORE:-}
+runs_per_end=${CODSPEED_DRIFT_RUNS:-5}
+# Main commits searched for runs at each end.
+search_commits=40
 title_prefix="CodSpeed drift"
 label=performance-regression
 # Rows listed in one issue. GitHub rejects issue bodies over 65536 characters.
 max_rows=80
 
 main() {
-  local update_issue=false
+  local update_issue=false run
   case "${1:-}" in
     "") ;;
     --update-issue) update_issue=true ;;
@@ -63,10 +73,12 @@ main() {
   find_head
   find_previous_report
   find_base
-  if [ "$base_run" = "$head_run" ]; then
-    echo "No new CodSpeed run on main since $base_sha." >&2
-    exit 0
-  fi
+  for run in $head_runs; do
+    if [[ " $base_runs " == *" $run "* ]]; then
+      echo "Fewer than $runs_per_end new CodSpeed runs on main since $base_sha." >&2
+      exit 0
+    fi
+  done
   echo "Comparing $base_sha..$head_sha" >&2
 
   recheck_previous_rows
@@ -83,31 +95,31 @@ main() {
   fi
 }
 
-# Sets head_sha and head_run: the newest main commit with a CodSpeed run.
+# Sets head_runs: the CodSpeed runs of the newest `runs_per_end` main commits
+# that have one, newest first. head_sha and head_run are the newest of them.
 find_head() {
-  local commits
-  if [ -n "${CODSPEED_DRIFT_HEAD:-}" ]; then
-    commits=$(git rev-parse "$CODSPEED_DRIFT_HEAD")
-  else
-    commits=$(git log --first-parent --format=%H -n 20 origin/main)
-  fi
-  if ! read -r head_sha head_run < <(first_commit_with_run $commits); then
-    echo "No CodSpeed run among the 20 newest main commits." >&2
+  # shellcheck disable=SC2046 # split the list of commit hashes into arguments
+  commits_with_runs $(git log --first-parent --format=%H -n "$search_commits" "${CODSPEED_DRIFT_HEAD:-origin/main}") \
+    > "$work/head-runs"
+  if [ "$(wc -l < "$work/head-runs")" -lt "$runs_per_end" ]; then
+    echo "Fewer than $runs_per_end CodSpeed runs among the $search_commits newest main commits." >&2
     exit 2
   fi
+  read -r head_sha head_run < "$work/head-runs"
+  head_runs=$(cut -d' ' -f2 "$work/head-runs" | xargs)
 }
 
-# Prints "<sha> <run id>" for the first of the given commits that has a CodSpeed run.
-first_commit_with_run() {
-  local sha run
+# Prints "<sha> <run id>" for the first `runs_per_end` of the given commits that
+# have a CodSpeed run.
+commits_with_runs() {
+  local sha run found=0
   for sha in "$@"; do
     run=$(run_of "$sha")
-    if [ -n "$run" ]; then
-      echo "$sha $run"
-      return 0
-    fi
+    [ -n "$run" ] || continue
+    echo "$sha $run"
+    found=$((found + 1))
+    [ "$found" -lt "$runs_per_end" ] || return 0
   done
-  return 1
 }
 
 # Prints the CodSpeed run id of a commit, or nothing if CodSpeed has no run for
@@ -119,8 +131,9 @@ run_of() {
     [ "$cached" = - ] || echo "$cached"
     return 0
   }
+  # run_of is called inside $(...), where a failed command does not stop the script.
   url=$(gh api "repos/$repo/commits/$1/check-runs?check_name=CodSpeed%20Performance%20Analysis" \
-    -q '.check_runs[0].details_url // empty')
+    -q '.check_runs[0].details_url // empty') || exit 2
   if [[ $url =~ /runs/compare/[0-9a-f]+\.\.([0-9a-f]+) ]]; then
     echo "$1 ${BASH_REMATCH[1]}" >> "$work/runs"
     echo "${BASH_REMATCH[1]}"
@@ -131,9 +144,9 @@ run_of() {
 
 # Sets previous_issue (number or empty), previous_open (true/false) and writes
 # the previous report's state to $work/previous.json:
-#   {head_sha, head_run, rows: [row]}, or {} when there is no previous report.
-# A row is {uri, change, before_run, sha, run, pr, since}; `change` is CodSpeed's
-# (old - new) / new, so slower is negative.
+#   {head_sha, head_runs, rows: [row]}, or {} when there is no previous report.
+# A row is {uri, change, before_runs, sha, run, pr, since}; `change` is the median
+# of CodSpeed's (old - new) / new, so slower is negative.
 find_previous_report() {
   previous_issue=
   previous_open=false
@@ -158,14 +171,17 @@ find_previous_report() {
   sed -n 's/^- \[[xX]\] `\([^`]*\)`.*/\1/p' "$work/previous.md" | jq -R . | jq -s . > "$work/ticked.json"
 }
 
-# Sets base_sha and base_run: where the previous report stopped, or else the
-# first run of the last CODSPEED_DRIFT_DAYS days. Never before CODSPEED_DRIFT_NOT_BEFORE.
+# Sets base_runs: the runs where the previous report stopped, or else the runs of
+# the first `runs_per_end` main commits of the last CODSPEED_DRIFT_DAYS days that
+# have one, newest first. Never before CODSPEED_DRIFT_NOT_BEFORE. base_sha and
+# base_run are the newest of them.
 find_base() {
   local previous_head range since
   previous_head=$(jq -r '.head_sha // empty' "$work/previous.json")
   if [ -n "$previous_head" ] && { [ -z "$not_before" ] || git merge-base --is-ancestor "$not_before" "$previous_head"; }; then
     base_sha=$previous_head
-    base_run=$(jq -r '.head_run' "$work/previous.json")
+    base_runs=$(jq -r '.head_runs | join(" ")' "$work/previous.json")
+    base_run=${base_runs%% *}
     return
   fi
   range=$head_sha
@@ -173,25 +189,69 @@ find_base() {
   # GNU date first, then BSD date (macOS).
   since=$(date -u -d "$days days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-"$days"d +%Y-%m-%dT%H:%M:%SZ)
   # shellcheck disable=SC2046 # split the list of commit hashes into arguments
-  if ! read -r base_sha base_run < <(first_commit_with_run $(git log --first-parent --reverse --format=%H --after="$since" "$range" | head -n 20)); then
-    echo "No CodSpeed run among the first 20 main commits after $since${not_before:+ and $not_before}." >&2
+  commits_with_runs $(git log --first-parent --reverse --format=%H --after="$since" "$range" | head -n "$search_commits") \
+    > "$work/base-runs"
+  if [ "$(wc -l < "$work/base-runs")" -lt "$runs_per_end" ]; then
+    echo "Fewer than $runs_per_end CodSpeed runs among the first $search_commits main commits after $since${not_before:+ and $not_before}." >&2
     exit 2
   fi
+  read -r base_sha base_run < <(tail -n 1 "$work/base-runs")
+  base_runs=$(cut -d' ' -f2 "$work/base-runs" | reverse_lines | xargs)
+}
+
+# Prints the lines of stdin in reverse order.
+reverse_lines() {
+  awk '{ line[NR] = $0 } END { for (i = NR; i > 0; i--) print line[i] }'
 }
 
 # Writes $work/new.json: rows at least `threshold` slower between base and head
 # that the previous report does not already list.
 new_rows() {
-  jq --argjson t "$threshold" --slurpfile still "$work/still.json" --arg base_run "$base_run" '
+  compare_median "$base_runs" "$head_runs"
+  jq --argjson t "$threshold" --slurpfile still "$work/still.json" --arg base_runs "$base_runs" '
     ($still[0] | map(.uri)) as $listed
     | to_entries
     | map(select(.value <= -$t and (.key | IN($listed[]) | not)))
     | sort_by(.value)
-    | map({uri: .key, change: .value, before_run: $base_run})
-  ' "$(compare_runs "$base_run" "$head_run")" > "$work/new.json"
+    | map({uri: .key, change: .value, before_runs: ($base_runs | split(" "))})
+  ' "$compared" > "$work/new.json"
 }
 
-# Prints the path of a file with {uri: change} for every benchmark in both runs.
+# The compare functions below set `compared` to the path of their result instead
+# of printing it: a function called inside $(...) runs in a subshell, where
+# `exit` on an API error would stop only the subshell.
+
+# Sets `compared`: a file with {uri: change} for every benchmark in all pairs of
+# runs: the first of the space-separated base runs with the first head run, and
+# so on. `change` is the median over the pairs.
+compare_median() {
+  local base head i out pairs=()
+  read -r -a base <<< "$1"
+  read -r -a head <<< "$2"
+  if [ "${#base[@]}" -ne "${#head[@]}" ]; then
+    echo "Cannot pair ${#base[@]} base runs with ${#head[@]} head runs." >&2
+    exit 2
+  fi
+  out="$work/median-$(echo "$1 $2" | cksum | cut -d' ' -f1).json"
+  if [ ! -s "$out" ]; then
+    for i in "${!base[@]}"; do
+      compare_runs "${base[$i]}" "${head[$i]}"
+      pairs+=("$compared")
+    done
+    jq -s '
+      length as $n
+      | (map(keys[]) | unique) as $uris
+      | [$uris[] as $u
+          | [.[][$u] | select(. != null)]
+          | select(length == $n)
+          | {key: $u, value: ((sort | .[($n - 1) / 2 | floor] + .[$n / 2 | floor]) / 2)}]
+      | from_entries
+    ' "${pairs[@]}" > "$out"
+  fi
+  compared=$out
+}
+
+# Sets `compared`: a file with {uri: change} for every benchmark in both runs.
 compare_runs() {
   local out="$work/compare-$1-$2.json" skip=0 count
   if [ ! -s "$out" ]; then
@@ -200,7 +260,8 @@ compare_runs() {
       jq -n --arg o "${repo%/*}" --arg r "${repo#*/}" --arg b "$1" --arg h "$2" --argjson s "$skip" '{
         query: "query q($o:String!,$r:String!,$b:String!,$h:String!,$s:Int){repository(name:$r,owner:$o){paginatedCompareRuns(baseRunId:$b,headRunId:$h,take:500,skip:$s){resultComparisons{benchmark{uri} change}}}}",
         variables: {o: $o, r: $r, b: $b, h: $h, s: $s}
-      }' | curl -fsS https://gql.codspeed.io/ -H 'content-type: application/json' -d @- > "$work/page.json"
+      }' > "$work/query.json"
+      codspeed_api "$work/query.json" "$work/page.json"
       if ! count=$(jq -e '.data.repository.paginatedCompareRuns.resultComparisons | length' "$work/page.json"); then
         echo "CodSpeed API error: $(head -c 500 "$work/page.json")" >&2
         exit 2
@@ -211,7 +272,24 @@ compare_runs() {
     done
     jq -s 'map({key: .benchmark.uri, value: .change}) | from_entries' "$out.tmp" > "$out"
   fi
-  echo "$out"
+  compared=$out
+}
+
+# Sends the GraphQL request in file $1 to CodSpeed and writes the response to $2.
+# CodSpeed answers 403 to bursts of requests, so a failed request is sent again
+# up to 5 times, waiting longer each time.
+codspeed_api() {
+  local attempt
+  for attempt in 1 2 3 4 5 6; do
+    if curl -fsS https://gql.codspeed.io/ -H 'content-type: application/json' -d @"$1" > "$2"; then
+      return 0
+    fi
+    [ "$attempt" -lt 6 ] || break
+    echo "Retrying the CodSpeed request in $((attempt * 15)) seconds." >&2
+    sleep $((attempt * 15))
+  done
+  echo "CodSpeed API request failed 6 times." >&2
+  exit 2
 }
 
 # Adds sha, run and pr to each new row: the first main commit in the window that
@@ -219,7 +297,7 @@ compare_runs() {
 # CodSpeed runs. For a single big step that is the commit that caused it; for
 # many small steps it is the middle of them.
 attribute_new_rows() {
-  local sha run n uri half lo hi mid change
+  local sha run n uri half lo hi mid change pr title
   [ "$(jq length "$work/new.json")" -eq 0 ] && return
   git log --first-parent --reverse --format=%H "$base_sha..$head_sha" > "$work/window-commits"
   : > "$work/window-runs"
@@ -240,7 +318,9 @@ attribute_new_rows() {
     while [ "$lo" -lt "$hi" ]; do
       mid=$(((lo + hi) / 2))
       run=$(sed -n "$((mid + 1))p" "$work/window-runs" | cut -d' ' -f2)
-      change=$(jq -r --arg u "$uri" '.[$u] // "missing"' "$(compare_runs "$base_run" "$run")")
+      # The one run at `mid` against each base run.
+      compare_median "$base_runs" "$(for _ in $base_runs; do printf '%s ' "$run"; done)"
+      change=$(jq -r --arg u "$uri" '.[$u] // "missing"' "$compared")
       if [ "$change" != missing ] && awk -v c="$change" -v h="$half" 'BEGIN { exit !(c <= h) }'; then
         hi=$mid
       else
@@ -248,9 +328,10 @@ attribute_new_rows() {
       fi
     done
     read -r sha run < <(sed -n "$((lo + 1))p" "$work/window-runs")
+    pr=$(pr_of "$sha")
     # Merge commits on main are titled "Merge '<pull request title>' from <author>".
-    jq -nc --arg uri "$uri" --arg sha "$sha" --arg run "$run" --arg pr "$(pr_of "$sha")" \
-      --arg title "$(git log -1 --format=%s "$sha" | sed -E "s/^Merge '(.*)' from( .*)?$/\1/")" \
+    title=$(git log -1 --format=%s "$sha" | sed -E "s/^Merge '(.*)' from( .*)?$/\1/")
+    jq -nc --arg uri "$uri" --arg sha "$sha" --arg run "$run" --arg pr "$pr" --arg title "$title" \
       '{uri: $uri, sha: $sha, run: $run, title: $title, pr: (if $pr == "" then null else ($pr | tonumber) end)}' \
       >> "$work/attributed"
   done 3< "$work/new-uris"
@@ -271,32 +352,34 @@ pr_of() {
 # $work/recovered.json. Rows of a closed report are not carried over: closing
 # the issue means someone dealt with all of it.
 recheck_previous_rows() {
-  local before_run
+  local before_runs
   echo '[]' > "$work/still.json"
   echo '[]' > "$work/recovered.json"
   $previous_open || return 0
   jq --slurpfile ticked "$work/ticked.json" '.rows // [] | map(select(.uri | IN($ticked[0][]) | not))' \
     "$work/previous.json" > "$work/carried.json"
-  for before_run in $(jq -r 'map(.before_run) | unique | .[]' "$work/carried.json"); do
-    jq --arg b "$before_run" --argjson t "$threshold" --slurpfile now "$(compare_runs "$before_run" "$head_run")" '
-      map(select(.before_run == $b) | . + {change: $now[0][.uri]})
+  jq -r 'map(.before_runs | join(" ")) | unique | .[]' "$work/carried.json" > "$work/before-runs"
+  while IFS= read -r before_runs <&3; do
+    compare_median "$before_runs" "$head_runs"
+    jq --arg b "$before_runs" --argjson t "$threshold" --slurpfile now "$compared" '
+      map(select((.before_runs | join(" ")) == $b) | . + {change: $now[0][.uri]})
       | {still: map(select(.change != null and .change <= -$t)),
          recovered: map(select(.change == null or .change > -$t))}
     ' "$work/carried.json" > "$work/split.json"
     jq -s '.[0] + .[1].still' "$work/still.json" "$work/split.json" > "$work/still.tmp" && mv "$work/still.tmp" "$work/still.json"
     jq -s '.[0] + .[1].recovered' "$work/recovered.json" "$work/split.json" > "$work/recovered.tmp" && mv "$work/recovered.tmp" "$work/recovered.json"
-  done
+  done 3< "$work/before-runs"
 }
 
 # Writes $work/body.md, or an empty file when no row is slower.
 write_report() {
   jq -r --slurpfile new "$work/new.json" --slurpfile still "$work/still.json" --slurpfile recovered "$work/recovered.json" \
     --arg repo "$repo" --arg base_sha "$base_sha" --arg base_run "$base_run" --arg head_sha "$head_sha" \
-    --arg head_run "$head_run" --argjson t "$threshold" --argjson max "$max_rows" -n '
+    --arg head_run "$head_run" --arg head_runs "$head_runs" --argjson runs_per_end "$runs_per_end" --argjson t "$threshold" --argjson max "$max_rows" -n '
     def pct: (-. * 1000 | round) / 10 | tostring + "%";
     def short: .[:10];
     def codspeed_link($from; $to): "[CodSpeed](https://codspeed.io/\($repo)/runs/compare/\($from)..\($to))";
-    def row: "- [ ] `\(.uri)`: \(.change | pct) slower, \(codspeed_link(.before_run; $head_run))";
+    def row: "- [ ] `\(.uri)`: \(.change | pct) slower, \(codspeed_link(.before_runs[0]; $head_run))";
     # One heading per commit that made benchmarks slower, worst first.
     def by_commit(row):
       group_by(.sha)
@@ -311,7 +394,7 @@ write_report() {
     | ($still[0][:($max - ($new_rows | length))]) as $still_rows
     | (($new[0] | length) + ($still[0] | length) - ($new_rows | length) - ($still_rows | length)) as $unlisted
     | if ($new_rows + $still_rows | length) == 0 then empty else
-      "Benchmarks at least \($t | -. | pct) slower on main. This report compares [`\($base_sha | short)`](https://github.com/\($repo)/commit/\($base_sha)) with [`\($head_sha | short)`](https://github.com/\($repo)/commit/\($head_sha)) (\(codspeed_link($base_run; $head_run))).\n\n"
+      "Benchmarks at least \($t | -. | pct) slower on main. This report compares the CodSpeed runs of the \($runs_per_end) main commits up to [`\($base_sha | short)`](https://github.com/\($repo)/commit/\($base_sha)) with those of the \($runs_per_end) up to [`\($head_sha | short)`](https://github.com/\($repo)/commit/\($head_sha)) (\(codspeed_link($base_run; $head_run))), in pairs, and lists the median change of each benchmark.\n\n"
       + "Tick a box once the slowdown is fixed, explained or accepted. Unticked rows are copied into the next issue for as long as the benchmark stays slower.\n"
       + (if ($new_rows | length) > 0 then
           "\n### New this week\n\nEach benchmark is listed under the first commit with at least half of its slowdown.\n\n" + ($new_rows | by_commit(row)) + "\n"
@@ -323,7 +406,7 @@ write_report() {
       + (if ($recovered[0] | length) > 0 then
           "\n### Faster again\n\n" + ($recovered[0] | map("- `\(.uri)`, reported since \(.since)") | join("\n")) + "\n"
         else "" end)
-      + "\n<!-- codspeed-drift-state \({head_sha: $head_sha, head_run: $head_run, rows: ($new_rows + $still_rows)} | tojson) -->"
+      + "\n<!-- codspeed-drift-state \({head_sha: $head_sha, head_runs: ($head_runs | split(" ")), rows: ($new_rows + $still_rows)} | tojson) -->"
     end
   ' > "$work/body.md"
 }
