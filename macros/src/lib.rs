@@ -193,9 +193,20 @@ pub fn codspeed_criterion_benchmark(attr: TokenStream, input: TokenStream) -> To
     codspeed::criterion_benchmark_attribute(attr, input)
 }
 
+/// Registers a divan benchmark with distinct stable and nightly names. The function
+/// receives a `turso_benches::Bencher`, which measures 100 calls at once in CodSpeed
+/// builds.
 #[proc_macro_attribute]
 pub fn divan_bench(attr: TokenStream, input: TokenStream) -> TokenStream {
-    codspeed::divan_bench_attribute(attr, input)
+    codspeed::divan_bench_attribute(attr, input, codspeed::DivanCalls::Batched)
+}
+
+/// Like `divan_bench`, but the function receives divan's own `Bencher` and each
+/// measurement is one call. For memory benchmarks, where a measurement is one large
+/// workload.
+#[proc_macro_attribute]
+pub fn divan_bench_single_call(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::divan_bench_attribute(attr, input, codspeed::DivanCalls::Single)
 }
 
 /// Processes a Rust docs to extract the description string.

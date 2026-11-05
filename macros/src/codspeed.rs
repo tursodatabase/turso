@@ -3,11 +3,25 @@ use quote::quote;
 use syn::visit_mut::{self, VisitMut};
 use syn::{parse_macro_input, Expr, ExprCall, ExprMethodCall, ItemFn, LitStr};
 
-pub(crate) fn divan_bench_attribute(attr: TokenStream, input: TokenStream) -> TokenStream {
+pub(crate) enum DivanCalls {
+    Batched,
+    Single,
+}
+
+pub(crate) fn divan_bench_attribute(
+    attr: TokenStream,
+    input: TokenStream,
+    calls: DivanCalls,
+) -> TokenStream {
     let attr = proc_macro2::TokenStream::from(attr);
     let mut function = parse_macro_input!(input as ItemFn);
-    if let Err(error) = pass_turso_bencher(&mut function) {
-        return error.to_compile_error().into();
+    match calls {
+        DivanCalls::Batched => {
+            if let Err(error) = pass_turso_bencher(&mut function) {
+                return error.to_compile_error().into();
+            }
+        }
+        DivanCalls::Single => {}
     }
     let nightly_name = LitStr::new(
         &format!("{} nightly", function.sig.ident),

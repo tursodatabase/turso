@@ -20,14 +20,19 @@ impl<'a, 'b> Bencher<'a, 'b> {
     }
 
     pub fn bench_local<O, B: FnMut() -> O>(self, benched: B) {
+        // The outputs are returned so that they are dropped after the measurement
+        // ends, as divan does with the output of a single call.
         #[cfg(feature = "codspeed")]
         {
             let mut benched = benched;
-            self.0.bench_local(move || {
-                for _ in 0..CODSPEED_BATCH {
-                    divan::black_box(benched());
-                }
-            });
+            self.0
+                .with_inputs(|| Vec::with_capacity(CODSPEED_BATCH))
+                .bench_local_values(move |mut outputs: Vec<O>| {
+                    for _ in 0..CODSPEED_BATCH {
+                        outputs.push(benched());
+                    }
+                    outputs
+                });
         }
         #[cfg(not(feature = "codspeed"))]
         self.0.bench_local(benched);
@@ -54,11 +59,17 @@ impl<'a, 'b, I, G: FnMut() -> I> BencherWithInputs<'a, 'b, G> {
             let mut benched = benched;
             let mut gen_input = self.gen_input;
             self.bencher
-                .with_inputs(move || (0..CODSPEED_BATCH).map(|_| gen_input()).collect::<Vec<I>>())
-                .bench_local_values(move |inputs| {
-                    for input in inputs {
-                        divan::black_box(benched(input));
+                .with_inputs(move || {
+                    let inputs: Vec<I> = (0..CODSPEED_BATCH).map(|_| gen_input()).collect();
+                    (inputs, Vec::with_capacity(CODSPEED_BATCH))
+                })
+                // Both vectors are returned so that their memory, and the outputs,
+                // are freed after the measurement ends.
+                .bench_local_values(move |(mut inputs, mut outputs): (Vec<I>, Vec<O>)| {
+                    for input in inputs.drain(..) {
+                        outputs.push(benched(input));
                     }
+                    (inputs, outputs)
                 });
         }
         #[cfg(not(feature = "codspeed"))]
