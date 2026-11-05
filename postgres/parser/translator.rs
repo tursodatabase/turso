@@ -5,9 +5,10 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -4948,9 +4949,10 @@ impl PostgreSQLTranslator {
                     "cache" => match extract_def_elem_int(elem) {
                         Some(1) => {}
                         Some(cache) if cache < 1 => {
-                            return Err(ParseError::ParseError(format!(
-                                "CACHE ({cache}) must be greater than zero"
-                            )));
+                            return Err(ParseError::Sqlstate {
+                                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                                message: format!("CACHE ({cache}) must be greater than zero"),
+                            });
                         }
                         Some(cache) => {
                             return Err(not_supported(format!(

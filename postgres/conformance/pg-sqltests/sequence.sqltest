@@ -42,6 +42,22 @@ expect @tursopg error {
     CACHE 9999999999 \(Turso sequences do not cache values, so CACHE must be 1\) is not supported
 }
 
+test create-sequence-with-cache-0 {
+    CREATE SEQUENCE cache_zero CACHE 0;
+}
+@sqlstate 22023
+expect error {
+    CACHE \(0\) must be greater than zero
+}
+
+test create-sequence-with-negative-cache {
+    CREATE SEQUENCE cache_negative CACHE -1;
+}
+@sqlstate 22023
+expect error {
+    CACHE \(-1\) must be greater than zero
+}
+
 test create-sequence-with-fractional-cache {
     CREATE SEQUENCE cache_fraction CACHE 1.5;
 }
