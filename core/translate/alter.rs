@@ -1027,12 +1027,7 @@ pub fn translate_alter_table(
                     )));
                 }
             }
-            // Remove column-level CHECK constraints for the dropped column
-            btree.check_constraints.retain(|c| {
-                c.column
-                    .as_ref()
-                    .is_none_or(|col| normalize_ident(col) != normalize_ident(column_name))
-            });
+            btree.drop_column_constraints(column_name);
 
             // Check if column is used in a foreign key constraint (child side)
             // SQLite does not allow dropping a column that is part of a FK constraint

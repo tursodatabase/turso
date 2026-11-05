@@ -5527,6 +5527,17 @@ impl BTreeTable {
         }
     }
 
+    /// Removes the column constraints of a column that is being dropped.
+    /// Does not remove the column itself.
+    pub(crate) fn drop_column_constraints(&mut self, column_name: &str) {
+        let column_name = normalize_ident(column_name);
+        self.check_constraints.retain(|c| {
+            c.column
+                .as_ref()
+                .is_none_or(|col| normalize_ident(col) != column_name)
+        });
+    }
+
     /// Fill in what custom type columns get from their type:
     /// - SQLite's name-based type/affinity rules use the BASE type instead of
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would

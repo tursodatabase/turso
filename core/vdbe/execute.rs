@@ -18083,13 +18083,7 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns_mut().remove(*column_index);
-        // Remove column-level CHECK constraints for the dropped column
-        let col_name = column_name.clone();
-        btree.check_constraints.retain(|c| {
-            c.column
-                .as_ref()
-                .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
-        });
+        btree.drop_column_constraints(&column_name);
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
         Ok(())
