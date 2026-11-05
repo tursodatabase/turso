@@ -538,7 +538,7 @@ mod tests {
             .to_string();
         assert!(
             err.contains(
-                "database aux has type cents: custom types and domains can only be used in the main database"
+                "database aux has custom types: custom types and domains can only be used in the main database"
             ),
             "unexpected error: {err}"
         );
@@ -587,7 +587,7 @@ mod tests {
             let err = conn.execute(sql).unwrap_err().to_string();
             assert!(
                 err.contains(
-                    "database aux has type cents: custom types and domains can only be used in the main database"
+                    "database aux has custom types: custom types and domains can only be used in the main database"
                 ),
                 "unexpected error for {sql}: {err}"
             );
@@ -595,6 +595,358 @@ mod tests {
         let rows: Vec<(i64,)> = aux_conn.exec_rows("SELECT c FROM t");
         assert_eq!(rows, vec![(5,)]);
         conn.execute("DETACH aux").unwrap();
+    }
+
+    /// A database that had types still has the table that stored them, and
+    /// ATTACH refuses it without reading that table. With MVCC the type rows
+    /// can be in the log only.
+    #[test]
+    fn test_attach_refuses_database_that_dropped_its_types() {
+        for mvcc in [false, true] {
+            let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let aux_db = TempDatabase::builder()
+                .with_opts(custom_types)
+                .with_mvcc(mvcc)
+                .build();
+            let aux_conn = aux_db.connect_limbo();
+            aux_conn
+                .execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            aux_conn.execute("DROP TYPE cents").unwrap();
+
+            let db = TempDatabase::builder()
+                .with_opts(custom_types.with_attach(true))
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+            let err = conn
+                .execute(format!("ATTACH '{}' AS aux", aux_db.path.display()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(
+                    "database aux has custom types: custom types and domains can only be used in the main database"
+                ),
+                "mvcc={mvcc}, unexpected error: {err}"
+            );
+        }
+    }
+
+    /// A stored expression outside main can't CAST to a type of main. Its
+    /// values would follow main's type while the database is attached, and
+    /// SQLite's rules for the name otherwise: an index on CAST(x AS tag) built
+    /// here would be corrupt in a database whose main has no tag.
+    #[test]
+    fn test_objects_outside_main_cannot_cast_to_types_of_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db =
+            TempDatabase::new_with_existent_with_opts(&main_path, custom_types.with_attach(true));
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE tag BASE text ENCODE value DECODE 'A' || value")
+            .unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x text, n integer)")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES ('a', 1)").unwrap();
+        conn.execute("CREATE TEMP TABLE tt(x text)").unwrap();
+
+        // Main itself can store CASTs to its types.
+        conn.execute("CREATE TABLE m(x text)").unwrap();
+        for sql in [
+            "CREATE INDEX mi ON m(CAST(x AS tag))",
+            "CREATE VIEW mv AS SELECT CAST(x AS tag) FROM m",
+            "CREATE TRIGGER mr AFTER INSERT ON m BEGIN SELECT CAST(new.x AS tag); END",
+            "ALTER TABLE m ADD COLUMN y text DEFAULT (CAST('a' AS tag))",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        for (sql, object, database) in [
+            ("CREATE INDEX aux.i ON t(CAST(x AS tag))", "index i", "aux"),
+            (
+                "CREATE INDEX aux.i ON t(x) WHERE CAST(x AS tag) > ''",
+                "index i",
+                "aux",
+            ),
+            (
+                "CREATE VIEW aux.v AS SELECT CAST(x AS tag) FROM t",
+                "view v",
+                "aux",
+            ),
+            (
+                "CREATE TRIGGER aux.r AFTER INSERT ON t BEGIN UPDATE t SET x = CAST(x AS tag); END",
+                "trigger r",
+                "aux",
+            ),
+            (
+                "CREATE TRIGGER aux.r AFTER INSERT ON t WHEN CAST(new.x AS tag) > '' BEGIN SELECT 1; END",
+                "trigger r",
+                "aux",
+            ),
+            (
+                "CREATE TABLE aux.u(x text, CHECK (CAST(x AS tag) > ''))",
+                "table u",
+                "aux",
+            ),
+            (
+                "CREATE TABLE aux.u(x text CHECK (CAST(x AS tag) > ''))",
+                "column u.x",
+                "aux",
+            ),
+            (
+                "CREATE TABLE aux.u(x text DEFAULT (CAST('a' AS tag)))",
+                "column u.x",
+                "aux",
+            ),
+            (
+                "CREATE TABLE aux.u(x text, y text AS (CAST(x AS tag)))",
+                "column u.y",
+                "aux",
+            ),
+            (
+                "ALTER TABLE aux.t ADD COLUMN y text DEFAULT (CAST('a' AS tag))",
+                "column t.y",
+                "aux",
+            ),
+            (
+                "ALTER TABLE aux.t ADD COLUMN y text CHECK (CAST(y AS tag) > '')",
+                "column t.y",
+                "aux",
+            ),
+            (
+                "ALTER TABLE aux.t ALTER COLUMN x TO z text CHECK (CAST(z AS tag) > '')",
+                "column t.z",
+                "aux",
+            ),
+            ("CREATE INDEX ti ON tt(CAST(x AS tag))", "index ti", "temp"),
+            (
+                "CREATE TEMP VIEW tv AS SELECT CAST(x AS tag) FROM tt",
+                "view tv",
+                "temp",
+            ),
+            (
+                "CREATE TEMP TRIGGER tr AFTER INSERT ON tt BEGIN SELECT CAST(new.x AS tag); END",
+                "trigger tr",
+                "temp",
+            ),
+        ] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            let expected = format!(
+                "{object} casts to type tag in database {database}: custom types and domains can only be used in the main database"
+            );
+            assert!(err.contains(&expected), "unexpected error for {sql}: {err}");
+        }
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM aux.sqlite_schema");
+        assert_eq!(rows, vec![("t".into(),)]);
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM temp.sqlite_schema");
+        assert_eq!(rows, vec![("tt".into(),)]);
+
+        // Inside a transaction, a refused statement leaves both databases
+        // usable.
+        conn.execute("BEGIN").unwrap();
+        for sql in [
+            "CREATE INDEX aux.i ON t(CAST(x AS tag))",
+            "CREATE INDEX ti ON tt(CAST(x AS tag))",
+        ] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            assert!(
+                err.contains("custom types and domains can only be used in the main database"),
+                "unexpected error for {sql}: {err}"
+            );
+        }
+        conn.execute("CREATE INDEX aux.l ON t(x)").unwrap();
+        conn.execute("CREATE INDEX tl ON tt(x)").unwrap();
+        conn.execute("INSERT INTO tt VALUES ('a')").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        // A name that is no type, and a built-in type, cast the same way in
+        // every database.
+        conn.execute("CREATE INDEX aux.j ON t(CAST(x AS foo))")
+            .unwrap();
+        conn.execute("CREATE INDEX aux.k ON t(CAST(n AS bigint))")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES ('b', 2)").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA aux.integrity_check");
+        assert_eq!(rows, vec![("ok".into(),)]);
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA temp.integrity_check");
+        assert_eq!(rows, vec![("ok".into(),)]);
+    }
+
+    /// ATTACH refuses a database with a stored CAST to a type of main: the
+    /// index on CAST(x AS tag) holds what SQLite's rules for tag give, and
+    /// main's tag would give other values.
+    #[test]
+    fn test_attach_refuses_database_that_casts_to_a_type_of_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(x text)").unwrap();
+            conn.execute("CREATE INDEX i ON t(CAST(x AS tag))").unwrap();
+            conn.execute("INSERT INTO t VALUES ('a')").unwrap();
+            conn.close().unwrap();
+        }
+        let opts = custom_types.with_attach(true);
+        let db = TempDatabase::new_with_existent_with_opts(&temp_dir.path().join("main.db"), opts);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE tag BASE text ENCODE value DECODE 'A' || value")
+            .unwrap();
+        let err = conn
+            .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "index i casts to type tag in database aux: custom types and domains can only be used in the main database"
+            ),
+            "unexpected error: {err}"
+        );
+
+        let db = TempDatabase::new_with_existent_with_opts(&temp_dir.path().join("main2.db"), opts);
+        let conn = db.connect_limbo();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA aux.integrity_check");
+        assert_eq!(rows, vec![("ok".into(),)]);
+    }
+
+    /// Other connections can make an attached database cast to a type of main
+    /// after ATTACH: one creates the type in main, or one adds the CAST to the
+    /// attached database. Each statement checks every attached database
+    /// against the main schema it was translated with, so the next statement
+    /// is refused, and DETACH still works.
+    #[test]
+    fn test_attached_database_that_gains_a_cast_to_a_type_of_main_is_refused() {
+        for type_comes_last in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let aux_path = temp_dir.path().join("aux.db");
+            let main_path = temp_dir.path().join("main.db");
+            let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let aux_db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let aux_conn = aux_db.connect_limbo();
+            aux_conn.execute("CREATE TABLE t(x text)").unwrap();
+            aux_conn.execute("INSERT INTO t VALUES ('a')").unwrap();
+
+            let db = TempDatabase::new_with_existent_with_opts(
+                &main_path,
+                custom_types.with_attach(true),
+            );
+            let conn = db.connect_limbo();
+            let other_main_conn = db.connect_limbo();
+            conn.execute("CREATE TABLE m(x text)").unwrap();
+            let create_type = "CREATE TYPE tag BASE text ENCODE value DECODE 'A' || value";
+            let create_index = "CREATE INDEX i ON t(CAST(x AS tag))";
+            if type_comes_last {
+                aux_conn.execute(create_index).unwrap();
+            } else {
+                conn.execute(create_type).unwrap();
+            }
+            conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+                .unwrap();
+            let rows: Vec<(String,)> = conn.exec_rows("SELECT x FROM aux.t");
+            assert_eq!(rows, vec![("a".into(),)]);
+            if type_comes_last {
+                other_main_conn.execute(create_type).unwrap();
+            } else {
+                aux_conn.execute(create_index).unwrap();
+            }
+
+            for sql in [
+                "SELECT x FROM aux.t",
+                "INSERT INTO aux.t VALUES ('b')",
+                "SELECT x FROM m",
+            ] {
+                let err = conn.execute(sql).unwrap_err().to_string();
+                assert!(
+                    err.contains(
+                        "index i casts to type tag in database aux: custom types and domains can only be used in the main database"
+                    ),
+                    "type_comes_last={type_comes_last}, unexpected error for {sql}: {err}"
+                );
+            }
+            conn.execute("DETACH aux").unwrap();
+            let rows: Vec<(String,)> = aux_conn.exec_rows("PRAGMA integrity_check");
+            assert_eq!(rows, vec![("ok".into(),)]);
+        }
+    }
+
+    /// A transaction that finds an attached database refused can still be
+    /// rolled back.
+    #[test]
+    fn test_transaction_that_finds_a_refused_database_can_roll_back() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let aux_db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+        let aux_conn = aux_db.connect_limbo();
+        aux_conn.execute("CREATE TABLE t(x text)").unwrap();
+
+        let db = TempDatabase::new_with_existent_with_opts(
+            &temp_dir.path().join("main.db"),
+            custom_types.with_attach(true),
+        );
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE tag BASE text ENCODE value DECODE 'A' || value")
+            .unwrap();
+        conn.execute("CREATE TABLE m(x text)").unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO m VALUES ('a')").unwrap();
+        aux_conn
+            .execute("CREATE INDEX i ON t(CAST(x AS tag))")
+            .unwrap();
+
+        let err = conn.execute("SELECT x FROM aux.t").unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "index i casts to type tag in database aux: custom types and domains can only be used in the main database"
+            ),
+            "unexpected error: {err}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+        conn.execute("DETACH aux").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM m");
+        assert_eq!(rows, vec![(0,)]);
+    }
+
+    /// Another connection can create a type in main that this connection's
+    /// temp database already casts to. The next statement is refused, as the
+    /// index on CAST(x AS tag) holds values that main's tag does not give.
+    #[test]
+    fn test_temp_database_that_gains_a_cast_to_a_type_of_main_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(
+            &temp_dir.path().join("main.db"),
+            custom_types,
+        );
+        let conn = db.connect_limbo();
+        let other_conn = db.connect_limbo();
+        conn.execute("CREATE TABLE m(x text)").unwrap();
+        conn.execute("CREATE TEMP TABLE tt(x text)").unwrap();
+        conn.execute("CREATE INDEX ti ON tt(CAST(x AS tag))")
+            .unwrap();
+        conn.execute("INSERT INTO tt VALUES ('a')").unwrap();
+        other_conn
+            .execute("CREATE TYPE tag BASE text ENCODE value DECODE 'A' || value")
+            .unwrap();
+
+        for sql in ["INSERT INTO tt VALUES ('b')", "SELECT x FROM m"] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            assert!(
+                err.contains(
+                    "index ti casts to type tag in database temp: custom types and domains can only be used in the main database"
+                ),
+                "unexpected error for {sql}: {err}"
+            );
+        }
     }
 
     /// A table of an attached or the temp database can't have a column of a

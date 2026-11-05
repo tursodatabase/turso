@@ -32,8 +32,8 @@ use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
-    normalize_ident, quote_identifier, walk_expr_with_subqueries, walk_schema_expressions,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    normalize_ident, quote_identifier, walk_ddl_stored_expressions, walk_expr_with_subqueries,
+    walk_schema_expressions, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -862,7 +862,7 @@ pub(crate) fn check_column_type(
         );
     };
     // Statements look custom types up in main only. See
-    // Schema::check_has_only_builtin_types.
+    // check_usable_outside_main.
     if database_id != MAIN_DB_ID && !td.is_builtin {
         let database_name = catalog
             .namespace_name(database_id)
@@ -3611,6 +3611,93 @@ fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<Strin
         })
     })?;
     Ok(type_use)
+}
+
+/// Refuses `schema`, the schema of database `database_name` other than main,
+/// when it could need a user-defined type or domain. Statements look types up
+/// in main only, so such a database would get main's type of that name, or
+/// none: an index on `CAST(x AS t)` would hold values that main's `t` does not
+/// give, and `PRAGMA integrity_check` would report it as corrupt.
+pub(crate) fn check_usable_outside_main(
+    schema: &Schema,
+    database_name: &str,
+    main: &Schema,
+) -> Result<()> {
+    // The types table stays after the last DROP TYPE, so this also refuses a
+    // database that had types.
+    if schema.has_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME) {
+        bail_parse_error!(
+            "database {database_name} has custom types: custom types and domains can only be used in the main database"
+        );
+    }
+    if !main
+        .type_registry
+        .values()
+        .any(|type_def| !type_def.is_builtin)
+    {
+        // No CAST can name a user-defined type.
+        return Ok(());
+    }
+    let mut cast = None;
+    walk_schema_expressions(schema, &mut |owner, expr| {
+        if cast.is_none() {
+            if let Some(type_name) = user_type_cast_to(expr, main) {
+                cast = Some(format!("{owner} casts to type {type_name}"));
+            }
+        }
+        Ok(if cast.is_some() {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })?;
+    if let Some(cast) = cast {
+        bail_parse_error!(
+            "{cast} in database {database_name}: custom types and domains can only be used in the main database"
+        );
+    }
+    Ok(())
+}
+
+/// Describes the first expression `stmt` would store in the schema that casts
+/// to a user-defined type of `main`, which a database other than main must
+/// not store (see check_usable_outside_main).
+pub(crate) fn find_stored_cast_to_user_type(
+    stmt: &ast::Stmt,
+    main: &Schema,
+) -> Result<Option<String>> {
+    let mut cast = None;
+    walk_ddl_stored_expressions(stmt, &mut |owner, expr| {
+        if cast.is_none() {
+            if let Some(type_name) = user_type_cast_to(expr, main) {
+                cast = Some(format!("{owner} casts to type {type_name}"));
+            }
+        }
+        Ok(if cast.is_some() {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })?;
+    Ok(cast)
+}
+
+/// The type name of `expr` when it is a CAST to a type or domain of `main`
+/// that is not built in. A CAST to a name that is no type gets an affinity
+/// from the name, the same in every database.
+fn user_type_cast_to<'a>(expr: &'a ast::Expr, main: &Schema) -> Option<&'a str> {
+    match expr {
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if main
+            .get_type_def_unchecked(&type_name.name)
+            .is_some_and(|type_def| !type_def.is_builtin) =>
+        {
+            Some(type_name.name.as_str())
+        }
+        _ => None,
+    }
 }
 
 /// The name of the first other type or domain whose definition names the

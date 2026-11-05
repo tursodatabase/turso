@@ -289,7 +289,7 @@ DROP DOMAIN my_domain;
 
 - **STRICT tables only**: Using a domain type on a non-STRICT table is rejected at CREATE TABLE and ALTER TABLE ADD COLUMN time. Non-STRICT tables allow arbitrary type names as affinity hints, but domain constraints (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables, so permitting them would be misleading.
 - **Cannot drop while in use**: A domain cannot be dropped while any table column or another domain references it.
-- **Main database only**: Domains live in the main database. A table in an attached database or a `TEMP` table cannot have a column of a domain, and ATTACH refuses a database that has its own domains. See [CREATE TYPE](/docs/sql-reference/statements/create-type#restrictions).
+- **Main database only**: Domains live in the main database. A table in an attached database or a `TEMP` table cannot have a column of a domain or store a CAST to one, and ATTACH refuses a database that has or had its own domains. See [CREATE TYPE](/docs/sql-reference/statements/create-type#restrictions).
 
 <Note>
 If a non-STRICT table was created with a type name that did not exist at the time (e.g., `CREATE TABLE t(x mydom)`), and a domain with that name is created afterwards (`CREATE DOMAIN mydom AS ...`), the domain constraints will **not** be retroactively enforced on the existing table. This is not a bug: non-STRICT tables treat all type names as plain affinity hints regardless of whether a matching domain exists. STRICT tables prevent this scenario because they reject unknown type names at CREATE TABLE time.

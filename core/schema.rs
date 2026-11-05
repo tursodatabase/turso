@@ -2160,27 +2160,6 @@ impl Schema {
         self.type_registry.get(&type_registry_key(type_name))
     }
 
-    /// Fails when this schema, the schema of database `database_name` other
-    /// than main, has a type or domain that is not built in. Statements look
-    /// custom types up in the main database only, so a value of such a type
-    /// would be read without its DECODE, or with the DECODE of a main type
-    /// of the same name. Built-in types are the same in every database.
-    pub fn check_has_only_builtin_types(&self, database_name: &str) -> Result<()> {
-        let user_type = self
-            .type_registry
-            .values()
-            .filter(|type_def| !type_def.is_builtin)
-            .min_by(|a, b| a.name.cmp(&b.name));
-        if let Some(type_def) = user_type {
-            let kind = if type_def.is_domain { "domain" } else { "type" };
-            crate::bail_parse_error!(
-                "database {database_name} has {kind} {}: custom types and domains can only be used in the main database",
-                type_def.name
-            );
-        }
-        Ok(())
-    }
-
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
     /// the base-type chain to the ultimate primitive.
     /// Returns `Ok(None)` if the type is not registered (or the table isn't strict).

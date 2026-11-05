@@ -172,6 +172,12 @@ pub fn translate(
         roles::check_statement_privileges(&stmt)?;
     }
 
+    // DETACH and ROLLBACK read no database, and are how a database refused by
+    // check_other_databases is detached.
+    let checks_other_databases =
+        !matches!(stmt, ast::Stmt::Detach { .. } | ast::Stmt::Rollback { .. });
+    let stored_cast = schema::find_stored_cast_to_user_type(&stmt, resolver.schema())?;
+
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
@@ -186,31 +192,60 @@ pub fn translate(
         }
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
-    check_other_databases_have_only_builtin_types(&resolver, &program)?;
+    if checks_other_databases {
+        check_other_databases(&resolver)?;
+    }
+    if let Some(cast) = stored_cast {
+        check_stored_cast_written_to_main_only(&cast, &program, &resolver)?;
+    }
 
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
 }
 
-/// Fails when the statement reads or writes a database other than main that
-/// has a type or domain of its own. ATTACH refuses such a database, and this
-/// catches one that gained a type after it was attached.
-fn check_other_databases_have_only_builtin_types(
-    resolver: &Resolver,
-    program: &ProgramBuilder,
-) -> Result<()> {
-    for database_id in program.accessed_databases() {
-        if database_id == crate::MAIN_DB_ID {
-            continue;
-        }
+/// Fails when a database other than main could need a type or domain, using
+/// the main schema this statement was translated with. ATTACH and DDL refuse
+/// such a database; this catches one that became so through a change made by
+/// another connection, to main or to that database. A statement whose schema
+/// is out of date is translated again, so the check sees every change.
+fn check_other_databases(resolver: &Resolver) -> Result<()> {
+    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
+    if resolver.has_temp_database() {
+        database_ids.set(crate::TEMP_DB_ID)?;
+    }
+    for database_id in database_ids {
         let database_name = resolver
             .catalog
             .namespace_name(database_id)
-            .expect("a database the statement accesses has a name");
+            .expect("an attached database has a name");
         resolver.with_schema(database_id, |schema| {
-            schema.check_has_only_builtin_types(&database_name)
+            schema::check_usable_outside_main(schema, &database_name, resolver.schema())
         })?;
+    }
+    Ok(())
+}
+
+/// Fails when a statement that stores `cast`, a CAST to a user-defined type of
+/// main, writes to a database other than main. Checked when the statement is
+/// translated, as SQLite checks objects created outside main (DbFixer in
+/// attach.c): failing later, once the statement has run SetCookie, would leave
+/// the connection's copy of the schema version out of date.
+fn check_stored_cast_written_to_main_only(
+    cast: &str,
+    program: &ProgramBuilder,
+    resolver: &Resolver,
+) -> Result<()> {
+    for database_id in program.written_databases() {
+        if database_id != crate::MAIN_DB_ID {
+            let database_name = resolver
+                .catalog
+                .namespace_name(database_id)
+                .expect("a database a statement writes to has a name");
+            bail_parse_error!(
+                "{cast} in database {database_name}: custom types and domains can only be used in the main database"
+            );
+        }
     }
     Ok(())
 }

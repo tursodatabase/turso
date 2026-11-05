@@ -2200,6 +2200,11 @@ impl ProgramBuilder {
         Ok(())
     }
 
+    /// The databases the program writes to.
+    pub(crate) fn written_databases(&self) -> impl Iterator<Item = usize> + '_ {
+        self.write_databases.iter()
+    }
+
     pub fn begin_read_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         // Just override the transaction mode when it is None
         if matches!(self.txn_mode, TransactionMode::None) {
@@ -2223,13 +2228,6 @@ impl ProgramBuilder {
         self.read_database_cookies
             .insert(database_id, schema_cookie);
         Ok(())
-    }
-
-    /// The databases the statement reads or writes, each once or twice.
-    pub(crate) fn accessed_databases(&self) -> impl Iterator<Item = usize> + '_ {
-        self.read_databases
-            .iter()
-            .chain(self.write_databases.iter())
     }
 
     pub const fn begin_concurrent_operation(&mut self) {

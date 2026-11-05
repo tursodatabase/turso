@@ -601,7 +601,11 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
-                    db.schema.lock().check_has_only_builtin_types(alias)?;
+                    crate::translate::schema::check_usable_outside_main(
+                        &db.schema.lock(),
+                        alias,
+                        &self.schema.read(),
+                    )?;
                     self.has_non_main_pagers.store(true, Ordering::Release);
                     let database_id = self
                         .attached_databases

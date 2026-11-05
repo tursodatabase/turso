@@ -1736,6 +1736,160 @@ where
     Ok(())
 }
 
+/// Call `func` on every expression that `stmt` would store in the schema,
+/// with the object it belongs to: the expressions walk_schema_expressions
+/// would find once the statement has run. Only CREATE INDEX, TABLE, TRIGGER
+/// and VIEW and ALTER TABLE store expressions.
+pub fn walk_ddl_stored_expressions<F>(stmt: &ast::Stmt, func: &mut F) -> Result<()>
+where
+    F: FnMut(&str, &ast::Expr) -> Result<WalkControl>,
+{
+    match stmt {
+        ast::Stmt::CreateIndex {
+            idx_name,
+            columns,
+            with_clause,
+            where_clause,
+            ..
+        } => {
+            let owner = format!("index {}", idx_name.name.as_str());
+            let exprs = columns
+                .iter()
+                .map(|column| column.expr.as_ref())
+                .chain(with_clause.iter().map(|(_, expr)| expr.as_ref()))
+                .chain(where_clause.as_deref());
+            for expr in exprs {
+                walk_expr_with_subqueries(expr, &mut |expr| func(&owner, expr))?;
+            }
+        }
+        ast::Stmt::CreateTable { tbl_name, body, .. } => match body {
+            ast::CreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                ..
+            } => {
+                for column in columns {
+                    walk_column_stored_expressions(tbl_name.name.as_str(), column, func)?;
+                }
+                let owner = format!("table {}", tbl_name.name.as_str());
+                for constraint in constraints {
+                    match &constraint.constraint {
+                        ast::TableConstraint::Check { expr, .. } => {
+                            walk_expr_with_subqueries(expr, &mut |expr| func(&owner, expr))?;
+                        }
+                        ast::TableConstraint::PrimaryKey { columns, .. }
+                        | ast::TableConstraint::Unique { columns, .. } => {
+                            for column in columns {
+                                walk_expr_with_subqueries(&column.expr, &mut |expr| {
+                                    func(&owner, expr)
+                                })?;
+                            }
+                        }
+                        ast::TableConstraint::ForeignKey { .. } => {}
+                    }
+                }
+            }
+            // The table gets the result columns' names and types, not the query.
+            ast::CreateTableBody::AsSelect(_) => {}
+        },
+        ast::Stmt::AlterTable(alter) => match &alter.body {
+            ast::AlterTableBody::AddColumn(column)
+            | ast::AlterTableBody::AlterColumn { new: column, .. } => {
+                walk_column_stored_expressions(alter.name.name.as_str(), column, func)?;
+            }
+            ast::AlterTableBody::RenameTo(_)
+            | ast::AlterTableBody::RenameColumn { .. }
+            | ast::AlterTableBody::DropColumn(_) => {}
+        },
+        ast::Stmt::CreateTrigger {
+            trigger_name,
+            when_clause,
+            commands,
+            ..
+        } => {
+            let owner = format!("trigger {}", trigger_name.name.as_str());
+            if let Some(when_clause) = when_clause {
+                walk_expr_with_subqueries(when_clause, &mut |expr| func(&owner, expr))?;
+            }
+            for command in commands {
+                visit_trigger_cmd(command, &mut |expr: &ast::Expr| func(&owner, expr))?;
+            }
+        }
+        ast::Stmt::CreateView {
+            view_name, select, ..
+        } => {
+            let owner = format!("view {}", view_name.name.as_str());
+            walk_select_expressions(select, &mut |expr| func(&owner, expr))?;
+        }
+        ast::Stmt::CreateMaterializedView {
+            view_name, select, ..
+        } => {
+            let owner = format!("materialized view {}", view_name.name.as_str());
+            walk_select_expressions(select, &mut |expr| func(&owner, expr))?;
+        }
+        // A virtual table stores its module arguments as text.
+        ast::Stmt::CreateVirtualTable(_) => {}
+        ast::Stmt::Analyze { .. }
+        | ast::Stmt::Attach { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Detach { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Pragma { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Select(_)
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Vacuum { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::CreateSchema { .. }
+        | ast::Stmt::DropSchema { .. } => {}
+    }
+    Ok(())
+}
+
+/// Calls `func` on the CHECK, DEFAULT and generated expressions of a column
+/// definition.
+fn walk_column_stored_expressions<F>(
+    table_name: &str,
+    column: &ast::ColumnDefinition,
+    func: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str, &ast::Expr) -> Result<WalkControl>,
+{
+    let owner = format!("column {table_name}.{}", column.col_name.as_str());
+    for constraint in &column.constraints {
+        match &constraint.constraint {
+            ast::ColumnConstraint::Check { expr, .. }
+            | ast::ColumnConstraint::Default(expr)
+            | ast::ColumnConstraint::Generated { expr, .. } => {
+                walk_expr_with_subqueries(expr, &mut |expr| func(&owner, expr))?;
+            }
+            ast::ColumnConstraint::PrimaryKey { .. }
+            | ast::ColumnConstraint::NotNull { .. }
+            | ast::ColumnConstraint::Unique(_)
+            | ast::ColumnConstraint::Collate { .. }
+            | ast::ColumnConstraint::ForeignKey { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 /// Walk all expressions in a statement, including subqueries.
 pub fn walk_stmt_expressions<F>(stmt: &ast::Stmt, func: &mut F) -> Result<()>
 where
