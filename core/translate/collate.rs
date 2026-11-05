@@ -555,7 +555,8 @@ pub fn in_subquery_collation(
         query_column_type(query, column, resolver),
     ];
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
+    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate, operand_order)?
+    {
         return Ok(CollationSeq::Type(ordering));
     }
     comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
@@ -632,6 +633,27 @@ pub fn compound_column_collation(
     first_collation(compound_column_exprs(arms, column, resolver))
 }
 
+/// The collation of column `column` of a UNION ALL, where `arms` are its
+/// SELECTs, when no ORDER BY sorts by it. UNION ALL keeps every row, so the
+/// column's values are never compared and may have a type that has no
+/// comparison, such as json. Columns whose types have an order must still
+/// agree on it, as in [compound_column_collation]: `SELECT n FROM t UNION ALL
+/// SELECT a FROM t` for a numeric n and an integer[] a is an error. A type
+/// with no comparison has no order, so json may sit beside numeric here,
+/// which PostgreSQL refuses.
+pub fn union_all_column_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let exprs = compound_column_exprs(arms, column, resolver);
+    let has_collate = exprs.clone().any(|(expr, _)| has_collate_operator(expr));
+    if let Some(ordering) = common_ordering_of(exprs.clone(), has_collate, order_of_type)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    first_text_collation(exprs).map(CollationSeq::Text)
+}
+
 /// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
 /// where `arms` are its SELECTs. The COLLATE applies to the column of every
 /// SELECT, so it is an error when any of them has a type that takes none, as
@@ -642,7 +664,11 @@ pub fn compound_order_by_collation(
     explicit_collation: TextCollation,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    common_ordering_of(compound_column_exprs(arms, column, resolver), true)?;
+    common_ordering_of(
+        compound_column_exprs(arms, column, resolver),
+        true,
+        operand_order,
+    )?;
     Ok(CollationSeq::Text(explicit_collation))
 }
 
@@ -688,7 +714,7 @@ fn common_type_ordering<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
         .clone()
         .into_iter()
         .any(|(expr, _)| has_collate_operator(expr));
-    common_ordering_of(exprs, has_collate)
+    common_ordering_of(exprs, has_collate, operand_order)
 }
 
 /// The one order among the types of `exprs`, as [common_type_ordering]
@@ -696,6 +722,7 @@ fn common_type_ordering<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
 fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     exprs: impl IntoIterator<Item = (&'a Expr, C)>,
     has_collate: bool,
+    order: OrderOfType,
 ) -> Result<Option<TypeOrdering>> {
     // Most comparisons have two operands; keep their types off the heap.
     let mut types: SmallVec<[ExprType; 2]> = SmallVec::new();
@@ -706,23 +733,24 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
         schema.get_or_insert(context.schema());
     }
     match schema {
-        Some(schema) => common_ordering(&types, schema, has_collate),
+        Some(schema) => common_ordering(&types, schema, has_collate, order),
         None => Ok(None),
     }
 }
 
 /// The one order among values of `types`, as [common_type_ordering] decides
 /// it. `has_collate` says whether a COLLATE applies to the values. Every
-/// COLLATE that applies to a value is checked here, through [operand_order].
+/// COLLATE that applies to a value is checked here, through `order`.
 fn common_ordering(
     types: &[ExprType],
     schema: &Schema,
     has_collate: bool,
+    order: OrderOfType,
 ) -> Result<Option<TypeOrdering>> {
     let mut found: Option<(TypeOrdering, &ExprType)> = None;
     let mut array_of_unknown_elements = None;
     for ty in types {
-        let ordering = match operand_order(ty, schema, has_collate)? {
+        let ordering = match order(ty, schema, has_collate)? {
             OperandOrder::None => continue,
             OperandOrder::ArrayOfUnknownElements => {
                 array_of_unknown_elements.get_or_insert(ty);
@@ -772,13 +800,15 @@ pub(crate) fn key_collation(
 /// Fails when `operand`, the operand of a COLLATE operator, has a type that
 /// takes no COLLATE, such as `d COLLATE nocase` for a date d.
 pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
-    common_ordering_of([(operand, context)], true).map(|_| ())
+    common_ordering_of([(operand, context)], true, operand_order).map(|_| ())
 }
 
 /// Fails when the values of `key`, an ORDER BY or DISTINCT key, can't be
 /// compared. Planning checks every key the query has, so that a key the
 /// planner later drops is refused too, as in PostgreSQL: `j` in `ORDER BY id,
-/// j` for a rowid `id`, or an ORDER BY inside `EXISTS (...)`.
+/// j` for a rowid `id`, or an ORDER BY inside `EXISTS (...)`. A scalar
+/// subquery is not planned yet here, so its type is not known and it passes;
+/// if the planner drops it, it is never checked (#11455).
 pub(crate) fn check_sort_key(key: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
     common_type_ordering([(key, context)]).map(|_| ())
 }
@@ -948,6 +978,10 @@ enum OperandOrder {
     /// array type, or as an array of numbers when there is none.
     ArrayOfUnknownElements,
 }
+
+/// How [common_ordering] finds the order of each type: [operand_order] for
+/// values that are compared, [order_of_type] for values that are not.
+type OrderOfType = fn(&ExprType, &Schema, bool) -> Result<OperandOrder>;
 
 /// The order a value of type `ty` brings to a comparison. `has_collate` says
 /// whether a COLLATE applies to the compared values; it is an error when `ty`

@@ -2162,3 +2162,35 @@ fn command_result_kind_preserves_effects_errors_and_completion() {
     assert_eq!(schema.result_kind(), Command);
     assert!(schema.run_ignore_rows().is_err());
 }
+
+/// Loading the schema binds every CHECK constraint without the connection's
+/// dialect, to refuse comparisons of json values. A CHECK that calls functions
+/// only tursopg has, or random(), which tursopg resolves differently, must
+/// still load.
+#[test]
+fn database_with_check_on_postgres_function_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pg_check.db");
+    let path = path.to_str().unwrap();
+    {
+        let (_io, db) =
+            turso_pg::open_database(path, None, OpenFlags::default(), DatabaseOpts::new()).unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INT, j jsonb, n TEXT CHECK (quote_ident(n) <> '' AND random() < 2))",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '{}', 'a')").unwrap();
+        conn.inner().close().unwrap();
+    }
+    let (_io, db) =
+        turso_pg::open_database(path, None, OpenFlags::default(), DatabaseOpts::new()).unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    assert_eq!(
+        conn.prepare("SELECT id FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+}

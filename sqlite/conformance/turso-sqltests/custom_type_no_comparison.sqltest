@@ -195,6 +195,26 @@ expect {
     {"a":1}|2
 }
 
+# UNION ALL doesn't compare a column it doesn't sort by, but the SELECTs'
+# columns' types must still agree on their order.
+@requires strict "uses STRICT tables"
+test no-comparison-union-all-numeric-with-array {
+    CREATE TABLE t(n numeric(10,2), a integer[]) STRICT;
+    SELECT n FROM t UNION ALL SELECT a FROM t;
+}
+expect error {
+    cannot compare type numeric with type integer\[\]
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-union-all-collate-on-numeric {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    SELECT n FROM t UNION ALL SELECT 'x' COLLATE nocase;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
 @requires strict "uses STRICT tables"
 test no-comparison-domain-over-json {
     CREATE DOMAIN doc AS json;
@@ -474,6 +494,117 @@ test no-comparison-array-contains-value {
     CREATE TABLE n(a inet) STRICT;
     INSERT INTO n VALUES ('::1');
     SELECT array_contains(ARRAY['0:0:0:0:0:0:0:1'], a) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-where {
+    CREATE TABLE n(a inet) STRICT;
+    INSERT INTO n VALUES ('::1');
+    SELECT count(*) FROM n WHERE ARRAY['0:0:0:0:0:0:0:1'] @> a;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-join-on {
+    CREATE TABLE n(a inet) STRICT;
+    CREATE TABLE m(x int) STRICT;
+    INSERT INTO n VALUES ('::1');
+    INSERT INTO m VALUES (1);
+    SELECT count(*) FROM n JOIN m ON ARRAY['0:0:0:0:0:0:0:1'] @> n.a;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-overlap-in-having {
+    CREATE TABLE m(x int) STRICT;
+    INSERT INTO m VALUES (1);
+    SELECT count(*) FROM m GROUP BY x HAVING ARRAY['0:0:0:0:0:0:0:1'] && ARRAY[CAST('::1' AS inet)];
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-partial-index-where {
+    CREATE TABLE n(id int, a inet) STRICT;
+    CREATE INDEX i ON n(id) WHERE ARRAY['0:0:0:0:0:0:0:1'] @> a;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test no-comparison-array-contains-in-trigger-body-where {
+    CREATE TABLE n(id int, a inet) STRICT;
+    CREATE TABLE log(x int) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON n BEGIN DELETE FROM log WHERE ARRAY['0:0:0:0:0:0:0:1'] @> NEW.a; END;
+    INSERT INTO n VALUES (1, '::1');
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+# A column DEFAULT, UPSERT's DO UPDATE and a trigger's WHEN are compiled
+# without being bound with their column types, so code generation refuses
+# them. PostgreSQL gives 1 or true for each of these.
+@requires strict "uses STRICT tables"
+test no-comparison-array-function-in-column-default {
+    CREATE TABLE d(id int, p int DEFAULT (array_position(ARRAY['0:0:0:0:0:0:0:1'], CAST('::1' AS inet)))) STRICT;
+    INSERT INTO d(id) VALUES (1);
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-in-column-default {
+    CREATE TABLE d(id int, p int DEFAULT (ARRAY['0:0:0:0:0:0:0:1'] @> CAST('::1' AS inet))) STRICT;
+    INSERT INTO d(id) VALUES (1);
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-concat-in-upsert-set {
+    CREATE TABLE n(id int PRIMARY KEY, a inet, p int) STRICT;
+    INSERT INTO n VALUES (1, '::1', 0);
+    INSERT INTO n VALUES (1, '::1', 0) ON CONFLICT(id) DO UPDATE SET p = length(ARRAY[1] || a);
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-function-in-upsert-where {
+    CREATE TABLE n(id int PRIMARY KEY, a inet, p int) STRICT;
+    INSERT INTO n VALUES (1, '::1', 0);
+    INSERT INTO n VALUES (1, '::1', 0) ON CONFLICT(id) DO UPDATE SET p = 1
+        WHERE array_position(ARRAY['0:0:0:0:0:0:0:1'], excluded.a) = 1;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test no-comparison-array-function-in-trigger-when {
+    CREATE TABLE n(id int PRIMARY KEY, a inet) STRICT;
+    CREATE TABLE log(x int);
+    CREATE TRIGGER tr AFTER INSERT ON n
+        WHEN array_position(ARRAY['0:0:0:0:0:0:0:1'], NEW.a) = 1
+    BEGIN
+        INSERT INTO log VALUES (1);
+    END;
+    INSERT INTO n VALUES (1, '::1');
 }
 expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared

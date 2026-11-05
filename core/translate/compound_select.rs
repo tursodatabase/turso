@@ -1,7 +1,9 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{compound_column_collation, CollationSeq};
+use crate::translate::collate::{
+    compound_column_collation, union_all_column_collation, CollationSeq,
+};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -830,10 +832,10 @@ fn create_collection_index(
 /// compound, including those of nested arms, uses it, as SQLite's
 /// multiSelectCollSeq does.
 ///
-/// UNION ALL keeps every row, so it compares only the ORDER BY columns. The other
-/// columns get BINARY, which only decides the unspecified order of rows with
-/// equal ORDER BY keys. That keeps UNION ALL working for types whose values
-/// can't be compared.
+/// UNION ALL keeps every row, so it compares only the ORDER BY columns. The
+/// other columns' collations only decide the unspecified order of rows with
+/// equal ORDER BY keys, so they may have types whose values can't be compared
+/// (see [union_all_column_collation]).
 fn compound_collations(
     left: &[(SelectPlan, CompoundOperator)],
     right_most: &SelectPlan,
@@ -854,7 +856,7 @@ fn compound_collations(
             if is_compared(column) {
                 compound_column_collation(&arms, column, resolver)
             } else {
-                Ok(CollationSeq::BINARY)
+                union_all_column_collation(&arms, column, resolver)
             }
         })
         .collect()

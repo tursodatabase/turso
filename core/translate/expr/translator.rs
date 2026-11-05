@@ -1272,6 +1272,9 @@ fn translate_function_call_expr(
             }
         },
         Func::Scalar(srf) => {
+            // Binding checks this too, but a column DEFAULT, UPSERT's DO UPDATE
+            // and a trigger's WHEN are compiled without being bound with their
+            // column types.
             if srf.is_array_function() {
                 let context = ExprContext::new(referenced_tables, resolver);
                 check_array_arguments(
