@@ -6446,7 +6446,7 @@ mod tests {
 
     #[test]
     fn bootstrap_encrypts_pages_with_the_local_key_before_writing() {
-        use turso_core::{CipherMode, EncryptionContext, EncryptionKey, OpenFlags, SqliteDialect};
+        use turso_core::{CipherMode, EncryptionContext, EncryptionKey, OpenFlags};
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.db");
         let target = dir.path().join("replica.db");

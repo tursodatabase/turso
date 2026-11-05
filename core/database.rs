@@ -3784,7 +3784,7 @@ mod database_tests {
                 OpenFlags::Create,
                 options,
                 Some(encryption.clone()),
-                Arc::new(SqliteDialect),
+                Arc::new(EngineDialect),
             )?;
             let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key.clone())))?;
             conn.execute("PRAGMA journal_mode = 'mvcc'")?;
@@ -3803,7 +3803,7 @@ mod database_tests {
                 OpenFlags::None,
                 options,
                 Some(encryption.clone()),
-                Arc::new(SqliteDialect),
+                Arc::new(EngineDialect),
             )?;
             let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key.clone())))?;
             let mut stmt = conn.prepare("SELECT value FROM t ORDER BY rowid")?;
@@ -3821,7 +3821,7 @@ mod database_tests {
             OpenFlags::None,
             options,
             Some(encryption),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         let rows = conn.prepare("SELECT count(*) FROM t")?.run_collect_rows()?;
