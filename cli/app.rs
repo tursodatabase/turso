@@ -4,7 +4,7 @@ use crate::{
         import::ImportFile,
         Command, CommandParser,
     },
-    config::{Config, TableConfig},
+    config::Config,
     dot_command::tokenize_dot_command,
     helper::LimboHelper,
     input::{
@@ -1284,7 +1284,7 @@ impl Limbo {
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_truncation_indicator("…")
-            .load_preset(TableConfig::BORDER_PRESET);
+            .load_preset("││──├─┼┤│    ┬┴┌┐└┘");
 
         if num_columns > 0 {
             let header = column_names
