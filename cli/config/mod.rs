@@ -114,6 +114,10 @@ impl Default for TableConfig {
 }
 
 impl TableConfig {
+    /// `comfy_table` preset for result tables: box-drawing borders with a line
+    /// under the header and none between rows, like sqlite3's `.mode box`.
+    pub const BORDER_PRESET: &str = "││──├─┼┤│    ┬┴┌┐└┘";
+
     // These methods are needed for serde default attributes
     fn default_header_color() -> LimboColor {
         // Use adaptive colors for serde defaults too

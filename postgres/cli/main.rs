@@ -711,7 +711,7 @@ fn print_result_set(
     let mut table = Table::new();
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+        .load_preset(TableConfig::BORDER_PRESET);
 
     let header: Vec<Cell> = column_names
         .iter()
