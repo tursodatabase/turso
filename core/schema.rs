@@ -5883,43 +5883,8 @@ impl BTreeTable {
                 }
                 sql.push_str(&quote_ident(col));
             }
-            sql.push_str(") REFERENCES ");
-            sql.push_str(&quote_ident(&fk.parent_table));
-            if !fk.parent_columns.is_empty() {
-                sql.push('(');
-                for (i, col) in fk.parent_columns.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&quote_ident(col));
-                }
-                sql.push(')');
-            }
-
-            // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
-            if fk.on_delete != RefAct::NoAction {
-                sql.push_str(" ON DELETE ");
-                sql.push_str(match fk.on_delete {
-                    RefAct::SetNull => "SET NULL",
-                    RefAct::SetDefault => "SET DEFAULT",
-                    RefAct::Cascade => "CASCADE",
-                    RefAct::Restrict => "RESTRICT",
-                    _ => "",
-                });
-            }
-            if fk.on_update != RefAct::NoAction {
-                sql.push_str(" ON UPDATE ");
-                sql.push_str(match fk.on_update {
-                    RefAct::SetNull => "SET NULL",
-                    RefAct::SetDefault => "SET DEFAULT",
-                    RefAct::Cascade => "CASCADE",
-                    RefAct::Restrict => "RESTRICT",
-                    _ => "",
-                });
-            }
-            if fk.deferred {
-                sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
-            }
+            sql.push_str(") ");
+            push_references_clause(&mut sql, fk);
         }
 
         // Add table-level CHECK constraints (column-level ones were emitted inline above)
@@ -6175,6 +6140,46 @@ impl BTreeTable {
             }
         }
         Ok(deps)
+    }
+}
+
+fn push_references_clause(sql: &mut String, fk: &ForeignKey) {
+    sql.push_str("REFERENCES ");
+    sql.push_str(&quote_ident(&fk.parent_table));
+    if !fk.parent_columns.is_empty() {
+        sql.push('(');
+        for (i, col) in fk.parent_columns.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&quote_ident(col));
+        }
+        sql.push(')');
+    }
+
+    // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
+    if fk.on_delete != RefAct::NoAction {
+        sql.push_str(" ON DELETE ");
+        sql.push_str(match fk.on_delete {
+            RefAct::SetNull => "SET NULL",
+            RefAct::SetDefault => "SET DEFAULT",
+            RefAct::Cascade => "CASCADE",
+            RefAct::Restrict => "RESTRICT",
+            _ => "",
+        });
+    }
+    if fk.on_update != RefAct::NoAction {
+        sql.push_str(" ON UPDATE ");
+        sql.push_str(match fk.on_update {
+            RefAct::SetNull => "SET NULL",
+            RefAct::SetDefault => "SET DEFAULT",
+            RefAct::Cascade => "CASCADE",
+            RefAct::Restrict => "RESTRICT",
+            _ => "",
+        });
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
     }
 }
 
