@@ -578,3 +578,32 @@ fn vacuum_into_copies_the_tables_of_a_namespace_across_target_commits(db: TempDa
         50000 * 50001 / 2
     );
 }
+
+/// A namespace created after a table larger than a batch: its name reaches
+/// the target's schema in memory before the rows are copied, the big table's
+/// batch commit comes next, and only then the rows of the namespaces table
+/// and of the namespace's own table. The name must outlive that commit, or
+/// the namespace's table cannot be addressed when its turn comes.
+#[turso_macros::test]
+fn vacuum_into_keeps_a_namespace_named_after_a_batch_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE big(x INTEGER PRIMARY KEY, y TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO big SELECT s, 'row ' || s FROM generate_series(1, 25000) AS s")
+        .unwrap();
+    let shop = conn.create_namespace("shop").unwrap();
+    conn.execute("CREATE TABLE shop.t(x INTEGER PRIMARY KEY, y TEXT); INSERT INTO shop.t VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    let copy = db.path.with_file_name(format!(
+        "{}-copy.db",
+        db.path.file_stem().unwrap().to_str().unwrap()
+    ));
+    conn.execute(format!("VACUUM INTO '{}'", copy.display()))
+        .unwrap();
+
+    let copied_db = reopen(&copy);
+    let copied = copied_db.connect_limbo();
+    assert_eq!(copied.qualifier("shop"), Some(shop));
+    assert_eq!(query_i64(&copied, "SELECT count(*) FROM big"), 25000);
+    assert_eq!(query_i64(&copied, "SELECT sum(x) FROM shop.t"), 3);
+}

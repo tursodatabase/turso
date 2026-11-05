@@ -1186,15 +1186,6 @@ pub(crate) fn vacuum_target_build_step(
                     if let Some(batch) = config.commit_every {
                         if state.batch_rows >= batch.rows || state.batch_bytes >= batch.bytes {
                             state.target_conn.execute("COMMIT")?;
-                            // Keep the target's shared schema at the version
-                            // just committed, as the final commit does, so
-                            // that no statement on the target sees a newer
-                            // cookie on disk and reparses the schema from
-                            // it: a reparse would lose what only the
-                            // connection holds — the mirrored custom types
-                            // and the names of the namespaces, whose rows
-                            // may not be copied yet.
-                            state.target_conn.publish_schema_if_newer();
                             state.batches_since_checkpoint += 1;
                             if state.batches_since_checkpoint >= batch.checkpoint_every_batches {
                                 // Nothing reads the target while it is built,
