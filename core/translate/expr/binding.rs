@@ -461,7 +461,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     resolver.schema().get_type_def_unchecked(&col.ty_str);
                                 #[expect(
                                     clippy::disallowed_methods,
-                                    reason = "a column whose type has no definition is not a struct or union, and the `else` branch below rejects the field access with an error: core/translate/expr/binding.rs:480 (`bind_and_rewrite_expr`)"
+                                    reason = "a column whose type has no definition is not a struct or union, and the `else` branch below rejects the field access with an error: `bind_and_rewrite_expr` in core/translate/expr/binding.rs"
                                 )]
                                 let is_struct_or_union = type_def
                                     .map(|td| td.is_struct() || td.is_union())
@@ -1141,7 +1141,7 @@ pub(super) fn resolve_struct_from_expr(
                 "union_extract" if args.len() == 2 => {
                     #[expect(
                         clippy::disallowed_methods,
-                        reason = "binding already rejected a `union_extract` whose second argument is not a string literal: core/translate/expr/binding.rs:1377 (`validate_custom_type_function_call`)"
+                        reason = "binding already rejected a `union_extract` whose second argument is not a string literal: `validate_custom_type_function_call` in core/translate/expr/binding.rs"
                     )]
                     let tag_name = extract_string_literal(&args[1]).ok()?;
                     let union_td =
@@ -1160,7 +1160,7 @@ pub(super) fn resolve_struct_from_expr(
                 "struct_extract" if args.len() == 2 => {
                     #[expect(
                         clippy::disallowed_methods,
-                        reason = "binding already rejected a `struct_extract` whose second argument is not a string literal: core/translate/expr/binding.rs:1377 (`validate_custom_type_function_call`)"
+                        reason = "binding already rejected a `struct_extract` whose second argument is not a string literal: `validate_custom_type_function_call` in core/translate/expr/binding.rs"
                     )]
                     let field_name = extract_string_literal(&args[1]).ok()?;
                     let parent_td =
@@ -1229,7 +1229,7 @@ pub(super) fn find_custom_type_column<'a>(
             let type_def = resolver.schema().get_type_def_unchecked(&col.ty_str);
             #[expect(
                 clippy::disallowed_methods,
-                reason = "a column whose type has no definition is not a struct or union column, so it is not a match and the caller reports an unknown table or column: core/translate/expr/binding.rs:320 (`bind_and_rewrite_expr`)"
+                reason = "a column whose type has no definition is not a struct or union column, so it is not a match and the caller reports an unknown table or column: `bind_and_rewrite_expr` in core/translate/expr/binding.rs"
             )]
             let is_struct_or_union = type_def
                 .map(|td| td.is_struct() || td.is_union())

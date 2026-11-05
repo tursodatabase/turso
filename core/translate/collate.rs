@@ -434,11 +434,11 @@ impl LocaleCollationRegistry {
         Ok(id)
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "an index of an existing entry is always accepted by `from_index`, because `get_or_register` calls `from_index` before it pushes an entry: core/translate/collate.rs:405 (`LocaleCollationRegistry::get_or_register`)"
-    )]
     fn find(&self, name: &str) -> Option<LocaleCollationId> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an index of an existing entry is always accepted by `from_index`, because `get_or_register` calls `from_index` before it pushes an entry: `LocaleCollationRegistry::get_or_register` in core/translate/collate.rs"
+        )]
         self.collations
             .read()
             .iter()
@@ -508,10 +508,6 @@ pub fn comparison_collation(
 /// [comparison_collation] for `x IN (SELECT y ...)` and other comparisons
 /// whose operands belong to different queries, so each operand's columns are
 /// looked up in its own tables.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "no COLLATE operator and no column with a declared collation means BINARY, as in SQLite (rule 3 in the doc comment of core/translate/collate.rs:497 (`comparison_collation`))"
-)]
 pub fn comparison_collation_across_queries(
     lhs: &Expr,
     lhs_context: &ExprContext<'_, '_>,
@@ -532,6 +528,10 @@ pub fn comparison_collation_across_queries(
             None => expr_collation_if_any(rhs, rhs_context, catalog)?,
         }
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "no COLLATE operator and no column with a declared collation means BINARY, as in SQLite (rule 3 in the doc comment of `comparison_collation` in core/translate/collate.rs)"
+    )]
     Ok(CollationSeq::Text(
         collation.unwrap_or(TextCollation::Binary),
     ))
@@ -595,15 +595,15 @@ pub fn expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<Coll
 /// it has none. A subquery or view column stores it apart from the order of
 /// its type (see `Column::text_collation`), so that `CAST(col AS text)` in the
 /// outer query, whose type has no order, compares with the text collation.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "`expr_collation_if_any` returns None only when the expression has no COLLATE operator and no column with a declared collation, and SQLite compares such an expression with BINARY: core/translate/collate.rs:950 (`expr_collation_if_any`)"
-)]
 pub(crate) fn expr_text_collation(
     expr: &Expr,
     metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<TextCollation> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "`expr_collation_if_any` returns None only when the expression has no COLLATE operator and no column with a declared collation, and SQLite compares such an expression with BINARY: `expr_collation_if_any` in core/translate/collate.rs"
+    )]
     Ok(expr_collation_if_any(expr, metadata, catalog)?.unwrap_or(TextCollation::Binary))
 }
 
@@ -992,11 +992,11 @@ fn expr_collation_if_any(
 
 /// A column has its declared collation, BINARY when it declares none. A rowid
 /// alias (INTEGER PRIMARY KEY) is the rowid and has none, as in SQLite.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "`Column::text_collation` returns None only for a column without a COLLATE clause, which SQLite compares with BINARY: core/schema.rs (`Column::text_collation`)"
-)]
 pub(crate) fn column_collation(column: &crate::schema::Column) -> Option<TextCollation> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "`Column::text_collation` returns None only for a column without a COLLATE clause, which SQLite compares with BINARY: `Column::text_collation` in core/schema.rs"
+    )]
     (!column.is_rowid_alias()).then(|| column.text_collation().unwrap_or(TextCollation::Binary))
 }
 

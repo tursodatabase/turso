@@ -51,16 +51,18 @@ The choice depends on whether the None/Err case represents:
 `unwrap_or`, `unwrap_or_else`, `unwrap_or_default`, `map_or`, `map_or_else`
 and `Result::ok` turn a missing value or an error into a default. In custom-type
 code a wrong default is a wrong answer, e.g. an unknown type that compares as
-text. Clippy rejects these methods in files that start with
-`#![deny(clippy::disallowed_methods)]` (list in `core/clippy.toml`), currently
-`core/schema.rs`, `core/translate/collate.rs`, `core/translate/expr/binding.rs`
-and `core/translate/expr/expr_type.rs`. Return an error for the missing case
-instead. If the default really is correct, put
-`#[expect(clippy::disallowed_methods, reason = "...")]` on the smallest
-statement or item, and make the reason point at the code that makes the missing
-case impossible or harmless (`path:line`). "Should never happen" is not a
-reason. Defaults nobody has justified yet say `UNREVIEWED fallback: <what the
-default hides>`.
+text. Clippy rejects these methods (list in `core/clippy.toml`) in every file
+that starts with `#![deny(clippy::disallowed_methods)]`; find them with
+`git grep -l '^#!\[deny(clippy::disallowed_methods)'`. Return an error for the
+missing case instead. If the default really is correct, put
+`#[expect(clippy::disallowed_methods, reason = "...")]` on the smallest item
+that holds the call: the `let` statement or expression, or a small helper
+function that does only that one fallback. Never on a whole function that does
+other things, because a new fallback added inside it would pass unchecked. The
+reason names the function that makes the missing case impossible or harmless
+(`` `Schema::add_index` in core/schema.rs ``), not a line number, since lines
+move. "Should never happen" is not a reason. Defaults nobody has justified yet
+say `UNREVIEWED fallback (#issue): <what the default hides>`.
 
 ## If-Statements
 
