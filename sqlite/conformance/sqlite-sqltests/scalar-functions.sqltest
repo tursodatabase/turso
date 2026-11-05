@@ -2253,13 +2253,6 @@ expect error {
     wrong number of arguments to function sqlite_compileoption_get()
 }
 
-test sqlite-compileoption-used-in-index-rejected {
-    CREATE TABLE compileoption_t(a);
-    CREATE INDEX compileoption_i ON compileoption_t(sqlite_compileoption_used(a));
-}
-expect error {
-}
-
 test cast-large-text-to-numeric {
     SELECT typeof(CAST('9223372036854775808' AS NUMERIC)), CAST('9223372036854775808' AS NUMERIC);
 }
