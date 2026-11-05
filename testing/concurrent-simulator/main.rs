@@ -13,6 +13,7 @@ use turso_whopper::{
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
     fts::FtsProfile,
     properties::*,
+    swarm::SwarmConfig,
     workloads::*,
 };
 
@@ -35,15 +36,19 @@ struct Args {
     /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, fts-merge, fts-snapshots, fts-recovery, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
-    /// Max connections
-    #[arg(long, default_value_t = 4)]
-    max_connections: usize,
+    /// Pick the workloads, the connection count and the fault probabilities from the seed
+    /// (swarm testing). The flags that you give keep their values.
+    #[arg(long)]
+    swarm: bool,
+    /// Max connections [default: 4]
+    #[arg(long)]
+    max_connections: Option<usize>,
     /// Number of worker processes in multiprocess mode. Defaults to `max_connections`.
     #[arg(long)]
     processes: Option<usize>,
-    /// Number of connections opened inside each worker process in multiprocess mode.
-    #[arg(long, default_value_t = 1)]
-    connections_per_process: usize,
+    /// Number of connections opened inside each worker process in multiprocess mode [default: 1]
+    #[arg(long)]
+    connections_per_process: Option<usize>,
     /// Reopen probability per step.
     #[arg(long)]
     reopen_probability: Option<f64>,
@@ -85,15 +90,15 @@ struct Args {
     /// Run in multiprocess mode (spawns OS processes instead of in-process fibers)
     #[arg(long)]
     multiprocess: bool,
-    /// Probability of killing a worker process per step (multiprocess mode only)
-    #[arg(long, default_value_t = 0.0)]
-    kill_probability: f64,
+    /// Probability of killing a worker process per step (multiprocess mode only) [default: 0]
+    #[arg(long)]
+    kill_probability: Option<f64>,
     /// Probability of restarting the full worker cohort per step (multiprocess mode only)
     #[arg(long, default_value_t = 0.0)]
     restart_probability: f64,
-    /// Probability of failing a scoped Turso allocation while stepping a statement.
-    #[arg(long, default_value_t = 0.05)]
-    allocation_fault_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement [default: 0.05]
+    #[arg(long)]
+    allocation_fault_probability: Option<f64>,
     /// Probability of probing a same-connection checkpoint while a statement
     /// is suspended (the checkpoint must be rejected).
     #[arg(long)]
@@ -120,7 +125,7 @@ enum SubCmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Dispatch to worker BEFORE init_logger so the worker can install its own
     // stderr-only subscriber without the coordinator's logger polluting stdout.
@@ -172,15 +177,80 @@ fn main() -> anyhow::Result<()> {
     println!("mode = {}", args.mode);
     println!("seed = {seed}");
 
+    let swarm = if args.swarm {
+        Some(apply_swarm(&mut args, seed)?)
+    } else {
+        None
+    };
+
     if args.multiprocess {
-        return run_multiprocess(&args, seed);
+        return run_multiprocess(&args, seed, swarm.as_ref());
     }
 
-    run_inprocess(&args, seed)
+    run_inprocess(&args, seed, swarm.as_ref())
+}
+
+/// Gives each setting that the command line leaves unset the value that the swarm picks
+/// from the seed.
+fn apply_swarm(args: &mut Args, seed: u64) -> anyhow::Result<SwarmConfig> {
+    anyhow::ensure!(
+        args.elle.is_none()
+            && matches!(
+                args.mode.as_str(),
+                "fast" | "chaos" | "ragnarök" | "ragnarok"
+            ),
+        "--swarm works only with the default workloads: use --mode fast, chaos or ragnarok, \
+         without --elle"
+    );
+    let swarm = SwarmConfig::new(seed);
+    let mut flags = Vec::new();
+    if args.multiprocess {
+        let processes = *args
+            .processes
+            .get_or_insert(args.max_connections.unwrap_or(swarm.processes));
+        let connections_per_process = *args
+            .connections_per_process
+            .get_or_insert(swarm.connections_per_process);
+        let kill_probability = *args.kill_probability.get_or_insert(swarm.kill_probability);
+        flags.push(format!("--processes {processes}"));
+        flags.push(format!(
+            "--connections-per-process {connections_per_process}"
+        ));
+        flags.push(format!("--kill-probability {kill_probability}"));
+    } else {
+        let max_connections = *args.max_connections.get_or_insert(swarm.max_connections);
+        let reopen_probability = *args
+            .reopen_probability
+            .get_or_insert(swarm.reopen_probability);
+        let allocation_fault_probability = *args
+            .allocation_fault_probability
+            .get_or_insert(swarm.allocation_fault_probability);
+        let checkpoint_probe_probability = *args
+            .checkpoint_probe_probability
+            .get_or_insert(swarm.checkpoint_probe_probability);
+        flags.push(format!("--max-connections {max_connections}"));
+        flags.push(format!("--reopen-probability {reopen_probability}"));
+        flags.push(format!(
+            "--allocation-fault-probability {allocation_fault_probability}"
+        ));
+        flags.push(format!(
+            "--checkpoint-probe-probability {checkpoint_probe_probability}"
+        ));
+        if args.enable_mvcc {
+            args.mvcc_checkpoint_threshold = args
+                .mvcc_checkpoint_threshold
+                .or(swarm.mvcc_checkpoint_threshold);
+            if let Some(threshold) = args.mvcc_checkpoint_threshold {
+                flags.push(format!("--mvcc-checkpoint-threshold {threshold}"));
+            }
+        }
+    }
+    println!("swarm: {}", flags.join(" "));
+    Ok(swarm)
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
+fn run_multiprocess(args: &Args, seed: u64, swarm: Option<&SwarmConfig>) -> anyhow::Result<()> {
     anyhow::ensure!(
         FtsProfile::from_mode(&args.mode).is_none(),
         "FTS profiles require one process because multiprocess mode does not run their recovery and cache checks"
@@ -200,20 +270,22 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     let max_steps = args.max_steps.unwrap_or(base_max_steps);
 
     let (workloads, properties, elle_tables, chaotic_profiles) =
-        build_workloads_and_properties(args);
-    let process_count = args.processes.unwrap_or(args.max_connections);
+        build_workloads_and_properties(args, swarm);
+    let process_count = args.processes.unwrap_or_else(|| args.max_connections());
+    let connections_per_process = args.connections_per_process.unwrap_or(1);
+    let kill_probability = args.kill_probability.unwrap_or(0.0);
 
     let opts = MultiprocessOpts {
         seed: Some(seed),
         process_count,
-        connections_per_process: args.connections_per_process,
+        connections_per_process,
         max_steps,
         enable_mvcc: args.enable_mvcc,
         elle_tables,
         workloads,
         properties,
         chaotic_profiles,
-        kill_probability: args.kill_probability,
+        kill_probability,
         restart_probability: args.restart_probability,
         history_output: args.history_output.clone(),
         keep_files: args.keep,
@@ -222,20 +294,20 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     println!(
         "multiprocess = true ({} processes, {} connections/process, {} total connections)",
         process_count,
-        args.connections_per_process,
-        process_count.saturating_mul(args.connections_per_process)
+        connections_per_process,
+        process_count.saturating_mul(connections_per_process)
     );
-    if args.kill_probability > 0.0 {
-        println!("kill_probability = {}", args.kill_probability);
+    if kill_probability > 0.0 {
+        println!("kill_probability = {kill_probability}");
     }
     if args.restart_probability > 0.0 {
         println!("restart_probability = {}", args.restart_probability);
     }
-    if args.allocation_fault_probability > 0.0 {
+    if args.allocation_fault_probability() > 0.0 {
         println!(
             "allocation fault injection disabled in multiprocess mode \
              (requested probability = {})",
-            args.allocation_fault_probability
+            args.allocation_fault_probability()
         );
     }
     if let Some(path) = &args.history_output {
@@ -279,14 +351,14 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
 }
 
 #[cfg(not(all(any(unix, target_os = "windows"), target_pointer_width = "64")))]
-fn run_multiprocess(_args: &Args, _seed: u64) -> anyhow::Result<()> {
+fn run_multiprocess(_args: &Args, _seed: u64, _swarm: Option<&SwarmConfig>) -> anyhow::Result<()> {
     Err(anyhow::anyhow!(
         "multiprocess mode is only supported on 64-bit Unix and Windows hosts"
     ))
 }
 
-fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
-    let opts = build_inprocess_opts(args, seed)?;
+fn run_inprocess(args: &Args, seed: u64, swarm: Option<&SwarmConfig>) -> anyhow::Result<()> {
+    let opts = build_inprocess_opts(args, seed, swarm)?;
 
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
@@ -388,7 +460,7 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
+fn build_workloads_and_properties(args: &Args, swarm: Option<&SwarmConfig>) -> BuildArtifacts {
     if let Some(elle_model) = args.elle {
         let elle_counter = Arc::new(std::sync::atomic::AtomicI64::new(1));
 
@@ -514,6 +586,21 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(RollbackWorkload)),
             (10, Box::new(IntegrityCheckWorkload)),
         ];
+        let w = match swarm {
+            Some(swarm) => {
+                let w = swarm.pick_workloads(w);
+                let (on, off): (Vec<_>, Vec<_>) = w.iter().partition(|(weight, _)| *weight > 0);
+                let on: Vec<String> = on
+                    .iter()
+                    .map(|(weight, workload)| format!("{}:{weight}", workload.name()))
+                    .collect();
+                let off: Vec<&str> = off.iter().map(|(_, workload)| workload.name()).collect();
+                println!("swarm: workloads {}", on.join(" "));
+                println!("swarm: workloads off {}", off.join(" "));
+                w
+            }
+            None => w,
+        };
 
         let p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
@@ -537,7 +624,11 @@ type TableSchemas = Vec<(String, String)>;
 type ChaosProfiles = Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>;
 type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfiles);
 
-fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
+fn build_inprocess_opts(
+    args: &Args,
+    seed: u64,
+    swarm: Option<&SwarmConfig>,
+) -> anyhow::Result<WhopperOpts> {
     if let Some(profile) = FtsProfile::from_mode(&args.mode) {
         anyhow::ensure!(
             args.elle.is_none(),
@@ -550,9 +641,9 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         let mut opts = profile
             .options(args.enable_mvcc)
             .with_seed(seed)
-            .with_max_connections(args.max_connections)
+            .with_max_connections(args.max_connections())
             .with_keep_files(args.keep)
-            .with_allocation_fault_probability(args.allocation_fault_probability);
+            .with_allocation_fault_probability(args.allocation_fault_probability());
         if let Some(steps) = args.max_steps {
             opts.max_steps = steps;
         }
@@ -586,11 +677,11 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     }
 
     let (workloads, properties, elle_tables, chaotic_profiles) =
-        build_workloads_and_properties(args);
+        build_workloads_and_properties(args, swarm);
 
     let opts = base_opts
         .with_seed(seed)
-        .with_max_connections(args.max_connections)
+        .with_max_connections(args.max_connections())
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
@@ -600,13 +691,23 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_workloads(workloads)
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
-        .with_allocation_fault_probability(args.allocation_fault_probability);
+        .with_allocation_fault_probability(args.allocation_fault_probability());
     let opts = match args.checkpoint_probe_probability {
         Some(probability) => opts.with_checkpoint_probe_probability(probability),
         None => opts,
     };
 
     Ok(opts)
+}
+
+impl Args {
+    fn max_connections(&self) -> usize {
+        self.max_connections.unwrap_or(4)
+    }
+
+    fn allocation_fault_probability(&self) -> f64 {
+        self.allocation_fault_probability.unwrap_or(0.05)
+    }
 }
 
 fn is_btree_rebalance_mode(mode: &str) -> bool {
@@ -692,7 +793,7 @@ mod tests {
                     arguments.push("--enable-mvcc");
                 }
                 let args = Args::parse_from(arguments);
-                let opts = build_inprocess_opts(&args, 811).unwrap();
+                let opts = build_inprocess_opts(&args, 811, None).unwrap();
                 assert_eq!(opts.fts_profile, FtsProfile::from_mode(mode));
                 assert_eq!(opts.seed, Some(811));
                 assert_eq!(opts.max_steps, 37);
@@ -711,6 +812,62 @@ mod tests {
     #[test]
     fn fts_modes_reject_unrelated_workloads() {
         let args = Args::parse_from(["whopper", "--mode", "fts-merge", "--elle", "list-append"]);
-        assert!(build_inprocess_opts(&args, 811).is_err());
+        assert!(build_inprocess_opts(&args, 811, None).is_err());
+    }
+
+    #[test]
+    fn swarm_keeps_the_flags_that_the_command_line_gives() {
+        let picked = SwarmConfig::new(811);
+        let max_connections = (picked.max_connections + 1).to_string();
+        let mut args = Args::parse_from([
+            "whopper",
+            "--swarm",
+            "--max-connections",
+            &max_connections,
+            "--allocation-fault-probability",
+            "0.5",
+        ]);
+        apply_swarm(&mut args, 811).unwrap();
+        assert_eq!(args.max_connections, Some(picked.max_connections + 1));
+        assert_eq!(args.allocation_fault_probability, Some(0.5));
+        assert_eq!(args.reopen_probability, Some(picked.reopen_probability));
+        assert_eq!(
+            args.checkpoint_probe_probability,
+            Some(picked.checkpoint_probe_probability)
+        );
+    }
+
+    #[test]
+    fn swarm_sets_the_mvcc_checkpoint_threshold_only_with_mvcc() {
+        let mut picked_threshold = false;
+        for seed in 0..50 {
+            let mut args = Args::parse_from(["whopper", "--swarm"]);
+            apply_swarm(&mut args, seed).unwrap();
+            assert_eq!(args.mvcc_checkpoint_threshold, None);
+
+            let mut args = Args::parse_from(["whopper", "--swarm", "--enable-mvcc"]);
+            let picked = apply_swarm(&mut args, seed).unwrap();
+            assert_eq!(
+                args.mvcc_checkpoint_threshold,
+                picked.mvcc_checkpoint_threshold
+            );
+            assert!(!args.enable_experimental_mvcc_passive_checkpoint);
+            picked_threshold |= picked.mvcc_checkpoint_threshold.is_some();
+        }
+        assert!(picked_threshold);
+    }
+
+    #[test]
+    fn swarm_rejects_modes_that_use_their_own_workloads() {
+        for arguments in [
+            ["whopper", "--swarm", "--mode", "fts-merge"],
+            ["whopper", "--swarm", "--mode", "btree-rebalance"],
+            ["whopper", "--swarm", "--mode", "schema-clone-faults"],
+            ["whopper", "--swarm", "--mode", "recovery-heavy"],
+            ["whopper", "--swarm", "--elle", "list-append"],
+        ] {
+            let mut args = Args::parse_from(arguments);
+            assert!(apply_swarm(&mut args, 811).is_err(), "{arguments:?}");
+        }
     }
 }

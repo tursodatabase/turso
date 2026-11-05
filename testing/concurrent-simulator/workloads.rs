@@ -1,5 +1,7 @@
 //! Workload definitions for the simulator.
 
+use std::any::Any;
+
 use rand::{Rng, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
@@ -42,8 +44,15 @@ impl GenerationContext for WorkloadContext<'_> {
 /// A workload generates operations to be executed on a fiber.
 /// Returns Some(Operation) if an operation was generated, None if this
 /// workload couldn't be applied and another should be tried.
-pub trait Workload: Send + Sync {
+pub trait Workload: Any + Send + Sync {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation>;
+
+    /// The type name without its module path and `Workload` suffix, for example `Begin`.
+    fn name(&self) -> &'static str {
+        let path = std::any::type_name::<Self>();
+        let name = path.rsplit_once("::").map_or(path, |(_, name)| name);
+        name.strip_suffix("Workload").unwrap_or(name)
+    }
 }
 
 // ============================================================================

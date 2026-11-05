@@ -393,6 +393,10 @@ If you need to reproduce a run, just defined the `SEED` environment variable as 
 SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
 
+To give each run a different mix of workloads, connections, and fault probabilities, add `--swarm`.
+The seed also picks these settings, so `SEED=1234` repeats a swarm run.
+See [the Whopper README](testing/concurrent-simulator/README.md#swarm-testing).
+
 You can also run Whopper in exploration mode to find more serious bugs:
 
 ```console
