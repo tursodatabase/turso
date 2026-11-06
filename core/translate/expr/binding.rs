@@ -1,7 +1,12 @@
 use super::*;
+use crate::namespace::NamespaceRef;
+use crate::schema::{
+    SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
+};
+use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
-    merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
-    OuterQueryReference, ResolvedColumn,
+    is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
+    ColumnLookup, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -51,12 +56,15 @@ pub(super) fn resolve_qualified_on_ref(
     internal_id: TableInternalId,
     normalized_id: &str,
 ) -> Result<Option<QualifiedMatch>> {
-    if let Some(col_idx) = table.columns().iter().position(|c| {
+    let mut matching = table.columns().iter().enumerate().filter(|(_, c)| {
         c.name
             .as_ref()
             .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
-    }) {
-        let col = table.columns().get(col_idx).unwrap();
+    });
+    if let Some((col_idx, col)) = matching.next() {
+        if matching.next().is_some() {
+            crate::bail_parse_error!("ambiguous column name: {}", normalized_id);
+        }
         return Ok(Some(QualifiedMatch::Column {
             col_idx,
             is_rowid_alias: col.is_rowid_alias(),
@@ -306,7 +314,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 m.is_rowid_alias,
                                 &field_name,
                                 m.type_def,
-                            );
+                            )?;
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
@@ -363,13 +371,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name_clone,
                         alias: None,
                     };
-                    let db_resolution = resolver.resolve_database_id(&qualified_name);
+                    let db_resolution = resolver.resolve_namespace(&qualified_name);
 
-                    if let Ok(database_id) = db_resolution.as_ref() {
+                    if let Ok(namespace) = db_resolution.as_ref() {
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(*database_id),
+                            Some(*namespace),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
@@ -397,9 +405,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     // the table+column exist, use that. Otherwise fall through to
                     // table.column.field for struct/union field access.
                     let mut resolved_as_db_table_col = false;
-                    if let Ok(database_id) = db_resolution {
-                        let table = resolver
-                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
+                    if let Ok(namespace) = db_resolution {
+                        let table = resolver.with_schema(namespace.database_id, |schema| {
+                            schema.get_table(namespace.id, &tbl_name_str)
+                        });
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {
@@ -461,7 +470,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                         col.is_rowid_alias(),
                                         &field_name,
                                         type_def.unwrap(),
-                                    );
+                                    )?;
                                     referenced_tables.mark_column_used(tbl_id, col_idx);
                                     return Ok(WalkControl::Continue);
                                 } else {
@@ -499,7 +508,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
-                    validate_function_tail(name.as_str(), 0, filter_over, resolver)?;
+                    validate_function_tail(
+                        name.as_str(),
+                        0,
+                        filter_over,
+                        false,
+                        &resolver.catalog,
+                    )?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -574,31 +589,91 @@ pub fn bind_and_rewrite_expr<'a>(
                     name,
                     args,
                     filter_over,
+                    order_by,
                     ..
                 } => {
-                    validate_function_tail(name.as_str(), args.len(), filter_over, resolver)?;
+                    validate_function_tail(
+                        name.as_str(),
+                        args.len(),
+                        filter_over,
+                        !order_by.is_empty(),
+                        &resolver.catalog,
+                    )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                }
+                // INSERT replaces a DEFAULT in VALUES with the column's default
+                // before binding, so any DEFAULT left is misplaced.
+                Expr::Default => {
+                    crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
                 }
                 _ => {}
             }
             Ok(WalkControl::Continue)
         },
     )?;
+    check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
+}
+
+/// Fails when `expr` uses an operator that no function of its operands' types
+/// runs, such as `d * 2` for a date d, applies a COLLATE to a type that takes
+/// none, or compares two types with different orders. This runs on every
+/// expression a statement binds, so it also catches what the planner never
+/// compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are
+/// bound only once the binding walk is done, so these are further walks.
+pub(crate) fn check_custom_types(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    // Only custom types and arrays refuse an operator, a COLLATE or a
+    // comparison. Without custom types enabled there are neither: the type
+    // registry is empty and arrays are refused.
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let context = ExprContext::new(tables, resolver);
+    // Operators first: `(d * 2) COLLATE nocase` fails because `*` does not
+    // exist for a date, not because its result has no type.
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_custom_operator(expr, &context.type_env())?;
+        Ok(WalkControl::Continue)
+    })?;
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_expr_collation(expr, &context)?;
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
-fn validate_function_tail(
+pub(crate) fn validate_function_tail(
     name: &str,
     arg_count: usize,
     filter_over: &ast::FunctionTail,
-    resolver: &Resolver,
+    has_order_by: bool,
+    resolver: &CatalogContext,
 ) -> Result<()> {
-    if filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
+    if !has_order_by && filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
     }
-    match resolver.resolve_function(name, arg_count)? {
+    let func = match resolver.resolve_function(name, arg_count) {
+        Ok(func) => func,
+        // SQLite reports OVER on a scalar function before a wrong argument count.
+        Err(err) if filter_over.over_clause.is_some() => {
+            match crate::dialect::engine::resolve_builtin_function_name(name, arg_count) {
+                Ok(Some(Func::Scalar(_))) => {
+                    crate::bail_parse_error!("{} may not be used as a window function", name)
+                }
+                _ => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    match func {
         Some(Func::Agg(_) | Func::Window(_)) | None => Ok(()),
         Some(Func::External(func)) if func.func.is_aggregate() => Ok(()),
+        _ if has_order_by => {
+            crate::bail_parse_error!("ORDER BY may not be used with non-aggregate {}()", name)
+        }
         _ if filter_over.over_clause.is_some() => {
             crate::bail_parse_error!("{} may not be used as a window function", name)
         }
@@ -699,6 +774,23 @@ pub(in crate::translate) fn lookup_unqualified_column(
     include_rowid: bool,
 ) -> ColumnLookup {
     let Some(join_columns) = table.parenthesized_join_columns() else {
+        if matches!(
+            table,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+        ) && table
+            .columns()
+            .iter()
+            .filter(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+            })
+            .count()
+            > 1
+        {
+            return ColumnLookup::Ambiguous;
+        }
         return match table.get_column_by_name(column_name) {
             Some((column_index, _)) => ColumnLookup::Found(column_index),
             None => ColumnLookup::Missing,
@@ -723,25 +815,29 @@ pub(in crate::translate) fn lookup_unqualified_column(
 fn resolve_qualified_name(
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
-    database_id: Option<usize>,
+    namespace: Option<NamespaceRef>,
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedNameMatch> {
-    let use_nearest_table_only = resolver.dialect.qualified_column_uses_nearest_table_only();
+    let use_nearest_table_only = resolver
+        .catalog
+        .dialect
+        .qualified_column_uses_nearest_table_only();
     let mut table_found = false;
     let mut found = None;
     for joined_table in table_references.joined_tables() {
         let candidate = match_qualified_name_in_table(
             &joined_table.table,
             joined_table.internal_id,
-            &joined_table.identifier,
-            if database_id == Some(joined_table.database_id)
-                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
-            {
-                None
-            } else {
-                database_id
-            },
+            qualifier_names_table(
+                &joined_table.table,
+                &joined_table.identifier,
+                joined_table.has_alias,
+                joined_table.namespace.database_id,
+                table_name,
+                namespace.is_some(),
+            ),
+            database_id_to_match(&joined_table.table, joined_table.namespace, namespace),
             table_name,
             column_name,
         )?;
@@ -785,8 +881,15 @@ fn resolve_qualified_name(
         let candidate = match_qualified_name_in_table(
             &outer_ref.table,
             outer_ref.internal_id,
-            &outer_ref.identifier,
-            database_id,
+            qualifier_names_table(
+                &outer_ref.table,
+                &outer_ref.identifier,
+                outer_ref.has_alias,
+                outer_ref.namespace.database_id,
+                table_name,
+                namespace.is_some(),
+            ),
+            database_id_to_match(&outer_ref.table, outer_ref.namespace, namespace),
             table_name,
             column_name,
         )?;
@@ -830,6 +933,53 @@ fn resolve_qualified_name(
     }
 }
 
+/// Whether `<tbl>` in `<tbl>.<col>` names the FROM item `table_reference_name`.
+///
+/// Like SQLite's `isValidSchemaTableName()`, the schema table without an alias
+/// can be named by either `sqlite_schema` or `sqlite_master`, whichever name
+/// FROM used. The temp schema table accepts the temp names, and also the main
+/// names when the column has a database qualifier. With an alias, only the
+/// alias names the table.
+fn qualifier_names_table(
+    table: &Table,
+    table_reference_name: &str,
+    has_alias: bool,
+    table_database_id: usize,
+    table_name: &str,
+    has_database_qualifier: bool,
+) -> bool {
+    if has_alias || !is_schema_table(table) {
+        return table_reference_name.eq_ignore_ascii_case(table_name);
+    }
+    let main_names = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
+    let temp_names = [TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT];
+    let names_main_table = main_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(table_name));
+    let names_temp_table = temp_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(table_name));
+    if table_database_id == crate::TEMP_DB_ID {
+        names_temp_table || (has_database_qualifier && names_main_table)
+    } else {
+        names_main_table
+    }
+}
+
+/// A schema name that matches the table's own database is already satisfied,
+/// so the table can then be matched by its alias.
+fn database_id_to_match(
+    table: &Table,
+    table_namespace: NamespaceRef,
+    namespace: Option<NamespaceRef>,
+) -> Option<usize> {
+    if namespace == Some(table_namespace) && matches!(table, Table::BTree(_) | Table::Virtual(_)) {
+        None
+    } else {
+        namespace.map(|namespace| namespace.database_id)
+    }
+}
+
 /// Whether the join that added this outer table merged the column with USING.
 fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize) -> bool {
     let Some(join_info) = outer_ref.join_info.as_ref() else {
@@ -848,7 +998,7 @@ fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize)
 fn match_qualified_name_in_table(
     table: &Table,
     table_id: TableInternalId,
-    table_reference_name: &str,
+    qualifier_names_table: bool,
     database_id: Option<usize>,
     table_name: &str,
     column_name: &str,
@@ -871,12 +1021,12 @@ fn match_qualified_name_in_table(
                 is_rowid_alias: table.columns()[col_idx].is_rowid_alias(),
             }));
         }
-        if table_found && !table_reference_name.eq_ignore_ascii_case(table_name) {
+        if table_found && !qualifier_names_table {
             return Ok(QualifiedTableMatch::NoColumn);
         }
     }
 
-    if database_id.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
+    if database_id.is_some() || !qualifier_names_table {
         return Ok(QualifiedTableMatch::NoTable);
     }
     Ok(
@@ -966,7 +1116,7 @@ pub(super) fn resolve_typedef_from_column(
         ast::Expr::Column { table, column, .. } => {
             resolve_column_type_str(*table, *column, referenced_tables, resolver)?
         }
-        ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
+        ast::Expr::Variable(var) => var.custom_type.as_ref()?.name.clone(),
         _ => return None,
     };
     let td = resolver.schema().get_type_def_unchecked(&ty_str)?;
@@ -1103,16 +1253,33 @@ pub(super) fn find_custom_type_column<'a>(
 }
 
 /// Build an `Expr::FieldAccess { base: Expr::Column { ... }, field, resolved }` node,
-/// pre-resolving the field index via `resolve_field_access`.
+/// resolving the field index via `resolve_field_access`. Fails when `td` has no
+/// such field or variant.
 pub(super) fn make_field_access_expr(
     table_id: TableInternalId,
     col_idx: usize,
     is_rowid_alias: bool,
     field_name: &str,
     td: &crate::schema::TypeDef,
-) -> Expr {
-    let resolved = resolve_field_access(td, field_name);
-    Expr::FieldAccess {
+) -> Result<Expr> {
+    let Some(resolved) = resolve_field_access(td, field_name) else {
+        if td.is_struct() {
+            crate::bail_parse_error!(
+                "no such field '{}' in struct type '{}'",
+                field_name,
+                td.name
+            );
+        }
+        if td.is_union() {
+            crate::bail_parse_error!(
+                "no such variant '{}' in union type '{}'",
+                field_name,
+                td.name
+            );
+        }
+        crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
+    };
+    Ok(Expr::FieldAccess {
         base: Box::new(Expr::Column {
             database: None,
             table: table_id,
@@ -1121,7 +1288,7 @@ pub(super) fn make_field_access_expr(
         }),
         field: ast::Name::from_bytes(field_name.as_bytes()),
         resolved,
-    }
+    })
 }
 
 /// Try to resolve `col_name.mid_name.leaf_name` as 2-level deep field access
@@ -1153,13 +1320,18 @@ pub(super) fn try_resolve_nested_field_access<'a>(
                 .map(|(_, f)| f.type_name.as_str())
         });
 
-    let has_leaf = inner_type_name
-        .and_then(|tn| resolver.schema().get_type_def_unchecked(tn))
-        .is_some_and(|itd| itd.find_struct_field(leaf_name).is_some());
-
-    if !has_leaf {
+    let inner_td = inner_type_name.and_then(|tn| resolver.schema().get_type_def_unchecked(tn));
+    let Some((mid_resolution, leaf_resolution)) = inner_td.and_then(|inner_td| {
+        let leaf_index = inner_td.find_struct_field(leaf_name)?.0;
+        Some((
+            resolve_field_access(td, mid_name)?,
+            ast::FieldAccessResolution::StructField {
+                field_index: leaf_index,
+            },
+        ))
+    }) else {
         return Ok(None);
-    }
+    };
 
     let nested_expr = Expr::FieldAccess {
         base: Box::new(Expr::FieldAccess {
@@ -1170,10 +1342,10 @@ pub(super) fn try_resolve_nested_field_access<'a>(
                 is_rowid_alias: m.is_rowid_alias,
             }),
             field: ast::Name::from_bytes(mid_name.as_bytes()),
-            resolved: None,
+            resolved: mid_resolution,
         }),
         field: ast::Name::from_bytes(leaf_name.as_bytes()),
-        resolved: None,
+        resolved: leaf_resolution,
     };
 
     Ok(Some((nested_expr, m.table_id, m.col_idx)))
@@ -1190,67 +1362,6 @@ pub(super) fn resolve_field_access(
         Some(ast::FieldAccessResolution::UnionVariant { tag_index: tag_idx })
     } else {
         None
-    }
-}
-
-/// Recursively resolve the output TypeDef of an expression.
-///
-/// For `Expr::Column`, returns the column's declared custom type.
-/// For `Expr::FieldAccess`, recurses into the base to find the parent type,
-/// then looks up what type the accessed field/variant produces.
-/// Returns `None` for expressions that don't produce a known custom type.
-pub(super) fn resolve_expr_output_type<'a>(
-    expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &'a Resolver<'a>,
-) -> crate::Result<&'a crate::schema::TypeDef> {
-    match expr {
-        ast::Expr::Column { table, column, .. } => {
-            let Some(referenced_tables) = referenced_tables else {
-                crate::bail_parse_error!("cannot resolve type: no table context");
-            };
-            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table) else {
-                crate::bail_parse_error!("cannot resolve type: table not found");
-            };
-            let col = &tbl.columns()[*column];
-            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
-                crate::bail_parse_error!(
-                    "column '{}' has type '{}' which is not a known struct or union type",
-                    col.name.as_deref().unwrap_or("?"),
-                    col.ty_str
-                );
-            };
-            Ok(td)
-        }
-        ast::Expr::FieldAccess { base, field, .. } => {
-            let parent_td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-            let field_name = normalize_ident(field.as_str());
-            // Find what type this field/variant produces
-            let inner_type_name =
-                if let Some((_, variant)) = parent_td.find_union_variant(&field_name) {
-                    &variant.type_name
-                } else if let Some((_, f)) = parent_td.find_struct_field(&field_name) {
-                    &f.type_name
-                } else {
-                    let kind = if parent_td.is_union() {
-                        "variant"
-                    } else {
-                        "field"
-                    };
-                    crate::bail_parse_error!("no such {} '{}' in type", kind, field_name);
-                };
-            let Some(td) = resolver.schema().get_type_def_unchecked(inner_type_name) else {
-                crate::bail_parse_error!(
-                    "'{}' resolves to type '{}' which is not a known type",
-                    field_name,
-                    inner_type_name
-                );
-            };
-            Ok(td)
-        }
-        _ => {
-            crate::bail_parse_error!("expression does not produce a known custom type");
-        }
     }
 }
 

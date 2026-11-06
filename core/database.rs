@@ -3,6 +3,9 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
+use crate::namespace::NamespaceId;
+use crate::security::roles::ROLES_TABLE_NAME;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -53,12 +56,12 @@ use crate::{
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
+use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::any::Any;
 #[cfg(host_shared_wal)]
 use std::path::Path;
-#[cfg(host_shared_wal)]
 use std::sync::OnceLock;
 use std::{fmt, ops::Deref};
 #[cfg(feature = "fs")]
@@ -77,7 +80,6 @@ pub struct DatabaseOpts {
     pub enable_autovacuum: bool,
     pub enable_vacuum: bool,
     pub enable_attach: bool,
-    pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     /// Open the database in MVCC mode. A database that is not in MVCC mode
@@ -142,11 +144,6 @@ impl DatabaseOpts {
 
     pub fn with_attach(mut self, enable: bool) -> Self {
         self.enable_attach = enable;
-        self
-    }
-
-    pub fn with_generated_columns(mut self, enable: bool) -> Self {
-        self.enable_generated_columns = enable;
         self
     }
 
@@ -315,7 +312,7 @@ impl OpenOptions {
 ///
 /// Turso treats every path with the `:memory:` prefix as a named
 /// in-memory database.
-pub(crate) fn is_memory_like(path: &str) -> bool {
+pub fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
 
@@ -342,7 +339,7 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 }
 
 /// Phase tracking for async database opening
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub enum OpenDbAsyncPhase {
     #[default]
     Init,
@@ -352,6 +349,10 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
+    /// Reads the roles table into the role catalog. Runs after MVCC
+    /// bootstrap, because before it an MVCC database has no table roots and
+    /// has not replayed its logical log.
+    LoadingRoles,
     Done,
 }
 
@@ -496,6 +497,7 @@ enum StatsRefresh {
 
 /// Settings for a single connection, passed to [`Database::connect`] and
 /// [`Database::connect_async`].
+#[derive(Clone)]
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
@@ -573,6 +575,10 @@ pub struct OpenDbAsyncState {
     /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
     /// when `DatabaseOpts::with_mvcc` is set, held across yields.
     mvcc_convert_stmt: Option<crate::Statement>,
+    /// The roles table scan of `LoadingRoles` and the rows read so far, held
+    /// across yields.
+    roles_stmt: Option<Box<Statement>>,
+    role_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -597,6 +603,8 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
+            roles_stmt: None,
+            role_rows: Vec::new(),
         }
     }
 }
@@ -638,6 +646,9 @@ pub(crate) enum RegistryEntry {
 /// across I/O yields. Holding it across yields deadlocks single-threaded
 /// event loops because the blocked thread
 /// can never resume the coroutine that owns the lock.
+///
+/// Never drop an `Arc<Database>` while holding the mutex either: dropping the
+/// last one runs `Database::drop`, which locks the mutex to remove the entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DatabaseKey {
     File(io::FileId),
@@ -706,6 +717,9 @@ pub struct Database<
     pub(crate) incarnation: u64,
 
     pager_state: Arc<SharedPagerState>,
+    /// Key of this database's entry in `DATABASE_MANAGER`, set once the
+    /// database is registered. `Drop` uses it to remove the entry.
+    registry_key: OnceLock<DatabaseKey>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
@@ -769,6 +783,20 @@ impl fmt::Debug for Database {
     }
 }
 
+impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
+    fn drop(&mut self) {
+        let Some(key) = self.registry_key.get() else {
+            return;
+        };
+        let mut registry = DATABASE_MANAGER.lock();
+        // Another open of the same file may have replaced the entry already.
+        if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
+        {
+            registry.remove(key);
+        }
+    }
+}
+
 impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
@@ -825,11 +853,10 @@ impl Database {
             allocators,
             path,
             wal_path,
-            schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
-                s.generated_columns_enabled = opts.enable_generated_columns;
-                s
-            }))),
+            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
+                enable_custom_types,
+                dialect.as_ref(),
+            )?))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -856,6 +883,7 @@ impl Database {
             },
 
             pager_state: Arc::new(SharedPagerState::new(init_page_1)),
+            registry_key: OnceLock::new(),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -895,6 +923,7 @@ impl Database {
             let registry = DATABASE_MANAGER.lock();
             if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
                 if let Some(db) = weak.upgrade() {
+                    drop(registry);
                     Self::check_registry_dialect(&db, dialect.as_ref())?;
                     return Ok(db);
                 }
@@ -907,10 +936,14 @@ impl Database {
         let mut registry = DATABASE_MANAGER.lock();
         if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
             if let Some(existing) = weak.upgrade() {
+                drop(registry);
                 Self::check_registry_dialect(&existing, dialect.as_ref())?;
                 return Ok(existing);
             }
         }
+        db.registry_key
+            .set(key.clone())
+            .expect("database is registered once");
         registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
         Ok(db)
     }
@@ -1114,6 +1147,7 @@ impl Database {
             },
             _ => return Ok(None),
         };
+        drop(registry);
 
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
@@ -1347,6 +1381,7 @@ impl Database {
                 match registry.get(&key) {
                     Some(RegistryEntry::Ready(weak)) => {
                         if let Some(db) = weak.upgrade() {
+                            drop(registry);
                             tracing::debug!("took database {path:?} from the registry");
 
                             let db_is_encrypted =
@@ -1404,6 +1439,9 @@ impl Database {
             Ok(IOResult::Done(db)) => {
                 // Register the opened database and remove the Opening sentinel.
                 if let Some(registry_key) = state.registry_key.take() {
+                    db.registry_key
+                        .set(registry_key.clone())
+                        .expect("database is registered once");
                     let mut registry = DATABASE_MANAGER.lock();
                     registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
                 }
@@ -1623,7 +1661,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
-                        None,
+                        ConnectionContext::default(),
                         StatsRefresh::Blocking,
                     )?;
 
@@ -1691,6 +1729,7 @@ impl Database {
                         pager,
                         &syms,
                         dialect.as_ref(),
+                        conn.experimental_custom_types_enabled(),
                     );
 
                     match result {
@@ -1700,30 +1739,6 @@ impl Database {
                             state.schema_guard = None;
                         }
                         Err(e) => return Err(e),
-                    }
-
-                    // Load custom types from __turso_internal_types if the table
-                    // exists and custom types are enabled. The schema loaded by
-                    // make_from_btree includes the table definition but not its
-                    // contents. We need to read the stored type definitions so
-                    // that DECODE/ENCODE and affinity metadata are available to
-                    // all subsequent connections.
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    if conn.experimental_custom_types_enabled() {
-                        // Sync the connection's schema from the database so it
-                        // can query __turso_internal_types.
-                        conn.maybe_update_schema();
-                        let type_sqls = conn.query_stored_type_definitions()?;
-                        if !type_sqls.is_empty() {
-                            let db = state
-                                .db
-                                .as_ref()
-                                .expect("db must be initialized in Init phase");
-                            db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
-                        }
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
@@ -1773,7 +1788,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
-                                None,
+                                ConnectionContext::default(),
                                 StatsRefresh::Blocking,
                             )?);
                         }
@@ -1783,6 +1798,60 @@ impl Database {
                         );
                         // Done — drop the bootstrap connection.
                         state.mvcc_bootstrap_conn = None;
+                    }
+
+                    // Load the names of the namespaces, which the schema rows
+                    // of their objects do not carry. This comes after the MVCC
+                    // bootstrap, whose recovery rebuilds the schema from the
+                    // schema rows and may replay rows of the namespaces table.
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    conn.maybe_update_schema();
+                    if !conn
+                        .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
+                    {
+                        let namespace_rows = conn.query_stored_namespaces()?;
+                        db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
+                    }
+
+                    state.phase = OpenDbAsyncPhase::LoadingRoles;
+                }
+
+                OpenDbAsyncPhase::LoadingRoles => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.roles_stmt.is_none() {
+                        let schema = db.schema.lock().clone();
+                        let has_roles_table = db.dialect().supports_roles()
+                            && schema
+                                .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+                                .is_some();
+                        *conn.schema.write() = schema;
+                        if has_roles_table {
+                            state.roles_stmt = Some(Box::new(conn.prepare_roles_read()?));
+                        }
+                    }
+                    if let Some(stmt) = state.roles_stmt.as_mut() {
+                        let rows = &mut state.role_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(row.get_values().cloned().collect());
+                            Ok(())
+                        }));
+                        state.roles_stmt = None;
+                        let roles =
+                            Arc::new(crate::security::roles::RoleCatalog::new(&state.role_rows)?);
+                        db.with_schema_mut(|schema| {
+                            schema.roles = roles;
+                            Ok(())
+                        })?;
                     }
 
                     state.phase = OpenDbAsyncPhase::Done;
@@ -1904,22 +1973,22 @@ impl Database {
                                         let decoded_page_size = header.page_size.get() as usize;
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                                "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                            )));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
                                         if header.reserved_space != required_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                     }
                                 }
@@ -2437,8 +2506,14 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
+            let mvcc_bootstrap_conn = self._connect(
+                true,
+                None,
+                None,
+                None,
+                ConnectionContext::default(),
+                StatsRefresh::Blocking,
+            )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2455,27 +2530,54 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        self.connect_with(opts, ConnectionContext::default())
+    }
+
+    /// Connects with `opts`, and with `context` as the value that
+    /// [`Connection::context`] returns for the connection.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_context<C: Any + Send + Sync>(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        context: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self.connect_with(
+            opts,
+            ConnectionContext {
+                value: Some(context),
+                hooks: None,
+            },
+        )
+    }
+
+    /// Connects with `opts`, and with `hooks` as the hooks that the
+    /// connection calls, which are also the value that
+    /// [`Connection::context`] returns for it.
+    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        hooks: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self.connect_with(
+            opts,
+            ConnectionContext {
+                value: Some(hooks.clone()),
+                hooks: Some(hooks),
+            },
+        )
+    }
+
+    fn connect_with(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        context: ConnectionContext,
+    ) -> Result<Arc<Connection>> {
         self._connect(
             false,
             None,
             opts.encryption_key,
             opts.page_codec,
-            None,
-            StatsRefresh::Blocking,
-        )
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn connect_with_context<C: Any + Send + Sync>(
-        self: &Arc<Database>,
-        context: Arc<C>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            None,
-            Some(context),
+            context,
             StatsRefresh::Blocking,
         )
     }
@@ -2515,7 +2617,7 @@ impl Database {
                     None,
                     opts.encryption_key,
                     opts.page_codec,
-                    None,
+                    ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
                 state.conn = Some(conn.clone());
@@ -2540,7 +2642,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        context: Option<Arc<dyn Any + Send + Sync>>,
+        context: ConnectionContext,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2597,7 +2699,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
-            None,
+            ConnectionContext::default(),
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2611,12 +2713,13 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
-        context: Option<Arc<dyn Any + Send + Sync>>,
+        context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
-            context,
+            context: context.value,
+            hooks: context.hooks,
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),
@@ -2629,6 +2732,7 @@ impl Database {
             syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
+            next_page_size: AtomicU32::new(0),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
             wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
@@ -2640,16 +2744,19 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: crate::Namespaces::default(),
+            qualifiers: crate::Qualifiers::default(),
             search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
+            tx_read_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
             dqs_dml: AtomicBool::new(true),
             sequence_inner_retries: AtomicU64::new(0),
+            #[cfg(feature = "test_helper")]
+            test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
@@ -2684,6 +2791,8 @@ impl Database {
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
+            triggers_enabled: AtomicBool::new(true),
+            writes_stored_values: AtomicBool::new(false),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
@@ -2697,6 +2806,8 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            session_role: crate::security::roles::RoleId::SUPERUSER,
+            current_role: RwLock::new(crate::security::roles::RoleId::SUPERUSER),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections
@@ -3446,7 +3557,7 @@ impl Database {
 
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
         let name = table.name.clone();
-        self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
+        self.with_schema_mut(|schema| schema.add_virtual_table(NamespaceId::ROOT, table))?;
         Ok(name)
     }
 
@@ -3509,10 +3620,6 @@ impl Database {
         self.opts.enable_attach
     }
 
-    pub fn experimental_generated_columns_enabled(&self) -> bool {
-        self.opts.enable_generated_columns
-    }
-
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.opts.enable_multiprocess_wal
     }
@@ -3544,7 +3651,7 @@ pub(crate) struct AttachedDatabase {
 }
 
 /// The databases of a connection other than main and temp, by database id.
-/// Their names are in the connection's [`crate::Namespaces`].
+/// Their names are in the connection's [`crate::Qualifiers`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     allocated: Vec<u64>,
@@ -3635,7 +3742,7 @@ mod database_tests {
         Arc,
     };
 
-    use super::{is_memory_like, Database, InitState};
+    use super::{is_memory_like, Database, DatabaseKey, InitState, DATABASE_MANAGER};
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{
         PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation,
@@ -3643,8 +3750,8 @@ mod database_tests {
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
         storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
-        DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, SqliteDialect, IO,
+        DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
+        OpenFlags, OpenOptions, PlatformIO, IO,
     };
 
     #[test]
@@ -4263,7 +4370,7 @@ mod database_tests {
         let file = io.open_file(path, OpenFlags::Create, true).unwrap();
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(EngineDialect))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(opts)
@@ -4344,6 +4451,31 @@ mod database_tests {
 
     #[cfg(feature = "fs")]
     #[test]
+    fn registry_entry_is_removed_when_last_database_reference_drops() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("registry-drop.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+        let file_key = DatabaseKey::File(crate::io::get_file_id(path).unwrap());
+        let reopened = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        assert!(Arc::ptr_eq(&db, &reopened));
+        drop(reopened);
+        assert!(DATABASE_MANAGER.lock().contains_key(&file_key));
+        drop(db);
+        assert!(!DATABASE_MANAGER.lock().contains_key(&file_key));
+
+        let name = "registry-entry-is-removed-when-last-database-reference-drops";
+        let memory_key = DatabaseKey::SharedMemory(name.to_string());
+        let db = Database::open_shared_memory(name, Arc::new(EngineDialect)).unwrap();
+        assert!(DATABASE_MANAGER.lock().contains_key(&memory_key));
+        drop(db);
+        assert!(!DATABASE_MANAGER.lock().contains_key(&memory_key));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
     fn page_codec_identity_must_match_cached_database() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-identity.db");
@@ -4387,7 +4519,7 @@ mod database_tests {
         let err = Database::open(
             io,
             path,
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .flags(OpenFlags::Create)
                 .encryption(EncryptionOpts {
                     cipher: "aes256gcm".to_string(),
@@ -4412,7 +4544,7 @@ mod database_tests {
         let err = Database::open(
             io,
             path_str,
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .flags(OpenFlags::Create)
                 .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
                 .page_codec(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>),
@@ -4439,7 +4571,7 @@ mod database_tests {
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
 
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(EngineDialect))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
@@ -4484,7 +4616,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(SqliteDialect),
+                Arc::new(EngineDialect),
             )
             .is_err(),
             "opening without the codec must not reuse a codec-required database"
@@ -4960,7 +5092,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
 
@@ -5442,7 +5574,7 @@ mod database_tests {
         let db = Database::open(
             io,
             path_str,
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .flags(OpenFlags::ReadOnly)
                 .page_codec(codec.clone()),
         )
@@ -5471,7 +5603,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(SqliteDialect),
+                Arc::new(EngineDialect),
             )
             .unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -5499,7 +5631,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new()).unwrap();

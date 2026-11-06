@@ -903,3 +903,45 @@ func TestSyncPullBytesThreshold(t *testing.T) {
 	require.Greater(t, withThreshold, withoutThreshold)
 	require.Greater(t, withThreshold, int64(1))
 }
+
+// TestSyncPullAfterCanceledPull verifies that a Pull aborted by its context
+// does not leave the sync engine locked: once the remote answers again, the
+// next Pull must reach it instead of blocking forever.
+func TestSyncPullAfterCanceledPull(t *testing.T) {
+	var hang atomic.Bool
+	hang.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hang.Load() {
+			<-r.Context().Done()
+			return
+		}
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	bootstrapIfEmpty := false
+	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+		Path:             ":memory:",
+		RemoteUrl:        server.URL,
+		BootstrapIfEmpty: &bootstrapIfEmpty,
+	})
+	require.Nil(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = db.Pull(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	hang.Store(false)
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.Pull(context.Background())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorContains(t, err, "status=503")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pull blocked after a previous Pull was canceled")
+	}
+}

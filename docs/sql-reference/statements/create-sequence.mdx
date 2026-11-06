@@ -294,6 +294,14 @@ The "current value" reachable from a fresh connection depends on mode:
 | `START value (x) cannot be less than MINVALUE (y)` | For ascending sequences, `START` is below `MINVALUE`. |
 | `START value (x) cannot be greater than MAXVALUE (y)` | For descending sequences, `START` is above `MAXVALUE`. |
 
+## PostgreSQL catalog access
+
+Through the PostgreSQL frontend, `pg_catalog.pg_sequence` exposes parameters for
+public-schema sequences. Join `seqrelid` to `pg_catalog.pg_class.oid` to retrieve
+the sequence name. The catalog reports the stored start, increment, bounds, and
+cycle setting. It reports the engine's `bigint` representation and cache size 1;
+the declared PostgreSQL sequence type and cache size are not retained.
+
 ## See Also
 
 - [DROP SEQUENCE](/docs/sql-reference/statements/drop-sequence) for removing sequences

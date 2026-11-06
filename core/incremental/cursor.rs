@@ -257,11 +257,12 @@ fn read_only_error() -> Box<LimboError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::{ConnectOpts, Connection, Database, OpenFlags};
-    use crate::{Result, SqliteDialect};
+    use crate::{EngineDialect, Result};
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -280,7 +281,6 @@ mod tests {
                 enable_autovacuum: false,
                 enable_vacuum: false,
                 enable_attach: false,
-                enable_generated_columns: false,
                 enable_multiprocess_wal: false,
                 enable_without_rowid: false,
                 enable_mvcc: false,
@@ -288,7 +288,7 @@ mod tests {
                 unsafe_testing: false,
             },
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
 
@@ -325,7 +325,7 @@ mod tests {
         let view_mutex = conn
             .schema
             .read()
-            .get_materialized_view(view_name)
+            .get_materialized_view(NamespaceId::ROOT, view_name)
             .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page

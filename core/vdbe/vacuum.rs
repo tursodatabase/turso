@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
@@ -114,6 +115,14 @@ impl SchemaEntry {
     }
 }
 
+/// Whether replaying the object called `name` on the target needs the
+/// reserved-name check bypassed: the engine's own tables, and the objects of
+/// namespaces, which are copied under mangled names that no user
+/// statement may create.
+fn replay_bypasses_reserved_names(name: &str) -> bool {
+    crate::schema::is_system_table(name) || crate::namespace::is_reserved_object_name(true, name)
+}
+
 /// Split rowid-ordered schema entries into the replay phases used by VACUUM.
 /// Returns indices into `entries` for `(tables_to_create, tables_to_copy,
 /// indexes_to_create, post_data_entries)`.
@@ -208,7 +217,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_encryption(source_db.experimental_encryption_enabled())
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
-        .with_generated_columns(source_db.experimental_generated_columns_enabled())
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
@@ -367,14 +375,19 @@ fn finalize_vacuum_target_header(
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
         mv_store.with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())?;
-        set_mvcc_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
-        return Ok(crate::IOResult::Done(()));
+    } else {
+        let pager = target_conn.pager.load();
+        if let crate::IOResult::IO(io) =
+            pager.with_header_mut(|header| header_meta.apply_to(header))?
+        {
+            return Ok(crate::IOResult::IO(io));
+        }
     }
-    let pager = target_conn.pager.load();
-    pager.with_header_mut(|header| header_meta.apply_to(header))
+    set_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
+    Ok(crate::IOResult::Done(()))
 }
 
-fn set_mvcc_schema_version_from_header_cookie(
+fn set_schema_version_from_header_cookie(
     target_conn: &Arc<Connection>,
     schema_cookie: u32,
 ) -> Result<()> {
@@ -622,6 +635,10 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.set_foreign_keys_enabled(false);
                 state.target_conn.set_check_constraints_ignored(true);
                 state.target_conn.wal_auto_actions_disable();
+                // The source rows are read as stored values (the SELECT is an
+                // internal helper statement), so they are written without
+                // ENCODE. SQLite's VACUUM copies the records unchanged too.
+                state.target_conn.set_writes_stored_values(true);
 
                 // Wrap all operations in a single write transaction so helper
                 // statements share one durable target build and cleanup can
@@ -685,7 +702,11 @@ pub(crate) fn vacuum_target_build_step(
                                     .source_conn
                                     .with_schema(config.source_db_id, |schema| {
                                         schema
-                                            .get_index(&entry.tbl_name, &entry.name)
+                                            .get_index(
+                                                NamespaceId::ROOT,
+                                                &entry.tbl_name,
+                                                &entry.name,
+                                            )
                                             .is_some_and(|idx| idx.is_backing_btree_index())
                                     })
                             })
@@ -715,6 +736,27 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateTable { idx } => {
                 let entries_len = state.tables_to_create.len();
                 if idx >= entries_len {
+                    // The rows of the namespaces table are copied with the
+                    // data, but the tables of a namespace are copied by the
+                    // namespace's name, so the target needs the names first.
+                    // Naming them any earlier would not last: switching the
+                    // target to MVCC reloads its schema.
+                    let namespaces: Vec<(NamespaceId, String)> =
+                        config
+                            .source_conn
+                            .with_schema(config.source_db_id, |schema| {
+                                schema
+                                    .namespaces()
+                                    .map(|(id, name)| (id, name.to_string()))
+                                    .collect()
+                            });
+                    if !namespaces.is_empty() {
+                        state.target_conn.with_schema_mut(|target_schema| {
+                            for (id, name) in &namespaces {
+                                target_schema.name_namespace(*id, name);
+                            }
+                        })?;
+                    }
                     // Done creating tables, start copying data
                     state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
@@ -724,21 +766,16 @@ pub(crate) fn vacuum_target_build_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
-                // System tables (sqlite_stat1, __turso_internal_types, etc.) have
-                // reserved name prefixes that translate_create_table rejects for
-                // user SQL. Temporarily mark the target connection as nested during
-                // prepare() so the reserved-name check is bypassed at compile
-                // time. The guard is only for prepare: keeping it during step()
+                // Temporarily mark the target connection as nested during prepare()
+                // so that checks for new user SQL do not reject a table the database
+                // already has: the reserved names of system tables (sqlite_stat1,
+                // __turso_internal_types, etc.) and a COLLATE on a type with its own
+                // order. The guard is only for prepare: keeping it during step()
                 // would make this CREATE TABLE look nested, so its Transaction
                 // opcode would skip write setup.
-                let is_system = crate::schema::is_system_table(&entry.name);
-                if is_system {
-                    state.target_conn.start_nested();
-                }
+                state.target_conn.start_nested();
                 let target_stmt = state.target_conn.prepare(&sql);
-                if is_system {
-                    state.target_conn.end_nested();
-                }
+                state.target_conn.end_nested();
                 let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateTable {
                     target_schema_stmt: Box::new(target_stmt),
@@ -800,7 +837,10 @@ pub(crate) fn vacuum_target_build_step(
                         .target_conn
                         .schema
                         .read()
-                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .get_btree_table(
+                            NamespaceId::ROOT,
+                            crate::schema::SQLITE_SEQUENCE_TABLE_NAME,
+                        )
                         .is_some();
                     if !target_has_sequence {
                         state.phase = VacuumTargetBuildPhase::StartCopyTable {
@@ -861,19 +901,45 @@ pub(crate) fn vacuum_target_build_step(
                 let entry_ordinal = state.tables_to_copy[table_idx];
                 let entry = &state.schema_entries[entry_ordinal];
                 let table_name = &entry.name;
-                let escaped_table_name = table_name.replace('"', "\"\"");
+                // A table of a namespace is copied by the name that
+                // names it in SQL: its namespace and its bare name, which
+                // the target knows too, since its namespaces were named above.
                 // Derive copy-column list from BTreeTable.columns in schema,
                 // filtering out virtual generated columns so the SELECT and
                 // INSERT arities stay aligned.
-                let source_btree_table = config
-                    .source_conn
-                    .with_schema(config.source_db_id, |schema| {
-                        schema.get_btree_table(table_name)
-                    });
+                let (namespace, bare_name, source_btree_table) =
+                    config
+                        .source_conn
+                        .with_schema(config.source_db_id, |schema| {
+                            let (namespace, bare_name) = schema.demangle_name(table_name);
+                            (
+                                namespace,
+                                bare_name.to_string(),
+                                schema.get_btree_table(namespace, bare_name),
+                            )
+                        });
+                let escaped_schema_name = if namespace.is_root() {
+                    config.escaped_schema_name.clone()
+                } else {
+                    config
+                        .source_conn
+                        .with_schema(config.source_db_id, |schema| {
+                            schema
+                                .namespace_name(namespace)
+                                .map(|name| name.replace('"', "\"\""))
+                        })
+                        .ok_or_else(|| {
+                            LimboError::Corrupt(format!(
+                                "table \"{table_name}\" is stored under a namespace without a name"
+                            ))
+                        })?
+                };
+                let escaped_table_name = bare_name.replace('"', "\"\"");
 
                 let (select_sql, insert_sql) = build_copy_sql(
-                    &config.escaped_schema_name,
+                    &escaped_schema_name,
                     &escaped_table_name,
+                    (!namespace.is_root()).then_some(escaped_schema_name.as_str()),
                     source_btree_table.as_deref(),
                 )?;
 
@@ -989,8 +1055,16 @@ pub(crate) fn vacuum_target_build_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
-                // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                // INDEX statements are user-visible; those of a stored
+                // namespace carry a mangled name. They are prepared as nested
+                // so that checks for new user SQL, such as the reserved-name
+                // check and the one rejecting qualified columns, do not reject
+                // an index the database already has. As for system tables, the
+                // guard is only for prepare.
+                state.target_conn.start_nested();
+                let target_stmt = state.target_conn.prepare(&entry.sql);
+                state.target_conn.end_nested();
+                let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1036,7 +1110,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &entry.sql)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1088,6 +1162,7 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
+                state.target_conn.publish_schema_if_newer();
                 return Ok(crate::IOResult::Done(()));
             }
         }
@@ -1105,7 +1180,7 @@ fn prepare_on_target(
     table_name: &str,
     sql: &str,
 ) -> Result<crate::Statement> {
-    let is_system = crate::schema::is_system_table(table_name);
+    let is_system = replay_bypasses_reserved_names(table_name);
     if is_system {
         target_conn.start_nested();
     }
@@ -1138,9 +1213,13 @@ fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Resu
 //   Output:
 //   - select_sql: SELECT rowid, "name", "salary" FROM "main"."employees"
 //   - insert_sql: INSERT INTO "main"."employees" (rowid, "name", "salary") VALUES (?, ?, ?)
+/// `target_schema_name` qualifies the table in the INSERT, for a table of a
+/// namespace, which the target names by the namespace's name; a
+/// table of the root is inserted into unqualified, into the target's main.
 pub(crate) fn build_copy_sql(
     escaped_schema_name: &str,
     escaped_table_name: &str,
+    target_schema_name: Option<&str>,
     source_btree_table: Option<&BTreeTable>,
 ) -> Result<(String, String)> {
     let Some(btree) = source_btree_table else {
@@ -1255,7 +1334,14 @@ pub(crate) fn build_copy_sql(
     let select_sql =
         format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
     let insert_sql =
-        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+        match target_schema_name {
+            Some(schema) => format!(
+                "INSERT INTO \"{schema}\".\"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})"
+            ),
+            None => format!(
+                "INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})"
+            ),
+        };
 
     Ok((select_sql, insert_sql))
 }
@@ -1760,7 +1846,11 @@ fn reload_physical_schema_for_mvcc_vacuum(
     // blocking `Schema::populate_sequences` and `populate_sequences_via_sql`
     // helpers, which violate the vdbe async contract from inside the
     // VACUUM state machine.
-    let preserved_sequences = connection.schema.read().sequences.clone();
+    let preserved_sequences = connection
+        .schema
+        .read()
+        .sequences_by_name(NamespaceId::ROOT)
+        .clone();
     let reparse_result = connection.read_current_schema_cookie().and_then(|cookie| {
         connection.reparse_schema_with_cookie_keeping_sequences(cookie, preserved_sequences)
     });
@@ -1834,7 +1924,7 @@ fn vacuum_in_place_step(
                     })?;
                     // acquire the exclusive lock on the mvcc
                     let mut guard = MvccVacuumGuard::acquire(connection.clone(), mv_store.clone())?;
-                    if mv_store.has_uncheckpointed_log()? {
+                    if mv_store.has_uncheckpointed_log() {
                         return Err(LimboError::TxError(
                             "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
                         ).into());
@@ -1887,6 +1977,9 @@ fn vacuum_in_place_step(
                         });
                         cleanup_state.source_tx_open = true;
                         cleanup_state.vacuum_lock_held = true;
+                        // SQLite drops the pending PRAGMA page_size when it vacuums a WAL
+                        // database in place, so a later VACUUM INTO does not use it.
+                        connection.next_page_size.store(0, Ordering::SeqCst);
                         *phase = VacuumInPlacePhase::ReadSourceMetadata;
                         continue;
                     }
@@ -1972,7 +2065,11 @@ fn vacuum_in_place_step(
                 let temp_db_ref = temp_db
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
-                let source_sequences = connection.schema.read().sequences.clone();
+                let source_sequences = connection
+                    .schema
+                    .read()
+                    .sequences_by_name(NamespaceId::ROOT)
+                    .clone();
                 *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
@@ -2496,7 +2593,7 @@ mod tests {
     use crate::storage::pager::Page;
     use crate::util::IOExt;
     use crate::vdbe::execute::TransactionYieldPoint;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{
         Buffer, Clock, Completion, ConnectOpts, DatabaseOpts, File, MemoryIO, MonotonicInstant,
         OpenFlags, WallClockInstant, IO,
@@ -2813,23 +2910,21 @@ mod tests {
     #[test]
     fn replace_shared_schema_after_vacuum_replaces_wrapped_schema_cookie() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
 
         db.with_schema_mut(|schema| {
             schema.schema_version = u32::MAX;
             Ok(())
         })?;
 
-        let replacement = Schema {
-            generated_columns_enabled: true,
-            schema_version: 0,
-            ..Default::default()
-        };
-        replace_shared_schema_after_vacuum(db.as_ref(), Arc::new(replacement));
+        let mut replacement = Schema::new();
+        replacement.schema_version = 0;
+        let replacement = Arc::new(replacement);
+        replace_shared_schema_after_vacuum(db.as_ref(), replacement.clone());
 
         let schema = db.clone_schema();
         assert_eq!(schema.schema_version, 0);
-        assert!(schema.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&schema, &replacement));
 
         Ok(())
     }
@@ -2837,7 +2932,7 @@ mod tests {
     #[test]
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
         let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
@@ -2850,22 +2945,21 @@ mod tests {
 
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 42.into();
+        let mut schema = Schema::new();
+        schema.schema_version = 42;
+        let schema = Arc::new(schema);
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(Schema {
-                generated_columns_enabled: true,
-                schema_version: 42,
-                ..Default::default()
-            }),
+            schema: schema.clone(),
         };
 
         install_committed_vacuum_image(&conn, crate::MAIN_DB_ID, &committed);
 
         assert_eq!(conn.schema.read().schema_version, 42);
-        assert!(conn.schema.read().generated_columns_enabled);
+        assert!(Arc::ptr_eq(&*conn.schema.read(), &schema));
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 42);
-        assert!(shared.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&shared, &schema));
 
         Ok(())
     }
@@ -2873,7 +2967,7 @@ mod tests {
     #[test]
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
         let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
@@ -2886,13 +2980,12 @@ mod tests {
 
         let mut header = DatabaseHeader::default();
         header.schema_cookie = 43.into();
+        let mut schema = Schema::new();
+        schema.schema_version = 43;
+        let schema = Arc::new(schema);
         let committed = VacuumCommittedImageMeta {
             header,
-            schema: Arc::new(Schema {
-                generated_columns_enabled: true,
-                schema_version: 43,
-                ..Default::default()
-            }),
+            schema: schema.clone(),
         };
 
         vacuum_in_place_cleanup(
@@ -2905,10 +2998,10 @@ mod tests {
         )?;
 
         assert_eq!(conn.schema.read().schema_version, 43);
-        assert!(conn.schema.read().generated_columns_enabled);
+        assert!(Arc::ptr_eq(&*conn.schema.read(), &schema));
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 43);
-        assert!(shared.generated_columns_enabled);
+        assert!(Arc::ptr_eq(&shared, &schema));
 
         Ok(())
     }
@@ -2926,7 +3019,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
         // Source is uninitialized so its header reserved_space isn't usable.
@@ -2967,19 +3060,25 @@ mod tests {
         assert_eq!(committed.header.write_version, mvcc_version);
         assert_eq!(committed.schema.schema_version, 42);
         assert!(
-            committed.schema.tables.contains_key("generate_series"),
+            committed
+                .schema
+                .has_table(NamespaceId::ROOT, "generate_series"),
             "captured schema must retain built-in table-valued functions"
         );
-        let table_root = match committed.schema.tables.get("t").expect("table t").as_ref() {
+        let table_root = match committed
+            .schema
+            .get_table(NamespaceId::ROOT, "t")
+            .expect("table t")
+            .as_ref()
+        {
             crate::schema::Table::BTree(btree) => btree.root_page,
             _ => panic!("expected btree table"),
         };
         assert!(table_root > 0);
         let index_root = committed
             .schema
-            .indexes
-            .get("t")
-            .and_then(|indexes| indexes.front())
+            .indices_including_backing(NamespaceId::ROOT, "t")
+            .next()
             .map(|index| index.root_page)
             .expect("index idx_t_v");
         assert!(index_root > 0);
@@ -2997,7 +3096,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3045,7 +3144,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
         source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
@@ -3067,7 +3166,7 @@ mod tests {
             OpenFlags::Create,
             vacuum_target_opts_from_source(&source_db),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new())?;
         mirror_symbols(&source_conn, &target_conn);
@@ -3130,7 +3229,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3176,7 +3275,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3219,7 +3318,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
@@ -3273,7 +3372,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new())?;
         target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
@@ -3329,7 +3428,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new())?;
 
@@ -3365,7 +3464,7 @@ mod tests {
                 cipher: CipherMode::Aes256Gcm.to_string(),
                 hexkey: key_hex.to_string(),
             }),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         let reserved_space = source_conn
@@ -3398,7 +3497,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new())?;
         target_conn.execute("CREATE TABLE seed(x)")?;

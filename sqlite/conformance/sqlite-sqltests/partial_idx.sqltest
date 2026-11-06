@@ -1853,3 +1853,24 @@ expect {
     1|2|9
     2|1|9
 }
+
+test partial-index-where-current-timestamp-rejected {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a) WHERE CURRENT_TIMESTAMP IS NOT NULL;
+}
+expect error {
+}
+
+test partial-index-where-current-date-rejected {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a) WHERE CURRENT_DATE IS NOT NULL;
+}
+expect error {
+}
+
+test partial-index-where-current-time-rejected {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a) WHERE a > 0 AND CURRENT_TIME IS NOT NULL;
+}
+expect error {
+}

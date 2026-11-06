@@ -1,23 +1,33 @@
-# Error reporting through the PostgreSQL frontend. Expectations deliberately
-# avoid matching exact message text: turso-pg and real PostgreSQL word their
-# errors differently, and this corpus should stay valid for differential runs.
+# Error reporting through the PostgreSQL frontend. Expectations compare the
+# SQLSTATE and not the message text: turso-pg and real PostgreSQL word their
+# errors differently, and this corpus must stay valid for differential runs.
 
 @database :memory:
 
 test error-missing-table {
     SELECT * FROM missing;
 }
+@sqlstate 42P01
 expect error {}
 
 test error-missing-column {
     CREATE TABLE t (a int);
     SELECT nonexistent FROM t;
 }
+@sqlstate 42703
+expect error {}
+
+test error-missing-column-named-like-an-error-message {
+    CREATE TABLE t (a int);
+    SELECT "no such object" FROM t;
+}
+@sqlstate 42703
 expect error {}
 
 test error-syntax {
     SELEC 1;
 }
+@sqlstate 42601
 expect error {}
 
 test error-aborts-rest-of-batch {
@@ -26,6 +36,7 @@ test error-aborts-rest-of-batch {
     SELECT * FROM missing;
     INSERT INTO t VALUES (2);
 }
+@sqlstate 42P01
 expect error {}
 
 # Schema databases are file-backed, so the schema table is dropped before each
@@ -37,6 +48,7 @@ test error-drop-type-used-by-table-in-other-schema {
     CREATE TABLE err_drop_type.t (m mood);
     DROP TYPE mood;
 }
+@sqlstate 2BP01
 expect error {}
 
 test error-drop-domain-used-by-table-in-other-schema {
@@ -46,4 +58,5 @@ test error-drop-domain-used-by-table-in-other-schema {
     CREATE TABLE err_drop_domain.t (v pos);
     DROP DOMAIN pos;
 }
+@sqlstate 2BP01
 expect error {}

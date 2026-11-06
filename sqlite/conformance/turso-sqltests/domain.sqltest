@@ -94,6 +94,27 @@ expect {
 
 
 @requires custom_types "uses CREATE DOMAIN"
+test domain-default-followed-by-not-null {
+    CREATE DOMAIN defnn AS integer DEFAULT 42 NOT NULL;
+    CREATE TABLE t1(a defnn) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    42
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-followed-by-not-null-rejects-null {
+    CREATE DOMAIN defnn AS integer DEFAULT 42 NOT NULL;
+    CREATE TABLE t1(a defnn) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
 test domain-default-column-override {
     CREATE DOMAIN defint2 AS integer DEFAULT 10;
     CREATE TABLE t1(a defint2 DEFAULT 99) STRICT;
@@ -961,7 +982,7 @@ test domain-over-custom-type-cast-pass {
     SELECT CAST(5 AS positive_cents);
 }
 expect {
-    500
+    5
 }
 
 @requires custom_types "uses CREATE DOMAIN"
@@ -1016,9 +1037,9 @@ test domain-over-custom-type-expression-index {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE DOMAIN pc AS cents;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
-    CREATE INDEX i ON t(x + 0);
+    CREATE INDEX i ON t(abs(x));
     INSERT INTO t VALUES (1, 5);
-    SELECT count(*) FROM t WHERE x + 0 = 5;
+    SELECT count(*) FROM t WHERE abs(x) = 5;
     PRAGMA integrity_check;
 }
 expect {
@@ -1028,19 +1049,19 @@ expect {
 
 @requires custom_types "uses CREATE DOMAIN"
 test domain-over-custom-type-index-lookup {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE cents BASE integer ENCODE value * 100;
     CREATE DOMAIN pc AS cents;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
     CREATE INDEX i ON t(x);
     INSERT INTO t VALUES (1, 5), (2, 6);
-    SELECT id FROM t WHERE x = 5;
-    UPDATE t SET x = 9 WHERE x = 6;
+    SELECT id FROM t WHERE x = 500;
+    UPDATE t SET x = 9 WHERE x = 600;
     SELECT id, x FROM t ORDER BY id;
 }
 expect {
     1
-    1|5
-    2|9
+    1|500
+    2|900
 }
 
 @requires custom_types "uses CREATE DOMAIN"

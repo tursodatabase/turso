@@ -1,4 +1,5 @@
 use super::stream::EphemeralDelta;
+use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
 use turso_parser::ast::{self, TableInternalId};
 
@@ -31,12 +32,13 @@ pub(super) fn make_joined_table(
         unmatched_right_rows_plan: None,
         table: crate::schema::Table::BTree(table.clone()),
         identifier: identifier.to_string(),
+        has_alias: false,
         internal_id: id,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id: 0,
+        namespace: NamespaceRef::root_of(crate::MAIN_DB_ID),
         indexed: None,
         plan_estimate: None,
     }
@@ -97,7 +99,6 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
     program: &mut ProgramBuilder,
     channel: &EphemeralDelta,
     remap: &BindingRemap,
-    table_references: &TableReferences,
     resolver: &mut Resolver<'a>,
 ) -> Result<()> {
     resolver.enable_expr_to_reg_cache();
@@ -113,7 +114,7 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
             default: None,
         });
         let bound = remap_bound_expr(expr, remap)?;
-        cache_stream_expr_reg(resolver, bound, value_reg, table_references)?;
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false);
     }
     turso_assert!(
         channel.binding_rowid_columns.len() == channel.schema.bindings.len(),
@@ -147,44 +148,7 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
             database: None,
             table: phase_id,
         };
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false);
     }
     Ok(())
-}
-
-/// Cache one materialized stream value with the collation context a regular
-/// column read would have produced.
-///
-/// Stateful operators publish synthetic expressions such as `SUM(x)`. Those
-/// results do not inherit the argument column's collation, so only SQL's
-/// column-like forms and an explicit `COLLATE` carry context across the
-/// physical stream boundary.
-pub(super) fn cache_stream_expr_reg<'a>(
-    resolver: &mut Resolver<'a>,
-    expr: ast::Expr,
-    value_reg: usize,
-    table_references: &TableReferences,
-) -> Result<()> {
-    fn carries_collation(expr: &ast::Expr) -> bool {
-        match expr {
-            ast::Expr::Column { .. } | ast::Expr::RowId { .. } | ast::Expr::Collate(_, _) => true,
-            ast::Expr::Cast { expr, .. } | ast::Expr::Unary(ast::UnaryOperator::Positive, expr) => {
-                carries_collation(expr)
-            }
-            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => carries_collation(&exprs[0]),
-            _ => false,
-        }
-    }
-
-    if carries_collation(&expr) {
-        resolver.cache_scalar_expr_reg(
-            std::borrow::Cow::Owned(expr),
-            value_reg,
-            false,
-            table_references,
-        )
-    } else {
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
-        Ok(())
-    }
 }

@@ -1027,3 +1027,41 @@ expect {
     11
     ok
 }
+
+# DO UPDATE is only compiled when some constraint check can jump to it. When
+# the INSERT cannot conflict, errors in the SET clause or in UPDATE triggers
+# must not fail the INSERT.
+@cross-check-integrity
+test upsert-do-update-not-compiled-when-insert-cannot-conflict {
+    CREATE TABLE t(a, b INTEGER PRIMARY KEY);
+    INSERT INTO t(a) VALUES (1) ON CONFLICT DO UPDATE SET nosuch = 1;
+    INSERT INTO t(a) VALUES (2) ON CONFLICT(b) DO UPDATE SET nosuch = 1;
+    INSERT INTO t(a) SELECT 3 ON CONFLICT DO UPDATE SET a = excluded.nosuch;
+    CREATE TABLE u(a);
+    CREATE TRIGGER w BEFORE UPDATE ON u BEGIN INSERT INTO gone VALUES (1); END;
+    INSERT INTO u VALUES (1) ON CONFLICT DO UPDATE SET a = 2;
+    SELECT * FROM t;
+    SELECT * FROM u;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    1
+}
+
+test upsert-do-update-compiled-when-insert-sets-rowid {
+    CREATE TABLE t(a, b INTEGER PRIMARY KEY);
+    INSERT INTO t(a, b) VALUES (1, 1) ON CONFLICT DO UPDATE SET nosuch = 1;
+}
+expect error {
+    no such column: nosuch
+}
+
+test upsert-do-update-compiled-when-table-has-unique-index {
+    CREATE TABLE t(a UNIQUE);
+    INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET nosuch = 1;
+}
+expect error {
+    no such column: nosuch
+}

@@ -21,8 +21,9 @@ use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
     DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
     OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
-    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
+    PageLocation, QueryMode, Statement, StepResult, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 use crate::{
     assert_send, assert_sync,
@@ -398,11 +399,10 @@ impl TursoDatabaseConfig {
                 "vacuum" => opts.with_vacuum(true),
                 "encryption" => opts.with_encryption(true),
                 "attach" => opts.with_attach(true),
-                "generated_columns" => opts.with_generated_columns(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
-                // "strict" is always enabled, kept for backwards compatibility
+                // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
                 _ => opts,
             };
         }
@@ -470,7 +470,7 @@ pub unsafe fn bytes_from_slice<'a>(
             "expected slice, got null pointer".to_string(),
         ));
     }
-    Ok(std::slice::from_raw_parts(ptr as *const u8, len))
+    Ok(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
 }
 
 /// SAFETY: slice must points to the valid memory
@@ -734,9 +734,13 @@ impl From<Box<LimboError>> for TursoError {
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
+            // A Raise is a constraint error that carries its own conflict
+            // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
             LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
                 TursoError::Constraint(e)
             }
+            LimboError::Raise(_, e) => TursoError::Constraint(e.to_string()),
+            LimboError::ConstraintViolation(violation) => TursoError::Constraint(violation.message),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             e @ (LimboError::DatabaseFull | LimboError::SequenceExhausted { .. }) => {
@@ -1726,6 +1730,14 @@ impl TursoStatement {
             .to_owned()
             .map_err(LimboError::from)?)
     }
+    /// returns true if the statement does not write to the database, like sqlite3_stmt_readonly
+    pub fn is_readonly(&self) -> bool {
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.get_program().is_readonly(),
+            None => true,
+        }
+    }
     /// returns column count
     pub fn column_count(&self) -> usize {
         let handle = self.handle.lock().unwrap();
@@ -1779,7 +1791,11 @@ impl TursoStatement {
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
         if let Some(stmt) = handle.as_mut() {
-            while stmt.execution_state().is_running() {
+            // Finish a statement only after it has returned a row, so that an
+            // `INSERT ... RETURNING` whose rows were not all read still commits. A statement
+            // that stopped earlier, for example on Busy, must not run further: dropping it
+            // below rolls it back, as `sqlite3_finalize` would.
+            while stmt.has_returned_row() && stmt.execution_state().is_running() {
                 let status = step_inner(stmt, self.async_io, waker)?;
                 if status == TursoStatusCode::Io {
                     return Ok(status);
@@ -1850,6 +1866,33 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn structured_constraint_errors_keep_sqlite_codes() {
+        for kind in [
+            turso_core::ConstraintKind::PrimaryKey,
+            turso_core::ConstraintKind::Unique,
+            turso_core::ConstraintKind::ForeignKey,
+            turso_core::ConstraintKind::NotNull,
+            turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Trigger,
+            turso_core::ConstraintKind::Datatype,
+            turso_core::ConstraintKind::Other,
+        ] {
+            let error = LimboError::ConstraintViolation(Box::new(
+                turso_core::ConstraintViolation::new(kind, "constraint message".to_string()),
+            ));
+            let error = TursoError::from(error);
+            assert!(
+                matches!(&error, TursoError::Constraint(message) if message == "constraint message"),
+                "{kind:?}: {error:?}"
+            );
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_CONSTRAINT
+            ));
+        }
+    }
 
     #[test]
     fn commit_dependency_abort_requires_transaction_retry() {
@@ -2063,7 +2106,7 @@ mod tests {
 
         // Each token toggles its corresponding flag.
         let opts = config_with_features(Some(
-            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,multiprocess_wal,without_rowid",
         ))
         .database_opts();
         assert!(opts.enable_views);
@@ -2073,15 +2116,14 @@ mod tests {
         assert!(opts.enable_vacuum);
         assert!(opts.enable_encryption);
         assert!(opts.enable_attach);
-        assert!(opts.enable_generated_columns);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
 
-        // Whitespace is trimmed; `strict` and unknown names are ignored.
+        // Whitespace is trimmed; `strict`, `generated_columns` and unknown names are ignored.
         let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
         assert!(opts.enable_views);
         assert_eq!(
-            config_with_features(Some("strict,unknown")).database_opts(),
+            config_with_features(Some("strict,generated_columns,unknown")).database_opts(),
             turso_core::DatabaseOpts::new()
         );
     }
@@ -2943,5 +2985,81 @@ mod tests {
         assert_eq!(stmt.n_change(), 0);
         assert_eq!(stmt.column_count(), 0);
         assert_eq!(stmt.parameters_count(), 0);
+    }
+
+    /// Opens a file database with two connections. The second one gives up on locks after 1ms.
+    fn open_holder_and_writer() -> (
+        tempfile::NamedTempFile,
+        Arc<super::TursoConnection>,
+        Arc<super::TursoConnection>,
+    ) {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = config_with_features(None);
+        config.path = temp_file.path().to_str().unwrap().to_string();
+        let db = TursoDatabase::new(config);
+        let _ = db.open().unwrap();
+        let holder = db.connect().unwrap();
+        let writer = db.connect().unwrap();
+        writer.set_busy_timeout(std::time::Duration::from_millis(1));
+        (temp_file, holder, writer)
+    }
+
+    fn execute_sql(conn: &Arc<super::TursoConnection>, sql: &str) {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    fn count_rows(conn: &Arc<super::TursoConnection>) -> Value {
+        let mut count = conn.prepare_single("SELECT count(*) FROM t").unwrap();
+        assert_eq!(count.step(None).unwrap(), TursoStatusCode::Row);
+        count.row_value(0).unwrap()
+    }
+
+    #[test]
+    fn finalize_does_not_resume_statements_that_failed_with_busy() {
+        let (_file, holder, writer) = open_holder_and_writer();
+        execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
+        execute_sql(&holder, "BEGIN IMMEDIATE");
+
+        let mut failed = Vec::new();
+        for sql in ["INSERT INTO t VALUES (1)", "BEGIN IMMEDIATE"] {
+            let mut stmt = writer.prepare_single(sql).unwrap();
+            let result = stmt.execute(None);
+            assert!(
+                matches!(result, Err(TursoError::Busy(_))),
+                "{sql}: {result:?}"
+            );
+            failed.push(stmt);
+        }
+
+        execute_sql(&holder, "ROLLBACK");
+        for mut stmt in failed {
+            assert_eq!(stmt.finalize(None).unwrap(), TursoStatusCode::Done);
+        }
+
+        assert!(
+            writer.get_auto_commit(),
+            "finalize opened the transaction of a BEGIN IMMEDIATE that returned Busy"
+        );
+        assert_eq!(
+            count_rows(&holder),
+            Value::from_i64(0),
+            "finalize committed an INSERT whose execute returned Busy"
+        );
+    }
+
+    #[test]
+    fn finalize_commits_insert_returning_after_a_partial_read() {
+        let (_file, holder, writer) = open_holder_and_writer();
+        execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
+
+        let mut insert = writer
+            .prepare_single("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
+            .unwrap();
+        assert_eq!(insert.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(insert.finalize(None).unwrap(), TursoStatusCode::Done);
+
+        assert_eq!(count_rows(&holder), Value::from_i64(3));
+        assert!(writer.get_auto_commit());
     }
 }

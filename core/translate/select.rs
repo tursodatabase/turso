@@ -1,4 +1,5 @@
 use super::emitter::{emit_program, TranslateCtx};
+use super::expr_context::ExprContext;
 use super::plan::{
     expand_star, expand_table_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound,
     NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
@@ -7,7 +8,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq};
+use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -23,7 +24,9 @@ use crate::translate::planner::{
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
+use crate::translate::subquery::{
+    plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -66,7 +69,7 @@ pub fn emit_select_plan(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {
@@ -258,7 +261,21 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
-    let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let (mut limit, mut offset) =
+        limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let mut cse_map = Vec::new();
+    let mut same_query_map = Vec::new();
+    plan_limit_offset_subqueries(
+        program,
+        &mut last.non_from_clause_subqueries,
+        &mut last.table_references,
+        resolver,
+        connection,
+        limit.as_deref_mut(),
+        offset.as_deref_mut(),
+        &mut cse_map,
+        &mut same_query_map,
+    )?;
 
     // ORDER BY names can come from any arm of a compound SELECT.
     let all_plans: Vec<&SelectPlan> = left
@@ -629,6 +646,7 @@ fn prepare_one_select_plan(
                             exprs,
                             sort_elided: false,
                             having,
+                            columns_read_by_group_subqueries: Vec::new(),
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
@@ -638,6 +656,7 @@ fn prepare_one_select_plan(
                             sort_elided: false,
                             exprs: vec![],
                             having: having_predicates,
+                            columns_read_by_group_subqueries: Vec::new(),
                         });
                     }
                 }
@@ -949,6 +968,7 @@ fn first_aggregate_without_over_clause<'a>(
         {
             Ok(Some(crate::function::Func::Agg(_))) => true,
             _ => resolver
+                .catalog
                 .symbol_table
                 .resolve_function(name.as_str(), args_count)
                 .is_some_and(|f| f.func.is_aggregate()),
@@ -1288,7 +1308,13 @@ fn resolve_compound_order_by_expr(
         ast::Expr::Collate(inner, collation_name) => {
             let (col_idx, _) =
                 resolve_compound_order_by_expr(inner, all_plans, resolver, term_number)?;
-            return Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)));
+            let collation = compound_order_by_collation(
+                all_plans,
+                col_idx,
+                TextCollation::new(collation_name.as_str())?,
+                resolver,
+            )?;
+            return Ok((col_idx, Some(collation)));
         }
         // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
         // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
@@ -1652,12 +1678,9 @@ pub fn emit_simple_count(
         .aggregates
         .first()
         .expect("simple count requires exactly one aggregate");
-    t_ctx.resolver.cache_expr_reg(
-        Cow::Owned(agg.original_expr.clone()),
-        target_reg,
-        false,
-        None,
-    );
+    t_ctx
+        .resolver
+        .cache_expr_reg(Cow::Owned(agg.original_expr.clone()), target_reg, false);
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     emit_select_result(
@@ -1862,12 +1885,9 @@ fn is_constant_or_group_by(
         }
         for group_by_expr in group_by_exprs {
             if exprs_are_equivalent(e, group_by_expr)
-                && resolve_comparison_collseq_with_symbols(
-                    group_by_expr,
-                    group_by_expr,
-                    table_references,
-                    Some(resolver.symbol_table),
-                )? == CollationSeq::Binary
+                && ExprContext::new(Some(table_references), resolver)
+                    .expr_collation(group_by_expr)?
+                    == CollationSeq::BINARY
             {
                 *e = Expr::Literal(ast::Literal::Null);
                 return Ok(WalkControl::SkipChildren);

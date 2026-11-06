@@ -527,3 +527,49 @@ expect {
     4|5|6||keep
     5|0|0|40|
 }
+
+# The first OR branch scans index i and leaves a DeferredSeek pending on t.
+# The second branch positions t itself, so every RowId there must read t's
+# own row instead of the rowid saved by that pending seek.
+setup multi_index_or_rowid_branch_schema {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    CREATE INDEX i ON t(b);
+    INSERT INTO t VALUES (3, NULL), (4, 0), (5, 1);
+}
+
+@setup multi_index_or_rowid_branch_schema
+test select-multi-index-or-rowid-branch-seek-ge {
+    SELECT a FROM t WHERE (b = 0 AND a IS NULL) OR a >= 0 ORDER BY a;
+}
+expect {
+    3
+    4
+    5
+}
+
+@setup multi_index_or_rowid_branch_schema
+test select-multi-index-or-rowid-branch-seek-gt {
+    SELECT a FROM t WHERE (b = 0 AND a IS NULL) OR a > 3 ORDER BY a;
+}
+expect {
+    4
+    5
+}
+
+@setup multi_index_or_rowid_branch_schema
+test select-multi-index-or-rowid-branch-rewind {
+    SELECT a FROM t WHERE (b = 0 AND a IS NULL) OR a < 5 ORDER BY a;
+}
+expect {
+    3
+    4
+}
+
+@setup multi_index_or_rowid_branch_schema
+test delete-multi-index-or-rowid-branch {
+    DELETE FROM t WHERE (b = 0 AND a < 0) OR a >= 0;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}

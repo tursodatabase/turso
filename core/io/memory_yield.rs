@@ -211,7 +211,7 @@ impl File for MemoryYieldFile {
 mod tests {
     use super::*;
     use crate::vdbe::StepResult;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, IOResult, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -357,7 +357,7 @@ mod tests {
     fn engine_yields_and_round_trips() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryYieldIO::new());
-        let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(SqliteDialect))
+        let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(EngineDialect))
             .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
@@ -408,7 +408,7 @@ mod tests {
         let db = Database::open_file(
             io.clone(),
             "journal_mode_mvcc_yield.db",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -453,7 +453,7 @@ mod tests {
             OpenFlags::Create,
             crate::DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -496,7 +496,7 @@ mod tests {
     fn pager_allocate_and_free_yield_for_header_reads_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(SqliteDialect))
+        let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(EngineDialect))
             .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
@@ -528,7 +528,7 @@ mod tests {
         let db = Database::open_file(
             io.clone(),
             "overflow_delete_yield.db",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -589,7 +589,7 @@ mod tests {
         let db = Database::open_file(
             io.clone(),
             "wasm_opfs_spill_hang.db",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

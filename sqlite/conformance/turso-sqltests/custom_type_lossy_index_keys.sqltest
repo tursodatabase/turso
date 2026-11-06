@@ -1,0 +1,200 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# A key (index, UNIQUE, PRIMARY KEY, FOREIGN KEY, automatic index) on a custom
+# type must not exist when the index order can differ from the order of the
+# decoded values.
+#
+# The index stores the stored form of a value, but queries compare the decoded
+# form. For a type that decodes with lower(), 'A' and 'a' are two index entries
+# but one value. An index lookup then finds one row where a scan finds two.
+#
+# Allowed: built-in types, types with no DECODE, types whose DECODE is exactly
+# `value`, and a domain follows its base type. An array is allowed exactly when
+# its element type is. Explicit conversions such as CAST(c AS lossy_ci) stay
+# allowed.
+# Refused: everything else, with an error that names the type and suggests
+# CAST(c AS <base>).
+#
+# These cases show one refusal for each way to declare a key. The generated
+# version (every type kind against every declaration form, ALTER COLUMN on
+# every key form, and a comparison of every query with the same query on a
+# table without keys) is tests/integration/lossy_index_keys.rs.
+#
+# lossy_ci is DECODE lower(value), which merges 'A' and 'a'.
+
+@requires strict "uses STRICT tables"
+test lossy-create-index {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c lossy_ci, k INTEGER) STRICT;
+    CREATE INDEX i ON t(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+@requires strict "uses STRICT tables"
+test lossy-unique-column {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c lossy_ci UNIQUE) STRICT;
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+@requires strict "uses STRICT tables"
+test lossy-primary-key {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER, c lossy_ci, PRIMARY KEY(c)) STRICT;
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+@requires strict "uses STRICT tables"
+test lossy-foreign-key-child-column {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE parent(c text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, c lossy_ci REFERENCES parent(c)) STRICT;
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+@requires strict "uses STRICT tables"
+test lossy-alter-add-column-references {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE parent(c text PRIMARY KEY) STRICT;
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t ADD COLUMN c lossy_ci REFERENCES parent(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+# ALTER COLUMN that gives a column with no key a REFERENCES.
+@requires strict "uses STRICT tables"
+test lossy-alter-column-adds-references {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE parent(c text PRIMARY KEY) STRICT;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text) STRICT;
+    ALTER TABLE t ALTER COLUMN x TO c lossy_ci REFERENCES parent(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+# An index on a generated column of a lossy type.
+@requires strict "uses STRICT tables"
+test lossy-generated-column-unique-index {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, w text, c lossy_ci AS (w)) STRICT;
+    CREATE UNIQUE INDEX ui ON t(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+# Changing the type of a column that is already a key must be refused too.
+@requires strict "uses STRICT tables"
+test lossy-alter-column-type-of-a-key {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c text, UNIQUE(c)) STRICT;
+    INSERT INTO t VALUES (1, 'A');
+    ALTER TABLE t ALTER COLUMN c TO d lossy_ci;
+}
+expect error {
+    of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\([cd] AS text\) instead
+}
+
+# A TEMP table finds its column types in the main database, like any other
+# table, so the same rule applies to it.
+@requires strict "uses STRICT tables"
+test lossy-create-index-on-temp-table {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, c lossy_ci) STRICT;
+    CREATE INDEX temp.i ON t(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
+@requires strict "uses STRICT tables"
+test lossy-alter-column-type-of-a-temp-table-key {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, c text, UNIQUE(c)) STRICT;
+    ALTER TABLE temp.t ALTER COLUMN c TO d lossy_ci;
+}
+expect error {
+    column 'd' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(d AS text\) instead
+}
+
+@requires strict "uses STRICT tables"
+test array-of-lossy-type-index {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c lossy_ci[]) STRICT;
+    CREATE INDEX i ON t(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci\[\]' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\[\]\) instead
+}
+
+# An index on an explicit conversion is allowed, and gives the same rows as a scan.
+@requires strict "uses STRICT tables"
+test lossy-index-on-cast-is-allowed {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c lossy_ci, k INTEGER) STRICT;
+    INSERT INTO t VALUES (1, 'A', 0), (2, 'a', 0), (3, 'b', 0);
+    CREATE INDEX i ON t(CAST(c AS lossy_ci));
+    SELECT id FROM t WHERE CAST(c AS lossy_ci) = 'a' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# A type whose DECODE is exactly `value` can be a key.
+@requires strict "uses STRICT tables"
+test unique-type-with-decode-value-is-allowed {
+    CREATE TYPE decode_value(value text) BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c decode_value UNIQUE) STRICT;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t VALUES (3, 'A');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# The planner builds an automatic index for this join on other types. The index
+# would hold the stored forms, so it must not be built: the answer must be the
+# same as a scan that compares decoded values ('A' equals 'a').
+@requires strict "uses STRICT tables"
+test lossy-join-does-not-use-an-automatic-index {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c lossy_ci) STRICT;
+    INSERT INTO t VALUES (1, 'A'), (2, 'a'), (3, 'b');
+    EXPLAIN QUERY PLAN SELECT a.id, b.id FROM t a JOIN t b ON a.c = b.c;
+    SELECT a.id, b.id FROM t a JOIN t b ON a.c = b.c ORDER BY a.id, b.id;
+}
+expect {
+    1|0|0|SCAN t AS a
+    2|0|0|SCAN t AS b
+    1|1
+    1|2
+    2|1
+    2|2
+    3|3
+}
+
+# The same join on a type whose DECODE is exactly `value` still gets the
+# automatic index.
+@requires strict "uses STRICT tables"
+test join-on-type-with-decode-value-uses-an-automatic-index {
+    CREATE TYPE decode_value(value text) BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c decode_value) STRICT;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a');
+    EXPLAIN QUERY PLAN SELECT a.id, b.id FROM t a JOIN t b ON a.c = b.c;
+}
+expect pattern {
+    1\|0\|0\|SCAN t AS a\n2\|0\|0\|SEARCH b USING COVERING INDEX ephemeral_\w+ \(c=\?\)
+}

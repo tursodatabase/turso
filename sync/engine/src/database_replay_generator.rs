@@ -1014,7 +1014,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     enum QueryKind {
         Delete { use_rowid: bool },

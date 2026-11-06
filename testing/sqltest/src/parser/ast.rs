@@ -70,6 +70,8 @@ pub enum Capability {
     MaterializedViews,
     /// Support for custom types (CREATE TYPE / DROP TYPE)
     CustomTypes,
+    /// Support for CREATE INDEX ... USING <index method> (experimental)
+    IndexMethod,
 }
 
 impl Capability {
@@ -79,6 +81,7 @@ impl Capability {
         Capability::Strict,
         Capability::MaterializedViews,
         Capability::CustomTypes,
+        Capability::IndexMethod,
     ];
 
     /// Get all capabilities as a HashSet (convenience for backends that support everything)
@@ -94,6 +97,7 @@ impl Display for Capability {
             Capability::Strict => write!(f, "strict"),
             Capability::MaterializedViews => write!(f, "materialized_views"),
             Capability::CustomTypes => write!(f, "custom_types"),
+            Capability::IndexMethod => write!(f, "index_method"),
         }
     }
 }
@@ -132,7 +136,7 @@ pub struct TestFile {
     /// successful test statement on backends that preserve typed results.
     pub verify_materialized_views: bool,
     /// Named setup blocks that can be composed
-    pub setups: HashMap<String, String>,
+    pub setups: HashMap<String, Setup>,
     /// Test cases
     pub tests: Vec<TestCase>,
     /// Snapshot test cases (for EXPLAIN output)
@@ -143,6 +147,18 @@ pub struct TestFile {
     pub global_skip: Vec<Skip>,
     /// Global capability requirements that apply to all tests in the file
     pub global_requires: Vec<Requirement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Setup {
+    pub sql: String,
+    pub backend: Option<Backend>,
+}
+
+impl Setup {
+    pub fn runs_on(&self, backend: Backend) -> bool {
+        self.backend.is_none_or(|only| only == backend)
+    }
 }
 
 /// A setup reference with its span in the source
@@ -338,8 +354,23 @@ pub enum Expectation {
     Pattern(String),
     /// Compare as sets (order doesn't matter)
     Unordered(Vec<String>),
-    /// Expect an error with optional pattern match
-    Error(Option<String>),
+    /// Expect an error
+    Error {
+        /// SQLSTATE that the error must have, set by `@sqlstate`
+        sqlstate: Option<String>,
+        /// Regex that the error message must match
+        pattern: Option<String>,
+    },
+}
+
+impl Expectation {
+    /// SQLSTATE that this expectation requires, if any
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Expectation::Error { sqlstate, .. } => sqlstate.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Collection of expectations with optional backend-specific overrides

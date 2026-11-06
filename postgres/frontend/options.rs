@@ -1,3 +1,4 @@
+use crate::error::sqlstate_error;
 use std::sync::Arc;
 use turso_core::{
     array_values_from_any,
@@ -8,6 +9,7 @@ use turso_core::{
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
+use turso_pg_parser::sqlstate::SQLSTATE_NULL_VALUE_NOT_ALLOWED;
 
 #[derive(Debug)]
 pub(crate) struct PgOptionsToTable;
@@ -119,8 +121,9 @@ fn append_options(input: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
             continue;
         }
         if matches!(value, Value::Null) {
-            return Err(LimboError::InvalidArgument(
-                "null array element not allowed in this context".into(),
+            return Err(sqlstate_error(
+                SQLSTATE_NULL_VALUE_NOT_ALLOWED,
+                "null array element not allowed in this context",
             ));
         }
         let option = value.to_string();

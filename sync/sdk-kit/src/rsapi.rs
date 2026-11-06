@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
@@ -170,14 +173,17 @@ impl TursoDatabaseSyncChanges {
     }
 }
 
+type SharedSyncEngine<TBytes> = Arc<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>;
+
 pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
     sync_config: TursoDatabaseSyncConfig,
     sync_engine_opts: turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts,
     sync_engine_io_queue: SyncEngineIoStats<SyncEngineIoQueue<TBytes>>,
-    sync_engine: Arc<Mutex<Option<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>>>,
+    sync_engine: Arc<Mutex<Option<SharedSyncEngine<TBytes>>>>,
     db_io: Option<Arc<dyn IO>>,
     sync_busy: Arc<SyncBusyGate>,
+    operation_gate: Arc<SyncOperationGate>,
 }
 
 #[allow(unused_variables)]
@@ -271,7 +277,9 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Option<Arc<dyn IO>> = if is_memory {
+        let db_io: Option<Arc<dyn IO>> = if let Some(io) = &db_config.io {
+            Some(io.clone())
+        } else if is_memory {
             Some(Arc::new(MemoryIO::new()))
         } else {
             // persitent IO initialized later in order to read metadata first and decide if we need partial DB IO
@@ -286,6 +294,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             sync_engine: Arc::new(Mutex::new(None)),
             db_io,
             sync_busy: Arc::new(SyncBusyGate::default()),
+            operation_gate: Arc::new(SyncOperationGate::default()),
         }))
     }
     /// open the database which must be created earlier (e.g. through [Self::init])
@@ -338,7 +347,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
-                *sync_engine.lock() = Some(sync_engine_opened);
+                *sync_engine.lock() = Some(Arc::new(sync_engine_opened));
                 Ok(None)
             })
         })))
@@ -368,7 +377,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         sync_engine_opts.partial_sync_opts.is_some()
                     })?,
                 };
-                let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
                     io.clone(),
@@ -402,16 +410,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
-                // A fresh MVCC bootstrap only carries the last durable
-                // generation base; catch up to the retained logical log so
-                // the database is current at connect time (no-op for
-                // page-protocol replicas).
-                if fresh_bootstrap {
-                    sync_engine_opened
-                        .catch_up_after_fresh_bootstrap(&coro)
-                        .await?;
-                }
-                *sync_engine.lock() = Some(sync_engine_opened);
+                *sync_engine.lock() = Some(Arc::new(sync_engine_opened));
                 Ok(None)
             })
         })))
@@ -421,15 +420,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     pub fn connect(&self) -> Box<TursoDatabaseAsyncOperation> {
         let db_config = self.db_config.clone();
         let sync_engine = self.sync_engine.clone();
+        let operation_gate = self.operation_gate.clone();
         let sync_busy = self.sync_busy.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let sync_engine = sync_engine.lock_arc();
-                let Some(sync_engine) = &*sync_engine else {
-                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                        "sync engine must be initialized".to_string(),
-                    ));
-                };
+                let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 let connection = sync_engine.connect_rw(&coro).await?;
                 Ok(Some(TursoAsyncOperationResult::Connection {
                     connection: turso_sdk_kit::rsapi::TursoConnection::new_with_sync_busy(
@@ -445,14 +440,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// get stats of synced database
     pub fn stats(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let operation_gate = self.operation_gate.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let sync_engine = sync_engine.lock_arc();
-                let Some(sync_engine) = &*sync_engine else {
-                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                        "sync engine must be initialized".to_string(),
-                    ));
-                };
+                let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 let stats = sync_engine.stats(&coro).await?;
                 Ok(Some(TursoAsyncOperationResult::Stats { stats }))
             })
@@ -461,15 +452,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// checkpoint WAL of synced database
     pub fn checkpoint(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let operation_gate = self.operation_gate.clone();
         let sync_busy = self.sync_busy.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let sync_engine = sync_engine.lock_arc();
-                let Some(sync_engine) = &*sync_engine else {
-                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                        "sync engine must be initialized".to_string(),
-                    ));
-                };
+                let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 let _sync_busy = SyncBusyGuard::new(sync_busy);
                 sync_engine.checkpoint(&coro).await?;
                 Ok(None)
@@ -479,14 +466,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// push local changes to remote for synced database
     pub fn push_changes(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let operation_gate = self.operation_gate.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let sync_engine = sync_engine.lock_arc();
-                let Some(sync_engine) = &*sync_engine else {
-                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                        "sync engine must be initialized".to_string(),
-                    ));
-                };
+                let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 sync_engine.push_changes_to_remote(&coro).await?;
                 Ok(None)
             })
@@ -495,14 +478,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// wait changes from remote to apply them later with [Self::apply_changes] methods
     pub fn wait_changes(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let operation_gate = self.operation_gate.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let sync_engine = sync_engine.lock_arc();
-                let Some(sync_engine) = &*sync_engine else {
-                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                        "sync engine must be initialized".to_string(),
-                    ));
-                };
+                let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 let changes = sync_engine.wait_changes_from_remote(&coro).await?;
                 Ok(Some(TursoAsyncOperationResult::Changes {
                     changes: Box::new(TursoDatabaseSyncChanges { changes }),
@@ -516,15 +495,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         changes: Box<TursoDatabaseSyncChanges>,
     ) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let operation_gate = self.operation_gate.clone();
         let sync_busy = self.sync_busy.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let sync_engine = sync_engine.lock_arc();
-                let Some(sync_engine) = &*sync_engine else {
-                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                        "sync engine must be initialized".to_string(),
-                    ));
-                };
+                let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 let changes = changes.changes;
                 let _sync_busy = SyncBusyGuard::new(sync_busy);
                 sync_engine
@@ -575,5 +550,101 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn arc_from_capi(value: *const capi::c::turso_sync_database_t) -> Arc<Self> {
         Arc::from_raw(value as *const Self)
+    }
+}
+
+fn start_operation<TBytes: AsRef<[u8]> + Send + Sync + 'static>(
+    sync_engine: &Mutex<Option<SharedSyncEngine<TBytes>>>,
+    operation_gate: Arc<SyncOperationGate>,
+) -> Result<(SharedSyncEngine<TBytes>, SyncOperationPermit), turso_sync_engine::errors::Error> {
+    let sync_engine = initialized_engine(sync_engine)?;
+    let permit = SyncOperationPermit::acquire(operation_gate)?;
+    Ok((sync_engine, permit))
+}
+
+fn initialized_engine<TBytes: AsRef<[u8]> + Send + Sync + 'static>(
+    sync_engine: &Mutex<Option<SharedSyncEngine<TBytes>>>,
+) -> Result<SharedSyncEngine<TBytes>, turso_sync_engine::errors::Error> {
+    sync_engine.lock().clone().ok_or_else(|| {
+        turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+            "sync engine must be initialized".to_string(),
+        )
+    })
+}
+
+#[derive(Default)]
+struct SyncOperationGate {
+    in_progress: AtomicBool,
+}
+
+struct SyncOperationPermit {
+    gate: Arc<SyncOperationGate>,
+}
+
+impl SyncOperationPermit {
+    fn acquire(gate: Arc<SyncOperationGate>) -> Result<Self, turso_sync_engine::errors::Error> {
+        gate.in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                    "another sync operation is in progress".to_string(),
+                )
+            })?;
+        Ok(Self { gate })
+    }
+}
+
+impl Drop for SyncOperationPermit {
+    fn drop(&mut self) {
+        self.gate.in_progress.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use turso_core::{MemoryIO, OpenFlags, IO};
+    use turso_sdk_kit::rsapi::{TursoDatabaseConfig, TursoStatusCode};
+
+    use super::{TursoDatabaseSync, TursoDatabaseSyncConfig};
+
+    #[test]
+    fn create_writes_sync_metadata_through_the_io_from_the_database_config() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let sync = TursoDatabaseSync::<Vec<u8>>::new(
+            TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                experimental_features: None,
+                async_io: true,
+                encryption: None,
+                vfs: Default::default(),
+                io: Some(io.clone()),
+                db_file: None,
+                page_codec: None,
+                open_flags: OpenFlags::default(),
+            },
+            TursoDatabaseSyncConfig {
+                remote_url: None,
+                path: ":memory:".to_string(),
+                client_name: "test".to_string(),
+                long_poll_timeout_ms: None,
+                bootstrap_if_empty: false,
+                reserved_bytes: None,
+                partial_sync_opts: None,
+                remote_encryption_key: None,
+                push_operations_threshold: None,
+                pull_bytes_threshold: None,
+                logical_mvcc_pull: None,
+            },
+        )
+        .unwrap();
+
+        let operation = sync.create();
+        while let TursoStatusCode::Io = operation.resume().unwrap() {}
+
+        assert!(io
+            .open_file(":memory:-info", OpenFlags::None, false)
+            .is_ok());
     }
 }

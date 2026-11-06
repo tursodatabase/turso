@@ -53,7 +53,7 @@ addr  opcode             p1  p2  p3  p4           p5  comment
   22    OpenDup           2   0   0                0  new_cursor=2, original_cursor=0
   23    Null              0  14   0                0  r[14]=NULL
   24    Integer           1  15   0                0  r[15]=1; LIMIT counter
-  25    IfNot            15  47   0                0  if !r[15] goto 47
+  25    IfNot            15  50   0                0  if !r[15] goto 50
   26    Once             34   0   0                0  goto 34
   27    OpenAutoindex     3   0   0                0  cursor=3
   28    Rewind            2  34   0                0  Rewind  ephemeral()

@@ -114,3 +114,9 @@ expect {
     3
     5
 }
+test duplicate-subquery-output-names-remain-unique-in-sqlite {
+    SELECT s.x, s."x:1" FROM (SELECT 1 AS x, 2 AS x) AS s;
+}
+expect {
+    1|2
+}

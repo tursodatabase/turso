@@ -639,7 +639,7 @@ pub(crate) fn real_to_i64(r: f64) -> i64 {
     }
 }
 
-fn apply_integer_affinity(val: ValueRef) -> Option<ValueRef> {
+pub(crate) fn apply_integer_affinity(val: ValueRef) -> Option<ValueRef> {
     let ValueRef::Numeric(Numeric::Float(nn)) = val else {
         return None;
     };

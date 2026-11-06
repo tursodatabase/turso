@@ -2013,6 +2013,7 @@ pub struct ExprConfig {
 
     /// Probability of aggregate FILTER clause.
     pub aggregate_filter_probability: f64,
+    pub aggregate_order_by_probability: f64,
 }
 
 impl Default for ExprConfig {
@@ -2030,8 +2031,9 @@ impl Default for ExprConfig {
             compound_op_weights: CompoundOpWeights::default(),
             // Stubs
             like_escape_probability: 0.0,
-            aggregate_distinct_probability: 0.0,
+            aggregate_distinct_probability: 0.2,
             aggregate_filter_probability: 0.3,
+            aggregate_order_by_probability: 0.3,
         }
     }
 }

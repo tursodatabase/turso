@@ -1,3 +1,4 @@
+use crate::translate::expr_context::ExprContext;
 use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
@@ -6,11 +7,7 @@ use turso_parser::ast::{self, SortOrder};
 use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
-    translate::{
-        collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
-        group_by::is_orderby_agg_or_const,
-        plan::Aggregate,
-    },
+    translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -20,61 +17,13 @@ use crate::{
 };
 
 use super::{
-    emitter::TranslateCtx,
+    emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
-use crate::vdbe::insn::SortComparatorType;
-
-/// Maps a custom type `<` operator function name to a SortComparatorType.
-/// Returns None if the function name is not recognized.
-fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType> {
-    match func_name {
-        "numeric_lt" => Some(SortComparatorType::NumericLt),
-        "test_uint_lt" => Some(SortComparatorType::TestUintLt),
-        "string_reverse" => Some(SortComparatorType::StringReverse),
-        "array_lt" => Some(SortComparatorType::ArrayLt),
-        _ => None,
-    }
-}
-
-/// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the SortComparatorType if the type has a `<` operator with a known
-/// comparator. Returns None otherwise, which causes the sorter to use encoded
-/// blob ordering instead of silently wrong results.
-pub(crate) fn custom_type_comparator(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
-) -> Option<SortComparatorType> {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        // Array columns use element-wise comparison
-        if col.is_array() {
-            return Some(SortComparatorType::ArrayLt);
-        }
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
-        type_def
-            .operators()
-            .iter()
-            .find(|op| op.op == "<")
-            .and_then(|op| op.func_name.as_ref())
-            .and_then(|func_name| sort_comparator_from_func_name(func_name))
-    } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some(SortComparatorType::ArrayLt)
-    } else {
-        None
-    }
-}
 
 /// For a result column expression that is a column reference to a custom type,
 /// returns the column definition and type definition.
@@ -99,35 +48,6 @@ fn result_column_custom_type_info<'a>(
     } else {
         None
     }
-}
-
-/// Returns true if the expression is a column reference to a custom type
-/// (with encode/decode) that does NOT have a `<` operator with a known
-/// sort comparator. This includes types with no `<` operator at all, and
-/// types whose `<` function is not recognized by the sorter.
-fn is_custom_type_without_lt(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
-) -> bool {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
-            if let Some(col) = table.get_column_at(*column) {
-                if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode().is_some() {
-                        // No `<` operator at all (naked or with function)
-                        return !type_def.operators().iter().any(|op| op.op == "<");
-                    }
-                }
-            }
-        }
-    }
-    false
 }
 
 // Metadata for handling ORDER BY operations
@@ -168,22 +88,17 @@ impl EmitOrderBy {
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
-        // Block ORDER BY on custom type columns without OPERATOR '<'
         for (expr, _, _) in order_by.iter() {
-            if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
-                if let Some((col, type_def)) =
-                    result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
-                {
-                    let col_name = col.name.as_deref().unwrap_or("?");
+            if let Some((col, type_def)) =
+                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
+            {
+                if col.type_ordering().is_none() && !type_def.is_sortable() {
                     crate::bail_parse_error!(
-                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                    col_name,
-                    type_def.name
-                );
+                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                        col.name.as_deref().unwrap_or("?"),
+                        type_def.name
+                    );
                 }
-                crate::bail_parse_error!(
-                    "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"
-                );
             }
         }
 
@@ -210,12 +125,8 @@ impl EmitOrderBy {
                         "heap sort cannot express an explicit NULLS ordering".to_string(),
                     ));
                 }
-                let collation = Some(resolve_comparison_collseq_with_symbols(
-                    column,
-                    column,
-                    referenced_tables,
-                    Some(t_ctx.resolver.symbol_table),
-                )?);
+                let collation = ExprContext::new(Some(referenced_tables), &t_ctx.resolver)
+                    .expr_collation(column)?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
@@ -224,6 +135,7 @@ impl EmitOrderBy {
                     nulls_order: None,
                     pos_in_table,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 });
@@ -235,13 +147,18 @@ impl EmitOrderBy {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table,
-                collation: None,
+                collation: CollationSeq::BINARY,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.try_push(IndexColumn::new(pos_in_table.to_string(), pos_in_table))?;
+                index_columns.try_push(IndexColumn::new(
+                    pos_in_table.to_string(),
+                    pos_in_table,
+                    CollationSeq::BINARY,
+                ))?;
             }
             let index = Arc::new(Index {
                 name: index_name,
@@ -254,6 +171,7 @@ impl EmitOrderBy {
                 where_clause: None,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             });
             program.alloc_cursor_id(CursorType::BTreeIndex(index))
         } else {
@@ -280,47 +198,27 @@ impl EmitOrderBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let mut order_collations_nulls: Vec<(
-                SortOrder,
-                Option<CollationSeq>,
-                Option<turso_parser::ast::NullsOrder>,
-            )> = order_by
-                .iter()
-                .map(|(expr, dir, nulls)| {
-                    let collation = Some(resolve_comparison_collseq_with_symbols(
-                        expr,
-                        expr,
-                        referenced_tables,
-                        Some(t_ctx.resolver.symbol_table),
-                    )?);
-                    Ok::<_, crate::LimboError>((*dir, collation, *nulls))
-                })
-                .try_collect::<Result<Vec<_>>>()??;
-
-            // Resolve custom type comparators for ORDER BY columns.
-            // For types with a `<` operator, the comparator is used for correct sort ordering.
-            let mut comparators: Vec<Option<SortComparatorType>> = order_by
-                .iter()
-                .map(|(expr, _, _)| {
-                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
-                })
-                .try_collect()?;
+            let mut data = sorter_open_data(
+                sort_cursor,
+                order_by
+                    .iter()
+                    .map(|(expr, dir, nulls)| (expr.as_ref(), *dir, *nulls)),
+                referenced_tables,
+                &t_ctx.resolver,
+            )?;
 
             if has_sequence {
-                // sequence column: ascending with BINARY collation, no comparator, no nulls order
-                order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
-                comparators.try_push(None)?;
+                // sequence column: ascending with BINARY collation, no nulls order
+                data.order_collations_nulls.try_push((
+                    SortOrder::Asc,
+                    CollationSeq::BINARY,
+                    None,
+                ))?;
             }
 
-            let key_len = order_collations_nulls.len();
-
+            data.columns = data.order_collations_nulls.len();
             program.emit_insn(Insn::SorterOpen {
-                data: Box::new(SorterOpenData {
-                    cursor_id: sort_cursor,
-                    columns: key_len,
-                    order_collations_nulls,
-                    comparators,
-                }),
+                data: Box::new(data),
             });
         }
         Ok(())
@@ -421,7 +319,7 @@ impl EmitOrderBy {
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
             if remapping.deduplicated {
-                if let Some((col, type_def)) = result_column_custom_type_info(
+                if let Some((_, type_def)) = result_column_custom_type_info(
                     &rc.expr,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
@@ -437,8 +335,6 @@ impl EmitOrderBy {
                             decode_expr,
                             reg,
                             reg,
-                            col,
-                            &type_def,
                             &t_ctx.resolver,
                         )?;
                         program.preassign_label_to_next_insn(skip_label);
@@ -531,8 +427,8 @@ impl EmitOrderBy {
                 });
             } else {
                 // Sort keys must be encoded (on-disk) values. Suppress decode so the
-                // sorter compares encoded representations, using either the base type's
-                // built-in comparison (naked OPERATOR '<') or a custom comparator function.
+                // sorter compares stored values, with SQLite's comparison or the
+                // built-in type's own order (numeric).
                 let is_custom =
                     result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
                         .is_some_and(|(_, td)| td.decode().is_some());
@@ -712,6 +608,28 @@ impl EmitOrderBy {
         }
         Ok(())
     }
+}
+
+pub(crate) fn sorter_open_data<'a>(
+    cursor_id: usize,
+    terms: impl IntoIterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)>,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<SorterOpenData> {
+    let terms = terms.into_iter();
+    let capacity = terms.size_hint().0;
+    let mut data = SorterOpenData {
+        cursor_id,
+        columns: 0,
+        order_collations_nulls: Vec::try_with_capacity_ext(capacity)?,
+    };
+    for (expr, direction, nulls) in terms {
+        let collation = ExprContext::new(Some(tables), resolver).expr_collation(expr)?;
+        data.order_collations_nulls
+            .try_push((direction, collation, nulls))?;
+    }
+    data.columns = data.order_collations_nulls.len();
+    Ok(data)
 }
 
 /// Emits the bytecode for inserting a row into a sorter.

@@ -1692,6 +1692,70 @@ expect {
     8C1761133117621332
 }
 
+test json-patch-keeps-escapes-in-added-keys {
+    select json_patch('{}', '{"\u00e9":1}');
+    select json_patch('{"a":1}', '{"b\u00e9":2}');
+    select json_patch('{"a":1}', '{"a":"\u00e9"}');
+    select json_patch('{"a":{"x":1}}', '{"a":{"b\u00e9":{"c":null,"d\n":[1]}},"f\u0041":{"g":{}}}');
+}
+expect {
+    {"\u00e9":1}
+    {"a":1,"b\u00e9":2}
+    {"a":"\u00e9"}
+    {"a":{"x":1,"b\u00e9":{"d\n":[1]}},"f\u0041":{"g":{}}}
+}
+
+test json-patch-matches-escaped-keys-by-value {
+    select json_patch('{"\u00e9":1}', '{"é":2}');
+    select json_patch('{"é":1}', '{"\u00e9":2}');
+}
+expect {
+    {"\u00e9":2}
+    {"é":2}
+}
+
+test jsonb-patch-copies-added-key-bytes {
+    select hex(jsonb_patch('{}', '{"x\ny":1}'));
+    select json_valid(jsonb_patch('{}', '{"x\ny":1}'), 8);
+    select hex(jsonb_patch('{"a":{"b":1}}', jsonb('{a:{c:2},"x\x41":3}')));
+}
+expect {
+    7C48785C6E791331
+    1
+    CC1317618C176213311763133259785C7834311333
+}
+
+test json-patch-object-over-non-object-starts-empty {
+    select json_patch('{"a":1}', '{"a":{"b":1,"b":null}}');
+    select json_patch('{"a":1}', '{"a":{"b":{"x":1},"b":{"y":2}}}');
+    select json_patch('{"a":[1],"c":2}', '{"a":{"b":{"c":null,"d":{"e":null}}},"c":{"x":null}}');
+}
+expect {
+    {"a":{}}
+    {"a":{"b":{"x":1,"y":2}}}
+    {"a":{"b":{"d":{}}},"c":{}}
+}
+
+test json-patch-applies-duplicate-patch-keys-in-order {
+    select json_patch('{}', '{"a":{"x":1},"a":5,"a":{"y":2}}');
+    select json_patch('{}', '{"a":{"x":1},"a":null,"a":{"y":2}}');
+    select json_patch('{"a":{"b":1}}', '{"a":{"c":2},"a":{"b":null}}');
+    select json_patch('{"a":{"b":{"c":1}},"z":0}', '{"a":{"b":{"d":{"e":{"f":2}}}},"z":{"q":null}}');
+}
+expect {
+    {"a":{"y":2}}
+    {"a":{"y":2}}
+    {"a":{"c":2}}
+    {"a":{"b":{"c":1,"d":{"e":{"f":2}}}},"z":{}}
+}
+
+test json-patch-does-not-decode-textraw-keys {
+    select json_patch('{"a\nb":0}', x'7C4A615C6E621331');
+}
+expect {
+    {"a\nb":0,"a\\\\nb":1}
+}
+
 test json-remove-1 {
     select json_remove('{"a": 5, "a": [5,4,3,2,1]}','$.a', '$.a[4]', '$.a[5]', '$.a');
 }
@@ -3726,29 +3790,96 @@ expect {
     {"a":[1,2,3,4]}
 }
 
+# Appending to the root array must grow the root array header by the size of
+# the appended value. An empty array or object is one byte, the same size as
+# the placeholder written before the value, so a header that misses the
+# placeholder byte drops the appended value.
+test json_set_array_append_empty_container_at_root {
+    SELECT json_set('["i1"]', '$[#]', json('[]')),
+           json(jsonb_set('["i1"]', '$[#]', json('[]'))),
+           json_set('[1]', '$[#]', json('{}')),
+           json_set('[]', '$[#]', json('[]')),
+           json_insert('[1]', '$[#]', json('[]')),
+           json_set('[1]', '$[1]', json('[]')),
+           json_insert('[1]', '$[1]', json('{}'));
+}
+expect {
+    ["i1",[]]|["i1",[]]|[1,{}]|[[]]|[1,[]]|[1,[]]|[1,{}]
+}
+
+test jsonb_set_array_append_at_root_header_size {
+    SELECT hex(jsonb_set('[1]', '$[#]', 5)),
+           hex(jsonb_set('[1]', '$[#]', json('[2]'))),
+           hex(jsonb_insert('[1]', '$[#]', json('[]'))),
+           hex(jsonb_set('[1,2,3,4,5]', '$[#]', 6)),
+           hex(jsonb_set('[1,2,3,4,5]', '$[5]', json('[]'), '$[#]', json('{}')));
+}
+expect {
+    4B13311335|5B13312B1332|3B13310B|CB0C133113321333133413351336|CB0C133113321333133413350B0C
+}
+
+test json_set_array_append_at_root_then_key {
+    SELECT json_set('[1]', '$[#].a', json('[]')),
+           json(jsonb_set('[1]', '$[#].a', 5));
+}
+expect {
+    [1,{"a":[]}]|[1,{"a":5}]
+}
+
+# An array index after another array index must not turn an empty object that
+# is already in the document into an array: SQLite leaves the document
+# unchanged.
+test json_set_array_index_into_existing_empty_object {
+    SELECT json_set('[{}]', '$[0][#]', 1),
+           json_set('[{}]', '$[0][0]', 1),
+           json_set('[{}]', '$[#-1][#]', 1),
+           json_insert('[{}]', '$[0][#]', 1),
+           json(jsonb_set('[{}]', '$[0][#]', 1)),
+           json(jsonb_insert('[{}]', '$[0][#]', 1)),
+           json(jsonb_set(x'2bcc00', '$[0][#]', 1)),
+           json_set('[[{}]]', '$[0][0][#]', 1),
+           json_set('{"a":[{}]}', '$.a[0][#]', 1);
+}
+expect {
+    [{}]|[{}]|[{}]|[{}]|[{}]|[{}]|[{}]|[[{}]]|{"a":[{}]}
+}
+
+# A path that creates nested arrays creates each one as an array directly, and
+# every new array header counts the array created inside it.
+test jsonb_set_nested_array_append_creates_arrays {
+    SELECT hex(jsonb_set('[]', '$[#][#]', 1)),
+           hex(jsonb_set('[]', '$[0][0][0]', 1)),
+           hex(jsonb_set('[]', '$[#][#][#][#]', 1)),
+           hex(jsonb_insert('[[]]', '$[0][#][#]', json('[]'))),
+           hex(jsonb_set('{"a":[]}', '$.a[#][#][#]', 1)),
+           hex(jsonb_set('[[1,2,3,4,5,6,7,8,9]]', '$[0][#][#]', 1)),
+           json_set('{}', '$.a[0][#][#]', 1),
+           json_set('[]', '$[#].a[#]', 2);
+}
+expect {
+    3B2B1331|4B3B2B1331|5B4B3B2B1331|3B2B1B0B|7C17614B3B2B1331|CB17CB151331133213331334133513361337133813392B1331|{"a":[[[1]]]}|[{"a":[2]}]
+}
+
 # A BLOB argument is read as JSONB, so every element type, payload size and
 # text byte in it is caller-controlled. Validation used to be skipped whenever
 # the payload exceeded 7 bytes, which let arbitrary bytes reach
 # str::from_utf8_unchecked through an object key, and a child element could
 # declare a payload larger than the containing buffer.
 #
-# SQLite is more lenient here: it renders an invalid UTF-8 key with replacement
-# characters rather than rejecting the document.
+# Like SQLite, a key that is not UTF-8 is accepted; it does not match '$.a'.
 
-@skip-if sqlite "sqlite renders malformed jsonb leniently"
 test jsonb-truncated-utf8-key {
-    SELECT json_extract(x'9C79616161616161F000', '$.a');
+    SELECT quote(json_extract(x'9C79616161616161F000', '$.a'));
 }
-expect error {
-    malformed JSON
+expect {
+    NULL
 }
 
-@skip-if sqlite "sqlite renders malformed jsonb leniently"
 test jsonb-invalid-utf8-key {
-    SELECT json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a');
+    SELECT quote(json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a'));
 }
-expect error {
-    malformed JSON
+expect {
+    NULL
 }
 
 @skip-if sqlite "sqlite renders malformed jsonb leniently"

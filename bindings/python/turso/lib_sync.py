@@ -74,12 +74,20 @@ class _HttpContext:
         return v
 
     def base_url(self) -> Optional[str]:
-        return self._eval(self.remote_url)
+        url = self._eval(self.remote_url)
+        return _to_https_url(url) if url else url
 
     def token(self) -> Optional[str]:
         if self.auth_token is None:
             return None
         return self._eval(self.auth_token)
+
+
+def _to_https_url(url: str) -> str:
+    for scheme in ("libsql://", "turso://"):
+        if url.startswith(scheme):
+            return "https://" + url[len(scheme):]
+    return url
 
 
 def _join_url(base: str, path: str) -> str:
@@ -460,11 +468,8 @@ def connect_sync(
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
-    if remote_url and isinstance(remote_url, str):
-        if remote_url.startswith("libsql://"):
-            remote_url = "https://" + remote_url[len("libsql://"):]
-        elif remote_url.startswith("turso://"):
-            remote_url = "https://" + remote_url[len("turso://"):]
+    if isinstance(remote_url, str):
+        remote_url = _to_https_url(remote_url)
     http_ctx = _HttpContext(remote_url=remote_url, auth_token=auth_token, client_name=cname)
 
     # Database config: async_io must be True to let Python drive IO
@@ -487,7 +492,8 @@ def connect_sync(
 
     sync_cfg = PyTursoSyncDatabaseConfig(
         path=path,
-        remote_url=remote_url,
+        # a callable url is evaluated by _HttpContext on every request, so the engine gets no url
+        remote_url=remote_url if isinstance(remote_url, str) else None,
         client_name=cname,
         long_poll_timeout_ms=long_poll_timeout_ms,
         bootstrap_if_empty=bootstrap_if_empty,

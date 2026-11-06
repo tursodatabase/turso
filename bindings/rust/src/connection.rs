@@ -516,6 +516,30 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
+    /// Sets a wall-clock limit for each statement run on this connection.
+    ///
+    /// The VM checks the deadline before every instruction, so a statement that
+    /// runs past it fails with [`Error::Interrupt`] even when it never yields
+    /// (for example a long aggregate over an in-memory or cached table).
+    /// `Duration::ZERO` disables the limit, which is the default.
+    pub fn set_query_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.set_query_timeout(duration);
+        Ok(())
+    }
+
+    /// Interrupts the statement currently running on this connection, like
+    /// [`sqlite3_interrupt`](https://www.sqlite.org/c3ref/interrupt.html).
+    ///
+    /// The running statement fails with [`Error::Interrupt`]. This is safe to
+    /// call from another thread through a clone of the connection, and it is a
+    /// no-op when no statement is running.
+    pub fn interrupt(&self) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.interrupt();
+        Ok(())
+    }
 }
 
 impl Debug for Connection {

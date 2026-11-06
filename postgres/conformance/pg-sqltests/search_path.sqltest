@@ -45,6 +45,7 @@ test search-path-missing-schema-errors {
     SET search_path TO missing_schema_ms;
     SELECT id, label FROM demo;
 }
+@sqlstate 42P01
 expect error {}
 
 test search-path-public-resolves-to-main {
@@ -88,7 +89,130 @@ expect {
 test search-path-empty-does-not-find-stored-tables {
     SELECT a FROM t1;
 }
+@sqlstate 42P01
 expect error {}
+
+setup local_search_path_commit {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lc_a;
+    DROP TABLE IF EXISTS sp_lc_a.demo;
+    CREATE TABLE sp_lc_a.demo (label text);
+    INSERT INTO sp_lc_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_commit
+test search-path-set-local-ends-at-commit {
+    BEGIN;
+    SET LOCAL search_path TO sp_lc_a;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+    COMMIT;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+}
+expect {
+    sp_lc_a
+    from a
+    "$user", public
+    from public
+}
+
+setup local_search_path_outside_transaction {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lo_a;
+    DROP TABLE IF EXISTS sp_lo_a.demo;
+    CREATE TABLE sp_lo_a.demo (label text);
+    INSERT INTO sp_lo_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_outside_transaction
+test search-path-set-local-outside-a-transaction-ends-with-its-statement {
+    SET LOCAL search_path TO sp_lo_a;
+    SHOW search_path;
+    SELECT label FROM demo;
+}
+expect {
+    "$user", public
+    from public
+}
+
+setup local_search_path_rollback {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lr_a;
+    DROP TABLE IF EXISTS sp_lr_a.demo;
+    CREATE TABLE sp_lr_a.demo (label text);
+    INSERT INTO sp_lr_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_rollback
+test search-path-local-set-config-ends-at-rollback {
+    BEGIN;
+    SELECT set_config('search_path', 'sp_lr_a', true);
+    SELECT label FROM demo;
+    ROLLBACK;
+    SELECT label FROM demo;
+}
+expect {
+    sp_lr_a
+    from a
+    from public
+}
+
+setup rollback_search_path {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_rb_a;
+    DROP TABLE IF EXISTS sp_rb_a.demo;
+    CREATE TABLE sp_rb_a.demo (label text);
+    INSERT INTO sp_rb_a.demo VALUES ('from a');
+}
+
+@setup rollback_search_path
+test search-path-set-is-undone-by-rollback {
+    BEGIN;
+    SET search_path TO sp_rb_a;
+    SELECT label FROM demo;
+    ROLLBACK;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+}
+expect {
+    from a
+    "$user", public
+    from public
+}
+
+setup savepoint_search_path {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_sv_a;
+    DROP TABLE IF EXISTS sp_sv_a.demo;
+    CREATE TABLE sp_sv_a.demo (label text);
+    INSERT INTO sp_sv_a.demo VALUES ('from a');
+}
+
+@setup savepoint_search_path
+test search-path-rollback-to-savepoint-restores-it {
+    BEGIN;
+    SET search_path TO sp_sv_a;
+    SAVEPOINT s;
+    SET LOCAL search_path TO public;
+    SELECT label FROM demo;
+    ROLLBACK TO SAVEPOINT s;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+    COMMIT;
+    SELECT label FROM demo;
+}
+expect {
+    from public
+    sp_sv_a
+    from a
+    from a
+}
 
 test public-schema-qualified-column-reference {
     DROP TABLE IF EXISTS demo;
@@ -174,6 +298,7 @@ test create-table-with-no-existing-schema-in-search-path-errors {
     SET search_path TO sp_missing_ct;
     CREATE TABLE t (x int);
 }
+@sqlstate 3F000
 expect error {
     no schema has been selected to create in
 }
@@ -420,6 +545,7 @@ test drop-column-checks-the-views-of-the-table-schema {
     SET search_path TO sp_dc;
     ALTER TABLE public.t DROP COLUMN b;
 }
+@sqlstate 2BP01
 expect error {
     cannot drop column
 }
@@ -471,6 +597,7 @@ test search-path-main-does-not-select-a-schema-to-create-in {
     SET search_path TO main;
     CREATE TABLE sp_main_t (a int);
 }
+@sqlstate 3F000
 expect error {
     no schema has been selected to create in
 }
@@ -481,4 +608,116 @@ test quoted-uppercase-search-path-does-not-match-a-lowercase-schema {
     SELECT current_schema();
 }
 expect {
+}
+
+test search-path-empty-qualified-generate-series {
+    SET search_path TO '';
+    SELECT * FROM pg_catalog.generate_series(1, 3);
+    SELECT sum(g.n) FROM pg_catalog.generate_series(1, 3) AS g(n);
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+test search-path-empty-unqualified-generate-series {
+    SET search_path TO '';
+    SELECT * FROM generate_series(1, 3);
+    SELECT sum(g.n) FROM generate_series(1, 3) AS g(n);
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+test drop-view-ignores-relations-outside-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_drop_view;
+    DROP VIEW IF EXISTS sp_drop_view.t;
+    DROP VIEW IF EXISTS sp_drop_view.v;
+    DROP VIEW IF EXISTS public.v;
+    DROP TABLE IF EXISTS public.t;
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT a FROM t;
+    SET search_path TO sp_drop_view;
+    DROP VIEW IF EXISTS t;
+    DROP MATERIALIZED VIEW IF EXISTS v;
+    SELECT count(*) FROM public.v;
+}
+expect {
+    0
+}
+
+test current-schemas-default-and-null {
+    SELECT pg_catalog.current_schemas(false), current_schemas(true);
+    SELECT CASE WHEN current_schemas(NULL) IS NULL THEN 1 ELSE 0 END;
+}
+expect {
+    {public}|{pg_catalog,public}
+    1
+}
+
+test current-schemas-existing-unique-and-explicit-catalog {
+    CREATE SCHEMA sp_list;
+    SET search_path TO missing_schema, sp_list, public, sp_list, information_schema;
+    SELECT current_schemas(false), current_schemas(true);
+    SET search_path TO public, pg_catalog, sp_list, pg_catalog;
+    SELECT current_schemas(false), current_schemas(true);
+    SET search_path TO '';
+    SELECT current_schemas(false), current_schemas(true);
+}
+expect {
+    {sp_list,public,information_schema}|{pg_catalog,sp_list,public,information_schema}
+    {public,pg_catalog,sp_list}|{public,pg_catalog,sp_list}
+    {}|{pg_catalog}
+}
+
+test current-schemas-setting-rollback-and-schema-drop {
+    CREATE SCHEMA sp_live;
+    BEGIN;
+    SET LOCAL search_path TO sp_live, public;
+    SELECT current_schemas(false);
+    ROLLBACK;
+    SELECT current_schemas(false);
+    SET search_path TO sp_live, public;
+    DROP SCHEMA sp_live;
+    SELECT current_schemas(false);
+    SELECT 0 WHERE set_config('search_path', NULL, false) IS NULL;
+    SELECT current_schemas(false);
+}
+expect {
+    {sp_live,public}
+    {public}
+    {public}
+    {public}
+}
+
+test current-schemas-quotes-array-elements {
+    CREATE SCHEMA "a,b";
+    CREATE SCHEMA "a\b";
+    CREATE SCHEMA "null";
+    SET search_path TO "a,b", "a\b", "null";
+    SELECT current_schemas(false);
+    SELECT * FROM unnest(current_schemas(false));
+}
+expect {
+    {"a,b","a\\\\b","null"}
+    a,b
+    a\b
+    null
+}
+
+test cte-hides-table-of-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cte;
+    DROP TABLE IF EXISTS sp_cte.t;
+    CREATE TABLE sp_cte.t (x int);
+    INSERT INTO sp_cte.t VALUES (1);
+    SET search_path TO sp_cte;
+    WITH t AS (SELECT 2 AS x) SELECT x FROM t;
+}
+expect {
+    2
 }

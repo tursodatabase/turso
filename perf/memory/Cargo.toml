@@ -14,15 +14,20 @@ name = "stack-report"
 path = "src/stack_report.rs"
 
 [[bin]]
+name = "mvcc-row-memory"
+path = "src/mvcc_row_memory.rs"
+
+[[bin]]
 name = "fts-memory"
 path = "src/fts_memory.rs"
 required-features = ["fts"]
 
 [features]
 stacker = ["turso/stacker"]
-fts = ["turso/fts", "dep:tempfile", "dep:turso_core"]
+fts = ["turso/fts", "dep:tempfile", "dep:turso_core", "dep:turso_sqlite"]
 
 [dependencies]
+turso_sqlite = { path = "../../sqlite/frontend", optional = true }
 turso = { path = "../../bindings/rust", default-features = false }
 turso_core = { path = "../../core", optional = true, default-features = false, features = ["fs", "fts", "test_helper"] }
 turso_parser = { workspace = true }

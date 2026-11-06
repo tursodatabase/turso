@@ -47,6 +47,76 @@ pub enum ValueType {
     Error,
 }
 
+/// What a STRICT column of a plain type stores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrictType {
+    /// INTEGER, INT, REAL, TEXT or BLOB: only values of this storage class.
+    Stores(StorageClass),
+    /// ANY: every value, unchanged.
+    Any,
+}
+
+impl StrictType {
+    /// The STRICT column type named `type_name`, which may be quoted as a
+    /// whole like `"INT"`. None for a name a STRICT table refuses, such as
+    /// FLOAT.
+    pub fn named(type_name: &str) -> Option<Self> {
+        let name = crate::util::strip_type_name_quotes(type_name).unwrap_or(type_name);
+        turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
+            b"INTEGER" | b"INT" => Some(Self::Stores(StorageClass::Integer)),
+            b"REAL" => Some(Self::Stores(StorageClass::Real)),
+            b"BLOB" => Some(Self::Stores(StorageClass::Blob)),
+            b"TEXT" => Some(Self::Stores(StorageClass::Text)),
+            b"ANY" => Some(Self::Any),
+            _ => None,
+        })
+    }
+
+    /// The type name a STRICT column of this type is declared with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stores(StorageClass::Integer) => "INTEGER",
+            Self::Stores(StorageClass::Real) => "REAL",
+            Self::Stores(StorageClass::Text) => "TEXT",
+            Self::Stores(StorageClass::Blob) => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
+}
+
+/// A storage class other than NULL: the kind of value a STRICT column of
+/// type INTEGER, REAL, TEXT or BLOB holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StorageClass {
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl StorageClass {
+    pub fn value_type(self) -> ValueType {
+        match self {
+            Self::Integer => ValueType::Integer,
+            Self::Real => ValueType::Float,
+            Self::Text => ValueType::Text,
+            Self::Blob => ValueType::Blob,
+        }
+    }
+
+    /// The affinity of a column of this type: what turns '5' into 5 for
+    /// INTEGER and 5 into 5.0 for REAL.
+    pub fn affinity(self) -> crate::vdbe::affinity::Affinity {
+        use crate::vdbe::affinity::Affinity;
+        match self {
+            Self::Integer => Affinity::Integer,
+            Self::Real => Affinity::Real,
+            Self::Text => Affinity::Text,
+            Self::Blob => Affinity::Blob,
+        }
+    }
+}
+
 impl Display for ValueType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -1932,6 +2002,9 @@ mod immutable_record {
 
             let header_size = Record::calc_header_size(size_header);
             let total_size = header_size + size_values;
+            if total_size > Value::MAX_BLOB_LENGTH as usize {
+                return Err(LimboError::TooBig);
+            }
             buf.try_reserve_exact(total_size)?;
             buf.resize(total_size, 0);
 
@@ -2636,12 +2709,12 @@ impl IndexInfo {
             .iter()
             .map(|c| KeyInfo {
                 sort_order: c.order,
-                collation: c.collation.unwrap_or_default(),
+                collation: c.collation,
                 nulls_order: c.nulls_order,
             })
             .chain(has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
                 nulls_order: None,
             }));
         Self::new_in(
@@ -2717,22 +2790,8 @@ where
     Ok(std::cmp::Ordering::Equal)
 }
 
-/// Treats `NULL` as equal to itself and smaller than other values.
-pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
-where
-    V1: AsValueRef,
-    V2: AsValueRef,
-{
-    let l = l.as_value_ref();
-    let r = r.as_value_ref();
-    match (l, r) {
-        (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
-        _ => l.cmp(&r),
-    }
-}
-
 pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
+    cmp_with_sort(key.collation.compare(*a, *b), a, b, key)
 }
 
 /// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
@@ -2822,13 +2881,16 @@ where
 {
     if right_values.len() != 0 && index_info.num_cols <= 13 {
         let val = right_values.peek().unwrap();
+        let collation = index_info.key_info[0].collation;
         match val.as_value_ref() {
-            ValueRef::Numeric(Numeric::Integer(key)) => RecordCompare::Int {
-                rhs_first_value: key,
-            },
-            ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
-                RecordCompare::String
+            ValueRef::Numeric(Numeric::Integer(key))
+                if matches!(collation, CollationSeq::Text(_)) =>
+            {
+                RecordCompare::Int {
+                    rhs_first_value: key,
+                }
             }
+            ValueRef::Text(_) if collation == CollationSeq::BINARY => RecordCompare::String,
             _ => RecordCompare::Generic,
         }
     } else {
@@ -3038,7 +3100,7 @@ where
     };
 
     let collation = index_info.key_info[0].collation;
-    let comparison = collation.compare_strings(&lhs_text, &rhs_text);
+    let comparison = collation.compare(ValueRef::Text(lhs_text), ValueRef::Text(rhs_text));
 
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
@@ -3167,12 +3229,7 @@ where
         };
 
         let key_info = &index_info.key_info[field_idx];
-        let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
-                key_info.collation.compare_strings(lhs_text, rhs_text)
-            }
-            _ => lhs_value.cmp(rhs_value),
-        };
+        let comparison = key_info.collation.compare(lhs_value, *rhs_value);
 
         let final_comparison = cmp_with_sort(comparison, &lhs_value, rhs_value, key_info);
 
@@ -3937,6 +3994,22 @@ mod tests {
     use asserting::prelude::*;
 
     #[test]
+    fn text_subtype_integer_conversion() {
+        assert_eq!(i64::from(TextSubtype::Text), 0);
+        assert_eq!(TextSubtype::try_from(0_i64), Ok(TextSubtype::Text));
+        #[cfg(feature = "json")]
+        {
+            assert_eq!(i64::from(TextSubtype::Json), 74);
+            assert_eq!(TextSubtype::try_from(74_i64), Ok(TextSubtype::Json));
+        }
+        #[cfg(not(feature = "json"))]
+        assert_eq!(TextSubtype::try_from(74_i64), Err(74));
+        for value in [-1, 1, 73, 75, 256, i64::MAX] {
+            assert_eq!(TextSubtype::try_from(value), Err(value));
+        }
+    }
+
+    #[test]
     fn is_ascii_checks_every_byte_of_every_length() {
         for len in (0..=129).chain([255, 256, 257, 511, 512, 513, 528]) {
             for offset in 0..64 {
@@ -4206,12 +4279,7 @@ mod tests {
             let column_order = index_key_info[i].sort_order;
             let collation = index_key_info[i].collation;
 
-            let cmp = match (&l[i], &r[i]) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    collation.compare_strings(left, right)
-                }
-                _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
-            };
+            let cmp = collation.compare(l[i], r[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return match column_order {
@@ -4391,7 +4459,7 @@ mod tests {
         let index_info = create_index_info(
             2,
             vec![SortOrder::Asc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 2],
+            vec![CollationSeq::BINARY; 2],
         );
 
         let test_cases = vec![
@@ -4466,7 +4534,7 @@ mod tests {
         let index_info = create_index_info(
             2,
             vec![SortOrder::Asc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 2],
+            vec![CollationSeq::BINARY; 2],
         );
 
         let test_cases = vec![
@@ -4526,7 +4594,7 @@ mod tests {
 
     #[test]
     fn test_type_precedence() {
-        let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::Binary]);
+        let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::BINARY]);
 
         // Test SQLite type precedence: NULL < Numbers < Text < Blob
         let test_cases = vec![
@@ -4611,7 +4679,7 @@ mod tests {
         let index_info = create_index_info(
             2,
             vec![SortOrder::Desc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 2],
+            vec![CollationSeq::BINARY; 2],
         );
 
         let test_cases = vec![
@@ -4650,7 +4718,7 @@ mod tests {
     #[test]
     fn test_edge_cases() {
         let index_info =
-            create_index_info(15, vec![SortOrder::Asc; 15], vec![CollationSeq::Binary; 15]);
+            create_index_info(15, vec![SortOrder::Asc; 15], vec![CollationSeq::BINARY; 15]);
 
         let test_cases = vec![
             (
@@ -4706,7 +4774,7 @@ mod tests {
     #[test]
     fn compare_record_preserves_prefix_tie_breakers() {
         let index_info =
-            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::Binary; 2]);
+            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::BINARY; 2]);
         for first in [Value::from_i64(42), Value::build_text("key"), Value::Null] {
             let serialized = create_record(vec![first.clone(), Value::from_i64(99)]);
             for tie_breaker in [Ordering::Less, Ordering::Equal, Ordering::Greater] {
@@ -4730,7 +4798,7 @@ mod tests {
         let index_info = create_index_info(
             3,
             vec![SortOrder::Asc, SortOrder::Asc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 3],
+            vec![CollationSeq::BINARY; 3],
         );
 
         let serialized = create_record(vec![
@@ -4769,8 +4837,8 @@ mod tests {
 
     #[test]
     fn test_strategy_selection() {
-        let collations_small = vec![CollationSeq::Binary; 3];
-        let collations_large = vec![CollationSeq::Binary; 15];
+        let collations_small = vec![CollationSeq::BINARY; 3];
+        let collations_large = vec![CollationSeq::BINARY; 15];
         let index_info_small = create_index_info(
             3,
             vec![SortOrder::Asc, SortOrder::Asc, SortOrder::Asc],
@@ -5067,7 +5135,7 @@ mod tests {
     /// Before the Numeric refactor, ValueRef had separate Float(f64) and Integer(i64)
     /// variants. A raw f64::NAN could be stored in Float, and comparing two NaN floats
     /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
-    /// compare_immutable_single would then panic.
+    /// the single-value compare would then panic.
     ///
     /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
     /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
@@ -5084,7 +5152,7 @@ mod tests {
         assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
 
         // Exercise every representable float edge case through partial_cmp,
-        // Ord::cmp, and compare_immutable_single — none of these can panic now.
+        // Ord::cmp, and CollationSeq::compare — none of these can panic now.
         let values: Vec<ValueRef> = vec![
             ValueRef::Null,
             ValueRef::from_i64(0),
@@ -5121,10 +5189,10 @@ mod tests {
             }
         }
 
-        // compare_immutable_single is where the unwrap panic originally surfaced.
+        // The single-value compare, now CollationSeq::compare, is where the unwrap panic originally surfaced.
         for a in &values {
             for b in &values {
-                let _ = compare_immutable_single(*a, *b, CollationSeq::Binary);
+                let _ = CollationSeq::BINARY.compare(*a, *b);
             }
         }
 
