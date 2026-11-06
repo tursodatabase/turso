@@ -1,3 +1,4 @@
+use crate::error::sqlstate_error;
 use crate::functions::validate_pg_input;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -16,6 +17,7 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -299,6 +301,13 @@ impl Dialect for PostgresDialect {
 
     fn constraint_errors_show_values(&self) -> bool {
         true
+    }
+
+    fn table_name_as_value_error(&self, name: &str) -> LimboError {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("a reference to the whole row of \"{name}\" is not supported"),
+        )
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

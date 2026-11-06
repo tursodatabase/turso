@@ -1663,3 +1663,233 @@ test random-divisor-is-not-an-integer {
 expect {
     ok
 }
+
+# Function calls that PostgreSQL accepts and tursopg rejects. The tests of
+# user-defined functions are in create-function.sqltest.
+
+test function-call-with-named-notation-is-rejected {
+    SELECT make_date(year => 2024, month => 1, day => 2);
+}
+expect {
+    2024-01-02
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^named notation in a function call is not supported$
+}
+
+test function-call-with-mixed-notation-is-rejected {
+    SELECT make_date(2024, month => 1, day := 2);
+}
+expect {
+    2024-01-02
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^mixed positional and named notation in a function call is not supported$
+}
+
+test function-call-in-from-with-named-notation-is-rejected {
+    SELECT * FROM make_date(year => 2024, month => 1, day => 2);
+}
+expect {
+    2024-01-02
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^named notation in a function call is not supported$
+}
+
+test function-call-with-a-variadic-argument-is-rejected {
+    SELECT concat(VARIADIC ARRAY['a', 'b']);
+}
+expect {
+    ab
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a VARIADIC function argument is not supported$
+}
+
+# PostgreSQL gives one row for each value when a set-returning function is
+# called in the select list. tursopg runs some of these functions in FROM.
+test set-returning-function-in-the-select-list-is-rejected {
+    SELECT generate_series(1, 3);
+}
+expect {
+    1
+    2
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^set-returning function generate_series\(\) outside FROM is not supported$
+}
+
+test unnest-in-the-select-list-is-rejected {
+    SELECT unnest(ARRAY[1, 2]);
+}
+expect {
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^set-returning function unnest\(\) outside FROM is not supported$
+}
+
+test set-returning-function-that-tursopg-does-not-have-is-rejected {
+    SELECT regexp_matches('abc', 'b');
+}
+expect {
+    {b}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^set-returning function regexp_matches\(\) is not supported$
+}
+
+test set-returning-function-in-where-is-rejected {
+    SELECT 1 WHERE generate_series(1, 2) > 0;
+}
+@sqlstate 0A000
+expect error {
+    ^set-returning functions are not allowed in WHERE$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^set-returning function generate_series\(\) outside FROM is not supported$
+}
+
+test column-notation-on-a-function-result-is-rejected {
+    SELECT (now()).epoch;
+}
+@sqlstate 42809
+expect error {
+    ^column notation \.epoch applied to type timestamp with time zone, which is not a composite type$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^column notation \.epoch on a function result is not supported$
+}
+
+test column-notation-on-a-constant-is-rejected {
+    SELECT (false).is_true;
+}
+@sqlstate 42809
+expect error {
+    ^column notation \.is_true applied to type boolean, which is not a composite type$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^column notation \.is_true on an expression is not supported$
+}
+
+test column-notation-on-a-table-name-reads-the-column {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+    SELECT (emp).name FROM emp;
+}
+expect {
+    Bill
+}
+
+# A table name that is not the name of a column is the whole row of the
+# table in PostgreSQL.
+test whole-row-reference-in-an-aggregate-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+    SELECT count(emp) FROM emp;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a reference to the whole row of "emp" is not supported$
+}
+
+test whole-row-reference-in-the-select-list-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+    SELECT emp FROM emp;
+}
+expect {
+    (Bill,4200)
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a reference to the whole row of "emp" is not supported$
+}
+
+test whole-row-reference-to-a-table-alias-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+    SELECT count(e) FROM emp AS e;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a reference to the whole row of "e" is not supported$
+}
+
+test whole-row-reference-to-a-subquery-is-rejected {
+    SELECT s FROM (SELECT 1 AS a) AS s;
+}
+expect {
+    (1)
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a reference to the whole row of "s" is not supported$
+}
+
+test whole-row-reference-to-a-table-of-the-outer-query-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+    SELECT (SELECT count(emp) FROM (SELECT 1) AS one) FROM emp;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a reference to the whole row of "emp" is not supported$
+}
+
+test table-name-hidden-by-an-alias-is-a-missing-column {
+    CREATE TABLE emp (name text, salary numeric);
+    SELECT count(emp) FROM emp AS e;
+}
+@sqlstate 42703
+expect error {
+    ^column "emp" does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: emp$
+}
+
+test column-with-the-name-of-its-table-is-a-column {
+    CREATE TABLE t (t int);
+    INSERT INTO t VALUES (7);
+    SELECT t FROM t;
+}
+expect {
+    7
+}
+
+test whole-row-reference-with-star-in-a-function-call-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+    SELECT count(emp.*) FROM emp;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^table\.\* inside an expression is not supported$
+}
