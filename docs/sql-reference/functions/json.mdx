@@ -99,7 +99,7 @@ SELECT json_array();
 
 ### json_object / jsonb_object
 
-Creates a JSON object from alternating label/value pairs. When called with `*`, expands all columns of the row into label/value pairs using column names as keys.
+Creates a JSON object from alternating label/value pairs. When called with `*`, expands the columns that `SELECT *` would return into label/value pairs using column names as keys, so a column joined with `USING` or `NATURAL` appears once.
 
 ```sql
 json_object(label1, value1, label2, value2, ...)
