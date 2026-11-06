@@ -1306,6 +1306,43 @@ expect error {
     unknown variant 'red' in union type 'direction'
 }
 
+# union_value() resolves its tag against the union column that receives the
+# value. RETURNING and WHERE have no such column, so union_value() there is an
+# error, even when the same statement has just written a union column.
+test union-value-in-insert-returning-rejected {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT PRIMARY KEY, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 1)) RETURNING union_value('f', 2.5);
+}
+expect error {
+    can only be used in INSERT/UPDATE targeting a union-typed column
+}
+
+test union-value-in-update-returning-rejected {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT PRIMARY KEY, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 1));
+    UPDATE tagged SET val = union_value('f', 2.5) RETURNING union_value('i', 3);
+}
+expect error {
+    can only be used in INSERT/UPDATE targeting a union-typed column
+}
+
+# A RETURNING here would fail in the INSERT part before DO UPDATE is compiled,
+# so union_value() goes in the WHERE of a second ON CONFLICT clause, which is
+# compiled after the SET of the first one.
+test union-value-in-second-upsert-where-rejected {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT PRIMARY KEY, val number, k INT UNIQUE) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 1), 1);
+    INSERT INTO tagged VALUES (1, union_value('i', 2), 2)
+        ON CONFLICT(id) DO UPDATE SET val = union_value('f', 2.5)
+        ON CONFLICT(k) DO UPDATE SET k = 3 WHERE val <> union_value('i', 3);
+}
+expect error {
+    can only be used in INSERT/UPDATE targeting a union-typed column
+}
+
 # ============================================================================
 # Nested UNION (union-in-union)
 # ============================================================================

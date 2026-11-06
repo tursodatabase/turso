@@ -801,7 +801,7 @@ pub(crate) fn expand_with_generated_columns(
         }
     }
 
-    // Evaluate virtual generated column expressions
+    // Evaluate generated column expressions (both VIRTUAL and STORED)
     for (col_idx, col) in table.columns.iter().enumerate() {
         if let Some(expr) = col.generated_expr() {
             if let Some(value) = expr_to_value(expr, &full_row, table) {
@@ -1337,7 +1337,7 @@ impl Shadow for Update {
                             }
                         }
                     }
-                    // Recompute virtual generated columns after SET assignments
+                    // Recompute generated columns after SET assignments
                     for (col_idx, col) in columns.iter().enumerate() {
                         if let Some(expr) = col.generated_expr() {
                             if let Some(value) = expr_to_value(expr, &new_row, &t2) {

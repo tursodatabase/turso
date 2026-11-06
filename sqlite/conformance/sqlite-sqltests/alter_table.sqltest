@@ -3665,3 +3665,13 @@ test alter-table-ignores-a-subquery-in-a-named-window-frame-bound {
 expect {
     ok
 }
+
+test alter-table-rename-column-changes-only-case {
+    CREATE TABLE t(a INT, b INT);
+    ALTER TABLE t RENAME COLUMN a TO A;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    A
+    b
+}

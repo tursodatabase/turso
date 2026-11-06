@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_virtual_columns;
-use crate::alloc::TursoIteratorExt;
+use super::emitter::gencol::compute_generated_columns;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -192,8 +192,12 @@ fn upsert_index_is_affected(
         return Ok(true);
     }
 
+    let changed_cols = match table.btree() {
+        Some(btree) => btree.columns_affected_by_update(directly_changed_cols.iter())?,
+        None => directly_changed_cols.try_clone()?,
+    };
     for c in referenced_index_cols(idx, table)? {
-        if directly_changed_cols.get(c) {
+        if changed_cols.get(c) {
             return Ok(true);
         }
     }
@@ -201,8 +205,7 @@ fn upsert_index_is_affected(
 }
 
 /// Collect the set of columns referenced by the partial WHERE (empty if none), or
-/// by the expression of any IndexColumn on the index. Virtual-column references
-/// are expanded to their transitive stored-column dependencies.
+/// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask> {
     let mut referenced_cols = ColumnMask::default();
 
@@ -216,10 +219,7 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
             referenced_cols.set(ic.pos_in_table)?;
         }
     }
-    match table.btree() {
-        Some(btree) => btree.dependencies_of_columns(referenced_cols),
-        None => Ok(referenced_cols),
-    }
+    Ok(referenced_cols)
 }
 
 /// Columns referenced by any expression index columns on the index.
@@ -780,12 +780,31 @@ pub fn emit_upsert(
                     None,
                 )?,
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that both index records and the table record
+            // use the converted values.
+            let affinity = bt
+                .columns()
+                .iter()
+                .filter(|c| !c.is_virtual_generated())
+                .map(|c| c.affinity());
+
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
 
-    // Recompute virtual columns for the new row after SET clauses have modified base columns.
+    // Recompute generated columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
-    compute_new_row_virtual_columns(
+    compute_new_row_generated_columns(
         program,
         ctx,
         new_start,
@@ -794,6 +813,7 @@ pub fn emit_upsert(
         DmlRowForm::UserFacing,
         resolver,
     )?;
+    emit_generated_column_notnull_checks(program, ctx, new_start, &layout, constraint_on_error);
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -817,25 +837,6 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
         }
 
         // Evaluate CHECK constraints on the new values
@@ -976,7 +977,7 @@ pub fn emit_upsert(
                     resolver,
                 )?;
             }
-            compute_new_row_virtual_columns(
+            compute_new_row_generated_columns(
                 program,
                 ctx,
                 new_start,
@@ -985,6 +986,13 @@ pub fn emit_upsert(
                 DmlRowForm::Stored,
                 resolver,
             )?;
+            emit_generated_column_notnull_checks(
+                program,
+                ctx,
+                new_start,
+                &layout,
+                constraint_on_error,
+            );
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
@@ -1638,9 +1646,9 @@ pub fn emit_upsert(
         }
     }
 
-    // Compute virtual columns for RETURNING (if any virtual columns exist)
+    // Compute the generated columns of the NEW image for RETURNING
     if !returning.is_empty() {
-        compute_new_row_virtual_columns(
+        compute_new_row_generated_columns(
             program,
             ctx,
             new_start,
@@ -1684,7 +1692,7 @@ fn do_update_constraint_on_error(program: &ProgramBuilder) -> Option<ast::Resolv
     }
 }
 
-fn compute_new_row_virtual_columns(
+fn compute_new_row_generated_columns(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
     new_start: usize,
@@ -1693,7 +1701,7 @@ fn compute_new_row_virtual_columns(
     form: DmlRowForm,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    if !ctx.table.has_virtual_columns {
+    if !ctx.table.has_generated_columns() {
         return Ok(());
     }
     let dml_ctx = DmlColumnContext::layout(
@@ -1703,13 +1711,38 @@ fn compute_new_row_virtual_columns(
         layout.clone(),
         form,
     );
-    compute_virtual_columns(
+    compute_generated_columns(
         program,
         &ctx.table.columns_topo_sort()?,
         &dml_ctx,
         resolver,
         ctx.table,
     )
+}
+
+fn emit_generated_column_notnull_checks(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    new_start: usize,
+    layout: &ColumnLayout,
+    on_error: Option<ast::ResolveType>,
+) {
+    for (idx, column) in ctx.table.columns().iter().enumerate() {
+        if !column.is_generated() || !column.notnull() {
+            continue;
+        }
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
+            target_reg: layout.to_register(new_start, idx),
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!(
+                "{}.{}",
+                ctx.table.name,
+                column.name.as_deref().expect("table columns have names")
+            ),
+            on_error,
+        });
+    }
 }
 
 /// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.

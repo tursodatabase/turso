@@ -14,7 +14,7 @@ use crate::types::IOResultOr;
 use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
-    schema::{Column, GeneratedType, Index, Schema, Table, Trigger, Type},
+    schema::{Column, Index, Schema, Table, Trigger, Type},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
@@ -1691,7 +1691,7 @@ where
                         func(SchemaExprOwner::ColumnDefault { table, column }, expr)
                     })?;
                 }
-                if let GeneratedType::Virtual { expr, .. } = column.generated_type() {
+                if let Some(expr) = column.generated_expr() {
                     walk_expr_with_subqueries(expr, &mut |expr| {
                         func(SchemaExprOwner::GeneratedColumn { table, column }, expr)
                     })?;

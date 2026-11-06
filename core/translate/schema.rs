@@ -800,6 +800,7 @@ fn validate(
             table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
+        table.check_stored_columns_have_no_custom_types(resolver.schema())?;
     }
     Ok(())
 }
