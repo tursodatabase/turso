@@ -38,6 +38,8 @@ const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
+const MULTIPROCESS_FRESH_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_fresh_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -471,6 +473,79 @@ fn multiprocess_async_open_child_process() {
     let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(count_test_rows(&conn), 1);
+}
+
+#[test]
+fn multiprocess_open_reinitializes_unpublished_coordination_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("unpublished-header.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let shm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
+    // A creator that died after sizing the file but before publishing the header.
+    std::fs::File::create(&shm_path)
+        .unwrap()
+        .set_len(1 << 16)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key)")
+        .unwrap();
+}
+
+/// Concurrent first opens of a new database must all succeed.
+#[test]
+fn concurrent_fresh_multiprocess_open_succeeds() {
+    const ROUNDS: usize = 20;
+    const OPENERS: usize = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let current_exe = std::env::current_exe().unwrap();
+
+    for round in 0..ROUNDS {
+        let db_path = dir.path().join(format!("fresh-open-{round}.db"));
+        let start_file = dir.path().join(format!("start-{round}"));
+        let children: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                Command::new(&current_exe)
+                    .arg(MULTIPROCESS_FRESH_OPEN_CHILD_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env("TURSO_MULTIPROCESS_DB_PATH", &db_path)
+                    .env("TURSO_MULTIPROCESS_START_FILE", &start_file)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        std::fs::write(&start_file, b"go").unwrap();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "round {round}: concurrent fresh open failed: stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// Child half of `concurrent_fresh_multiprocess_open_succeeds`.
+#[test]
+fn multiprocess_fresh_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let start_file = std::env::var_os("TURSO_MULTIPROCESS_START_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    wait_for_file(&start_file);
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let _db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
 }
 
 /// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
