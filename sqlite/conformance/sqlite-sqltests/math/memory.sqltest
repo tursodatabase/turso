@@ -735,6 +735,22 @@ expect {
     -0.549306144334055
 }
 
+@backend rust
+test atanh-roundtrip-before-ceil {
+    SELECT ceil(atanh(-tanh(1.0))) = 0.0;
+}
+expect {
+    1
+}
+
+@backend rust
+test atanh-minimized-math-fuzz-regression {
+    SELECT mod((0.0), 0.0 - exp((0.0))) + ceil((atanh((-1.0) * tanh(1.0)))) = 0.0;
+}
+expect {
+    1
+}
+
 test atanh-str {
     SELECT atanh('-0.5')
 }
