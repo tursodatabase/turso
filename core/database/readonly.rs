@@ -51,14 +51,14 @@ struct ObservedContents {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReadObservation {
     count: usize,
-    checksum: u128,
+    checksum: [u8; 16],
 }
 
 impl ReadObservation {
     fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             count: bytes.len(),
-            checksum: twox_hash::XxHash3_128::oneshot(bytes),
+            checksum: twox_hash::XxHash3_128::oneshot(bytes).to_le_bytes(),
         }
     }
 }
