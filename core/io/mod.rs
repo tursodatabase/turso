@@ -457,6 +457,66 @@ impl File for DiskTempFile {
     }
 }
 
+#[cfg(all(
+    test,
+    feature = "fs",
+    any(target_family = "unix", target_os = "windows"),
+    not(miri),
+    not(shuttle)
+))]
+mod filesystem_open_tests {
+    use super::*;
+
+    #[test]
+    fn readonly_create_syscall() {
+        check_readonly_create(&SyscallIO::new().unwrap());
+    }
+
+    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+    #[test]
+    fn readonly_create_win_iocp() {
+        check_readonly_create(&WindowsIOCP::new().unwrap());
+    }
+
+    fn check_readonly_create(io: &dyn IO) {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        let existing = dir.path().join("existing.db");
+        let contents = b"preserve existing file bytes";
+        std::fs::write(&existing, contents).unwrap();
+
+        for flags in [OpenFlags::ReadOnly, OpenFlags::ReadOnly | OpenFlags::Create] {
+            let result = io.open_file(missing.to_str().unwrap(), flags, false);
+            assert!(result.is_err(), "read-only open succeeded: {flags:?}");
+            assert!(
+                !missing.exists(),
+                "read-only open created a file: {flags:?}"
+            );
+
+            let file = io
+                .open_file(existing.to_str().unwrap(), flags, false)
+                .unwrap();
+            assert_eq!(file.size().unwrap(), contents.len() as u64);
+            drop(file);
+            assert_eq!(std::fs::read(&existing).unwrap(), contents);
+        }
+
+        let file = io
+            .open_file(missing.to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+        assert!(missing.exists());
+        assert_eq!(file.size().unwrap(), 0);
+        drop(file);
+
+        let file = io
+            .open_file(existing.to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+        assert_eq!(file.size().unwrap(), contents.len() as u64);
+        drop(file);
+        assert_eq!(std::fs::read(&existing).unwrap(), contents);
+    }
+}
+
 #[cfg(all(test, feature = "fs", not(target_family = "wasm")))]
 mod temp_file_tests {
     use super::*;
