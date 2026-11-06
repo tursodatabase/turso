@@ -249,21 +249,26 @@ class Database extends DatabasePromise {
      * When remoteWrites is enabled, returns a wrapper that routes writes to remote.
      */
     override async prepare(sql: string) {
-        const localStmt = await super.prepare(sql);
+        await this.execLock.acquire();
+        try {
+            const localStmt = await super.prepare(sql);
 
-        if (!this.#remoteWriter) {
-            return localStmt;
+            if (!this.#remoteWriter) {
+                return localStmt;
+            }
+
+            const category = this.#db.classifySql(sql);
+            const isReadonly = category === "read";
+            return new RemoteWriteStatement(
+                localStmt,
+                sql,
+                isReadonly,
+                this.#remoteWriter,
+                () => this.pull(),
+            ) as any;
+        } finally {
+            this.execLock.release();
         }
-
-        const category = this.#db.classifySql(sql);
-        const isReadonly = category === "read";
-        return new RemoteWriteStatement(
-            localStmt,
-            sql,
-            isReadonly,
-            this.#remoteWriter,
-            () => this.pull(),
-        ) as any;
     }
 
     /**
