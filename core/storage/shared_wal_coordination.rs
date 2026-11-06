@@ -34,6 +34,7 @@ use crate::{
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
@@ -41,6 +42,8 @@ const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
+const CREATOR_INIT_WAIT: Duration = Duration::from_secs(5);
+const CREATOR_INIT_POLL: Duration = Duration::from_millis(1);
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
 const UNUSED_READER_FRAME: u64 = u64::MAX;
 /// Frame stored in the reader slot of readers that read only the database
@@ -939,21 +942,39 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
-        let metadata_len = file.size()? as usize;
-        let initialize = metadata_len == 0
-            || (open_mode == SharedWalCoordinationOpenMode::Exclusive && metadata_len < base_len);
-        if open_mode == SharedWalCoordinationOpenMode::MultiProcess && metadata_len < base_len {
+        let deadline = Instant::now() + CREATOR_INIT_WAIT;
+        let (open_mode, metadata_len, initialize, base_mapping) = loop {
+            let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
+            let metadata_len = file.size()? as usize;
+            let multi_process = open_mode == SharedWalCoordinationOpenMode::MultiProcess;
+            // The creator holds the lifetime lock while it sizes and initializes.
+            let mut creator_in_progress = multi_process && metadata_len < base_len;
+            let initialize = !multi_process && metadata_len < base_len;
+            if initialize {
+                file.shared_wal_set_len(initial_file_len as u64)?;
+            }
+            let mut mapping = None;
+            if !creator_in_progress {
+                let base_mapping = file.shared_wal_map(0, base_len)?;
+                creator_in_progress = multi_process && !Self::header_published(&*base_mapping);
+                mapping = Some(base_mapping);
+            }
+            match mapping {
+                Some(base_mapping) if !creator_in_progress => {
+                    break (open_mode, metadata_len, initialize, base_mapping);
+                }
+                _ => {}
+            }
+            // Unlock while waiting so a dead creator's file gets re-initialized.
+            drop(mapping);
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
-            )));
-        }
-        if initialize {
-            file.shared_wal_set_len(initial_file_len as u64)?;
-        }
-
-        let base_mapping = file.shared_wal_map(0, base_len)?;
+            if Instant::now() >= deadline {
+                return Err(LimboError::Corrupt(format!(
+                    "shared WAL coordination file was not initialized in time: got {metadata_len}, minimum {base_len}"
+                )));
+            }
+            std::thread::sleep(CREATOR_INIT_POLL);
+        };
         let base_ptr = base_mapping.ptr();
 
         let mut region = Self::new_region(
@@ -2895,7 +2916,6 @@ impl MappedSharedWalCoordination {
             .as_ptr()
             .cast::<SharedWalCoordinationMapHeader>();
         unsafe {
-            std::ptr::addr_of_mut!((*header).magic).write(SHARED_WAL_COORDINATION_MAGIC);
             std::ptr::addr_of_mut!((*header).version).write(SHARED_WAL_COORDINATION_VERSION);
             std::ptr::addr_of_mut!((*header).reader_slot_count).write(reader_slot_count);
             std::ptr::addr_of_mut!((*header).reader_bitmap_word_count)
@@ -2941,6 +2961,26 @@ impl MappedSharedWalCoordination {
         for owner in self.reader_owners() {
             owner.store(UNOWNED_LOCK, Ordering::Release);
         }
+        // Written last: a zero magic means initialization is unfinished.
+        unsafe {
+            Self::magic_word(self.base_ptr.as_ptr()).store(
+                u64::from_ne_bytes(SHARED_WAL_COORDINATION_MAGIC),
+                Ordering::Release,
+            );
+        }
+    }
+
+    fn header_published(mapping: &dyn SharedWalMappedRegion) -> bool {
+        // SAFETY: the mapping is at least one header long and page aligned.
+        let magic = unsafe { Self::magic_word(mapping.ptr().as_ptr()) };
+        magic.load(Ordering::Acquire) != 0
+    }
+
+    /// SAFETY: `base` must point to a live, 8-byte aligned header mapping.
+    // std atomic, not crate::sync: shuttle's AtomicU64 has no `from_ptr`, and
+    // this word is shared with other processes, which shuttle cannot model.
+    unsafe fn magic_word<'a>(base: *mut u8) -> &'a std::sync::atomic::AtomicU64 {
+        unsafe { std::sync::atomic::AtomicU64::from_ptr(base.cast::<u64>()) }
     }
 
     fn validate_existing(
