@@ -443,8 +443,10 @@ jobs:
           seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
             i="$1"
             log="sim-run-$i.log"
+            seed="$(od -An -N8 -tu8 /dev/urandom | tr -d "[:space:]")"
+            echo "iteration $i starting: seed: $seed"
             read -r -a args <<< "$SIM_ARGS"
-            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
+            if ./target/debug/limbo_sim "${args[@]}" --seed "$seed" >"$log" 2>&1; then
               echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
             else
               echo "iteration $i FAILED:"
@@ -452,6 +454,14 @@ jobs:
               exit 255
             fi
           ' _
+      - name: Upload simulator logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-${{ matrix.profile.name }}-${{ github.run_attempt }}
+          path: sim-run-*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
         # TODO: find out why this blows the stack so quickly every time..
         # e.g. https://github.com/tursodatabase/turso/actions/runs/22370904813/job/64749257476?pr=5588
