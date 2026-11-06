@@ -319,13 +319,13 @@ impl IndexMethod for VectorSparseInvertedIndexMethod {
         &self,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let column = crate::util::quote_identifier(&configuration.columns[0].name);
+        let table = crate::util::quote_identifier(&configuration.table_name);
         let query_pattern1 = format!(
-            "SELECT vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?",
-            configuration.columns[0].name, configuration.table_name
+            "SELECT vector_distance_jaccard({column}, ?) as distance FROM {table} ORDER BY distance LIMIT ?"
         );
         let query_pattern2 = format!(
-            "SELECT vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?",
-            configuration.columns[0].name, configuration.table_name
+            "SELECT vector_distance_jaccard(?, {column}) as distance FROM {table} ORDER BY distance LIMIT ?"
         );
         Ok(Arc::new(VectorSparseInvertedIndexMethodAttachment {
             configuration: configuration.clone(),
@@ -335,6 +335,12 @@ impl IndexMethod for VectorSparseInvertedIndexMethod {
 }
 
 impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
+    fn rename_table(&self, to: &str) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let mut configuration = self.configuration.clone();
+        configuration.table_name = to.to_string();
+        VectorSparseInvertedIndexMethod.attach(&configuration)
+    }
+
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,

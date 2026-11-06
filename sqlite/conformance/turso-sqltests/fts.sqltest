@@ -3,6 +3,72 @@
 @skip-file-if mvcc "index methods not supported in mvcc mode"
 
 @backend cli
+test fts-table-repeated-rename-and-drop-index {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX idx ON t USING fts(a);
+    INSERT INTO t VALUES ('hello');
+    ALTER TABLE t RENAME TO "new name";
+    SELECT count(*) FROM "new name" WHERE fts_match(a, 'hello');
+    ALTER TABLE "new name" RENAME TO final;
+    INSERT INTO final VALUES ('hello again');
+    SELECT count(*) FROM final WHERE fts_match(a, 'hello');
+    DROP INDEX idx;
+    SELECT count(*) FROM final;
+}
+expect {
+    1
+    2
+    2
+}
+
+@backend cli
+test fts-table-rename-keeps-index-usable {
+    CREATE TABLE t(a TEXT, b TEXT);
+    CREATE INDEX idx ON t USING fts(a, b);
+    INSERT INTO t VALUES ('hello', 'x');
+    ALTER TABLE t RENAME TO t2;
+    SELECT rowid FROM t2 WHERE fts_match(a, b, 'hello');
+    INSERT INTO t2 VALUES ('hello again', 'y');
+    SELECT count(*) FROM t2 WHERE fts_match(a, b, 'hello');
+}
+expect {
+    1
+    2
+}
+
+@backend cli
+test fts-table-rename-rollback {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX idx ON t USING fts(a);
+    INSERT INTO t VALUES ('hello');
+    BEGIN;
+    ALTER TABLE t RENAME TO t2;
+    SELECT count(*) FROM t2 WHERE fts_match(a, 'hello');
+    ROLLBACK;
+    SELECT count(*) FROM t WHERE fts_match(a, 'hello');
+}
+expect {
+    1
+    1
+}
+
+@backend cli
+test fts-table-rename-preserves-uncommitted-writes {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX idx ON t USING fts(a);
+    BEGIN;
+    INSERT INTO t VALUES ('hello');
+    ALTER TABLE t RENAME TO t2;
+    SELECT count(*) FROM t2 WHERE fts_match(a, 'hello');
+    COMMIT;
+    SELECT count(*) FROM t2 WHERE fts_match(a, 'hello');
+}
+expect {
+    1
+    1
+}
+
+@backend cli
 test fts-ranked-limit-offset {
     CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT);
     CREATE INDEX fx ON d USING fts(body);

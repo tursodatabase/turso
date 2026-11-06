@@ -949,6 +949,14 @@ fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<H
 }
 
 impl IndexMethodAttachment for FtsIndexAttachment {
+    fn rename_table(&self, to: &str) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let mut cfg = self.cfg.clone();
+        cfg.table_name = to.to_string();
+        let mut attachment = Self::new(cfg)?;
+        attachment.shared = Arc::clone(&self.shared);
+        Ok(Arc::new(attachment))
+    }
+
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: FTS_INDEX_METHOD_NAME,

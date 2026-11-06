@@ -79,6 +79,13 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
     fn backing_schema(&self) -> BackingSchema;
 
+    /// Rebind the attachment when its indexed table is renamed.
+    fn rename_table(&self, _to: &str) -> Result<Arc<dyn IndexMethodAttachment>> {
+        Err(LimboError::InternalError(
+            "table rename is not supported by this index method".to_string(),
+        ))
+    }
+
     /// Returns the result expression this index provides for the captured query parameters.
     /// The planner compares it with the requested expression before using an index result
     /// instead of evaluating the function. Return None if the index cannot provide it.
