@@ -19,6 +19,7 @@ use turso_core::{
 };
 use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
+use turso_pg_parser::routine::{routine_error, CatalogType};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
@@ -384,6 +385,12 @@ fn prepare_statement_inner(
         return Err(in_failed_sql_transaction_error());
     }
 
+    if let Some(error) = routine_error(sql, &parse_result, |schema, name| {
+        signature_type(&pg_conn.conn, schema, name)
+    }) {
+        return Err(translation_error(&pg_conn.conn, error));
+    }
+
     // The single definition of what counts as the transaction's first
     // query, for every kind of statement this function returns.
     let marks_query_start = execution_takes_snapshot(&parse_result);
@@ -489,6 +496,37 @@ fn prepare_statement_inner(
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
     .with_post_run(post_run))
+}
+
+/// What a type name in a function signature names: the row type of a
+/// table, view or sequence, which is looked up like a relation, or a type
+/// that CREATE TYPE or CREATE DOMAIN made. Such a type is not in a schema,
+/// so only a name without a schema or with `public` can name it.
+fn signature_type(conn: &Arc<Connection>, schema: Option<&str>, name: &str) -> CatalogType {
+    let is_relation = relation_lookup_namespaces(conn, schema)
+        .iter()
+        .any(|namespace| {
+            conn.with_schema(namespace.database_id(), |catalog| {
+                let ns = namespace.target.id;
+                catalog.get_table(ns, name).is_some()
+                    || catalog.get_view(ns, name).is_some()
+                    || catalog.has_sequence(ns, name)
+            })
+        });
+    if is_relation {
+        return CatalogType::RowType;
+    }
+    let is_user_defined = matches!(schema, None | Some("public"))
+        && conn.with_schema(turso_core::MAIN_DB_ID, |catalog| {
+            catalog
+                .get_type_def_unchecked(name)
+                .is_some_and(|type_def| !type_def.is_builtin)
+        });
+    if is_user_defined {
+        CatalogType::UserDefined
+    } else {
+        CatalogType::Missing
+    }
 }
 
 /// Connection and session state changes that must follow a statement's
