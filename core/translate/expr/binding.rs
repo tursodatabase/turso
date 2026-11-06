@@ -5,8 +5,8 @@ use crate::schema::{
 };
 use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
-    is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
-    ColumnLookup, OuterQueryReference, ResolvedColumn,
+    expand_star, is_schema_table, merge_columns, resolve_unqualified_column,
+    unqualified_column_sources, ColumnLookup, OuterQueryReference, ResolvedColumn,
 };
 
 /// The precedence of binding identifiers to columns.
@@ -520,45 +520,26 @@ pub fn bind_and_rewrite_expr<'a>(
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
-                                let joined_tables = referenced_tables.joined_tables();
-                                if !joined_tables.is_empty() {
-                                    // Mark all columns as used so the optimizer doesn't
-                                    // create partial covering indexes that would miss columns
-                                    let joined_tables = referenced_tables.joined_tables_mut();
-                                    for table in joined_tables.iter_mut() {
-                                        for col_idx in 0..table.columns().len() {
-                                            table.mark_column_used(col_idx);
-                                        }
-                                    }
-
-                                    // Build arguments: alternating column_name (as string literal), column_value (as column reference)
+                                if !referenced_tables.joined_tables().is_empty() {
+                                    // Take the same columns as SELECT *, so a USING or
+                                    // NATURAL column appears once and a duplicate table
+                                    // is ambiguous.
+                                    let mut star_columns = Vec::new();
+                                    expand_star(
+                                        referenced_tables,
+                                        &mut star_columns,
+                                        false,
+                                        resolver,
+                                    )?;
                                     let mut args: Vec<Box<ast::Expr>> = Vec::new();
-
-                                    let joined_tables = referenced_tables.joined_tables();
-                                    for table in joined_tables.iter() {
-                                        for (col_idx, col) in table.columns().iter().enumerate() {
-                                            // Skip hidden columns (like rowid in some cases)
-                                            if col.hidden() {
-                                                continue;
-                                            }
-
-                                            // Add column name as a string literal
-                                            let col_name = col.name.clone().unwrap_or_else(|| {
-                                                format!("column{}", col_idx + 1)
-                                            });
-                                            let quoted_col_name = format!("'{col_name}'");
-                                            args.push(Box::new(ast::Expr::Literal(
-                                                ast::Literal::String(quoted_col_name),
-                                            )));
-
-                                            // Add column reference using Expr::Column
-                                            args.push(Box::new(ast::Expr::Column {
-                                                database: None,
-                                                table: table.internal_id,
-                                                column: col_idx,
-                                                is_rowid_alias: col.is_rowid_alias(),
-                                            }));
-                                        }
+                                    for column in star_columns {
+                                        let column_name = column
+                                            .alias
+                                            .expect("star expansion names every column");
+                                        args.push(Box::new(ast::Expr::Literal(
+                                            ast::Literal::String(format!("'{column_name}'")),
+                                        )));
+                                        args.push(Box::new(column.expr));
                                     }
 
                                     // Replace FunctionCallStar with expanded FunctionCall
