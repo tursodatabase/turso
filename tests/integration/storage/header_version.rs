@@ -2008,7 +2008,7 @@ impl turso_core::IO for ActivationFaultIO {
         if !self.state.paused.load(std::sync::atomic::Ordering::Acquire) {
             let read = self.state.reads.lock().unwrap().pop();
             if let Some(read) = read {
-                let _ = read.file.pread(read.offset, read.completion)?;
+                drop(read.file.pread(read.offset, read.completion)?);
             }
         }
         self.inner.step()
@@ -2085,7 +2085,7 @@ impl turso_core::io::File for ActivationFaultFile {
             }
             Err(error) => original.error(error),
         });
-        let _ = self.inner.pwrite(offset, buffer, proxy)?;
+        drop(self.inner.pwrite(offset, buffer, proxy)?);
         Ok(c)
     }
     fn sync(
