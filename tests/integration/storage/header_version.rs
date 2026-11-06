@@ -1203,6 +1203,10 @@ fn test_readonly_first_writer_activation_preserves_readers() {
             .execute("INSERT INTO t(val) VALUES ('survivor')")
             .unwrap();
         writer.close().unwrap();
+        drop(reader);
+        drop(writer);
+        drop(writer_db);
+        drop(db);
         assert_eq!(read_header_versions(&path), (2, 2));
     }
 }
