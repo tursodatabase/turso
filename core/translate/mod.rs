@@ -36,6 +36,7 @@ pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod roles;
 pub(crate) mod rollback;
+pub(crate) mod row_security;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod sequence;
@@ -153,6 +154,9 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+    if !is_engine_statement {
+        resolver.row_security_role = connection.row_security_role()?;
+    }
 
     walk_stmt_expressions(&stmt, &mut |expr| {
         if let ast::Expr::Variable(variable) = expr {
@@ -234,6 +238,8 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::CreatePolicy(..)
+            | ast::Stmt::DropPolicy { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -564,6 +570,20 @@ fn translate_statement(
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;
         }
+        ast::Stmt::CreatePolicy(policy) => {
+            row_security::translate_create_policy(&policy, resolver, program)?
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => row_security::translate_drop_policy(
+            &policy_name,
+            &tbl_name,
+            if_exists,
+            resolver,
+            program,
+        )?,
     };
 
     if is_write {
@@ -653,6 +673,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::DropSequence { .. } => "drop_sequence",
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
+        ast::Stmt::CreatePolicy(..) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 

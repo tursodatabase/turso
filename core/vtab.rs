@@ -631,6 +631,11 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
         order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode>;
     fn sql(&self) -> String;
+    /// Whether the table reads the database file directly, which shows rows
+    /// that row-level security hides.
+    fn reads_raw_storage(&self) -> bool {
+        false
+    }
 }
 
 pub trait InternalVirtualTableCursor: Send + Sync {

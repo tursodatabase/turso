@@ -2103,6 +2103,15 @@ pub fn insn_to_row(
                 0,
                 format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
             ),
+            Insn::UpdateRowSecurity { db, change } => (
+                "UpdateRowSecurity",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("update row security {change:?}"),
+            ),
             Insn::DropView {
                 db,
                 namespace: _,

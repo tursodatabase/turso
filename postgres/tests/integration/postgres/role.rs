@@ -317,6 +317,37 @@ fn role_without_privileges_cannot_drop_schema_or_copy_from_a_file(db: TempDataba
     assert_eq!(copy.to_string(), "permission denied to COPY from a file");
 }
 
+/// Privileges are not stored, so only a GRANT that matches what roles may do
+/// anyway succeeds: every role may read every table and write none.
+#[test]
+fn only_grant_select_on_a_table_is_accepted() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+
+    conn.execute("GRANT SELECT ON t TO alice").unwrap();
+    conn.execute("GRANT SELECT ON TABLE t TO alice, PUBLIC")
+        .unwrap();
+    for sql in [
+        "REVOKE SELECT ON t FROM alice",
+        "GRANT INSERT ON t TO alice",
+        "GRANT SELECT, UPDATE ON t TO alice",
+        "GRANT ALL ON t TO alice",
+        "GRANT SELECT (x) ON t TO alice",
+        "GRANT SELECT ON t TO alice WITH GRANT OPTION",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO alice",
+        "GRANT USAGE ON SCHEMA public TO alice",
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO alice",
+    ] {
+        let error = conn.execute(sql).unwrap_err();
+        assert!(
+            error.to_string().ends_with("is not supported"),
+            "{sql}: {error}"
+        );
+    }
+}
+
 /// The PostgreSQL frontend runs in MVCC mode, which has no materialized
 /// views, so REFRESH does nothing for the superuser even without the view.
 #[test]

@@ -32,6 +32,7 @@ pub enum CommandTag {
     CreateFunction,
     CreateIndex,
     CreateMaterializedView,
+    CreatePolicy,
     CreateProcedure,
     CreateRole,
     CreateSchema,
@@ -51,6 +52,7 @@ pub enum CommandTag {
     DropFunction,
     DropIndex,
     DropMaterializedView,
+    DropPolicy,
     DropProcedure,
     DropRole,
     DropSchema,
@@ -134,6 +136,7 @@ impl CommandTag {
             }
             NodeEnum::CreateFunctionStmt(_) => Self::CreateFunction,
             NodeEnum::CreateExtensionStmt(_) => Self::CreateExtension,
+            NodeEnum::CreatePolicyStmt(_) => Self::CreatePolicy,
             NodeEnum::CreateRoleStmt(_) => Self::CreateRole,
             NodeEnum::AlterRoleStmt(_) => Self::AlterRole,
             NodeEnum::DropRoleStmt(_) => Self::DropRole,
@@ -203,6 +206,7 @@ impl CommandTag {
             Self::CreateIndex => "CREATE INDEX",
             Self::CreateMaterializedView => "CREATE MATERIALIZED VIEW",
             Self::CreateProcedure => "CREATE PROCEDURE",
+            Self::CreatePolicy => "CREATE POLICY",
             Self::CreateRole => "CREATE ROLE",
             Self::CreateSchema => "CREATE SCHEMA",
             Self::CreateSequence => "CREATE SEQUENCE",
@@ -222,6 +226,7 @@ impl CommandTag {
             Self::DropIndex => "DROP INDEX",
             Self::DropMaterializedView => "DROP MATERIALIZED VIEW",
             Self::DropProcedure => "DROP PROCEDURE",
+            Self::DropPolicy => "DROP POLICY",
             Self::DropRole => "DROP ROLE",
             Self::DropSchema => "DROP SCHEMA",
             Self::DropSequence => "DROP SEQUENCE",
@@ -287,6 +292,7 @@ impl CommandTag {
     fn drop(object: ObjectType) -> Self {
         match object {
             ObjectType::ObjectTable => Self::DropTable,
+            ObjectType::ObjectPolicy => Self::DropPolicy,
             ObjectType::ObjectIndex => Self::DropIndex,
             ObjectType::ObjectSequence => Self::DropSequence,
             ObjectType::ObjectView => Self::DropView,
@@ -366,6 +372,15 @@ mod tests {
             ("ALTER SEQUENCE s RESTART", CommandTag::AlterSequence),
             ("TRUNCATE t", CommandTag::TruncateTable),
             ("GRANT SELECT ON t TO alice", CommandTag::Grant),
+            (
+                "CREATE POLICY p ON t USING (true)",
+                CommandTag::CreatePolicy,
+            ),
+            ("DROP POLICY p ON t", CommandTag::DropPolicy),
+            (
+                "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+                CommandTag::AlterTable,
+            ),
             ("REVOKE SELECT ON t FROM alice", CommandTag::Revoke),
             ("START TRANSACTION", CommandTag::StartTransaction),
             ("ROLLBACK TO SAVEPOINT sp", CommandTag::Rollback),

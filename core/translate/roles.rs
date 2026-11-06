@@ -75,6 +75,14 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
             Action::Alter,
             Object::Table(alter.name.name.as_str().to_string()),
         ),
+        ast::Stmt::CreatePolicy(policy) => PermissionDenied::owner(
+            Action::Alter,
+            Object::Table(policy.tbl_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::DropPolicy { tbl_name, .. } => PermissionDenied::owner(
+            Action::Alter,
+            Object::Table(tbl_name.name.as_str().to_string()),
+        ),
         ast::Stmt::DropTable { tbl_name, .. } => PermissionDenied::owner(
             Action::Drop,
             Object::Table(tbl_name.name.as_str().to_string()),

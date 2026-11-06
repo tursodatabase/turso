@@ -28,6 +28,10 @@ impl BtreeDumpTable {
 }
 
 impl InternalVirtualTable for BtreeDumpTable {
+    fn reads_raw_storage(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "btree_dump".to_string()
     }

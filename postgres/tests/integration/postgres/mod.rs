@@ -6,6 +6,7 @@ mod functions;
 mod namespace;
 mod parse_edge_cases;
 mod role;
+mod row_security;
 mod sequence;
 mod table;
 mod type_aliases;

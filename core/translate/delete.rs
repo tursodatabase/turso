@@ -105,6 +105,11 @@ pub fn translate_delete(
         program,
         connection,
     )?;
+    crate::translate::row_security::reject_write_with_row_security(
+        &normalized_table_name,
+        namespace,
+        resolver,
+    )?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

@@ -326,6 +326,11 @@ pub fn translate_insert(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
+    crate::translate::row_security::reject_write_with_row_security(
+        &btree_table.name,
+        namespace,
+        resolver,
+    )?;
 
     let BoundInsertResult {
         mut values,

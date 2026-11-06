@@ -15204,6 +15204,20 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_update_row_security(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(UpdateRowSecurity { db, change }, insn);
+    program.connection.with_database_schema_mut(*db, |schema| {
+        Arc::make_mut(&mut schema.row_security).apply(change)
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads

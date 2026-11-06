@@ -26,6 +26,10 @@ impl DbPageTable {
 }
 
 impl InternalVirtualTable for DbPageTable {
+    fn reads_raw_storage(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         DBPAGE_TABLE_NAME.to_string()
     }

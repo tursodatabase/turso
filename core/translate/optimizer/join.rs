@@ -833,7 +833,9 @@ fn join_lhs_and_rhs<'a>(
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
-                && !build_is_left_of_right_or_full_join;
+                && !build_is_left_of_right_or_full_join
+                && !table_references.is_row_security_filtered(build_table.internal_id)
+                && !table_references.is_row_security_filtered(rhs_table_reference.internal_id);
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),

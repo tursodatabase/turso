@@ -2,6 +2,158 @@
 
 ## The SQL language
 
+### `ALTER TABLE ... ROW LEVEL SECURITY` — hide rows from roles
+
+**Synopsis:**
+
+```sql
+ALTER TABLE name ENABLE ROW LEVEL SECURITY
+ALTER TABLE name DISABLE ROW LEVEL SECURITY
+```
+
+**Description:**
+
+`ENABLE ROW LEVEL SECURITY` makes the table show a role that is not a
+superuser only the rows that one of the table's policies shows, as created
+with `CREATE POLICY`. Without policies, such a role sees no rows. The
+superuser always sees every row.
+
+`DISABLE ROW LEVEL SECURITY` shows every row to every role again. The table
+keeps its policies.
+
+**Parameters:**
+
+- `name`: The name of a table in the database, optionally schema-qualified.
+
+**Notes:**
+
+Only a superuser can change a table's row-level security.
+
+Rows are hidden in every query that reads the table, including joins,
+subqueries, CTEs and views. Views are checked as the role running the query,
+not as the view's owner. On the right side of a `LEFT JOIN`, a hidden row
+reads as NULLs like a row that does not exist. `RIGHT JOIN` and `FULL JOIN`
+with such a table are not supported.
+
+A role cannot insert, update or delete rows of a table with row-level
+security yet. Renaming such a table is not supported. `DROP TABLE` removes
+the table's row-level security and policies.
+
+**Examples:**
+
+```sql
+CREATE TABLE documents (id int PRIMARY KEY, owner text, title text);
+INSERT INTO documents VALUES (1, 'alice', 'Plan'), (2, 'bob', 'Budget');
+CREATE ROLE alice;
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+SET ROLE alice;
+SELECT count(*) FROM documents;
+```
+
+```
+ count
+-------
+     0
+(1 row)
+```
+
+### `CREATE POLICY` — show rows of a table to roles
+
+**Synopsis:**
+
+```sql
+CREATE POLICY name ON table_name
+    [ AS { PERMISSIVE | RESTRICTIVE } ]
+    [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+    [ TO { role_name | PUBLIC } [, ...] ]
+    [ USING ( condition ) ]
+    [ WITH CHECK ( check_condition ) ]
+```
+
+**Description:**
+
+`CREATE POLICY` adds a policy to a table with row-level security. A role that
+is not a superuser sees a row when the `USING` condition of at least one
+permissive policy for that role is true for it, and the `USING` conditions
+of all restrictive policies for that role are true too. Policies are
+permissive unless created `AS RESTRICTIVE`. Only `FOR ALL` and `FOR SELECT`
+policies decide which rows a role sees.
+Policies have no effect while the table's row-level security is disabled.
+
+**Parameters:**
+
+- `name`: The name of the policy, unique among the table's policies.
+- `table_name`: The name of the table, optionally schema-qualified.
+- `role_name`: A role the policy applies to. `PUBLIC`, the default, means
+  every role.
+- `condition`: Which rows the policy shows: the rows for which the condition
+  is true. It can use the columns of the table, written as `column` or
+  `table_name.column`, and call functions such as `current_user` or
+  `auth.uid()`. A policy without `USING` shows no rows.
+- `check_condition`: Which rows the policy lets a role write. It follows the
+  same rules as `condition`.
+
+**Notes:**
+
+Only a superuser can create policies.
+
+The conditions cannot contain subqueries, except `(SELECT expression)`
+without `FROM`, which is the same as `(expression)`. Supabase recommends that
+form, as in `(SELECT auth.uid())`. It cannot use generated columns that are
+not stored.
+
+The condition is checked before the query's own conditions, so the query never
+evaluates its expressions on a row the role cannot see. An index on a column
+the condition compares can be used to find the rows.
+
+A role named in `TO` must have been created with `CREATE ROLE`. A policy
+applies only to the roles it names, not to other roles that are members of
+them.
+
+`WITH CHECK` cannot be used with `FOR SELECT` or `FOR DELETE`, and
+`FOR INSERT` policies can only have `WITH CHECK`, as in PostgreSQL.
+
+Roles cannot write to tables with row-level security yet. `FOR INSERT`,
+`FOR UPDATE` and `FOR DELETE` policies and `WITH CHECK` conditions are kept,
+so scripts written for PostgreSQL run, but they have no effect. The columns a policy uses cannot be renamed,
+dropped or altered. Policies are not listed in the `pg_policy` catalog.
+
+**Examples:**
+
+Show each role its own documents:
+
+```sql
+CREATE POLICY own_documents ON documents
+    FOR SELECT
+    USING (owner = (SELECT current_user));
+SET ROLE alice;
+SELECT id, title FROM documents;
+```
+
+```
+ id | title
+----+-------
+  1 | Plan
+(1 row)
+```
+
+Show each Supabase user their own rows. The user comes from the request's JWT
+claims:
+
+```sql
+CREATE ROLE authenticated;
+CREATE TABLE todos (id int PRIMARY KEY, user_id uuid, title text);
+ALTER TABLE todos ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_todos ON todos
+    FOR SELECT TO authenticated
+    USING ((SELECT auth.uid()) = user_id);
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub": "11111111-1111-1111-1111-111111111111"}', true);
+SELECT id, title FROM todos;
+COMMIT;
+```
+
 ### `CREATE ROLE` — create a role
 
 **Synopsis:**
@@ -52,6 +204,58 @@ SELECT rolname FROM pg_roles;
 (2 rows)
 ```
 
+### `DROP POLICY` — remove a policy
+
+**Synopsis:**
+
+```sql
+DROP POLICY [ IF EXISTS ] name ON table_name
+```
+
+**Description:**
+
+`DROP POLICY` removes a policy from a table. If it was the table's last
+policy and the table has row-level security, a role that is not a superuser
+then sees no rows of the table.
+
+**Parameters:**
+
+- `IF EXISTS`: Do nothing instead of failing if the policy does not exist.
+- `name`: The name of the policy.
+- `table_name`: The name of the table, optionally schema-qualified.
+
+**Notes:**
+
+Only a superuser can drop policies.
+
+**Examples:**
+
+```sql
+DROP POLICY own_documents ON documents;
+```
+
+### `GRANT SELECT` — let roles read tables
+
+**Synopsis:**
+
+```sql
+GRANT SELECT ON [ TABLE ] table_name [, ...] TO role [, ...]
+```
+
+**Description:**
+
+`GRANT SELECT` on tables succeeds and stores nothing, because every role may
+already read every table, except the rows that row-level security hides. It is
+accepted so that scripts written for PostgreSQL run unchanged.
+
+**Notes:**
+
+Privileges are not stored yet, so any other `GRANT`, and `REVOKE`, fail with
+an error instead of claiming to change what a role may do. This includes
+other privileges, column lists, `WITH GRANT OPTION`, `ON ALL TABLES IN
+SCHEMA`, and objects other than tables. Granting a role to another role is not
+supported.
+
 ### `SET ROLE` — set the current role
 
 **Synopsis:**
@@ -86,10 +290,12 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership, `GRANT` and table privileges are not supported yet. A role that is
-not a superuser may read the rows of every table, but it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create, alter or
-drop objects, create roles, or `COPY FROM` a file.
+Ownership and table privileges are not supported yet; only `GRANT SELECT` on
+tables is accepted.
+A role that is not a superuser may read the rows of every table, except the
+rows that row-level security hides, but it cannot insert, update, delete or
+truncate rows, call `nextval` or `setval`, create, alter or drop objects,
+create roles, or `COPY FROM` a file.
 
 **Examples:**
 

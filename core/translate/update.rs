@@ -271,6 +271,11 @@ fn prepare_update_plan(
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
+    crate::translate::row_security::reject_write_with_row_security(
+        target_name.as_str(),
+        namespace,
+        resolver,
+    )?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
@@ -328,6 +333,11 @@ fn prepare_update_plan(
         &mut vtab_predicates,
         &mut from_tables,
         connection,
+    )?;
+    crate::translate::row_security::add_select_row_security_filters(
+        &mut from_tables,
+        &mut where_clause,
+        resolver,
     )?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces

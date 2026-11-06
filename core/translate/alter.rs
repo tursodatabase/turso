@@ -36,6 +36,7 @@ use crate::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
         },
+        row_security,
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -872,22 +873,18 @@ pub fn translate_alter_table(
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
 
-    // Check if this table has dependent materialized views
-    let dependent_views = resolver.with_schema(database_id, |s| {
-        s.get_dependent_materialized_views(namespace.id, table_name)
-    });
-    if !dependent_views.is_empty() {
-        return Err(LimboError::ParseError(format!(
-            "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
-            dependent_views.join(", ")
-        )));
-    }
-
     let mut btree = (*original_btree).clone();
 
     match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
+            reject_dependent_materialized_views(resolver, namespace, table_name)?;
             let column_name = column_name.as_str();
+            row_security::reject_change_of_policy_column(
+                table_name,
+                namespace,
+                column_name,
+                resolver,
+            )?;
 
             // Tables always have at least one column.
             turso_assert_ne!(btree.columns().len(), 0);
@@ -1211,6 +1208,7 @@ pub fn translate_alter_table(
             rewrite_rows_result?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
+            reject_dependent_materialized_views(resolver, namespace, table_name)?;
             let is_generated = col_def
                 .constraints
                 .iter()
@@ -1489,7 +1487,16 @@ pub fn translate_alter_table(
                 },
             )?
         }
+        ast::AlterTableBody::RowSecurity(enable) => {
+            row_security::translate_row_security_change(
+                namespace, table_name, enable, resolver, program,
+            )?;
+        }
         ast::AlterTableBody::RenameTo(new_name) => {
+            reject_dependent_materialized_views(resolver, namespace, table_name)?;
+            row_security::reject_rename_of_table_with_row_security(
+                table_name, namespace, resolver,
+            )?;
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
@@ -1742,6 +1749,7 @@ pub fn translate_alter_table(
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
+            reject_dependent_materialized_views(resolver, namespace, table_name)?;
             let from;
             let definition;
             let col_name;
@@ -1769,6 +1777,7 @@ pub fn translate_alter_table(
 
             let from = from.as_str();
             let col_name = col_name.as_str();
+            row_security::reject_change_of_policy_column(table_name, namespace, from, resolver)?;
 
             let Some((column_index, _)) = btree.get_column(from) else {
                 return Err(LimboError::ParseError(format!(
@@ -2470,6 +2479,9 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
+        ast::AlterTableBody::RowSecurity(_) => {
+            crate::bail_parse_error!("\"{view_name}\" is not a table")
+        }
     }
 }
 
@@ -2532,6 +2544,23 @@ fn reject_change_of_indexed_column_order(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn reject_dependent_materialized_views(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table_name: &str,
+) -> Result<()> {
+    let dependent_views = resolver.with_schema(namespace.database_id, |s| {
+        s.get_dependent_materialized_views(namespace.id, table_name)
+    });
+    if !dependent_views.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
+            dependent_views.join(", ")
+        )));
     }
     Ok(())
 }
