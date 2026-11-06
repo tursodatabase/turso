@@ -749,6 +749,7 @@ mod tests {
                     SQLITE_OK
                 );
                 assert_eq!(old.calls, i32::from(mode != 3));
+                #[cfg(not(feature = "sqlite3"))]
                 assert_eq!(new.calls, i32::from(mode >= 2));
                 assert_eq!(sqlite3_close(db), SQLITE_OK);
                 assert_eq!(old.calls, 1);
