@@ -344,7 +344,15 @@ class Database {
     if (this.connected) {
       return new Statement(maybeValue(prepareStatement(this.db, sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
     } else {
-      return new Statement(maybePromise(() => this.connect().then(() => prepareStatement(this.db, sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+      return new Statement(maybePromise(async () => {
+        await this.connect();
+        await this.execLock.acquire();
+        try {
+          return prepareStatement(this.db, sql);
+        } finally {
+          this.execLock.release();
+        }
+      }), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
     }
   }
 
