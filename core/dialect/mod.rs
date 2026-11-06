@@ -17,6 +17,10 @@ pub mod engine;
 
 pub(crate) use engine::EngineDialect;
 
+use crate::schema::{BTreeTable, Schema};
+use crate::{Connection, Func, LimboError, OpenOptions, Result, Value};
+use turso_parser::ast::{Cmd, CreateTableBody, QualifiedName, Stmt};
+
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
@@ -36,7 +40,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
-    fn format_error(&self, error: crate::LimboError) -> crate::LimboError {
+    fn format_error(&self, error: LimboError) -> LimboError {
         error.into_sqlite_error()
     }
 
@@ -48,7 +52,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// connection compilation state changes. Implementations must accept the
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
-    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)>;
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)>;
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -57,11 +61,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// `sqlite_sequence`) are plain SQLite text and carry no frontend
     /// marker, so every implementation must fall back to SQLite parsing
     /// for text it does not recognize as its own.
-    fn parse_table_sql(
-        &self,
-        sql: &str,
-        root_page: i64,
-    ) -> crate::Result<crate::schema::BTreeTable>;
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable>;
 
     /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
     /// AST.
@@ -72,7 +72,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// [`Dialect::format_rewritten_table_sql`]. Internal engine tables use
     /// plain SQLite text, so implementations must retain the same SQLite
     /// fallback required by [`Dialect::parse_table_sql`].
-    fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt>;
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt>;
 
     /// Recover SQL that can be prepared to recreate a persisted table.
     ///
@@ -82,7 +82,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// persisted statement originally qualified the source database. Unmarked
     /// internal engine tables must retain the SQLite fallback used by the
     /// schema parsing methods.
-    fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String>;
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String>;
 
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
@@ -95,9 +95,9 @@ pub trait Dialect: Send + Sync + 'static {
     fn format_table_sql(
         &self,
         input: &str,
-        tbl_name: &turso_parser::ast::QualifiedName,
-        body: &turso_parser::ast::CreateTableBody,
-    ) -> crate::Result<String>;
+        tbl_name: &QualifiedName,
+        body: &CreateTableBody,
+    ) -> Result<String>;
 
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
@@ -105,9 +105,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// longer describes the rewritten table. Dialects that need syntax beyond
     /// a marker around canonical SQL can override this to render their native
     /// table definition from the rewritten AST.
-    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
-        let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
-            return Err(crate::LimboError::InternalError(
+    fn format_rewritten_table_sql(&self, stmt: &Stmt) -> Result<String> {
+        let Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+            return Err(LimboError::InternalError(
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
@@ -117,7 +117,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// Install the dialect's catalog tables into a freshly constructed
     /// schema.
     ///
-    /// Called by [`crate::schema::Schema::with_options`] on every schema
+    /// Called by [`Schema::with_options`] on every schema
     /// construction and rebuild, so catalog tables survive rebuilds
     /// structurally instead of being re-registered by hand. The SQLite
     /// dialect registers the standard built-in catalog here; other
@@ -125,13 +125,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// [`engine::register_builtin_catalog`] and then add their own tables
     /// (constructed with [`crate::VirtualTable::new_internal`], which
     /// requires no connection).
-    fn register_catalog(
-        &self,
-        schema: &mut crate::schema::Schema,
-        enable_custom_types: bool,
-    ) -> crate::Result<()>;
+    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()>;
 
-    fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
+    fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         options
     }
 
@@ -141,28 +137,26 @@ pub trait Dialect: Send + Sync + 'static {
     /// resolves the built-in set, another dialect resolves its own —
     /// mapping names onto engine primitives where it wants them (usually
     /// by composing with [`engine::resolve_builtin_function`]) and onto
-    /// [`crate::Func::Dialect`] for functions it executes
+    /// [`Func::Dialect`] for functions it executes
     /// itself via [`Dialect::exec_scalar_function`]. Consulted
     /// before extension functions; engine-generated helper statements
     /// always resolve with SQLite semantics instead.
-    fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::Func>>;
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>>;
 
     /// Execute a dialect scalar function at runtime.
     ///
     /// Receives the connection — unlike extension functions — because
     /// catalog functions (e.g. `pg_get_tabledef`) need to inspect the
-    /// schema. Only reached through [`crate::Func::Dialect`],
+    /// schema. Only reached through [`Func::Dialect`],
     /// so a dialect that never resolves to that variant can keep the
     /// default "no such function" error.
     fn exec_scalar_function(
         &self,
-        _conn: &crate::Connection,
+        _conn: &Connection,
         name: &str,
-        _args: &[crate::Value],
-    ) -> crate::Result<crate::Value> {
-        Err(crate::LimboError::ParseError(format!(
-            "no such function: {name}"
-        )))
+        _args: &[Value],
+    ) -> Result<Value> {
+        Err(LimboError::ParseError(format!("no such function: {name}")))
     }
 
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
@@ -294,11 +288,20 @@ pub trait Dialect: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::BTreeTable;
+    use crate::io::PlatformIO;
+    use crate::native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule};
     use crate::storage::database::DatabaseFile;
     use crate::sync::atomic::{AtomicUsize, Ordering};
-    use crate::{ConnectOpts, Database, DatabaseOpts, EngineDialect, MemoryIO, OpenFlags, IO};
+    use crate::types::IOResultOr;
+    use crate::{
+        ConnectOpts, Database, DatabaseOpts, IOResult, MemoryIO, Numeric, OpenFlags,
+        StatementStatusCounter, IO,
+    };
     use std::sync::Arc;
+    use turso_ext::{
+        ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode, VTabKind,
+    };
+    use turso_parser::parser::Parser;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `
     /// marker before delegating to SQLite parsing, mirroring how a frontend
@@ -315,7 +318,7 @@ mod tests {
             "test"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
             self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(sql) = sql.strip_prefix("test: ") {
                 let (cmd, offset) = engine::parse(sql)?;
@@ -325,18 +328,18 @@ mod tests {
             }
         }
 
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
             self.parse_calls.fetch_add(1, Ordering::SeqCst);
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
             BTreeTable::from_sql(sql, root_page)
         }
 
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
             engine::parse_table_sql_ast(sql)
         }
 
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
             engine::table_sql_for_replay(sql)
         }
@@ -344,57 +347,45 @@ mod tests {
         fn format_table_sql(
             &self,
             input: &str,
-            _tbl_name: &turso_parser::ast::QualifiedName,
-            _body: &turso_parser::ast::CreateTableBody,
-        ) -> crate::Result<String> {
+            _tbl_name: &QualifiedName,
+            _body: &CreateTableBody,
+        ) -> Result<String> {
             Ok(format!("/* test */ {input}"))
         }
 
-        fn resolve_function(
-            &self,
-            name: &str,
-            arg_count: usize,
-        ) -> crate::Result<Option<crate::function::Func>> {
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
             if name.eq_ignore_ascii_case("nvl") {
                 return engine::resolve_builtin_function("coalesce", arg_count);
             }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
-                return Ok(Some(crate::function::Func::Dialect(
-                    "test_add_one".to_string(),
-                )));
+                return Ok(Some(Func::Dialect("test_add_one".to_string())));
             }
             engine::resolve_builtin_function(name, arg_count)
         }
 
         fn exec_scalar_function(
             &self,
-            _conn: &crate::Connection,
+            _conn: &Connection,
             name: &str,
-            args: &[crate::Value],
-        ) -> crate::Result<crate::Value> {
+            args: &[Value],
+        ) -> Result<Value> {
             assert_eq!(name, "test_add_one");
-            let crate::Value::Numeric(crate::numeric::Numeric::Integer(v)) = args[0] else {
-                return Err(crate::LimboError::InvalidArgument(
+            let Value::Numeric(Numeric::Integer(v)) = args[0] else {
+                return Err(LimboError::InvalidArgument(
                     "test_add_one expects an integer".to_string(),
                 ));
             };
-            Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(
-                v + 1,
-            )))
+            Ok(Value::Numeric(Numeric::Integer(v + 1)))
         }
 
-        fn register_catalog(
-            &self,
-            schema: &mut crate::schema::Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
             engine::register_builtin_catalog(schema, enable_custom_types)
         }
 
-        fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
+        fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
             options.native_module(
                 "test_catalog",
-                turso_ext::VTabKind::TableValuedFunction,
+                VTabKind::TableValuedFunction,
                 TestCatalogTable,
             )
         }
@@ -413,21 +404,21 @@ mod tests {
             "strict-test"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
             engine::parse(sql)
         }
 
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
             BTreeTable::from_sql(sql, root_page)
         }
 
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
             engine::parse_table_sql_ast(sql)
         }
 
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
             engine::table_sql_for_replay(sql)
         }
@@ -435,25 +426,17 @@ mod tests {
         fn format_table_sql(
             &self,
             input: &str,
-            _tbl_name: &turso_parser::ast::QualifiedName,
-            _body: &turso_parser::ast::CreateTableBody,
-        ) -> crate::Result<String> {
+            _tbl_name: &QualifiedName,
+            _body: &CreateTableBody,
+        ) -> Result<String> {
             Ok(format!("{}{input}", Self::PREFIX))
         }
 
-        fn register_catalog(
-            &self,
-            schema: &mut crate::schema::Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
             engine::register_builtin_catalog(schema, enable_custom_types)
         }
 
-        fn resolve_function(
-            &self,
-            name: &str,
-            arg_count: usize,
-        ) -> crate::Result<Option<crate::function::Func>> {
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
             engine::resolve_builtin_function(name, arg_count)
         }
     }
@@ -463,31 +446,31 @@ mod tests {
     #[derive(Debug)]
     struct TestCatalogTable;
 
-    impl crate::native_ext::VirtualTableModule for TestCatalogTable {
+    impl VirtualTableModule for TestCatalogTable {
         type Table = Self;
 
-        fn schema(&self, _args: &[crate::Value]) -> crate::Result<String> {
+        fn schema(&self, _args: &[Value]) -> Result<String> {
             Ok("CREATE TABLE test_catalog (value INTEGER)".to_string())
         }
 
-        fn create(&self, _args: &[crate::Value]) -> crate::Result<Self::Table> {
+        fn create(&self, _args: &[Value]) -> Result<Self::Table> {
             Ok(Self)
         }
     }
 
-    impl crate::native_ext::VirtualTable for TestCatalogTable {
+    impl VirtualTable for TestCatalogTable {
         type Cursor = TestCatalogCursor;
 
-        fn open(&self, _conn: Arc<crate::Connection>) -> crate::Result<Self::Cursor> {
+        fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
             Ok(TestCatalogCursor { row: 0 })
         }
 
         fn best_index(
             &self,
-            constraints: &[turso_ext::ConstraintInfo],
-            _order_by: &[turso_ext::OrderByInfo],
-        ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
-            Ok(turso_ext::IndexInfo {
+            constraints: &[ConstraintInfo],
+            _order_by: &[OrderByInfo],
+        ) -> Result<IndexInfo, ResultCode> {
+            Ok(IndexInfo {
                 idx_num: 0,
                 idx_str: None,
                 order_by_consumed: false,
@@ -495,7 +478,7 @@ mod tests {
                 estimated_rows: 1,
                 constraint_usages: constraints
                     .iter()
-                    .map(|_| turso_ext::ConstraintUsage {
+                    .map(|_| ConstraintUsage {
                         argv_index: None,
                         omit: false,
                     })
@@ -508,46 +491,38 @@ mod tests {
         row: usize,
     }
 
-    impl crate::native_ext::VirtualTableCursor for TestCatalogCursor {
+    impl VirtualTableCursor for TestCatalogCursor {
         fn filter(
             &mut self,
-            _args: &[crate::Value],
+            _args: &[Value],
             _idx_str: Option<&str>,
             _idx_num: i32,
-        ) -> crate::types::IOResultOr<bool> {
+        ) -> IOResultOr<bool> {
             self.row = 0;
-            Ok(crate::IOResult::Done(true))
+            Ok(IOResult::Done(true))
         }
 
-        fn next(&mut self) -> crate::types::IOResultOr<bool> {
+        fn next(&mut self) -> IOResultOr<bool> {
             self.row += 1;
-            Ok(crate::IOResult::Done(self.row < 1))
+            Ok(IOResult::Done(self.row < 1))
         }
 
         fn rowid(&self) -> i64 {
             self.row as i64
         }
 
-        fn column(&mut self, column: usize) -> crate::types::IOResultOr<crate::Value> {
-            Ok(crate::IOResult::Done(match column {
-                0 => crate::Value::from_i64(42),
-                _ => crate::Value::Null,
+        fn column(&mut self, column: usize) -> IOResultOr<Value> {
+            Ok(IOResult::Done(match column {
+                0 => Value::from_i64(42),
+                _ => Value::Null,
             }))
         }
     }
 
-    fn open_db(
-        io: &Arc<dyn IO>,
-        path: &str,
-        dialect: Arc<dyn Dialect>,
-    ) -> crate::Result<Arc<Database>> {
+    fn open_db(io: &Arc<dyn IO>, path: &str, dialect: Arc<dyn Dialect>) -> Result<Arc<Database>> {
         let file = io.open_file(path, OpenFlags::Create, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Database::open(
-            io.clone(),
-            path,
-            crate::OpenOptions::new(dialect).storage(db_file),
-        )
+        Database::open(io.clone(), path, OpenOptions::new(dialect).storage(db_file))
     }
 
     #[test]
@@ -590,11 +565,8 @@ mod tests {
         conn.set_full_column_names(true);
         let rows = stmt.run_collect_rows().unwrap();
 
-        assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
-        assert_eq!(
-            stmt.stmt_status(crate::StatementStatusCounter::Reprepare),
-            1
-        );
+        assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
         assert_eq!(dialect.statement_parse_calls.load(Ordering::SeqCst), 2);
         conn.close().unwrap();
     }
@@ -614,7 +586,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-catalog.db", Arc::new(TestDialect::default())).unwrap();
 
-        let query_catalog = |conn: &Arc<crate::Connection>| -> Vec<Vec<crate::Value>> {
+        let query_catalog = |conn: &Arc<Connection>| -> Vec<Vec<Value>> {
             conn.prepare("SELECT value FROM test_catalog")
                 .unwrap()
                 .run_collect_rows()
@@ -625,15 +597,11 @@ mod tests {
         let conn2 = db.connect(ConnectOpts::new()).unwrap();
         assert_eq!(
             query_catalog(&conn1),
-            vec![vec![crate::Value::Numeric(
-                crate::numeric::Numeric::Integer(42)
-            )]]
+            vec![vec![Value::Numeric(Numeric::Integer(42))]]
         );
         assert_eq!(
             query_catalog(&conn2),
-            vec![vec![crate::Value::Numeric(
-                crate::numeric::Numeric::Integer(42)
-            )]]
+            vec![vec![Value::Numeric(Numeric::Integer(42))]]
         );
 
         // DDL on another connection forces conn1 to rebuild its schema from
@@ -642,9 +610,7 @@ mod tests {
         conn2.execute("CREATE TABLE t (x INTEGER)").unwrap();
         assert_eq!(
             query_catalog(&conn1),
-            vec![vec![crate::Value::Numeric(
-                crate::numeric::Numeric::Integer(42)
-            )]]
+            vec![vec![Value::Numeric(Numeric::Integer(42))]]
         );
 
         conn1.close().unwrap();
@@ -677,7 +643,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap();
-            assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
+            assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
         }
         conn.close().unwrap();
         new_conn.close().unwrap();
@@ -703,7 +669,7 @@ mod tests {
             .unwrap()
             .run_collect_rows()
             .unwrap();
-        assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
+        assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
         conn.close().unwrap();
     }
 
@@ -727,7 +693,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap();
-            assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
+            assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
             conn.close().unwrap();
         }
     }
@@ -743,12 +709,8 @@ mod tests {
             // A frontend prepares its translated AST while supplying the
             // original statement text.
             let input = "CREATE TABLE t (x INTEGER)";
-            let stmt = match turso_parser::parser::Parser::new(input.as_bytes())
-                .next_cmd()
-                .unwrap()
-                .unwrap()
-            {
-                turso_parser::ast::Cmd::Stmt(stmt) => stmt,
+            let stmt = match Parser::new(input.as_bytes()).next_cmd().unwrap().unwrap() {
+                Cmd::Stmt(stmt) => stmt,
                 other => panic!("unexpected command: {other:?}"),
             };
             conn.prepare_translated_stmt(stmt, input)
@@ -794,28 +756,28 @@ mod tests {
             "nofuncs"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
             engine::parse(sql)
         }
 
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
             BTreeTable::from_sql(sql, root_page)
         }
 
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
             engine::parse_table_sql_ast(sql)
         }
 
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
             engine::table_sql_for_replay(sql)
         }
 
         fn format_table_sql(
             &self,
             _input: &str,
-            tbl_name: &turso_parser::ast::QualifiedName,
-            body: &turso_parser::ast::CreateTableBody,
-        ) -> crate::Result<String> {
+            tbl_name: &QualifiedName,
+            body: &CreateTableBody,
+        ) -> Result<String> {
             Ok(format!(
                 "CREATE TABLE {} {}",
                 tbl_name.name.as_ident(),
@@ -823,19 +785,11 @@ mod tests {
             ))
         }
 
-        fn register_catalog(
-            &self,
-            schema: &mut crate::schema::Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
             engine::register_builtin_catalog(schema, enable_custom_types)
         }
 
-        fn resolve_function(
-            &self,
-            _name: &str,
-            _arg_count: usize,
-        ) -> crate::Result<Option<crate::function::Func>> {
+        fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
             Ok(None)
         }
     }
@@ -852,12 +806,7 @@ mod tests {
             .unwrap()
             .run_collect_rows()
             .unwrap();
-        assert_eq!(
-            rows,
-            vec![vec![crate::Value::Numeric(
-                crate::numeric::Numeric::Integer(42)
-            )]]
-        );
+        assert_eq!(rows, vec![vec![Value::Numeric(Numeric::Integer(42))]]);
 
         // Built-ins still resolve because the dialect composes with the
         // shared table.
@@ -866,12 +815,7 @@ mod tests {
             .unwrap()
             .run_collect_rows()
             .unwrap();
-        assert_eq!(
-            rows,
-            vec![vec![crate::Value::Numeric(
-                crate::numeric::Numeric::Integer(7)
-            )]]
-        );
+        assert_eq!(rows, vec![vec![Value::Numeric(Numeric::Integer(7))]]);
 
         // Unknown names still error.
         let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
@@ -904,7 +848,7 @@ mod tests {
             .unwrap()
             .run_collect_rows()
             .unwrap();
-        assert_eq!(rows, vec![vec![crate::Value::from_i64(2)]]);
+        assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
         conn.close().unwrap();
     }
 
@@ -951,19 +895,19 @@ mod tests {
             .run_collect_rows()
             .unwrap();
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0][0], crate::Value::from_i64(1));
-        assert_eq!(rows[0][1], crate::Value::build_text("t"));
-        assert_eq!(rows[0][2], crate::Value::from_i64(1));
-        assert_eq!(rows[1][0], crate::Value::from_i64(2));
-        assert_eq!(rows[1][1], crate::Value::Null);
-        assert_eq!(rows[1][2], crate::Value::Null);
+        assert_eq!(rows[0][0], Value::from_i64(1));
+        assert_eq!(rows[0][1], Value::build_text("t"));
+        assert_eq!(rows[0][2], Value::from_i64(1));
+        assert_eq!(rows[1][0], Value::from_i64(2));
+        assert_eq!(rows[1][1], Value::Null);
+        assert_eq!(rows[1][2], Value::Null);
         assert_eq!(rows[0][3], rows[1][3]);
-        assert_eq!(rows[2][0], crate::Value::from_i64(1));
-        assert_eq!(rows[2][1], crate::Value::build_text("t"));
-        assert_eq!(rows[2][2], crate::Value::from_i64(2));
-        assert_eq!(rows[3][0], crate::Value::from_i64(2));
-        assert_eq!(rows[3][1], crate::Value::Null);
-        assert_eq!(rows[3][2], crate::Value::Null);
+        assert_eq!(rows[2][0], Value::from_i64(1));
+        assert_eq!(rows[2][1], Value::build_text("t"));
+        assert_eq!(rows[2][2], Value::from_i64(2));
+        assert_eq!(rows[3][0], Value::from_i64(2));
+        assert_eq!(rows[3][1], Value::Null);
+        assert_eq!(rows[3][2], Value::Null);
         assert_eq!(rows[2][3], rows[3][3]);
         conn.close().unwrap();
     }
@@ -1016,7 +960,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![crate::Value::from_i64(1)]]
+            vec![vec![Value::from_i64(1)]]
         );
         conn.close().unwrap();
     }
@@ -1070,7 +1014,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source.db");
         let output_path = dir.path().join("output.db");
-        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io.clone(),
             source_path.to_str().unwrap(),
@@ -1110,7 +1054,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![crate::Value::from_i64(42)]]
+            vec![vec![Value::from_i64(42)]]
         );
     }
 
@@ -1121,7 +1065,7 @@ mod tests {
         let source_path = dir.path().join("source.db");
         let attached_path = dir.path().join("attached.db");
         let output_path = dir.path().join("output.db");
-        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io.clone(),
             source_path.to_str().unwrap(),
@@ -1156,7 +1100,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![crate::Value::from_i64(42)]]
+            vec![vec![Value::from_i64(42)]]
         );
     }
 
@@ -1165,7 +1109,7 @@ mod tests {
     fn in_place_vacuum_replays_schema_with_source_dialect() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.db");
-        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io,
             path.to_str().unwrap(),
@@ -1196,7 +1140,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![crate::Value::from_i64(42)]]
+            vec![vec![Value::from_i64(42)]]
         );
     }
 }
