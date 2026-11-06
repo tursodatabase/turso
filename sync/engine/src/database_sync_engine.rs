@@ -3719,18 +3719,22 @@ mod tests {
     }
 
     struct EmptyCompletion<T> {
+        status: u16,
         data: Mutex<Option<Vec<T>>>,
     }
 
     impl<T> EmptyCompletion<T> {
         fn empty() -> Self {
-            Self {
-                data: Mutex::new(Some(Vec::new())),
-            }
+            Self::with_data(Vec::new())
         }
 
         fn with_data(data: Vec<T>) -> Self {
+            Self::with_status(200, data)
+        }
+
+        fn with_status(status: u16, data: Vec<T>) -> Self {
             Self {
+                status,
                 data: Mutex::new(Some(data)),
             }
         }
@@ -3740,7 +3744,7 @@ mod tests {
         type DataPollResult = EmptyPollResult<T>;
 
         fn status(&self) -> Result<Option<u16>> {
-            Ok(Some(200))
+            Ok(Some(self.status))
         }
 
         fn poll_data(&self) -> Result<Option<Self::DataPollResult>> {
@@ -3865,7 +3869,7 @@ mod tests {
     /// requests than responses were queued. Records every request for
     /// assertions on the wire traffic.
     struct QueuedSyncEngineIo {
-        responses: Mutex<std::collections::VecDeque<Vec<u8>>>,
+        responses: Mutex<std::collections::VecDeque<EmptyCompletion<u8>>>,
         #[allow(clippy::type_complexity)]
         requests: Mutex<Vec<(String, String, Option<Vec<u8>>)>>,
     }
@@ -3913,7 +3917,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("engine made more HTTP requests than queued responses");
-            Ok(EmptyCompletion::with_data(response))
+            Ok(response)
         }
 
         fn add_io_callback(&self, _callback: Box<dyn FnMut() -> bool + Send>) {}
@@ -5173,6 +5177,7 @@ mod tests {
             responses: Mutex::new(
                 vec![first_contact_response, followup_logical_response]
                     .into_iter()
+                    .map(EmptyCompletion::with_data)
                     .collect(),
             ),
             requests: Mutex::new(Vec::new()),
@@ -5344,6 +5349,7 @@ mod tests {
             responses: Mutex::new(
                 vec![bootstrap_response, catch_up_response]
                     .into_iter()
+                    .map(EmptyCompletion::with_data)
                     .collect(),
             ),
             requests: Mutex::new(Vec::new()),
@@ -5405,6 +5411,191 @@ mod tests {
         );
         assert_eq!(catch_up.client_revision, server_revision);
         assert_eq!(catch_up.long_poll_timeout_ms, 0);
+    }
+
+    #[test]
+    fn legacy_replica_empty_pull_preserves_progress_with_v1_hint() {
+        check_legacy_replica_pull(false);
+    }
+
+    #[test]
+    fn legacy_replica_pull_applies_frames_and_preserves_local_writes_with_v1_hint() {
+        check_legacy_replica_pull(true);
+    }
+
+    fn check_legacy_replica_pull(with_frames: bool) {
+        for hint in [
+            DatabaseSyncEngineProtocolVersion::V1,
+            DatabaseSyncEngineProtocolVersion::Legacy,
+        ] {
+            for remote_protocol in [RemotePullProtocol::Pages, RemotePullProtocol::Unknown] {
+                let dir = tempfile::tempdir().unwrap();
+                let main_path = dir.path().join("replica.db").to_str().unwrap().to_string();
+                let remote_path = dir.path().join("remote.db").to_str().unwrap().to_string();
+                let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+                let remote_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &remote_path,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+                remote_conn.wal_auto_actions_disable();
+                remote_conn
+                    .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                remote_conn
+                    .execute("INSERT INTO items VALUES (1, 'base')")
+                    .unwrap();
+                remote_conn
+                    .checkpoint(turso_core::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    })
+                    .unwrap();
+                let base = std::fs::read(&remote_path).unwrap();
+                let frames = if with_frames {
+                    remote_conn
+                        .execute("INSERT INTO items VALUES (2, 'remote')")
+                        .unwrap();
+                    let wal = std::fs::read(format!("{remote_path}-wal")).unwrap();
+                    wal[32..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let frame_count = frames.len() as u64 / super::WAL_FRAME_SIZE as u64;
+                assert_eq!(frames.len() % super::WAL_FRAME_SIZE, 0);
+                assert_eq!(frame_count > 0, with_frames);
+                assert!(frame_count < 100);
+                let checkpoint_status = serde_json::to_vec(&serde_json::json!({
+                    "status": "checkpoint_needed",
+                    "generation": 1,
+                    "max_frame_no": frame_count,
+                }))
+                .unwrap();
+                let checkpoint_needed =
+                    || EmptyCompletion::with_status(400, checkpoint_status.clone());
+                let response = if with_frames {
+                    EmptyCompletion::with_data(frames)
+                } else {
+                    checkpoint_needed()
+                };
+                let sync_io = Arc::new(QueuedSyncEngineIo {
+                    responses: Mutex::new(
+                        [
+                            EmptyCompletion::with_data(encoded_page_stream_response(
+                                &base,
+                                "base",
+                                PullUpdatesProtocol::Pages,
+                            )),
+                            response,
+                            checkpoint_needed(),
+                        ]
+                        .into(),
+                    ),
+                    requests: Mutex::new(Vec::new()),
+                });
+                let mut opts = default_test_opts();
+                opts.remote_url = Some("https://example.com".into());
+                opts.bootstrap_if_empty = true;
+                opts.logical_mvcc_pull = None;
+                opts.wal_pull_batch_size = 100;
+                let expected_revision = DatabasePullRevision::Legacy {
+                    generation: 1,
+                    synced_frame_no: Some(frame_count),
+                };
+                let mut gen = genawaiter::sync::Gen::new({
+                    let io = io.clone();
+                    let sync_io = sync_io.clone();
+                    let main_path = main_path.clone();
+                    move |coro| async move {
+                        let coro: Coro<()> = coro.into();
+                        let stats = SyncEngineIoStats::new(sync_io.clone());
+                        let engine = DatabaseSyncEngine::create_db(
+                            &coro,
+                            io.clone(),
+                            stats.clone(),
+                            &main_path,
+                            opts.clone(),
+                        )
+                        .await?;
+                        // Model an existing plaintext replica with legacy progress on disk.
+                        engine
+                            .update_meta(&coro, |meta| {
+                                meta.synced_revision = Some(DatabasePullRevision::Legacy {
+                                    generation: 1,
+                                    synced_frame_no: Some(0),
+                                });
+                                meta.remote_pull_protocol = remote_protocol;
+                            })
+                            .await?;
+                        let conn = engine.connect_rw(&coro).await?;
+                        conn.execute("INSERT INTO items VALUES (3, 'local')")?;
+                        drop(conn);
+                        drop(engine);
+
+                        opts.protocol_version_hint = hint;
+                        let engine = DatabaseSyncEngine::create_db(
+                            &coro,
+                            io.clone(),
+                            stats.clone(),
+                            &main_path,
+                            opts.clone(),
+                        )
+                        .await?;
+                        let changes = engine.wait_changes_from_remote(&coro).await?;
+                        assert_eq!(changes.stream_kind, DbChangesStreamKind::LegacyPages);
+                        assert_eq!(changes.is_empty(), !with_frames);
+                        engine.apply_changes_from_remote(&coro, changes).await?;
+                        assert_eq!(
+                            engine.meta().synced_revision,
+                            Some(expected_revision.clone())
+                        );
+                        assert!(engine.meta().last_pull_unix_time.is_some());
+                        drop(engine);
+
+                        // Reopening must resume from the saved legacy frame number.
+                        let engine =
+                            DatabaseSyncEngine::create_db(&coro, io, stats, &main_path, opts)
+                                .await?;
+                        assert_eq!(
+                            engine.meta().synced_revision,
+                            Some(expected_revision.clone())
+                        );
+                        engine.pull_changes_from_remote(&coro).await?;
+                        assert_eq!(engine.meta().synced_revision, Some(expected_revision));
+                        let conn = engine.connect_rw(&coro).await?;
+                        let mut stmt = conn.prepare("SELECT id, value FROM items ORDER BY id")?;
+                        let mut rows = Vec::new();
+                        while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                            rows.push((row.get::<i64>(0)?, row.get::<String>(1)?));
+                        }
+                        let mut expected = vec![(1, "base".to_string())];
+                        if with_frames {
+                            expected.push((2, "remote".to_string()));
+                        }
+                        expected.push((3, "local".to_string()));
+                        assert_eq!(rows, expected);
+                        Result::Ok(())
+                    }
+                });
+                loop {
+                    match gen.resume_with(Ok(())) {
+                        genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                        genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+                    }
+                }
+                assert!(sync_io.responses.lock().unwrap().is_empty());
+                let requests = sync_io.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[0].1, "/pull-updates");
+                assert_eq!((&*requests[1].0, &*requests[1].1), ("GET", "/sync/1/1/101"));
+                assert_eq!(requests[2].0, "GET");
+                assert_eq!(
+                    requests[2].1,
+                    format!("/sync/1/{}/{}", frame_count + 1, frame_count + 101)
+                );
+            }
+        }
     }
 
     /// Forcing `logical_mvcc_pull: Some(true)` on a replica whose revision
@@ -5578,7 +5769,7 @@ mod tests {
         let bootstrap_response =
             encoded_page_stream_response(&remote_bytes, "g1:o0", PullUpdatesProtocol::Pages);
         let sync_io = Arc::new(QueuedSyncEngineIo {
-            responses: Mutex::new(vec![bootstrap_response].into_iter().collect()),
+            responses: Mutex::new([EmptyCompletion::with_data(bootstrap_response)].into()),
             requests: Mutex::new(Vec::new()),
         });
         let sync_engine_io = SyncEngineIoStats::new(sync_io);
