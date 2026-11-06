@@ -599,11 +599,11 @@ pub fn op_checkpoint(
         // helper statement is alive on the connection would let a checkpoint
         // clobber a suspended statement that holds one (e.g. a pragma vtab
         // cursor's stored helper).
-        state.explicit_checkpoint_guard = Some(
-            program
-                .connection
-                .begin_explicit_checkpoint(pager.clone(), true)?,
-        );
+        state.explicit_checkpoint_guard = Some(program.connection.begin_explicit_checkpoint(
+            pager.clone(),
+            *database,
+            true,
+        )?);
     }
 
     // In autocommit mode, this statement can still hold an implicit read tx.

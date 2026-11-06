@@ -3672,6 +3672,7 @@ impl Database {
 }
 
 pub(crate) struct AttachedDatabase {
+    pub(crate) readonly: bool,
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
     pub(crate) sync_mode: SyncMode,
@@ -3702,11 +3703,12 @@ impl DatabaseCatalog {
         self.index_to_data.get(idx).map(|entry| entry.pager.clone())
     }
 
-    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>) -> usize {
+    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>, readonly: bool) -> usize {
         let idx = self.allocate_index();
         self.index_to_data.insert(
             idx,
             AttachedDatabase {
+                readonly,
                 db,
                 pager,
                 sync_mode: SyncMode::Full,
@@ -4576,6 +4578,113 @@ mod database_tests {
         reader.execute("INSERT INTO scratch VALUES(7)").unwrap();
         writer.execute("INSERT INTO test VALUES(3)").unwrap();
         assert_eq!(count_test_rows(&reader), 2);
+    }
+
+    #[test]
+    fn readonly_attachment_reuses_storage_without_losing_access_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attached.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
+            .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let main = Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_attach(true)),
+        )
+        .unwrap();
+        let connection = main.connect(ConnectOpts::new()).unwrap();
+        connection
+            .execute(format!("ATTACH 'file:{}?mode=ro' AS aux", path.display()))
+            .unwrap();
+        connection.execute("PRAGMA query_only=OFF").unwrap();
+        let snapshot = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        assert!(matches!(
+            connection.execute("INSERT INTO aux.test VALUES(2)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        assert!(matches!(
+            connection.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        connection.execute("CREATE TABLE writable(id); INSERT INTO writable VALUES(1); CREATE TEMP TABLE scratch(id); INSERT INTO scratch VALUES(1)").unwrap();
+        writer.execute("INSERT INTO test VALUES(3)").unwrap();
+        let restricted = main
+            .connect(ConnectOpts::new().with_readonly(true))
+            .unwrap();
+        restricted
+            .execute(format!("ATTACH '{}' AS inherited", path.display()))
+            .unwrap();
+        restricted.execute("PRAGMA query_only=OFF").unwrap();
+        assert!(matches!(
+            restricted.execute("INSERT INTO inherited.test VALUES(4)"),
+            Err(LimboError::ReadOnly)
+        ));
+        restricted
+            .execute("CREATE TEMP TABLE scratch(id); INSERT INTO scratch VALUES(1)")
+            .unwrap();
+    }
+
+    #[test]
+    fn readonly_connection_cannot_checkpoint_shared_writable_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(EngineDialect)).unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+        let snapshot = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        assert!(matches!(
+            reader.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        assert!(matches!(
+            reader.checkpoint(crate::CheckpointMode::Truncate {
+                upper_bound_inclusive: None
+            }),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        writer
+            .checkpoint(crate::CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
     }
 
     #[test]

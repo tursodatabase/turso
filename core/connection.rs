@@ -1980,7 +1980,7 @@ impl Connection {
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
-    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
+    ) -> Result<(Arc<Database>, Option<EncryptionOpts>, bool)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
@@ -2017,7 +2017,7 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        Ok((db, encryption_opts))
+        Ok((db, encryption_opts, flags.contains(OpenFlags::ReadOnly)))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -2482,7 +2482,8 @@ impl Connection {
         // while statements are active — same rule as PRAGMA wal_checkpoint.
         // The guard also rejects new statements until the checkpoint finishes
         // and cleans up pager checkpoint state if we bail out mid-flight.
-        let _checkpoint_guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
+        let _checkpoint_guard =
+            self.begin_explicit_checkpoint(self.pager.load().clone(), crate::MAIN_DB_ID, false)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(
@@ -2873,9 +2874,12 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|temp_db| temp_db.db.is_readonly()),
             _ => {
-                let db = self.attached_databases.read().get_database_by_index(index);
-                db.expect("Should never have called this without being sure the database exists")
-                    .is_readonly()
+                let attached = self.attached_databases.read();
+                let entry = attached
+                    .index_to_data
+                    .get(&index)
+                    .expect("attached database exists");
+                entry.readonly || entry.db.is_readonly()
             }
         }
     }
@@ -4712,8 +4716,12 @@ impl Connection {
     pub(crate) fn begin_explicit_checkpoint(
         &self,
         pager: Arc<Pager>,
+        database_id: usize,
         from_statement: bool,
     ) -> Result<ExplicitCheckpointGuard> {
+        if self.is_readonly(database_id) {
+            return Err(LimboError::ReadOnly);
+        }
         let statements_expected = if from_statement { 1 } else { 0 };
         let mut activity = self.statement_activity.lock();
         // Parked incremental blob handles don't count: they hold a Root

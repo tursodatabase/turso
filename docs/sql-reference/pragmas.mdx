@@ -614,6 +614,8 @@ the current setting.
 
 ### wal_checkpoint
 
+A connection cannot explicitly checkpoint a database that it opened or attached read-only, even when another connection has writable access to the same file.
+
 Forces a WAL checkpoint.
 
 ```sql
