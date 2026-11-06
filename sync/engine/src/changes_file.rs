@@ -741,4 +741,271 @@ mod tests {
         }
     }
 
+    struct ControlledFile {
+        inner: Arc<dyn File>,
+        delay: AtomicBool,
+        fail_write: AtomicBool,
+        fail_sync: AtomicBool,
+        read_limit: AtomicUsize,
+        reads: AtomicUsize,
+        truncates: AtomicUsize,
+        pending: Mutex<Vec<(u64, std::sync::Weak<Buffer>, Completion)>>,
+        writes: Mutex<Vec<Vec<u8>>>,
+        write_buffers: Mutex<Vec<usize>>,
+        short_write: AtomicBool,
+    }
+
+    impl ControlledFile {
+        fn new() -> Self {
+            Self {
+                inner: memory_file(),
+                delay: AtomicBool::new(false),
+                fail_write: AtomicBool::new(false),
+                fail_sync: AtomicBool::new(false),
+                read_limit: AtomicUsize::new(usize::MAX),
+                reads: AtomicUsize::new(0),
+                truncates: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
+                writes: Mutex::new(Vec::new()),
+                write_buffers: Mutex::new(Vec::new()),
+                short_write: AtomicBool::new(false),
+            }
+        }
+
+        fn flush(&self) {
+            for (pos, buffer, c) in self.pending.lock().expect("pending").drain(..) {
+                let buffer = buffer
+                    .upgrade()
+                    .expect("completion must retain the write buffer");
+                assert!(self
+                    .inner
+                    .pwrite(pos, buffer, c)
+                    .expect("delayed write")
+                    .succeeded());
+            }
+        }
+    }
+
+    impl File for ControlledFile {
+        fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> turso_core::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn size(&self) -> turso_core::Result<u64> {
+            self.inner.size()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let length = c
+                .as_read()
+                .buf()
+                .len()
+                .min(self.read_limit.load(Ordering::SeqCst));
+            let output = c.clone();
+            let buffer = Arc::new(Buffer::new_temporary(length));
+            let completion = Completion::new_read(buffer, move |result| {
+                match result {
+                    Ok((buffer, n)) => {
+                        output.as_read().buf().as_mut_slice()[..n as usize]
+                            .copy_from_slice(&buffer.as_slice()[..n as usize]);
+                        output.complete(n);
+                    }
+                    Err(error) => output.error(error),
+                }
+                None
+            });
+            assert!(self.inner.pread(pos, completion)?.finished());
+            Ok(c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> turso_core::Result<Completion> {
+            self.writes
+                .lock()
+                .expect("writes")
+                .push(buffer.as_slice().to_vec());
+            self.write_buffers
+                .lock()
+                .expect("write buffers")
+                .push(Arc::as_ptr(&buffer) as usize);
+            if self.fail_write.load(Ordering::SeqCst) {
+                c.error(turso_core::CompletionError::ShortWrite);
+                Ok(c)
+            } else if self.short_write.load(Ordering::SeqCst) {
+                c.complete(buffer.len() as i32 - 1);
+                Ok(c)
+            } else if self.delay.load(Ordering::SeqCst) {
+                self.pending.lock().expect("pending").push((
+                    pos,
+                    Arc::downgrade(&buffer),
+                    c.clone(),
+                ));
+                Ok(c)
+            } else {
+                self.inner.pwrite(pos, buffer, c)
+            }
+        }
+        fn sync(&self, c: Completion, kind: FileSyncType) -> turso_core::Result<Completion> {
+            if self.fail_sync.load(Ordering::SeqCst) {
+                c.error(turso_core::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected sync failure",
+                ));
+                Ok(c)
+            } else {
+                self.inner.sync(c, kind)
+            }
+        }
+        fn truncate(&self, size: u64, c: Completion) -> turso_core::Result<Completion> {
+            self.truncates.fetch_add(1, Ordering::SeqCst);
+            self.inner.truncate(size, c)
+        }
+    }
+
+    #[test]
+    fn plaintext_pages_reuse_the_input_buffer() {
+        let file = Arc::new(ControlledFile::new());
+        let mut changes = ChangesFile::new(file.clone(), None);
+        let buffer = Arc::new(Buffer::new_temporary(4120));
+        run(|coro| async move {
+            changes.reset(&coro, ChangeKind::Pages).await?;
+            for value in 0..16 {
+                buffer.as_mut_slice().fill(value);
+                changes.append_page(&coro, buffer.clone()).await?;
+            }
+            let sealed = changes.finish(&coro).await?;
+            assert_eq!(
+                *file.write_buffers.lock().unwrap(),
+                vec![Arc::as_ptr(&buffer) as usize; 16],
+                "plaintext page writes must reuse the caller's buffer"
+            );
+            let mut reader = changes.open_reader(&coro, Some(sealed.kind())).await?;
+            for value in 0..16 {
+                assert_eq!(reader.next_record(&coro).await?, Some(vec![value; 4120]));
+            }
+            assert!(reader.next_record(&coro).await?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn page_write_failures_require_reset_before_reuse() {
+        for encrypted in [false, true] {
+            for short in [false, true] {
+                let file = Arc::new(ControlledFile::new());
+                let mut changes = ChangesFile::new(file.clone(), encrypted.then(crypto));
+                let buffer = Arc::new(Buffer::new(vec![42; 4120]));
+                run(|coro| async move {
+                    changes.reset(&coro, ChangeKind::Pages).await?;
+                    file.fail_write.store(!short, Ordering::SeqCst);
+                    file.short_write.store(short, Ordering::SeqCst);
+                    assert!(changes.append_page(&coro, buffer.clone()).await.is_err());
+                    assert!(changes.finish(&coro).await.is_err());
+                    file.fail_write.store(false, Ordering::SeqCst);
+                    file.short_write.store(false, Ordering::SeqCst);
+                    changes.reset(&coro, ChangeKind::Pages).await?;
+                    changes.append_page(&coro, buffer.clone()).await?;
+                    let sealed = changes.finish(&coro).await?;
+                    let mut reader = changes.open_reader(&coro, Some(sealed.kind())).await?;
+                    assert_eq!(reader.next_record(&coro).await?, Some(vec![42; 4120]));
+                    assert!(reader.next_record(&coro).await?.is_none());
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_records_use_single_writes_and_buffered_reads() {
+        for kind in [ChangeKind::Logical, ChangeKind::Pages] {
+            let file = Arc::new(ControlledFile::new());
+            let mut changes = ChangesFile::new(file.clone(), None);
+            let records = match kind {
+                ChangeKind::Logical => {
+                    // The second delimiter straddles the 64 KiB buffer boundary.
+                    [65532, 128, 200_000, 1]
+                        .into_iter()
+                        .chain(std::iter::repeat_n(100, 10_000))
+                        .map(|size| vec![42; size])
+                        .collect::<Vec<_>>()
+                }
+                ChangeKind::Pages => vec![vec![23; 4120]; 100],
+            };
+            let size: usize = records
+                .iter()
+                .map(|r| {
+                    r.len()
+                        + if kind == ChangeKind::Logical {
+                            prost::length_delimiter_len(r.len())
+                        } else {
+                            0
+                        }
+                })
+                .sum();
+            run(|coro| async move {
+                changes.reset(&coro, kind).await?;
+                for record in &records {
+                    changes.append_record(&coro, record).await?;
+                }
+                let sealed = changes.finish(&coro).await?;
+                assert_eq!(file.writes.lock().unwrap().len(), records.len());
+                let mut reader = changes.open_reader(&coro, Some(sealed.kind())).await?;
+                for record in records {
+                    assert_eq!(reader.next_record(&coro).await?, Some(record));
+                }
+                assert!(reader.next_record(&coro).await?.is_none());
+                assert_eq!(file.reads.load(Ordering::SeqCst), size.div_ceil(64 * 1024));
+                Ok(())
+            })
+            .expect("buffered plaintext replay");
+        }
+    }
+
+    #[test]
+    fn buffered_short_reads_and_invalid_lengths() {
+        for encrypted in [false, true] {
+            for prefix in [
+                None,
+                Some(vec![0x80]),
+                Some(vec![0xff; 10]),
+                Some(vec![0x81, 0]),
+                Some(vec![0]),
+                Some(vec![0xff, 0xff, 0x7f]),
+            ] {
+                let file = Arc::new(ControlledFile::new());
+                file.read_limit.store(997, Ordering::SeqCst);
+                let mut changes = ChangesFile::new(file.clone(), encrypted.then(crypto));
+                run(|coro| async move {
+                    changes.reset(&coro, ChangeKind::Logical).await?;
+                    let record = vec![42; 70_000];
+                    changes.append_record(&coro, &record).await?;
+                    let mut sealed = changes.finish(&coro).await?;
+                    if let Some(prefix) = &prefix {
+                        assert!(file.truncate(0, Completion::new_trunc(|_| {}))?.succeeded());
+                        changes.write(&coro, 0, prefix.clone()).await?;
+                        sealed.size = prefix.len() as u64;
+                        changes.state = State::Sealed(sealed.clone());
+                    }
+                    let mut reader = changes.open_reader(&coro, Some(sealed.kind())).await?;
+                    if prefix.is_none() {
+                        assert_eq!(reader.next_record(&coro).await?, Some(record));
+                        assert!(reader.next_record(&coro).await?.is_none());
+                    } else {
+                        assert!(reader.next_record(&coro).await.is_err());
+                        assert!(reader.next_record(&coro).await.is_err());
+                    }
+                    Ok(())
+                })
+                .expect("read validation");
+            }
+        }
+    }
+
 }
