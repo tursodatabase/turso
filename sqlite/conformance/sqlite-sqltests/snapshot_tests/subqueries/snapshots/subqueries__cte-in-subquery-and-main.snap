@@ -26,7 +26,8 @@ QUERY PLAN
 |--SCALAR SUBQUERY 1
 |  `--SCAN category_avg
 |     `--SCAN products USING INDEX idx_products_category
-|--SCAN products USING INDEX idx_products_category
+|--MATERIALIZE category_avg
+|  `--SCAN products USING INDEX idx_products_category
 |--SCAN products AS p
 `--SEARCH ca USING INDEX ephemeral_subquery_t5 (category_id=?)
 
