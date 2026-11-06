@@ -2111,6 +2111,41 @@ fn test_update_or_fail_partial_success_in_txn(tmp_db: TempDatabase) -> anyhow::R
     Ok(())
 }
 
+/// INSERT OR FAIL inside an explicit transaction keeps the rows inserted
+/// before the conflict, so they count in both changes() and total_changes().
+#[turso_macros::test]
+fn test_insert_or_fail_in_txn_counts_kept_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let limbo_db = tmp_db.connect_limbo();
+    let sqlite_db = rusqlite::Connection::open_in_memory()?;
+
+    let setup = [
+        "CREATE TABLE u(a UNIQUE)",
+        "INSERT INTO u VALUES (1)",
+        "BEGIN",
+    ];
+    for sql in &setup {
+        limbo_db.execute(sql)?;
+        sqlite_db.execute(sql, params![])?;
+    }
+
+    let insert = "INSERT OR FAIL INTO u VALUES (2), (3), (1)";
+    assert_that!(limbo_db.execute(insert)).is_err();
+    assert_that!(sqlite_db.execute(insert, params![])).is_err();
+
+    let verify = "SELECT changes(), total_changes()";
+    let limbo_rows = limbo_exec_rows(&limbo_db, verify);
+    let sqlite_rows = sqlite_exec_rows(&sqlite_db, verify);
+    assert_eq!(
+        limbo_rows, sqlite_rows,
+        "change counts differ after INSERT OR FAIL: limbo={limbo_rows:?} sqlite={sqlite_rows:?}"
+    );
+
+    limbo_db.execute("COMMIT")?;
+    sqlite_db.execute("COMMIT", params![])?;
+
+    Ok(())
+}
+
 /// A BEFORE INSERT trigger runs an `UPDATE OR FAIL` that conflicts. The FAIL
 /// belongs to the trigger's UPDATE, not to the outer INSERT, so it must govern
 /// how much is rolled back: SQLite keeps the changes made before the conflict

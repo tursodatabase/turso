@@ -3899,6 +3899,12 @@ impl Program {
                                         &self.connection,
                                     );
                                 }
+                            } else {
+                                // The kept rows stay in the open transaction.
+                                // commit_txn() adds them to total_changes()
+                                // in autocommit mode; here nothing else does.
+                                self.connection
+                                    .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
                             }
                         }
                         _ => {
