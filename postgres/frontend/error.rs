@@ -317,6 +317,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
         SQLSTATE_DUPLICATE_OBJECT
+    } else if msg.starts_with("operator does not exist: ") {
+        SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
@@ -585,6 +587,14 @@ mod tests {
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
+            (
+                "operator does not exist: date * integer",
+                SQLSTATE_UNDEFINED_FUNCTION,
+            ),
+            (
+                "operator does not exist: \"no such table\" + integer",
+                SQLSTATE_UNDEFINED_FUNCTION,
+            ),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),
