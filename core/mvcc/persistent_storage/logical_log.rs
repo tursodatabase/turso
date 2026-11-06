@@ -616,6 +616,23 @@ impl LogicalLog {
 }
 
 impl LogicalLog {
+    pub(crate) fn replace_readonly_file(&mut self, file: Arc<dyn File>) -> Result<Arc<dyn File>> {
+        if self.pending_header_write.is_some() || self.pending_running_crc.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "cannot activate MVCC storage with an unfinished log write".into(),
+            ));
+        }
+        let previous_id = self.file.file_id()?.ok_or_else(|| {
+            LimboError::InvalidArgument("MVCC log descriptor identity is unavailable".into())
+        })?;
+        if file.file_id()? != Some(previous_id) {
+            return Err(LimboError::InvalidArgument(
+                "MVCC log file changed while open read-only; close all handles and reopen".into(),
+            ));
+        }
+        Ok(std::mem::replace(&mut self.file, file))
+    }
+
     fn new_internal(
         file: Arc<dyn File>,
         io: Arc<dyn crate::IO>,

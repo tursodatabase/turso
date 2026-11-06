@@ -233,9 +233,9 @@ fn explain_setup_failure(e: std::io::Error) -> LimboError {
             "io_uring_setup: not supported (host kernel version {})",
             read_kernel_setting("osrelease").unwrap_or_else(|| "unknown".to_string())
         )),
-        ErrorKind::PermissionDenied => LimboError::IoBackendUnavailable(
-            permission_denied_message(read_kernel_setting("io_uring_disabled").as_deref()),
-        ),
+        ErrorKind::PermissionDenied => LimboError::IoBackendUnavailable(permission_denied_message(
+            read_kernel_setting("io_uring_disabled").as_deref(),
+        )),
         _ => io_error(e, "io_uring_setup"),
     }
 }
@@ -698,6 +698,15 @@ unsafe impl Sync for UringFile {}
 crate::assert::assert_send_sync!(UringFile);
 
 impl File for UringFile {
+    fn file_id(&self) -> Result<Option<super::FileId>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.file.metadata().map_err(|e| io_error(e, "metadata"))?;
+        Ok(Some(super::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }))
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed

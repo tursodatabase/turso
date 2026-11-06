@@ -5314,7 +5314,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<Option<MetadataIoInFlight>> {
         let log_size = self.get_logical_log_file().size()?;
         let pager = bootstrap_conn.pager.load().clone();
-        if bootstrap_conn.db.is_readonly() {
+        if bootstrap_conn.is_readonly(crate::MAIN_DB_ID) {
             return Err(LimboError::Corrupt(
                 "Missing MVCC metadata table in read-only mode".to_string(),
             ));
@@ -9135,6 +9135,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|(row, _versions)| row.row_id))
     }
 
+    pub(crate) fn replace_readonly_log_file(&self, file: Arc<dyn File>) -> Result<Arc<dyn File>> {
+        self.storage.replace_readonly_file(file)
+    }
+
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.storage.get_logical_log_file()
     }
@@ -9204,7 +9208,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 CompleteCheckpointState::ReadingHeader { reader } => {
                     let header_result = return_if_io!(reader.try_read_header_nonblock());
                     let wal_max_frame = wal.get_max_frame_in_wal();
-                    let is_readonly = connection.db.is_readonly();
+                    let is_readonly = connection.is_readonly(crate::MAIN_DB_ID);
                     if wal_max_frame == 0 {
                         if is_readonly {
                             // Nothing to reconcile in read-only mode with no committed frames.

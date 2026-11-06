@@ -275,6 +275,15 @@ pub(crate) fn unix_shared_wal_map(
 }
 
 impl File for UnixFile {
+    fn file_id(&self) -> Result<Option<super::FileId>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.file.metadata().map_err(|e| io_error(e, "metadata"))?;
+        Ok(Some(super::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }))
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
@@ -619,6 +628,9 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+        assert_eq!(
+            &slice[mapped.len() - 128..],
+            &bytes[4096 + 81920 - 128..4096 + 81920]
+        );
     }
 }

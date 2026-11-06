@@ -3,6 +3,9 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+mod readonly;
+use readonly::ReadonlyStorage;
+
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
 use crate::security::roles::ROLES_TABLE_NAME;
@@ -230,7 +233,7 @@ pub struct OpenOptions {
     /// process-wide registry keys on the default WAL for a path.
     wal_path: Option<String>,
     flags: OpenFlags,
-    readonly_main_writable: bool,
+    readonly_storage: Option<Arc<ReadonlyStorage>>,
     db_opts: DatabaseOpts,
     pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
@@ -251,7 +254,7 @@ impl OpenOptions {
             storage: None,
             wal_path: None,
             flags: OpenFlags::default(),
-            readonly_main_writable: false,
+            readonly_storage: None,
             db_opts: DatabaseOpts::default(),
             native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
@@ -590,6 +593,7 @@ pub struct OpenDbAsyncState {
     /// across yields.
     roles_stmt: Option<Box<Statement>>,
     role_rows: Vec<Vec<Value>>,
+    readonly_storage: Option<Arc<ReadonlyStorage>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -616,12 +620,16 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             roles_stmt: None,
             role_rows: Vec::new(),
+            readonly_storage: None,
         }
     }
 }
 
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
+        if let Some(storage) = &self.readonly_storage {
+            storage.abort_bootstrap();
+        }
         if let Some(registry_key) = self.registry_key.take() {
             let mut registry = DATABASE_MANAGER.lock();
             registry.remove(&registry_key);
@@ -816,6 +824,8 @@ struct WriterReadiness {
     legacy: bool,
     orphan_wal: bool,
     retained_wal_files: Vec<Arc<dyn crate::io::File>>,
+    storage: Option<Arc<ReadonlyStorage>>,
+    activation_failed: bool,
 }
 
 impl Database {
@@ -1288,24 +1298,42 @@ impl Database {
             options.flags,
             options.db_opts,
         )?;
-        let file = if effective_flags.contains(OpenFlags::ReadOnly)
+        let file = if use_registry
+            && options.durable_storage.is_none()
+            && options.encryption.is_none()
+            && options.page_codec.is_none()
+            && effective_flags.contains(OpenFlags::ReadOnly)
+            && !effective_flags.contains(OpenFlags::NoLock)
+            && std::env::var(io::ENV_DISABLE_FILE_LOCK).is_err()
             && !is_memory_like(path)
             && !options.db_opts.enable_multiprocess_wal
         {
             match io.open_file(
                 path,
-                effective_flags & !OpenFlags::ReadOnly & !OpenFlags::Create,
+                (effective_flags & !OpenFlags::ReadOnly & !OpenFlags::Create) | OpenFlags::NoLock,
                 true,
             ) {
                 Ok(file) => {
-                    options.readonly_main_writable = true;
-                    file
+                    let wal_path = options
+                        .wal_path
+                        .clone()
+                        .unwrap_or_else(|| format!("{path}-wal"));
+                    match ReadonlyStorage::try_new(io.clone(), file.clone(), path, &wal_path) {
+                        Ok(Some(storage)) => {
+                            options.readonly_storage = Some(storage);
+                            file
+                        }
+                        Ok(None) | Err(LimboError::LockingError(_)) => {
+                            drop(file);
+                            io.open_file(path, effective_flags, true)?
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(LimboError::CompletionError(CompletionError::IOError(
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem,
                     _,
-                )))
-                | Err(LimboError::LockingError(_)) => io.open_file(path, effective_flags, true)?,
+                ))) => io.open_file(path, effective_flags, true)?,
                 Err(error) => return Err(error),
             }
         } else {
@@ -1481,7 +1509,7 @@ impl Database {
             storage,
             flags,
             options.db_opts,
-            options.readonly_main_writable,
+            options.readonly_storage.clone(),
             options.encryption.clone(),
             options.durable_storage.clone(),
             options.page_codec.clone(),
@@ -1563,7 +1591,7 @@ impl Database {
             storage,
             options.flags,
             options.db_opts,
-            options.readonly_main_writable,
+            options.readonly_storage.clone(),
             options.encryption.clone(),
             options.durable_storage.clone(),
             options.page_codec.clone(),
@@ -1585,7 +1613,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        readonly_main_writable: bool,
+        readonly_storage: Option<Arc<ReadonlyStorage>>,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
@@ -1593,30 +1621,37 @@ impl Database {
         dialect: Arc<dyn Dialect>,
         native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
-        Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
-        if encryption_opts.is_some() && page_codec.is_some() {
-            return Err(LimboError::InvalidArgument(
-                "built-in encryption cannot be combined with an external page codec".to_string(),
+        state.readonly_storage.clone_from(&readonly_storage);
+        let result = (|| {
+            Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
+            if encryption_opts.is_some() && page_codec.is_some() {
+                return Err(LimboError::InvalidArgument(
+                    "built-in encryption cannot be combined with an external page codec"
+                        .to_string(),
+                )
+                .into());
+            }
+            Self::do_open_async_internal(
+                state,
+                io,
+                path,
+                wal_path,
+                db_file,
+                flags,
+                opts,
+                readonly_storage.clone(),
+                encryption_opts,
+                durable_storage,
+                page_codec,
+                allocators,
+                dialect,
+                native_extensions,
             )
-            .into());
-        }
-        let result = Self::do_open_async_internal(
-            state,
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            readonly_main_writable,
-            encryption_opts,
-            durable_storage,
-            page_codec,
-            allocators,
-            dialect,
-            native_extensions,
-        );
+        })();
         if result.is_err() {
+            if let Some(storage) = &state.readonly_storage {
+                storage.abort_bootstrap();
+            }
             let _ = state.schema_guard.take();
         }
         result
@@ -1631,7 +1666,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        readonly_main_writable: bool,
+        readonly_storage: Option<Arc<ReadonlyStorage>>,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
@@ -1669,6 +1704,11 @@ impl Database {
                         native_extensions,
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
+                    db.writer_readiness
+                        .lock()
+                        .storage
+                        .clone_from(&readonly_storage);
+                    state.readonly_storage.clone_from(&readonly_storage);
 
                     // Header validation + WAL recovery runs as a sub state
                     // machine in the ValidatingHeader phase so it can yield
@@ -1712,9 +1752,8 @@ impl Database {
                             "Either WAL or MVStore must be enabled"
                         );
                     }
-                    if readonly_main_writable
+                    if readonly_storage.is_some()
                         && db.readonly_bootstrap
-                        && db.get_mv_store().is_none()
                         && !db.opts.enable_multiprocess_wal
                         && db.page_codec_id.is_none()
                         && matches!(db.encryption_cipher_mode.get(), CipherMode::None)
@@ -1839,7 +1878,6 @@ impl Database {
                     // would route a resumed open into the bootstrap arm.
                     if state.mvcc_convert_stmt.is_some()
                         || (db.opts.enable_mvcc
-                            && db.get_mv_store().is_none()
                             && !db.readonly_bootstrap
                             && !db.open_flags.contains(OpenFlags::ReadOnly))
                     {
@@ -1865,7 +1903,7 @@ impl Database {
                                 ConnectOpts {
                                     encryption_key: state.encryption_key.clone(),
                                     page_codec: page_codec.clone(),
-                                    readonly: Some(false),
+                                    readonly: Some(db.readonly_bootstrap),
                                 },
                                 ConnectionContext::default(),
                                 StatsRefresh::Blocking,
@@ -1933,6 +1971,9 @@ impl Database {
                         })?;
                     }
 
+                    if let Some(storage) = &state.readonly_storage {
+                        storage.finish_bootstrap()?;
+                    }
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -1951,20 +1992,33 @@ impl Database {
 
     fn ensure_writable_ready(&self) -> Result<()> {
         if self.is_readonly() {
-            return Err(LimboError::ReadOnly);
+            // Only an actual filesystem permission failure permits the C API's readonly fallback.
+            let _probe = self.io.open_file(&self.path, OpenFlags::NoLock, true)?;
+            return Err(LimboError::InvalidArgument(
+                "read-only authority cannot be activated; close all handles and reopen before writing".into(),
+            ));
         }
         let mut readiness = self.writer_readiness.lock();
         if readiness.ready {
             return Ok(());
         }
+        if readiness.activation_failed {
+            return Err(LimboError::InvalidArgument(
+                "writer activation failed after changing storage; close all handles and reopen"
+                    .into(),
+            ));
+        }
         if self.opts.enable_multiprocess_wal
             || self.page_codec_id.is_some()
+            || self.durable_storage.is_some()
             || !matches!(self.encryption_cipher_mode.get(), CipherMode::None)
         {
             return Err(LimboError::InvalidArgument(
-                "readonly storage activation requires an unencrypted default WAL database".into(),
+                "readonly storage activation requires unencrypted default storage".into(),
             ));
         }
+        let storage = readiness.storage.clone().ok_or(LimboError::ReadOnly)?;
+        let writer_lock = storage.lock_writer()?;
         let pager = self._init(None, None)?;
         let wal = self.build_wal(
             self.shared_wal.read().last_checksum_and_max_frame(),
@@ -1979,6 +2033,7 @@ impl Database {
             }
             let result: Result<()> = (|| {
                 let header = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
+                readiness.activation_failed = true;
                 header.borrow_mut().read_version = RawVersion::from(Version::Wal);
                 header.borrow_mut().write_version = RawVersion::from(Version::Wal);
                 let completion =
@@ -2001,7 +2056,17 @@ impl Database {
             wal.release_vacuum_lock();
             result?;
         }
-        readiness.legacy = false;
+        let mv_store = self.get_mv_store().as_ref().cloned();
+        let logical_log = if mv_store.is_some() {
+            Some(
+                self.io
+                    .open_file(storage.logical_log_path(), OpenFlags::None, false)?,
+            )
+        } else {
+            None
+        };
+        // A failed writable attempt may leave files changed, so only pre-mutation failures are retryable.
+        readiness.activation_failed = true;
         if readiness.orphan_wal {
             self.io.remove_file(&self.wal_path)?;
             readiness.orphan_wal = false;
@@ -2009,12 +2074,20 @@ impl Database {
         let file = self
             .io
             .open_file(&self.wal_path, OpenFlags::Create, false)?;
+        if let (Some(mv_store), Some(logical_log)) = (mv_store, logical_log) {
+            readiness
+                .retained_wal_files
+                .push(mv_store.replace_readonly_log_file(logical_log)?);
+        }
         let mut shared = self.shared_wal.write();
         if let Some(previous) = shared.runtime.file.replace(file) {
             readiness.retained_wal_files.push(previous);
         }
         shared.metadata.enabled.store(true, Ordering::Release);
+        readiness.legacy = false;
+        readiness.activation_failed = false;
         readiness.ready = true;
+        storage.retain_writer_lock(writer_lock);
         Ok(())
     }
 
@@ -2582,6 +2655,9 @@ impl Database {
                             self.allocators.mv_store.clone(),
                             self.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
+                        if let Some(storage) = &self.writer_readiness.lock().storage {
+                            storage.verify_log_file(&mv_store.get_logical_log_file())?;
+                        }
                         self.mv_store.store(Some(mv_store));
                     }
 
@@ -2796,7 +2872,7 @@ impl Database {
         let readonly = opts.readonly.unwrap_or(self.readonly_bootstrap);
         let encryption_key = opts.encryption_key;
         let page_codec = opts.page_codec;
-        if !readonly && !self.is_readonly() {
+        if !readonly {
             self.ensure_writable_ready()?;
         }
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -3835,7 +3911,7 @@ impl DatabaseCatalog {
         self.index_to_data.get(idx).map(|entry| entry.pager.clone())
     }
 
-    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>) -> usize {
+    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>, readonly: bool) -> usize {
         let idx = self.allocate_index();
         self.index_to_data.insert(
             idx,
@@ -3843,7 +3919,7 @@ impl DatabaseCatalog {
                 db,
                 pager,
                 sync_mode: SyncMode::Full,
-                readonly: false,
+                readonly,
             },
         );
         idx

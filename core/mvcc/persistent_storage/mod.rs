@@ -92,6 +92,11 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Used after an external database restore so future MVCC recovery starts
     /// from the restored image instead of replaying stale local log frames.
     fn reset_to_fresh_header(&self) -> Result<Completion>;
+    fn replace_readonly_file(&self, _file: Arc<dyn File>) -> Result<Arc<dyn File>> {
+        Err(LimboError::InvalidArgument(
+            "custom MVCC storage cannot activate a read-only authority".into(),
+        ))
+    }
     fn get_logical_log_file(&self) -> Arc<dyn File>;
     fn logical_log_offset(&self) -> u64;
     fn should_checkpoint(&self) -> bool;
@@ -165,6 +170,10 @@ impl Storage {
 }
 
 impl DurableStorage for Storage {
+    fn replace_readonly_file(&self, file: Arc<dyn File>) -> Result<Arc<dyn File>> {
+        self.logical_log.write().replace_readonly_file(file)
+    }
+
     fn serialize_row_version(
         &self,
         log_record: &mut LogRecord,
