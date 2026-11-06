@@ -1145,6 +1145,7 @@ fn find_select_plan_form(
         // Every row the WHERE clause keeps reaches the LIMIT unless an aggregate or DISTINCT
         // comes between.
         !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
+        plan.distinctness.is_distinct(),
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -2487,6 +2488,7 @@ fn optimize_table_access(
         initial_input_cardinality,
         None,
         true,
+        false,
     )?
     else {
         return Ok(None);
@@ -2524,6 +2526,7 @@ fn find_table_access_plan(
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
     rows_pass_through: bool,
+    distinct: bool,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2694,7 +2697,13 @@ fn find_table_access_plan(
     };
     let maybe_order_target = match simple_aggregate_target {
         Some(target) => Some(target),
-        None => compute_order_target(order_by, group_by.as_mut(), table_references, resolver)?,
+        None => compute_order_target(
+            order_by,
+            group_by.as_mut(),
+            distinct,
+            table_references,
+            resolver,
+        )?,
     };
 
     add_implied_column_equalities(where_clause, table_references, resolver)?;

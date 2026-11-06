@@ -149,6 +149,7 @@ pub fn simple_aggregate_order_target(
 pub fn compute_order_target(
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     group_by_opt: Option<&mut GroupBy>,
+    distinct: bool,
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<Option<OrderTarget>> {
@@ -169,7 +170,9 @@ pub fn compute_order_target(
             group_by
                 .exprs
                 .iter()
-                .map(|expr| (expr, SortOrder::Asc, None)),
+                .zip(group_by.sort_order.iter())
+                .zip(group_by.nulls_order.iter())
+                .map(|((expr, dir), nulls)| (expr, *dir, *nulls)),
             tables,
             resolver,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
@@ -183,6 +186,13 @@ pub fn compute_order_target(
         // If the GROUP BY contains all the expressions in the ORDER BY,
         // then we again can use the GROUP BY expressions as the target order for the join;
         // however in this case we must take the ASC/DESC from ORDER BY into account.
+        //
+        // A DISTINCT query keeps the first group of each duplicate, so it must not reorder
+        // its groups for the ORDER BY. `distinct_order_by_is_group_by` already dropped an
+        // ORDER BY that the groups provide.
+        (false, Some(group_by)) if distinct => {
+            distinct_group_by_order_target(order_by, group_by, tables, resolver)
+        }
         (false, Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
             let group_by_contains_all = order_by.iter().all(|(expr, _, _)| {
@@ -245,6 +255,67 @@ pub fn compute_order_target(
             )
         }
     }
+}
+
+/// Computes the [OrderTarget] of a DISTINCT query whose ORDER BY still needs its own sort,
+/// so that DISTINCT sees the groups in the same order as in SQLite.
+///
+/// Only the GROUP BY sort can be left out, and the target is ascending: like SQLite,
+/// a scan that returns the rows grouped is read forward, and only a GROUP BY sorter
+/// uses the directions from `distinct_group_by_sort_order`.
+fn distinct_group_by_order_target(
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
+    group_by: &GroupBy,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<OrderTarget>> {
+    // Each row is its own group when the GROUP BY has the rowid of the only table,
+    // and SQLite then reads the table in rowid order.
+    let target_exprs: Vec<&ast::Expr> = match rowid_of_only_table(&group_by.exprs, tables) {
+        Some(rowid) => vec![rowid],
+        // SQLite matches GROUP BY terms to an index in any order. Listing the ORDER BY
+        // terms first lets an index that starts with them provide the groups.
+        None => {
+            let mut exprs: Vec<&ast::Expr> = group_by.exprs.iter().collect();
+            exprs.sort_by_key(|expr| {
+                order_by
+                    .iter()
+                    .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
+                    .unwrap_or(usize::MAX)
+            });
+            exprs
+        }
+    };
+    OrderTarget::maybe_from_iterator(
+        target_exprs
+            .into_iter()
+            .map(|expr| (expr, SortOrder::Asc, None)),
+        tables,
+        resolver,
+        OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
+    )
+}
+
+fn rowid_of_only_table<'a>(
+    exprs: &'a [ast::Expr],
+    tables: &TableReferences,
+) -> Option<&'a ast::Expr> {
+    let [table] = tables.joined_tables() else {
+        return None;
+    };
+    exprs.iter().find(|expr| match expr {
+        ast::Expr::RowId { table: id, .. } => *id == table.internal_id,
+        ast::Expr::Column {
+            table: id, column, ..
+        } => {
+            *id == table.internal_id
+                && table
+                    .columns()
+                    .get(*column)
+                    .is_some_and(|column| column.is_rowid_alias())
+        }
+        _ => false,
+    })
 }
 
 /// Check if the plan's row iteration order matches the [OrderTarget]'s column order.

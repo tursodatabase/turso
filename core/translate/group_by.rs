@@ -335,6 +335,44 @@ pub fn compute_group_by_sort_order(
     (sort_order, nulls_order)
 }
 
+/// Computes the GROUP BY key directions of a DISTINCT query the way SQLite does.
+///
+/// DISTINCT keeps the first group of each duplicate, so the group order decides
+/// which row survives. SQLite copies the ORDER BY directions to the GROUP BY by
+/// position, and only when the ORDER BY as written has as many terms as the
+/// GROUP BY; otherwise every key is ascending.
+pub fn distinct_group_by_sort_order(
+    groupby_len: usize,
+    order_by_as_written: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
+) -> (Vec<SortOrder>, Vec<Option<ast::NullsOrder>>) {
+    let sort_order = if order_by_as_written.len() == groupby_len {
+        order_by_as_written
+            .iter()
+            .map(|(_, direction, _)| *direction)
+            .collect()
+    } else {
+        vec![SortOrder::Asc; groupby_len]
+    };
+    (sort_order, vec![None; groupby_len])
+}
+
+/// Whether the groups of a DISTINCT query already come out in ORDER BY order
+/// after `distinct_group_by_sort_order`, so that the ORDER BY sort can be left out.
+/// Like SQLite, this needs the ORDER BY as written to list the GROUP BY terms in
+/// the same order, with no NULLS clause that changes the default.
+pub fn distinct_order_by_is_group_by(
+    group_by_exprs: &[ast::Expr],
+    order_by_as_written: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
+) -> bool {
+    order_by_as_written.len() == group_by_exprs.len()
+        && order_by_as_written.iter().zip(group_by_exprs).all(
+            |((expr, direction, nulls), group_by_expr)| {
+                nulls.is_none_or(|nulls| nulls == ast::NullsOrder::default_for(*direction))
+                    && exprs_are_equivalent(expr, group_by_expr)
+            },
+        )
+}
+
 /// Extracts unique leaf column references from all aggregate function arguments.
 /// These are the base table columns that aggregate expressions depend on.
 /// By storing only these in the GROUP BY sorter (instead of pre-computed expression

@@ -13,7 +13,9 @@ use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::group_by::compute_group_by_sort_order;
+use crate::translate::group_by::{
+    compute_group_by_sort_order, distinct_group_by_sort_order, distinct_order_by_is_group_by,
+};
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
     GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
@@ -710,6 +712,9 @@ fn prepare_one_select_plan(
                 )?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
+            let distinct_order_by_as_written =
+                (plan.distinctness.is_distinct() && has_group_by).then(|| key.clone());
+
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
             let mut i = 0;
@@ -810,12 +815,20 @@ fn prepare_one_select_plan(
             if let Some(group_by) = &mut plan.group_by {
                 // now that we have resolved the ORDER BY expressions and aggregates, we can
                 // compute the necessary sort order for the GROUP BY clause
-                (group_by.sort_order, group_by.nulls_order) = compute_group_by_sort_order(
-                    &group_by.exprs,
-                    &plan.order_by,
-                    &plan.aggregates,
-                    resolver,
-                );
+                if let Some(order_by_as_written) = &distinct_order_by_as_written {
+                    (group_by.sort_order, group_by.nulls_order) =
+                        distinct_group_by_sort_order(group_by.exprs.len(), order_by_as_written);
+                    if distinct_order_by_is_group_by(&group_by.exprs, order_by_as_written) {
+                        plan.order_by.clear();
+                    }
+                } else {
+                    (group_by.sort_order, group_by.nulls_order) = compute_group_by_sort_order(
+                        &group_by.exprs,
+                        &plan.order_by,
+                        &plan.aggregates,
+                        resolver,
+                    );
+                }
                 debug_assert_eq!(
                     group_by.exprs.len(),
                     group_by.sort_order.len(),

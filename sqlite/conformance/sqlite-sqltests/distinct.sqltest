@@ -273,3 +273,53 @@ test distinct-spilled-many-duplicates {
 expect {
     5000|12497500
 }
+
+# DISTINCT keeps the first group of each duplicate, so the order in which the
+# GROUP BY returns its groups decides which row survives an ORDER BY on a column
+# that is not selected (#11489).
+@cross-check-integrity
+test distinct-group-by-order-by-unselected-column {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 'dup'), (2, 'p'), (3, 'q'), (4, 'dup');
+    SELECT DISTINCT b FROM t GROUP BY a, b ORDER BY a DESC;
+    SELECT DISTINCT b FROM t GROUP BY a, b ORDER BY a DESC LIMIT 1 OFFSET 2;
+}
+expect {
+    q
+    p
+    dup
+    dup
+}
+
+# The ORDER BY directions go to the GROUP BY by position, and only when both
+# have the same number of terms.
+@cross-check-integrity
+test distinct-group-by-order-by-directions-by-position {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c);
+    INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, 'z'), (4, 4, 40, 'x'),
+        (5, 5, NULL, 'y'), (6, NULL, 60, 'w'), (7, 7, 5, 'x');
+    SELECT group_concat(c, ' ') FROM (SELECT DISTINCT c FROM t GROUP BY a, b ORDER BY b DESC, a);
+    SELECT group_concat(c, ' ') FROM (SELECT DISTINCT c FROM t GROUP BY a ORDER BY b DESC);
+    SELECT group_concat(c, ' ') FROM (SELECT DISTINCT c FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST);
+    SELECT group_concat(r, ' ') FROM (SELECT DISTINCT c || count(*) AS r FROM t GROUP BY b, a ORDER BY sum(b) DESC, a DESC);
+}
+expect {
+    w z x y
+    w z x y
+    w z y x
+    w1 x1 z1 y1
+}
+
+# A GROUP BY that has the rowid makes one group per row, in rowid order.
+@cross-check-integrity
+test distinct-group-by-rowid-order-by-other-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c);
+    INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, 'z'), (4, 4, 40, 'x'),
+        (5, 5, NULL, 'y'), (6, NULL, 60, 'w'), (7, 7, 5, 'x');
+    SELECT group_concat(c, ' ') FROM (SELECT DISTINCT c FROM t GROUP BY id, c ORDER BY a DESC, b DESC, id DESC);
+    SELECT group_concat(c, ' ') FROM (SELECT DISTINCT c FROM t GROUP BY id, c ORDER BY id DESC, c);
+}
+expect {
+    z y x w
+    x w y z
+}
