@@ -1461,7 +1461,7 @@ mod tests {
         fn step(&self) -> Result<()> {
             let read = self.queue.lock().pop();
             if let Some(read) = read {
-                let _ = read.file.pread(read.offset, read.completion)?;
+                drop(read.file.pread(read.offset, read.completion)?);
             }
             Ok(())
         }
