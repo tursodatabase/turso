@@ -1291,6 +1291,22 @@ test domain-default-column-ref-fails-at-insert {
 expect error {
 }
 
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-parameter-rejected-at-create {
+    CREATE DOMAIN d AS INTEGER CHECK (value > ?);
+}
+expect error {
+    parameters prohibited in domain CHECK expressions
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-parameter-rejected-at-create {
+    CREATE DOMAIN d AS INTEGER DEFAULT ?;
+}
+expect error {
+    parameters prohibited in domain DEFAULT expressions
+}
+
 
 # ------------------------------------------------------------------------------
 # Adversarial tests: STRICT vs non-STRICT enforcement

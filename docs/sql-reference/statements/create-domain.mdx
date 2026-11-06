@@ -32,6 +32,8 @@ Domains work only with STRICT tables. Using a domain name in a non-STRICT table 
 
 `CREATE DOMAIN d` fails while a type, index, CHECK constraint, generated column, column default, view or trigger already uses `CAST(... AS d)`: that CAST converts to NUMERIC until `d` exists, and creating `d` would change what it gives. Create the domain first. A domain whose own CHECK or DEFAULT casts to it fails with `cannot create domain d: it casts to itself`.
 
+CHECK and DEFAULT cannot contain a bind parameter (`?`, `?1`, `:name`): nothing binds it when the domain is used, so `CREATE DOMAIN d AS integer CHECK (value > ?)` fails with `parameters prohibited in domain CHECK expressions`.
+
 ## Clauses
 
 ### IF NOT EXISTS
