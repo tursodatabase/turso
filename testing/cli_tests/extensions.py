@@ -455,22 +455,23 @@ def _test_kv(exec_name, ext_path):
         "create virtual table t using kv_store;",
     )
     turso.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE t" in res)
+    total = int(turso.shell.execute("select total_changes();"))
     turso.run_test_fn("insert into t values ('k1', 'v1');", null)
     turso.run_test_fn(
         "select changes(), total_changes(), last_insert_rowid() = (select rowid from t);",
-        lambda res: res == "1|2|1",
+        lambda res: res == f"1|{total + 1}|1",
         "insert into vtable counts a change and sets last_insert_rowid",
     )
     turso.run_test_fn("update t set value = 'v2';", null)
     turso.run_test_fn(
         "select changes(), total_changes();",
-        lambda res: res == "1|3",
+        lambda res: res == f"1|{total + 2}",
         "update of vtable counts a change",
     )
     turso.run_test_fn("delete from t;", null)
     turso.run_test_fn(
         "select changes(), total_changes();",
-        lambda res: res == "1|4",
+        lambda res: res == f"1|{total + 3}",
         "delete from vtable counts a change",
     )
     turso.run_test_fn(
