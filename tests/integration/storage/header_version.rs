@@ -2401,10 +2401,15 @@ fn test_empty_readonly_file_can_later_accept_a_writer() {
     let rows: Vec<(i64,)> = reader.exec_rows("SELECT 1");
     assert_eq!(rows, vec![(1,)]);
     let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    let writer = writer_db.connect(ConnectOpts::new().with_readonly(false)).unwrap();
+    let writer = writer_db
+        .connect(ConnectOpts::new().with_readonly(false))
+        .unwrap();
     writer.execute("CREATE TABLE t(x)").unwrap();
     writer.execute("INSERT INTO t VALUES (7)").unwrap();
     let rows: Vec<(i64,)> = reader.exec_rows("SELECT x FROM t");
     assert_eq!(rows, vec![(7,)]);
-    assert!(matches!(reader.execute("INSERT INTO t VALUES (8)"), Err(turso_core::LimboError::ReadOnly)));
+    assert!(matches!(
+        reader.execute("INSERT INTO t VALUES (8)"),
+        Err(turso_core::LimboError::ReadOnly)
+    ));
 }
