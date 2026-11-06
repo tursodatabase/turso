@@ -804,6 +804,7 @@ dependencies = [
  "libfuzzer-sys",
  "rusqlite",
  "turso_core",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -1627,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.0"
+version = "0.9.0-pre.2"
 dependencies = [
  "aegis",
  "aes",
@@ -1697,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.0"
+version = "0.9.0-pre.2"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -1706,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.0"
+version = "0.9.0-pre.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1715,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.0"
+version = "0.9.0-pre.2"
 dependencies = [
  "bitflags",
  "memchr",
@@ -1724,6 +1725,14 @@ dependencies = [
  "strum_macros",
  "thiserror",
  "turso_macros",
+]
+
+[[package]]
+name = "turso_sqlite"
+version = "0.9.0-pre.2"
+dependencies = [
+ "turso_core",
+ "turso_parser",
 ]
 
 [[package]]
