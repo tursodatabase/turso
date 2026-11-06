@@ -1867,6 +1867,8 @@ fn test_readonly_activation_fault_process() {
         let conn = db.connect(ConnectOpts::new().with_readonly(false)).unwrap();
         let rows: Vec<(String,)> = conn.exec_rows("SELECT val FROM t");
         assert_eq!(rows, vec![("test".to_string(),)]);
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
         conn.close().unwrap();
         println!("ACTIVATION_RECOVERED");
         return;
