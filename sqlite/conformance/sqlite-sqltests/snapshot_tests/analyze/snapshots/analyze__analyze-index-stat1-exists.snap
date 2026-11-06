@@ -44,7 +44,7 @@ addr  opcode       p1  p2  p3  p4              p5  comment
   29  Copy         12  15   0                   0  r[15]=r[12]
   30  MakeRecord   13   3  16                   0  r[16]=mkrec(r[13..15])
   31  NewRowid      0  17   0                   0  r[17]=rowid
-  32  Insert        0  16  17  sqlite_stat1     0  intkey=r[17] data=r[16]
+  32  Insert        0  16  17  sqlite_stat1    40  intkey=r[17] data=r[16]
   33  Halt          0   0   0                   0
   34  Transaction   0   2   4                   0  iDb=0 tx_mode=Write
   35  String8       0   3   0  items            0  r[3]='items'

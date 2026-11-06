@@ -54,7 +54,7 @@ addr  opcode       p1  p2  p3  p4                                               
   39  Copy         18  21   0                                                    0  r[21]=r[18]
   40  MakeRecord   19   3  22                                                    0  r[22]=mkrec(r[19..21])
   41  NewRowid      1  23   0                                                    0  r[23]=rowid
-  42  Insert        1  22  23  sqlite_stat1                                      0  intkey=r[23] data=r[22]
+  42  Insert        1  22  23  sqlite_stat1                                     40  intkey=r[23] data=r[22]
   43  OpenRead      4   4   0  k(2,B)                                            0  =idx_products_category, root=4, iDb=0
   44  Integer       1  25   0                                                    0  r[25]=1
   45  Function      0  25  24  stat_init                                         0  r[24]=func(r[25])
@@ -74,7 +74,7 @@ addr  opcode       p1  p2  p3  p4                                               
   59  Copy         28  31   0                                                    0  r[31]=r[28]
   60  MakeRecord   29   3  32                                                    0  r[32]=mkrec(r[29..31])
   61  NewRowid      1  33   0                                                    0  r[33]=rowid
-  62  Insert        1  32  33  sqlite_stat1                                      0  intkey=r[33] data=r[32]
+  62  Insert        1  32  33  sqlite_stat1                                     40  intkey=r[33] data=r[32]
   63  OpenRead      5   3   0  k(2,B)                                            0  =idx_products_sku, root=3, iDb=0
   64  Integer       1  35   0                                                    0  r[35]=1
   65  Function      0  35  34  stat_init                                         0  r[34]=func(r[35])
@@ -94,7 +94,7 @@ addr  opcode       p1  p2  p3  p4                                               
   79  Copy         38  41   0                                                    0  r[41]=r[38]
   80  MakeRecord   39   3  42                                                    0  r[42]=mkrec(r[39..41])
   81  NewRowid      1  43   0                                                    0  r[43]=rowid
-  82  Insert        1  42  43  sqlite_stat1                                      0  intkey=r[43] data=r[42]
+  82  Insert        1  42  43  sqlite_stat1                                     40  intkey=r[43] data=r[42]
   83  Halt          0   0   0                                                    0
   84  Transaction   0   2   9                                                    0  iDb=0 tx_mode=Write
   85  String8       0  11   0  products                                          0  r[11]='products'
