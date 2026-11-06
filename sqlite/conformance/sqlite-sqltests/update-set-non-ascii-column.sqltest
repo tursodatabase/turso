@@ -1,0 +1,66 @@
+@database :memory:
+
+# UPDATE SET (plain UPDATE and UPSERT DO UPDATE) with non-ASCII column names
+# https://github.com/tursodatabase/turso/issues/10321
+
+@cross-check-integrity
+test update-set-non-ascii-column {
+    CREATE TABLE t("Ä");
+    INSERT INTO t VALUES(1);
+    UPDATE t SET "Ä" = 2;
+    SELECT "Ä" FROM t;
+    UPDATE t SET Ä = 3;
+    SELECT "Ä" FROM t;
+}
+expect {
+    2
+    3
+}
+
+@cross-check-integrity
+test update-set-non-ascii-column-case-sensitive {
+    CREATE TABLE t("Ä");
+    INSERT INTO t VALUES(1);
+    UPDATE t SET "ä" = 2;
+}
+expect error {
+    no such column
+}
+
+@cross-check-integrity
+test update-set-multiple-non-ascii-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, "Ä", "Ö", "Ü");
+    INSERT INTO t VALUES(1, 10, 20, 30);
+    UPDATE t SET ("Ä", "Ö") = (100, 200);
+    SELECT "Ä", "Ö", "Ü" FROM t;
+    UPDATE t SET Ü = 300;
+    SELECT "Ä", "Ö", "Ü" FROM t;
+}
+expect {
+    100|200|30
+    100|200|300
+}
+
+@cross-check-integrity
+test upsert-set-non-ascii-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, "Ä");
+    INSERT INTO t VALUES(1, 1);
+    INSERT INTO t VALUES(1, 2) ON CONFLICT(id) DO UPDATE SET "Ä" = 3;
+    SELECT "Ä" FROM t;
+    INSERT INTO t VALUES(1, 4) ON CONFLICT(id) DO UPDATE SET Ä = 5;
+    SELECT "Ä" FROM t;
+}
+expect {
+    3
+    5
+}
+
+@cross-check-integrity
+test upsert-set-non-ascii-column-case-sensitive {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, "Ä");
+    INSERT INTO t VALUES(1, 1);
+    INSERT INTO t VALUES(1, 2) ON CONFLICT(id) DO UPDATE SET "ä" = 3;
+}
+expect error {
+    no such column
+}
