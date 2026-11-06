@@ -7,7 +7,7 @@ use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -4931,6 +4931,21 @@ impl PostgreSQLTranslator {
         let mut max_value = None;
         let mut cycle = false;
 
+        // PostgreSQL checks for a repeated option name before looking at
+        // any option's value. pg_query emits an option and its NO form
+        // under the same name.
+        let mut seen_options = std::collections::HashSet::new();
+        for opt_node in &seq.options {
+            if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
+                if !seen_options.insert(elem.defname.as_str()) {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_SYNTAX_ERROR,
+                        message: "conflicting or redundant options".into(),
+                    });
+                }
+            }
+        }
+
         let mut as_type = None;
         for opt_node in &seq.options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
@@ -7197,6 +7212,20 @@ pub fn try_extract_copy_from(
     } else {
         Some(extract_key_columns(&copy.attlist)?)
     };
+
+    // PostgreSQL checks for a repeated option name before looking at any
+    // option's value.
+    let mut seen_options = std::collections::HashSet::new();
+    for opt in &copy.options {
+        if let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node {
+            if !seen_options.insert(def.defname.as_str()) {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_SYNTAX_ERROR,
+                    message: "conflicting or redundant options".into(),
+                });
+            }
+        }
+    }
 
     let mut delimiter = None;
     let mut header = false;
@@ -10818,6 +10847,32 @@ mod tests {
     }
 
     #[test]
+    fn copy_from_rejects_repeated_options() {
+        for sql in [
+            "COPY t FROM '/tmp/d' WITH (DELIMITER ',', DELIMITER ';')",
+            "COPY t FROM '/tmp/d' WITH (NULL '', NULL 'x')",
+            "COPY t FROM '/tmp/d' WITH (HEADER true, HEADER false)",
+            "COPY t FROM '/tmp/d' WITH (FORMAT text, FORMAT text)",
+            "COPY t FROM '/tmp/d' WITH (ENCODING 'utf8', ENCODING 'utf-8')",
+            "COPY t FROM '/tmp/d' WITH (FREEZE false, FREEZE true)",
+            "COPY t FROM '/tmp/d' DELIMITER ',' DELIMITER ';'",
+            // PostgreSQL reports the repeat, not the bad first value.
+            "COPY t FROM '/tmp/d' WITH (DELIMITER '::', DELIMITER ',')",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = try_extract_copy_from(&parsed).expect_err(sql);
+            let ParseError::Sqlstate {
+                sqlstate, message,
+            } = &err
+            else {
+                panic!("{sql}: {err}")
+            };
+            assert_eq!(*sqlstate, SQLSTATE_SYNTAX_ERROR, "{sql}");
+            assert_eq!(message, "conflicting or redundant options", "{sql}");
+        }
+    }
+
+    #[test]
     fn test_try_extract_copy_from_with_columns() {
         let parsed = crate::parse("COPY users (id, name) FROM '/tmp/data.tsv'").unwrap();
         let copy = try_extract_copy_from(&parsed).unwrap().unwrap();
@@ -11941,6 +11996,37 @@ mod tests {
         };
         assert_eq!(min_value, Some(i16::MIN as i64));
         assert_eq!(max_value, None);
+    }
+
+    #[test]
+    fn create_sequence_rejects_repeated_options() {
+        for sql in [
+            "CREATE SEQUENCE s START 1 START 2",
+            "CREATE SEQUENCE s START WITH 1 START 2",
+            "CREATE SEQUENCE s INCREMENT 1 INCREMENT 2",
+            "CREATE SEQUENCE s MINVALUE 1 NO MINVALUE",
+            "CREATE SEQUENCE s NO MINVALUE NO MINVALUE",
+            "CREATE SEQUENCE s NO MAXVALUE MAXVALUE 5",
+            "CREATE SEQUENCE s CYCLE NO CYCLE",
+            "CREATE SEQUENCE s CACHE 1 CACHE 2",
+            "CREATE SEQUENCE s AS int AS bigint",
+            "CREATE SEQUENCE s OWNED BY NONE OWNED BY NONE",
+            "CREATE SEQUENCE s MINVALUE 1 START 2 MINVALUE 3",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .expect_err(sql);
+            let ParseError::Sqlstate {
+                sqlstate, message,
+            } = &err
+            else {
+                panic!("{sql}: {err}")
+            };
+            assert_eq!(*sqlstate, SQLSTATE_SYNTAX_ERROR, "{sql}");
+            assert_eq!(message, "conflicting or redundant options", "{sql}");
+        }
+        assert_translates("CREATE SEQUENCE s NO MINVALUE NO MAXVALUE START 1 INCREMENT 2");
     }
 
     #[test]
