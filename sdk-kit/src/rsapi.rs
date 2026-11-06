@@ -1084,7 +1084,11 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly))
+                    .with_page_codec(page_codec.clone()),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1093,7 +1097,11 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly))
+                    .with_encryption_key(encryption_key),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -2098,6 +2106,35 @@ mod tests {
         let result = db.open().unwrap();
         assert!(!result.is_io());
         db
+    }
+
+    #[test]
+    fn readonly_connection_cannot_write_through_cached_writable_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("mixed.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut config = config_with_features(None);
+        config.path = path;
+        let writer_db = TursoDatabase::new(config.clone());
+        assert!(!writer_db.open().unwrap().is_io());
+        let writer = writer_db.connect().unwrap();
+        execute_sql(&writer, "CREATE TABLE t(x)");
+        execute_sql(&writer, "INSERT INTO t VALUES(1)");
+        config.open_flags = OpenFlags::ReadOnly;
+        let reader_db = TursoDatabase::new(config);
+        assert!(!reader_db.open().unwrap().is_io());
+        let reader = reader_db.connect().unwrap();
+        execute_sql(&reader, "PRAGMA query_only=OFF");
+        let mut statement = reader.prepare_single("INSERT INTO t VALUES(2)").unwrap();
+        assert!(matches!(
+            statement.execute(None),
+            Err(TursoError::Readonly(_))
+        ));
+        execute_sql(&writer, "INSERT INTO t VALUES(3)");
+        assert_eq!(count_rows(&reader), Value::from_i64(2));
     }
 
     #[test]

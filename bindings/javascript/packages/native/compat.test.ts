@@ -129,6 +129,25 @@ test('readonly-db', () => {
     }
 })
 
+test('readonly connection stays restricted beside a writable connection', () => {
+    const path = `test-mixed-${(Math.random() * 1000000) | 0}.db`;
+    const rw = new Database(path);
+    let ro;
+    try {
+        rw.exec("CREATE TABLE t(x); INSERT INTO t VALUES(1)");
+        ro = new Database(path, { readonly: true });
+        ro.exec("PRAGMA query_only=OFF");
+        expect(() => ro.exec("INSERT INTO t VALUES(2)")).toThrowError(/readonly database/g);
+        rw.exec("INSERT INTO t VALUES(3)");
+        expect(ro.prepare("SELECT x FROM t ORDER BY x").all()).toEqual([{ x: 1 }, { x: 3 }]);
+    } finally {
+        ro?.close();
+        rw.close();
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+});
+
 test('file-must-exist', () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     let error: any;
