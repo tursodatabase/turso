@@ -71,6 +71,17 @@ expect {
     3|d|INTEGER|0||0|2
 }
 
+test gencol_pragma_table_xinfo_shows_stored_with_hidden_3 {
+    CREATE TABLE t1(a INTEGER, v INTEGER AS (a * 2) VIRTUAL, s INTEGER AS (a * 3) STORED, b TEXT);
+    PRAGMA table_xinfo(t1);
+}
+expect {
+    0|a|INTEGER|0||0|0
+    1|v|INTEGER|0||0|2
+    2|s|INTEGER|0||0|3
+    3|b|TEXT|0||0|0
+}
+
 # =============================================================================
 # 2. Expression Types
 # =============================================================================
@@ -3449,6 +3460,27 @@ expect error {
     cannot add a STORED column
 }
 
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_alter_add_stored_with_custom_type_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER) STRICT;
+    ALTER TABLE t1 ADD COLUMN s cents AS (a) STORED;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support array types"
+@requires custom_types "uses array types"
+test gencol_alter_add_stored_reading_array_column_rejected {
+    CREATE TABLE t1(a INTEGER[]) STRICT;
+    ALTER TABLE t1 ADD COLUMN s TEXT AS (a) STORED;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
 # --- RENAME COLUMN with generated columns ---
 
 test gencol_rename_column_updates_expression {
@@ -3676,10 +3708,19 @@ expect {
     ok
 }
 
-# --- PRAGMA table_info hides virtual columns ---
+# --- PRAGMA table_info hides generated columns ---
 
 test gencol_pragma_table_info_hides_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
+    PRAGMA table_info(t1);
+}
+expect {
+    0|a|INTEGER|0||0
+    1|c|TEXT|0||0
+}
+
+test gencol_pragma_table_info_hides_stored {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c TEXT);
     PRAGMA table_info(t1);
 }
 expect {
@@ -4424,6 +4465,66 @@ test gencol_error_order_stored_chain {
 }
 expect error {
     integer overflow
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_custom_type_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER, s cents AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support array types"
+@requires custom_types "uses array types"
+test gencol_stored_with_array_type_rejected {
+    CREATE TABLE t1(a INTEGER, s INTEGER[] AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_reading_custom_type_column_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a cents, s INTEGER AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support array types"
+@requires custom_types "uses array types"
+test gencol_stored_reading_array_column_rejected {
+    CREATE TABLE t1(a INTEGER[], s TEXT AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_reading_custom_type_column_through_virtual_column_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a cents, v INTEGER AS (a) VIRTUAL, s INTEGER AS (v) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_next_to_unread_custom_type_column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER, c cents, s INTEGER AS (a * 2) STORED) STRICT;
+    INSERT INTO t1(a, c) VALUES (1, 5);
+    SELECT a, c, s FROM t1;
+}
+expect {
+    1|5|2
 }
 
 # =============================================================================
