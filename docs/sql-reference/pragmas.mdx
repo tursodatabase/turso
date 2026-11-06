@@ -405,8 +405,10 @@ convert it.
 
 If storage changed outside the process while read-only state was retained, a
 persistent write can require closing all handles and reopening the database.
-An I/O failure after activation has changed storage also requires closing and
-reopening; the failed operation does not acknowledge a user transaction.
+A temporary I/O failure while validating unchanged storage can be retried before
+activation changes any files. An I/O failure after activation has changed storage
+requires closing and reopening; the failed operation does not acknowledge a user
+transaction.
 Encrypted, custom, unidentified, multiprocess, and lock-disabled storage do not
 use this activation path.
 
