@@ -257,6 +257,74 @@ expect {
     12|3
 }
 
+test unqualified-rowid-table-and-derived {
+    CREATE TABLE t1(a);
+    INSERT INTO t1(rowid, a) VALUES(7, 5);
+    SELECT rowid, _rowid_, oid FROM (SELECT 1) JOIN t1
+    UNION ALL
+    SELECT rowid, _rowid_, oid FROM t1 JOIN (SELECT 1);
+}
+expect {
+    7|7|7
+    7|7|7
+}
+
+test unqualified-rowid-virtual-and-derived {
+    SELECT rowid FROM (SELECT 1) JOIN json_each('[5,6]')
+    UNION ALL
+    SELECT rowid FROM json_each('[5,6]') JOIN (SELECT 1);
+}
+expect {
+    0
+    1
+    0
+    1
+}
+
+test unqualified-rowid-null-joined-virtual {
+    SELECT typeof(rowid) FROM (SELECT 1) LEFT JOIN json_each('[5]') ON 0;
+}
+expect {
+    null
+}
+
+test unqualified-rowid-named-column-precedes-implicit {
+    CREATE TABLE t1(a);
+    INSERT INTO t1(rowid, a) VALUES(7, 5);
+    SELECT rowid FROM (SELECT 9 AS rowid) JOIN t1;
+}
+expect {
+    9
+}
+
+test unqualified-rowid-cte-and-table {
+    CREATE TABLE t1(a);
+    INSERT INTO t1(rowid, a) VALUES(7, 5);
+    WITH q AS (SELECT 1) SELECT oid FROM q JOIN t1;
+}
+expect {
+    7
+}
+
+@backend rust
+test unqualified-rowid-without-rowid-and-table {
+    CREATE TABLE t1(a PRIMARY KEY) WITHOUT ROWID;
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t2(rowid, b) VALUES(7, 5);
+    SELECT rowid FROM t1 JOIN t2;
+}
+expect {
+    7
+}
+
+test unqualified-rowid-multiple-real-sources {
+    SELECT rowid FROM (SELECT 1) JOIN json_each('[5]') JOIN json_each('[6]');
+}
+expect error {
+    ambiguous
+}
+
 test json-tree-id-with-two-byte-container-header {
     SELECT max(id), count(*) FROM json_tree((SELECT json_group_array(value) FROM generate_series(1, 500)));
 }
