@@ -499,6 +499,7 @@ enum StatsRefresh {
 /// [`Database::connect_async`].
 #[derive(Clone)]
 pub struct ConnectOpts {
+    readonly: bool,
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
 }
@@ -512,9 +513,17 @@ impl ConnectOpts {
     /// external page codec.
     pub fn new() -> Self {
         Self {
+            readonly: false,
             encryption_key: None,
             page_codec: None,
         }
+    }
+
+    /// Restricts this connection to read-only access to the main database.
+    /// Setting false cannot make read-only database storage writable.
+    pub fn with_readonly(mut self, readonly: bool) -> Self {
+        self.readonly = readonly;
+        self
     }
 
     /// Sets the key used to open an encrypted database. Use this when the key
@@ -1130,6 +1139,7 @@ impl Database {
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
+        flags: OpenFlags,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
@@ -1161,6 +1171,7 @@ impl Database {
 
         Self::check_registry_dialect(&db, dialect)?;
 
+        Self::check_registry_access(&db, flags)?;
         Ok(Some(db))
     }
 
@@ -1226,6 +1237,7 @@ impl Database {
                 &options.encryption,
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
+                options.flags,
             )? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
@@ -1395,6 +1407,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_access(&db, flags)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1456,6 +1469,15 @@ impl Database {
             Ok(IOResult::IO(_)) => {}
         }
         result
+    }
+
+    fn check_registry_access(db: &Database, flags: OpenFlags) -> Result<()> {
+        if db.is_readonly() && !flags.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::InvalidArgument(
+                "database is already open read-only; close all existing connections and database handles, then reopen it writable".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Synchronous [`Database::do_open_async`] that drives the IO loop.
@@ -1663,6 +1685,7 @@ impl Database {
                         page_codec.clone(),
                         ConnectionContext::default(),
                         StatsRefresh::Blocking,
+                        false,
                     )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
@@ -1790,6 +1813,7 @@ impl Database {
                                 page_codec.clone(),
                                 ConnectionContext::default(),
                                 StatsRefresh::Blocking,
+                                false,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -2513,6 +2537,7 @@ impl Database {
                 None,
                 ConnectionContext::default(),
                 StatsRefresh::Blocking,
+                false,
             )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
@@ -2579,6 +2604,7 @@ impl Database {
             opts.page_codec,
             context,
             StatsRefresh::Blocking,
+            opts.readonly,
         )
     }
 
@@ -2619,6 +2645,7 @@ impl Database {
                     opts.page_codec,
                     ConnectionContext::default(),
                     StatsRefresh::Deferred,
+                    opts.readonly,
                 )?;
                 state.conn = Some(conn.clone());
                 conn
@@ -2644,6 +2671,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         context: ConnectionContext,
         stats: StatsRefresh,
+        readonly: bool,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
@@ -2677,6 +2705,7 @@ impl Database {
             encryption_key,
             default_cache_size,
             context,
+            readonly,
         )?;
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
@@ -2700,6 +2729,7 @@ impl Database {
             encryption_key,
             default_cache_size,
             ConnectionContext::default(),
+            false,
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2714,9 +2744,11 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
         context: ConnectionContext,
+        readonly: bool,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
+            main_readonly: readonly,
             db: self.clone(),
             context: context.value,
             hooks: context.hooks,
@@ -4447,6 +4479,135 @@ mod database_tests {
         let second = open_with_page_codec(io, path, second_codec);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn readonly_registry_rejects_writable_sync_and_async_joins_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-first.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        {
+            let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            writer
+                .execute("CREATE TABLE test(id INTEGER PRIMARY KEY); INSERT INTO test VALUES(1)")
+                .unwrap();
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let readonly = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        let reader = readonly
+            .connect(ConnectOpts::new().with_readonly(false))
+            .unwrap();
+        assert!(reader.is_readonly(crate::MAIN_DB_ID));
+        let snapshot = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        for flags in [OpenFlags::None, OpenFlags::Create] {
+            let error = Database::open(
+                io.clone(),
+                path,
+                OpenOptions::new(Arc::new(EngineDialect)).flags(flags),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, LimboError::InvalidArgument(ref message)
+                if message.contains("read-only") && message.contains("close") && message.contains("reopen")),
+                "{error}"
+            );
+            let options = OpenOptions::new(Arc::new(EngineDialect))
+                .flags(flags)
+                .storage(readonly.db_file.clone());
+            let mut state = OpenDbAsyncState::new();
+            let error = Database::open_async(&mut state, io.clone(), path, &options).unwrap_err();
+            assert!(matches!(*error, LimboError::InvalidArgument(ref message)
+                if message.contains("read-only") && message.contains("reopen")));
+            assert_eq!(snapshot(), before);
+        }
+        assert_eq!(count_test_rows(&reader), 1);
+        drop(reader);
+        drop(readonly);
+        let writable = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        writable
+            .connect(ConnectOpts::new())
+            .unwrap()
+            .execute("INSERT INTO test VALUES(2)")
+            .unwrap();
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn readonly_connection_restriction_survives_writable_registry_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("writable-first.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
+            .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id INTEGER PRIMARY KEY); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let reused = Database::open(
+            io,
+            path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&db, &reused));
+        let reader = reused
+            .connect(ConnectOpts::new().with_readonly(true))
+            .unwrap();
+        assert!(reader.is_readonly(crate::MAIN_DB_ID));
+        assert!(!writer.is_readonly(crate::MAIN_DB_ID));
+        reader.execute("PRAGMA query_only=OFF").unwrap();
+        assert!(matches!(
+            reader.execute("INSERT INTO test VALUES(2)"),
+            Err(LimboError::ReadOnly)
+        ));
+        reader.execute("CREATE TEMP TABLE scratch(value)").unwrap();
+        reader.execute("INSERT INTO scratch VALUES(7)").unwrap();
+        writer.execute("INSERT INTO test VALUES(3)").unwrap();
+        assert_eq!(count_test_rows(&reader), 2);
+    }
+
+    #[test]
+    fn readonly_connection_restriction_is_applied_by_async_connect() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let mut state = super::ConnectAsyncState::default();
+        let reader = loop {
+            match db
+                .connect_async(ConnectOpts::new().with_readonly(true), &mut state)
+                .unwrap()
+            {
+                IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+                IOResult::Done(connection) => break connection,
+            }
+        };
+        assert!(reader.is_readonly(crate::MAIN_DB_ID));
+        assert!(matches!(
+            reader.execute("INSERT INTO test VALUES(1)"),
+            Err(LimboError::ReadOnly)
+        ));
+        writer.execute("INSERT INTO test VALUES(2)").unwrap();
+        assert_eq!(count_test_rows(&reader), 1);
     }
 
     #[cfg(feature = "fs")]

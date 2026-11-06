@@ -386,6 +386,8 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
+Turning `query_only` off does not remove a read-only restriction chosen when opening or connecting to the database.
+
 ### full_column_names / short_column_names
 
 Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean.

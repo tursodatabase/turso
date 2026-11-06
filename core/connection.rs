@@ -391,6 +391,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
+    pub(crate) main_readonly: bool,
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
@@ -1930,7 +1931,8 @@ impl Connection {
                 None,
                 dialect,
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn =
+                db.connect(ConnectOpts::new().with_readonly(flags.contains(OpenFlags::ReadOnly)))?;
             return Ok((io, conn));
         }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
@@ -1960,7 +1962,8 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn =
+            db.connect(ConnectOpts::new().with_readonly(flags.contains(OpenFlags::ReadOnly)))?;
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -2566,7 +2569,7 @@ impl Connection {
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
-            && !self.db.is_readonly()
+            && !self.is_readonly(MAIN_DB_ID)
             && !is_memory_db
             && should_checkpoint_on_close
         {
@@ -2862,7 +2865,7 @@ impl Connection {
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
         match index {
-            crate::MAIN_DB_ID => self.db.is_readonly(),
+            crate::MAIN_DB_ID => self.main_readonly || self.db.is_readonly(),
             crate::TEMP_DB_ID => self
                 .temp
                 .database
