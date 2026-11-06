@@ -262,6 +262,8 @@ FROM employees
 GROUP BY department;
 ```
 
+Aggregate functions, including those registered by an application, cannot be used in `WHERE` or as arguments to another aggregate in the same query. These uses return a misuse of aggregate function error. To aggregate an aggregate result, put the first aggregation in a subquery.
+
 Aggregate functions that can be used with GROUP BY:
 
 | Function | Description |
