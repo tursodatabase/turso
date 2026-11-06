@@ -425,6 +425,17 @@ fn test_multiple_statements() {
     let sql = "INSERT INTO t VALUES ('a;b'); SELECT 1";
     let stmts = split_statements(sql).expect("Failed to split statements");
     assert_eq!(stmts.len(), 2);
+
+    // Semicolons inside a BEGIN ATOMIC function body should not split
+    let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END; SELECT 3";
+    let stmts = split_statements(sql).expect("Failed to split statements");
+    assert_eq!(
+        stmts,
+        [
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END",
+            "SELECT 3"
+        ]
+    );
 }
 
 #[test]
