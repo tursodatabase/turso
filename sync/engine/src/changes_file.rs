@@ -994,4 +994,166 @@ mod tests {
         }
     }
 
+    #[test]
+    fn write_failures_prevent_sealing_without_requiring_fsync() {
+        for write_failure in [true, false] {
+            let file = Arc::new(ControlledFile::new());
+            let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
+            run(|coro| async move {
+                changes.reset(&coro, ChangeKind::Logical).await?;
+                file.fail_write.store(write_failure, Ordering::SeqCst);
+                if write_failure {
+                    assert!(changes
+                        .append_record(&coro, b"private payload")
+                        .await
+                        .is_err());
+                } else {
+                    changes.append_record(&coro, b"private payload").await?;
+                    file.fail_sync.store(true, Ordering::SeqCst);
+                }
+                if write_failure {
+                    assert!(changes.finish(&coro).await.is_err());
+                    assert!(matches!(changes.state, State::Invalid));
+                } else {
+                    let sealed = changes.finish(&coro).await?;
+                    let mut reader = changes.open_reader(&coro, &sealed).await?;
+                    assert_eq!(
+                        reader.next_record(&coro).await?,
+                        Some(b"private payload".to_vec())
+                    );
+                    assert!(reader.next_record(&coro).await?.is_none());
+                }
+                for write in file.writes.lock().expect("writes").iter() {
+                    assert!(!write.windows(15).any(|bytes| bytes == b"private payload"));
+                }
+                Ok(())
+            })
+            .expect("failure test");
+        }
+    }
+
+    #[test]
+    fn cancelled_plaintext_page_write_keeps_buffer_until_reset_drains_it() {
+        let file = Arc::new(ControlledFile::new());
+        let mut changes = ChangesFile::new(file.clone(), None);
+        run(|coro| {
+            let changes = &mut changes;
+            async move { changes.reset(&coro, ChangeKind::Pages).await }
+        })
+        .unwrap();
+        file.delay.store(true, Ordering::SeqCst);
+        let buffer = Arc::new(Buffer::new(vec![29; 4120]));
+        let weak = Arc::downgrade(&buffer);
+        let mut write =
+            Gen::new(|co| async { changes.append_page(&co.into(), buffer.clone()).await });
+        assert!(matches!(
+            write.resume_with(Ok(())),
+            GeneratorState::Yielded(_)
+        ));
+        drop(write);
+        drop(buffer);
+        assert!(changes.sealed().is_err());
+        assert!(
+            weak.upgrade().is_some(),
+            "pending write lost the caller's buffer"
+        );
+        let truncates = file.truncates.load(Ordering::SeqCst);
+        let mut reset = Gen::new(|co| async { changes.reset(&co.into(), ChangeKind::Pages).await });
+        assert!(matches!(
+            reset.resume_with(Ok(())),
+            GeneratorState::Yielded(_)
+        ));
+        assert_eq!(file.truncates.load(Ordering::SeqCst), truncates);
+        assert_eq!(weak.upgrade().unwrap().as_slice(), &[29; 4120]);
+        file.flush();
+        file.delay.store(false, Ordering::SeqCst);
+        let GeneratorState::Complete(result) = reset.resume_with(Ok(())) else {
+            panic!("reset should complete after pending write");
+        };
+        result.unwrap();
+        drop(reset);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(file.truncates.load(Ordering::SeqCst), truncates + 1);
+        run(|coro| async move {
+            changes
+                .append_page(&coro, Arc::new(Buffer::new(vec![7; 4120])))
+                .await?;
+            let sealed = changes.finish(&coro).await?;
+            let mut reader = changes.open_reader(&coro, &sealed).await?;
+            assert_eq!(reader.next_record(&coro).await?, Some(vec![7; 4120]));
+            assert!(reader.next_record(&coro).await?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reset_waits_for_cancelled_writer_before_truncation() {
+        let file = Arc::new(ControlledFile::new());
+        let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
+        run(|coro| {
+            let changes = &mut changes;
+            async move { changes.reset(&coro, ChangeKind::Logical).await }
+        })
+        .expect("reset");
+        file.delay.store(true, Ordering::SeqCst);
+        let mut write = Gen::new(|co| async {
+            changes
+                .append_record(&co.into(), b"cancelled payload")
+                .await
+        });
+        assert!(matches!(
+            write.resume_with(Ok(())),
+            GeneratorState::Yielded(_)
+        ));
+        drop(write);
+        let truncates = file.truncates.load(Ordering::SeqCst);
+        let mut reset = Gen::new(|co| async { changes.reset(&co.into(), ChangeKind::Pages).await });
+        assert!(matches!(
+            reset.resume_with(Ok(())),
+            GeneratorState::Yielded(_)
+        ));
+        assert_eq!(file.truncates.load(Ordering::SeqCst), truncates);
+        file.flush();
+        file.delay.store(false, Ordering::SeqCst);
+        let GeneratorState::Complete(result) = reset.resume_with(Ok(())) else {
+            panic!("reset should complete")
+        };
+        result.expect("reset after cancelled write");
+        drop(reset);
+        assert_eq!(file.truncates.load(Ordering::SeqCst), truncates + 1);
+        run(|coro| async move {
+            changes.append_record(&coro, &[4; 4120]).await?;
+            let sealed = changes.finish(&coro).await?;
+            let mut reader = changes.open_reader(&coro, &sealed).await?;
+            assert_eq!(reader.next_record(&coro).await?, Some(vec![4; 4120]));
+            assert!(reader.next_record(&coro).await?.is_none());
+            Ok(())
+        })
+        .expect("reuse after cancellation");
+    }
+
+    #[test]
+    fn partial_reads_and_empty_batch_size_validation() {
+        let file = Arc::new(ControlledFile::new());
+        file.read_limit.store(7, Ordering::SeqCst);
+        let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
+        run(|coro| async move {
+            changes.reset(&coro, ChangeKind::Pages).await?;
+            changes.append_record(&coro, &[23; 4120]).await?;
+            let pages = changes.finish(&coro).await?;
+            let mut reader = changes.open_reader(&coro, &pages).await?;
+            assert_eq!(reader.next_record(&coro).await?, Some(vec![23; 4120]));
+            assert!(reader.next_record(&coro).await?.is_none());
+            drop(reader);
+            changes.reset(&coro, ChangeKind::Logical).await?;
+            let empty = changes.finish(&coro).await?;
+            assert_eq!(empty.size, 0);
+            assert!(changes.validate_boundary(&coro).await?);
+            changes.write(&coro, 0, vec![1]).await?;
+            assert!(changes.open_reader(&coro, &empty).await.is_err());
+            Ok(())
+        })
+        .expect("partial reads and empty authentication");
+    }
 }
