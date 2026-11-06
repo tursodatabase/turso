@@ -401,7 +401,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -2386,7 +2386,7 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
@@ -2419,7 +2419,12 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if subquery_reads_outer_aggregate(subquery) {
+        if let Some(func) = outer_aggregate_read_by_subquery(subquery) {
+            // An aggregate's arguments are evaluated for each input row, before
+            // this query has computed the aggregate the subquery reads.
+            if aggregate_subquery_ids.contains(&subquery.internal_id) {
+                crate::bail_parse_error!("misuse of aggregate: {}()", func);
+            }
             subquery.eval_phase = if has_grouped_output {
                 SubqueryEvalPhase::GroupedOutput
             } else {
@@ -2472,6 +2477,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
     if let Some(group_by) = plan.group_by.as_mut() {
         group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
     }
+    Ok(())
 }
 
 /// The columns of `plan`'s own tables that are read by its subqueries that run
@@ -2531,8 +2537,8 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
     found
 }
 
-/// True when a result column of the subquery contains an aggregate whose value
-/// the outer query computes: a plain aggregate call that is not one of the
+/// The name of an aggregate in a result column of the subquery whose value the
+/// outer query computes: a plain aggregate call that is not one of the
 /// subquery's own aggregates, because its argument referenced an outer column
 /// and it was moved to the outer query during resolution. The subquery reads
 /// that aggregate back from the register the outer query finalizes it into.
@@ -2540,14 +2546,19 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
+fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<String> {
+    // EXISTS only checks whether a row comes out and never evaluates its
+    // result columns, as in SQLite.
+    if matches!(subquery.query_type, SubqueryType::Exists { .. }) {
+        return None;
+    }
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
-        return false;
+        return None;
     };
     let Plan::Select(select) = plan.as_ref() else {
-        return false;
+        return None;
     };
-    let mut found = false;
+    let mut found = None;
     for rc in &select.result_columns {
         let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
             if let ast::Expr::FunctionCall {
@@ -2563,13 +2574,13 @@ fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
                         Ok(Some(crate::function::Func::Agg(_)))
                     );
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
-                    found = true;
+                    found = Some(name.as_str().to_string());
                     return Ok(WalkControl::SkipChildren);
                 }
             }
             Ok(WalkControl::Continue)
         });
-        if found {
+        if found.is_some() {
             break;
         }
     }

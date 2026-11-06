@@ -633,7 +633,7 @@ pub(super) fn choose_best_in_seek_candidate(
                     continue;
                 }
                 let constrained_column = &rhs_table.table.columns()[col_pos];
-                let idx_aff = constrained_column.affinity();
+                let idx_aff = constrained_column.comparison_affinity();
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
@@ -659,11 +659,7 @@ pub(super) fn choose_best_in_seek_candidate(
             }
 
             let lhs_affinity = if let Some(col_pos) = constraint.table_col_pos {
-                btree
-                    .columns()
-                    .get(col_pos)
-                    .map(|col| col.affinity())
-                    .unwrap_or(Affinity::Blob)
+                btree.columns()[col_pos].comparison_affinity()
             } else {
                 Affinity::Integer
             };

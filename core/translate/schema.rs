@@ -9,7 +9,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
+    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
@@ -20,7 +20,9 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::expr_type::iif_values;
+use crate::translate::expr::expr_type::{
+    base_value_type, decode_type, iif_values, value_type, ExprType,
+};
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
@@ -738,73 +740,7 @@ fn validate(
         let is_strict = options.contains_strict();
 
         for c in columns {
-            if let Some(ref col_type) = c.col_type {
-                let type_name = &column_declared_type(&col_type.name);
-                let is_builtin = is_builtin_strict_type(&col_type.name);
-
-                // Array columns require STRICT tables because the encode/decode
-                // pipeline is only emitted for STRICT tables.
-                if col_type.is_array() && !is_strict {
-                    bail_parse_error!(
-                        "array type columns require STRICT tables: {}.{}",
-                        table_name,
-                        c.col_name
-                    );
-                }
-                if col_type.is_array() {
-                    resolver.schema().check_array_element_type(type_name)?;
-                }
-
-                // Domain types require STRICT tables because domain constraints
-                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
-                if !is_builtin && !is_strict {
-                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
-                    if let Some(td) = type_def {
-                        if td.is_domain {
-                            bail_parse_error!(
-                                "domain type columns require STRICT tables: {}.{}",
-                                table_name,
-                                c.col_name
-                            );
-                        }
-                    }
-                }
-
-                if !is_builtin && is_strict {
-                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
-                    {
-                        match type_def {
-                            None => {
-                                bail_parse_error!(
-                                    "unknown datatype for {}.{}: \"{}\"",
-                                    table_name,
-                                    c.col_name,
-                                    type_name
-                                );
-                            }
-                            Some(td) if td.user_params().next().is_some() => {
-                                // Parametric type: verify the column provides the right
-                                // number of user parameters (excluding `value`).
-                                let provided = match &col_type.size {
-                                    Some(ast::TypeSize::TypeSize(_, _)) => 2,
-                                    Some(ast::TypeSize::MaxSize(_)) => 1,
-                                    None => 0,
-                                };
-                                let expected = td.user_params().count();
-                                if provided != expected {
-                                    bail_parse_error!(
-                                        "type \"{}\" requires {} parameter(s), got {}",
-                                        type_name,
-                                        expected,
-                                        provided
-                                    );
-                                }
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                }
-            }
+            check_column_type(c, table_name, is_strict, resolver.schema())?;
         }
 
         // In STRICT tables, validate that CHECK constraint comparisons have
@@ -860,10 +796,84 @@ fn validate(
                     bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
                 }
             }
-            table.resolve_custom_types(resolver.schema());
+            table.resolve_custom_types(resolver.schema())?;
             table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
+    }
+    Ok(())
+}
+
+/// Refuses a column type that a table cannot have. CREATE TABLE, ADD COLUMN
+/// and ALTER COLUMN all call this, so ALTER cannot give a column a type that
+/// CREATE TABLE refuses.
+pub(crate) fn check_column_type(
+    column: &ast::ColumnDefinition,
+    table_name: &str,
+    is_strict: bool,
+    schema: &Schema,
+) -> Result<()> {
+    let Some(col_type) = &column.col_type else {
+        if is_strict {
+            bail_parse_error!("missing datatype for {}.{}", table_name, column.col_name);
+        }
+        return Ok(());
+    };
+    let type_name = &column_declared_type(&col_type.name);
+    let is_builtin = is_builtin_strict_type(&col_type.name);
+
+    if col_type.is_array() {
+        // Arrays are encoded and decoded only in STRICT tables.
+        if !is_strict {
+            bail_parse_error!(
+                "array type columns require STRICT tables: {}.{}",
+                table_name,
+                column.col_name
+            );
+        }
+        schema.check_array_element_type(type_name)?;
+    }
+    if is_builtin {
+        return Ok(());
+    }
+
+    let type_def = schema.get_type_def_unchecked(type_name);
+    if !is_strict {
+        // Domain constraints (CHECK, NOT NULL, DEFAULT) are enforced only in
+        // STRICT tables. Any other name is a plain declared type with an affinity.
+        if type_def.is_some_and(|td| td.is_domain) {
+            bail_parse_error!(
+                "domain type columns require STRICT tables: {}.{}",
+                table_name,
+                column.col_name
+            );
+        }
+        return Ok(());
+    }
+    let Some(td) = type_def else {
+        bail_parse_error!(
+            "unknown datatype for {}.{}: \"{}\"",
+            table_name,
+            column.col_name,
+            type_name
+        );
+    };
+    // A type with parameters besides `value` needs each one given, as in `p(10)`.
+    let expected = td.user_params().count();
+    if expected > 0 {
+        let provided = match &col_type.size {
+            Some(ast::TypeSize::TypeSize(_, _)) => 2,
+            Some(ast::TypeSize::MaxSize(_)) => 1,
+            None => 0,
+        };
+        if provided != expected {
+            bail_parse_error!(
+                "type \"{}\" requires {} parameter(s), got {}",
+                type_name,
+                expected,
+                provided
+            );
+        }
     }
     Ok(())
 }
@@ -3117,6 +3127,7 @@ pub fn translate_create_type(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
+    check_name_not_cast_to("type", &normalized_name, resolver)?;
 
     // Validate encode/coerce/decode expressions for safety (only for custom types)
     if let ast::CreateTypeBody::CustomType {
@@ -3137,22 +3148,51 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
-
-        let type_def = crate::schema::TypeDef::from_create_type(
-            &normalized_name,
-            body,
-            crate::schema::TypeOrigin::User,
-            String::new(),
-        )?;
+        let type_def =
+            TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
         resolver
             .schema()
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
+        // A CAST to the type from its own DECODE would run that DECODE again
+        // without end.
+        if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {
+            bail_parse_error!("cannot create type {normalized_name}: it casts to itself");
+        }
+        check_decode_type(&type_def, resolver)?;
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
 
     persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+/// Refuse a DECODE when the kind of value it returns can't be worked out:
+/// comparisons with the type's values convert the other side to that kind,
+/// so they would have to guess it.
+fn check_decode_type(type_def: &TypeDef, resolver: &Resolver) -> Result<()> {
+    let schema = resolver.schema();
+    let syms = resolver.catalog.symbol_table;
+    if value_type(type_def, schema, syms).is_some() {
+        return Ok(());
+    }
+    let name = &type_def.name;
+    if let Some(base) = base_value_type(type_def.base(), schema) {
+        if let Some(ExprType::Custom {
+            type_def: other, ..
+        }) = decode_type(type_def, base, schema, syms)
+        {
+            if schema.type_ordering(&other).is_some() {
+                bail_parse_error!(
+                    "DECODE of type {name} returns a {}, which only compares in its own order; wrap it in CAST(... AS <type>), such as CAST(... AS text)",
+                    other.name
+                );
+            }
+        }
+    }
+    bail_parse_error!(
+        "cannot tell what kind of value DECODE of type {name} returns; wrap it in CAST(... AS <type>), such as CAST(... AS text)"
+    );
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
@@ -3287,6 +3327,7 @@ pub fn translate_create_domain(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
+    check_name_not_cast_to("domain", &normalized_name, resolver)?;
 
     // Validate base type exists — must be a primitive or a registered type
     let base_normalized = normalize_ident(base_type);
@@ -3317,6 +3358,18 @@ pub fn translate_create_domain(
     if let Some(ref def) = default {
         validate_type_expr(def, "domain DEFAULT", &resolver.catalog)?;
     }
+    // A CAST to the domain from its own CHECK or DEFAULT would run that
+    // expression again without end.
+    let registry_key = type_registry_key(&normalized_name);
+    for expr in constraints
+        .iter()
+        .map(|c| c.check.as_ref())
+        .chain(default.as_deref())
+    {
+        if expr_casts_to_type(expr, &registry_key)? {
+            bail_parse_error!("cannot create domain {normalized_name}: it casts to itself");
+        }
+    }
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
@@ -3337,6 +3390,28 @@ pub fn translate_create_domain(
     };
 
     persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+/// Refuse a new type or domain whose name an existing type or stored
+/// expression already casts to. That CAST follows SQLite's rules for the name
+/// (`CAST(x AS b)` gives a NUMERIC), and creating the type would change the
+/// values it gives, such as those stored in an index.
+fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver) -> Result<()> {
+    let registry_key = type_registry_key(normalized_name);
+    if let Some(name) =
+        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+    {
+        bail_parse_error!(
+            "cannot create {kind} {normalized_name}: type {name} already casts to it; \
+             create {normalized_name} before {name}"
+        );
+    }
+    if let Some(owner) =
+        find_in_any_database(resolver, |schema| find_cast_to_type(schema, &registry_key))?
+    {
+        bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
+    }
+    Ok(())
 }
 
 pub fn translate_drop_type(
@@ -3376,28 +3451,17 @@ pub fn translate_drop_type(
 
     // Check if anything in any database uses this type
     let registry_key = type_registry_key(type_name);
-    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
-    database_ids.set(MAIN_DB_ID)?;
-    if resolver.has_temp_database() {
-        database_ids.set(crate::TEMP_DB_ID)?;
-    }
-    for database_id in database_ids {
-        let type_use =
-            resolver.with_schema(database_id, |schema| find_type_use(schema, &registry_key))?;
-        if let Some(type_use) = type_use {
-            bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
-        }
+    if let Some(type_use) =
+        find_in_any_database(resolver, |schema| find_type_use(schema, &registry_key))?
+    {
+        bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
     }
 
     // Check if any other type/domain depends on this type
-    for (name, td) in resolver.schema().type_registry.iter() {
-        if type_registry_key(name) != registry_key && type_def_uses_type(td, &registry_key)? {
-            bail_parse_error!(
-                "cannot drop type {}: type {} depends on it",
-                normalized_name,
-                name
-            );
-        }
+    if let Some(name) =
+        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+    {
+        bail_parse_error!("cannot drop type {normalized_name}: type {name} depends on it");
     }
 
     // Open cursor to sqlite_turso_types table
@@ -3477,6 +3541,25 @@ pub fn translate_drop_type(
     Ok(())
 }
 
+/// The first answer `find` gives for the schema of the main, temp or an
+/// attached database.
+fn find_in_any_database(
+    resolver: &Resolver,
+    find: impl Fn(&Schema) -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
+    database_ids.set(MAIN_DB_ID)?;
+    if resolver.has_temp_database() {
+        database_ids.set(crate::TEMP_DB_ID)?;
+    }
+    for database_id in database_ids {
+        if let Some(found) = resolver.with_schema(database_id, &find)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 /// Describes the first object in `schema` that uses the type: a column of
 /// that type, or any stored expression that casts to it.
 fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
@@ -3493,6 +3576,11 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
             }
         }
     }
+    find_cast_to_type(schema, registry_key)
+}
+
+/// Describes the first stored expression in `schema` that casts to the type.
+fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
     let mut type_use = None;
     walk_schema_expressions(schema, &mut |owner, expr| {
         if type_use.is_none() && is_cast_to_type(expr, registry_key) {
@@ -3507,15 +3595,27 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
     Ok(type_use)
 }
 
+/// The name of the first other type or domain whose definition names the
+/// type (see type_def_uses_type).
+fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+    for (name, type_def) in schema.type_registry.iter() {
+        if type_registry_key(name) != registry_key && type_def_uses_type(type_def, registry_key)? {
+            return Ok(Some(name.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether the definition of `type_def` names the type `registry_key`. Every
 /// field is listed by name, so a new field has to say whether it can name one.
-fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
+pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
     let TypeDef {
         name: _,
         is_builtin: _,
         not_null: _,
         is_domain: _,
         accepts_collate: _,
+        range_offsets: _,
         sql: _,
         domain_checks,
         kind,
@@ -3532,6 +3632,8 @@ fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
             ordering: _,
             operators: _,
             operator_signatures: _,
+            // Worked out from the parts above.
+            kinds: _,
         } => (
             std::iter::once(base.as_str())
                 // `CREATE TYPE outer_t(value inner_t)` converts every value

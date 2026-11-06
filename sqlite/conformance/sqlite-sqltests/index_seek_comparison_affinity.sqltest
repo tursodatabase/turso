@@ -178,3 +178,22 @@ test real-affinity-in-list-preserves-integer {
 expect {
 0
 }
+
+# An IN list on an indexed column of a custom type gets the comparison
+# affinity before the type's ENCODE, as the scan does: 1.0 becomes 1, which
+# boolean accepts, and 1, 1.0 and '1' give one seek key, so the row is read once.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test in-list-on-indexed-boolean-applies-affinity-before-encode {
+    CREATE TABLE t(b boolean) STRICT;
+    INSERT INTO t VALUES (1), (0);
+    CREATE INDEX t_b ON t(b);
+    SELECT
+        (SELECT count(*) FROM t WHERE b IN (1.0)),
+        (SELECT count(*) FROM t WHERE b IN (1, 1.0, '1', 1e0, '1.0')),
+        (SELECT count(*) FROM t WHERE b = 1.0 OR b = 0.0),
+        (SELECT count(*) FROM t NOT INDEXED WHERE b IN (1, 1.0, '1', 1e0, '1.0'));
+}
+expect {
+1|1|2|1
+}

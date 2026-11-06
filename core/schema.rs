@@ -17,6 +17,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::schema::type_def_uses_type;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::StrictType;
@@ -118,7 +119,9 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
-use crate::translate::expr::expr_type::{column_type, ExprType};
+use crate::translate::expr::expr_type::{
+    column_type, primitive_value_type, stored_value_type, value_type, BuiltinType, ExprType,
+};
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     column_declared_type, is_rowid_alias_type, type_from_name, UnparsedFromSqlIndex,
@@ -250,6 +253,10 @@ pub enum TypeDefKind {
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
         ordering: Option<TypeOrdering>,
+        /// The kinds of value the type reads as and stores. `None` only while
+        /// the type is being registered (see Schema::update_value_types),
+        /// since a DECODE may call functions of the connection.
+        kinds: Option<ValueKinds>,
         operators: std::vec::Vec<TypeOperator>,
         /// How operators such as `+` and `-x` run on values of this type.
         operator_signatures: std::vec::Vec<OperatorSignature>,
@@ -257,6 +264,16 @@ pub enum TypeDefKind {
     },
     Struct(StructDef),
     Union(UnionDef),
+}
+
+/// The kinds of value a custom type reads as and stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueKinds {
+    /// What DECODE gives, or the stored value without a DECODE. A domain
+    /// reads as the type it is based on.
+    pub read: BuiltinType,
+    /// That of the BASE, which for a domain is the type it is based on.
+    pub stored: BuiltinType,
 }
 
 /// One way an operator runs when an operand has a custom type: `args[0] op
@@ -308,6 +325,25 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
         "numeric" => Some(TypeOrdering::Numeric),
         _ => None,
     }
+}
+
+/// The kind of value a built-in type reads as. uuid, jsonb and numeric store
+/// blobs and DECODE them to text. The built-in types are registered before any
+/// connection's functions, so the kind of `uuid_str(value)` can't be worked
+/// out from the DECODE then; a test checks these against the DECODE of each
+/// type.
+fn builtin_value_type(type_name: &str) -> crate::Result<BuiltinType> {
+    Ok(match type_name {
+        "boolean" | "smallint" | "bigint" => BuiltinType::Integer,
+        "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timestamp"
+        | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => BuiltinType::Text,
+        "bytea" => BuiltinType::Blob,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "built-in type {type_name} has no kind of value"
+            )))
+        }
+    })
 }
 
 /// Operators on built-in types. User types have none: `x + 1` on a user type is
@@ -459,9 +495,17 @@ impl ResolvedType {
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
-        self.chain.iter().all(|td| {
-            matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
-        })
+        self.chain
+            .iter()
+            .all(|td| matches!(td.kind, TypeDefKind::Custom { .. }))
+            && self.decode_returns_value_unchanged()
+    }
+
+    /// Whether every type in the chain has no DECODE, or `DECODE value`.
+    pub fn decode_returns_value_unchanged(&self) -> bool {
+        self.chain
+            .iter()
+            .all(|td| td.decode_returns_value_unchanged())
     }
 
     /// Find the first DEFAULT expression in the type chain (child first, then ancestors).
@@ -469,6 +513,32 @@ impl ResolvedType {
     /// doesn't declare its own.
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         self.chain.iter().find_map(|td| td.default_expr())
+    }
+
+    /// Whether storing a value of the type may change it: some type in the
+    /// chain has an ENCODE or a COERCE.
+    pub fn has_encode_or_coerce(&self) -> bool {
+        self.chain.iter().any(|td| td.has_encode_or_coerce())
+    }
+
+    /// Whether reading a stored value of the type runs a DECODE.
+    pub fn has_decode(&self) -> bool {
+        self.chain.iter().any(|td| td.decode().is_some())
+    }
+
+    /// Whether the type refuses NULL: some type in the chain is NOT NULL.
+    pub fn not_null(&self) -> bool {
+        self.chain.iter().any(|td| td.not_null)
+    }
+
+    /// Whether values of the type take a COLLATE. A domain answers as its
+    /// base type does, and a domain over a SQLite type takes one when that
+    /// type is text.
+    pub fn accepts_collate(&self) -> bool {
+        self.chain
+            .iter()
+            .find_map(|td| td.accepts_collate)
+            .unwrap_or_else(|| self.primitive == "text")
     }
 }
 
@@ -479,6 +549,9 @@ pub struct TypeDef {
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
     pub is_domain: bool,
+    /// The offsets a RANGE frame over values of the type may have. None for a
+    /// domain, which takes the offsets of the type it is based on.
+    pub range_offsets: Option<RangeOffsets>,
     /// Whether values of the type take a COLLATE, as PostgreSQL's text types
     /// do. None for a domain, which takes the answer of its base type.
     pub accepts_collate: Option<bool>,
@@ -573,7 +646,48 @@ impl TypeDef {
     pub fn ordering(&self) -> Option<TypeOrdering> {
         match &self.kind {
             TypeDefKind::Custom { ordering, .. } => *ordering,
-            _ => None,
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => None,
+        }
+    }
+
+    /// The kind of value the type reads as. STRUCT and UNION values are blobs.
+    pub(crate) fn value_type(&self) -> BuiltinType {
+        self.kinds().read
+    }
+
+    /// The kind of value the type stores. STRUCT and UNION values are blobs.
+    pub(crate) fn stored_type(&self) -> BuiltinType {
+        self.kinds().stored
+    }
+
+    /// Whether the type's kinds are still to be worked out, which is only
+    /// the case while it is being registered.
+    fn kinds_pending(&self) -> bool {
+        matches!(self.kind, TypeDefKind::Custom { kinds: None, .. })
+    }
+
+    fn kinds(&self) -> ValueKinds {
+        match &self.kind {
+            TypeDefKind::Custom {
+                kinds: Some(kinds), ..
+            } => *kinds,
+            TypeDefKind::Custom { kinds: None, .. } => panic!(
+                "kinds of type {} were read before they were worked out",
+                self.name
+            ),
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => ValueKinds {
+                read: BuiltinType::Blob,
+                stored: BuiltinType::Blob,
+            },
+        }
+    }
+
+    fn set_kinds(&mut self, new_kinds: ValueKinds) {
+        match &mut self.kind {
+            TypeDefKind::Custom { kinds, .. } => *kinds = Some(new_kinds),
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => {
+                unreachable!("STRUCT and UNION types are never pending")
+            }
         }
     }
 
@@ -684,18 +798,39 @@ impl TypeDef {
                 // CREATE TYPE checks where type parameters are used. A type
                 // already stored by an earlier version is loaded unchecked, so
                 // the database still opens and DROP TYPE can remove it.
-                let (ordering, operator_signatures) = if is_builtin {
-                    (builtin_ordering(type_name), builtin_signatures(type_name))
+                // A built-in type's BASE is a SQLite type. A user type's kinds
+                // are worked out once it is registered.
+                let (ordering, kinds, operator_signatures) = if is_builtin {
+                    let Some(stored) = primitive_value_type(base) else {
+                        return Err(crate::LimboError::InternalError(format!(
+                            "built-in type {type_name} has BASE {base}"
+                        )));
+                    };
+                    let kinds = ValueKinds {
+                        read: builtin_value_type(type_name)?,
+                        stored,
+                    };
+                    (
+                        builtin_ordering(type_name),
+                        Some(kinds),
+                        builtin_signatures(type_name),
+                    )
                 } else {
-                    (None, std::vec::Vec::new())
+                    (None, None, std::vec::Vec::new())
                 };
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    range_offsets: Some(match origin {
+                        TypeOrigin::Builtin { range_offsets, .. } => range_offsets,
+                        TypeOrigin::User => RangeOffsets::None,
+                    }),
                     accepts_collate: Some(match origin {
-                        TypeOrigin::Builtin { accepts_collate } => accepts_collate,
+                        TypeOrigin::Builtin {
+                            accepts_collate, ..
+                        } => accepts_collate,
                         // A user type takes a COLLATE when its values are text.
                         TypeOrigin::User => base.eq_ignore_ascii_case("text"),
                     }),
@@ -708,6 +843,7 @@ impl TypeDef {
                         coerce: coerce.clone(),
                         decode: decode.clone(),
                         ordering,
+                        kinds,
                         operators: operators.clone(),
                         operator_signatures,
                         default: default.clone(),
@@ -731,6 +867,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -764,6 +901,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -793,6 +931,7 @@ impl TypeDef {
             is_builtin: false,
             not_null,
             is_domain: true,
+            range_offsets: None,
             accepts_collate: None,
             sql,
             domain_checks: constraints.to_vec(),
@@ -804,6 +943,7 @@ impl TypeDef {
                 decode: None,
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
+                kinds: None,
                 operators: std::vec::Vec::new(),
                 operator_signatures: std::vec::Vec::new(),
                 default,
@@ -1218,12 +1358,45 @@ impl Default for Schema {
     }
 }
 
+/// What kind of number a type's values are in a RANGE frame, which decides
+/// the offsets a frame over them may have, as PostgreSQL's `in_range`
+/// functions do. The same kind says which frames a value of the type may be
+/// the offset of. Only number types take an offset: in PostgreSQL date, time
+/// and timestamp take an interval, which Turso does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeOffsets {
+    /// Not a number: `RANGE BETWEEN 1 PRECEDING` over a date is an error, and
+    /// so is a date offset.
+    None,
+    /// An integer type, such as smallint or bigint. It takes integer offsets.
+    Integer,
+    /// numeric. It takes integer and numeric offsets.
+    Numeric,
+}
+
+impl RangeOffsets {
+    /// Whether a frame over values of this kind may have an offset of kind
+    /// `offset`.
+    pub fn takes(self, offset: RangeOffsets) -> bool {
+        matches!(
+            (self, offset),
+            (RangeOffsets::Integer, RangeOffsets::Integer)
+                | (
+                    RangeOffsets::Numeric,
+                    RangeOffsets::Integer | RangeOffsets::Numeric
+                )
+        )
+    }
+}
+
 /// Whether a type is built into Turso or made by a user's CREATE TYPE.
 #[derive(Debug, Clone, Copy)]
 pub enum TypeOrigin {
-    /// `accepts_collate` says whether values of the type take a COLLATE.
+    /// `accepts_collate` says whether values of the type take a COLLATE, and
+    /// `range_offsets` what kind of number they are in a RANGE frame.
     Builtin {
         accepts_collate: bool,
+        range_offsets: RangeOffsets,
     },
     User,
 }
@@ -1236,16 +1409,16 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     // types do, so of the types below only varchar does.
     const COLLATE: bool = true;
     const NO_COLLATE: bool = false;
-    let types: &[(bool, &str)] = &[
+    let types: &[(bool, RangeOffsets, &str)] = &[
         #[cfg(feature = "uuid")]
-        (NO_COLLATE, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
         #[cfg(feature = "json")]
-        (NO_COLLATE, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
         #[cfg(feature = "json")]
-        (NO_COLLATE, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
-        (COLLATE, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
+        (COLLATE, RangeOffsets::None, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'"),
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1254,20 +1427,20 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         // the fraction outright, silently dropping precision on insert.
         // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
         // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        (NO_COLLATE, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE bigint(value integer) BASE integer"),
-        (NO_COLLATE, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
-        (NO_COLLATE, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
-        (NO_COLLATE, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Integer, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Integer, "CREATE TYPE bigint(value integer) BASE integer"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Numeric, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
-    for &(accepts_collate, sql) in types {
+    for &(accepts_collate, range_offsets, sql) in types {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
@@ -1281,7 +1454,10 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         let type_def = TypeDef::from_create_type(
             &type_name,
             &body,
-            TypeOrigin::Builtin { accepts_collate },
+            TypeOrigin::Builtin {
+                accepts_collate,
+                range_offsets,
+            },
             sql.to_string(),
         )?;
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
@@ -1888,9 +2064,8 @@ impl Schema {
             .ordering()
     }
 
-    /// Whether values of `type_def` take a COLLATE. A domain answers as its
-    /// base type does, and a domain over a SQLite type takes one when that
-    /// type is text.
+    /// Whether values of `type_def` take a COLLATE. See
+    /// [ResolvedType::accepts_collate].
     pub fn type_accepts_collate(&self, type_def: &TypeDef) -> crate::Result<bool> {
         if let Some(accepts_collate) = type_def.accepts_collate {
             return Ok(accepts_collate);
@@ -1900,11 +2075,7 @@ impl Schema {
             .ok_or_else(|| {
                 LimboError::InternalError(format!("type {} is not registered", type_def.name))
             })?;
-        Ok(resolved
-            .chain
-            .iter()
-            .find_map(|type_def| type_def.accepts_collate)
-            .unwrap_or_else(|| resolved.primitive == "text"))
+        Ok(resolved.accepts_collate())
     }
 
     /// Fails when `element_type` is neither a STRICT type nor a custom type,
@@ -1942,7 +2113,7 @@ impl Schema {
         self.resolve_type(&column.ty_str, is_strict)
             .ok()
             .flatten()
-            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
+            .is_some_and(|resolved| resolved.has_decode())
     }
 
     /// Fails when `column` is lossy, so it cannot be an index, UNIQUE, PRIMARY KEY
@@ -2070,17 +2241,15 @@ impl Schema {
         &self,
         column: &Column,
     ) -> Result<(bool, Vec<CheckConstraint>)> {
-        let mut not_null = false;
         let mut checks = vec![];
         let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
-            return Ok((not_null, checks));
+            return Ok((false, checks));
         };
         if !resolved.is_domain() {
-            return Ok((not_null, checks));
+            return Ok((false, checks));
         }
         let col_name = column.name.as_deref().unwrap_or("").to_string();
         for td in &resolved.chain {
-            not_null |= td.not_null && !column.is_array();
             for (i, dc) in td.domain_checks.iter().enumerate() {
                 let rewritten = rewrite_value_to_column(&dc.check, &col_name);
                 let name = dc
@@ -2095,7 +2264,7 @@ impl Schema {
                 })?;
             }
         }
-        Ok((not_null, checks))
+        Ok((resolved.not_null() && !column.is_array(), checks))
     }
 
     pub fn remove_type(&mut self, type_name: &str) {
@@ -2133,8 +2302,16 @@ impl Schema {
         }
     }
 
-    /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
-    pub fn add_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+    /// Parse a CREATE TYPE SQL string and add the type to the in-memory
+    /// registry. `syms` has the functions its DECODE may call.
+    pub fn add_type_from_sql(&mut self, sql: &str, syms: &SymbolTable) -> crate::Result<()> {
+        self.insert_type_from_sql(sql)?;
+        self.update_value_types(syms)
+    }
+
+    /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
+    /// in-memory registry without working out the kind its DECODE gives.
+    fn insert_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
         use turso_parser::parser::Parser;
 
@@ -2181,14 +2358,88 @@ impl Schema {
         Ok(())
     }
 
+    /// Works out the kinds of value each newly added type reads as and
+    /// stores. A type's kinds can depend on the kinds of the types its
+    /// definition names (see type_def_uses_type), so a type is worked out only
+    /// after all of those are, whatever order the types were added in. Built-in
+    /// types name their kinds when they are created.
+    fn update_value_types(&mut self, syms: &SymbolTable) -> Result<()> {
+        let mut pending: std::vec::Vec<String> = self
+            .type_registry
+            .iter()
+            .filter(|(_, type_def)| type_def.kinds_pending())
+            .map(|(key, _)| key.clone())
+            .collect();
+        pending.sort();
+        // For each pending type, the other pending types its definition names.
+        let mut waits_for: std::vec::Vec<(String, std::vec::Vec<String>)> = std::vec::Vec::new();
+        for key in &pending {
+            let type_def = &self.type_registry[key];
+            let mut names = std::vec::Vec::new();
+            for other in &pending {
+                if type_def_uses_type(type_def, other)? {
+                    names.push(other.clone());
+                }
+            }
+            waits_for.push((key.clone(), names));
+        }
+        while !waits_for.is_empty() {
+            let (ready, waiting): (std::vec::Vec<_>, std::vec::Vec<_>) =
+                waits_for.into_iter().partition(|(_, names)| {
+                    names
+                        .iter()
+                        .all(|name| !self.type_registry[name].kinds_pending())
+                });
+            if ready.is_empty() {
+                let names: std::vec::Vec<&str> = waiting
+                    .iter()
+                    .map(|(key, _)| self.type_registry[key].name.as_str())
+                    .collect();
+                return Err(LimboError::ParseError(match names.as_slice() {
+                    [name] => format!("cannot tell the kinds of type {name}: it names itself"),
+                    _ => format!(
+                        "cannot tell the kinds of types {}: they name each other",
+                        names.join(", ")
+                    ),
+                }));
+            }
+            for (key, _) in ready {
+                let type_def = &self.type_registry[&key];
+                let Some(stored) = stored_value_type(type_def, self) else {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot tell what kind of value type {} stores",
+                        type_def.name
+                    )));
+                };
+                let Some(read) = value_type(type_def, self, syms) else {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot tell what kind of value DECODE of type {} returns",
+                        type_def.name
+                    )));
+                };
+                let mut updated = (**type_def).clone();
+                updated.set_kinds(ValueKinds { read, stored });
+                self.type_registry.insert(key, Arc::new(updated));
+            }
+            waits_for = waiting;
+        }
+        Ok(())
+    }
+
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom
     /// type affinities on all STRICT tables.
-    fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+    fn load_type_definitions(
+        &mut self,
+        type_sqls: &[String],
+        syms: &SymbolTable,
+    ) -> crate::Result<()> {
         for sql in type_sqls {
-            self.add_type_from_sql(sql).map_err(|e| {
+            self.insert_type_from_sql(sql).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
             })?;
         }
+        self.update_value_types(syms)
+            .map_err(|e| crate::LimboError::Corrupt(format!("malformed database schema - {e}")))?;
         self.resolve_all_custom_type_affinities()?;
         Ok(())
     }
@@ -2219,7 +2470,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_types(self);
+            modified.resolve_custom_types(self)?;
             modified.propagate_domain_constraints(self)?;
             tables.push((
                 namespace,
@@ -3780,7 +4031,7 @@ impl Schema {
             self.refuse_custom_types()?;
         }
         if !type_sqls.is_empty() {
-            self.load_type_definitions(type_sqls)?;
+            self.load_type_definitions(type_sqls, syms)?;
         }
         if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
@@ -4029,7 +4280,7 @@ impl Schema {
                         }
                     }
 
-                    table.resolve_custom_types(self);
+                    table.resolve_custom_types(self)?;
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = name.to_string();
@@ -5532,13 +5783,14 @@ impl BTreeTable {
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
     ///   incorrectly map to REAL instead of INTEGER).
     /// - Keys on the column use the order of its type, when it has one.
-    pub fn resolve_custom_types(&mut self, schema: &Schema) {
+    pub fn resolve_custom_types(&mut self, schema: &Schema) -> Result<()> {
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         for col in &mut self.columns {
-            col.resolve_custom_type(schema);
+            col.resolve_custom_type(schema)?;
         }
+        Ok(())
     }
 
     /// Propagate domain NOT NULL and CHECK constraints to table columns.
@@ -7616,6 +7868,10 @@ pub struct Column {
     /// Keys on the column use it instead of `collation`. Set from the schema's
     /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
     type_ordering: Option<TypeOrdering>,
+    /// The affinity of the values a custom-type column reads as, which
+    /// comparisons use. `affinity()` is that of the stored form. None for a
+    /// column without a custom type or array type, which compares by `affinity()`.
+    value_affinity: Option<Affinity>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -7761,6 +8017,7 @@ impl Column {
             info,
             collation: col,
             type_ordering: None,
+            value_affinity: None,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -7983,30 +8240,67 @@ impl Column {
     /// Whether an index on this column is ordered differently from how its
     /// values compare. A custom type without an ordering is indexed by its
     /// stored form, which does not sort like the values the column reads as,
-    /// so such an index can serve `=` but not a range or ORDER BY.
+    /// so such an index can serve `=` but not a range or ORDER BY. An array
+    /// holds the values of its elements and is indexed by their stored forms,
+    /// so it follows its element type.
     pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
-        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
+        let ordering = if self.is_array() {
+            match schema.resolve_type(&self.ty_str, is_strict) {
+                Ok(resolved) => resolved.and_then(|resolved| resolved.ordering()),
+                // Resolving fails only for a circular type chain or when out of
+                // memory. Answer "differs", so the index serves only `=`.
+                Err(_) => return true,
+            }
+        } else {
+            self.type_ordering
+        };
+        ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
     }
     /// Fill in what a column of a STRICT table gets from its custom type: the
     /// type, affinity and key order of the type it is stored as. Every path
     /// that adds a column to a STRICT table calls this, so a column added by
     /// ALTER TABLE matches the same column read back from the schema.
-    pub fn resolve_custom_type(&mut self, schema: &Schema) {
+    pub fn resolve_custom_type(&mut self, schema: &Schema) -> Result<()> {
         if self.is_array() {
             // Arrays are stored as record-format blobs regardless of element type.
             self.set_ty(Type::Blob);
             self.override_affinity(Affinity::Blob);
+            self.value_affinity = Some(Affinity::Blob);
             self.type_ordering = crate::translate::expr::expr_type::type_ordering(
                 &crate::translate::expr::expr_type::column_type(self, true, schema),
                 schema,
             );
-            return;
+            return Ok(());
         }
-        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) {
-            let (base_ty, _) = type_from_name(&resolved.primitive);
-            self.set_ty(base_ty);
-            self.override_affinity(Affinity::affinity(&resolved.primitive));
-            self.type_ordering = resolved.ordering();
+        match schema.resolve_type_unchecked(&self.ty_str)? {
+            Some(resolved) => {
+                let (base_ty, _) = type_from_name(&resolved.primitive);
+                self.set_ty(base_ty);
+                let stored_affinity = Affinity::affinity(&resolved.primitive);
+                self.override_affinity(stored_affinity);
+                self.type_ordering = resolved.ordering();
+                self.value_affinity = Some(match self.type_ordering {
+                    // Its values compare in the type's own order, by how
+                    // they are stored.
+                    Some(_) => stored_affinity,
+                    None => resolved.leaf().value_type().affinity(),
+                });
+            }
+            None => self.value_affinity = None,
+        }
+        Ok(())
+    }
+    /// The affinity comparisons with the column's values use: that of the
+    /// values a custom type reads as, which may differ from what it stores
+    /// (`BASE text DECODE CAST(value AS real)` compares as REAL). A column
+    /// without a custom type compares by its own affinity, as in SQLite.
+    #[inline]
+    pub fn comparison_affinity(&self) -> Affinity {
+        match self.value_affinity {
+            Some(affinity) => affinity,
+            // #11380: also reached by a column whose custom type was never
+            // resolved, which this can't tell from a column without one.
+            None => self.affinity(),
         }
     }
     /// Set the key order of a derived table's column, which takes it from the
@@ -8699,6 +8993,48 @@ mod tests {
         assert!(schema
             .get_table(NamespaceId::ROOT, SCHEMA_TABLE_NAME)
             .is_some());
+    }
+
+    #[test]
+    fn builtin_types_read_as_the_kind_their_decode_gives() {
+        use crate::{
+            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts,
+            EngineDialect, MemoryIO, OpenFlags, IO, MAIN_DB_ID,
+        };
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let syms = conn.syms.read();
+        conn.with_schema(MAIN_DB_ID, |schema| {
+            assert!(schema.type_registry.values().all(|t| t.is_builtin));
+            for (name, type_def) in &schema.type_registry {
+                assert_eq!(
+                    Some(type_def.value_type()),
+                    value_type(type_def, schema, &syms),
+                    "built-in type {name}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "kinds of type price were read before they were worked out")]
+    fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
+        let mut schema = Schema::new();
+        schema
+            .insert_type_from_sql(
+                "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
+            )
+            .unwrap();
+        schema.get_type_def_unchecked("price").unwrap().value_type();
     }
 
     #[test]

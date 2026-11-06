@@ -205,7 +205,10 @@ impl Time {
 
         match year.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                let months = match (year - 1).unsigned_abs().checked_mul(12) {
+                let months = match year
+                    .checked_sub(1)
+                    .and_then(|y| y.unsigned_abs().checked_mul(12))
+                {
                     Some(m) => m,
                     None => return Ok(None),
                 };
@@ -216,7 +219,10 @@ impl Time {
                 };
             }
             std::cmp::Ordering::Less => {
-                let months = match (year - 1).unsigned_abs().checked_mul(12) {
+                let months = match year
+                    .checked_sub(1)
+                    .and_then(|y| y.unsigned_abs().checked_mul(12))
+                {
                     Some(m) => m,
                     None => return Ok(None),
                 };
@@ -231,13 +237,19 @@ impl Time {
 
         match month.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                dt = match dt.checked_add_months(chrono::Months::new((month - 1).unsigned_abs())) {
+                dt = match month
+                    .checked_sub(1)
+                    .and_then(|m| dt.checked_add_months(chrono::Months::new(m.unsigned_abs())))
+                {
                     Some(d) => d,
                     None => return Ok(None),
                 };
             }
             std::cmp::Ordering::Less => {
-                dt = match dt.checked_sub_months(chrono::Months::new((month - 1).unsigned_abs())) {
+                dt = match month
+                    .checked_sub(1)
+                    .and_then(|m| dt.checked_sub_months(chrono::Months::new(m.unsigned_abs())))
+                {
                     Some(d) => d,
                     None => return Ok(None),
                 };
@@ -245,31 +257,34 @@ impl Time {
             std::cmp::Ordering::Equal => (),
         };
 
-        if let Some(d) = chrono::Duration::try_days(day - 1) {
-            dt += d;
-        } else {
-            return Ok(None);
-        }
+        dt = match day
+            .checked_sub(1)
+            .and_then(chrono::Duration::try_days)
+            .and_then(|d| dt.checked_add_signed(d))
+        {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
-        if let Some(d) = chrono::Duration::try_hours(hour) {
-            dt += d;
-        } else {
-            return Ok(None);
-        }
+        dt = match chrono::Duration::try_hours(hour).and_then(|d| dt.checked_add_signed(d)) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
-        if let Some(d) = chrono::Duration::try_minutes(minutes) {
-            dt += d;
-        } else {
-            return Ok(None);
-        }
+        dt = match chrono::Duration::try_minutes(minutes).and_then(|d| dt.checked_add_signed(d)) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
-        if let Some(d) = chrono::Duration::try_seconds(seconds) {
-            dt += d;
-        } else {
-            return Ok(None);
-        }
+        dt = match chrono::Duration::try_seconds(seconds).and_then(|d| dt.checked_add_signed(d)) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
-        dt += chrono::Duration::nanoseconds(nano_secs);
+        dt = match dt.checked_add_signed(chrono::Duration::nanoseconds(nano_secs)) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
         let dt = dt
             .and_local_timezone(offset)
@@ -287,13 +302,17 @@ impl Time {
 
         match years.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                dt = dt
-                    .checked_add_months(chrono::Months::new(years.unsigned_abs() * 12))
+                dt = years
+                    .unsigned_abs()
+                    .checked_mul(12)
+                    .and_then(|m| dt.checked_add_months(chrono::Months::new(m)))
                     .ok_or(TimeError::CreationError)?;
             }
             std::cmp::Ordering::Less => {
-                dt = dt
-                    .checked_sub_months(chrono::Months::new(years.unsigned_abs() * 12))
+                dt = years
+                    .unsigned_abs()
+                    .checked_mul(12)
+                    .and_then(|m| dt.checked_sub_months(chrono::Months::new(m)))
                     .ok_or(TimeError::CreationError)?;
             }
             std::cmp::Ordering::Equal => (),
@@ -313,7 +332,9 @@ impl Time {
             std::cmp::Ordering::Equal => (),
         };
 
-        dt += chrono::Duration::try_days(days).ok_or(TimeError::CreationError)?;
+        dt = chrono::Duration::try_days(days)
+            .and_then(|d| dt.checked_add_signed(d))
+            .ok_or(TimeError::CreationError)?;
 
         Ok(dt.into())
     }
@@ -342,10 +363,10 @@ impl Time {
         self.inner.timestamp_nanos_opt()
     }
 
-    pub fn add_duration(&self, d: Duration) -> Self {
-        Self {
-            inner: self.inner + d.inner,
-        }
+    pub fn add_duration(&self, d: Duration) -> Option<Self> {
+        self.inner
+            .checked_add_signed(d.inner)
+            .map(|inner| Self { inner })
     }
 
     pub fn sub_duration(&self, d: Duration) -> Self {
@@ -599,5 +620,81 @@ impl Deref for Duration {
     type Target = chrono::Duration;
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+
+    #[test]
+    fn time_date_out_of_range_returns_none() {
+        // make_date(1, 4, 1453556443)
+        assert!(Time::time_date(1, 4, 1453556443, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+        // make_timestamp(2024, 1, 1453556443, 0, 0, 0)
+        assert!(Time::time_date(2024, 1, 1453556443, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+        // make_date(40, 1, -2147483648)
+        assert!(Time::time_date(40, 1, -2147483648, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+        // make_date(-2147483648, 1, 1) and make_date(2000, -2147483648, 1)
+        assert!(Time::time_date(i32::MIN, 1, 1, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+        assert!(Time::time_date(2000, i32::MIN, 1, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+        assert!(Time::time_date(2000, 1, i64::MIN, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+        // the same overflow through the hour argument
+        assert!(Time::time_date(2024, 1, 1, 24 * 1453556443, 0, 0, 0, utc())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn time_date_large_day_in_range() {
+        assert!(Time::time_date(1, 4, 3_000_000, 0, 0, 0, 0, utc())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn time_add_date_out_of_range_is_error() {
+        let t = || {
+            Time::time_date(2024, 1, 1, 0, 0, 0, 0, utc())
+                .unwrap()
+                .unwrap()
+        };
+        // time_add_date(make_date(2024,1,1), 0, 0, 1453556443)
+        assert!(t().time_add_date(0, 0, 1453556443).is_err());
+        assert!(t().time_add_date(0, 0, i64::MAX).is_err());
+        // time_add_date(make_date(2024,1,1), 2147483647)
+        assert!(t().time_add_date(i32::MAX, 0, 0).is_err());
+        assert!(t().time_add_date(i32::MIN, 0, 0).is_err());
+        // normal case still works
+        let t2 = t().time_add_date(1, 1, 1).unwrap();
+        assert_eq!(t2.get_second(), 0);
+    }
+
+    #[test]
+    fn add_duration_out_of_range_returns_none() {
+        // time_add(time_date(-262143,1,1), -9223372036854775807)
+        let t = Time::time_date(-262143, 1, 1, 0, 0, 0, 0, utc())
+            .unwrap()
+            .unwrap();
+        assert!(t
+            .add_duration(Duration::from(-9223372036854775807))
+            .is_none());
+        assert!(t.add_duration(Duration::from(1)).is_some());
     }
 }

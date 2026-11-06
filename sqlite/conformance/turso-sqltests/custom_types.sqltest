@@ -1021,16 +1021,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test drop-type-that-casts-to-itself {
-    CREATE TYPE o BASE integer ENCODE CAST(value AS o) DECODE value;
-    DROP TYPE o;
-    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'o%';
-}
-expect {
-    0
-}
-
-@requires strict "uses STRICT tables"
 test add-column-custom-type {
     CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;

@@ -204,6 +204,15 @@ impl RegisterColumn {
         }
     }
 
+    /// A column of the table being written whose register holds the value
+    /// DECODE gave, so comparisons use the affinity of that value's kind.
+    pub fn decoded_table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
+        Self {
+            affinity: column.comparison_affinity(),
+            ..Self::table_column(column, is_strict, schema)
+        }
+    }
+
     /// NEW.x or OLD.x in a trigger. It has the collation and type of column x
     /// but, as in SQLite, no affinity unless x is the rowid alias.
     /// See https://www.sqlite.org/forum/forumpost/819f2d6627
@@ -295,16 +304,26 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => {
-                Some(table.columns().iter().map(|c| c.affinity()).collect())
-            }
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.comparison_affinity())
+                    .collect(),
+            ),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.comparison_affinity())
+                        .collect()
+                }),
         };
 
         Self {

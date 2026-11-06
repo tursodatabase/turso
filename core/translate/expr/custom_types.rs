@@ -106,27 +106,27 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
-    // Array columns: pass through raw record blob. ArrayDecode is emitted
-    // at display time (ResultRow) so that functions/subscripts see raw blobs.
+    // An array stays a record blob, holding the values its elements read as.
+    // It is turned into text only for output.
     if column.is_array() {
-        return Ok(());
+        return emit_array_decode(program, dest_reg, column, resolver);
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        emit_decode(program, &resolved.chain, dest_reg, resolver)?;
+        emit_decode(program, &resolved, dest_reg, resolver)?;
     }
     Ok(())
 }
 
-/// Emits the DECODE of each of `chain`'s types on the stored value in `reg`,
-/// which turns it into the value a column of the type reads back. NULL is
-/// left as it is.
+/// Emits the DECODE of each of `resolved`'s types on the stored value in
+/// `reg`, which turns it into the value a column of the type reads back. NULL
+/// is left as it is.
 pub(crate) fn emit_decode(
     program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
+    resolved: &ResolvedType,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    if chain.iter().all(|td| td.decode().is_none()) {
+    if !resolved.has_decode() {
         return Ok(());
     }
     let skip_label = program.allocate_label();
@@ -136,7 +136,7 @@ pub(crate) fn emit_decode(
     });
 
     // Apply decode in reverse order (parent/ancestor first, then child)
-    for td in chain.iter().rev() {
+    for td in resolved.chain.iter().rev() {
         if let Some(decode_expr) = td.decode() {
             emit_type_expr(program, decode_expr, reg, reg, resolver)?;
         }
@@ -150,29 +150,24 @@ pub(crate) fn emit_decode(
 /// Validates NOT NULL and CHECK constraints from the domain type chain.
 pub(super) fn emit_domain_cast_constraints(
     program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
+    resolved: &ResolvedType,
     cast_type: &ast::Type,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
 
-    let any_not_null = chain.iter().any(|td| td.not_null);
-
-    if any_not_null {
+    if resolved.not_null() {
         program.emit_insn(Insn::HaltIfNull {
             constraint_info: None,
             target_reg: reg,
             err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: format!(
-                "domain {} does not allow null values",
-                chain.first().map(|td| td.name.as_str()).unwrap_or("?")
-            ),
+            description: format!("domain {} does not allow null values", resolved.leaf().name),
             on_error: None,
         });
     }
 
-    for td in chain {
+    for td in &resolved.chain {
         for (i, dc) in td.domain_checks.iter().enumerate() {
             let constraint_name = dc
                 .name
@@ -468,10 +463,8 @@ pub(crate) fn emit_constraint_values_decode(
             table.is_strict,
             resolver,
         )?;
-        // emit_user_facing_column_value leaves arrays encoded, because SELECT
-        // decodes them when it outputs the row.
         if column.is_array() {
-            emit_array_decode(program, decoded_reg, column, resolver)?;
+            program.emit_insn(Insn::ArrayDecode { reg: decoded_reg });
         }
         info.violation_regs[i] = decoded_reg;
     }
