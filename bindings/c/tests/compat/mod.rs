@@ -1601,6 +1601,68 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_misuse_returns_error_without_aborting() {
+        bounded_destructor_child(
+            "tests::aggregate_misuse_child",
+            "TURSO_AGGREGATE_MISUSE_CHILD",
+        );
+    }
+
+    #[test]
+    fn aggregate_misuse_child() {
+        if std::env::var_os("TURSO_AGGREGATE_MISUSE_CHILD").is_none() {
+            return;
+        }
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"agg".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    None,
+                    Some(signature_aggregate_step),
+                    Some(signature_aggregate_final),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(x); INSERT INTO t VALUES(1),(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            for sql in [
+                "SELECT max(agg(x)) FROM t",
+                "SELECT sum(agg(x)) FROM t",
+                "SELECT agg(agg(x)) FROM t",
+                "SELECT x FROM t WHERE agg(x)>0",
+            ] {
+                let sql = std::ffi::CString::new(sql).unwrap();
+                assert_eq!(
+                    sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                    SQLITE_ERROR
+                );
+                let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                    .to_str()
+                    .unwrap();
+                assert!(message.contains("misuse of aggregate"), "{message}");
+                scalar_query(db, "SELECT agg(x) FROM t", 77);
+            }
+            scalar_query(db, "SELECT abs(agg(x)) FROM t", 77);
+            scalar_query(db, "SELECT max(a) FROM (SELECT agg(x) AS a FROM t)", 77);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn aggregate_step_error_stops_execution_and_finalizes_once() {
         unsafe {
             let mut db = ptr::null_mut();
