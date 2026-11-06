@@ -520,11 +520,11 @@ fn execute_query(
     stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
         for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
+            let (pg_type, format) = header_clone
                 .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+                .map(|fi| (fi.datatype().clone(), fi.format()))
+                .unwrap_or((Type::TEXT, FieldFormat::Text));
+            encode_value(&mut encoder, val, &pg_type, format)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -720,27 +720,27 @@ fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    format: FieldFormat,
 ) -> turso_core::Result<()> {
     match val {
         Value::Null => encoder
             .encode_field(&None::<i8>)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+        Value::Numeric(n) if format == FieldFormat::Binary => {
+            encode_binary_number(encoder, n, pg_type)
+                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+        }
         Value::Numeric(turso_core::Numeric::Integer(i)) => {
-            let encoded = if *pg_type == Type::BOOL {
-                // Boolean columns: encode as true/false instead of 0/1
-                encoder.encode_field(&(*i != 0))
-            } else if *pg_type == Type::INT4 {
-                // Binary format writes the width of the Rust type, so INT4
-                // needs an i32. A value outside the i32 range keeps the i64
-                // encoding as before, which binary clients still misread.
-                match i32::try_from(*i) {
-                    Ok(i) => encoder.encode_field(&i),
-                    Err(_) => encoder.encode_field(i),
-                }
+            // Boolean columns: encode as true/false instead of 0/1
+            if *pg_type == Type::BOOL {
+                encoder
+                    .encode_field(&(*i != 0))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else {
-                encoder.encode_field(i)
-            };
-            encoded.map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                encoder
+                    .encode_field(i)
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            }
         }
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
@@ -781,6 +781,43 @@ fn encode_value(
         Value::Blob(b) => encoder
             .encode_field(&b.as_slice())
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+    }
+}
+
+/// Binary format writes a number with the width of its Rust type, so the
+/// encoding follows the column's type, not the stored value: `count(*)` is
+/// typed text, and `coalesce(NULL::float8, 1)` holds an integer. For a type
+/// without a binary number encoding here, the value is sent as its text, the
+/// same bytes as in text format.
+fn encode_binary_number(
+    encoder: &mut DataRowEncoder,
+    n: &turso_core::Numeric,
+    pg_type: &Type,
+) -> PgWireResult<()> {
+    use turso_core::Numeric::{Float, Integer};
+    match *n {
+        Integer(i) if *pg_type == Type::BOOL => encoder.encode_field(&(i != 0)),
+        // A value outside the i32 range, stored in an int column, keeps
+        // the i64 encoding as before, which binary clients still misread.
+        Integer(i) if *pg_type == Type::INT4 => match i32::try_from(i) {
+            Ok(i) => encoder.encode_field(&i),
+            Err(_) => encoder.encode_field(&i),
+        },
+        Integer(i) if *pg_type == Type::INT8 => encoder.encode_field(&i),
+        Integer(i) if *pg_type == Type::FLOAT8 => encoder.encode_field(&(i as f64)),
+        Float(f) if *pg_type == Type::FLOAT8 => encoder.encode_field(&f64::from(f)),
+        Integer(i) => encoder.encode_field_with_type_and_format(
+            &i,
+            pg_type,
+            FieldFormat::Text,
+            &FormatOptions::default(),
+        ),
+        Float(f) => encoder.encode_field_with_type_and_format(
+            &f64::from(f),
+            pg_type,
+            FieldFormat::Text,
+            &FormatOptions::default(),
+        ),
     }
 }
 
@@ -1199,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn int4_results_are_four_bytes_in_binary_format() {
+    fn binary_numbers_follow_the_column_type() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
             None,
@@ -1210,6 +1247,8 @@ mod tests {
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
         conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
+        conn.execute("CREATE TABLE o (i int)").unwrap();
+        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1236,6 +1275,45 @@ mod tests {
                 b"\0\0\0\x08\0\0\0\0\0\0\0\x2a",
                 b"\0\0\0\x0242",
             ),
+            (
+                "SELECT 9000000000::int8",
+                Type::INT8,
+                b"\0\0\0\x08\0\0\0\x02\x18\x71\x1a\0",
+                b"\0\0\0\x0a9000000000",
+            ),
+            (
+                "SELECT int8(9000000000)",
+                Type::INT8,
+                b"\0\0\0\x08\0\0\0\x02\x18\x71\x1a\0",
+                b"\0\0\0\x0a9000000000",
+            ),
+            // Out of the int4 range: still 8 bytes, until #10826.
+            (
+                "SELECT i FROM o",
+                Type::INT4,
+                b"\0\0\0\x08\0\0\0\0\xb2\xd0\x5e\0",
+                b"\0\0\0\x0a3000000000",
+            ),
+            (
+                "SELECT 1.5::float8",
+                Type::FLOAT8,
+                b"\0\0\0\x08\x3f\xf8\0\0\0\0\0\0",
+                b"\0\0\0\x031.5",
+            ),
+            ("SELECT true", Type::BOOL, b"\0\0\0\x01\x01", b"\0\0\0\x01t"),
+            // The column's type, not the stored value, picks the encoding.
+            (
+                "SELECT count(*) FROM t",
+                Type::TEXT,
+                b"\0\0\0\x011",
+                b"\0\0\0\x011",
+            ),
+            (
+                "SELECT coalesce(NULL::float8, 1)",
+                Type::FLOAT8,
+                b"\0\0\0\x08\x3f\xf0\0\0\0\0\0\0",
+                b"\0\0\0\x011",
+            ),
         ] {
             for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
             {
@@ -1244,7 +1322,13 @@ mod tests {
                 assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                encode_value(
+                    &mut encoder,
+                    &rows[0][0],
+                    fields[0].datatype(),
+                    fields[0].format(),
+                )
+                .unwrap();
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
         }
@@ -1272,7 +1356,13 @@ mod tests {
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
                 let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                encode_value(
+                    &mut encoder,
+                    &rows[0][0],
+                    fields[0].datatype(),
+                    fields[0].format(),
+                )
+                .unwrap();
                 let row = encoder.finish().unwrap();
                 assert_eq!(row.field_count, 1);
                 assert_eq!(&row.data[..], b"\0\0\0\x01t");
@@ -1379,7 +1469,13 @@ mod tests {
         let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
         let rows = stmt.run_collect_rows().unwrap();
         let mut encoder = DataRowEncoder::new(fields.clone());
-        encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+        encode_value(
+            &mut encoder,
+            &rows[0][0],
+            fields[0].datatype(),
+            fields[0].format(),
+        )
+        .unwrap();
         assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");
     }
 
