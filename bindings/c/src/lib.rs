@@ -456,7 +456,11 @@ fn percent_decode(input: &str) -> Option<String> {
             let lo = *iter.next()?;
             let hex = [hi, lo];
             let s = std::str::from_utf8(&hex).ok()?;
-            bytes.push(u8::from_str_radix(s, 16).ok()?);
+            let decoded = u8::from_str_radix(s, 16).ok()?;
+            if decoded == 0 {
+                break;
+            }
+            bytes.push(decoded);
         } else {
             bytes.push(b);
         }
@@ -464,79 +468,80 @@ fn percent_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Parse a URI filename (when SQLITE_OPEN_URI is set).
-/// Returns (path, is_memory) where path is the file path extracted from the URI
-/// and is_memory indicates whether the database should be in-memory.
-///
-/// Supported URI forms (per SQLite docs):
-///   file::memory:           -> in-memory
-///   file:path?mode=memory   -> in-memory (path is just a name)
-///   file:path               -> real file at path
-///   file:///path             -> real file at /path (authority form)
-///   file://localhost/path    -> real file at /path
-fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
-    // Must start with "file:"
-    let after_file = &uri[5..];
+struct ParsedFilename {
+    path: String,
+    memory: bool,
+    cache_shared: bool,
+    access: i32,
+}
 
-    // Extract path and query parts
-    let (raw_path, query) = match after_file.find('?') {
-        Some(pos) => (&after_file[..pos], Some(&after_file[pos + 1..])),
-        None => (after_file, None),
+struct OpenError {
+    code: i32,
+    message: String,
+}
+
+fn parse_uri_filename(uri: &str, mut access: i32) -> Result<ParsedFilename, OpenError> {
+    let invalid = |message: String| OpenError {
+        code: SQLITE_ERROR,
+        message,
     };
-
-    // Strip fragment if present (after #)
-    let raw_path = match raw_path.find('#') {
-        Some(pos) => &raw_path[..pos],
-        None => raw_path,
-    };
-
-    // Handle authority: file:///path or file://localhost/path
-    let path = if let Some(after_slashes) = raw_path.strip_prefix("//") {
-        // file:///path -> authority is empty, path starts at third /
-        // file://localhost/path -> authority is "localhost"
-        match after_slashes.find('/') {
-            Some(pos) => {
-                let authority = &after_slashes[..pos];
-                if !authority.is_empty() && authority != "localhost" {
-                    return Err(()); // non-local authority not supported
-                }
-                percent_decode(&after_slashes[pos..]).ok_or(())?
-            }
-            None => {
-                // file:// with no path after authority
-                return Err(());
-            }
+    let after_file = uri[5..]
+        .split('#')
+        .next()
+        .expect("split always returns a component");
+    let (raw_path, query) = after_file.split_once('?').unwrap_or((after_file, ""));
+    let raw_path = if let Some(authority_path) = raw_path.strip_prefix("//") {
+        let (authority, path) = authority_path
+            .split_once('/')
+            .unwrap_or((authority_path, ""));
+        if !authority.is_empty() && authority != "localhost" {
+            return Err(invalid(format!("invalid uri authority: {authority}")));
+        }
+        if authority_path.contains('/') {
+            format!("/{path}")
+        } else {
+            String::new()
         }
     } else {
-        percent_decode(raw_path).ok_or(())?
+        raw_path.to_owned()
     };
-
-    let mut is_memory = path == ":memory:";
+    let path = percent_decode(&raw_path).ok_or_else(|| invalid("invalid URI encoding".into()))?;
     let mut cache_shared = false;
-    if let Some(query) = query {
-        for param in query.split('&') {
-            let (key, value) = match param.find('=') {
-                Some(pos) => (&param[..pos], &param[pos + 1..]),
-                None => (param, ""),
-            };
-            match key {
-                "mode" => match value {
-                    "memory" => is_memory = true,
-                    "ro" | "rw" | "rwc" => {} // valid modes, no-op (Turso doesn't enforce read-only yet)
-                    _ => return Err(()),      // unknown mode -> SQLITE_CANTOPEN
-                },
-                "cache" => {
-                    if value == "shared" {
-                        cache_shared = true;
-                    }
-                    // "private" is also valid but is the default behavior
+    for parameter in query.split('&') {
+        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        let key = percent_decode(key).ok_or_else(|| invalid("invalid URI encoding".into()))?;
+        let value = percent_decode(value).ok_or_else(|| invalid("invalid URI encoding".into()))?;
+        match key.as_str() {
+            "mode" => {
+                let mode = match value.as_str() {
+                    "ro" => SQLITE_OPEN_READONLY,
+                    "rw" => SQLITE_OPEN_READWRITE,
+                    "rwc" => SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                    "memory" => SQLITE_OPEN_MEMORY,
+                    _ => return Err(invalid(format!("no such access mode: {value}"))),
+                };
+                if mode != SQLITE_OPEN_MEMORY && mode > access {
+                    return Err(OpenError {
+                        code: SQLITE_PERM,
+                        message: format!("access mode not allowed: {value}"),
+                    });
                 }
-                _ => {}
+                access = mode;
             }
+            "cache" => match value.as_str() {
+                "shared" => cache_shared = true,
+                "private" => cache_shared = false,
+                _ => return Err(invalid(format!("no such cache mode: {value}"))),
+            },
+            _ => {}
         }
     }
-
-    Ok((path, is_memory, cache_shared))
+    Ok(ParsedFilename {
+        memory: path == ":memory:" || access & SQLITE_OPEN_MEMORY != 0,
+        path,
+        cache_shared,
+        access,
+    })
 }
 
 #[no_mangle]
@@ -564,43 +569,44 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         Err(_) => return failed_open(db_out, SQLITE_MISUSE, "filename is not valid UTF-8"),
     };
 
-    // Determine the effective filename and whether to use in-memory IO
-    let (effective_filename, use_memory, cache_shared) =
-        if (flags & SQLITE_OPEN_URI) != 0 && filename_str.starts_with("file:") {
-            match parse_uri_filename(filename_str) {
-                Ok(result) => result,
-                Err(()) => return failed_open(db_out, SQLITE_CANTOPEN, "invalid URI filename"),
-            }
-        } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
-            (":memory:".to_string(), true, false)
-        } else if filename_str.is_empty() {
-            // SQLite opens a private on-disk database for "" and deletes it
-            // when the connection closes.
-            (
-                temp_database_path().to_string_lossy().into_owned(),
-                false,
-                false,
-            )
-        } else {
-            (filename_str.to_string(), false, false)
-        };
+    let access = flags & (SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    if !matches!(access, SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE | 6) {
+        return failed_open(db_out, SQLITE_MISUSE, "invalid access flags");
+    }
+    let parsed = if flags & SQLITE_OPEN_URI != 0 && filename_str.starts_with("file:") {
+        match parse_uri_filename(filename_str, access | (flags & SQLITE_OPEN_MEMORY)) {
+            Ok(parsed) => parsed,
+            Err(error) => return failed_open(db_out, error.code, &error.message),
+        }
+    } else {
+        ParsedFilename {
+            path: filename_str.to_owned(),
+            memory: flags & SQLITE_OPEN_MEMORY != 0 || filename_str == ":memory:",
+            cache_shared: false,
+            access,
+        }
+    };
+    let use_memory = parsed.memory;
+    let cache_shared = parsed.cache_shared;
     let temp_path = if filename_str.is_empty() && !use_memory {
-        Some(std::path::PathBuf::from(&effective_filename))
+        Some(temp_database_path())
     } else {
         None
     };
-
-    // Open read-only when asked to, and also when the file exists but is
-    // not writable: SQLite falls back to read-only access in that case
-    // instead of failing to open.
+    let effective_filename = temp_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or(parsed.path);
     let file_is_readonly = !use_memory
         && std::fs::metadata(&effective_filename)
-            .map(|m| m.permissions().readonly())
+            .map(|metadata| metadata.permissions().readonly())
             .unwrap_or(false);
-    let file_open_flags = if (flags & SQLITE_OPEN_READONLY) != 0 || file_is_readonly {
+    let file_open_flags = if parsed.access & SQLITE_OPEN_READONLY != 0 || file_is_readonly {
         turso_core::OpenFlags::ReadOnly
+    } else if parsed.access & SQLITE_OPEN_CREATE != 0 || temp_path.is_some() {
+        turso_core::OpenFlags::Create
     } else {
-        turso_core::OpenFlags::default()
+        turso_core::OpenFlags::None
     };
 
     let use_shared_memory = use_memory && cache_shared;
@@ -669,7 +675,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect(ConnectOpts::new()) {
+    match db.connect(
+        ConnectOpts::new().with_readonly(file_open_flags.contains(turso_core::OpenFlags::ReadOnly)),
+    ) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
