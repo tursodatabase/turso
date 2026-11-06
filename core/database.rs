@@ -1878,6 +1878,7 @@ impl Database {
                     // would route a resumed open into the bootstrap arm.
                     if state.mvcc_convert_stmt.is_some()
                         || (db.opts.enable_mvcc
+                            && db.get_mv_store().is_none()
                             && !db.readonly_bootstrap
                             && !db.open_flags.contains(OpenFlags::ReadOnly))
                     {
@@ -1992,6 +1993,10 @@ impl Database {
 
     fn ensure_writable_ready(&self) -> Result<()> {
         if self.is_readonly() {
+            // Autovacuum policy may make an originally writable open read-only.
+            if !self.readonly_bootstrap {
+                return Ok(());
+            }
             // Only an actual filesystem permission failure permits the C API's readonly fallback.
             let _probe = self.io.open_file(&self.path, OpenFlags::NoLock, true)?;
             return Err(LimboError::InvalidArgument(
