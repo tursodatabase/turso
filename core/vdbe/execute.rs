@@ -4604,8 +4604,9 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let mut started_secondary_tx = false;
-                if write && conn.is_readonly(*db) {
-                    return Err(LimboError::ReadOnly.into());
+                conn.check_database_storage(*db)?;
+                if write {
+                    conn.ensure_database_writable(*db)?;
                 }
                 let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
                 turso_assert!(
@@ -15562,6 +15563,7 @@ pub fn op_sequence_begin_inner_tx(
     if conn.is_tx_read_only() {
         return Err(LimboError::ReadOnly.into());
     }
+    conn.ensure_database_writable(*db)?;
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
@@ -19947,6 +19949,7 @@ fn op_journal_mode_inner(
                     .into());
                 }
 
+                program.connection.ensure_database_writable(*db)?;
                 state.active_op_state.journal_mode().new_mode = Some(new_mode);
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Checkpoint;
             }

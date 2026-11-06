@@ -76,6 +76,10 @@ use ptrmap::*;
 pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
+    pub(crate) fn page(&self) -> &PageRef {
+        &self.0
+    }
+
     pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
         Ok(IOResult::Done(Self(page)))

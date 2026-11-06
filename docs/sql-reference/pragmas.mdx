@@ -393,6 +393,24 @@ remain writable. `mode=rw` requires an existing file, and `mode=rwc` permits
 creating one. URI modes can restrict the caller's open flags but cannot add
 write or creation permission.
 
+For supported builtin, unencrypted filesystem storage, read-only and writable
+connections may share the same database within a process. A writable open does
+not convert storage immediately: the first persistent write or explicit
+checkpoint acquires writer authority. On a legacy rollback-journal file, that
+operation can return busy until existing readers end their transactions. A
+writable connection that already holds its own legacy read transaction must
+end that transaction before retrying the upgrade. Private TEMP operations do
+not activate the main database, and closing an unused writable handle does not
+convert it.
+
+If storage changed outside the process while read-only state was retained, a
+persistent write can require closing all handles and reopening the database.
+A temporary I/O failure while validating unchanged storage can be retried before
+activation changes any files. An I/O failure after activation has changed storage
+requires closing and reopening; the failed operation does not acknowledge a user
+transaction.
+Encrypted, custom, unidentified, multiprocess, and lock-disabled storage do not
+use this activation path.
 
 ### full_column_names / short_column_names
 

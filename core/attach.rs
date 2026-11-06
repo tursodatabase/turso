@@ -477,7 +477,7 @@ impl Connection {
                     } else if self.db.is_in_memory_db() {
                         Database::io_for_path(path)?
                     } else {
-                        self.db.io.clone()
+                        self.db.storage_io()
                     };
                     let main_db_flags = if self.is_readonly(MAIN_DB_ID) {
                         self.db.open_flags | crate::OpenFlags::ReadOnly
