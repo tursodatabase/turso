@@ -20537,8 +20537,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // through it as well; a source that lives in memory has no file
                 // IO, so its copy goes through the platform's. The copy is
                 // built in a temporary file beside the destination and moved
-                // there once complete, unless the destination already exists
-                // (see VacuumIntoTempOutput).
+                // there once complete, unless the destination already exists or
+                // the IO cannot rename a file (see VacuumIntoTempOutput).
                 let (io, build_path, temp_output): (
                     Arc<dyn crate::IO>,
                     String,

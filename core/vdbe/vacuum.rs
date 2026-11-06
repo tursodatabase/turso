@@ -422,7 +422,10 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
 /// A destination that already exists — an empty file — may be open
 /// elsewhere: attached on this connection, or created by another process
 /// that waits for it. The copy must land in that file, so it is built there
-/// directly, as it always was; only that copy can be left partial.
+/// directly, as it always was; only that copy can be left partial. The
+/// same goes for an IO that cannot rename a file ([`crate::IO::supports_rename`]):
+/// the copy is built at the destination, which is where it would end up on
+/// an IO that keeps its files in memory, where no process dies partway.
 pub(crate) struct VacuumIntoTempOutput {
     io: Arc<dyn crate::IO>,
     temp_path: String,
@@ -433,9 +436,13 @@ impl VacuumIntoTempOutput {
     const SUFFIX: &'static str = "-vacuum";
 
     /// The temporary file for a copy to `dest_path`, after removing what an
-    /// attempt that died partway left there; None when the destination
-    /// already exists and the copy has to be built in it.
+    /// attempt that died partway left there; None when the copy has to be
+    /// built at the destination: it already exists, or `io` cannot move
+    /// the temporary file over it.
     pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Option<Self>> {
+        if !io.supports_rename() {
+            return Ok(None);
+        }
         let this = Self {
             io,
             temp_path: format!("{dest_path}{}", Self::SUFFIX),
@@ -466,52 +473,33 @@ impl VacuumIntoTempOutput {
     /// Moves the finished copy to the destination. The copy was
     /// checkpointed under `SyncMode::Full` and closed, so the file is
     /// self-contained and synced and its WAL is empty; the WAL and shm are
-    /// dropped and an MVCC copy's logical log moves with it. The move is a
-    /// rename, so the destination goes from absent (or empty) to complete
-    /// in one step, and the directory is synced so the name is durable.
+    /// dropped and an MVCC copy's logical log moves with it. The move is
+    /// the IO's rename, so the destination goes from absent (or empty) to
+    /// complete in one step, durably.
     pub fn install(&self) -> Result<()> {
         for sidecar in ["-wal", "-shm"] {
             remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
         }
-        std::fs::rename(&self.temp_path, &self.dest_path)
-            .map_err(|e| crate::error::io_error(e, "rename"))?;
-        let temp_log = format!("{}-log", self.temp_path);
-        if std::fs::metadata(&temp_log).is_ok() {
-            std::fs::rename(&temp_log, format!("{}-log", self.dest_path))
-                .map_err(|e| crate::error::io_error(e, "rename"))?;
-        }
-        sync_parent_dir(&self.dest_path)
+        self.io.rename_file(&self.temp_path, &self.dest_path)?;
+        not_found_is_ok(self.io.rename_file(
+            &format!("{}-log", self.temp_path),
+            &format!("{}-log", self.dest_path),
+        ))
     }
 }
 
 fn remove_file_if_exists(io: &dyn crate::IO, path: &str) -> Result<()> {
-    match io.remove_file(path) {
+    not_found_is_ok(io.remove_file(path))
+}
+
+fn not_found_is_ok(result: Result<()>) -> Result<()> {
+    match result {
         Err(LimboError::CompletionError(crate::CompletionError::IOError(
             std::io::ErrorKind::NotFound,
             _,
         ))) => Ok(()),
         result => result,
     }
-}
-
-/// Syncs the directory holding `path`, so that a rename into it is durable.
-/// Directories cannot be synced on Windows, and need not be.
-fn sync_parent_dir(path: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let dir = std::path::Path::new(path)
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::File::open(dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| crate::error::io_error(e, "sync"))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
 /// Copy functions, vtab modules, and index methods from one connection to
@@ -3928,6 +3916,17 @@ mod tests {
                 return Err(injected_failure("remove_file"));
             }
             self.inner.remove_file(path)
+        }
+
+        fn supports_rename(&self) -> bool {
+            self.inner.supports_rename()
+        }
+
+        fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+            if self.state.covers(from) && self.state.dead() {
+                return Err(injected_failure("rename"));
+            }
+            self.inner.rename_file(from, to)
         }
 
         fn step(&self) -> Result<()> {

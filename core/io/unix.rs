@@ -77,6 +77,14 @@ impl IO for UnixIO {
         Ok(())
     }
 
+    fn supports_rename(&self) -> bool {
+        true
+    }
+
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        crate::io::rename_file_durably(from, to)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())

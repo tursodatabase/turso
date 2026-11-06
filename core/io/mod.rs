@@ -574,6 +574,21 @@ pub trait IO: Clock + Send + Sync {
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
 
+    /// Whether [`IO::rename_file`] works: the backend keeps its files on
+    /// a file system that can move a file over another in one step.
+    fn supports_rename(&self) -> bool {
+        false
+    }
+
+    /// Moves the file at `from` to `to`, replacing a file there, in one
+    /// step that a crash cannot leave half done, and makes the move
+    /// durable. Only when [`IO::supports_rename`] says so.
+    fn rename_file(&self, _from: &str, _to: &str) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "this IO cannot rename files".to_string(),
+        ))
+    }
+
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {
         false
@@ -2194,4 +2209,22 @@ mod shuttle_tests {
         concurrent_overlapping_writes,
         test_concurrent_overlapping_writes_impl
     );
+}
+
+/// Moves the file at `from` to `to` with the platform rename, replacing a
+/// file at `to`, then syncs the directory the name lives in so the move is
+/// durable. Directories cannot be synced on Windows, and need not be.
+pub(crate) fn rename_file_durably(from: &str, to: &str) -> Result<()> {
+    std::fs::rename(from, to).map_err(|e| crate::error::io_error(e, "rename"))?;
+    #[cfg(unix)]
+    {
+        let dir = std::path::Path::new(to)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| crate::error::io_error(e, "sync"))?;
+    }
+    Ok(())
 }
