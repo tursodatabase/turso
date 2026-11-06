@@ -1,0 +1,163 @@
+@database :memory:
+
+test fk-parent-nonunique-update-key {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a,b REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,1);
+    PRAGMA foreign_keys=ON;
+    UPDATE t1 SET b=7;
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-nonunique-delete {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a,b REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t1;
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-nonunique-empty-update {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    PRAGMA foreign_keys=ON;
+    UPDATE t1 SET b=7;
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-nonunique-empty-delete {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t1;
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-nonunique-unrelated-update {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,1);
+    PRAGMA foreign_keys=ON;
+    UPDATE t1 SET a=7;
+    SELECT a,b FROM t1;
+}
+expect {
+    7|1
+}
+
+test fk-parent-nonunique-disabled {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,1);
+    UPDATE t1 SET b=7;
+    SELECT a,b FROM t1;
+    DELETE FROM t1;
+    SELECT count(*) FROM t1;
+}
+expect {
+    1|7
+    0
+}
+
+test fk-parent-valid-unique-update {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE UNIQUE INDEX i1 ON t1(b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,1);
+    PRAGMA foreign_keys=ON;
+    UPDATE t1 SET b=7;
+    SELECT b FROM t1;
+}
+expect {
+    7
+}
+
+test fk-parent-valid-rowid-update {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY,b);
+    CREATE TABLE t2(a REFERENCES t1(a));
+    INSERT INTO t1 VALUES(1,1);
+    PRAGMA foreign_keys=ON;
+    UPDATE t1 SET a=7;
+    SELECT a FROM t1;
+}
+expect {
+    7
+}
+
+test fk-parent-partial-unique-delete {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE UNIQUE INDEX i1 ON t1(b) WHERE a>0;
+    CREATE TABLE t2(a REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t1;
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-nonunique-immediate-insert {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t1 VALUES(1,1);
+    SELECT b FROM t1;
+}
+expect {
+    1
+}
+
+test fk-parent-nonunique-deferred-insert {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b) DEFERRABLE INITIALLY DEFERRED);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t1 VALUES(1,1);
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-incompatible-unique-collation {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX i1 ON t1(b COLLATE BINARY);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    INSERT INTO t1 VALUES(1,'value');
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t1;
+}
+expect error {
+    foreign key mismatch
+}
+
+test fk-parent-nonunique-drop {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t1(a,b);
+    CREATE TABLE t2(a REFERENCES t1(b));
+    PRAGMA foreign_keys=ON;
+    DROP TABLE t1;
+    SELECT count(*) FROM sqlite_schema WHERE name='t1';
+}
+expect {
+    0
+}
