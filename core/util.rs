@@ -1836,7 +1836,8 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::DropSequence { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
-        | ast::Stmt::DropSchema { .. } => {}
+        | ast::Stmt::DropSchema { .. }
+        | ast::Stmt::Truncate { .. } => {}
     }
     Ok(())
 }

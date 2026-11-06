@@ -32,9 +32,9 @@ const MAIN_SCHEMA_NAME: &str = "main";
 pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
     let denial = match stmt {
         ast::Stmt::Select(_) => return Ok(()),
-        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
-            write_denial(tbl_name)
-        }
+        ast::Stmt::Insert { tbl_name, .. }
+        | ast::Stmt::Delete { tbl_name, .. }
+        | ast::Stmt::Truncate { tbl_name } => write_denial(tbl_name),
         ast::Stmt::Update(update) => write_denial(&update.tbl_name),
         ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }

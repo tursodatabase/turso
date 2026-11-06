@@ -4018,8 +4018,7 @@ pub fn emit_fk_child_insert_checks(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, &child_tbl.name, None)
     })? {
-        let is_self_ref = fk_ref.fk.parent_namespace == namespace.id
-            && fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
+        let is_self_ref = fk_ref.is_self_reference();
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();

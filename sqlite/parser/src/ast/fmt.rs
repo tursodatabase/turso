@@ -891,6 +891,10 @@ impl ToTokens for Stmt {
                 name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::Truncate { tbl_name } => {
+                s.append(TK_ID, Some("TRUNCATE"))?;
+                tbl_name.to_tokens(s, context)
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,

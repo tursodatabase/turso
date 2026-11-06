@@ -378,6 +378,12 @@ pub enum Stmt {
         /// schema name
         name: Name,
     },
+    /// `TRUNCATE`: deletes every row of a table. Built only by the
+    /// PostgreSQL frontend; the SQLite parser has no such syntax.
+    Truncate {
+        /// table name
+        tbl_name: QualifiedName,
+    },
 }
 
 #[repr(transparent)]

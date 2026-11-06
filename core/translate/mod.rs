@@ -54,7 +54,7 @@ mod window;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::delete::translate_delete;
+use crate::translate::delete::{translate_delete, translate_truncate};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::WalkControl;
 use crate::util::walk_stmt_expressions;
@@ -92,6 +92,7 @@ pub fn translate(
         stmt,
         ast::Stmt::CreateIndex { .. }
             | ast::Stmt::Delete { .. }
+            | ast::Stmt::Truncate { .. }
             | ast::Stmt::Insert { .. }
             | ast::Stmt::Update { .. }
     );
@@ -248,6 +249,7 @@ fn translate_statement(
             | ast::Stmt::DropSequence { .. }
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
+            | ast::Stmt::Truncate { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -262,7 +264,10 @@ fn translate_statement(
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
-        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
+        ast::Stmt::Delete { .. }
+            | ast::Stmt::Truncate { .. }
+            | ast::Stmt::Insert { .. }
+            | ast::Stmt::Update { .. }
     );
 
     // PRAGMA count_changes: top-level INSERT/UPDATE/DELETE statements return one row
@@ -275,7 +280,7 @@ fn translate_statement(
         match &stmt {
             ast::Stmt::Insert { .. } => Some("rows inserted"),
             ast::Stmt::Update { .. } => Some("rows updated"),
-            ast::Stmt::Delete { .. } => Some("rows deleted"),
+            ast::Stmt::Delete { .. } | ast::Stmt::Truncate { .. } => Some("rows deleted"),
             _ => None,
         }
     } else {
@@ -402,6 +407,9 @@ fn translate_statement(
                 program,
                 connection,
             )?
+        }
+        ast::Stmt::Truncate { tbl_name } => {
+            translate_truncate(&tbl_name, resolver, program, connection)?
         }
         ast::Stmt::Detach { name } => {
             crate::attach::translate_detach(&name, resolver, program, connection.clone())?
@@ -632,6 +640,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
         ast::Stmt::Delete { .. } => "delete",
+        ast::Stmt::Truncate { .. } => "truncate",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",
         ast::Stmt::DropTable { .. } => "drop_table",

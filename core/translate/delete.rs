@@ -1,8 +1,10 @@
+use crate::dialect::TableRemoval;
 use crate::namespace::NamespaceRef;
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
+use crate::translate::fkeys::reject_removal_of_referenced_table;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
@@ -80,6 +82,33 @@ fn validate_delete(
     Ok::<(), crate::LimboError>(())
     }))?;
     Ok(table)
+}
+
+/// TRUNCATE deletes every row of the table, like DELETE without WHERE.
+pub fn translate_truncate(
+    tbl_name: &QualifiedName,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let namespace = resolver.resolve_queried_table(tbl_name)?;
+    reject_removal_of_referenced_table(
+        resolver,
+        connection,
+        namespace,
+        tbl_name.name.as_str(),
+        TableRemoval::Truncate,
+    )?;
+    translate_delete(
+        tbl_name,
+        resolver,
+        None,
+        vec![],
+        None,
+        None,
+        program,
+        connection,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
