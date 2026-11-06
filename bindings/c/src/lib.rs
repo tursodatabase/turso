@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
-use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 use turso_sqlite::SqliteDialect;
 use turso_sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
@@ -348,138 +347,53 @@ pub struct SqliteContext {
 // SAFETY: SqliteContext is only used single-threaded within a function call.
 unsafe impl Send for SqliteContext {}
 
-struct FuncSlot {
-    x_func: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
-    p_app: usize,   // *mut c_void stored as usize for Send
-    destroy: usize, // Option<unsafe extern "C" fn(*mut c_void)> stored as usize for Send
-    name: String,
-    db: usize, // *mut sqlite3 stored as usize for Send
+struct UserData {
+    context: *mut ffi::c_void,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 }
 
-// SAFETY: p_app lifetime is the caller's responsibility (same as SQLite C API).
-unsafe impl Send for FuncSlot {}
-
-const MAX_CUSTOM_FUNCS: usize = 32;
-
-static FUNC_SLOTS: OnceLock<Mutex<[Option<FuncSlot>; MAX_CUSTOM_FUNCS]>> = OnceLock::new();
-
-fn func_slots() -> &'static Mutex<[Option<FuncSlot>; MAX_CUSTOM_FUNCS]> {
-    FUNC_SLOTS.get_or_init(|| Mutex::new(std::array::from_fn(|_| None)))
-}
-
-unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
-    let (x_func, p_app, db) = {
-        let slots = func_slots().lock().unwrap();
-        match slots[slot_id].as_ref() {
-            Some(s) => (s.x_func, s.p_app, s.db),
-            None => return ExtValue::null(),
+impl Drop for UserData {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.destroy {
+            unsafe { destroy(self.context) };
         }
-    };
+    }
+}
 
-    // Build array of *mut c_void each pointing into the argv slice.
-    // The C callback reads these via sqlite3_value_* functions.
+struct ScalarBridge {
+    callback: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+    user_data: UserData,
+    // Statements keep the database handle alive; owning it here would form a cycle.
+    db: *mut sqlite3,
+}
+
+unsafe extern "C" fn scalar_ctx_destructor(context: usize) {
+    drop(Box::from_raw(context as *mut ScalarBridge));
+}
+
+unsafe extern "C" fn scalar_trampoline(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<turso_ext::ContextDestructor>,
+    _value_destructor: Option<turso_ext::ValueDestructor>,
+) -> ExtValue {
+    let bridge = &*(context as *const ScalarBridge);
     let mut arg_ptrs: Vec<*mut ffi::c_void> = (0..argc as usize)
         .map(|i| argv.add(i) as *mut ffi::c_void)
         .collect();
-
     let mut ctx = SqliteContext {
         result: ExtValue::null(),
-        p_app: p_app as *mut ffi::c_void,
-        db: db as *mut sqlite3,
+        p_app: bridge.user_data.context,
+        db: bridge.db,
     };
-
-    x_func(
+    (bridge.callback)(
         &mut ctx as *mut SqliteContext as *mut ffi::c_void,
         argc,
         arg_ptrs.as_mut_ptr(),
     );
-
     ctx.result
 }
-
-// 32 pre-generated bridge functions — one per slot.
-// Each bridges turso_core's ScalarFunction ABI to the C sqlite3_create_function_v2 callback.
-macro_rules! func_bridge {
-    ($id:literal, $name:ident) => {
-        unsafe extern "C" fn $name(
-            _context: usize,
-            argc: i32,
-            argv: *const ExtValue,
-            _context_destructor: Option<turso_ext::ContextDestructor>,
-            _value_destructor: Option<turso_ext::ValueDestructor>,
-        ) -> ExtValue {
-            dispatch_func_bridge($id, argc, argv)
-        }
-    };
-}
-
-func_bridge!(0, func_bridge_0);
-func_bridge!(1, func_bridge_1);
-func_bridge!(2, func_bridge_2);
-func_bridge!(3, func_bridge_3);
-func_bridge!(4, func_bridge_4);
-func_bridge!(5, func_bridge_5);
-func_bridge!(6, func_bridge_6);
-func_bridge!(7, func_bridge_7);
-func_bridge!(8, func_bridge_8);
-func_bridge!(9, func_bridge_9);
-func_bridge!(10, func_bridge_10);
-func_bridge!(11, func_bridge_11);
-func_bridge!(12, func_bridge_12);
-func_bridge!(13, func_bridge_13);
-func_bridge!(14, func_bridge_14);
-func_bridge!(15, func_bridge_15);
-func_bridge!(16, func_bridge_16);
-func_bridge!(17, func_bridge_17);
-func_bridge!(18, func_bridge_18);
-func_bridge!(19, func_bridge_19);
-func_bridge!(20, func_bridge_20);
-func_bridge!(21, func_bridge_21);
-func_bridge!(22, func_bridge_22);
-func_bridge!(23, func_bridge_23);
-func_bridge!(24, func_bridge_24);
-func_bridge!(25, func_bridge_25);
-func_bridge!(26, func_bridge_26);
-func_bridge!(27, func_bridge_27);
-func_bridge!(28, func_bridge_28);
-func_bridge!(29, func_bridge_29);
-func_bridge!(30, func_bridge_30);
-func_bridge!(31, func_bridge_31);
-
-static FUNC_BRIDGES: [ScalarFunction; MAX_CUSTOM_FUNCS] = [
-    func_bridge_0,
-    func_bridge_1,
-    func_bridge_2,
-    func_bridge_3,
-    func_bridge_4,
-    func_bridge_5,
-    func_bridge_6,
-    func_bridge_7,
-    func_bridge_8,
-    func_bridge_9,
-    func_bridge_10,
-    func_bridge_11,
-    func_bridge_12,
-    func_bridge_13,
-    func_bridge_14,
-    func_bridge_15,
-    func_bridge_16,
-    func_bridge_17,
-    func_bridge_18,
-    func_bridge_19,
-    func_bridge_20,
-    func_bridge_21,
-    func_bridge_22,
-    func_bridge_23,
-    func_bridge_24,
-    func_bridge_25,
-    func_bridge_26,
-    func_bridge_27,
-    func_bridge_28,
-    func_bridge_29,
-    func_bridge_30,
-    func_bridge_31,
-];
 
 // ===== End custom function infrastructure =====
 
@@ -1210,6 +1124,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
         }
     }
     stmt_ref.clear_text_cache();
+    let _handle = stmt_ref.db.clone();
     let _ = Box::from_raw(stmt);
     result
 }
@@ -3137,101 +3052,109 @@ unsafe extern "C" fn collation_bridge_destroy(context: usize) {
     }
 }
 
+enum PendingFunction {
+    Scalar(*mut ScalarBridge),
+    Delete(UserData),
+}
+
+impl Drop for PendingFunction {
+    fn drop(&mut self) {
+        match self {
+            Self::Scalar(bridge) if !bridge.is_null() => unsafe {
+                drop(Box::from_raw(*bridge));
+            },
+            _ => {}
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function_v2(
     db: *mut sqlite3,
     name: *const ffi::c_char,
-    _n_args: ffi::c_int,
+    n_args: ffi::c_int,
     _enc: ffi::c_int,
     context: *mut ffi::c_void,
     func: Option<unsafe extern "C" fn()>,
-    _step: Option<unsafe extern "C" fn()>,
-    _final_: Option<unsafe extern "C" fn()>,
-    _destroy: Option<unsafe extern "C" fn()>,
+    step: Option<unsafe extern "C" fn()>,
+    final_: Option<unsafe extern "C" fn()>,
+    destroy: Option<unsafe extern "C" fn()>,
 ) -> ffi::c_int {
-    if db.is_null() || name.is_null() {
+    let handle = if db.is_null() {
+        None
+    } else {
+        Some(sqlite3::clone_from_raw(db))
+    };
+    let user_data = UserData {
+        context,
+        destroy: destroy.map(|callback| std::mem::transmute(callback)),
+    };
+    let Some(handle) = &handle else {
+        return SQLITE_MISUSE;
+    };
+    if name.is_null() {
         return SQLITE_MISUSE;
     }
-    // Only scalar functions (xFunc) are supported for now; skip aggregate registration.
-    let x_func_raw = match func {
-        Some(f) => f,
-        None => return SQLITE_OK,
+    let Ok(name) = CStr::from_ptr(name).to_str() else {
+        return SQLITE_MISUSE;
     };
-    // Cast the opaque fn() pointer to the real scalar callback signature.
-    let x_func: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
-        std::mem::transmute(x_func_raw);
-
-    let func_name = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => return SQLITE_MISUSE,
-    };
-
-    // Cast the destroy callback.
-    let destroy_fn: Option<unsafe extern "C" fn(*mut ffi::c_void)> =
-        _destroy.map(|f| std::mem::transmute(f));
-
-    // Allocate a bridge slot.  Reuse an existing slot with the same name
-    // (invoking the old destroy callback) before falling back to a free slot.
-    let mut slots = func_slots().lock().unwrap();
-    let slot_id = if let Some(id) = slots
-        .iter()
-        .position(|s| s.as_ref().is_some_and(|s| s.name == func_name))
-    {
-        // Reuse existing slot — invoke old destroy callback on old user data.
-        if let Some(old) = slots[id].take() {
-            if old.destroy != 0 {
-                let old_destroy: unsafe extern "C" fn(*mut ffi::c_void) =
-                    std::mem::transmute(old.destroy);
-                old_destroy(old.p_app as *mut ffi::c_void);
-            }
+    let name_c = CString::new(name).unwrap();
+    let mut registration = match (func, step, final_) {
+        (Some(callback), None, None) => {
+            PendingFunction::Scalar(Box::into_raw(Box::new(ScalarBridge {
+                callback: std::mem::transmute::<
+                    unsafe extern "C" fn(),
+                    unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+                >(callback),
+                user_data,
+                db,
+            })))
         }
-        id
-    } else {
-        match slots.iter().position(|s| s.is_none()) {
-            Some(id) => id,
-            None => return SQLITE_ERROR, // all 32 slots used
-        }
+        (None, None, None) => PendingFunction::Delete(user_data),
+        _ => return SQLITE_MISUSE,
     };
-    slots[slot_id] = Some(FuncSlot {
-        x_func,
-        p_app: context as usize,
-        destroy: destroy_fn.map_or(0, |f| f as usize),
-        name: func_name.clone(),
-        db: db as usize,
-    });
-    drop(slots);
-
-    let bridge = FUNC_BRIDGES[slot_id];
-
-    let func_name_c = match CString::new(func_name.as_str()) {
-        Ok(s) => s,
-        Err(_) => {
-            func_slots().lock().unwrap()[slot_id] = None;
-            return SQLITE_ERROR;
-        }
-    };
-
-    let db_ref = &*db;
-    let inner = db_ref.inner.lock().unwrap();
-    let api = inner.conn._build_turso_ext();
-    let rc = (api.register_scalar_function)(
-        api.ctx,
-        func_name_c.as_ptr(),
-        _n_args,
-        false,
-        0,
-        bridge,
-        None,
-        None,
-    );
-    inner.conn._free_extension_ctx(api);
-
-    if rc != turso_ext::ResultCode::OK {
-        func_slots().lock().unwrap()[slot_id] = None;
-        return SQLITE_ERROR;
+    let previous;
+    let inner = handle.inner.lock().unwrap();
+    let conn = &inner.conn;
+    previous = conn.external_function_signature(name, n_args);
+    if conn.has_active_root_statement() && previous.is_some() {
+        return SQLITE_BUSY;
     }
-
-    SQLITE_OK
+    let rc = match &registration {
+        PendingFunction::Delete(_user_data) => {
+            conn.unregister_external_function(name, n_args);
+            turso_ext::ResultCode::OK
+        }
+        PendingFunction::Scalar(bridge) => {
+            let api = conn._build_turso_ext();
+            let rc = (api.register_scalar_function)(
+                api.ctx,
+                name_c.as_ptr(),
+                n_args,
+                false,
+                *bridge as usize,
+                scalar_trampoline,
+                Some(scalar_ctx_destructor),
+                None,
+            );
+            conn._free_extension_ctx(api);
+            rc
+        }
+    };
+    if rc == turso_ext::ResultCode::OK {
+        match &mut registration {
+            PendingFunction::Scalar(bridge) => *bridge = std::ptr::null_mut(),
+            PendingFunction::Delete(_) => {}
+        }
+    }
+    drop(inner);
+    drop(previous);
+    drop(registration);
+    if rc == turso_ext::ResultCode::OK {
+        SQLITE_OK
+    } else {
+        SQLITE_ERROR
+    }
 }
 
 #[no_mangle]
@@ -3755,15 +3678,15 @@ fn limbo_err_code(err: &LimboError) -> i32 {
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
-        unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
+        let err_msg = err.bare_message();
+        unsafe { *container = CString::new(err_msg.as_ref()).unwrap().into_raw() };
     }
     code
 }
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}"))
+    set_db_err_msg(db, limbo_err_code(&err), &err.bare_message())
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {
@@ -3782,6 +3705,19 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structured_error_messages_preserve_payload_without_category() {
+        for error in [
+            LimboError::Corrupt("Internal error: application payload".into()),
+            LimboError::ParseError("Parse error: application payload".into()),
+        ] {
+            let expected = error.bare_message().into_owned();
+            let mut message = ptr::null_mut();
+            handle_limbo_err(error, &mut message);
+            let message = unsafe { CString::from_raw(message) };
+            assert_eq!(message.to_str().unwrap(), expected);
+        }
+    }
 
     #[test]
     fn structured_constraint_errors_keep_sqlite_codes() {

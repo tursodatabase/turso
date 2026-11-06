@@ -4470,6 +4470,8 @@ impl Connection {
             .read()
             .functions
             .values()
+            .flatten()
+            .filter_map(|entry| entry.function.as_ref())
             .flat_map(|f| {
                 let is_agg = f.func.is_aggregate();
                 f.func.arg_counts().into_iter().map(move |argc| {
@@ -4482,6 +4484,31 @@ impl Connection {
                 })
             })
             .collect()
+    }
+
+    pub fn external_function_signature(
+        &self,
+        name: &str,
+        argc: i32,
+    ) -> Option<Arc<function::ExternalFunc>> {
+        self.syms
+            .read()
+            .functions
+            .get(&crate::util::normalize_ident(name))?
+            .iter()
+            .find(|entry| entry.arg_counts == [argc])
+            .and_then(|entry| entry.function.clone())
+    }
+
+    pub fn unregister_external_function(&self, name: &str, argc: i32) {
+        let name = crate::util::normalize_ident(name);
+        let mut syms = self.syms.write();
+        if let Some(bucket) = syms.functions.get_mut(&name) {
+            if let Some(entry) = bucket.iter_mut().find(|entry| entry.arg_counts == [argc]) {
+                entry.function = None;
+                self.bump_prepare_context_generation();
+            }
+        }
     }
 
     pub fn register_external_collation(
@@ -5236,9 +5263,16 @@ pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 
+#[derive(Debug, Clone)]
+pub struct FunctionRegistration {
+    // A deleted exact arity must still prevent fallback to a variadic registration.
+    pub function: Option<Arc<function::ExternalFunc>>,
+    arg_counts: Vec<i32>,
+}
+
 #[derive(Default)]
 pub struct SymbolTable {
-    pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    pub functions: HashMap<String, Vec<FunctionRegistration>>,
     /// Custom collations by normalized name.
     pub collations: HashMap<String, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
@@ -5294,13 +5328,36 @@ impl SymbolTable {
     ) -> Option<Arc<function::ExternalFunc>> {
         self.functions
             .get(name)
-            .cloned()
-            .or_else(|| {
-                self.functions
-                    .get(&crate::util::normalize_ident(name))
-                    .cloned()
+            .or_else(|| self.functions.get(&crate::util::normalize_ident(name)))?
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry
+                    .arg_counts
+                    .iter()
+                    .any(|&argc| argc < 0 || argc as usize == arg_count)
             })
-            .filter(|func| func.func.matches_arg_count(arg_count))
+            .min_by_key(|entry| (entry.arg_counts.contains(&-1), entry.arg_counts.len()))
+            .and_then(|entry| entry.function.clone())
+    }
+
+    pub fn insert_function(&mut self, name: String, function: Arc<function::ExternalFunc>) {
+        let mut arg_counts = function.func.arg_counts();
+        arg_counts.sort_unstable();
+        arg_counts.dedup();
+        self.insert_function_registration(
+            name,
+            FunctionRegistration {
+                function: Some(function),
+                arg_counts,
+            },
+        );
+    }
+
+    fn insert_function_registration(&mut self, name: String, registration: FunctionRegistration) {
+        let bucket = self.functions.entry(name).or_default();
+        bucket.retain(|old| old.arg_counts != registration.arg_counts);
+        bucket.push(registration);
     }
 
     pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
@@ -5310,8 +5367,10 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
-        for (name, func) in &other.functions {
-            self.functions.insert(name.clone(), func.clone());
+        for (name, functions) in &other.functions {
+            for function in functions {
+                self.insert_function_registration(name.clone(), function.clone());
+            }
         }
         for (name, collation) in &other.collations {
             self.collations.insert(name.clone(), collation.clone());
