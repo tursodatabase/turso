@@ -1023,6 +1023,8 @@ fn test_postgres_refuses_a_database_file_whose_tables_are_in_no_schema() {
         )
         .unwrap();
     let before = std::fs::read(&path).unwrap();
+    let wal_path = dir.path().join("main.db-wal");
+    assert!(!wal_path.exists());
 
     // The file is not new, so no public schema is made for it, and its
     // table is in no schema: the frontend refuses it rather than hide it.
@@ -1039,6 +1041,7 @@ fn test_postgres_refuses_a_database_file_whose_tables_are_in_no_schema() {
 
     // Refusing it writes nothing, so SQLite still reads it as it was.
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!wal_path.exists());
     let v: String = rusqlite::Connection::open(&path)
         .unwrap()
         .query_row("SELECT v FROM counted", [], |row| row.get(0))

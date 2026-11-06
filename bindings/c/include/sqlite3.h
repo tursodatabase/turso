@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define SQLITE_VERSION        "3.42.0"
-#define SQLITE_VERSION_NUMBER 3042000
+#define SQLITE_VERSION        "3.50.4"
+#define SQLITE_VERSION_NUMBER 3050004
 
 /* SQLite C extension loading is not supported: Turso extensions are a
 ** different mechanism. Consumers (e.g. PHP's ext/sqlite3) compile their
