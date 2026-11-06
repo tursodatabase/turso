@@ -200,3 +200,42 @@ expect {
     1|0n
     2|0n
 }
+
+setup outer-rows-with-one-match {
+    CREATE TABLE r(a);
+    CREATE TABLE l(x);
+    INSERT INTO r VALUES (5), (6);
+    INSERT INTO l VALUES (5);
+}
+
+@setup outer-rows-with-one-match
+test correlated-scalar-aggregate-retains-matching-row {
+    SELECT count(*) + (SELECT r.a) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    6
+}
+
+@setup outer-rows-with-one-match
+test correlated-exists-aggregate-retains-matching-row {
+    SELECT count(*) + EXISTS (SELECT 1 WHERE r.a = 5) FROM r JOIN l ON l.x = r.a;
+}
+expect {
+    2
+}
+
+@setup outer-rows-with-one-match
+test correlated-scalar-aggregate-where-retains-matching-row {
+    SELECT count(*) + (SELECT r.a) FROM r WHERE a = 5;
+}
+expect {
+    6
+}
+
+@setup outer-rows-with-one-match
+test correlated-scalar-aggregate-null-row-with-no-match {
+    SELECT count(*) + (SELECT coalesce(r.a, 100)) FROM r JOIN l ON l.x = r.a WHERE r.a = 6;
+}
+expect {
+    100
+}
