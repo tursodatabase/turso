@@ -1,0 +1,5 @@
+{
+  "name": "better-sqlite3",
+  "version": "0.0.0-turso-shim",
+  "main": "index.cjs"
+}
