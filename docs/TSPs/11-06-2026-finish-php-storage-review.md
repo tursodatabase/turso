@@ -25,7 +25,7 @@ Mixed opens include builtin unencrypted MVCC. Immutable connection policy surviv
 
 **Blocked by:** None
 **Files:** bindings/javascript/packages/common/promise.ts; bindings/javascript/sync/packages/wasm/promise.test.ts
-**Interfaces:** `async prepare(sql: string): Promise<Statement>` connects before acquiring existing execution gate, then releases in finally.
+**Interfaces:** `prepare(sql: string): Statement` preserves the common synchronous API; the deferred statement factory connects and prepares under the existing execution gate, releasing it in finally.
 - [x] Pause a completed actual native worker call before its gate releases, issue prepare, verify zero native entries during the pause and SELECT42 result afterward. Observed RED1/GREEN0.
 - [x] Execute focused and full browser sync file plus native prepare/error controls; independent review and commit.
 
@@ -148,7 +148,7 @@ application run for the storage delta.
 
 The final `eda0afbc4` runtime was rebuilt with
 `cargo build --locked --profile lib-release --bin tursodb`, using the same Rust
-1.88 toolchain, profile and features as baseline `78a77aac1`. No agent Cargo,
+1.88 toolchain, profile and features as baseline `78a77aac1`. These are shared-host measurements; unrelated Python workloads and Defender activity were later observed, so they do not establish isolated-machine acceptance. No agent Cargo,
 stress or test processes ran during measurement. Each median uses eight warm
 trials after one warmup, alternating binary order. Main-file hashes were unchanged
 after both experiments.
@@ -222,3 +222,22 @@ remaining source blocker. The final native suites and the exact platform run
 cover that repair. Fork PR #15 is ready for review with the measured scan/memory
 tradeoff and application/browser coverage limits stated explicitly; publication
 into fork main and upstream #11497 follow in the parent task.
+
+### Upstream review and CI diagnostic followthrough
+
+The fresh-process recovery child now additionally requires `PRAGMA
+integrity_check` to return `ok` after each injected header-write, sync, WAL-open,
+and process-exit failure. This addresses the explicit structural-integrity
+review request alongside the existing original-row assertion.
+
+The upstream WriteStress run at head `78a77aac1` was cancelled at the job's
+35-minute limit: three iterations passed, while the remaining iteration's seed
+and redirected log were unavailable. Its cause remains unresolved. The workflow
+now chooses and prints each full 64-bit seed before starting the simulator and
+requests per-iteration log upload with `always()`. Artifact retention remains
+best effort during cancellation; workloads, iteration counts and timeouts are
+unchanged. A shell harness checks success and failure propagation, preserves
+`18446744073709551615` without numeric conversion, and confirms the seed survives
+cancellation of a blocked child. The same cancellation check on the old workflow
+shows the missing seed. These diagnostics improve reproducibility; they do not
+establish a fix for the original timeout.
