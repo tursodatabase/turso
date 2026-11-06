@@ -757,3 +757,45 @@ fn test_copy_from_stdin_unsupported(db: TempDatabase) {
     // STDIN is not supported — should produce an error
     assert!(result.is_err());
 }
+
+#[turso_macros::test(mvcc)]
+fn test_copy_from_empty_lines_load_empty_string_rows(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE e (s TEXT)").unwrap();
+
+    let data = write_temp_file("x\n\ny\n");
+    let sql = format!("COPY e FROM '{}'", data.path().display());
+    conn.execute(&sql).unwrap();
+
+    let rows = query_all(&conn, "SELECT s FROM e");
+    assert_eq!(rows.len(), 3);
+    assert_text(&rows[0][0], "x");
+    assert_text(&rows[1][0], "");
+    assert_text(&rows[2][0], "y");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_copy_from_escaped_delimiter_and_newline(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE e2 (x TEXT, y TEXT)").unwrap();
+    let data2 = write_temp_file("a\\\tb\tc\n");
+    let sql2 = format!("COPY e2 FROM '{}'", data2.path().display());
+    conn.execute(&sql2).unwrap();
+
+    let rows2 = query_all(&conn, "SELECT x, length(x), y FROM e2");
+    assert_eq!(rows2.len(), 1);
+    assert_text(&rows2[0][0], "a\tb");
+    assert_int(&rows2[0][1], 3);
+    assert_text(&rows2[0][2], "c");
+
+    conn.execute("CREATE TABLE e (s TEXT)").unwrap();
+    let data = write_temp_file("x\\\n");
+    let sql = format!("COPY e FROM '{}'", data.path().display());
+    conn.execute(&sql).unwrap();
+
+    let rows = query_all(&conn, "SELECT hex(s) FROM e");
+    assert_eq!(rows.len(), 1);
+    assert_text(&rows[0][0], "780A");
+}
