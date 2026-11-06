@@ -229,6 +229,14 @@ pub fn bind_and_rewrite_expr<'a>(
                     if id.quoted_with('"') && resolver.dqs_dml.is_enabled() {
                         *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                         return Ok(WalkControl::Continue);
+                    } else if referenced_tables
+                        .find_table_and_internal_id_by_identifier(&normalized_id)
+                        .is_some()
+                    {
+                        return Err(resolver
+                            .catalog
+                            .dialect
+                            .table_name_as_value_error(id.as_str()));
                     } else {
                         crate::bail_parse_error!("no such column: {}", id.as_str())
                     }
