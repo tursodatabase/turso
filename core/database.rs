@@ -1088,8 +1088,12 @@ impl Database {
             return Ok(());
         }
 
-        let probe_flags = (flags | OpenFlags::Create) & !OpenFlags::NoLock & !OpenFlags::ReadOnly;
-        match io.open_file(path, probe_flags, true) {
+        // Shared, so concurrent multiprocess openers do not reject each other.
+        let probe_flags = (flags | OpenFlags::Create | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
+        let probe = io
+            .open_file(path, probe_flags, true)
+            .and_then(|file| file.lock_file(false).map(|()| file));
+        match probe {
             Ok(_probe_file) => Ok(()),
             Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
                 "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
