@@ -322,7 +322,7 @@ pub(crate) fn open_vacuum_temp_db(
     let page_codec = source_conn.pager.load().page_codec_external();
     let db = match &page_codec {
         Some(codec) => Database::open(
-            source_db.io.clone(),
+            source_db.storage_io(),
             &path,
             crate::OpenOptions::new(source_db.dialect())
                 .flags(OpenFlags::Create)
@@ -331,7 +331,7 @@ pub(crate) fn open_vacuum_temp_db(
                 .page_codec(codec.clone()),
         )?,
         None => Database::open_file_with_flags(
-            source_db.io.clone(),
+            source_db.storage_io(),
             &path,
             OpenFlags::Create,
             vacuum_target_opts_from_source(source_db),

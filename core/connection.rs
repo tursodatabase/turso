@@ -1127,6 +1127,7 @@ impl Connection {
         sql: impl AsRef<str>,
         origin: StatementOrigin,
     ) -> Result<Statement> {
+        self.db.check_storage_health()?;
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -2366,12 +2367,14 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        self.ensure_database_writable(crate::MAIN_DB_ID)?;
         self.pager.load().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
+        self.ensure_database_writable(crate::MAIN_DB_ID)?;
         let pager = self.pager.load();
         pager.begin_read_tx()?;
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
@@ -2570,6 +2573,7 @@ impl Connection {
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
+            && self.db.writer_is_active()
             && !self.is_readonly(crate::MAIN_DB_ID)
             && !is_memory_db
             && should_checkpoint_on_close
@@ -2691,6 +2695,7 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
+        self.ensure_database_writable(crate::MAIN_DB_ID)?;
         self.db.reload_wal_after_external_restore()
     }
 
@@ -2861,6 +2866,32 @@ impl Connection {
 
     pub fn get_database_canonical_path(&self) -> String {
         self.db.get_database_canonical_path()
+    }
+
+    pub(crate) fn check_database_storage(&self, index: usize) -> Result<()> {
+        if index == crate::TEMP_DB_ID {
+            return Ok(());
+        }
+        if index == crate::MAIN_DB_ID {
+            return self.db.check_storage_health();
+        }
+        let catalog = self.attached_databases.read();
+        catalog
+            .index_to_data
+            .get(&index)
+            .ok_or(LimboError::SchemaUpdated)?
+            .db
+            .check_storage_health()
+    }
+
+    pub(crate) fn ensure_database_writable(&self, index: usize) -> Result<()> {
+        if self.is_readonly(index) {
+            return Err(LimboError::ReadOnly);
+        }
+        if index == crate::TEMP_DB_ID {
+            return Ok(());
+        }
+        self.get_source_database(index).ensure_writable_ready()
     }
 
     /// Check if a specific attached database is read only or not, by its index
@@ -4766,9 +4797,7 @@ impl Connection {
         from_statement: bool,
         database: usize,
     ) -> Result<ExplicitCheckpointGuard> {
-        if self.is_readonly(database) {
-            return Err(LimboError::ReadOnly);
-        }
+        self.ensure_database_writable(database)?;
         let statements_expected = if from_statement { 1 } else { 0 };
         let mut activity = self.statement_activity.lock();
         // Parked incremental blob handles don't count: they hold a Root

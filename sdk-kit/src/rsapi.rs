@@ -18,10 +18,10 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
-    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
-    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
-    PageLocation, QueryMode, Statement, StepResult, IO,
+    types::AsValueRef, ConnectOpts, Connection, Database, DatabaseOpts, DatabaseStorage,
+    EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions, PageCodec,
+    PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode, Statement,
+    StepResult, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -1010,15 +1010,8 @@ impl TursoDatabase {
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
                     }
-                    let db_file = if let Some(db_file) = &self.config.db_file {
-                        db_file.clone()
-                    } else {
-                        let file = io.open_file(&self.config.path, open_flags, true)?;
-                        Arc::new(DatabaseFile::new(file))
-                    };
-
                     state.io = Some(io);
-                    state.db_file = Some(db_file);
+                    state.db_file = self.config.db_file.clone();
                     state.opts = Some(opts);
                     state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
@@ -1030,20 +1023,18 @@ impl TursoDatabase {
                         .as_ref()
                         .expect("io must be initialized in Init phase")
                         .clone();
-                    let db_file = state
-                        .db_file
-                        .as_ref()
-                        .expect("db_file must be initialized in Init phase")
-                        .clone();
+                    let db_file = state.db_file.clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
                     let open_flags = state.open_flags;
 
-                    let options = OpenOptions::new(Arc::new(SqliteDialect))
-                        .storage(db_file)
+                    let mut options = OpenOptions::new(Arc::new(SqliteDialect))
                         .flags(open_flags)
                         .db_opts(opts)
                         .encryption(self.config.encryption.clone())
                         .page_codec(self.config.page_codec.clone());
+                    if let Some(db_file) = db_file {
+                        options = options.storage(db_file);
+                    }
                     match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
@@ -1084,7 +1075,11 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_page_codec(page_codec.clone())
+                    .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly)),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1093,7 +1088,11 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_encryption_key(encryption_key)
+                    .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly)),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))

@@ -471,11 +471,29 @@ impl Statement {
         }
     }
 
+    fn check_storage_health(&self) -> Result<()> {
+        self.program.connection.db.check_storage_health()?;
+        for database in self
+            .program
+            .prepared
+            .read_databases
+            .iter()
+            .chain(self.program.prepared.write_databases.iter())
+            .filter(|&database| database > crate::TEMP_DB_ID)
+        {
+            self.program.connection.check_database_storage(database)?;
+        }
+        Ok(())
+    }
+
     /// Every step of a statement passes through here, so the work that only
     /// matters on the first call, the last call, a busy wait or an error is
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if let Err(error) = self.check_storage_health() {
+            return self.finish_step(Err(Box::new(error)), waker);
+        }
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
