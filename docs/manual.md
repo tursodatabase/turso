@@ -582,7 +582,7 @@ Turso supports switching between different journal modes at runtime using the `P
 | Mode | Description |
 |------|-------------|
 | `wal` | Write-Ahead Logging mode. The default mode for new databases. Provides good concurrency for readers and writers. |
-| `mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. **Note:** the feature is not production ready so do not use it for critical data right now. |
+| `mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. |
 
 > **Note:** Legacy SQLite journal modes (`delete`, `truncate`, `persist`, `memory`, `off`) are recognized but not currently supported. Attempting to switch to these modes will return an error.
 
