@@ -62,6 +62,8 @@ pub use memory::MemoryIO;
 pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
+#[cfg(feature = "fs")]
+pub(crate) use common::ENV_DISABLE_FILE_LOCK;
 mod completions;
 pub use clock::Clock;
 pub use completions::*;
@@ -151,6 +153,11 @@ pub trait SharedWalMappedRegion: Send + Sync {
 }
 
 pub trait File: Send + Sync {
+    /// Descriptor identity is required before an unlocked reader can acquire writer authority.
+    fn file_id(&self) -> Result<Option<FileId>> {
+        Ok(None)
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;

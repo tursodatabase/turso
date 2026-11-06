@@ -896,6 +896,25 @@ unsafe impl Sync for WindowsFile {}
 crate::assert::assert_send_sync!(WindowsFile);
 
 impl File for WindowsFile {
+    fn file_id(&self) -> Result<Option<super::FileId>> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        // The owned handle remains valid while the OS fills this output structure.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let result = unsafe { GetFileInformationByHandle(self.file_handle, &mut info) };
+        if result == 0 {
+            return Err(crate::error::io_error(
+                std::io::Error::last_os_error(),
+                "GetFileInformationByHandle",
+            ));
+        }
+        Ok(Some(super::FileId {
+            dev: info.dwVolumeSerialNumber as u64,
+            ino: (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64,
+        }))
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive_access: bool) -> Result<()> {
         trace!(

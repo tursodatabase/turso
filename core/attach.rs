@@ -622,16 +622,11 @@ impl Connection {
                     readonly,
                 } => {
                     self.has_non_main_pagers.store(true, Ordering::Release);
-                    let database_id = self
-                        .attached_databases
-                        .write()
-                        .insert(db.clone(), pager.clone());
-                    self.attached_databases
-                        .write()
-                        .index_to_data
-                        .get_mut(&database_id)
-                        .expect("attached database was just inserted")
-                        .readonly = *readonly;
+                    let database_id = self.attached_databases.write().insert(
+                        db.clone(),
+                        pager.clone(),
+                        *readonly,
+                    );
                     self.add_qualifier(crate::Qualifier::database(alias, database_id));
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));

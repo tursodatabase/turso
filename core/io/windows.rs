@@ -1,8 +1,8 @@
+use super::windows_lock::{acquire_process_file_lock, ProcessFileLockGuard};
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
-use super::windows_lock::{acquire_process_file_lock, ProcessFileLockGuard};
 use crate::sync::Arc;
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
 use std::cell::Cell;
@@ -22,8 +22,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS,
     OPEN_EXISTING,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
-use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, ResetEvent, WaitForSingleObject, INFINITE,
+};
+use windows_sys::Win32::System::IO::{
+    GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
+};
 
 // Per-thread event handle used to synchronously wait for completion of an
 // overlapped ReadFile/WriteFile. Created lazily on first use and reused for
@@ -84,8 +88,7 @@ fn write_chunk(handle: HANDLE, event: HANDLE, pos: u64, data: &[u8]) -> Result<u
         if wait != WAIT_OBJECT_0 {
             return Err(last_os_error("pwrite WaitForSingleObject"));
         }
-        let ok =
-            unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_written, FALSE) };
+        let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_written, FALSE) };
         if ok == FALSE {
             return Err(last_os_error("pwrite GetOverlappedResult"));
         }
@@ -229,6 +232,25 @@ unsafe impl Send for WindowsFile {}
 unsafe impl Sync for WindowsFile {}
 
 impl File for WindowsFile {
+    fn file_id(&self) -> Result<Option<super::FileId>> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        // The owned handle remains valid while the OS fills this output structure.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let result = unsafe { GetFileInformationByHandle(self.handle, &mut info) };
+        if result == 0 {
+            return Err(crate::error::io_error(
+                std::io::Error::last_os_error(),
+                "GetFileInformationByHandle",
+            ));
+        }
+        Ok(Some(super::FileId {
+            dev: info.dwVolumeSerialNumber as u64,
+            ino: (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64,
+        }))
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         trace!("lock_file(exclusive = {})", exclusive);
@@ -340,7 +362,8 @@ impl File for WindowsFile {
 
         while total_written < total_size {
             let remaining = &buf_slice[total_written..];
-            let written = with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
+            let written =
+                with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
             if written == 0 {
                 return Err(LimboError::CompletionError(CompletionError::IOError(
                     ErrorKind::UnexpectedEof,
@@ -382,9 +405,8 @@ impl File for WindowsFile {
 
             while buf_written < slice.len() {
                 let remaining = &slice[buf_written..];
-                let written = with_io_event(|event| {
-                    write_chunk(self.handle, event, current_pos, remaining)
-                })?;
+                let written =
+                    with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
                 if written == 0 {
                     return Err(LimboError::CompletionError(CompletionError::IOError(
                         ErrorKind::UnexpectedEof,

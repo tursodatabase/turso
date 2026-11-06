@@ -1309,3 +1309,398 @@ fn test_utf16_db_returns_unsupported_encoding_error() {
         );
     }
 }
+
+fn external_sqlite_command(path: &Path, action: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let module = module_path!().split_once("::").unwrap().1;
+    command
+        .arg("--exact")
+        .arg(format!("{module}::test_readonly_external_sqlite_process"))
+        .arg("--nocapture")
+        .env("TURSO_READONLY_EXTERNAL_PATH", path)
+        .env("TURSO_READONLY_EXTERNAL_ACTION", action);
+    command
+}
+
+#[test]
+fn test_readonly_external_sqlite_process() {
+    let Some(path) = std::env::var_os("TURSO_READONLY_EXTERNAL_PATH") else {
+        return;
+    };
+    let action = std::env::var("TURSO_READONLY_EXTERNAL_ACTION").unwrap();
+    if action == "lock" {
+        use turso_core::IO;
+        let io = turso_core::PlatformIO::new().unwrap();
+        let _file = io
+            .open_file(Path::new(&path).to_str().unwrap(), OpenFlags::None, false)
+            .unwrap();
+        return;
+    }
+    let connection = rusqlite::Connection::open(path).unwrap();
+    if action == "hold_read" {
+        use std::io::Write;
+        connection.execute_batch("BEGIN; SELECT * FROM t;").unwrap();
+        println!("SQLITE_READER_READY");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        connection.execute_batch("ROLLBACK").unwrap();
+    } else {
+        connection
+            .execute("INSERT INTO t(val) VALUES ('external')", ())
+            .unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        println!("EXTERNAL_SQLITE_COMMITTED count={count}");
+    }
+}
+
+fn run_external_sqlite(path: &Path, action: &str) {
+    let output = external_sqlite_command(path, action).output().unwrap();
+    assert!(
+        output.status.success(),
+        "external SQLite failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if action == "write" {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("EXTERNAL_SQLITE_COMMITTED count="),
+            "external helper did not commit: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+fn hold_external_sqlite_reader(path: &Path) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = external_sqlite_command(path, "hold_read")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
+        if line.contains("SQLITE_READER_READY") {
+            break;
+        }
+    }
+    child.stdout = Some(stdout.into_inner());
+    child
+}
+
+fn release_external_sqlite_reader(mut child: std::process::Child) {
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+fn open_readonly_activation_database(
+    path: &Path,
+    flags: OpenFlags,
+) -> turso_core::Result<Arc<Database>> {
+    Database::open_file_with_flags(
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        flags,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+}
+
+fn readonly_storage_bytes(path: &Path) -> Vec<Option<Vec<u8>>> {
+    [
+        path.to_path_buf(),
+        std::path::PathBuf::from(format!("{}-wal", path.display())),
+        path.with_extension("db-log"),
+    ]
+    .iter()
+    .map(|path| match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("{}: {error}", path.display()),
+    })
+    .collect()
+}
+
+#[test]
+fn test_readonly_allows_external_writer_and_rejects_stale_activation() {
+    for legacy in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("external.db");
+        if legacy {
+            create_legacy_db(&path);
+        } else {
+            create_wal_db(&path);
+        }
+        let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+        let reader = database
+            .connect(ConnectOpts::new().with_readonly(true))
+            .unwrap();
+        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, vec![(1,)]);
+        let initial = readonly_storage_bytes(&path);
+        run_external_sqlite(&path, "write");
+        let before = readonly_storage_bytes(&path);
+        assert_ne!(
+            initial, before,
+            "external commit did not change storage; legacy={legacy}"
+        );
+        let changes: Vec<_> = initial
+            .iter()
+            .zip(&before)
+            .enumerate()
+            .map(|(index, (initial, current))| {
+                (
+                    index,
+                    initial.as_ref().map(Vec::len),
+                    current.as_ref().map(Vec::len),
+                    initial == current,
+                    initial.as_ref().map(|bytes| &bytes[..bytes.len().min(100)])
+                        == current.as_ref().map(|bytes| &bytes[..bytes.len().min(100)]),
+                )
+            })
+            .collect();
+        let result = open_readonly_activation_database(&path, OpenFlags::None);
+        assert!(
+            matches!(result, Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed")),
+            "legacy={legacy}: writable activation succeeded={}, error={:?}, files(index,before_len,after_len,all_equal,header_equal)={changes:?}",
+            result.is_ok(),
+            result.as_ref().err()
+        );
+        assert_eq!(readonly_storage_bytes(&path), before);
+        run_external_sqlite(&path, "write");
+        assert!(matches!(
+            reader.execute("INSERT INTO t(val) VALUES ('forbidden')"),
+            Err(turso_core::LimboError::ReadOnly)
+        ));
+    }
+}
+
+#[test]
+fn test_readonly_falls_back_while_external_reader_is_open() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("shared.db");
+    create_wal_db(&path);
+    let child = hold_external_sqlite_reader(&path);
+    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+    let reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    assert!(database.is_readonly());
+    assert!(matches!(
+        open_readonly_activation_database(&path, OpenFlags::None),
+        Err(turso_core::LimboError::InvalidArgument(_))
+    ));
+    release_external_sqlite_reader(child);
+}
+
+#[test]
+fn test_readonly_activation_lock_failure_is_retryable() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("retry.db");
+    create_legacy_db(&path);
+    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+    let reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    let child = hold_external_sqlite_reader(&path);
+    assert!(matches!(
+        open_readonly_activation_database(&path, OpenFlags::None),
+        Err(turso_core::LimboError::LockingError(_))
+    ));
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    release_external_sqlite_reader(child);
+    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
+    assert!(Arc::ptr_eq(&database, &writer_db));
+    let writer = writer_db
+        .connect(ConnectOpts::new().with_readonly(false))
+        .unwrap();
+    writer
+        .execute("INSERT INTO t(val) VALUES ('retry')")
+        .unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(2,)]);
+}
+
+#[test]
+fn test_readonly_bootstrap_failure_releases_main_lock() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("invalid.db");
+    std::fs::write(&path, [0xff; 4096]).unwrap();
+    assert!(open_readonly_activation_database(&path, OpenFlags::ReadOnly).is_err());
+    run_external_sqlite(&path, "lock");
+}
+
+#[test]
+fn test_readonly_activation_rejects_replaced_wal() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("replaced.db");
+    create_wal_db(&path);
+    let wal_path = format!("{}-wal", path.display());
+    std::fs::write(&wal_path, []).unwrap();
+    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+    let _reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    std::fs::remove_file(&wal_path).unwrap();
+    std::fs::write(&wal_path, []).unwrap();
+    assert!(
+        matches!(open_readonly_activation_database(&path, OpenFlags::None), Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed"))
+    );
+}
+
+#[test]
+fn test_readonly_mvcc_activation_preserves_snapshot() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("mvcc-activation.db");
+    create_wal_db(&path);
+    {
+        let database = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
+        let connection = database.connect(ConnectOpts::new()).unwrap();
+        connection.pragma_update("journal_mode", "'mvcc'").unwrap();
+    }
+    let before = readonly_storage_bytes(&path);
+    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+    let reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    reader.execute("BEGIN").unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    assert_eq!(readonly_storage_bytes(&path), before);
+    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
+    assert!(Arc::ptr_eq(&database, &writer_db));
+    let writer = writer_db
+        .connect(ConnectOpts::new().with_readonly(false))
+        .unwrap();
+    assert!(!writer.is_readonly(turso_core::MAIN_DB_ID));
+    writer
+        .execute("INSERT INTO t(val) VALUES ('writer')")
+        .unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    reader.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(2,)]);
+    assert!(matches!(
+        reader.execute("INSERT INTO t(val) VALUES ('forbidden')"),
+        Err(turso_core::LimboError::ReadOnly)
+    ));
+    reader.execute("CREATE TEMP TABLE local(x)").unwrap();
+    reader.execute("INSERT INTO local VALUES (1)").unwrap();
+    drop(writer);
+    drop(writer_db);
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(2,)]);
+}
+
+#[test]
+fn test_readonly_mvcc_activation_rejects_changed_log() {
+    use std::io::Write;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("changed-log.db");
+    create_wal_db(&path);
+    {
+        let database = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
+        let connection = database.connect(ConnectOpts::new()).unwrap();
+        connection.pragma_update("journal_mode", "'mvcc'").unwrap();
+    }
+    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+    let _reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path.with_extension("db-log"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    let before = readonly_storage_bytes(&path);
+    assert!(
+        matches!(open_readonly_activation_database(&path, OpenFlags::None), Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed"))
+    );
+    assert_eq!(readonly_storage_bytes(&path), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_readonly_mvcc_alias_activates_canonical_log() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("canonical.db");
+    let alias = directory.path().join("alias.db");
+    let decoy = alias.with_extension("db-log");
+    create_wal_db(&path);
+    {
+        let database = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
+        let connection = database.connect(ConnectOpts::new()).unwrap();
+        connection.pragma_update("journal_mode", "'mvcc'").unwrap();
+    }
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    std::fs::write(&decoy, b"unrelated alias log").unwrap();
+    {
+        let database = open_readonly_activation_database(&alias, OpenFlags::ReadOnly).unwrap();
+        let reader = database
+            .connect(ConnectOpts::new().with_readonly(true))
+            .unwrap();
+        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, vec![(1,)]);
+        let writer_db = open_readonly_activation_database(&alias, OpenFlags::None).unwrap();
+        let writer = writer_db
+            .connect(ConnectOpts::new().with_readonly(false))
+            .unwrap();
+        writer
+            .execute("INSERT INTO t(val) VALUES ('canonical writer')")
+            .unwrap();
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"unrelated alias log");
+    }
+    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+    let reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(2,)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_readonly_bootstrap_rejects_wal_alias_of_main() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("aliased-sidecar.db");
+    create_wal_db(&path);
+    let wal_path = format!("{}-wal", path.display());
+    std::fs::hard_link(&path, &wal_path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(
+        matches!(open_readonly_activation_database(&path, OpenFlags::ReadOnly), Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed"))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    run_external_sqlite(&path, "lock");
+}
+
+#[test]
+fn test_readonly_no_lock_does_not_activate_writer_authority() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("no-lock.db");
+    create_wal_db(&path);
+    let database =
+        open_readonly_activation_database(&path, OpenFlags::ReadOnly | OpenFlags::NoLock).unwrap();
+    let reader = database
+        .connect(ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    assert!(database.is_readonly());
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    assert!(
+        matches!(open_readonly_activation_database(&path, OpenFlags::None), Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("cannot be activated"))
+    );
+    run_external_sqlite(&path, "write");
+}
