@@ -588,6 +588,7 @@ pub struct OpenDbAsyncState {
     /// across yields.
     roles_stmt: Option<Box<Statement>>,
     role_rows: Vec<Vec<Value>>,
+    resolved_options: Option<OpenOptions>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -614,6 +615,7 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             roles_stmt: None,
             role_rows: Vec::new(),
+            resolved_options: None,
         }
     }
 }
@@ -1318,17 +1320,12 @@ impl Database {
     ///
     /// Drives the IO loop internally. When `OpenOptions::storage` is unset,
     /// opens the file at `path` (consulting the process-wide registry first).
-    pub fn open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+    pub fn open(io: Arc<dyn IO>, path: &str, options: OpenOptions) -> Result<Arc<Database>> {
         // Reject before resolving default storage: a registry hit there would
         // otherwise return the cached default-WAL instance and silently ignore
         // the custom wal_path before open_async runs its own check.
         Self::reject_wal_path_for_registry_open(&options)?;
         Self::validate_open_options(&options)?;
-        if options.storage.is_none() {
-            if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
-                return Ok(db);
-            }
-        }
         let mut state = OpenDbAsyncState::new();
         loop {
             match Self::open_async(&mut state, io.clone(), path, &options)? {
@@ -1341,8 +1338,8 @@ impl Database {
     }
 
     /// IOResult-driven twin of [`Database::open`]: the caller drives the IO
-    /// loop and passes `state` between calls. `OpenOptions::storage` must be
-    /// set.
+    /// loop and passes `state` between calls. Default storage is resolved once
+    /// and retained in the state across IO yields.
     ///
     /// This matters for the sync engine, which must yield on IO when the
     /// schema table spans multiple pages (potentially needing network IO to
@@ -1363,12 +1360,10 @@ impl Database {
     ) -> IOResultOr<Arc<Database>> {
         Self::reject_wal_path_for_registry_open(options)?;
         Self::validate_open_options(options)?;
-        let Some(storage) = options.storage.clone() else {
-            return Err(LimboError::InvalidArgument(
-                "OpenOptions::storage is required for Database::open_async".to_string(),
-            )
-            .into());
-        };
+        let mut options = state
+            .resolved_options
+            .clone()
+            .unwrap_or_else(|| options.clone());
         // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
         // Callers may hand us default flags on every poll, so this runs each
@@ -1405,6 +1400,11 @@ impl Database {
                                 )
                                 .into());
                             }
+                            if options.durable_storage.is_some() && db.durable_storage.is_none() {
+                                return Err(LimboError::InvalidArgument(
+                                    "database already open without custom durable storage; close the existing instance before reopening with a custom DurableStorage".into(),
+                                ).into());
+                            }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             Self::check_registry_access(&db, flags)?;
@@ -1427,26 +1427,42 @@ impl Database {
                 }
                 state.registry_key = Some(key);
             }
+            if state.registry_key.is_none() && options.storage.is_none() {
+                Self::resolve_default_storage(&io, path, &mut options, false)?;
+                if let Ok(file_id) = io.file_id(path) {
+                    let key = DatabaseKey::File(file_id);
+                    registry.insert(key.clone(), RegistryEntry::Opening);
+                    state.registry_key = Some(key);
+                }
+                state.resolved_options = Some(options.clone());
+            }
             // Lock is dropped here — the Opening sentinel prevents concurrent opens
             // of the same path without holding the mutex across yields.
         }
 
         // Open the database (no registry lock held; never re-consults it).
-        let result = Self::do_open_async_guarded(
-            state,
-            io.clone(),
-            path,
-            None,
-            storage,
-            flags,
-            options.db_opts,
-            options.encryption.clone(),
-            options.durable_storage.clone(),
-            options.page_codec.clone(),
-            options.allocators.clone(),
-            options.dialect.clone(),
-            &options.native_extensions,
-        );
+        let result = (|| {
+            if options.storage.is_none() {
+                Self::resolve_default_storage(&io, path, &mut options, false)?;
+                state.resolved_options = Some(options.clone());
+            }
+            let storage = options.storage.clone().expect("default storage resolved");
+            Self::do_open_async_guarded(
+                state,
+                io.clone(),
+                path,
+                None,
+                storage,
+                flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.page_codec.clone(),
+                options.allocators.clone(),
+                options.dialect.clone(),
+                &options.native_extensions,
+            )
+        })();
 
         match &result {
             Ok(IOResult::Done(db)) => {
@@ -3782,6 +3798,10 @@ mod database_tests {
         DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
         OpenFlags, OpenOptions, PlatformIO, IO,
     };
+
+    #[cfg(all(feature = "fs", feature = "io_memory_yield"))]
+    #[path = "async_open_tests.rs"]
+    mod async_open_tests;
 
     #[test]
     fn memory_path_classifies_named_memory_databases() {
