@@ -484,3 +484,17 @@ expect {
     2|8|8
     t2|8
 }
+
+@cross-check-integrity
+test changes-not-reset-by-create-index {
+    create table t(x);
+    insert into t values (1), (2), (3);
+    create index i on t(x);
+    select changes();
+    create index if not exists i on t(x);
+    select changes();
+}
+expect {
+    3
+    3
+}

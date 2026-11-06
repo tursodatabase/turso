@@ -1571,7 +1571,6 @@ pub fn op_vupdate(
             cursor_id,
             arg_count,
             start_reg,
-            conflict_action,
             ..
         },
         insn
@@ -1635,16 +1634,16 @@ pub fn op_vupdate(
     match result {
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Ok(IOResult::Done(Some(new_rowid))) => {
+            // Only an INSERT returns a rowid.
             state.record_rows_written(1);
-            if *conflict_action == 5 {
-                // ResolveType::Replace
-                program.connection.update_last_rowid(new_rowid);
-            }
+            state.record_statement_change();
+            program.connection.update_last_rowid(new_rowid);
             state.pc += 1;
         }
         Ok(IOResult::Done(None)) => {
             // no-op or successful update without rowid return
             state.record_rows_written(1);
+            state.record_statement_change();
             state.pc += 1;
         }
         Err(e) => {
