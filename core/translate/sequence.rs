@@ -733,6 +733,98 @@ pub(crate) fn emit_sqlite_sequence_sync(
     }) else {
         return Ok(false);
     };
+    emit_sqlite_sequence_row_write(
+        program,
+        sseq_table,
+        database_id,
+        autoinc_table_name,
+        value_reg,
+    );
+    Ok(true)
+}
+
+/// Emits the bytecode that scans the `sqlite_sequence` cursor
+/// `seq_cursor_id` for the row named by `name_reg` and leaves its `seq`
+/// in `value_reg`, zero when there is no such row, and its rowid in
+/// `rowid_reg`, NULL when there is none. `name_reg` gets the name as the
+/// row stores it, which may differ in case.
+pub fn emit_sqlite_sequence_row_read(
+    program: &mut ProgramBuilder,
+    seq_cursor_id: usize,
+    name_reg: usize,
+    value_reg: usize,
+    rowid_reg: usize,
+) {
+    program.emit_insn(Insn::Integer {
+        dest: value_reg,
+        value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: rowid_reg,
+        dest_end: None,
+    });
+
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    let next_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: seq_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let name_col_reg = program.alloc_register();
+    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: name_reg,
+        rhs: name_col_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default().jump_if_null(),
+        collation: CollationSeq::NOCASE,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: name_col_reg,
+        dst_reg: name_reg,
+        extra_amount: 0,
+    });
+
+    program.emit_column_or_rowid(seq_cursor_id, 1, value_reg);
+    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
+    program.emit_insn(Insn::AddImm {
+        register: value_reg,
+        value: 0,
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: seq_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_end_label,
+    });
+
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: seq_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(loop_end_label);
+}
+
+/// Emits the bytecode that makes `value_reg` the `seq` of the
+/// `sqlite_sequence` row named `name`, by deleting the rows of that name
+/// and inserting one. `sseq_table` is the `sqlite_sequence` table of
+/// database `database_id`. The write counts neither for `changes()` nor
+/// for `last_insert_rowid()`.
+pub fn emit_sqlite_sequence_row_write(
+    program: &mut ProgramBuilder,
+    sseq_table: Arc<BTreeTable>,
+    database_id: usize,
+    name: &str,
+    value_reg: usize,
+) {
     let sseq_root = sseq_table.root_page;
     let sseq_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sseq_table));
 
@@ -742,9 +834,9 @@ pub(crate) fn emit_sqlite_sequence_sync(
         db: database_id,
     });
 
-    let name_reg = program.emit_string8_new_reg(autoinc_table_name.to_string());
+    let name_reg = program.emit_string8_new_reg(name.to_string());
 
-    // Delete every existing row matching `name = autoinc_table_name`.
+    // Delete every existing row matching `name`.
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -816,7 +908,6 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_insn(Insn::Close {
         cursor_id: sseq_cursor,
     });
-    Ok(true)
 }
 
 /// If `seq` is an AUTOINCREMENT-backing sequence (its name begins with

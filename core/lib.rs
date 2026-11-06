@@ -179,6 +179,7 @@ pub use storage::{
 };
 pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::sequence::{emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,

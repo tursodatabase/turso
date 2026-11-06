@@ -1822,63 +1822,13 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         table_name_reg,
         ..
     } = meta;
-
-    program.emit_insn(Insn::Integer {
-        dest: r_seq,
-        value: 0,
-    });
-    program.emit_insn(Insn::Null {
-        dest: r_seq_rowid,
-        dest_end: None,
-    });
-
-    let loop_start_label = program.allocate_label();
-    let loop_end_label = program.allocate_label();
-    let found_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: seq_cursor_id,
-        pc_if_empty: loop_end_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    let name_col_reg = program.alloc_register();
-    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
-        target_pc: found_label,
-        flags: CmpInsFlags::default().jump_if_null(),
-        collation: super::collate::CollationSeq::NOCASE,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: name_col_reg,
-        dst_reg: table_name_reg,
-        extra_amount: 0,
-    });
-
-    program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
-    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
-    program.emit_insn(Insn::AddImm {
-        register: r_seq,
-        value: 0,
-    });
-    program.emit_insn(Insn::RowId {
-        cursor_id: seq_cursor_id,
-        dest: r_seq_rowid,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: loop_end_label,
-    });
-
-    program.preassign_label_to_next_insn(found_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: seq_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(loop_end_label);
+    crate::translate::sequence::emit_sqlite_sequence_row_read(
+        program,
+        seq_cursor_id,
+        table_name_reg,
+        r_seq,
+        r_seq_rowid,
+    );
 }
 
 fn emit_notnulls(
