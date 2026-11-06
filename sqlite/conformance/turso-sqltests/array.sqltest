@@ -2014,3 +2014,56 @@ test array-2d-refuses-nested-text-input-of-integers {
 expect error {
     cannot store non-array value in INTEGER column m.a
 }
+
+test array-plus-integer-refused {
+    CREATE TABLE t(a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[1, 2]);
+    SELECT a + 1 FROM t;
+}
+expect error {
+    operator does not exist: integer\[\] \+ integer
+}
+
+test array-negation-refused {
+    CREATE TABLE t(a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[1, 2]);
+    SELECT -a FROM t;
+}
+expect error {
+    operator does not exist: - integer\[\]
+}
+
+test integer-divided-by-array-refused {
+    CREATE TABLE t(b TEXT[]) STRICT;
+    INSERT INTO t VALUES (ARRAY['x']);
+    SELECT 1 / b FROM t;
+}
+expect error {
+    operator does not exist: integer / text\[\]
+}
+
+test array-bitwise-and-refused {
+    CREATE TABLE t(a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[1, 2]);
+    SELECT a & 1 FROM t;
+}
+expect error {
+    operator does not exist: integer\[\] & integer
+}
+
+test array-arithmetic-in-expression-index-refused {
+    CREATE TABLE t(a INTEGER, b TEXT[]) STRICT;
+    CREATE INDEX i ON t((1 / b));
+}
+expect error {
+    operator does not exist: integer / text\[\]
+}
+
+test array-elements-and-concat-still-work {
+    CREATE TABLE t(a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[3, 4]);
+    SELECT a[1] * a[2], -a[1], a || ARRAY[5] FROM t;
+}
+expect {
+    12|-3|{3,4,5}
+}
