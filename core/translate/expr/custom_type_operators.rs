@@ -79,6 +79,11 @@ pub(super) fn find_operator_call(
         .zip(types)
         .map(|(operand, ty)| Operand::new(operand, ty, env))
         .collect::<Result<Vec<_>>>()?;
+    // No operator decided here takes an array, as in PostgreSQL: SQLite's
+    // operator would read the array's stored bytes as a number.
+    if types.iter().any(ExprType::is_array) {
+        return Err(no_operator_error(op, &operands));
+    }
     let custom_types: Vec<&ColumnCustomType> = operands
         .iter()
         .filter_map(|operand| operand.value_type.as_ref())
@@ -95,19 +100,22 @@ pub(super) fn find_operator_call(
         })
         .find(|(signature, ty)| accepts(signature, ty, &operands));
     let Some((signature, ty)) = found else {
-        match operands.as_slice() {
-            [operand] => {
-                crate::bail_parse_error!("operator does not exist: {op} {}", operand.type_name())
-            }
-            [lhs, rhs] => crate::bail_parse_error!(
-                "operator does not exist: {} {op} {}",
-                lhs.type_name(),
-                rhs.type_name()
-            ),
-            _ => unreachable!("an operator has one or two operands"),
-        }
+        return Err(no_operator_error(op, &operands));
     };
     call_for(signature, ty, env)
+}
+
+fn no_operator_error(op: &str, operands: &[Operand]) -> LimboError {
+    let message = match operands {
+        [operand] => format!("operator does not exist: {op} {}", operand.type_name()),
+        [lhs, rhs] => format!(
+            "operator does not exist: {} {op} {}",
+            lhs.type_name(),
+            rhs.type_name()
+        ),
+        _ => unreachable!("an operator has one or two operands"),
+    };
+    LimboError::ParseError(message)
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types

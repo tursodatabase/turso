@@ -1562,12 +1562,6 @@ mod tests {
                 order: "c + 1",
                 ..kind("date", no_values, none("date"))
             },
-            // `+` on an array gives a value whose type nothing declares, which
-            // may be a custom type's value.
-            Kind {
-                order: "c + 1",
-                ..kind("integer[]", no_values, none("unknown"))
-            },
             // SQLite's CAST without a type name gives a SQLite number, also
             // from a custom type's value.
             Kind {
@@ -1625,12 +1619,6 @@ mod tests {
             ("CAST(1 AS TEXT)", known("text", Number::None), None),
             // SQLite's CAST without a type name, whose type is SQLite's ANY.
             ("CAST(1 AS)", known("any", Number::None), None),
-            // `+` on an array, whose type nothing declares.
-            (
-                "CAST('{1}' AS integer[]) + 1",
-                custom("unknown", Number::None),
-                None,
-            ),
             // A CASE that mixes SQLite types has SQLite's type ANY, and here
             // holds a real.
             (
