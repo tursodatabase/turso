@@ -1173,7 +1173,6 @@ pub fn emit_upsert(
                     new_start,
                     new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                     rowid_set_clause_reg,
-                    &updated_positions,
                     ParentKeyNewProbeMode::BeforeWrite,
                     upsert_database_id,
                     resolver,

@@ -616,7 +616,7 @@ set test_files {
   tkt-a7b7803e         fail
   tkt-a7debbe0         pass
   tkt-a8a0d2996a       pass
-  tkt-b1d3a2e531       fail
+  tkt-b1d3a2e531       pass
   tkt-b351d95f9        pass
   tkt-b72787b1         pass
   tkt-b75a9ca6b0       fail

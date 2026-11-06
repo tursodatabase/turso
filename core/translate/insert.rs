@@ -19,9 +19,9 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
-            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
-            emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
+            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
+            emit_cdc_patch_record, emit_check_constraints, emit_make_record,
+            prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
@@ -34,7 +34,7 @@ use crate::{
             build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
             emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
             fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ForeignKeyActions,
+            open_read_table, table_scan_match_any, ForeignKeyActions, IgnoredChildRows,
         },
         plan::{
             ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
@@ -4041,29 +4041,15 @@ fn emit_replace_delete_conflicting_row(
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = ForeignKeyActions::prepare_fk_delete_actions(
+        ForeignKeyActions::prepare_for_deleted_row(
             program,
             resolver,
-            ctx.table.name.as_str(),
+            ctx.table.as_ref(),
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
             None,
             ctx.namespace,
-        )?;
-        if resolver.with_schema(ctx.namespace.database_id, |s| {
-            s.has_child_fks(ctx.namespace.id, ctx.table.name.as_str())
-        }) {
-            emit_fk_child_decrement_on_delete(
-                program,
-                ctx.table.as_ref(),
-                ctx.table.name.as_str(),
-                ctx.cursor_id,
-                ctx.conflict_rowid_reg,
-                ctx.namespace,
-                resolver,
-            )?;
-        }
-        prepared
+        )?
     } else {
         ForeignKeyActions::default()
     };
@@ -4189,8 +4175,7 @@ pub fn emit_fk_child_insert_checks(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, &child_tbl.name, None)
     })? {
-        let is_self_ref = fk_ref.fk.parent_namespace == namespace.id
-            && fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
+        let is_self_ref = fk_ref.is_self_reference();
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
@@ -4493,11 +4478,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     for pref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(namespace.id, &parent_table.name)
     })? {
-        let is_self_ref = pref.child_namespace == namespace.id
-            && pref
-                .child_table
-                .name
-                .eq_ignore_ascii_case(&parent_table.name);
+        let is_self_ref = pref.is_self_reference();
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
@@ -4553,7 +4534,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program,
                 &pref,
                 new_pk_start,
-                new_row_rowid,
+                new_row_rowid.map(IgnoredChildRows::Row),
                 database_id,
                 resolver,
                 |p| {

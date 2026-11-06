@@ -32,7 +32,7 @@ use crate::translate::expr::expr_type::{
     base_value_type, decode_type, iif_values, value_type, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
-use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::fkeys::{emit_fk_drop_table_check, emit_fk_drop_table_deferred_decrements};
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
@@ -2108,6 +2108,12 @@ pub fn translate_drop_table(
             "cannot drop table {} because other objects depend on it: {usage}",
             normalize_ident(name)
         );
+    }
+    // Like SQLite's implicit DELETE, cancel the deferred violations of the
+    // dropped rows before counting the ones the drop causes, so that a
+    // decrement cannot cancel a violation of another table.
+    if connection.foreign_keys_enabled() {
+        emit_fk_drop_table_deferred_decrements(program, resolver, name, namespace)?;
     }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)

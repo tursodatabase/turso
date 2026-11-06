@@ -146,10 +146,11 @@ pub fn emit_guarded_fk_decrement(
 /// * the OLD-key probe finds children that would become orphans and increments
 ///   the FK counter, or halts immediately for RESTRICT;
 /// * the NEW-key probe finds children that this update repairs and decrements
-///   the deferred counter.
+///   the counter of the FK's kind: the statement counter for an immediate FK,
+///   the transaction counter for a deferred one.
 ///
-/// Because deferred checks share one aggregate counter, a NEW-key decrement is
-/// only correct if it corresponds to a real unresolved violation.
+/// Because all FKs of one kind share one counter, a NEW-key decrement is only
+/// correct if it corresponds to a real unresolved violation.
 ///
 /// `BeforeWrite` is correct for plain `UPDATE` and `UPSERT .. DO UPDATE`:
 /// if a child row matches the NEW key, that child is genuinely missing its
@@ -214,8 +215,6 @@ fn emit_parent_key_change_probes(
     new_key_start: usize,
     n_cols: usize,
     current_rowid_reg: usize,
-    parent_table: &BTreeTable,
-    updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
@@ -283,8 +282,6 @@ fn emit_parent_key_change_probes(
         new_key_start,
         n_cols,
         current_rowid_reg,
-        parent_table,
-        updated_positions,
         new_key_probe_mode,
         database_id,
         resolver,
@@ -495,14 +492,13 @@ pub(super) fn emit_skip_if_any_null(
 /// Iterate a table and call `on_match` when all child columns equal the
 /// non-NULL key at `parent_key_start`.
 ///
-/// Rows with any NULL FK column do not reference a parent and are ignored. For
-/// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
-/// its old child key is being updated away by the same statement.
+/// Rows with any NULL FK column do not reference a parent and are ignored, and
+/// so are the rows that `ignored_rows` names.
 pub fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
     parent_key_start: usize,
-    self_exclude_rowid: Option<usize>,
+    ignored_rows: Option<IgnoredChildRows>,
     database_id: usize,
     resolver: &Resolver,
     mut on_match: F,
@@ -586,23 +582,29 @@ where
         program.preassign_label_to_next_insn(cont);
     }
 
-    // The current row may match the OLD parent key only because it has not been
-    // physically rewritten yet. If the caller knows this row's child key is
-    // changing too, do not count that disappearing old self-reference.
-    if let Some(parent_rowid) = self_exclude_rowid {
+    if let Some(ignored_rows) = ignored_rows {
         let child_rowid = program.alloc_register();
         let skip = program.allocate_label();
         program.emit_insn(Insn::RowId {
             cursor_id: ccur,
             dest: child_rowid,
         });
-        program.emit_insn(Insn::Eq {
-            lhs: child_rowid,
-            rhs: parent_rowid,
-            target_pc: skip,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
-        });
+        match ignored_rows {
+            IgnoredChildRows::Row(rowid) => program.emit_insn(Insn::Eq {
+                lhs: child_rowid,
+                rhs: rowid,
+                target_pc: skip,
+                flags: CmpInsFlags::default(),
+                collation: CollationSeq::for_internal_values(),
+            }),
+            IgnoredChildRows::UpToRow(rowid) => program.emit_insn(Insn::Le {
+                lhs: child_rowid,
+                rhs: rowid,
+                target_pc: skip,
+                flags: CmpInsFlags::default(),
+                collation: CollationSeq::for_internal_values(),
+            }),
+        }
         on_match(program)?;
         program.preassign_label_to_next_insn(skip);
     } else {
@@ -620,6 +622,17 @@ where
     program.preassign_label_to_next_insn(done);
     program.emit_insn(Insn::Close { cursor_id: ccur });
     Ok(())
+}
+
+/// Child rows that `table_scan_match_any` skips.
+#[derive(Clone, Copy)]
+pub enum IgnoredChildRows {
+    /// The row whose rowid is in this register, for example a row that still
+    /// matches the OLD parent key only because the UPDATE has not rewritten
+    /// it yet.
+    Row(usize),
+    /// The rows whose rowid is at most the one in this register.
+    UpToRow(usize),
 }
 
 /// Build the index affinity mask string (one char per indexed column).
@@ -704,8 +717,6 @@ pub fn emit_rowid_pk_change_check(
     incoming: &[&ResolvedFkRef],
     old_rowid_reg: usize,
     new_rowid_reg: usize,
-    parent_table: &BTreeTable,
-    updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
@@ -717,8 +728,6 @@ pub fn emit_rowid_pk_change_check(
         new_rowid_reg,
         1,
         old_rowid_reg,
-        parent_table,
-        updated_positions,
         new_key_probe_mode,
         database_id,
         resolver,
@@ -736,7 +745,6 @@ pub fn emit_parent_index_key_change_checks(
     incoming: &[&ResolvedFkRef],
     table_btree: &BTreeTable,
     index: &Index,
-    updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
@@ -818,8 +826,6 @@ pub fn emit_parent_index_key_change_checks(
         new_key,
         idx_len,
         old_rowid_reg,
-        table_btree,
-        updated_positions,
         new_key_probe_mode,
         database_id,
         resolver,
@@ -838,47 +844,21 @@ pub fn emit_fk_parent_pk_change_counters(
     new_pk_start: usize,
     n_cols: usize,
     current_rowid_reg: usize,
-    parent_table: &BTreeTable,
-    updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     for &fk_ref in incoming {
-        // Self-referential UPDATEs ask two different questions:
+        // A row of a self-referencing table can be both the parent and the
+        // child. Before the rewrite, the scans still see the row's OLD child
+        // key, which the row no longer has after the UPDATE. Like SQLite, the
+        // scans skip the row, and the child-side checks of
+        // `emit_fk_child_update_counters`, which run for every self-reference
+        // whose parent key changes, count the row's own NEW child key:
         //
-        // 1. Does removing/changing the OLD parent key orphan a child row?
-        // 2. Does the NEW child key have a parent?
-        //
-        // The child-side code below answers question 2. This parent-side scan
-        // answers question 1 by looking for child rows that still point at the
-        // OLD parent key.
-        //
-        // A single row can be both the parent and the child:
-        //
-        //   UPDATE t SET id = 2, pid = 2 WHERE id = 1
-        //
-        // Before the physical rewrite, the scan still sees this row as
-        // `(id=1,pid=1)`. Counting that old self-reference would add a false
-        // violation because `pid` is being updated away in the same statement.
-        //
-        // Do not exclude the row when only the parent key changes. For
-        // `(id=1,pid=1)`, `UPDATE t SET id=2` leaves `(id=2,pid=1)`, and that
-        // is a real violation. With pre-rewrite FK checks, the NEW child probe
-        // can still see the old parent row in the table. The child-key-changed
-        // condition prevents that stale row from masking a parent-key-only
-        // orphan.
-        let self_exclude_rowid = if fk_ref.child_namespace == fk_ref.fk.parent_namespace
-            && fk_ref
-                .child_table
-                .name
-                .eq_ignore_ascii_case(&parent_table.name)
-            && fk_ref.child_key_changed(updated_positions, parent_table)
-        {
-            Some(current_rowid_reg)
-        } else {
-            None
-        };
+        //   (1,1): UPDATE t SET id = 2, pid = 2  -- valid
+        //   (1,1): UPDATE t SET id = 2           -- (2,1) has no parent
+        let self_exclude_rowid = fk_ref.is_self_reference().then_some(current_rowid_reg);
         emit_fk_parent_key_probe(
             program,
             fk_ref,
@@ -897,7 +877,7 @@ pub fn emit_fk_parent_pk_change_counters(
                 new_pk_start,
                 n_cols,
                 ParentProbePass::New,
-                None,
+                self_exclude_rowid,
                 database_id,
                 resolver,
             )?;
@@ -972,16 +952,15 @@ fn emit_fk_parent_key_probe(
     resolver: &Resolver,
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
-    let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
 
     let on_match = |p: &mut ProgramBuilder| -> Result<()> {
-        match (is_deferred, pass) {
+        match pass {
             // OLD key referenced by a child: removing/changing this parent key
-            // creates a violation unless a later statement repairs it.
-            (_, ParentProbePass::Old) => {
+            // creates a violation unless a later row or statement repairs it.
+            ParentProbePass::Old => {
                 if is_restrict {
                     // RESTRICT: immediate halt
                     emit_fk_restrict_halt(p, None)?;
@@ -991,16 +970,15 @@ fn emit_fk_parent_key_probe(
                 }
             }
 
-            // NEW key referenced by a child: this parent key may repair a
-            // deferred orphan. The decrement is guarded because the aggregate
-            // counter does not know which key originally incremented it.
-            (true, ParentProbePass::New) => {
+            // NEW key referenced by a child: this parent key may repair an
+            // orphan counted earlier in the statement, or, for a deferred FK,
+            // in the transaction. The decrement is guarded because the counter
+            // does not know which key originally incremented it.
+            ParentProbePass::New => {
                 let skip = p.allocate_label();
                 emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
                 p.preassign_label_to_next_insn(skip);
             }
-            // Immediate FK on NEW pass: nothing to cancel; do nothing.
-            (false, ParentProbePass::New) => {}
         }
         Ok(())
     };
@@ -1026,7 +1004,7 @@ fn emit_fk_parent_key_probe(
             program,
             fk_ref,
             parent_key_start,
-            self_exclude_rowid,
+            self_exclude_rowid.map(IgnoredChildRows::Row),
             database_id,
             resolver,
             on_match,
@@ -1189,109 +1167,141 @@ pub fn emit_fk_child_update_counters(
         return Ok(());
     }
 
+    // Like SQLite, a reference to the table itself is checked also when only
+    // its parent key changes: the row may reference its own OLD key, or have
+    // been missing its parent before the statement.
+    let mut fk_refs: Vec<ResolvedFkRef> = Vec::new();
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, Some(updated_cols))
     })? {
-        if !fk_ref.child_key_changed(updated_cols, child_tbl) {
+        if fk_ref.child_key_changed(updated_cols, child_tbl)
+            || (fk_ref.is_self_reference()
+                && fk_ref.parent_key_may_change(updated_cols, child_tbl)?)
+        {
+            fk_refs.push(fk_ref);
+        }
+    }
+
+    // Like SQLite, cancel the violations of the OLD keys of every foreign key
+    // before counting the violations of the NEW keys. Otherwise an OLD key
+    // that was already missing its parent before the statement could cancel
+    // the violation that another foreign key's NEW key counted.
+    for fk_ref in &fk_refs {
+        // The parent of the rows this action updates was removed by the
+        // statement that fired the action, which does not count a violation
+        // for a foreign key with an action. There is nothing to cancel.
+        if program.carries_out_action_of(&fk_ref.fk) {
             continue;
         }
 
         let ncols = fk_ref.fk.child_columns.len();
 
-        // Pass 1: OLD tuple handling only for deferred FKs
-        if fk_ref.fk.deferred {
-            if let Some((dml_ctx, fk_col_positions, null_skip)) =
-                load_old_fk_values(program, &fk_ref.fk.child_columns)?
-            {
-                if fk_ref.parent_uses_rowid {
-                    // Parent key is rowid: probe parent table by rowid
-                    let parent_tbl = resolver
-                        .with_schema(database_id, |s| {
-                            s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
-                        })
-                        .expect("parent btree");
-                    let pcur = open_read_table(program, &parent_tbl, database_id);
+        // Pass 1: OLD tuple handling
+        if let Some((dml_ctx, fk_col_positions, null_skip)) =
+            load_old_fk_values(program, &fk_ref.fk.child_columns)?
+        {
+            if fk_ref.parent_uses_rowid {
+                // Parent key is rowid: probe parent table by rowid
+                let parent_tbl = resolver
+                    .with_schema(database_id, |s| {
+                        s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+                    })
+                    .expect("parent btree");
+                let pcur = open_read_table(program, &parent_tbl, database_id);
 
-                    // first FK col is the rowid value
-                    let rid = program.alloc_register();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: dml_ctx.to_column_reg(fk_col_positions[0]),
-                        dst_reg: rid,
-                        extra_amount: 0,
-                    });
+                // first FK col is the rowid value
+                let rid = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: dml_ctx.to_column_reg(fk_col_positions[0]),
+                    dst_reg: rid,
+                    extra_amount: 0,
+                });
 
-                    // If NOT exists => decrement
-                    let miss = program.allocate_label();
-                    program.emit_insn(Insn::MustBeInt {
-                        reg: rid,
-                        target_pc: Some(miss),
-                    });
-                    program.emit_insn(Insn::NotExists {
-                        cursor: pcur,
-                        rowid_reg: rid,
-                        target_pc: miss,
-                    });
-                    // found: close & continue
-                    let join = program.allocate_label();
-                    program.emit_insn(Insn::Close { cursor_id: pcur });
-                    program.emit_insn(Insn::Goto { target_pc: join });
+                // If NOT exists => decrement
+                let miss = program.allocate_label();
+                program.emit_insn(Insn::MustBeInt {
+                    reg: rid,
+                    target_pc: Some(miss),
+                });
+                program.emit_insn(Insn::NotExists {
+                    cursor: pcur,
+                    rowid_reg: rid,
+                    target_pc: miss,
+                });
+                // found: close & continue
+                let join = program.allocate_label();
+                program.emit_insn(Insn::Close { cursor_id: pcur });
+                program.emit_insn(Insn::Goto { target_pc: join });
 
-                    // missing: guarded decrement
-                    program.preassign_label_to_next_insn(miss);
-                    program.emit_insn(Insn::Close { cursor_id: pcur });
-                    let skip = program.allocate_label();
-                    emit_guarded_fk_decrement(program, skip, fk_ref.fk.deferred);
-                    program.preassign_label_to_next_insn(skip);
+                // missing: guarded decrement
+                program.preassign_label_to_next_insn(miss);
+                program.emit_insn(Insn::Close { cursor_id: pcur });
+                let skip = program.allocate_label();
+                emit_guarded_fk_decrement(program, skip, fk_ref.fk.deferred);
+                program.preassign_label_to_next_insn(skip);
 
-                    program.preassign_label_to_next_insn(join);
-                } else {
-                    // Parent key is a unique index: use index probe
-                    let parent_tbl = resolver
-                        .with_schema(database_id, |s| {
-                            s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
-                        })
-                        .expect("parent btree");
-                    let idx = fk_ref
-                        .parent_unique_index
-                        .as_ref()
-                        .expect("parent unique index required");
-                    let icur = open_read_index(program, idx, database_id);
+                program.preassign_label_to_next_insn(join);
+            } else {
+                // Parent key is a unique index: use index probe
+                let parent_tbl = resolver
+                    .with_schema(database_id, |s| {
+                        s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+                    })
+                    .expect("parent btree");
+                let idx = fk_ref
+                    .parent_unique_index
+                    .as_ref()
+                    .expect("parent unique index required");
+                let icur = open_read_index(program, idx, database_id);
 
-                    let probe = copy_context_columns_with_affinity(
-                        program,
-                        &dml_ctx,
-                        &fk_col_positions,
-                        idx,
-                        &parent_tbl,
-                    );
-                    // Found: nothing; Not found: guarded decrement
-                    index_probe(
-                        program,
-                        icur,
-                        probe,
-                        ncols,
-                        |_p| Ok(()),
-                        |p| {
-                            let skip = p.allocate_label();
-                            emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
-                            p.preassign_label_to_next_insn(skip);
-                            Ok(())
-                        },
-                    )?;
-                }
-                // Resolve the null skip label after the FK check block so that
-                // when any OLD column is NULL, the entire check is bypassed.
-                program.preassign_label_to_next_insn(null_skip);
+                let probe = copy_context_columns_with_affinity(
+                    program,
+                    &dml_ctx,
+                    &fk_col_positions,
+                    idx,
+                    &parent_tbl,
+                );
+                // Found: nothing; Not found: guarded decrement
+                index_probe(
+                    program,
+                    icur,
+                    probe,
+                    ncols,
+                    |_p| Ok(()),
+                    |p| {
+                        let skip = p.allocate_label();
+                        emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                        p.preassign_label_to_next_insn(skip);
+                        Ok(())
+                    },
+                )?;
             }
+            // Resolve the null skip label after the FK check block so that
+            // when any OLD column is NULL, the entire check is bypassed.
+            program.preassign_label_to_next_insn(null_skip);
         }
+    }
+
+    for fk_ref in &fk_refs {
+        let ncols = fk_ref.fk.child_columns.len();
 
         // Pass 2: NEW tuple handling
         let fk_ok = program.allocate_label();
-        let is_self_ref = fk_ref.child_namespace == fk_ref.fk.parent_namespace
-            && fk_ref
-                .child_table
-                .name
-                .eq_ignore_ascii_case(&fk_ref.fk.parent_table);
+        let is_self_ref = fk_ref.is_self_reference();
+        // The probes below run before the row is rewritten, so for a
+        // self-reference they can find the row's own OLD image. If the NEW
+        // child key equals the row's OLD parent key and the parent key
+        // changes, that match is not a parent: SQLite deletes the OLD row
+        // before it checks the NEW one.
+        //
+        //   (1,NULL),(4,3): UPDATE t SET id=3, par=4 WHERE id=4
+        //
+        // An ON UPDATE CASCADE, SET NULL or SET DEFAULT action rewrites the
+        // child key that references the OLD parent key, so such a match is
+        // repaired by the action.
+        let check_stale_self_match = is_self_ref
+            && matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict)
+            && fk_ref.parent_key_may_change(updated_cols, child_tbl)?;
         for cname in &fk_ref.fk.child_columns {
             let (i, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
@@ -1345,6 +1355,31 @@ pub fn emit_fk_child_update_counters(
             program.preassign_label_to_next_insn(self_mismatch);
         }
 
+        // Missing parent: immediate HALT or deferred +1.
+        let emit_new_key_violation = |p: &mut ProgramBuilder| -> Result<()> {
+            let constraint_info = if fk_ref.fk.deferred {
+                None
+            } else {
+                let regs = fk_ref
+                    .fk
+                    .child_columns
+                    .iter()
+                    .map(|name| {
+                        let (pos, col) = child_tbl.get_column(name).unwrap();
+                        if col.is_rowid_alias() {
+                            new_rowid_reg
+                        } else {
+                            layout.to_register(new_start_reg, pos)
+                        }
+                    })
+                    .collect();
+                Some(Box::new(fk_constraint_info(
+                    p, resolver, child_tbl, &fk_ref.fk, regs,
+                )?))
+            };
+            emit_fk_violation(p, &fk_ref.fk, constraint_info)
+        };
+
         if fk_ref.parent_uses_rowid {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
@@ -1386,6 +1421,20 @@ pub fn emit_fk_child_update_counters(
                     collation: CollationSeq::for_internal_values(),
                 });
             }
+            if check_stale_self_match {
+                let old_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: child_cursor_id,
+                    dest: old_rowid,
+                });
+                program.emit_insn(Insn::Eq {
+                    lhs: tmp,
+                    rhs: old_rowid,
+                    target_pc: violation,
+                    flags: CmpInsFlags::default(),
+                    collation: CollationSeq::for_internal_values(),
+                });
+            }
 
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
@@ -1399,27 +1448,7 @@ pub fn emit_fk_child_update_counters(
             // missing: violation (immediate HALT or deferred +1)
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            let constraint_info = if fk_ref.fk.deferred {
-                None
-            } else {
-                let regs = fk_ref
-                    .fk
-                    .child_columns
-                    .iter()
-                    .map(|name| {
-                        let (pos, col) = child_tbl.get_column(name).unwrap();
-                        if col.is_rowid_alias() {
-                            new_rowid_reg
-                        } else {
-                            layout.to_register(new_start_reg, pos)
-                        }
-                    })
-                    .collect();
-                Some(Box::new(fk_constraint_info(
-                    program, resolver, child_tbl, &fk_ref.fk, regs,
-                )?))
-            };
-            emit_fk_violation(program, &fk_ref.fk, constraint_info)?;
+            emit_new_key_violation(program)?;
         } else {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
@@ -1458,6 +1487,22 @@ pub fn emit_fk_child_update_counters(
                 start
             };
 
+            let stale_self_match = program.allocate_label();
+            if check_stale_self_match {
+                emit_jump_if_old_parent_key_matches(
+                    program,
+                    fk_ref,
+                    child_tbl,
+                    child_cursor_id,
+                    probe,
+                    new_start_reg,
+                    new_rowid_reg,
+                    layout,
+                    stale_self_match,
+                    resolver,
+                )?;
+            }
+
             // FOUND: ok; NOT FOUND: violation path
             index_probe(
                 program,
@@ -1465,38 +1510,86 @@ pub fn emit_fk_child_update_counters(
                 probe,
                 ncols,
                 |_p| Ok(()),
-                |p| {
-                    let constraint_info = if fk_ref.fk.deferred {
-                        None
-                    } else {
-                        let regs = fk_ref
-                            .fk
-                            .child_columns
-                            .iter()
-                            .map(|name| {
-                                let (pos, col) = child_tbl.get_column(name).unwrap();
-                                if col.is_rowid_alias() {
-                                    new_rowid_reg
-                                } else {
-                                    layout.to_register(new_start_reg, pos)
-                                }
-                            })
-                            .collect();
-                        Some(Box::new(fk_constraint_info(
-                            p, resolver, child_tbl, &fk_ref.fk, regs,
-                        )?))
-                    };
-                    emit_fk_violation(p, &fk_ref.fk, constraint_info)?;
-                    Ok(())
-                },
+                emit_new_key_violation,
             )?;
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
+
+            if check_stale_self_match {
+                program.preassign_label_to_next_insn(stale_self_match);
+                program.emit_insn(Insn::Close { cursor_id: icur });
+                emit_new_key_violation(program)?;
+            }
         }
 
         // Skip label for NEW tuple NULL short-circuit
         program.preassign_label_to_next_insn(fk_ok);
     }
 
+    Ok(())
+}
+
+/// Jumps to `target_pc` if the NEW child key at `probe` equals the OLD parent
+/// key of the row at the cursor of a self-referencing table, and that OLD
+/// parent key differs from the row's NEW parent key.
+#[allow(clippy::too_many_arguments)]
+fn emit_jump_if_old_parent_key_matches(
+    program: &mut ProgramBuilder,
+    fk_ref: &ResolvedFkRef,
+    tbl: &BTreeTable,
+    cursor_id: usize,
+    probe: usize,
+    new_start_reg: usize,
+    new_rowid_reg: usize,
+    layout: &ColumnLayout,
+    target_pc: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    let old_rowid = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: old_rowid,
+    });
+    let old_parent_key = emit_columns_and_dependencies(
+        program,
+        tbl,
+        cursor_id,
+        old_rowid,
+        fk_ref.parent_pos.iter().copied(),
+        resolver,
+    )?;
+
+    let no_match = program.allocate_label();
+    let parent_key_changed = program.allocate_label();
+    for (k, &parent_pos) in fk_ref.parent_pos.iter().enumerate() {
+        let new_parent_reg = if tbl.columns()[parent_pos].is_rowid_alias() {
+            new_rowid_reg
+        } else {
+            layout.to_register(new_start_reg, parent_pos)
+        };
+        program.emit_insn(Insn::Ne {
+            lhs: old_parent_key.to_column_reg(parent_pos),
+            rhs: new_parent_reg,
+            target_pc: parent_key_changed,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: fk_ref.parent_collations[k],
+        });
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: no_match,
+    });
+
+    program.preassign_label_to_next_insn(parent_key_changed);
+    for (k, &parent_pos) in fk_ref.parent_pos.iter().enumerate() {
+        program.emit_insn(Insn::Ne {
+            lhs: probe + k,
+            rhs: old_parent_key.to_column_reg(parent_pos),
+            target_pc: no_match,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: fk_ref.parent_collations[k],
+        });
+    }
+    program.emit_insn(Insn::Goto { target_pc });
+    program.preassign_label_to_next_insn(no_match);
     Ok(())
 }
 
@@ -1531,17 +1624,12 @@ fn emit_fk_delete_parent_existence_check_single(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
     parent_bt: &Arc<BTreeTable>,
-    parent_table_name: &str,
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let is_self_ref = fk_ref.child_namespace == fk_ref.fk.parent_namespace
-        && fk_ref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(parent_table_name);
+    let is_self_ref = fk_ref.is_self_reference();
 
     let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
 
@@ -1599,7 +1687,7 @@ fn emit_fk_delete_parent_existence_check_single(
             fk_ref,
             parent_key_start,
             if is_self_ref {
-                Some(parent_rowid_reg)
+                Some(IgnoredChildRows::Row(parent_rowid_reg))
             } else {
                 None
             },
@@ -1635,7 +1723,6 @@ pub fn emit_fk_update_parent_actions(
     start: usize,
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
-    updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
@@ -1662,8 +1749,6 @@ pub fn emit_fk_update_parent_actions(
                 &rowid_fks,
                 old_rowid_reg,
                 rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-                table_btree,
-                updated_positions,
                 new_key_probe_mode,
                 database_id,
                 resolver,
@@ -1683,7 +1768,6 @@ pub fn emit_fk_update_parent_actions(
             &check_fks,
             table_btree,
             index.as_ref(),
-            updated_positions,
             new_key_probe_mode,
             database_id,
             resolver,
@@ -1903,6 +1987,7 @@ fn emit_fk_action_subprogram(
         subprogram_builder
             .flags
             .set_writes_stored_values(ctx.new_key_is_stored);
+        subprogram_builder.fk_action = Some(foreign_key.clone());
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         // Foreign-key actions see every row and need no privileges, as in
@@ -2291,16 +2376,60 @@ impl<T> Default for ForeignKeyActions<T> {
 }
 
 impl ForeignKeyActions<PreparedFkDeleteAction> {
-    /// Phase 1 of FK delete actions: build parent keys into registers and handle
-    /// NoAction/Restrict checks. Returns prepared actions for CASCADE/SetNull/
-    /// SetDefault that must be fired AFTER the parent row is deleted (step 4 per
-    /// SQLite docs: delete parent row first, then perform FK cascade actions).
+    /// Counts the foreign key changes of deleting the row at `rowid_reg` and
+    /// prepares the CASCADE/SET NULL/SET DEFAULT actions the delete fires on
+    /// child rows, which the caller runs after the row is deleted. Every path
+    /// that deletes a row (DELETE, UPDATE OR REPLACE, INSERT OR REPLACE) goes
+    /// through here.
+    ///
+    /// Like SQLite, the row's own foreign keys are cancelled before the
+    /// children the delete leaves without a parent are counted. The decrement
+    /// is skipped while the statement counter is zero, so in the other order a
+    /// row that was already missing its parent before the statement could
+    /// cancel the violation this delete causes.
     ///
     /// `replace_new_parent_regs` is only needed for REPLACE-style updates.
     /// When present, an immediate `ON DELETE NO ACTION` check is skipped if the
     /// row being inserted right after the implicit delete restores the same
     /// parent key, because that delete cannot leave any child orphaned.
-    pub fn prepare_fk_delete_actions(
+    pub fn prepare_for_deleted_row(
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        table: &BTreeTable,
+        cursor_id: usize,
+        rowid_reg: usize,
+        replace_new_parent_regs: Option<(usize, usize)>,
+        namespace: NamespaceRef,
+    ) -> Result<Self> {
+        let table_name = table.name.as_str();
+        if resolver.with_schema(namespace.database_id, |s| {
+            s.has_child_fks(namespace.id, table_name)
+        }) {
+            emit_fk_child_decrement_on_delete(
+                program, table, table_name, cursor_id, rowid_reg, namespace, resolver,
+            )?;
+        }
+        if !resolver.with_schema(namespace.database_id, |s| {
+            s.any_resolved_fks_referencing(namespace.id, table_name)
+        }) {
+            return Ok(Self::default());
+        }
+        Self::prepare_fk_delete_actions(
+            program,
+            resolver,
+            table_name,
+            cursor_id,
+            rowid_reg,
+            replace_new_parent_regs,
+            namespace,
+        )
+    }
+
+    /// Phase 1 of FK delete actions: build parent keys into registers and handle
+    /// NoAction/Restrict checks. Returns prepared actions for CASCADE/SetNull/
+    /// SetDefault that must be fired AFTER the parent row is deleted (step 4 per
+    /// SQLite docs: delete parent row first, then perform FK cascade actions).
+    fn prepare_fk_delete_actions(
         program: &mut ProgramBuilder,
         resolver: &mut Resolver,
         parent_table_name: &str,
@@ -2369,7 +2498,6 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                                 program,
                                 &fk_ref,
                                 &parent_bt,
-                                parent_table_name,
                                 parent_cursor_id,
                                 parent_rowid_reg,
                                 database_id,
@@ -2383,7 +2511,6 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         program,
                         &fk_ref,
                         &parent_bt,
-                        parent_table_name,
                         parent_cursor_id,
                         parent_rowid_reg,
                         database_id,
@@ -2395,7 +2522,6 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         program,
                         &fk_ref,
                         &parent_bt,
-                        parent_table_name,
                         parent_cursor_id,
                         parent_rowid_reg,
                         database_id,
@@ -2473,6 +2599,157 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 
         Ok(())
     }
+}
+
+/// Cancels the violations of the row's own foreign keys: for every child key
+/// whose parent is missing, lowers the counter of the foreign key's kind.
+#[allow(clippy::too_many_arguments)]
+fn emit_fk_child_decrement_on_delete(
+    program: &mut ProgramBuilder,
+    child_tbl: &BTreeTable,
+    child_table_name: &str,
+    child_cursor_id: usize,
+    child_rowid_reg: usize,
+    namespace: NamespaceRef,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    let database_id = namespace.database_id;
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(namespace.id, child_table_name, None)
+    })? {
+        // The parent of the rows this action deletes was removed by the
+        // statement that fired the action, which does not count a violation
+        // for a foreign key with an action. There is nothing to cancel.
+        if program.carries_out_action_of(&fk_ref.fk) {
+            continue;
+        }
+        emit_fk_child_key_decrement(
+            program,
+            child_tbl,
+            &fk_ref,
+            child_cursor_id,
+            child_rowid_reg,
+            database_id,
+            resolver,
+        )?;
+    }
+    Ok(())
+}
+
+/// Lowers the counter of the foreign key's kind if the parent of the child
+/// key of the row at `child_rowid_reg` is missing.
+fn emit_fk_child_key_decrement(
+    program: &mut ProgramBuilder,
+    child_tbl: &BTreeTable,
+    fk_ref: &ResolvedFkRef,
+    child_cursor_id: usize,
+    child_rowid_reg: usize,
+    database_id: usize,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    let child_positions: Vec<usize> = fk_ref
+        .fk
+        .child_columns
+        .iter()
+        .map(|cname| child_tbl.get_column(cname).unwrap().0)
+        .collect();
+    let child_key = emit_columns_and_dependencies(
+        program,
+        child_tbl,
+        child_cursor_id,
+        child_rowid_reg,
+        child_positions.iter().copied(),
+        resolver,
+    )?;
+
+    // Fast path: if any FK column is NULL can't be a violation
+    let null_skip = program.allocate_label();
+    for &pos in &child_positions {
+        program.emit_insn(Insn::IsNull {
+            reg: child_key.to_column_reg(pos),
+            target_pc: null_skip,
+        });
+    }
+
+    if fk_ref.parent_uses_rowid {
+        // Probe parent table by rowid
+        let parent_tbl = resolver
+            .with_schema(database_id, |s| {
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+            })
+            .expect("parent btree");
+        let pcur = open_read_table(program, &parent_tbl, database_id);
+
+        let tmpi = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: child_key.to_column_reg(child_positions[0]),
+            dst_reg: tmpi,
+            extra_amount: 0,
+        });
+        // A key that is not an integer cannot match a parent rowid, so the
+        // parent is missing, and NotExists jumps there too
+        let missing = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::MustBeInt {
+            reg: tmpi,
+            target_pc: Some(missing),
+        });
+
+        program.emit_insn(Insn::NotExists {
+            cursor: pcur,
+            rowid_reg: tmpi,
+            target_pc: missing,
+        });
+
+        // Parent FOUND, no decrement
+        program.emit_insn(Insn::Close { cursor_id: pcur });
+        program.emit_insn(Insn::Goto { target_pc: done });
+
+        // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
+        program.preassign_label_to_next_insn(missing);
+        program.emit_insn(Insn::Close { cursor_id: pcur });
+        emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
+        program.preassign_label_to_next_insn(done);
+    } else {
+        // Probe parent unique index
+        let parent_tbl = resolver
+            .with_schema(database_id, |s| {
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+            })
+            .expect("parent btree");
+        let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
+        let icur = open_read_index(program, idx, database_id);
+
+        // Build probe from current child row
+        let n = fk_ref.fk.child_columns.len();
+        let probe = program.alloc_registers(n);
+        for (i, &pos) in child_positions.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: child_key.to_column_reg(pos),
+                dst_reg: probe + i,
+                extra_amount: 0,
+            });
+        }
+        program.emit_insn(Insn::Affinity {
+            start_reg: probe,
+            count: std::num::NonZeroUsize::new(n).unwrap(),
+            affinities: build_index_affinity_string(idx, &parent_tbl),
+        });
+
+        let ok = program.allocate_label();
+        program.emit_insn(Insn::Found {
+            cursor_id: icur,
+            target_pc: ok,
+            record_reg: probe,
+            num_regs: n,
+        });
+        program.emit_insn(Insn::Close { cursor_id: icur });
+        emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
+        program.preassign_label_to_next_insn(ok);
+        program.emit_insn(Insn::Close { cursor_id: icur });
+    }
+    program.preassign_label_to_next_insn(null_skip);
+    Ok(())
 }
 
 /// Fire FK actions for UPDATE on parent table using Program opcode.
@@ -2682,18 +2959,18 @@ pub fn emit_fk_drop_table_check(
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
-    // Get all FK references to this parent table
     let fk_refs = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(namespace.id, parent_table_name)
     })?;
 
-    if fk_refs.is_empty() {
-        return Ok(());
-    }
-
     // Separate FK refs by action type:
     // - action_fk_refs: CASCADE, SET NULL, SET DEFAULT - need to fire action subprograms
     // - check_fk_refs: RESTRICT, NO ACTION - need violation counting
+    //
+    // A table's NO ACTION references to itself are not checked: dropping the
+    // table removes the referencing rows along with the rows they reference.
+    // Their actions still run, since the actions and the triggers they fire
+    // are visible outside the dropped table.
     let action_fk_refs: Vec<_> = fk_refs
         .iter()
         .filter(|fk| {
@@ -2705,8 +2982,19 @@ pub fn emit_fk_drop_table_check(
         .collect();
     let check_fk_refs: Vec<_> = fk_refs
         .iter()
-        .filter(|fk| matches!(fk.fk.on_delete, RefAct::Restrict | RefAct::NoAction))
+        .filter(|fk| match fk.fk.on_delete {
+            RefAct::Restrict => true,
+            RefAct::NoAction => !fk.is_self_reference(),
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => false,
+        })
         .collect();
+
+    if action_fk_refs.is_empty() && check_fk_refs.is_empty() {
+        return Ok(());
+    }
+    // RESTRICT is never deferred.
+    let counts_deferred =
+        |fk_ref: &ResolvedFkRef| fk_ref.fk.deferred && fk_ref.fk.on_delete == RefAct::NoAction;
 
     // Collect all parent rowids into a RowSet
     // r[rowset_reg] = NULL (initializes RowSet)
@@ -2830,18 +3118,24 @@ pub fn emit_fk_drop_table_check(
             resolver,
         )?;
 
+        // SQLite deletes the rows in rowid order and a RESTRICT reference
+        // fails only if the referencing row is not deleted yet. For a
+        // reference to the table itself, that is a row with a larger rowid.
+        let ignored_rows = (matches!(fk_ref.fk.on_delete, RefAct::Restrict)
+            && fk_ref.is_self_reference())
+        .then_some(IgnoredChildRows::UpToRow(current_rowid_reg));
         table_scan_match_any(
             program,
             fk_ref,
             parent_key_start,
-            None,
+            ignored_rows,
             database_id,
             resolver,
             |p| {
                 p.emit_insn(Insn::FkCounter {
                     constraint_info: None,
                     increment_value: 1,
-                    deferred: false,
+                    deferred: counts_deferred(fk_ref),
                 });
                 Ok(())
             },
@@ -2861,8 +3155,9 @@ pub fn emit_fk_drop_table_check(
         cursor_id: parent_write_cur,
     });
 
-    // Only check for violations if there are RESTRICT/NO ACTION FKs
-    if !check_fk_refs.is_empty() {
+    // A deferred NO ACTION violation is checked at COMMIT. The others fail
+    // the drop.
+    if check_fk_refs.iter().any(|fk_ref| !counts_deferred(fk_ref)) {
         // FkIfZero: if counter == 0, skip the halt
         let no_violations = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {
@@ -2876,6 +3171,113 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+/// Before DROP TABLE, cancels the deferred violations of the table's own rows:
+/// for every row whose deferred foreign key has no parent, lowers the
+/// transaction counter, as the implicit DELETE of SQLite's DROP TABLE does.
+/// Like SQLite, a foreign key whose parent table is gone counts every row with
+/// a non-NULL key as missing its parent, and a foreign key whose parent key has
+/// no UNIQUE index is skipped instead of failing the drop.
+pub fn emit_fk_drop_table_deferred_decrements(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_name: &str,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let database_id = namespace.database_id;
+    let table = resolver
+        .with_schema(database_id, |s| s.get_btree_table(namespace.id, table_name))
+        .ok_or_else(|| LimboError::InternalError(format!("table {table_name} not found")))?;
+    let mut deferred_fks = Vec::new();
+    for fk in table.foreign_keys.iter().filter(|fk| fk.deferred) {
+        match resolver.with_schema(database_id, |s| {
+            s.resolve_child_fk(namespace.id, fk, &table)
+        }) {
+            Ok(Some(fk_ref)) => deferred_fks.push(DroppedRowFk::Resolved(fk_ref)),
+            Ok(None) => deferred_fks.push(DroppedRowFk::ParentTableMissing(fk.clone())),
+            Err(_) => {}
+        }
+    }
+    if deferred_fks.is_empty() {
+        return Ok(());
+    }
+
+    let done = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: done,
+    });
+    let cursor_id = open_read_table(program, &table, database_id);
+    let rows_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: rows_done,
+    });
+    let loop_top = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_top);
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid_reg,
+    });
+    for fk in &deferred_fks {
+        match fk {
+            DroppedRowFk::Resolved(fk_ref) => emit_fk_child_key_decrement(
+                program,
+                &table,
+                fk_ref,
+                cursor_id,
+                rowid_reg,
+                database_id,
+                resolver,
+            )?,
+            DroppedRowFk::ParentTableMissing(fk) => {
+                let child_positions = fk
+                    .child_columns
+                    .iter()
+                    .map(|cname| {
+                        table.get_column(cname).map(|(pos, _)| pos).ok_or_else(|| {
+                            LimboError::InternalError(format!("child col {cname} missing"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let child_key = emit_columns_and_dependencies(
+                    program,
+                    &table,
+                    cursor_id,
+                    rowid_reg,
+                    child_positions.iter().copied(),
+                    resolver,
+                )?;
+                let skip = program.allocate_label();
+                for &pos in &child_positions {
+                    program.emit_insn(Insn::IsNull {
+                        reg: child_key.to_column_reg(pos),
+                        target_pc: skip,
+                    });
+                }
+                emit_guarded_fk_decrement(program, skip, true);
+                program.preassign_label_to_next_insn(skip);
+            }
+        }
+    }
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_top,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(rows_done);
+    program.emit_insn(Insn::Close { cursor_id });
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+/// A deferred foreign key of a table that DROP TABLE removes.
+enum DroppedRowFk {
+    Resolved(ResolvedFkRef),
+    ParentTableMissing(Arc<ForeignKey>),
 }
 
 #[cfg(test)]
