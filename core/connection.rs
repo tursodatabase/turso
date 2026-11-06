@@ -4493,8 +4493,18 @@ impl Connection {
             .collect()
     }
 
-    pub fn has_external_function_signature(&self, name: &str, argc: i32) -> bool {
-        self.syms.read().has_function_signature(name, argc)
+    pub fn external_function_signature(
+        &self,
+        name: &str,
+        argc: i32,
+    ) -> Option<Arc<function::ExternalFunc>> {
+        self.syms
+            .read()
+            .functions
+            .get(&crate::util::normalize_ident(name))?
+            .iter()
+            .find(|entry| entry.arg_counts == [argc])
+            .and_then(|entry| entry.function.clone())
     }
 
     pub fn unregister_external_function(&self, name: &str, argc: i32) {
@@ -5360,16 +5370,6 @@ impl SymbolTable {
             })
             .min_by_key(|entry| (entry.arg_counts.contains(&-1), entry.arg_counts.len()))
             .and_then(|entry| entry.function.clone())
-    }
-
-    pub fn has_function_signature(&self, name: &str, argc: i32) -> bool {
-        self.functions
-            .get(&crate::util::normalize_ident(name))
-            .is_some_and(|bucket| {
-                bucket
-                    .iter()
-                    .any(|entry| entry.arg_counts == [argc] && entry.function.is_some())
-            })
     }
 
     pub fn insert_function(&mut self, name: String, function: Arc<function::ExternalFunc>) {

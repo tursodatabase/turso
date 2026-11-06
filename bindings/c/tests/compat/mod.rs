@@ -691,6 +691,144 @@ mod tests {
     }
 
     #[test]
+    fn successful_function_destructor_reentry_child() {
+        if std::env::var_os("TURSO_SUCCESSFUL_FUNCTION_CHILD").is_none() {
+            return;
+        }
+        unsafe {
+            let step_raw = std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(signature_aggregate_step);
+            let final_raw = std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(signature_aggregate_final);
+            for mode in 0..4 {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+                let mut old = CollationOwnerProbe {
+                    db,
+                    calls: 0,
+                    reenter: true,
+                    closing: false,
+                };
+                let mut new = CollationOwnerProbe {
+                    db,
+                    calls: 0,
+                    reenter: true,
+                    closing: false,
+                };
+                let aggregate = mode == 1;
+                assert_eq!(
+                    sqlite3_create_function_v2(
+                        db,
+                        c"reentrant".as_ptr(),
+                        1,
+                        SQLITE_UTF8,
+                        (&mut old as *mut CollationOwnerProbe).cast(),
+                        (!aggregate).then_some(signature_aggregate_step),
+                        aggregate.then_some(step_raw),
+                        aggregate.then_some(final_raw),
+                        Some(probe_collation_destroy),
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_create_function_v2(
+                        db,
+                        if mode == 3 { c"absent" } else { c"reentrant" }.as_ptr(),
+                        1,
+                        SQLITE_UTF8,
+                        (&mut new as *mut CollationOwnerProbe).cast(),
+                        (mode == 0).then_some(signature_aggregate_step),
+                        aggregate.then_some(step_raw),
+                        aggregate.then_some(final_raw),
+                        Some(probe_collation_destroy),
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(old.calls, i32::from(mode != 3));
+                assert_eq!(new.calls, i32::from(mode >= 2));
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+                assert_eq!(old.calls, 1);
+                assert_eq!(new.calls, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn successful_function_destructor_reentry_is_bounded() {
+        bounded_destructor_child(
+            "tests::successful_function_destructor_reentry_child",
+            "TURSO_SUCCESSFUL_FUNCTION_CHILD",
+        );
+    }
+
+    #[test]
+    fn trigger_messages_preserve_engine_prefix_text() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE messages(value)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            for message in [
+                "Internal error: user payload",
+                "Parse error: user payload",
+                "Corrupt database: user payload",
+                "Env variable error: user payload",
+            ] {
+                let sql = std::ffi::CString::new(format!(
+                    "CREATE TRIGGER reject BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'{message}'); END"
+                )).unwrap();
+                assert_eq!(
+                    sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                    SQLITE_OK
+                );
+                let mut error = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"INSERT INTO messages VALUES(1)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        &mut error,
+                    ),
+                    SQLITE_CONSTRAINT
+                );
+                assert!(!error.is_null());
+                assert_eq!(std::ffi::CStr::from_ptr(error).to_str().unwrap(), message);
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                        .to_str()
+                        .unwrap(),
+                    message
+                );
+                sqlite3_free(error.cast());
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"DROP TRIGGER reject".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn scalar_prepared_replacement_keeps_userdata_alive() {
         unsafe {
             let mut db = ptr::null_mut();
