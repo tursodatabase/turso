@@ -1,6 +1,35 @@
 @database :memory:
 
 @requires index_method "uses CREATE INDEX ... USING"
+test vector-index-table-rename {
+    CREATE TABLE v(id INTEGER PRIMARY KEY, e);
+    CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e);
+    INSERT INTO v VALUES (1, vector32_sparse('[1,0,0]'));
+    ALTER TABLE v RENAME TO renamed;
+    INSERT INTO renamed VALUES (2, vector32_sparse('[0,1,0]'));
+    SELECT id FROM renamed ORDER BY vector_distance_jaccard(e, vector32_sparse('[1,0,0]')) LIMIT 1;
+    SELECT id FROM renamed ORDER BY vector_distance_jaccard(e, vector32_sparse('[0,1,0]')) LIMIT 1;
+}
+expect {
+    1
+    2
+}
+
+@requires index_method "uses CREATE INDEX ... USING"
+test vector-index-table-rename-quoted {
+    CREATE TABLE v(id INTEGER PRIMARY KEY, e);
+    CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e);
+    INSERT INTO v VALUES (1, vector32_sparse('[1,0,0]'));
+    ALTER TABLE v RENAME TO "new name";
+    SELECT id FROM "new name" ORDER BY vector_distance_jaccard(e, vector32_sparse('[1,0,0]')) LIMIT 1;
+    EXPLAIN QUERY PLAN SELECT id FROM "new name" ORDER BY vector_distance_jaccard(e, vector32_sparse('[1,0,0]')) LIMIT 1;
+}
+expect {
+    1
+    1|0|0|QUERY INDEX METHOD toy_vector_sparse_ivf
+}
+
+@requires index_method "uses CREATE INDEX ... USING"
 test vector-index-integrity-check {
     CREATE TABLE v(id INTEGER PRIMARY KEY, e);
     CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e);

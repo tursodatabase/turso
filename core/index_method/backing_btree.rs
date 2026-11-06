@@ -34,6 +34,13 @@ impl IndexMethod for BackingBtreeIndexMethod {
 }
 
 impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
+    fn rename_table(&self, to: &str) -> Result<Arc<dyn IndexMethodAttachment>> {
+        Ok(Arc::new(Self {
+            table_name: to.to_string(),
+            index_name: self.index_name.clone(),
+        }))
+    }
+
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: BACKING_BTREE_INDEX_METHOD_NAME,

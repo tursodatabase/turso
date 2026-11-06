@@ -17685,19 +17685,35 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
+        // Build all replacement attachments before changing the schema so a
+        // failure cannot leave the index list partially renamed.
+        let renamed_methods = schema
+            .indices_including_backing(*namespace, &normalized_from)
+            .map(|index| {
+                index
+                    .index_method
+                    .as_ref()
+                    .map(|method| method.rename_table(&normalized_to))
+                    .transpose()
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
         if let Some(mut indexes) = schema.take_indices(*namespace, &normalized_from) {
             // An automatic index is named after the table's mangled name, the
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
             let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
             let autoindex_prefix = format!("sqlite_autoindex_{mangled_from}_");
-            indexes.iter_mut().for_each(|index| {
-                let index = Arc::make_mut(index);
-                normalized_to.clone_into(&mut index.table_name);
-                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
-                    index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
-                }
-            });
+            indexes
+                .iter_mut()
+                .zip(renamed_methods)
+                .for_each(|(index, renamed_method)| {
+                    let index = Arc::make_mut(index);
+                    normalized_to.clone_into(&mut index.table_name);
+                    index.index_method = renamed_method;
+                    if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
+                        index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
+                    }
+                });
 
             schema.insert_indices(*namespace, normalized_to.to_owned(), indexes);
         };
