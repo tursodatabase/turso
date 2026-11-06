@@ -5455,7 +5455,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "sqlite3"))]
-    fn test_uri_legacy_reader_writer_open_busy_retry() {
+    fn test_uri_legacy_reader_defers_writer_activation_until_first_write() {
         unsafe {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("legacy.db");
@@ -5495,10 +5495,19 @@ mod tests {
                 SQLITE_OK
             );
             let mut writer = ptr::null_mut();
-            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_BUSY);
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
             assert!(!writer.is_null());
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_BUSY
+            );
             assert_eq!(sqlite3_errcode(writer), SQLITE_BUSY);
-            assert_eq!(sqlite3_close(writer), SQLITE_OK);
             assert_eq!(
                 sqlite3_exec(
                     reader,
@@ -5509,7 +5518,6 @@ mod tests {
                 ),
                 SQLITE_OK
             );
-            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
             assert_eq!(
                 sqlite3_exec(
                     writer,
