@@ -13,6 +13,9 @@ use crate::mvcc::database::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::{mangle_name, NamespaceId};
+use crate::schema::{
+    schema_record_with_root_page, SchemaRecord, SchemaRowType, SCHEMA_RECORD_COLUMN_COUNT,
+};
 use crate::schema::{Index, Schema};
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::comparator::{BasicComparator, Comparator};
@@ -29,8 +32,8 @@ use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
-    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
-    SyncMode, TransactionState, Value, ValueRef,
+    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Pager, Result, SyncMode,
+    TransactionState, Value,
 };
 use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -53,8 +56,6 @@ macro_rules! with_mvcc_checkpoint_allocation_site {
 
 /// Root page of the `sqlite_schema` B-tree in the database file.
 const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
-/// Column count of a `sqlite_schema` record (type, name, tbl_name, rootpage, sql).
-const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectTablePhase {
@@ -571,24 +572,14 @@ pub fn sqlite_schema_btree_identity(
         return None;
     }
 
-    let row_data = ImmutableRecordRef::from_bin_record(payload);
-    let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
-        return None;
+    let record = SchemaRecord::decode(payload)
+        .unwrap_or_else(|err| panic!("sqlite_schema record is malformed: {err}"));
+    let kind = match record.row_type {
+        SchemaRowType::Table => SqliteSchemaBtreeKind::Table,
+        SchemaRowType::Index => SqliteSchemaBtreeKind::Index,
+        _ => return None,
     };
-
-    let kind = match col0 {
-        ValueRef::Text(type_str) => match type_str.as_str() {
-            "table" => SqliteSchemaBtreeKind::Table,
-            "index" => SqliteSchemaBtreeKind::Index,
-            _ => return None,
-        },
-        _ => panic!("sqlite_schema.type column must be TEXT, got {col0:?}"),
-    };
-
-    let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 else {
-        panic!("sqlite_schema.rootpage column must be INTEGER, got {col3:?}");
-    };
-
+    let root_page = record.root_page;
     if root_page == 0 {
         return None;
     }
@@ -2901,12 +2892,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record =
-                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
-
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                        let record = schema_record_with_root_page(
+                            row_version.payload(row_id),
+                            root_page as i64,
+                        )?;
                         // Btree creation has already happened by this point; an injected fault
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
@@ -2936,11 +2925,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record =
-                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                        let record = schema_record_with_root_page(
+                            row_version.payload(row_id),
+                            root_page as i64,
+                        )?;
                         // Btree creation has already happened by this point; an injected fault
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
@@ -3728,7 +3716,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
         let cursor = BTreeCursor::new_table(
             pager.clone(),
             SQLITE_SCHEMA_ROOT_PAGE,
-            SQLITE_SCHEMA_COLUMN_COUNT,
+            SCHEMA_RECORD_COLUMN_COUNT,
         );
         Self {
             pager,
@@ -3976,7 +3964,7 @@ mod tests {
         let record = ImmutableRecordRef::from_shared_record(payload.clone());
 
         assert_eq!(record.get_payload().as_ptr(), payload_ptr);
-        assert_eq!(record.column_count(), SQLITE_SCHEMA_COLUMN_COUNT);
+        assert_eq!(record.column_count(), SCHEMA_RECORD_COLUMN_COUNT);
     }
 
     #[test]
