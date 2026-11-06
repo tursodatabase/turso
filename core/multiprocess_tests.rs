@@ -38,6 +38,8 @@ const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
+const MULTIPROCESS_TRUNCATE_AND_EXIT_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_truncate_and_exit_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -1313,6 +1315,82 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     }
 
     assert_eq!(count_test_rows(&conn), 3);
+}
+
+/// The generation (`checkpoint_seq`) of a WAL file on disk, read from its header; `None` for a
+/// WAL without a header (zero bytes).
+fn wal_header_checkpoint_seq(db_path: &str) -> Option<u32> {
+    let bytes = std::fs::read(format!("{db_path}-wal")).unwrap();
+    (bytes.len() >= 32).then(|| u32::from_be_bytes(bytes[12..16].try_into().unwrap()))
+}
+
+#[test]
+fn multiprocess_truncate_and_exit_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('child')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    // The process goes away without closing anything: whatever the truncate
+    // left on disk is all the next opener gets.
+    std::process::exit(0);
+}
+
+/// A TRUNCATE checkpoint restarts the WAL generation. The restarted generation must be on disk
+/// before the checkpoint returns: a process that exits without writing again otherwise leaves the
+/// next opener to start at generation 0, behind every position a consumer of `wal_state()` has
+/// already recorded.
+#[test]
+fn subprocess_wal_generation_survives_truncate_and_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("generation-after-truncate.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_TRUNCATE_AND_EXIT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child truncate failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+    assert_eq!(
+        wal_header_checkpoint_seq(db_path_str),
+        Some(1),
+        "the truncate must leave the restarted generation in the WAL header"
+    );
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+    assert_eq!(
+        wal_header_checkpoint_seq(db_path_str),
+        Some(1),
+        "a new opener must continue the generation the truncate restarted, not start at 0"
+    );
+    assert_eq!(count_test_rows(&conn), 2);
 }
 
 #[test]
