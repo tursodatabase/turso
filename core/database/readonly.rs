@@ -238,10 +238,7 @@ impl ReadonlyStorage {
             published: false,
             opened_paths: HashMap::new(),
         };
-        if let Err(error) = self.validate(snapshot) {
-            self.observations.lock().contradicted = true;
-            return Err(error);
-        }
+        self.validate(snapshot)?;
         Ok(guard)
     }
 
@@ -260,9 +257,6 @@ impl ReadonlyStorage {
         let result = self.validate(snapshot);
         let mut observations = self.observations.lock();
         observations.phase = Phase::Observing;
-        if result.is_err() {
-            observations.contradicted = true;
-        }
         result
     }
 
@@ -294,10 +288,11 @@ impl ReadonlyStorage {
 
     fn validate(&self, snapshot: FrozenObservations) -> Result<()> {
         for (path, expected) in snapshot.paths {
-            if self.io.file_id(&path).ok() != expected
+            let current = self.path_identity(&path)?;
+            if current != expected
                 && !self.observed_empty_wal_was_removed(&path, expected, &snapshot.files)?
             {
-                return Err(changed_storage());
+                return Err(self.changed_observations());
             }
         }
         for path in snapshot.missing {
@@ -307,7 +302,7 @@ impl ReadonlyStorage {
             {
                 Ok(file) => {
                     self.observations.lock().retained.push(file);
-                    return Err(changed_storage());
+                    return Err(self.changed_observations());
                 }
                 Err(LimboError::CompletionError(CompletionError::IOError(
                     std::io::ErrorKind::NotFound,
@@ -318,21 +313,48 @@ impl ReadonlyStorage {
         }
         for (id, contents) in snapshot.files {
             if contents.file.file_id()? != Some(id) {
-                return Err(changed_storage());
+                return Err(self.changed_observations());
             }
             if let Some(size) = contents.size {
                 if contents.file.size()? != size {
-                    return Err(changed_storage());
+                    return Err(self.changed_observations());
                 }
             }
             for ((offset, requested), expected) in contents.reads {
                 let current = read_bytes(&self.io, &contents.file, offset, requested)?;
                 if ReadObservation::from_bytes(&current) != expected {
-                    return Err(changed_storage());
+                    return Err(self.changed_observations());
                 }
             }
         }
         Ok(())
+    }
+
+    fn path_identity(&self, path: &str) -> Result<Option<FileId>> {
+        match self.io.file_id(path) {
+            Ok(id) => Ok(Some(id)),
+            Err(identity_error) => {
+                match self
+                    .io
+                    .open_file(path, OpenFlags::ReadOnly | OpenFlags::NoLock, false)
+                {
+                    Err(LimboError::CompletionError(CompletionError::IOError(
+                        std::io::ErrorKind::NotFound,
+                        _,
+                    ))) => Ok(None),
+                    Ok(file) => {
+                        self.observations.lock().retained.push(file);
+                        Err(identity_error)
+                    }
+                    Err(_) => Err(identity_error),
+                }
+            }
+        }
+    }
+
+    fn changed_observations(&self) -> LimboError {
+        self.observations.lock().contradicted = true;
+        changed_storage()
     }
 
     fn observed_empty_wal_was_removed(
@@ -1021,6 +1043,136 @@ mod tests {
         .unwrap();
         storage.finish_bootstrap().unwrap();
         assert_eq!(bytes_read.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn transient_validation_failures_allow_retry_without_discarding_read_history() {
+        for fault in 1..=5 {
+            let fixture = Fixture::new(vec![3; 100]);
+            let pending = Arc::new(AtomicUsize::new(0));
+            let file: Arc<dyn File> = Arc::new(ValidationFaultFile {
+                inner: fixture.storage.file.clone(),
+                pending: pending.clone(),
+            });
+            let io: Arc<dyn IO> = Arc::new(ValidationFaultIO {
+                inner: fixture.io.clone(),
+                pending: pending.clone(),
+                path: fixture.path.to_string_lossy().into_owned(),
+            });
+            let storage = ReadonlyStorage::try_new(
+                io.clone(),
+                file,
+                fixture.path.to_str().unwrap(),
+                &fixture.storage.wal_path,
+            )
+            .unwrap()
+            .unwrap();
+            storage.finish_bootstrap().unwrap();
+            let observed = storage.observed_file();
+            assert!(storage
+                .observed_io()
+                .open_file(&storage.wal_path, OpenFlags::ReadOnly, false)
+                .is_err());
+            assert_eq!(observed.size().unwrap(), 100);
+            assert_eq!(read_bytes(&io, &observed, 8, 16).unwrap(), vec![3; 16]);
+            pending.store(fault, Ordering::Release);
+            assert!(storage.freeze_validate().is_err(), "fault {fault}");
+            assert_eq!(pending.load(Ordering::Acquire), 0, "fault {fault}");
+            drop(storage.freeze_validate().unwrap());
+            fixture.write(8, &[7; 16]);
+            assert!(
+                storage.freeze_validate().is_err(),
+                "lost history after fault {fault}"
+            );
+            fixture.write(8, &[3; 16]);
+            assert!(
+                storage.freeze_validate().is_err(),
+                "forgot mismatch after fault {fault}"
+            );
+        }
+    }
+
+    fn fail_validation(pending: &AtomicUsize, fault: usize) -> Result<()> {
+        if pending
+            .compare_exchange(fault, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Err(CompletionError::IOError(
+                std::io::ErrorKind::Interrupted,
+                "injected transient validation failure",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    struct ValidationFaultFile {
+        inner: Arc<dyn File>,
+        pending: Arc<AtomicUsize>,
+    }
+
+    impl File for ValidationFaultFile {
+        fn file_id(&self) -> Result<Option<FileId>> {
+            fail_validation(&self.pending, 3)?;
+            self.inner.file_id()
+        }
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            fail_validation(&self.pending, 1)?;
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, kind: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, kind)
+        }
+        fn size(&self) -> Result<u64> {
+            fail_validation(&self.pending, 2)?;
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    struct ValidationFaultIO {
+        inner: Arc<dyn IO>,
+        pending: Arc<AtomicUsize>,
+        path: String,
+    }
+
+    impl Clock for ValidationFaultIO {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for ValidationFaultIO {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            fail_validation(&self.pending, 5)?;
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            if path == self.path {
+                fail_validation(&self.pending, 4)?;
+            }
+            self.inner.file_id(path)
+        }
+        fn step(&self) -> Result<()> {
+            self.inner.step()
+        }
     }
 
     #[test]
