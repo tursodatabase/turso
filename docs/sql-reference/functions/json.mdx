@@ -12,6 +12,9 @@ Most functions come in pairs: a `json_*` variant that returns TEXT and a `jsonb_
 
 SQL REAL arguments are converted to JSON numbers with up to 15 significant decimal digits, matching SQLite. Numbers already stored in JSON text retain their original precision.
 
+JSON text can contain up to 1000 nested objects and arrays. Each container counts
+as one nesting level; deeper input is rejected as malformed JSON.
+
 ## JSON Path Syntax
 
 Many JSON functions accept a **path** argument that identifies a specific element within a JSON document.
