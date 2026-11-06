@@ -81,7 +81,21 @@ func (s *session) updateStream(baton *string, baseURL *string) error {
 	return nil
 }
 
-// httpError builds an error from a non-200 response, surfacing the JSON
+// HTTPError is a non-2xx HTTP response from the server.
+// Message contains the JSON error or message field, if available, never the raw body.
+type HTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("turso: HTTP status %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("turso: HTTP status %d", e.StatusCode)
+}
+
+// httpError builds an error from a non-2xx response, surfacing the JSON
 // error message when the body carries one (section 9.3).
 func httpError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -95,10 +109,10 @@ func httpError(resp *http.Response) error {
 			message = parsed.Message
 		}
 		if message != "" {
-			return fmt.Errorf("turso: HTTP status %d: %s", resp.StatusCode, message)
+			return &HTTPError{StatusCode: resp.StatusCode, Message: message}
 		}
 	}
-	return fmt.Errorf("turso: HTTP status %d", resp.StatusCode)
+	return &HTTPError{StatusCode: resp.StatusCode}
 }
 
 // post sends a request carrying the current baton. Failed requests are not retried.

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -567,4 +568,137 @@ func TestCloseReusesSharedHTTPConnection(t *testing.T) {
 	if got := connections.Load(); got != 1 {
 		t.Fatalf("20 sequential sessions opened %d TCP connections, want 1", got)
 	}
+}
+
+func TestHTTPErrorBodies(t *testing.T) {
+	for _, tc := range []struct{ name, body, message string }{
+		{"error", `{"error":"denied","message":"other"}`, "denied"},
+		{"message", `{"message":"unavailable"}`, "unavailable"},
+		{"fallback", `{"error":"","message":"denied"}`, "denied"},
+		{"empty", "", ""},
+		{"missing", `{}`, ""},
+		{"null", `null`, ""},
+		{"malformed", `{"message":"secret"`, ""},
+		{"html", `<html>proxy details</html>`, ""},
+		{"wrong-type", `{"error":{},"message":"secret"}`, ""},
+		{"oversized", `{"message":"` + strings.Repeat("x", 1<<20) + `"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReader(tc.body)
+			err := httpError(&http.Response{StatusCode: 503, Body: io.NopCloser(body)})
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != 503 || httpErr.Message != tc.message {
+				t.Fatalf("unexpected HTTP error: %T %v", err, err)
+			}
+			want := "turso: HTTP status 503"
+			if tc.message != "" {
+				want += ": " + tc.message
+			}
+			if err.Error() != want {
+				t.Fatalf("got %q, want %q", err, want)
+			}
+			if consumed := len(tc.body) - body.Len(); consumed > 1<<20 {
+				t.Fatalf("read %d bytes, exceeding body limit", consumed)
+			}
+		})
+	}
+}
+
+func TestHTTPErrorPublicAPIs(t *testing.T) {
+	for _, status := range []int{301, 401, 403, 500, 502, 503} {
+		for _, operation := range []string{"open-retained", "ping", "describe", "sequence", "exec", "query", "execute", "sql-ping"} {
+			t.Run(fmt.Sprintf("%d/%s", status, operation), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Header.Get("X-API-Key") != "test-secret" {
+						t.Error("missing custom authentication header")
+					}
+					wantPath := "/v3/cursor"
+					if operation == "open-retained" || operation == "describe" || operation == "sequence" {
+						wantPath = "/v3/pipeline"
+					}
+					if r.URL.Path != wantPath {
+						t.Errorf("path = %s, want %s", r.URL.Path, wantPath)
+					}
+					w.WriteHeader(status)
+					fmt.Fprint(w, `{"message":"request rejected"}`)
+				}))
+				defer server.Close()
+				connector := NewConnector(server.URL, "").WithRequestHeaders(http.Header{"X-API-Key": {"test-secret"}})
+				ctx := context.Background()
+				var err error
+				if operation == "open-retained" {
+					_, err = connector.WithSessionRetention().OpenConnection(ctx)
+				} else if operation == "sql-ping" {
+					db := sql.OpenDB(connector)
+					defer db.Close()
+					err = db.PingContext(ctx)
+				} else {
+					conn, openErr := connector.OpenConnection(ctx)
+					if openErr != nil {
+						t.Fatal(openErr)
+					}
+					defer conn.Close()
+					switch operation {
+					case "ping":
+						err = conn.Ping(ctx)
+					case "describe":
+						_, err = conn.DescribeContext(ctx, "SELECT 1")
+					case "sequence":
+						_, err = conn.ExecContext(ctx, "SELECT 1; SELECT 2", nil)
+					case "exec":
+						_, err = conn.ExecContext(ctx, "SELECT 1", nil)
+					case "query":
+						_, err = conn.QueryContext(ctx, "SELECT 1", nil)
+					case "execute":
+						_, err = conn.ExecuteContext(ctx, "SELECT 1", nil)
+					}
+				}
+				var httpErr *HTTPError
+				if !errors.As(fmt.Errorf("preflight: %w", err), &httpErr) || httpErr.StatusCode != status || httpErr.Message != "request rejected" {
+					t.Fatalf("unexpected HTTP error: %T %v", err, err)
+				}
+				var protocolErr *Error
+				if errors.As(err, &protocolErr) {
+					t.Fatal("HTTP failure classified as a protocol error")
+				}
+			})
+		}
+	}
+}
+
+func TestTransportFailureIsNotHTTPError(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		connector := NewConnector("http://unused", "")
+		var err error
+		if retained {
+			_, err = connector.WithSessionRetention().OpenConnection(ctx)
+		} else {
+			conn, openErr := connector.OpenConnection(ctx)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			err = conn.Ping(ctx)
+			conn.Close()
+		}
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("transport error lost its cause: %T %v", err, err)
+		}
+	}
+}
+
+func TestHTTPErrorBodyReadFailure(t *testing.T) {
+	err := httpError(&http.Response{StatusCode: 401, Body: io.NopCloser(failingHTTPBody{})})
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != 401 || httpErr.Message != "" {
+		t.Fatalf("lost HTTP status after body read failure: %T %v", err, err)
+	}
+}
+
+type failingHTTPBody struct{}
+
+func (failingHTTPBody) Read([]byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
 }
