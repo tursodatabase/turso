@@ -51,6 +51,23 @@ as one operation, including its schema elements or cascading drops.
 An error or cancellation before commit rolls back the whole operation.
 Cancellation after commit does not undo the changes.
 
+## PostgreSQL functions, procedures, and triggers
+
+The PostgreSQL frontend does not support user-defined functions, procedures,
+or triggers. It rejects `CREATE FUNCTION`, `CREATE PROCEDURE`, `CREATE TRIGGER`,
+`DO`, `CALL`, and the `ALTER` and `DROP` statements for these objects.
+The error names the first feature of the statement that is not supported, for
+example `LANGUAGE plpgsql is not supported`, and has the SQLSTATE `0A000`.
+A function definition that PostgreSQL also rejects gets the PostgreSQL error.
+
+Some function calls are also rejected with the SQLSTATE `0A000`:
+
+- Named and mixed notation, as in `make_date(2024, month => 1, day => 2)`
+- `VARIADIC` arguments
+- A set-returning function outside `FROM`, as in `SELECT generate_series(1, 3)`
+- Column notation on an expression, as in `(now()).epoch`
+- A table name used as a value, as in `SELECT count(t) FROM t`, and `t.*` in a function call.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features

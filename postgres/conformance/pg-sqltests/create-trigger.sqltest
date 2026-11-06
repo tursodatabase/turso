@@ -1,0 +1,313 @@
+# CREATE TRIGGER and the other statements about triggers.
+#
+# tursopg does not support triggers yet. A test shows what PostgreSQL does,
+# and the error that tursopg gives for the first feature of the statement
+# that tursopg does not support. Most tests name a trigger function that does
+# not exist, so that tursopg reports the error of the trigger statement.
+
+@database :memory:
+
+setup items {
+    CREATE TABLE items (id int, name text);
+}
+
+# Row-level BEFORE and AFTER triggers with PL/pgSQL trigger functions.
+
+@setup items
+test before-row-trigger-changes-the-new-row {
+    CREATE FUNCTION upper_name() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.name := upper(NEW.name); RETURN NEW; END $$;
+    CREATE TRIGGER upper_name BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION upper_name();
+    INSERT INTO items VALUES (1, 'apple');
+    SELECT name FROM items;
+}
+expect {
+    APPLE
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^LANGUAGE plpgsql is not supported$
+}
+
+@setup items
+test before-row-trigger-that-returns-null-skips-the-row {
+    CREATE FUNCTION skip_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    CREATE TRIGGER skip_row BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION skip_row();
+    INSERT INTO items VALUES (1, 'apple');
+    SELECT count(*) FROM items;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^LANGUAGE plpgsql is not supported$
+}
+
+# An AFTER ROW trigger runs when the statement has changed all of its rows.
+@setup items
+test after-row-trigger-runs-after-the-statement {
+    CREATE TABLE counts (seen bigint);
+    CREATE FUNCTION count_items() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO counts SELECT count(*) FROM items; RETURN NULL; END $$;
+    CREATE TRIGGER count_items AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION count_items();
+    INSERT INTO items VALUES (1, 'a'), (2, 'b');
+    SELECT seen FROM counts;
+}
+expect {
+    2
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^LANGUAGE plpgsql is not supported$
+}
+
+@setup items
+test after-statement-trigger-runs-once {
+    CREATE TABLE counts (seen bigint);
+    CREATE FUNCTION count_items() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO counts SELECT count(*) FROM items; RETURN NULL; END $$;
+    CREATE TRIGGER count_items AFTER INSERT ON items FOR EACH STATEMENT EXECUTE FUNCTION count_items();
+    INSERT INTO items VALUES (1, 'a'), (2, 'b');
+    SELECT seen FROM counts;
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^LANGUAGE plpgsql is not supported$
+}
+
+# The features of CREATE TRIGGER.
+
+@setup items
+test create-trigger-is-rejected {
+    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER is not supported$
+}
+
+@setup items
+test create-statement-level-trigger-is-rejected {
+    CREATE TRIGGER t AFTER INSERT ON items EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a statement-level trigger \(a trigger without FOR EACH ROW\) is not supported$
+}
+
+@setup items
+test create-trigger-for-each-statement-is-rejected {
+    CREATE TRIGGER t AFTER INSERT ON items FOR EACH STATEMENT EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a statement-level trigger \(a trigger without FOR EACH ROW\) is not supported$
+}
+
+@setup items
+test create-instead-of-trigger-is-rejected {
+    CREATE VIEW items_view AS SELECT * FROM items;
+    CREATE TRIGGER t INSTEAD OF INSERT ON items_view FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER \.\.\. INSTEAD OF is not supported$
+}
+
+@setup items
+test create-truncate-trigger-is-rejected {
+    CREATE TRIGGER t BEFORE TRUNCATE ON items EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER \.\.\. TRUNCATE is not supported$
+}
+
+@setup items
+test create-trigger-on-update-of-columns-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE OF name ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER \.\.\. UPDATE OF is not supported$
+}
+
+@setup items
+test create-trigger-with-when-is-rejected {
+    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER \.\.\. WHEN is not supported$
+}
+
+@setup items
+test create-trigger-with-transition-tables-is-rejected {
+    CREATE TRIGGER t AFTER INSERT ON items REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER \.\.\. REFERENCING is not supported$
+}
+
+@setup items
+test create-constraint-trigger-is-rejected {
+    CREATE CONSTRAINT TRIGGER t AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE CONSTRAINT TRIGGER is not supported$
+}
+
+@setup items
+test create-or-replace-trigger-is-rejected {
+    CREATE OR REPLACE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE OR REPLACE TRIGGER is not supported$
+}
+
+@setup items
+test create-trigger-with-function-arguments-is-rejected {
+    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function('a');
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^an argument to a trigger function is not supported$
+}
+
+test create-schema-with-a-trigger-is-rejected {
+    CREATE SCHEMA app CREATE TABLE items (id int) CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRIGGER is not supported$
+}
+
+# The other statements about triggers.
+
+@setup items
+test drop-trigger-is-rejected {
+    DROP TRIGGER missing_trigger ON items;
+}
+@sqlstate 42704
+expect error {
+    ^trigger "missing_trigger" for table "items" does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP TRIGGER is not supported$
+}
+
+@setup items
+test drop-trigger-if-exists-is-rejected {
+    DROP TRIGGER IF EXISTS missing_trigger ON items;
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP TRIGGER is not supported$
+}
+
+@setup items
+test alter-trigger-is-rejected {
+    ALTER TRIGGER missing_trigger ON items RENAME TO other_trigger;
+}
+@sqlstate 42704
+expect error {
+    ^trigger "missing_trigger" for table "items" does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER TRIGGER is not supported$
+}
+
+test create-event-trigger-is-rejected {
+    CREATE EVENT TRIGGER missing_event_trigger ON ddl_command_start EXECUTE FUNCTION missing_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE EVENT TRIGGER is not supported$
+}
+
+test alter-event-trigger-is-rejected {
+    ALTER EVENT TRIGGER missing_event_trigger DISABLE;
+}
+@sqlstate 42704
+expect error {
+    ^event trigger "missing_event_trigger" does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER EVENT TRIGGER is not supported$
+}
+
+test drop-event-trigger-is-rejected {
+    DROP EVENT TRIGGER IF EXISTS missing_event_trigger;
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP EVENT TRIGGER is not supported$
+}

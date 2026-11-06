@@ -61,9 +61,10 @@ Basics not enumerated by the official feature matrix.
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
+| Function calls | 🟡 Partial | Positional notation only: named notation (`f(a => 1)`), mixed notation (`f(1, b => 2)`) and VARIADIC arguments are rejected. Column notation on an expression (`(f()).x`, `(false).is_true`) is rejected; `(t).x` on a table name reads the column. A whole-row reference, a table name used as a value (`count(t)`, `SELECT t FROM t`) or `t.*` in a function call, is rejected. A set-returning function such as `generate_series()` or `unnest()` is rejected outside FROM |
 | Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM and with joins; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
+| generate_series | ✅ Supported | In FROM and with joins, and rejected outside FROM; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
 | SET / SHOW / RESET | 🟡 Partial | Only search_path and custom parameters such as `app.user_id` (`SET [LOCAL]`, `SET ... TO DEFAULT`, `SET ... FROM CURRENT`, `RESET`, `RESET ALL`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
@@ -484,47 +485,47 @@ Upgrade is not supported.
 |---------|--------|-------|
 | ALTER TABLE ENABLE/DISABLE TRIGGER | ❌ Not supported | |
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
-| BEGIN ATOMIC function bodies | ❌ Not supported | |
-| CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
-| Column level triggers | ❌ Not supported | |
-| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
-| Event triggers | ❌ Not supported | |
+| BEGIN ATOMIC function bodies | ❌ Not supported | Rejected with an error, as is a `RETURN expression` body |
+| CALL syntax for executing procedures | ❌ Not supported | Rejected with an error |
+| CREATE FUNCTION | ❌ Not supported | Rejected with an error that names the first feature of the statement that tursopg does not support, for example LANGUAGE plpgsql, a function that is not STABLE, a type that is not a base type (polymorphic, composite, array, range, enum or domain), RETURNS SETOF/TABLE/record/void, OUT/INOUT/VARIADIC/named parameters, parameter defaults, an option such as SECURITY DEFINER, STRICT, COST or SET, a body that is not dollar-quoted, or a body that is not one SELECT (DDL, data changes, several statements). Definitions that PostgreSQL also rejects get PostgreSQL's error. ALTER FUNCTION/PROCEDURE/ROUTINE, DROP FUNCTION/PROCEDURE/ROUTINE/AGGREGATE and CREATE AGGREGATE are rejected too |
+| Column level triggers | ❌ Not supported | `UPDATE OF` columns are rejected |
+| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
+| Event triggers | ❌ Not supported | CREATE/ALTER/DROP EVENT TRIGGER are rejected |
 | FILTER clause for aggregate functions | ✅ Supported | |
 | ORDER BY support within aggregates | ❌ Not supported | Silently dropped |
-| Per function GUC settings | ❌ Not supported | |
+| Per function GUC settings | ❌ Not supported | SET and SET ... FROM CURRENT on CREATE FUNCTION are rejected |
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
-| RETURNS TABLE | ❌ Not supported | |
-| Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
-| Statement level TRUNCATE triggers | ❌ Not supported | |
-| Triggers on views | ❌ Not supported | |
-| Variadic functions | ❌ Not supported | VARIADIC arguments rejected |
-| WHEN clause for CREATE TRIGGER | ❌ Not supported | |
+| RETURNS TABLE | ❌ Not supported | Rejected |
+| Statement level triggers | ❌ Not supported | CREATE TRIGGER, ALTER TRIGGER and DROP TRIGGER are rejected with an error, for row-level triggers too |
+| Statement level TRUNCATE triggers | ❌ Not supported | Rejected |
+| Triggers on views | ❌ Not supported | INSTEAD OF triggers are rejected |
+| Variadic functions | ❌ Not supported | VARIADIC arguments and parameters rejected |
+| WHEN clause for CREATE TRIGGER | ❌ Not supported | Rejected |
 
 ## Procedural Languages
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION in a language other than SQL, CREATE LANGUAGE, DROP LANGUAGE and DO are rejected with an error |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
-| CREATE TRANSFORM | ❌ Not supported | |
+| CREATE TRANSFORM | ❌ Not supported | CREATE TRANSFORM, DROP TRANSFORM and TRANSFORM on CREATE FUNCTION are rejected |
 | DO statement for pl/perl | ❌ Not supported | |
-| DO statement for pl/pgsql | ❌ Not supported | |
+| DO statement for pl/pgsql | ❌ Not supported | Rejected |
 | EXCEPTION support in PL/pgSQL | ❌ Not supported | |
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
-| IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
-| Named parameters | ❌ Not supported | |
+| IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | OUT and INOUT parameters are rejected |
+| Named parameters | ❌ Not supported | Rejected in CREATE FUNCTION and in function calls |
 | Non-superuser language creation | ❌ Not supported | |
 | pl/pgsql installed by default | ❌ Not supported | |
-| Polymorphic functions | ❌ Not supported | |
+| Polymorphic functions | ❌ Not supported | Rejected |
 | Python 3 support for pl/python | ❌ Not supported | |
 | Qualified function parameters | ❌ Not supported | |
 | Query parallelism for RETURN QUERY | ❌ Not supported | |
 | RETURN QUERY in pl/pgsql | ❌ Not supported | |
-| ROWS and COST specification for functions | ❌ Not supported | |
+| ROWS and COST specification for functions | ❌ Not supported | Rejected |
 | Scrollable and updatable cursor support for pl/pgsql | ❌ Not supported | |
 | SQLERRM/SQLSTATE for pl/pgsql | ❌ Not supported | |
 | Unicode object support in PL/python | ❌ Not supported | |

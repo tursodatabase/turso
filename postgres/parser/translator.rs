@@ -2340,6 +2340,7 @@ impl PostgreSQLTranslator {
 
         let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
+        reject_named_arguments(&func_call.args)?;
         if func_call.func_variadic
             || func_call.agg_star
             || func_call.agg_distinct
@@ -3223,6 +3224,7 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("AIndirection missing arg".into()))?;
+                reject_column_notation_on_expression(arg, &indirection.indirection)?;
                 let mut expr = self.translate_expr(arg)?;
                 // Each indirection step is either an index (AIndices) or a field name (String)
                 for step in &indirection.indirection {
@@ -3300,6 +3302,9 @@ impl PostgreSQLTranslator {
                 Err(ParseError::ParseError(
                     "AStar should not be translated as expression".to_string(),
                 ))
+            }
+            Some(pg_query::protobuf::node::Node::NamedArgExpr(_)) => {
+                Err(not_supported("named notation in a function call"))
             }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported expression type: {:?}",
@@ -3885,6 +3890,8 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        reject_named_arguments(&func_call.args)?;
+        reject_set_returning_function(&func_name)?;
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
@@ -7680,11 +7687,116 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
         .to_ascii_uppercase()
 }
 
-fn not_supported(what: impl std::fmt::Display) -> ParseError {
+pub(crate) fn not_supported(what: impl std::fmt::Display) -> ParseError {
     ParseError::Sqlstate {
         sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
         message: format!("{what} is not supported"),
     }
+}
+
+/// Rejects named notation, `f(a => 1)`, and mixed notation, `f(1, b => 2)`,
+/// in the arguments of a function call.
+fn reject_named_arguments(args: &[pg_query::protobuf::Node]) -> Result<(), ParseError> {
+    let is_named = |arg: &pg_query::protobuf::Node| {
+        matches!(
+            arg.node,
+            Some(pg_query::protobuf::node::Node::NamedArgExpr(_))
+        )
+    };
+    if !args.iter().any(is_named) {
+        Ok(())
+    } else if args.iter().all(is_named) {
+        Err(not_supported("named notation in a function call"))
+    } else {
+        Err(not_supported(
+            "mixed positional and named notation in a function call",
+        ))
+    }
+}
+
+/// Rejects a call of a set-returning function in an expression, such as
+/// `SELECT generate_series(1, 3)`, which gives one row for each value in
+/// PostgreSQL.
+fn reject_set_returning_function(name: &str) -> Result<(), ParseError> {
+    if SET_RETURNING_FUNCTIONS_IN_FROM.contains(&name) {
+        Err(not_supported(format!(
+            "set-returning function {name}() outside FROM"
+        )))
+    } else if OTHER_SET_RETURNING_FUNCTIONS.contains(&name) {
+        Err(not_supported(format!("set-returning function {name}()")))
+    } else {
+        Ok(())
+    }
+}
+
+/// The set-returning functions of PostgreSQL that tursopg runs in FROM.
+const SET_RETURNING_FUNCTIONS_IN_FROM: &[&str] = &[
+    "generate_series",
+    "json_each",
+    "json_to_recordset",
+    "jsonb_to_recordset",
+    "pg_options_to_table",
+    "unnest",
+];
+
+/// The set-returning functions of PostgreSQL that tursopg does not have.
+const OTHER_SET_RETURNING_FUNCTIONS: &[&str] = &[
+    "aclexplode",
+    "generate_subscripts",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_each_text",
+    "json_object_keys",
+    "json_populate_recordset",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_object_keys",
+    "jsonb_path_query",
+    "jsonb_path_query_tz",
+    "jsonb_populate_recordset",
+    "pg_get_keywords",
+    "regexp_matches",
+    "regexp_split_to_table",
+    "string_to_table",
+    "ts_debug",
+    "ts_parse",
+    "ts_stat",
+    "ts_token_type",
+    "txid_snapshot_xip",
+];
+
+/// Rejects column notation, `(arg).name`, except `(t).name` with a single
+/// name `t`, which reads the column `name` of the table `t`. PostgreSQL
+/// reads other column notation as a field of a composite value or as a call
+/// of the function `name`, and tursopg supports neither.
+fn reject_column_notation_on_expression(
+    arg: &pg_query::protobuf::Node,
+    steps: &[pg_query::protobuf::Node],
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let is_table_name = matches!(
+        &arg.node,
+        Some(Node::ColumnRef(column)) if column.fields.len() == 1
+    );
+    for (index, step) in steps.iter().enumerate() {
+        let Some(Node::String(field)) = &step.node else {
+            continue;
+        };
+        if index == 0 && is_table_name {
+            continue;
+        }
+        return Err(match &arg.node {
+            Some(Node::FuncCall(_)) if index == 0 => not_supported(format!(
+                "column notation .{} on a function result",
+                field.sval
+            )),
+            _ => not_supported(format!("column notation .{} on an expression", field.sval)),
+        });
+    }
+    Ok(())
 }
 
 fn reject_constraint_attributes(

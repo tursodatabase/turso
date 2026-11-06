@@ -1,0 +1,48 @@
+@database :memory:
+
+# A table name in the place of a column is a missing column in SQLite, also
+# when the FROM clause has the table. PostgreSQL reads such a name as the
+# whole row of the table, and the PostgreSQL frontend reports it as not
+# supported.
+
+test table-name-in-the-select-list-is-a-missing-column {
+    CREATE TABLE t (a INTEGER);
+    SELECT t FROM t;
+}
+expect error {
+    no such column: t
+}
+
+test table-name-in-an-aggregate-is-a-missing-column {
+    CREATE TABLE t (a INTEGER);
+    SELECT count(t) FROM t;
+}
+expect error {
+    no such column: t
+}
+
+test table-alias-is-a-missing-column {
+    CREATE TABLE t (a INTEGER);
+    SELECT u FROM t AS u;
+}
+expect error {
+    no such column: u
+}
+
+test table-name-of-the-outer-query-is-a-missing-column {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT (SELECT count(t) FROM (SELECT 1)) FROM t;
+}
+expect error {
+    no such column: t
+}
+
+test column-with-the-name-of-its-table-is-a-column {
+    CREATE TABLE t (t INTEGER);
+    INSERT INTO t VALUES (7);
+    SELECT t FROM t;
+}
+expect {
+    7
+}

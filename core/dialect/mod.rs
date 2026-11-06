@@ -283,6 +283,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    /// The error for a name that is not a column but is the name of a table
+    /// in the FROM clause of the query or of an enclosing query, as `t` is
+    /// in `SELECT count(t) FROM t`.
+    ///
+    /// SQLite reports a missing column. PostgreSQL reads the name as the
+    /// whole row of the table.
+    fn table_name_as_value_error(&self, name: &str) -> LimboError {
+        LimboError::ParseError(format!("no such column: {name}"))
+    }
 }
 
 #[cfg(test)]

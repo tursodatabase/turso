@@ -4,6 +4,7 @@ use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
 
+pub mod routine;
 pub mod sqlstate;
 pub mod translator;
 
@@ -50,14 +51,39 @@ fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
 /// Uses pg_query's scanner which correctly handles semicolons inside
 /// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// A semicolon inside a BEGIN ATOMIC function body does not end the
+/// statement, but only the parser knows that. So when the scanner finds
+/// more than one statement and the SQL parses, the statements are where the
+/// parser found them.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
-    let parts =
+    let mut parts =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    if parts.len() > 1 {
+        if let Ok(parsed) = pg_query::parse(sql) {
+            parts = parsed
+                .protobuf
+                .stmts
+                .iter()
+                .map(|stmt| statement_text(sql, stmt))
+                .collect();
+        }
+    }
     Ok(parts
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+/// The text of `stmt` in `sql`, the string that it was parsed from. A
+/// length of 0 means that the statement ends where `sql` ends.
+fn statement_text<'a>(sql: &'a str, stmt: &pg_query::protobuf::RawStmt) -> &'a str {
+    let start = stmt.stmt_location as usize;
+    match stmt.stmt_len {
+        0 => &sql[start..],
+        len => &sql[start..start + len as usize],
+    }
 }
 
 /// Get tables referenced in a query
