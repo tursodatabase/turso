@@ -1681,11 +1681,13 @@ impl Database {
                     let conn = db._connect(
                         false,
                         Some(pager.clone()),
-                        state.encryption_key.clone(),
-                        page_codec.clone(),
+                        ConnectOpts {
+                            encryption_key: state.encryption_key.clone(),
+                            page_codec: page_codec.clone(),
+                            readonly: false,
+                        },
                         ConnectionContext::default(),
                         StatsRefresh::Blocking,
-                        false,
                     )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
@@ -1809,11 +1811,13 @@ impl Database {
                             state.mvcc_bootstrap_conn = Some(db._connect(
                                 true,
                                 Some(pager.clone()),
-                                state.encryption_key.clone(),
-                                page_codec.clone(),
+                                ConnectOpts {
+                                    encryption_key: state.encryption_key.clone(),
+                                    page_codec: page_codec.clone(),
+                                    readonly: false,
+                                },
                                 ConnectionContext::default(),
                                 StatsRefresh::Blocking,
-                                false,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -2533,11 +2537,9 @@ impl Database {
             let mvcc_bootstrap_conn = self._connect(
                 true,
                 None,
-                None,
-                None,
+                ConnectOpts::new(),
                 ConnectionContext::default(),
                 StatsRefresh::Blocking,
-                false,
             )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
@@ -2597,15 +2599,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            opts.encryption_key,
-            opts.page_codec,
-            context,
-            StatsRefresh::Blocking,
-            opts.readonly,
-        )
+        self._connect(false, None, opts, context, StatsRefresh::Blocking)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2641,11 +2635,9 @@ impl Database {
                 let conn = self._connect(
                     false,
                     None,
-                    opts.encryption_key,
-                    opts.page_codec,
+                    opts,
                     ConnectionContext::default(),
                     StatsRefresh::Deferred,
-                    opts.readonly,
                 )?;
                 state.conn = Some(conn.clone());
                 conn
@@ -2667,12 +2659,15 @@ impl Database {
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
-        encryption_key: Option<EncryptionKey>,
-        page_codec: Option<Arc<dyn PageCodec>>,
+        opts: ConnectOpts,
         context: ConnectionContext,
         stats: StatsRefresh,
-        readonly: bool,
     ) -> Result<Arc<Connection>> {
+        let ConnectOpts {
+            encryption_key,
+            page_codec,
+            readonly,
+        } = opts;
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
                 "database requires an external page codec".to_string(),
