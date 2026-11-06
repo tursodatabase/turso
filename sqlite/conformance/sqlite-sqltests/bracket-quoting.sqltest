@@ -125,3 +125,22 @@ test bracket-analyze-table-name {
 expect {
     0
 }
+
+@cross-check-integrity
+test bracket-function-call {
+    SELECT [upper]('a'), [lower]('B'), [abs](-42);
+}
+expect {
+    A|b|42
+}
+
+@cross-check-integrity
+test bracket-function-call-aggregate {
+    CREATE TABLE t10(a INTEGER);
+    INSERT INTO t10 VALUES (10), (20), (30);
+    SELECT [count](*), [count]([a]), [sum]([a]), [avg]([a]) FROM t10;
+}
+expect {
+    3|3|60|20.0
+}
+
