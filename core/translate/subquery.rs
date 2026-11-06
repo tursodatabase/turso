@@ -401,7 +401,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan)?;
+    assign_select_subquery_eval_phases(plan, resolver)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -2386,7 +2386,7 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
@@ -2419,7 +2419,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if let Some(func) = outer_aggregate_read_by_subquery(subquery) {
+        if let Some(func) = outer_aggregate_read_by_subquery(subquery, resolver)? {
             // An aggregate's arguments are evaluated for each input row, before
             // this query has computed the aggregate the subquery reads.
             if aggregate_subquery_ids.contains(&subquery.internal_id) {
@@ -2546,21 +2546,24 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<String> {
+fn outer_aggregate_read_by_subquery(
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Result<Option<String>> {
     // EXISTS only checks whether a row comes out and never evaluates its
     // result columns, as in SQLite.
     if matches!(subquery.query_type, SubqueryType::Exists { .. }) {
-        return None;
+        return Ok(None);
     }
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
-        return None;
+        return Ok(None);
     };
     let Plan::Select(select) = plan.as_ref() else {
-        return None;
+        return Ok(None);
     };
     let mut found = None;
     for rc in &select.result_columns {
-        let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
             if let ast::Expr::FunctionCall {
                 name,
                 args,
@@ -2569,20 +2572,23 @@ fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<
             } = e
             {
                 let is_plain_aggregate = filter_over.over_clause.is_none()
-                    && matches!(
-                        crate::function::Func::resolve_function(name.as_str(), args.len()),
-                        Ok(Some(crate::function::Func::Agg(_)))
-                    );
+                    && match resolver.resolve_function(name.as_str(), args.len())? {
+                        Some(crate::function::Func::Agg(_)) => true,
+                        Some(crate::function::Func::External(function)) => {
+                            function.func.is_aggregate()
+                        }
+                        _ => false,
+                    };
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
                     found = Some(name.as_str().to_string());
                     return Ok(WalkControl::SkipChildren);
                 }
             }
             Ok(WalkControl::Continue)
-        });
+        })?;
         if found.is_some() {
             break;
         }
     }
-    found
+    Ok(found)
 }
