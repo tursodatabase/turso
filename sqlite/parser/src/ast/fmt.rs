@@ -2505,9 +2505,11 @@ impl ToTokens for Type {
     ) -> Result<(), S::Error> {
         s.append(TK_ID, Some(&self.name))?;
         if let Some(ref size) = self.size {
-            s.append(TK_LP, None)?;
-            size.to_tokens(s, context)?;
-            s.append(TK_RP, None)?;
+            if !self.name.contains('(') {
+                s.append(TK_LP, None)?;
+                size.to_tokens(s, context)?;
+                s.append(TK_RP, None)?;
+            }
         }
         for _ in 0..self.array_dimensions {
             s.append(TK_LBRACKET, None)?;

@@ -340,7 +340,7 @@ fn test_alter_table_keeps_type_names_as_written_on_reopen() {
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
         conn.execute(
-            "CREATE TABLE t (z, e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, g \"\")",
+            "CREATE TABLE t (z, e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, g \"\", h VARCHAR /*INT*/ (10))",
         )
         .unwrap();
         conn.execute("ALTER TABLE t DROP COLUMN z").unwrap();
@@ -358,7 +358,7 @@ fn test_alter_table_keeps_type_names_as_written_on_reopen() {
         assert_eq!(
             schema,
             vec![(
-                "CREATE TABLE t (e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, g \"\", f \"c\"\"d\" TEXT)"
+                "CREATE TABLE t (e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, g \"\", h VARCHAR /*INT*/ (10), f \"c\"\"d\" TEXT)"
                     .to_string(),
             )]
         );
@@ -373,13 +373,19 @@ fn test_alter_table_keeps_type_names_as_written_on_reopen() {
                 ("BLOB".to_string(),),
                 ("BLOB/*INT*/REAL".to_string(),),
                 ("".to_string(),),
+                ("VARCHAR /*INT*/ (10)".to_string(),),
                 ("c\"d".to_string(),),
             ]
         );
 
-        conn.execute("INSERT INTO t (g) VALUES ('12')").unwrap();
-        let stored_types: Vec<(String,)> = conn.exec_rows("SELECT typeof(g) FROM t");
-        assert_eq!(stored_types, vec![("integer".to_string(),)]);
+        conn.execute("INSERT INTO t (g, h) VALUES ('12', '12')")
+            .unwrap();
+        let stored_types: Vec<(String, String)> =
+            conn.exec_rows("SELECT typeof(g), typeof(h) FROM t");
+        assert_eq!(
+            stored_types,
+            vec![("integer".to_string(), "integer".to_string())]
+        );
         conn.close().unwrap();
     }
 }
