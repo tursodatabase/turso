@@ -1,8 +1,9 @@
 @database :memory:
+@skip-file-if sqlite "SQLite does not support LATERAL"
 
 # LATERAL subqueries inside scalar subqueries, EXISTS, IN, CTEs, views,
 # recursive CTEs and compound selects.
-# The statements run through the PostgreSQL frontend (tursopg).
+# The statements run through both frontends.
 # PostgreSQL 16 gave every expected result.
 
 setup data {

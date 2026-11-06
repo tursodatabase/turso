@@ -325,6 +325,7 @@ When working on a new feature, please consider adding a test case for it.
 
 The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
 Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
+Tests for SQL that the PostgreSQL frontend also runs go in `testing/shared-sqltests/`.
 
 To run tests:
 
