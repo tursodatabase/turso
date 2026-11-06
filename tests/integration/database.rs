@@ -423,28 +423,27 @@ fn test_database_open_with_options() {
     );
 }
 
-/// Database::open_async still requires storage: default-storage resolution is
-/// synchronous (registry lookup, file probes, file open) and only runs in the
-/// synchronous Database::open entry point.
 #[test]
-fn test_open_async_requires_storage() {
+fn test_open_async_resolves_default_storage() {
     let tmp_dir = tempfile::TempDir::new().unwrap();
-    let path = tmp_dir.path().join("async-needs-storage.db");
+    let path = tmp_dir.path().join("async-default-storage.db");
     let path = path.to_str().unwrap();
-
     let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect));
     let mut state = turso_core::OpenDbAsyncState::new();
-    let err = Database::open_async(
-        &mut state,
-        io,
-        path,
-        &turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
-    )
-    .expect_err("open_async without storage must fail");
-    assert!(
-        matches!(*err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
-        "expected InvalidArgument about missing storage, got {err:?}"
-    );
+    let db = loop {
+        match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+            turso_core::IOResult::Done(db) => break db,
+            turso_core::IOResult::IO(_) => io.step().unwrap(),
+        }
+    };
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (7)").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(7,)]);
+    let reopened = Database::open(io, path, options).unwrap();
+    assert!(Arc::ptr_eq(&db, &reopened));
 }
 
 /// The registry-aware Database::open rejects a custom WAL path: the process
