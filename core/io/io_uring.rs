@@ -487,6 +487,14 @@ impl IO for UringIO {
         Ok(())
     }
 
+    fn supports_rename(&self) -> bool {
+        true
+    }
+
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        crate::io::rename_file_durably(from, to)
+    }
+
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         let mut state = self.state.lock();
         for c in completions {
