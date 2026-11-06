@@ -229,6 +229,67 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 mod tests {
     use super::*;
     #[test]
+    fn failed_open_returns_closeable_error_handle() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            let path = std::ffi::CString::new(directory.path().join("absent/db").to_str().unwrap())
+                .unwrap();
+            for v2 in [false, true] {
+                for deferred_close in [false, true] {
+                    let mut db = ptr::dangling_mut();
+                    let rc = if v2 {
+                        sqlite3_open_v2(path.as_ptr(), &mut db, 6, ptr::null())
+                    } else {
+                        sqlite3_open(path.as_ptr(), &mut db)
+                    };
+                    assert_eq!(rc, SQLITE_CANTOPEN);
+                    assert!(!db.is_null());
+                    assert_ne!(db, ptr::dangling_mut());
+                    assert_eq!(sqlite3_errcode(db), SQLITE_CANTOPEN);
+                    let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_owned();
+                    let diagnostic = message.to_string_lossy();
+                    assert!(
+                        diagnostic.contains("unable to open database"),
+                        "{diagnostic}"
+                    );
+                    #[cfg(unix)]
+                    assert!(
+                        diagnostic.contains("No such file")
+                            || diagnostic.contains("os error 2")
+                            || diagnostic.contains("not found"),
+                        "{diagnostic}"
+                    );
+                    assert_ne!(message.as_c_str(), c"out of memory");
+                    let mut statement = ptr::dangling_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT 1".as_ptr(),
+                            -1,
+                            &mut statement,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_MISUSE
+                    );
+                    assert!(statement.is_null());
+                    assert_eq!(
+                        std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                        message.as_c_str()
+                    );
+                    assert_eq!(
+                        if deferred_close {
+                            sqlite3_close_v2(db)
+                        } else {
+                            sqlite3_close(db)
+                        },
+                        SQLITE_OK
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn callback_errors_return_bare_engine_messages() {
         unsafe {
             let mut db = ptr::null_mut();
