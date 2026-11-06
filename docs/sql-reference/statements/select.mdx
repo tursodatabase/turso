@@ -280,6 +280,8 @@ Aggregate functions that can be used with GROUP BY:
 
 Filters groups after aggregation. WHERE filters individual rows before grouping; HAVING filters groups after.
 
+HAVING also works without GROUP BY: an aggregate query treats its input as one group. With a single built-in MIN or MAX aggregate, non-aggregate column values come from a row that supplies that minimum or maximum, including when those columns appear only in HAVING. If multiple rows tie for the extreme, the choice among them is unspecified.
+
 ```sql
 SELECT department, COUNT(*) AS headcount
 FROM employees
