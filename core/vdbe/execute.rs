@@ -1692,16 +1692,23 @@ pub fn op_vdestroy(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(VDestroy { db: _, table_name }, insn);
+    load_insn!(VDestroy { db, table_name }, insn);
     let conn = program.connection.clone();
     {
-        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
+        // The table may have been created by another connection, so look it up
+        // in the schema rather than in this connection's symbol table.
+        let Some(vtab) = conn.with_schema(*db, |schema| {
+            schema
+                .get_table(NamespaceId::ROOT, table_name)
+                .and_then(|table| table.virtual_table())
+        }) else {
             mark_unlikely();
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
             )
             .into());
         };
+        conn.syms.write().vtabs.remove(table_name);
         vtab.destroy()?;
     }
 
@@ -1722,14 +1729,13 @@ pub fn op_vbegin(
         .vtab_id()
         .expect("VBegin on non ext-virtual table cursor");
     let mut states = program.connection.vtab_txn_states.write();
-    if states.insert(vtab_id) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = states.entry(vtab_id) {
         // Only begin a new transaction if one is not already active for this virtual table module
-        let vtabs = &program.connection.syms.read().vtabs;
-        let vtab = vtabs
-            .iter()
-            .find(|p| p.1.id().eq(&vtab_id))
-            .expect("Could not find virtual table for VBegin");
-        vtab.1.begin()?;
+        let (_, CursorType::VirtualTable(vtab)) = &program.cursor_ref[*cursor_id] else {
+            panic!("VBegin on non-virtual table cursor");
+        };
+        vtab.begin()?;
+        entry.insert(vtab.clone());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1749,18 +1755,10 @@ pub fn op_vrename(
         insn
     );
     let name = state.registers[*new_name_reg].get_value().to_string();
-    let cursor = state.get_cursor(*cursor_id);
-    let cursor = cursor.as_virtual_mut();
-    let vtabs = &program.connection.syms.read().vtabs;
-    let vtab = vtabs
-        .iter()
-        .find(|p| {
-            p.1.id().eq(&cursor
-                .vtab_id()
-                .expect("non ext-virtual table used in VRollback"))
-        })
-        .expect("Could not find virtual table for VRollback");
-    vtab.1.rename(&name)?;
+    let (_, CursorType::VirtualTable(vtab)) = &program.cursor_ref[*cursor_id] else {
+        panic!("VRename on non-virtual table cursor");
+    };
+    vtab.rename(&name)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3948,13 +3946,8 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     if set.is_empty() {
         return Ok(());
     }
-    let reg = &conn.syms.read().vtabs;
-    for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.commit()?;
+    for (_, vtab) in set.drain() {
+        vtab.commit()?;
     }
     Ok(())
 }
@@ -4181,13 +4174,8 @@ pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     if set.is_empty() {
         return Ok(());
     }
-    let reg = &conn.syms.read().vtabs;
-    for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.rollback()?;
+    for (_, vtab) in set.drain() {
+        vtab.rollback()?;
     }
     Ok(())
 }

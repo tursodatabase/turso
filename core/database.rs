@@ -58,7 +58,7 @@ use crate::{
 };
 use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::any::Any;
 #[cfg(host_shared_wal)]
 use std::path::Path;
@@ -2800,7 +2800,7 @@ impl Database {
                 crate::connection::StatementActivity::default(),
             )),
             check_constraints_pragma: AtomicBool::new(false),
-            vtab_txn_states: RwLock::new(HashSet::default()),
+            vtab_txn_states: RwLock::new(HashMap::default()),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),
