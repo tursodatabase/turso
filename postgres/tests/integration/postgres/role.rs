@@ -448,3 +448,20 @@ fn role_names(conn: &PgConnection) -> Vec<String> {
         .map(|row| row[0].to_string())
         .collect()
 }
+
+/// Without role membership, an owner may give its relation to nobody but
+/// itself; PostgreSQL asks for the ability to SET ROLE to the new owner.
+#[test]
+fn owner_cannot_give_its_table_to_another_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    conn.execute("ALTER TABLE t OWNER TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("ALTER TABLE t OWNER TO bob").unwrap_err();
+    assert_eq!(error.to_string(), "permission denied to set role \"bob\"");
+    conn.execute("ALTER TABLE t OWNER TO CURRENT_USER").unwrap();
+}

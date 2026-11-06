@@ -251,6 +251,15 @@ impl Dialect for PostgresDialect {
         crate::classes::apply_relation_change(schema, change, values)
     }
 
+    fn relation_owner(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<RoleId> {
+        crate::classes::relation_owner(schema, namespace, name)
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }

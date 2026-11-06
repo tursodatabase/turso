@@ -159,6 +159,106 @@ fn opening_the_same_file_twice_does_not_create_the_table_twice_or_change_rows() 
     assert_eq!(class_rows(&conn), rows_before);
 }
 
+#[test]
+fn owner_to_stores_the_owner_and_lets_the_owner_drop_and_alter() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE alice").unwrap();
+    pg.execute("CREATE ROLE bob").unwrap();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+    pg.execute("ALTER TABLE t OWNER TO alice").unwrap();
+    let (_, _, _, _, owner) = class_row(&conn, "t").unwrap();
+    let alice_id = owner;
+    assert!(alice_id > 0, "alice's stored role id");
+
+    // bob may not drop or alter alice's table.
+    pg.execute("SET ROLE bob").unwrap();
+    let error = pg.execute("DROP TABLE t").unwrap_err().to_string();
+    assert!(error.contains("must be owner of table t"), "{error}");
+    let error = pg
+        .execute("ALTER TABLE t RENAME TO u")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must be owner of table t"), "{error}");
+    // Nor may bob, or even alice, transfer ownership: that stays with
+    // superusers for now.
+    let error = pg
+        .execute("ALTER TABLE t OWNER TO bob")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must be owner of table t"), "{error}");
+
+    // alice owns the table, so she may drop it. Renaming also needs CREATE
+    // on the schema, which only a superuser has until GRANT exists.
+    pg.execute("SET ROLE postgres").unwrap();
+    pg.execute("SET ROLE alice").unwrap();
+    let error = pg
+        .execute("ALTER TABLE t RENAME TO u")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("permission denied for schema public"),
+        "{error}"
+    );
+    pg.execute("SET ROLE postgres").unwrap();
+    pg.execute("ALTER TABLE t RENAME TO u").unwrap();
+    let (_, _, _, _, owner) = class_row(&conn, "u").unwrap();
+    assert_eq!(owner, alice_id, "rename keeps the owner");
+    pg.execute("SET ROLE alice").unwrap();
+    pg.execute("DROP TABLE u").unwrap();
+    assert_eq!(class_row(&conn, "u"), None);
+}
+
+#[test]
+fn owner_to_resolves_role_keywords_and_reports_missing_names() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
+    pg.execute("CREATE SEQUENCE s").unwrap();
+    pg.execute("CREATE INDEX t_x ON t (x)").unwrap();
+    pg.execute("CREATE ROLE alice").unwrap();
+
+    pg.execute("ALTER TABLE t OWNER TO CURRENT_ROLE").unwrap();
+    assert_eq!(class_row(&conn, "t").unwrap().4, 0);
+    pg.execute("ALTER TABLE t OWNER TO SESSION_USER").unwrap();
+    assert_eq!(class_row(&conn, "t").unwrap().4, 0);
+    pg.execute("ALTER VIEW v OWNER TO alice").unwrap();
+    pg.execute("ALTER SEQUENCE s OWNER TO alice").unwrap();
+    let alice_id = class_row(&conn, "v").unwrap().4;
+    assert!(alice_id > 0);
+    assert_eq!(class_row(&conn, "s").unwrap().4, alice_id);
+    // An index is owned by its table: ALTER INDEX changes nothing, and
+    // ALTER TABLE moves the index with the table.
+    pg.execute("ALTER INDEX t_x OWNER TO alice").unwrap();
+    assert_eq!(class_row(&conn, "t_x").unwrap().4, 0);
+    pg.execute("ALTER TABLE t OWNER TO alice").unwrap();
+    assert_eq!(class_row(&conn, "t").unwrap().4, alice_id);
+    assert_eq!(class_row(&conn, "t_x").unwrap().4, alice_id);
+    pg.execute("ALTER TABLE t OWNER TO postgres").unwrap();
+    assert_eq!(class_row(&conn, "t").unwrap().4, 0);
+    assert_eq!(class_row(&conn, "t_x").unwrap().4, 0);
+
+    let error = pg
+        .execute("ALTER TABLE t OWNER TO nobody")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("role \"nobody\" does not exist"), "{error}");
+    let error = pg
+        .execute("ALTER TABLE missing OWNER TO alice")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("relation \"missing\" does not exist"),
+        "{error}"
+    );
+    pg.execute("ALTER TABLE IF EXISTS missing OWNER TO alice")
+        .unwrap();
+}
+
 /// Opens `path` with the PostgreSQL dialect directly, skipping the
 /// frontend's catalog creation, the way files written before the catalog
 /// existed were made.
@@ -226,4 +326,21 @@ fn a_rolled_back_create_leaves_no_class_row_behind() {
     pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
     let (_, _, _, kind, _) = class_row(&conn, "t").unwrap();
     assert_eq!(kind, "r");
+}
+
+#[test]
+fn dropping_a_table_releases_the_sequences_it_owned() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE ROLE alice").unwrap();
+    pg.execute("CREATE TABLE d (x serial)").unwrap();
+    let error = pg
+        .execute("ALTER SEQUENCE d_x_seq OWNER TO alice")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot change owner of sequence"), "{error}");
+    // Turso keeps the sequence of a dropped table, unlike PostgreSQL, so it
+    // becomes a sequence of its own.
+    pg.execute("DROP TABLE d").unwrap();
+    pg.execute("ALTER SEQUENCE d_x_seq OWNER TO alice").unwrap();
 }

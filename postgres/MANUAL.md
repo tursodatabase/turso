@@ -86,10 +86,15 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership, `GRANT` and table privileges are not supported yet. A role that is
-not a superuser may read the rows of every table, but it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create, alter or
-drop objects, create roles, or `COPY FROM` a file.
+`GRANT` and table privileges are not supported yet. A role that is not a
+superuser may read the rows of every table, and it may alter and drop the
+relations it owns (see `ALTER TABLE ... OWNER TO`), except that renaming a
+relation or creating an index on it also needs CREATE on the schema, which
+only a superuser has; it cannot insert,
+update, delete or truncate rows, call `nextval` or `setval`, create objects
+or roles, or `COPY FROM` a file. Creating objects stays superuser-only
+because PostgreSQL gates it on the schema's CREATE privilege, which does not
+exist yet.
 
 **Examples:**
 
@@ -127,4 +132,61 @@ SELECT current_user;
 --------------
  postgres
 (1 row)
+```
+
+### `ALTER TABLE ... OWNER TO` — change a relation's owner
+
+**Synopsis:**
+
+```sql
+ALTER TABLE [ IF EXISTS ] name OWNER TO { role_name | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
+ALTER VIEW name OWNER TO role_name
+ALTER MATERIALIZED VIEW name OWNER TO role_name
+ALTER SEQUENCE name OWNER TO role_name
+ALTER INDEX name OWNER TO role_name
+```
+
+**Description:**
+
+`OWNER TO` makes `role_name` the owner of the relation. The owner may alter
+and drop the relation; every other role that is not a superuser gets
+`must be owner of table name` (SQLSTATE `42501`). `pg_class.relowner` stores
+the owner, and `pg_get_userbyid(relowner)` returns its name.
+
+A table's indexes and the sequences of its `serial` columns belong to the
+table, also after the table or the column is renamed, so they change owner
+with it and not on their own. `ALTER SEQUENCE name OWNED BY table.column`
+makes any sequence belong to a table the same way, and `OWNED BY NONE` makes
+it its own again. Dropping a table leaves the sequences it owned as their
+own; PostgreSQL drops them with the table. Otherwise: `ALTER INDEX ...
+OWNER TO` changes nothing, as in PostgreSQL, though without the WARNING
+PostgreSQL prints, and `ALTER SEQUENCE ... OWNER TO` on a `serial` column's
+sequence fails with `cannot change owner of sequence` (SQLSTATE `0A000`)
+unless it names the owner the sequence has, which changes nothing.
+`ALTER TABLE` accepts every relation kind; the other forms refuse a relation
+of another kind, for example `"t" is not a sequence` (SQLSTATE `42809`).
+
+**Parameters:**
+
+- `name`: An existing table, view, materialized view, sequence or index. A
+  missing relation is an error (`42P01`), unless `IF EXISTS` was given.
+- `role_name`: An existing role (`42704` when there is none), or
+  `CURRENT_ROLE`/`CURRENT_USER` for the role the session runs as now, or
+  `SESSION_USER` for the role the session logged in as.
+
+**Notes:**
+
+A superuser may give a relation to any role. The relation's owner may give
+it to itself only, which changes nothing; PostgreSQL also lets the owner give
+it to a role it may `SET ROLE` to, which takes role membership, which Turso
+does not support yet.
+
+**Examples:**
+
+```sql
+CREATE TABLE accounts (id int);
+CREATE ROLE jonathan;
+ALTER TABLE accounts OWNER TO jonathan;
+SET ROLE jonathan;
+DROP TABLE accounts;
 ```

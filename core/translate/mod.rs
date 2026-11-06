@@ -170,7 +170,7 @@ pub fn translate(
             .is_superuser(connection.current_role())
     {
         resolver.role_is_not_superuser = true;
-        roles::check_statement_privileges(&stmt)?;
+        roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
 
     match stmt {

@@ -42,8 +42,10 @@ use turso_core::{
     CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn, LimboError, NewOwner,
     Numeric, ProgramBuilder, RegisterOrLiteral, RelationChange, Value, SQLITE_CONSTRAINT_UNIQUE,
 };
+use turso_parser::ast;
 
 use turso_core::MAIN_DB_ID;
+use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -216,6 +218,23 @@ impl ClassCatalog {
                     self.add(class);
                 }
             }
+            RelationChange::ChangeOwner {
+                namespace,
+                name,
+                owner: NewOwner::Role(_),
+            } => {
+                let [owner] = values else {
+                    return Err(LimboError::InternalError(
+                        "an owner change carries the new owner".to_string(),
+                    ));
+                };
+                if let Some(oid) = self.oids_by_name.get(&(*namespace, name.to_string())) {
+                    self.by_oid
+                        .get_mut(oid)
+                        .expect("both maps hold the row")
+                        .relowner = RoleId::from_stored(read_back_integer(owner)?);
+                }
+            }
         }
         Ok(())
     }
@@ -357,7 +376,11 @@ fn read_back_integer(value: &Value) -> turso_core::Result<i64> {
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
 /// frontend: a class row per created relation, owned by the current role,
 /// which is what PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row
-/// for a dropped one; a rename keeps the oid and owner.
+/// for a dropped one; a rename keeps the oid and owner; `ALTER ... OWNER TO`
+/// sets the owner, with PostgreSQL's errors for a missing role (42704) and
+/// a catalog relation (42501). A sequence a serial column owns changes
+/// owner with its table only, as in PostgreSQL: on its own it fails with
+/// `cannot change owner of sequence` (0A000).
 pub(crate) fn translate_relation_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -367,7 +390,21 @@ pub(crate) fn translate_relation_changes(
     let allocates_oids = changes
         .iter()
         .any(|change| matches!(change, RelationChange::Create { .. }));
+    let changes_owner = changes.iter().any(|change| {
+        matches!(
+            change,
+            RelationChange::ChangeOwner {
+                owner: NewOwner::Role(_),
+                ..
+            }
+        )
+    });
     let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
+        if changes_owner {
+            return Err(LimboError::ParseError(
+                "the database has no relation catalog".to_string(),
+            ));
+        }
         return Ok(());
     };
     for change in changes {
@@ -456,9 +493,95 @@ pub(crate) fn translate_relation_changes(
                     emit_class_row_rename(program, &cursors, *namespace, old_name, new_name);
                 }
             }
+            RelationChange::ChangeOwner {
+                namespace,
+                name,
+                owner: NewOwner::Role(new_owner),
+            } => {
+                let owner = resolve_new_owner(schema, connection, *namespace, name, new_owner)?;
+                let Some(class) =
+                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+                else {
+                    continue;
+                };
+                // As in PostgreSQL: nothing changes when the owner stays, an
+                // index's owner is its table's, and a serial column's
+                // sequence changes owner with its table only.
+                if class.relowner == owner || class.relkind == RelationKind::Index {
+                    continue;
+                }
+                if class.relownedby != 0 {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot change owner of sequence \"{name}\""
+                    )));
+                }
+                emit_class_row_set_owner(program, &cursors, *namespace, name, owner, new_owner);
+                // A table's indexes and what it owns, such as the sequences
+                // of its serial columns, go with it.
+                let mut with_it = class_catalog(schema)
+                    .into_iter()
+                    .flat_map(|catalog| catalog.owned_by(class.oid))
+                    .map(|owned| (owned.relnamespace, owned.relname.clone()))
+                    .collect::<Vec<_>>();
+                with_it.extend(
+                    schema
+                        .get_indices(*namespace, name)
+                        .filter(|index| {
+                            is_user_relation_name(RelationKind::Index, &index.name)
+                                && !index.is_backing_btree_index()
+                        })
+                        .map(|index| (*namespace, index.name.clone())),
+                );
+                for (other_namespace, other_name) in with_it {
+                    emit_class_row_set_owner(
+                        program,
+                        &cursors,
+                        other_namespace,
+                        &other_name,
+                        owner,
+                        new_owner,
+                    );
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// The role `ALTER ... OWNER TO new_owner` gives relation `name` of
+/// `namespace` to. A relation without a class row is the engine's.
+fn resolve_new_owner(
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    namespace: NamespaceId,
+    name: &str,
+    new_owner: &ast::RoleSpec,
+) -> turso_core::Result<RoleId> {
+    let has_row =
+        class_catalog(schema).is_some_and(|catalog| catalog.get_by_name(namespace, name).is_some());
+    if !has_row {
+        return Err(LimboError::ParseError(format!(
+            "permission denied: \"{name}\" is a system catalog"
+        )));
+    }
+    Ok(match new_owner {
+        ast::RoleSpec::CurrentRole => connection.current_role(),
+        ast::RoleSpec::SessionUser => connection.session_role(),
+        ast::RoleSpec::Name(role_name) => {
+            if role_name == BOOTSTRAP_SUPERUSER_NAME {
+                RoleId::SUPERUSER
+            } else {
+                match schema.roles.get_by_name(role_name) {
+                    Some(role) => role.id,
+                    None => {
+                        return Err(LimboError::ParseError(format!(
+                            "role \"{role_name}\" does not exist"
+                        )))
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// The cursors of one statement's class row writes: the classes table, its
@@ -726,6 +849,43 @@ fn emit_class_row_rename(
             new_name: new_name.to_string(),
         }),
         value_regs: vec![],
+    });
+}
+
+/// Sets the owner of the class row of relation `name` of `namespace` to
+/// `owner`, which `new_owner` named.
+fn emit_class_row_set_owner(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+    owner: RoleId,
+    new_owner: &ast::RoleSpec,
+) {
+    let owner_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: owner.get(),
+        dest: owner_reg,
+    });
+    emit_find_class_row(program, cursors, namespace, name, |program, row| {
+        let record_reg = emit_class_record(
+            program,
+            ClassRecordColumn::Literal(name.to_string()),
+            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
+            ClassRecordColumn::Register(row.relkind_reg),
+            ClassRecordColumn::Register(owner_reg),
+            ClassRecordColumn::Register(row.relownedby_reg),
+        );
+        emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
+    });
+    program.emit_insn(Insn::RelationChange {
+        db: MAIN_DB_ID,
+        change: Box::new(RelationChange::ChangeOwner {
+            namespace,
+            name: name.to_string(),
+            owner: NewOwner::Role(new_owner.clone()),
+        }),
+        value_regs: vec![owner_reg],
     });
 }
 

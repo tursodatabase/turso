@@ -198,19 +198,10 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (namespace, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
-        let schema_norm = normalize_ident(schema);
-        let namespace = resolver.namespace_named(&schema_norm).ok_or_else(|| {
-            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
-        })?;
-        (namespace, normalize_ident(name))
-    } else {
-        let name = normalize_ident(&seq_name_raw);
-        match resolver.sequence_of_mangled_name(&name) {
-            Some(sequence) => sequence,
-            None => (resolver.resolve_existing_sequence(&name)?, name),
-        }
-    };
+    let (namespace, normalized_name) =
+        crate::translate::sequence::resolve_sequence_name(&seq_name_raw, resolver).ok_or_else(
+            || LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist")),
+        )?;
     crate::translate::roles::check_sequence_change(resolver, &normalized_name)?;
     let database_id = namespace.database_id;
     let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);

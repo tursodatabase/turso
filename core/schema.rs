@@ -1308,15 +1308,9 @@ pub struct Schema {
 }
 
 /// What kind of relation a schema object is, for the relations that
-/// [`Schema::user_relations`] lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelationKind {
-    Table,
-    View,
-    MaterializedView,
-    Sequence,
-    Index,
-}
+/// [`Schema::user_relations`] lists. The parser defines it, because
+/// `ALTER ... OWNER TO` names a kind.
+pub use turso_parser::ast::RelationKind;
 
 /// Materialized views the loader read before the names of the namespaces,
 /// with the roots of their state tables. A view body names tables by their

@@ -1730,6 +1730,15 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::OwnerTo { role, .. } => {
+                s.append(TK_ID, Some("OWNER"))?;
+                s.append(TK_TO, None)?;
+                match role {
+                    crate::ast::RoleSpec::Name(name) => s.append(TK_ID, Some(name)),
+                    crate::ast::RoleSpec::CurrentRole => s.append(TK_ID, Some("CURRENT_ROLE")),
+                    crate::ast::RoleSpec::SessionUser => s.append(TK_ID, Some("SESSION_USER")),
+                }
+            }
         }
     }
 }

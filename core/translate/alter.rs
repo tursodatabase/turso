@@ -1,6 +1,7 @@
 use crate::alloc::TursoIteratorExt;
-use crate::dialect::RelationChange;
+use crate::dialect::{NewOwner, RelationChange};
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::RelationKind;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::types::StrictType;
@@ -825,6 +826,22 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
+    if let ast::AlterTableBody::OwnerTo {
+        kind,
+        role,
+        if_exists,
+    } = &alter_table
+    {
+        return translate_alter_owner(
+            &qualified_name,
+            *kind,
+            role,
+            *if_exists,
+            resolver,
+            program,
+            connection,
+        );
+    }
     let namespace = resolver.resolve_existing_table(&qualified_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -888,6 +905,9 @@ pub fn translate_alter_table(
     let mut btree = (*original_btree).clone();
 
     match alter_table {
+        ast::AlterTableBody::OwnerTo { .. } => {
+            unreachable!("OWNER TO is translated before the table is resolved")
+        }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
@@ -2449,6 +2469,103 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+/// Translates `ALTER TABLE name OWNER TO role`, and the same for the other
+/// relation kinds: the dialect records the new owner in its own schema
+/// state, and moves what the relation owns with it, such as the sequences
+/// of a table's serial columns. As in PostgreSQL, a table's indexes change
+/// owner with the table, because they belong to it, and `ALTER INDEX ...
+/// OWNER TO` changes nothing, because an index is owned by its table.
+/// `ALTER TABLE` accepts every relation kind; the other forms refuse a
+/// relation of another kind.
+///
+/// [`crate::translate::roles::check_statement_privileges`] lets a superuser
+/// run it, and the owner when it names a role it may set, which without
+/// role membership is itself.
+fn translate_alter_owner(
+    qualified_name: &ast::QualifiedName,
+    kind: RelationKind,
+    role: &ast::RoleSpec,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let normalized_name = normalize_ident(qualified_name.name.as_str());
+    let Some((namespace, existing_kind)) =
+        owned_relation(resolver, qualified_name, &normalized_name)
+    else {
+        if if_exists {
+            return Ok(());
+        }
+        crate::bail_parse_error!("relation \"{normalized_name}\" does not exist");
+    };
+    if namespace.database_id != crate::MAIN_DB_ID {
+        crate::bail_parse_error!("permission denied: \"{normalized_name}\" is a system catalog");
+    }
+    // ALTER TABLE accepts every relation kind, as in PostgreSQL; the other
+    // forms want their own.
+    if kind != RelationKind::Table && existing_kind != kind {
+        crate::bail_parse_error!(
+            "\"{normalized_name}\" is not {}",
+            relation_kind_phrase(kind)
+        );
+    }
+    // The dialect decides what goes with the relation, such as a table's
+    // indexes, and whose an index's owner is.
+    let changes = [RelationChange::ChangeOwner {
+        namespace: namespace.id,
+        name: normalized_name,
+        owner: NewOwner::Role(role.clone()),
+    }];
+
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_relation_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    schema::emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// `kind` as an `ALTER ... OWNER TO` error names it.
+fn relation_kind_phrase(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Table => "a table",
+        RelationKind::View => "a view",
+        RelationKind::MaterializedView => "a materialized view",
+        RelationKind::Sequence => "a sequence",
+        RelationKind::Index => "an index",
+    }
+}
+
+/// The namespace and kind of the relation `qualified_name` names: a table,
+/// view, materialized view, sequence or index, whichever exists. None when
+/// none does.
+fn owned_relation(
+    resolver: &Resolver,
+    qualified_name: &ast::QualifiedName,
+    normalized_name: &str,
+) -> Option<(NamespaceRef, RelationKind)> {
+    let namespace = if qualified_name.namespace.is_some() {
+        resolver.resolve_namespace(qualified_name).ok()?
+    } else {
+        resolver
+            .find_existing_table(qualified_name)
+            .ok()
+            .flatten()
+            .or_else(|| resolver.find_existing_index(qualified_name).ok().flatten())
+            .or_else(|| resolver.find_existing_sequence(normalized_name))?
+    };
+    resolver
+        .with_schema(namespace.database_id, |schema| {
+            schema.relation_kind(namespace.id, normalized_name)
+        })
+        .map(|kind| (namespace, kind))
+}
+
 /// Adds the FOREIGN KEY of an inline `REFERENCES` clause on column
 /// `column_name` to `table`. `constraint` must be a
 /// [ast::ColumnConstraint::ForeignKey].
@@ -2505,6 +2622,8 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
+        // OWNER TO works on views; it is translated before this check runs.
+        ast::AlterTableBody::OwnerTo { .. } => Ok(()),
     }
 }
 

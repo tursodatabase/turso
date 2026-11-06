@@ -1337,7 +1337,8 @@ pub(crate) fn sequence_namespace(
 /// Translates `ALTER SEQUENCE name OWNED BY table.column`, or `OWNED BY
 /// NONE`: the dialect records which table the sequence belongs to in its
 /// own schema state, as PostgreSQL does for a `serial` column's sequence.
-/// The table must be in the sequence's namespace and have the column.
+/// The table must be in the sequence's namespace, have the column, and have
+/// the sequence's owner.
 pub fn translate_alter_sequence_owned_by(
     seq_name: &ast::QualifiedName,
     owner: Option<&(ast::QualifiedName, ast::Name)>,
@@ -1375,6 +1376,17 @@ pub fn translate_alter_sequence_owned_by(
                     column.as_str()
                 );
             }
+            let dialect = &resolver.catalog.dialect;
+            let (sequence_owner, table_owner) =
+                resolver.with_schema(namespace.database_id, |schema| {
+                    (
+                        dialect.relation_owner(schema, namespace.id, &normalized_name),
+                        dialect.relation_owner(schema, namespace.id, &normalized_table),
+                    )
+                });
+            if sequence_owner.is_some() && table_owner.is_some() && sequence_owner != table_owner {
+                bail_parse_error!("sequence must have same owner as table it is linked to");
+            }
             Some(normalized_table)
         }
         None => None,
@@ -1396,6 +1408,28 @@ pub fn translate_alter_sequence_owned_by(
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
+}
+
+/// The namespace and bare name of the sequence `name` names: `schema.name`,
+/// the mangled name of a sequence of a namespace, or a bare name found on
+/// the search path. None when the schema or the sequence does not exist.
+pub(crate) fn resolve_sequence_name(
+    name: &str,
+    resolver: &Resolver,
+) -> Option<(NamespaceRef, String)> {
+    if let Some((schema_name, bare_name)) = name.split_once('.') {
+        let namespace = resolver.namespace_named(&normalize_ident(schema_name))?;
+        let bare_name = normalize_ident(bare_name);
+        return resolver
+            .with_schema(namespace.database_id, |schema| {
+                schema.get_sequence(namespace.id, &bare_name).is_some()
+            })
+            .then_some((namespace, bare_name));
+    }
+    let bare_name = normalize_ident(name);
+    resolver
+        .sequence_of_mangled_name(&bare_name)
+        .or_else(|| Some((resolver.find_existing_sequence(&bare_name)?, bare_name)))
 }
 
 pub(crate) fn is_sequence_function(name: &str) -> bool {

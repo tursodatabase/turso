@@ -978,18 +978,6 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation)?;
 
-        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
-            return Err(not_supported(format!(
-                "ALTER {}",
-                drop_object_type_name(
-                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
-                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
-                )
-            )));
-        }
-        if alter.missing_ok {
-            return Err(not_supported("ALTER TABLE IF EXISTS"));
-        }
         if alter.cmds.len() > 1 {
             return Err(not_supported("ALTER TABLE with multiple subcommands"));
         }
@@ -1008,6 +996,43 @@ impl PostgreSQLTranslator {
 
         let subtype = AlterTableType::try_from(cmd.subtype)
             .map_err(|_| ParseError::ParseError("ALTER TABLE: invalid subtype".into()))?;
+        // OWNER TO works on every relation kind, so ALTER VIEW, ALTER
+        // MATERIALIZED VIEW, ALTER SEQUENCE and ALTER INDEX reach it too.
+        if subtype == AlterTableType::AtChangeOwner {
+            let kind = match pg_query::protobuf::ObjectType::try_from(alter.objtype) {
+                Ok(pg_query::protobuf::ObjectType::ObjectTable) => ast::RelationKind::Table,
+                Ok(pg_query::protobuf::ObjectType::ObjectView) => ast::RelationKind::View,
+                Ok(pg_query::protobuf::ObjectType::ObjectMatview) => {
+                    ast::RelationKind::MaterializedView
+                }
+                Ok(pg_query::protobuf::ObjectType::ObjectSequence) => ast::RelationKind::Sequence,
+                Ok(pg_query::protobuf::ObjectType::ObjectIndex) => ast::RelationKind::Index,
+                other => {
+                    return Err(not_supported(format!(
+                        "ALTER {} OWNER TO",
+                        drop_object_type_name(
+                            other.unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                        )
+                    )))
+                }
+            };
+            return Ok(ast::Stmt::AlterTable(ast::AlterTable {
+                name,
+                body: Self::translate_change_owner(cmd, kind, alter.missing_ok)?,
+            }));
+        }
+        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
+            return Err(not_supported(format!(
+                "ALTER {}",
+                drop_object_type_name(
+                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
+                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                )
+            )));
+        }
+        if alter.missing_ok {
+            return Err(not_supported("ALTER TABLE IF EXISTS"));
+        }
         if cmd.missing_ok {
             return Err(not_supported(format!(
                 "ALTER TABLE {} IF [NOT] EXISTS",
@@ -1095,6 +1120,37 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Stmt::AlterTable(ast::AlterTable { name, body }))
+    }
+
+    /// Translates the `OWNER TO` subcommand of `ALTER TABLE`, `ALTER VIEW`,
+    /// `ALTER MATERIALIZED VIEW`, `ALTER SEQUENCE` and `ALTER INDEX`.
+    fn translate_change_owner(
+        cmd: &pg_query::protobuf::AlterTableCmd,
+        kind: ast::RelationKind,
+        if_exists: bool,
+    ) -> Result<ast::AlterTableBody, ParseError> {
+        use pg_query::protobuf::RoleSpecType;
+
+        let Some(new_owner) = &cmd.newowner else {
+            return Err(ParseError::ParseError("OWNER TO: missing role".into()));
+        };
+        let role = match RoleSpecType::try_from(new_owner.roletype) {
+            Ok(RoleSpecType::RolespecCstring) => ast::RoleSpec::Name(new_owner.rolename.clone()),
+            Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                ast::RoleSpec::CurrentRole
+            }
+            Ok(RoleSpecType::RolespecSessionUser) => ast::RoleSpec::SessionUser,
+            _ => {
+                return Err(ParseError::ParseError(
+                    "role \"public\" does not exist".into(),
+                ))
+            }
+        };
+        Ok(ast::AlterTableBody::OwnerTo {
+            kind,
+            role,
+            if_exists,
+        })
     }
 
     fn translate_rename_stmt(
