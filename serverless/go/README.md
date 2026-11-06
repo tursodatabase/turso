@@ -194,3 +194,48 @@ responses leave the connection unusable.
 
 PostgreSQL message translation, parameter type inference, and COPY text encoding
 remain the gateway's responsibility.
+
+## HTTP errors and authentication checks
+
+Returned non-2xx HTTP failures from pipeline and cursor requests are
+`*turso.HTTPError`, with `StatusCode int` and `Message string`. Use `errors.As`
+to inspect them, including through wrapped errors. Hrana statement and stream
+errors remain `*turso.Error`; transport errors preserve their underlying cause
+and do not match `*turso.HTTPError`.
+
+Ordinary `OpenConnection` is lazy: call `Ping` to check authentication. For example,
+a gateway can pass its project secret through the header expected by its backend
+and map authentication failures separately from backend/transport failures:
+
+```go
+func checkAccess(ctx context.Context, url, secret string) int {
+    conn, err := turso.NewConnector(url, "").
+        WithRequestHeaders(http.Header{"X-API-Key": {secret}}).
+        OpenConnection(ctx)
+    if err == nil {
+        defer conn.Close()
+        err = conn.Ping(ctx)
+    }
+    if err == nil {
+        return http.StatusOK
+    }
+    var httpErr *turso.HTTPError
+    if errors.As(err, &httpErr) &&
+        (httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
+        return http.StatusUnauthorized
+    }
+    return http.StatusBadGateway
+}
+```
+
+The example uses `context`, `errors`, `net/http`, and the `turso` import above;
+replace `X-API-Key` with your backend's authentication header.
+`WithSessionRetention` also makes an opening HTTP request, whose failures use the
+same type. `Close` attempts cleanup but intentionally ignores cleanup errors.
+
+Error text remains `turso: HTTP status <code>` with `: <message>` when available.
+The driver reads at most 1 MiB and extracts only a string `error` field (preferred)
+or `message` field from valid JSON. Empty, malformed, or truncated JSON gives an
+empty message; raw HTML and other response bodies are never included. Parsed
+messages are still untrusted server text; escape them as appropriate when displaying
+them and avoid forwarding backend details to callers.

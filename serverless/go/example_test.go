@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -92,4 +93,25 @@ func ExampleConnection_ExecuteContext() {
 		panic(err)
 	}
 	fmt.Println(result.Columns, result.Rows, result.RowsAffected)
+}
+
+func ExampleHTTPError() {
+	ctx := context.Background()
+	conn, err := turso.NewConnector("https://my-db.turso.io", "").
+		WithRequestHeaders(http.Header{"X-API-Key": {"project-secret"}}).
+		OpenConnection(ctx)
+	if err == nil {
+		defer conn.Close()
+		err = conn.Ping(ctx)
+	}
+	status := http.StatusOK
+	if err != nil {
+		status = http.StatusBadGateway
+		var httpErr *turso.HTTPError
+		if errors.As(err, &httpErr) &&
+			(httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
+			status = http.StatusUnauthorized
+		}
+	}
+	fmt.Println(status)
 }
