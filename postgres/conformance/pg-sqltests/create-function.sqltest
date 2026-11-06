@@ -1,0 +1,1251 @@
+# CREATE FUNCTION and the other statements about functions, procedures and
+# function calls.
+#
+# tursopg does not support user-defined functions yet. A test shows what
+# PostgreSQL does, and the error that tursopg gives for the first feature of
+# the statement that tursopg does not support. When tursopg supports a
+# feature, the tursopg error of the tests for that feature goes away.
+
+@database :memory:
+
+setup emp {
+    CREATE TABLE emp (name text, salary numeric);
+    INSERT INTO emp VALUES ('Bill', 4200);
+}
+
+# Statements about procedures, aggregates, transforms and languages.
+
+test create-procedure-is-rejected {
+    CREATE TABLE log (msg text);
+    CREATE PROCEDURE add_log(text) LANGUAGE sql AS $$ INSERT INTO log VALUES ($1) $$;
+    CALL add_log('hello');
+    SELECT msg FROM log;
+}
+expect {
+    hello
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE PROCEDURE is not supported$
+}
+
+test call-is-rejected {
+    CALL missing_procedure();
+}
+@sqlstate 42883
+expect error {
+    ^procedure missing_procedure\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CALL is not supported$
+}
+
+test do-is-rejected {
+    DO $$ BEGIN PERFORM 1; END $$;
+    SELECT 'done';
+}
+expect {
+    done
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DO is not supported$
+}
+
+test alter-function-is-rejected {
+    ALTER FUNCTION missing_function(int) STABLE;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER FUNCTION is not supported$
+}
+
+test alter-function-rename-is-rejected {
+    ALTER FUNCTION missing_function(int) RENAME TO other_function;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER FUNCTION is not supported$
+}
+
+test alter-function-owner-is-rejected {
+    ALTER FUNCTION missing_function(int) OWNER TO postgres;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER FUNCTION is not supported$
+}
+
+test alter-function-set-schema-is-rejected {
+    ALTER FUNCTION missing_function(int) SET SCHEMA public;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER FUNCTION is not supported$
+}
+
+test alter-procedure-is-rejected {
+    ALTER PROCEDURE missing_procedure() SECURITY DEFINER;
+}
+@sqlstate 42883
+expect error {
+    ^procedure missing_procedure\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER PROCEDURE is not supported$
+}
+
+test alter-routine-is-rejected {
+    ALTER ROUTINE missing_function(int) STABLE;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER ROUTINE is not supported$
+}
+
+test alter-function-of-a-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    ALTER FUNCTION one() RENAME TO uno;
+    SELECT uno();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test drop-function-is-rejected {
+    DROP FUNCTION missing_function(int);
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP FUNCTION is not supported$
+}
+
+test drop-function-if-exists-is-rejected {
+    DROP FUNCTION IF EXISTS missing_function(int);
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP FUNCTION is not supported$
+}
+
+test drop-procedure-is-rejected {
+    DROP PROCEDURE IF EXISTS missing_procedure();
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP PROCEDURE is not supported$
+}
+
+test drop-routine-is-rejected {
+    DROP ROUTINE IF EXISTS missing_function(int);
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP ROUTINE is not supported$
+}
+
+test create-aggregate-is-rejected {
+    CREATE AGGREGATE my_sum (int) (SFUNC = int4pl, STYPE = int);
+    SELECT my_sum(x) FROM (VALUES (1), (2)) AS v(x);
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE AGGREGATE is not supported$
+}
+
+test drop-aggregate-is-rejected {
+    DROP AGGREGATE IF EXISTS missing_aggregate(int);
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP AGGREGATE is not supported$
+}
+
+test create-transform-is-rejected {
+    CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION missing_from_sql(internal), TO SQL WITH FUNCTION missing_to_sql(internal));
+}
+@sqlstate 42883
+expect error {
+    ^function missing_from_sql\(internal\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE TRANSFORM is not supported$
+}
+
+test create-language-is-rejected {
+    CREATE LANGUAGE my_language HANDLER plpgsql_call_handler;
+    SELECT lanname FROM pg_language WHERE lanname = 'my_language';
+}
+expect {
+    my_language
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE LANGUAGE is not supported$
+}
+
+test drop-language-is-rejected {
+    DROP LANGUAGE missing_language;
+}
+@sqlstate 42704
+expect error {
+    ^language "missing_language" does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DROP LANGUAGE is not supported$
+}
+
+# The language and the options of CREATE FUNCTION.
+
+test create-function-in-plpgsql-is-rejected {
+    CREATE FUNCTION add_one(int) RETURNS int LANGUAGE plpgsql STABLE AS $$ BEGIN RETURN $1 + 1; END $$;
+    SELECT add_one(1);
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^LANGUAGE plpgsql is not supported$
+}
+
+test create-function-in-the-internal-language-is-rejected {
+    CREATE FUNCTION my_abs(int) RETURNS int LANGUAGE internal STABLE AS 'int4abs';
+    SELECT my_abs(-3);
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^LANGUAGE internal is not supported$
+}
+
+test create-function-without-a-language-is-rejected {
+    CREATE FUNCTION one() RETURNS int STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^no language specified$
+}
+
+test create-function-with-an-inline-body-in-plpgsql-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE plpgsql STABLE RETURN 1;
+}
+@sqlstate 42P13
+expect error {
+    ^inline SQL function body only valid for language SQL$
+}
+
+test create-function-with-an-option-given-twice-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE IMMUTABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42601
+expect error {
+    ^conflicting or redundant options$
+}
+
+test create-window-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE WINDOW AS $$ SELECT 1 $$;
+    SELECT 'created';
+}
+expect {
+    created
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. WINDOW is not supported$
+}
+
+test create-function-with-a-transform-is-rejected {
+    CREATE FUNCTION one(int) RETURNS int LANGUAGE sql STABLE TRANSFORM FOR TYPE int AS $$ SELECT $1 $$;
+}
+@sqlstate 42704
+expect error {
+    ^transform for type integer language "sql" does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. TRANSFORM is not supported$
+}
+
+test create-leakproof-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE LEAKPROOF AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. LEAKPROOF is not supported$
+}
+
+test create-not-leakproof-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE NOT LEAKPROOF AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. NOT LEAKPROOF is not supported$
+}
+
+test create-security-definer-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE SECURITY DEFINER AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. SECURITY DEFINER is not supported$
+}
+
+test create-security-invoker-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE SECURITY INVOKER AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. SECURITY INVOKER is not supported$
+}
+
+test create-function-called-on-null-input-is-rejected {
+    CREATE FUNCTION is_missing(int) RETURNS boolean LANGUAGE sql STABLE CALLED ON NULL INPUT AS $$ SELECT $1 IS NULL $$;
+    SELECT is_missing(NULL);
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. CALLED ON NULL INPUT is not supported$
+}
+
+test create-function-returns-null-on-null-input-is-rejected {
+    CREATE FUNCTION is_missing(int) RETURNS boolean LANGUAGE sql STABLE RETURNS NULL ON NULL INPUT AS $$ SELECT $1 IS NULL $$;
+    SELECT coalesce(is_missing(NULL)::text, '<null>');
+}
+expect {
+    <null>
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. STRICT / RETURNS NULL ON NULL INPUT is not supported$
+}
+
+test create-strict-function-is-rejected {
+    CREATE FUNCTION is_missing(int) RETURNS boolean LANGUAGE sql STABLE STRICT AS $$ SELECT $1 IS NULL $$;
+    SELECT coalesce(is_missing(NULL)::text, '<null>');
+}
+expect {
+    <null>
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. STRICT / RETURNS NULL ON NULL INPUT is not supported$
+}
+
+test create-parallel-safe-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE PARALLEL SAFE AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. PARALLEL is not supported$
+}
+
+test create-function-with-a-cost-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE COST 10 AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. COST is not supported$
+}
+
+test create-function-with-rows-is-rejected {
+    CREATE FUNCTION one_two() RETURNS SETOF int LANGUAGE sql STABLE ROWS 2 AS $$ SELECT 1 UNION ALL SELECT 2 $$;
+    SELECT count(*) FROM one_two();
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. ROWS is not supported$
+}
+
+test create-function-with-a-support-function-is-rejected {
+    CREATE FUNCTION one(int) RETURNS int LANGUAGE sql STABLE SUPPORT generate_series_int4_support AS $$ SELECT $1 $$;
+    SELECT one(1);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. SUPPORT is not supported$
+}
+
+test create-function-with-a-setting-is-rejected {
+    CREATE FUNCTION path() RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog AS $$ SELECT current_setting('search_path') $$;
+    SELECT path();
+}
+expect {
+    pg_catalog
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. SET is not supported$
+}
+
+test create-function-with-a-setting-from-current-is-rejected {
+    SET search_path = pg_catalog, public;
+    CREATE FUNCTION path() RETURNS text LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$ SELECT current_setting('search_path') $$;
+    RESET search_path;
+    SELECT path();
+}
+expect {
+    pg_catalog, public
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. SET \.\.\. FROM CURRENT is not supported$
+}
+
+# Volatility. tursopg will support STABLE functions first.
+
+test create-function-without-volatility-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a VOLATILE function \(a function without STABLE or IMMUTABLE\) is not supported$
+}
+
+test create-volatile-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql VOLATILE AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a VOLATILE function \(a function without STABLE or IMMUTABLE\) is not supported$
+}
+
+test create-immutable-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^an IMMUTABLE function is not supported$
+}
+
+test create-volatile-function-that-changes-data-is-rejected {
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION add_log(text) RETURNS text LANGUAGE sql AS $$ INSERT INTO log VALUES ($1) RETURNING msg $$;
+    SELECT add_log('hello');
+}
+expect {
+    hello
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a VOLATILE function \(a function without STABLE or IMMUTABLE\) is not supported$
+}
+
+# The parameters and the result of a function.
+
+test create-function-with-a-polymorphic-parameter-is-rejected {
+    CREATE FUNCTION first_of(anyelement, anyelement) RETURNS anyelement LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+    SELECT first_of(1, 2), first_of('a'::text, 'b');
+}
+expect {
+    1|a
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of polymorphic type anyelement is not supported$
+}
+
+test create-function-with-a-polymorphic-array-parameter-is-rejected {
+    CREATE FUNCTION first_element(anycompatiblearray) RETURNS anycompatible LANGUAGE sql STABLE AS $$ SELECT $1[1] $$;
+    SELECT first_element(ARRAY[7, 8]);
+}
+expect {
+    7
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of polymorphic type anycompatiblearray is not supported$
+}
+
+@setup emp
+test create-function-with-a-table-row-parameter-is-rejected {
+    CREATE FUNCTION double_salary(emp) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT $1.salary * 2 $$;
+    SELECT name, double_salary(emp.*) FROM emp;
+}
+expect {
+    Bill|8400
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of composite type emp is not supported$
+}
+
+# PostgreSQL also accepts the table name alone as the row of the table, but
+# discourages it. tursopg will not support it.
+@setup emp
+test function-call-with-a-table-name-as-argument-is-rejected {
+    CREATE FUNCTION double_salary(emp) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT $1.salary * 2 $$;
+    SELECT name, double_salary(emp) FROM emp;
+}
+expect {
+    Bill|8400
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of composite type emp is not supported$
+}
+
+@setup emp
+test create-function-with-a-schema-qualified-table-row-parameter-is-rejected {
+    CREATE FUNCTION double_salary(public.emp) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT $1.salary * 2 $$;
+    SELECT name, double_salary(emp.*) FROM emp;
+}
+expect {
+    Bill|8400
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of composite type public\.emp is not supported$
+}
+
+@setup emp
+test create-function-returning-a-table-row-is-rejected {
+    CREATE FUNCTION new_emp() RETURNS emp LANGUAGE sql STABLE AS $$ SELECT 'None'::text, 1000.0 $$;
+    SELECT (new_emp()).name;
+}
+expect {
+    None
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function result of composite type emp is not supported$
+}
+
+@setup emp
+test create-function-returning-the-row-of-a-view-is-rejected {
+    CREATE VIEW emp_names AS SELECT name FROM emp;
+    CREATE FUNCTION first_name() RETURNS emp_names LANGUAGE sql STABLE AS $$ SELECT name FROM emp $$;
+    SELECT (first_name()).name;
+}
+expect {
+    Bill
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function result of composite type emp_names is not supported$
+}
+
+test create-function-with-an-enum-parameter-is-rejected {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION is_happy(mood) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 = 'happy' $$;
+    SELECT is_happy('happy');
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of user-defined type mood is not supported$
+}
+
+test create-function-returning-a-domain-is-rejected {
+    CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+    CREATE FUNCTION one() RETURNS positive LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function result of user-defined type positive is not supported$
+}
+
+test create-function-with-an-array-parameter-is-rejected {
+    CREATE FUNCTION first_element(int[]) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1[1] $$;
+    SELECT first_element(ARRAY[7, 8]);
+}
+expect {
+    7
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of an array type is not supported$
+}
+
+test create-function-with-a-range-parameter-is-rejected {
+    CREATE FUNCTION low(int4range) RETURNS int LANGUAGE sql STABLE AS $$ SELECT lower($1) $$;
+    SELECT low('[1,3)');
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter of range type int4range is not supported$
+}
+
+test create-function-with-a-missing-type-is-rejected {
+    CREATE FUNCTION one(missing_type) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42704
+expect error {
+    ^type missing_type does not exist$
+}
+
+test create-function-with-a-record-parameter-is-rejected {
+    CREATE FUNCTION one(record) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^SQL functions cannot have arguments of type record$
+}
+
+test create-function-with-an-any-parameter-is-rejected {
+    CREATE FUNCTION one("any") RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^SQL functions cannot have arguments of type "any"$
+}
+
+test create-function-with-a-set-parameter-is-rejected {
+    CREATE FUNCTION one(SETOF int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^functions cannot accept set arguments$
+}
+
+test create-sql-function-returning-trigger-is-rejected {
+    CREATE FUNCTION nothing() RETURNS trigger LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^SQL functions cannot return type trigger$
+}
+
+test create-function-without-a-result-type-is-rejected {
+    CREATE FUNCTION one() LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^function result type must be specified$
+}
+
+@setup emp
+test create-function-returning-the-type-of-a-column-is-rejected {
+    CREATE FUNCTION max_salary() RETURNS emp.salary%TYPE LANGUAGE sql STABLE AS $$ SELECT max(salary) FROM emp $$;
+    SELECT max_salary();
+}
+expect {
+    4200
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function result type written with %TYPE is not supported$
+}
+
+@setup emp
+test create-function-with-a-parameter-of-the-type-of-a-column-is-rejected {
+    CREATE FUNCTION raise(emp.salary%TYPE) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT $1 + 100 $$;
+    SELECT raise(salary) FROM emp;
+}
+expect {
+    4300
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function parameter type written with %TYPE is not supported$
+}
+
+@setup emp
+test create-function-returning-setof-a-table-is-rejected {
+    CREATE FUNCTION all_emps() RETURNS SETOF emp LANGUAGE sql STABLE AS $$ SELECT * FROM emp $$;
+    SELECT name FROM all_emps();
+}
+expect {
+    Bill
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS SETOF is not supported$
+}
+
+test create-function-returning-setof-a-base-type-is-rejected {
+    CREATE FUNCTION one_two() RETURNS SETOF int LANGUAGE sql STABLE AS $$ SELECT 1 UNION ALL SELECT 2 $$;
+    SELECT * FROM one_two();
+}
+expect {
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS SETOF is not supported$
+}
+
+# PostgreSQL gives one row for each value when a set-returning function is
+# called in the select list.
+test set-returning-function-call-in-the-select-list-is-rejected {
+    CREATE TABLE nodes (name text, parent text);
+    INSERT INTO nodes VALUES ('Child1', 'Top'), ('Child2', 'Top');
+    CREATE FUNCTION list_children(text) RETURNS SETOF text LANGUAGE sql STABLE AS $$ SELECT name FROM nodes WHERE parent = $1 ORDER BY name $$;
+    SELECT list_children('Top');
+}
+expect {
+    Child1
+    Child2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS SETOF is not supported$
+}
+
+test create-function-returning-record-is-rejected {
+    CREATE FUNCTION pair() RETURNS record LANGUAGE sql STABLE AS $$ SELECT 1, 'a'::text $$;
+    SELECT * FROM pair() AS p(n int, s text);
+}
+expect {
+    1|a
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS record is not supported$
+}
+
+test create-function-returning-table-is-rejected {
+    CREATE FUNCTION pairs() RETURNS TABLE (n int, s text) LANGUAGE sql STABLE AS $$ SELECT 1, 'a'::text $$;
+    SELECT n, s FROM pairs();
+}
+expect {
+    1|a
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS TABLE is not supported$
+}
+
+test create-function-returning-void-is-rejected {
+    CREATE FUNCTION nothing() RETURNS void LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    SELECT count(*) FROM (SELECT nothing()) AS calls;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS void is not supported$
+}
+
+test create-function-with-out-parameters-is-rejected {
+    CREATE FUNCTION sum_and_product(int, int, OUT int, OUT int) LANGUAGE sql STABLE AS $$ SELECT $1 + $2, $1 * $2 $$;
+    SELECT * FROM sum_and_product(3, 4);
+}
+expect {
+    7|12
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^an OUT parameter is not supported$
+}
+
+test create-function-with-an-inout-parameter-is-rejected {
+    CREATE FUNCTION add_one(INOUT int) LANGUAGE sql STABLE AS $$ SELECT $1 + 1 $$;
+    SELECT add_one(1);
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^an INOUT parameter is not supported$
+}
+
+test create-function-with-a-variadic-parameter-is-rejected {
+    CREATE FUNCTION sum_all(VARIADIC int[]) RETURNS bigint LANGUAGE sql STABLE AS $$ SELECT sum(x) FROM unnest($1) AS x $$;
+    SELECT sum_all(1, 2, 3);
+}
+expect {
+    6
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a VARIADIC parameter is not supported$
+}
+
+test create-function-with-a-named-parameter-is-rejected {
+    CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT a + b $$;
+    SELECT add(1, 2);
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a named function parameter is not supported$
+}
+
+test function-call-with-named-notation-is-rejected {
+    CREATE FUNCTION is_true(value boolean) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT value $$;
+    SELECT is_true(value => false);
+}
+expect {
+    f
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a named function parameter is not supported$
+}
+
+test create-function-with-a-parameter-default-is-rejected {
+    CREATE FUNCTION add(int, int DEFAULT 10) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 + $2 $$;
+    SELECT add(1);
+}
+expect {
+    11
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^DEFAULT on a function parameter is not supported$
+}
+
+# The body of a function.
+
+test create-function-with-a-return-body-is-rejected {
+    CREATE FUNCTION add(int, int) RETURNS int LANGUAGE sql STABLE RETURN $1 + $2;
+    SELECT add(1, 2);
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. RETURN is not supported$
+}
+
+test create-function-with-a-begin-atomic-body-is-rejected {
+    CREATE FUNCTION add(int, int) RETURNS int LANGUAGE sql STABLE BEGIN ATOMIC SELECT $1 + $2; END;
+    SELECT add(1, 2);
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION \.\.\. BEGIN ATOMIC is not supported$
+}
+
+test create-function-without-a-body-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE;
+}
+@sqlstate 42P13
+expect error {
+    ^no function body specified$
+}
+
+test create-function-with-two-body-strings-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$, $$ SELECT 2 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^only one AS item needed for language "sql"$
+}
+
+test create-function-with-a-single-quoted-body-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS 'SELECT 1';
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function body that is not dollar-quoted is not supported$
+}
+
+test create-function-with-an-escape-string-body-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS E'SELECT 1';
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function body that is not dollar-quoted is not supported$
+}
+
+test create-function-with-a-tagged-dollar-quoted-body {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS -- the body
+    $body$ SELECT 1 $body$;
+    SELECT one();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test create-function-with-a-syntax-error-in-the-body-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELEC 1 $$;
+}
+@sqlstate 42601
+expect error {
+    ^syntax error at or near "SELEC"$
+}
+
+test create-function-with-an-empty-body-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return integer$
+}
+@sqlstate 42P13
+expect @tursopg error {
+    ^a function body must end with a SELECT statement$
+}
+
+test create-function-with-a-body-that-does-not-end-with-select-is-rejected {
+    CREATE FUNCTION path() RETURNS text LANGUAGE sql STABLE AS $$ SHOW search_path $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return text$
+}
+@sqlstate 42P13
+expect @tursopg error {
+    ^a function body must end with a SELECT statement$
+}
+
+test create-function-with-several-statements-is-rejected {
+    CREATE FUNCTION two() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1; SELECT 2 $$;
+    SELECT two();
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a function body with more than one statement is not supported$
+}
+
+# PostgreSQL rejects the CREATE TABLE only when the function runs.
+test create-function-with-ddl-is-rejected {
+    CREATE FUNCTION make_table() RETURNS int LANGUAGE sql STABLE AS $$ CREATE TABLE made (a int); SELECT 1 $$;
+    SELECT 'created';
+}
+expect {
+    created
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a DDL statement in a function body is not supported$
+}
+
+# PostgreSQL rejects the INSERT only when the function runs, and tursopg
+# rejects it when the function is created.
+test stable-function-that-inserts-is-rejected {
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION add_log(text) RETURNS text LANGUAGE sql STABLE AS $$ INSERT INTO log VALUES ($1) RETURNING msg $$;
+    SELECT add_log('hello');
+}
+@sqlstate 0A000
+expect error {
+    ^INSERT is not allowed in a non-volatile function$
+}
+
+test stable-function-with-a-data-modifying-with-query-is-rejected {
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION add_log(text) RETURNS text LANGUAGE sql STABLE AS $$ WITH added AS (INSERT INTO log VALUES ($1) RETURNING msg) SELECT msg FROM added $$;
+    SELECT add_log('hello');
+}
+@sqlstate 0A000
+expect error {
+    ^SELECT is not allowed in a non-volatile function$
+}
+
+test stable-function-that-locks-rows-is-rejected {
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION first_log() RETURNS text LANGUAGE sql STABLE AS $$ SELECT msg FROM log FOR UPDATE $$;
+    SELECT coalesce(first_log(), '<null>');
+}
+@sqlstate 0A000
+expect error {
+    ^SELECT FOR UPDATE is not allowed in a non-volatile function$
+}
+
+# What tursopg will support first: STABLE SQL functions with parameters and
+# a result of base types.
+
+test create-function-with-base-types {
+    CREATE FUNCTION add(int, int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 + $2 $$;
+    SELECT add(1, 2);
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test create-function-adds-a-row-to-pg-proc {
+    CREATE FUNCTION add(int, int) RETURNS int LANGUAGE sql STABLE AS $$SELECT $1 + $2$$;
+    SELECT p.proname, l.lanname, p.prosrc, p.prosqlbody IS NULL FROM pg_proc AS p JOIN pg_language AS l ON l.oid = p.prolang WHERE p.proname = 'add';
+}
+expect {
+    add|sql|SELECT $1 + $2|t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test create-or-replace-function-replaces-the-body {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 41 $$;
+    CREATE OR REPLACE FUNCTION answer() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 42 $$;
+    SELECT answer();
+}
+expect {
+    42
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test create-or-replace-function-cannot-change-the-result-type {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 42 $$;
+    CREATE OR REPLACE FUNCTION answer() RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'forty-two' $$;
+}
+@sqlstate 42P13
+expect error {
+    ^cannot change return type of existing function$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+# PostgreSQL runs a function that calls itself. tursopg will reject it.
+test create-or-replace-function-that-calls-itself {
+    CREATE FUNCTION countdown(int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 0 $$;
+    CREATE OR REPLACE FUNCTION countdown(int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $1 <= 0 THEN 0 ELSE countdown($1 - 1) END $$;
+    SELECT countdown(3);
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+# tursopg rejects the first CREATE FUNCTION because it has no SQL functions
+# yet. It will reject the second one, because a function name will have
+# only one signature.
+test create-function-with-the-name-of-another-function-is-rejected {
+    CREATE FUNCTION describe(int) RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'int' $$;
+    CREATE FUNCTION describe(text) RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'text' $$;
+    SELECT describe(1), describe('a'::text);
+}
+expect {
+    int|text
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test function-call-with-arguments-of-other-types-is-rejected {
+    CREATE FUNCTION add(int, int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 + $2 $$;
+    SELECT add(1.5, 2);
+}
+@sqlstate 42883
+expect error {
+    ^function add\(numeric, integer\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test function-body-reads-tables-with-the-search-path-of-the-call {
+    CREATE SCHEMA first_schema;
+    CREATE SCHEMA second_schema;
+    CREATE TABLE first_schema.t (v text);
+    CREATE TABLE second_schema.t (v text);
+    INSERT INTO first_schema.t VALUES ('first');
+    INSERT INTO second_schema.t VALUES ('second');
+    SET search_path = first_schema;
+    CREATE FUNCTION read_t() RETURNS text LANGUAGE sql STABLE AS $$ SELECT v FROM t $$;
+    SET search_path = second_schema, first_schema;
+    SELECT read_t();
+}
+expect {
+    second
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test create-function-that-reads-a-missing-table-is-rejected {
+    CREATE FUNCTION count_missing() RETURNS bigint LANGUAGE sql STABLE AS $$ SELECT count(*) FROM missing $$;
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing" does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test create-function-without-checking-the-body {
+    SET check_function_bodies = false;
+    CREATE FUNCTION count_later() RETURNS bigint LANGUAGE sql STABLE AS $$ SELECT count(*) FROM created_later $$;
+    CREATE TABLE created_later (a int);
+    SELECT count_later();
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test drop-function-drops-a-function {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    DROP FUNCTION one();
+    SELECT one();
+}
+@sqlstate 42883
+expect error {
+    ^function one\(\) does not exist$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+test drop-function-used-by-a-view-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    CREATE VIEW calls_one AS SELECT one() AS x;
+    DROP FUNCTION one();
+}
+@sqlstate 2BP01
+expect error {
+    ^cannot drop function one\(\) because other objects depend on it$
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+# Calls of functions in column notation.
+
+test function-call-in-column-notation {
+    CREATE FUNCTION is_true(boolean) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+    SELECT (false).is_true;
+}
+expect {
+    f
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
