@@ -596,7 +596,10 @@ fn percent_decode(input: &str) -> Option<String> {
 ///   file:path               -> real file at path
 ///   file:///path             -> real file at /path (authority form)
 ///   file://localhost/path    -> real file at /path
-fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
+fn parse_uri_filename(
+    uri: &str,
+    flags: &mut ffi::c_int,
+) -> Result<(String, bool, bool), ffi::c_int> {
     // Must start with "file:"
     let after_file = &uri[5..];
 
@@ -620,17 +623,17 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
             Some(pos) => {
                 let authority = &after_slashes[..pos];
                 if !authority.is_empty() && authority != "localhost" {
-                    return Err(()); // non-local authority not supported
+                    return Err(SQLITE_CANTOPEN); // non-local authority not supported
                 }
-                percent_decode(&after_slashes[pos..]).ok_or(())?
+                percent_decode(&after_slashes[pos..]).ok_or(SQLITE_CANTOPEN)?
             }
             None => {
                 // file:// with no path after authority
-                return Err(());
+                return Err(SQLITE_CANTOPEN);
             }
         }
     } else {
-        percent_decode(raw_path).ok_or(())?
+        percent_decode(raw_path).ok_or(SQLITE_CANTOPEN)?
     };
 
     let mut is_memory = path == ":memory:";
@@ -644,8 +647,23 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
             match key {
                 "mode" => match value {
                     "memory" => is_memory = true,
-                    "ro" | "rw" | "rwc" => {} // valid modes, no-op (Turso doesn't enforce read-only yet)
-                    _ => return Err(()),      // unknown mode -> SQLITE_CANTOPEN
+                    "ro" => {
+                        *flags = (*flags & !(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE))
+                            | SQLITE_OPEN_READONLY;
+                    }
+                    "rw" => {
+                        if (*flags & SQLITE_OPEN_READONLY) != 0 {
+                            return Err(SQLITE_PERM);
+                        }
+                        *flags = (*flags & !SQLITE_OPEN_CREATE) | SQLITE_OPEN_READWRITE;
+                    }
+                    "rwc" => {
+                        if (*flags & SQLITE_OPEN_CREATE) == 0 {
+                            return Err(SQLITE_PERM);
+                        }
+                        *flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+                    }
+                    _ => return Err(SQLITE_ERROR),
                 },
                 "cache" => {
                     if value == "shared" {
@@ -665,7 +683,7 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
 pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const ffi::c_char,
     db_out: *mut *mut sqlite3,
-    flags: ffi::c_int,
+    mut flags: ffi::c_int,
     _z_vfs: *const ffi::c_char,
 ) -> ffi::c_int {
     trace!("sqlite3_open_v2");
@@ -676,6 +694,15 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     if filename.is_null() || db_out.is_null() {
         return SQLITE_MISUSE;
     }
+
+    let access_flags = flags & (SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    if access_flags != SQLITE_OPEN_READONLY
+        && access_flags != SQLITE_OPEN_READWRITE
+        && access_flags != (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+    {
+        return SQLITE_MISUSE;
+    }
+
     let filename_cstr = CStr::from_ptr(filename);
     let filename_str = match filename_cstr.to_str() {
         Ok(s) => s,
@@ -685,9 +712,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     // Determine the effective filename and whether to use in-memory IO
     let (effective_filename, use_memory, cache_shared) =
         if (flags & SQLITE_OPEN_URI) != 0 && filename_str.starts_with("file:") {
-            match parse_uri_filename(filename_str) {
+            match parse_uri_filename(filename_str, &mut flags) {
                 Ok(result) => result,
-                Err(()) => return SQLITE_CANTOPEN,
+                Err(err_rc) => return err_rc,
             }
         } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
             (":memory:".to_string(), true, false)
@@ -715,10 +742,14 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         && std::fs::metadata(&effective_filename)
             .map(|m| m.permissions().readonly())
             .unwrap_or(false);
-    let file_open_flags = if (flags & SQLITE_OPEN_READONLY) != 0 || file_is_readonly {
+    let file_open_flags = if temp_path.is_some() {
+        turso_core::OpenFlags::Create
+    } else if (flags & SQLITE_OPEN_READONLY) != 0 || file_is_readonly {
         turso_core::OpenFlags::ReadOnly
+    } else if (flags & SQLITE_OPEN_CREATE) != 0 {
+        turso_core::OpenFlags::Create
     } else {
-        turso_core::OpenFlags::default()
+        turso_core::OpenFlags::None
     };
 
     let use_shared_memory = use_memory && cache_shared;
