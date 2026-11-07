@@ -1982,6 +1982,128 @@ fn test_blob_read_corrupt_overflow_chain_no_panic(db: TempDatabase) {
     assert_that!(blob.read(9000, &mut buf)).is_err();
 }
 
+/// Creates a row with an overflow chain, then corrupts the chain to point past
+/// the end of the file. A table read must return a corruption error, as in SQLite,
+/// not an I/O error.
+#[cfg(not(feature = "checksum"))]
+#[test]
+fn test_table_read_reports_overflow_page_past_end_as_corrupt() {
+    // The database structure:
+    // - Page 1: sqlite_master (schema)
+    // - Page 2: t table data
+    // - Pages 3-6: overflow chain of the blob
+    let (_dir, path) = sqlite_db_with_overflow_pointer_past_end(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+         INSERT INTO t VALUES (1, zeroblob(20000));",
+        3,
+    );
+    // length(b) comes from the record header, so read the bytes with hex() to
+    // follow the chain.
+    assert_query_reports_corrupt(&path, "SELECT length(hex(b)) FROM t");
+}
+
+/// Same as above, but for an index scan, which reads the whole index record.
+#[cfg(not(feature = "checksum"))]
+#[test]
+fn test_index_read_reports_overflow_page_past_end_as_corrupt() {
+    // The database structure:
+    // - Page 1: sqlite_master (schema)
+    // - Page 2: w table data
+    // - Page 3: wx index data
+    // - Pages 4-6: overflow chain of the index entry
+    // - Pages 7-8: overflow chain of the table row
+    let (_dir, path) = sqlite_db_with_overflow_pointer_past_end(
+        "CREATE TABLE w(x TEXT);
+         CREATE INDEX wx ON w(x);
+         INSERT INTO w VALUES (printf('%.*c', 12000, 'a'));",
+        4,
+    );
+    assert_query_reports_corrupt(&path, "SELECT length(x) FROM w INDEXED BY wx WHERE x > ''");
+}
+
+/// SQLite uses the header page count only when it isn't 0 and the version-valid-for
+/// number matches the change counter. Otherwise it uses the file size, as for
+/// files written by SQLite before 3.7.0. A valid overflow chain must be readable
+/// in both cases, even though the header count is too small.
+#[cfg(not(feature = "checksum"))]
+#[test]
+fn test_overflow_read_when_header_page_count_is_not_valid() {
+    // (page count at offset 28, version-valid-for at offset 92)
+    for (page_count, version_valid_for) in [(0, None), (3, Some(12345))] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stale_page_count.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+             INSERT INTO t VALUES (1, zeroblob(20000));",
+        )
+        .unwrap();
+        conn.close().unwrap();
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(28)).unwrap();
+        file.write_all(&u32::to_be_bytes(page_count)).unwrap();
+        if let Some(version_valid_for) = version_valid_for {
+            file.seek(SeekFrom::Start(92)).unwrap();
+            file.write_all(&u32::to_be_bytes(version_valid_for))
+                .unwrap();
+        }
+        drop(file);
+
+        let query = "SELECT length(hex(b)) FROM t";
+        let sqlite_conn = rusqlite::Connection::open(&path).unwrap();
+        let sqlite_len: i64 = sqlite_conn.query_row(query, [], |row| row.get(0)).unwrap();
+        assert_eq!(sqlite_len, 40000, "page count {page_count}");
+        drop(sqlite_conn);
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn.exec_rows(query);
+        assert_eq!(rows, vec![(40000,)], "page count {page_count}");
+    }
+}
+
+/// Helper that creates a database with SQLite from `sql`, then sets the next
+/// page pointer of overflow page `page` to 9999, past the end of the file.
+#[cfg(not(feature = "checksum"))]
+fn sqlite_db_with_overflow_pointer_past_end(
+    sql: &str,
+    page: u64,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("bad_overflow_pointer.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(sql).unwrap();
+    conn.close().unwrap();
+
+    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start((page - 1) * PAGE_SIZE as u64))
+        .unwrap();
+    file.write_all(&9999u32.to_be_bytes()).unwrap();
+    (dir, path)
+}
+
+/// Helper that runs `query` on SQLite and on Turso, and asserts that both return
+/// a corruption error.
+#[cfg(not(feature = "checksum"))]
+fn assert_query_reports_corrupt(path: &std::path::Path, query: &str) {
+    let sqlite_conn = rusqlite::Connection::open(path).unwrap();
+    let sqlite_result = sqlite_conn.query_row(query, [], |row| row.get::<_, i64>(0));
+    assert!(
+        matches!(sqlite_result, Err(rusqlite::Error::SqliteFailure(ref e, _)) if e.code == rusqlite::ErrorCode::DatabaseCorrupt),
+        "{sqlite_result:?}"
+    );
+    drop(sqlite_conn);
+
+    let db = TempDatabase::new_with_existent(path);
+    let conn = db.connect_limbo();
+    let result = conn.execute(query);
+    assert!(
+        matches!(result, Err(turso_core::LimboError::Corrupt(_))),
+        "{result:?}"
+    );
+}
+
 /// A record header that is corrupt before the requested column must fail the
 /// read, as in SQLite, even when the record spills into overflow pages and the
 /// column is read on its own. Here `a` claims 8185 bytes instead of 100, which
