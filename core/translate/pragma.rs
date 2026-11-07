@@ -323,7 +323,6 @@ pub fn translate_pragma(
             }
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
             program.begin_write_on_database(database_id, schema_cookie)?;
-            program.begin_write_operation()?;
         }
         TransactionMode::Concurrent => {
             program.begin_concurrent_operation();
