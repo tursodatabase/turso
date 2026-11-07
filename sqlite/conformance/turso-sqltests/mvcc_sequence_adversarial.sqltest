@@ -83,6 +83,7 @@ expect {
 # watermark rows (no inline compaction outside CYCLE) and a same-name
 # re-CREATE resumed nextval from the old MAX(value).
 test mvcc-drop-table-releases-autoincrement-sequence {
+    PRAGMA show_internal_schema = ON;
     PRAGMA journal_mode='mvcc';
     CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
     INSERT INTO t(v) VALUES('a'),('b'),('c');
@@ -254,6 +255,7 @@ expect {
 # entries and the persistent sqlite_schema row for the backing table
 # follow the rename.
 test mvcc-alter-rename-autoincrement-table-keeps-sequence-attached {
+    PRAGMA show_internal_schema = ON;
     PRAGMA journal_mode='mvcc';
     CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
     INSERT INTO old(v) VALUES('a'),('b');
@@ -277,6 +279,7 @@ expect {
 # (renamed) implicit sequence. Combined regression for the rename +
 # orphan-cleanup paths.
 test mvcc-rename-then-drop-table-releases-renamed-sequence {
+    PRAGMA show_internal_schema = ON;
     PRAGMA journal_mode='mvcc';
     CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
     INSERT INTO old(v) VALUES('a'),('b');

@@ -8,9 +8,74 @@
 //! from sqlite_schema should have been consumed, but N remain".
 //! See https://github.com/tursodatabase/turso/issues/5616
 
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{limbo_exec_rows_internal, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use tempfile::TempDir;
+
+/// Turso's internal autoincrement bookkeeping table (the `__turso_internal_seq_*`
+/// backing table) must stay hidden from user-facing schema enumeration, the way SQLite
+/// keeps its own machinery behind the `sqlite_` prefix. Otherwise the common
+/// "enumerate user tables, then drop them" idiom breaks, because dropping the owning
+/// table also drops its internal table and the later DROP errors out.
+/// See https://github.com/tursodatabase/turso/issues/7980.
+#[test]
+fn test_internal_autoincrement_table_hidden_from_schema() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+
+    // sqlite_master shows only the user table and sqlite_sequence, exactly like SQLite —
+    // not the __turso_internal_ backing table.
+    let tables: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+    assert_eq!(tables, vec![("sqlite_sequence".into(),), ("t".into(),)]);
+
+    // The conventional user-tables filter returns only t. This is the bug: it used to
+    // also return the __turso_internal_ table, which the `sqlite*` filter does not catch.
+    let user_tables: Vec<(String,)> = conn
+        .exec_rows("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite*'");
+    assert_eq!(user_tables, vec![("t".into(),)]);
+
+    // PRAGMA table_list hides it too.
+    let listed: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM pragma_table_list WHERE name NOT GLOB 'sqlite*' ORDER BY name",
+    );
+    assert_eq!(listed, vec![("t".into(),)]);
+
+    // The table is hidden, not gone: an internal-origin query still sees it.
+    let internal = limbo_exec_rows_internal(
+        &conn,
+        "SELECT name FROM sqlite_master WHERE name GLOB '__turso_internal_*'",
+    );
+    assert!(
+        !internal.is_empty(),
+        "internal backing table must still exist on disk"
+    );
+
+    // PRAGMA show_internal_schema opts an ordinary connection back into seeing
+    // the internal rows, then hides them again.
+    conn.execute("PRAGMA show_internal_schema = ON").unwrap();
+    let shown: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_master WHERE name GLOB '__turso_internal_*'");
+    assert_eq!(
+        shown,
+        vec![("__turso_internal_seq___turso_internal_autoincrement_t".into(),)]
+    );
+    conn.execute("PRAGMA show_internal_schema = OFF").unwrap();
+    let hidden: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_master WHERE name GLOB '__turso_internal_*'");
+    assert!(hidden.is_empty());
+
+    // The enumerate-and-drop idiom from the issue now succeeds.
+    for (name,) in &user_tables {
+        conn.execute(format!("DROP TABLE \"{name}\"")).unwrap();
+    }
+    let remaining: Vec<(String,)> = conn
+        .exec_rows("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite*'");
+    assert!(remaining.is_empty());
+}
 
 /// After ALTER TABLE DROP COLUMN on an AUTOINCREMENT table, reopen must parse
 /// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.

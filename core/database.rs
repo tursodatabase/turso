@@ -2798,6 +2798,7 @@ impl Database {
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             tx_read_only: AtomicBool::new(false),
+            show_internal_schema: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
