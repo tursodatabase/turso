@@ -8,9 +8,9 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, ColumnLayout, Index, Schema, SchemaObjectType, StructDef, Table,
+    Type, TypeDef, TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -23,9 +23,12 @@ use crate::translate::emitter::{
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, iif_values, value_type, ExprType,
 };
-use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr::{
+    emit_custom_type_encode_columns, takes_input_of_type, translate_expr_no_constant_opt,
+    walk_expr, NoConstantOptReason, WalkControl,
+};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinity, ColumnMask, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sequence::bind_sequence_names;
@@ -1261,6 +1264,9 @@ pub fn translate_create_table(
     )?;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
+    if resolver.catalog.dialect.checks_string_defaults_at_create() && !connection.is_nested_stmt() {
+        emit_string_default_checks(program, &body, &normalized_tbl_name, resolver)?;
+    }
 
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
@@ -1596,6 +1602,108 @@ fn bind_default_sequence_names(
         }
     }
     Ok(bound)
+}
+
+/// Runs each column DEFAULT that is a quoted string through the type checks
+/// and ENCODE that INSERT runs on a value of the column, so a default that the
+/// column type rejects fails the CREATE TABLE. As in PostgreSQL, the type's
+/// parameters, such as the length of `varchar(n)`, are not checked here.
+fn emit_string_default_checks(
+    program: &mut ProgramBuilder,
+    body: &ast::CreateTableBody,
+    table_name: &str,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut table = create_table(
+        table_name,
+        body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
+    if !table.is_strict {
+        return Ok(());
+    }
+    table.resolve_custom_types(resolver.schema())?;
+    let mut defaults = Vec::new();
+    let mut checked_columns = ColumnMask::default();
+    for (i, column) in table.columns_mut().iter_mut().enumerate() {
+        let Some(literal) = column
+            .default
+            .as_deref()
+            .and_then(|default| string_default(default, column))
+        else {
+            continue;
+        };
+        defaults.push((i, literal.clone()));
+        column.ty_params.clear();
+        checked_columns.set(i)?;
+    }
+    if defaults.is_empty() {
+        return Ok(());
+    }
+
+    let table = Arc::new(table);
+    let layout = ColumnLayout::from_btree(&table)?;
+    let start_reg = program.alloc_registers(layout.num_non_virtual_cols());
+    program.emit_insn(Insn::Null {
+        dest: start_reg,
+        dest_end: Some(start_reg + layout.num_non_virtual_cols() - 1),
+    });
+    for (i, literal) in &defaults {
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            literal,
+            layout.to_register(start_reg, *i),
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    }
+    program.emit_insn(Insn::TypeCheck {
+        start_reg,
+        count: layout.num_non_virtual_cols(),
+        check_generated: false,
+        table_reference: BTreeTable::input_type_check_table_ref(
+            &table,
+            resolver.schema(),
+            Some(&checked_columns),
+        )?,
+    });
+    emit_custom_type_encode_columns(
+        program,
+        resolver,
+        table.columns(),
+        start_reg,
+        Some(&checked_columns),
+        &table.name,
+        &layout,
+    )?;
+    program.emit_insn(Insn::TypeCheck {
+        start_reg,
+        count: layout.num_non_virtual_cols(),
+        check_generated: false,
+        table_reference: BTreeTable::type_check_table_ref(&table, resolver.schema()),
+    });
+    Ok(())
+}
+
+/// The quoted string of a DEFAULT written as `'text'`, `('text')`, or a cast of
+/// `'text'` to the column's own type.
+fn string_default<'a>(default: &'a ast::Expr, column: &Column) -> Option<&'a ast::Expr> {
+    match default {
+        ast::Expr::Literal(ast::Literal::String(_)) => Some(default),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => string_default(&exprs[0], column),
+        ast::Expr::Cast {
+            expr,
+            type_name: Some(type_name),
+        } if !column.is_array()
+            && type_name.array_dimensions == 0
+            && type_name.name.eq_ignore_ascii_case(&column.ty_str) =>
+        {
+            string_default(expr, column)
+        }
+        _ => None,
+    }
 }
 
 /// Translates `CREATE SCHEMA name`: a new namespace of the main
