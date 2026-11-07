@@ -2113,17 +2113,14 @@ fn test_second_writer_busy_does_not_invoke_busy_handler() {
     assert_eq!(env.observer_ids(), vec![1]);
 }
 
-// The two tests below pin known data-loss gaps in the MVCC deferred-commit
-// model; they document current behavior, not desired behavior. A writer that
-// finishes while a sibling statement holds the shared implicit MVCC
-// transaction open defers its commit to the last sibling, so any path that
-// ends that transaction in a rollback silently discards changes whose caller
-// already observed success. The durable fix is committing at the writer's own
-// halt; see the FIXME in `halt` (core/vdbe/execute.rs).
+// A writer that finishes while a sibling statement holds the shared implicit
+// MVCC transaction open defers its commit to the last sibling. The two tests
+// below cover the paths that used to end that transaction in a rollback and
+// silently discard changes whose caller already observed success.
 
 #[test]
-fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
-    let env = SameConnectionMvcc::new(":memory:completed-writer-lost-reader-abandoned");
+fn test_mvcc_completed_writer_changes_kept_when_last_reader_abandoned() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-kept-reader-abandoned");
     env.setup_rows_table();
     env.conn
         .execute("INSERT INTO rows VALUES (10, 'existing')")
@@ -2138,22 +2135,21 @@ fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
     finish_without_rows(&mut returning);
     drop(returning);
 
-    // The reader is abandoned mid-scan instead of finishing, so the shared
-    // transaction ends through the rollback path and the completed writer's
-    // row is lost. Compare test_completed_writer_waits_for_sibling_mvcc_reader_to_commit,
-    // where the reader finishes normally and the writer's row commits.
+    // The reader is abandoned mid-scan instead of finishing. As in
+    // test_completed_writer_waits_for_sibling_mvcc_reader_to_commit, where it
+    // finishes normally, the shared transaction commits the writer's row.
     drop(reader);
 
     assert_eq!(
         env.observer_ids(),
-        vec![10],
-        "pins the deferred-commit gap: an abandoned last reader discards the completed writer's row"
+        vec![1, 10],
+        "an abandoned last reader commits the completed writer's row"
     );
 }
 
 #[test]
-fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
-    let env = SameConnectionMvcc::new(":memory:completed-writer-lost-joining-writer-error");
+fn test_mvcc_completed_writer_changes_kept_when_joining_writer_errors() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-kept-joining-writer-error");
     env.setup_rows_table();
     env.conn
         .execute("CREATE TABLE src(id INTEGER, v TEXT)")
@@ -2170,9 +2166,9 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
         .execute("INSERT INTO rows VALUES (1, 'one')")
         .unwrap();
 
-    // The joining writer changes a row (id 2) before hitting the duplicate,
-    // and has no local rollback boundary, so the whole shared transaction is
-    // rolled back — including the earlier INSERT that already reported success.
+    // The joining writer changes a row (id 2) before hitting the duplicate.
+    // Its statement savepoint undoes that row and keeps the earlier INSERT
+    // that already reported success.
     let err = env
         .conn
         .execute("INSERT INTO rows SELECT id, v FROM src")
@@ -2185,8 +2181,8 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
     drop(reader);
     assert_eq!(
         env.observer_ids(),
-        Vec::<i64>::new(),
-        "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
+        vec![1],
+        "a failing joined writer keeps the completed writer's row"
     );
 }
 
