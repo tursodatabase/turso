@@ -2241,3 +2241,42 @@ test virtual-custom-type-column-through-a-hash-join {
 expect {
     3
 }
+
+@requires strict "uses STRICT tables"
+test create-type-quoted-builtin-name-refused {
+    CREATE TYPE "Integer"(value integer) BASE integer;
+}
+expect error {
+    name is a built-in type
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-quoted-name {
+    CREATE TYPE "cents"(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a cents) STRICT;
+    INSERT INTO t1 VALUES (3);
+    SELECT a FROM t1;
+    DROP TABLE t1;
+    DROP TYPE "cents";
+    SELECT count(*) FROM __turso_internal_types WHERE name LIKE '%cents%';
+    CREATE TYPE cents(value integer) BASE integer;
+    SELECT name FROM __turso_internal_types WHERE name LIKE '%cents%';
+}
+expect {
+    3
+    0
+    cents
+}
+
+@requires strict "uses STRICT tables"
+test create-type-name-with-space {
+    CREATE TYPE "my type"(value text) BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t1(a "my type") STRICT;
+    INSERT INTO t1 VALUES ('abc');
+    SELECT a FROM t1;
+    SELECT name, sql FROM __turso_internal_types WHERE name = 'my type';
+}
+expect {
+    ABC
+    my type|CREATE TYPE "my type"(value text) BASE text ENCODE upper (value) DECODE value
+}

@@ -3487,7 +3487,11 @@ pub fn translate_create_domain(
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
-        let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        let mut s = format!(
+            "CREATE DOMAIN {} AS {}",
+            quote_identifier(&normalized_name),
+            quote_identifier(base_type)
+        );
         if let Some(ref def) = default {
             s.push_str(&format!(" DEFAULT {def}"));
         }
@@ -3590,11 +3594,13 @@ pub fn translate_drop_type(
         db: MAIN_DB_ID,
     });
 
-    // Search for matching row: name=type_name (col 0)
-    let name_reg = program.alloc_register();
+    // Search for the row by its sql (col 1), the text the type was loaded
+    // from. Its name (col 0) can't be used: older versions stored a quoted
+    // name such as `"pos"` there.
+    let sql_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
-        dest: name_reg,
-        value: normalized_name.clone(),
+        dest: sql_reg,
+        value: type_def.sql.clone(),
     });
 
     let end_loop_label = program.allocate_label();
@@ -3606,16 +3612,16 @@ pub fn translate_drop_type(
     });
     program.preassign_label_to_next_insn(loop_start_label);
 
-    // Read name (col 0)
-    let col0_reg = program.alloc_register();
-    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
+    // Read sql (col 1)
+    let col1_reg = program.alloc_register();
+    program.emit_column_or_rowid(types_cursor_id, 1, col1_reg);
 
     let skip_delete_label = program.allocate_label();
 
-    // Check name=type_name
+    // Check sql=type_def.sql
     program.emit_insn(Insn::Ne {
-        lhs: col0_reg,
-        rhs: name_reg,
+        lhs: col1_reg,
+        rhs: sql_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
         collation: CollationSeq::for_internal_values(),
