@@ -146,7 +146,7 @@ impl OpenedBTree {
 use super::{
     array::{
         array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        parse_text_array, serialize_array_from_blob, values_to_record_blob, MAX_ARRAY_ELEMENTS,
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
@@ -2691,7 +2691,6 @@ pub fn op_array_encode(
         return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
-    const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
             "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"

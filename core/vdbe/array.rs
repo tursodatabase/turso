@@ -5,6 +5,9 @@ use crate::numeric::Numeric;
 use crate::types::{ImmutableRecord, Value, ValueIterator};
 use crate::Result;
 
+/// The most elements an array value can hold.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
+
 /// Extract values from a record-format array blob.
 /// Returns Err if the blob is not a valid record.
 /// Uses zero-copy iteration over the blob bytes — no Vec<u8> allocation.
