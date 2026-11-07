@@ -242,6 +242,11 @@ pub(crate) fn emit_store_value(
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
     let convert = Insn::ConvertToType {
         reg,
         storage_class: resolved.storage_class()?,
@@ -261,6 +266,7 @@ pub(crate) fn emit_store_value(
         }
     }
     program.emit_insn(convert);
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 

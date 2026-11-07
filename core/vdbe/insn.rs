@@ -414,6 +414,7 @@ pub struct ArrayEncodeData {
     /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
     pub element_kind: crate::types::StrictType,
+    pub not_null_domain: Option<Arc<str>>,
     /// The number of dimensions of the array: 2 for INTEGER[][].
     pub dimensions: u32,
     pub target: ArrayEncodeTarget,

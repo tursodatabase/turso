@@ -552,6 +552,171 @@ expect {
     1
 }
 
+@requires strict "uses STRICT tables"
+test custom-null-cast-matches-null-column {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE TABLE null_fallback_values (v null_fallback) STRICT;
+    INSERT INTO null_fallback_values VALUES (NULL);
+    SELECT v IS NULL, CAST(NULL AS null_fallback) IS NULL, CAST(2 AS null_fallback)
+        FROM null_fallback_values;
+}
+expect {
+    1|1|2
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-cast-preserves-null-between-rows {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE TABLE null_cast_inputs (v INTEGER) STRICT;
+    INSERT INTO null_cast_inputs VALUES (7), (NULL), (8), (NULL);
+    SELECT quote(CAST(v AS null_fallback)) FROM null_cast_inputs ORDER BY rowid;
+}
+expect {
+    7
+    NULL
+    8
+    NULL
+}
+
+test custom-null-cast-skips-encode-coerce-decode {
+    CREATE TYPE null_guard(value integer, cap integer) BASE integer
+        ENCODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'NULL reached encoder') ELSE value * 10 END
+        COERCE CASE WHEN value IS NULL THEN RAISE(ABORT, 'NULL reached coercion')
+            WHEN value <= cap THEN value ELSE RAISE(ABORT, 'above cap') END
+        DECODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'NULL reached decoder') ELSE value / 10 END;
+    SELECT CAST(NULL AS null_guard(100)) IS NULL, CAST(2 AS null_guard(100));
+}
+expect {
+    1|2
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-encodes-default {
+    CREATE TYPE scaled BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v scaled NOT NULL DEFAULT 7) STRICT;
+    CREATE INDEX ix ON t(CAST(v AS integer));
+    INSERT OR REPLACE INTO t VALUES(1, NULL), (2, 8);
+    SELECT id, v FROM t ORDER BY id;
+    SELECT id FROM t INDEXED BY ix WHERE CAST(v AS integer) = 7;
+    PRAGMA integrity_check;
+}
+expect {
+    1|7
+    2|8
+    1
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-column-conflict-replace-encodes-default {
+    CREATE TYPE scaled BASE integer ENCODE value * 10 DECODE value / 10;
+    CREATE TABLE t(v scaled NOT NULL ON CONFLICT REPLACE DEFAULT 7) STRICT;
+    INSERT INTO t VALUES(NULL);
+    SELECT v FROM t;
+}
+expect {
+    7
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-coerces-default {
+    CREATE TYPE capped(value integer, cap integer) BASE integer
+        ENCODE value * 10 COERCE min(value, cap) DECODE value / 10;
+    CREATE TABLE t(v capped(50) NOT NULL DEFAULT 7) STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+    SELECT v FROM t;
+}
+expect {
+    5
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-validates-default-input {
+    CREATE TYPE scaled BASE integer ENCODE value * 10 DECODE value / 10;
+    CREATE TABLE t(v scaled NOT NULL DEFAULT 'bad') STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+}
+expect error {
+    cannot store TEXT value in INTEGER column t.v
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-encodes-array-default {
+    CREATE TYPE scaled BASE integer ENCODE value * 10 DECODE value / 10;
+    CREATE TABLE t(v scaled[] NOT NULL DEFAULT '{NULL,7}') STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+    SELECT v FROM t;
+}
+expect {
+    {NULL,7}
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-after-encode-produces-null {
+    CREATE TYPE scaled BASE integer
+        ENCODE CASE WHEN value = 7 THEN NULL ELSE value * 10 END DECODE value / 10;
+    CREATE TABLE t(v scaled NOT NULL DEFAULT 8) STRICT;
+    INSERT OR REPLACE INTO t VALUES(7);
+    SELECT v FROM t;
+}
+expect {
+    8
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-after-decode-produces-null {
+    CREATE TYPE scaled BASE integer ENCODE value * 10
+        DECODE CASE WHEN value = 70 THEN NULL ELSE value / 10 END;
+    CREATE TABLE t(v scaled NOT NULL DEFAULT 8) STRICT;
+    INSERT OR REPLACE INTO t VALUES(7);
+    SELECT v FROM t;
+}
+expect {
+    8
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-default-before-generated-column {
+    CREATE TYPE scaled BASE integer ENCODE value * 10 DECODE value / 10;
+    CREATE TABLE t(v scaled NOT NULL DEFAULT 7,
+        label TEXT GENERATED ALWAYS AS (printf('%d', v)) VIRTUAL) STRICT;
+    INSERT OR REPLACE INTO t(v) VALUES(NULL);
+    SELECT v, label FROM t;
+}
+expect {
+    7|7
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-default-encode-null {
+    CREATE TYPE null_default BASE integer ENCODE nullif(value, 7) DECODE value;
+    CREATE TABLE t(v null_default NOT NULL DEFAULT 7) STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.v
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-default-decode-null {
+    CREATE TYPE null_default BASE integer ENCODE value * 10 DECODE nullif(value, 70);
+    CREATE TABLE t(v null_default NOT NULL DEFAULT 7) STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.v
+}
+
+@requires strict "uses STRICT tables"
+test custom-null-replace-default-invalid-storage-type {
+    CREATE TYPE invalid_default BASE integer ENCODE value || 'x' DECODE value;
+    CREATE TABLE t(v invalid_default NOT NULL DEFAULT 7) STRICT;
+    INSERT OR REPLACE INTO t VALUES(NULL);
+}
+expect error {
+    cannot store TEXT value as type invalid_default \(BASE INTEGER\)
+}
+
 test uuid-blob-invalid-inputs-remain-null {
     SELECT uuid_blob(42) IS NULL, uuid_blob(3.5) IS NULL,
         uuid_blob(X'0102') IS NULL, uuid_blob('not a uuid') IS NULL,

@@ -91,6 +91,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_domain_array_null_errors_preserve_transaction() {
+        for mvcc in [false, true] {
+            let db = TempDatabase::builder()
+                .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+            conn.execute("CREATE DOMAIN required_int AS integer NOT NULL")
+                .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER, v required_int[]) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1, ARRAY[1]), (2, ARRAY[2])")
+                .unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES(3, ARRAY[3])").unwrap();
+            let expected = vec![
+                (1, "1".to_string()),
+                (2, "2".to_string()),
+                (3, "3".to_string()),
+            ];
+            for sql in [
+                "INSERT INTO t VALUES(4, ARRAY[4]), (5, ARRAY[NULL])",
+                "UPDATE t SET v = CASE WHEN id = 1 THEN ARRAY[10] ELSE ARRAY[NULL] END WHERE id < 3",
+            ] {
+                assert_that!(conn.execute(sql))
+                    .err()
+                    .display_string()
+                    .contains("domain required_int does not allow null values");
+                let rows: Vec<(i64, String)> =
+                    conn.exec_rows("SELECT id, array_to_string(v, ',') FROM t ORDER BY id");
+                assert_eq!(rows, expected, "mvcc={mvcc}, {sql}");
+            }
+            conn.execute("COMMIT").unwrap();
+            let rows: Vec<(i64, String)> =
+                conn.exec_rows("SELECT id, array_to_string(v, ',') FROM t ORDER BY id");
+            assert_eq!(rows, expected, "mvcc={mvcc}, after COMMIT");
+            conn.close().unwrap();
+        }
+    }
+
     /// Custom types must be loaded from __turso_internal_types when reopening
     /// a database. Without this, SELECT returns raw encoded values and PRAGMA
     /// list_types omits user-defined types.

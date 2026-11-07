@@ -352,11 +352,80 @@ test array-boolean-decode-roundtrip {
     CREATE TABLE t24 (id INTEGER PRIMARY KEY, flags boolean[]) STRICT;
     INSERT INTO t24 VALUES (1, '{true, false}');
     INSERT INTO t24 VALUES (2, '{false, false, true}');
+    INSERT INTO t24 VALUES (3, ARRAY[NULL, true, NULL, false, NULL]);
+    INSERT INTO t24 VALUES (4, ARRAY[NULL, NULL]);
+    INSERT INTO t24 VALUES (5, ARRAY[]);
+    INSERT INTO t24 VALUES (6, NULL);
     SELECT id, flags, array_length(flags) FROM t24 ORDER BY id;
 }
 expect {
     1|{1,0}|2
     2|{0,0,1}|3
+    3|{NULL,1,NULL,0,NULL}|5
+    4|{NULL,NULL}|2
+    5|{}|0
+    6||
+}
+
+test array-custom-decode-skips-null-elements {
+    CREATE TYPE null_sensitive BASE integer ENCODE value
+        DECODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'NULL reached decoder') ELSE value + 1 END;
+    CREATE TABLE null_sensitive_arrays (v null_sensitive[]) STRICT;
+    INSERT INTO null_sensitive_arrays VALUES (ARRAY[NULL, 1, NULL, 2, NULL]);
+    SELECT v FROM null_sensitive_arrays;
+}
+expect {
+    {NULL,2,NULL,3,NULL}
+}
+
+test array-custom-encode-skips-null-elements {
+    CREATE TYPE null_sensitive_encode BASE integer
+        ENCODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'NULL reached encoder') ELSE value + 1 END
+        DECODE value - 1;
+    CREATE TABLE null_sensitive_encode_arrays (id INTEGER PRIMARY KEY, v null_sensitive_encode[]) STRICT;
+    INSERT INTO null_sensitive_encode_arrays VALUES
+        (1, ARRAY[NULL, 1, NULL, 2, NULL]), (2, ARRAY[NULL, NULL]), (3, ARRAY[]), (4, NULL);
+    SELECT id, v FROM null_sensitive_encode_arrays ORDER BY id;
+    UPDATE null_sensitive_encode_arrays SET v = ARRAY[3, NULL, 4] WHERE id = 1;
+    INSERT INTO null_sensitive_encode_arrays VALUES (2, ARRAY[])
+        ON CONFLICT (id) DO UPDATE SET v = ARRAY[NULL, 5, NULL];
+    SELECT id, v FROM null_sensitive_encode_arrays ORDER BY id;
+    INSERT INTO null_sensitive_encode_arrays VALUES (5, '{NULL,6,NULL}') RETURNING id, v;
+    SELECT array_length(CAST(ARRAY[NULL, 7, NULL] AS null_sensitive_encode[])),
+        array_element(CAST(ARRAY[NULL, 7, NULL] AS null_sensitive_encode[]), 1) IS NULL,
+        CAST(NULL AS null_sensitive_encode[]) IS NULL;
+}
+expect {
+    1|{NULL,1,NULL,2,NULL}
+    2|{NULL,NULL}
+    3|{}
+    4|
+    1|{3,NULL,4}
+    2|{NULL,5,NULL}
+    3|{}
+    4|
+    5|{NULL,6,NULL}
+    3|1|1
+}
+
+test array-custom-null-elements-preserve-base-storage-kind {
+    CREATE TYPE text_named(value any) BASE integer ENCODE value DECODE value;
+    CREATE TABLE t(v text_named[]) STRICT;
+    INSERT INTO t VALUES(ARRAY[NULL,'5',6.0]);
+    SELECT v, typeof(v[2]), typeof(v[3]) FROM t;
+}
+expect {
+    {NULL,5,6}|integer|integer
+}
+
+test array-custom-encode-preserves-null-like-scalar {
+    CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
+    CREATE TABLE null_fallback_arrays (s null_fallback, v null_fallback[]) STRICT;
+    INSERT INTO null_fallback_arrays VALUES (NULL, ARRAY[NULL, 1]);
+    SELECT s IS NULL, v, v[1] IS NULL FROM null_fallback_arrays;
+}
+expect {
+    1|{NULL,1}|1
 }
 
 test array-subscript-on-null {

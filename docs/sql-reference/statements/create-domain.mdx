@@ -90,6 +90,8 @@ INSERT INTO contacts VALUES (2, NULL);
 
 A column-level NULL declaration does not override the domain's NOT NULL constraint.
 
+For an array of a domain declared with `AS integer NOT NULL`, the restriction applies to each scalar element. The whole array can be NULL unless the array column itself declares NOT NULL. Empty arrays are allowed. INSERT, UPDATE, UPSERT, and casts reject NULL elements, including scalar elements inside nested arrays.
+
 ### CHECK
 
 Adds a validation constraint. The expression can reference `value` to refer to the input value being checked. Multiple CHECK constraints can be specified and all must pass.
