@@ -3762,31 +3762,31 @@ impl JoinedTable {
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
 /// [SeekKey] also used to represent range scan termination condition.
 #[derive(Debug, Clone)]
-pub struct SeekDef {
+pub struct SeekDef<E = ast::Expr> {
     /// Common prefix of the key which is shared between start/end fields
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
     ///
     /// Then, prefix=[(eq=1, ASC)], start=Some((ge, Expr(30))), end=Some((gt, Sentinel))
-    pub prefix: Vec<SeekRangeConstraint>,
+    pub prefix: Vec<SeekRangeConstraint<E>>,
     /// The condition to use when seeking. See [SeekKey] for more details.
-    pub start: SeekKey,
+    pub start: SeekKey<E>,
     /// The condition to use when terminating the scan that follows the seek. See [SeekKey] for more details.
-    pub end: SeekKey,
+    pub end: SeekKey<E>,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
 }
 
-pub struct SeekDefKeyIterator<'a, T> {
-    seek_def: &'a SeekDef,
-    seek_key: &'a SeekKey,
+pub struct SeekDefKeyIterator<'a, E, T> {
+    seek_def: &'a SeekDef<E>,
+    seek_key: &'a SeekKey<E>,
     pos: usize,
     _t: PhantomData<T>,
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
-    type Item = SeekKeyComponent<&'a ast::Expr>;
+impl<'a, E> Iterator for SeekDefKeyIterator<'a, E, SeekKeyComponent<&'a E>> {
+    type Item = SeekKeyComponent<&'a E>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
@@ -3807,7 +3807,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
     }
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
+impl<E> Iterator for SeekDefKeyIterator<'_, E, Affinity> {
     type Item = Affinity;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -3828,10 +3828,10 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
     }
 }
 
-impl SeekDef {
+impl<E> SeekDef<E> {
     /// returns amount of values in the given seek key
     /// - so, for SELECT * FROM t WHERE x = 10 AND y = 20 AND y >= 30 there will be 3 values (10, 20, 30)
-    pub fn size(&self, key: &SeekKey) -> usize {
+    pub fn size(&self, key: &SeekKey<E>) -> usize {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
@@ -3842,8 +3842,8 @@ impl SeekDef {
     /// iterate over value expressions in the given seek key
     pub fn iter<'a>(
         &'a self,
-        key: &'a SeekKey,
-    ) -> SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
+        key: &'a SeekKey<E>,
+    ) -> SeekDefKeyIterator<'a, E, SeekKeyComponent<&'a E>> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3853,7 +3853,7 @@ impl SeekDef {
     }
 
     /// iterate over affinity in the given seek key
-    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a, Affinity> {
+    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey<E>) -> SeekDefKeyIterator<'a, E, Affinity> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3861,7 +3861,9 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
+}
 
+impl SeekDef<ast::Expr> {
     /// Whether the key component at `pos` came from a NULL-matching equality
     /// (`x IS <expr>`) rather than `x = <expr>`.
     ///
@@ -3906,7 +3908,10 @@ pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
 /// stored in the ephemeral index still includes the remaining payload columns
 /// (and possibly a synthetic rowid). Pad those trailing slots with NONE affinity
 /// so MakeRecord sees the same layout the index insert path produced.
-pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Option<Arc<String>> {
+pub fn synthesized_seek_affinity_str<E>(
+    index: &Index,
+    seek_def: &SeekDef<E>,
+) -> Option<Arc<String>> {
     let num_key_cols = seek_def.size(&seek_def.start);
     let total_cols = index.columns.len() + if index.has_rowid { 1 } else { 0 };
     let mut aff: String = seek_def
@@ -3935,9 +3940,9 @@ pub enum SeekKeyComponent<E> {
 
 /// A condition to use when seeking.
 #[derive(Debug, Clone)]
-pub struct SeekKey {
+pub struct SeekKey<E = ast::Expr> {
     /// Complete key must be constructed from common [SeekDef::prefix] and optional last_component
-    pub last_component: SeekKeyComponent<ast::Expr>,
+    pub last_component: SeekKeyComponent<E>,
 
     /// The comparison operator to use when seeking.
     pub op: SeekOp,

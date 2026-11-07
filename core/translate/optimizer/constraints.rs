@@ -1458,19 +1458,19 @@ pub struct RangeConstraintRef {
 
 #[derive(Debug, Clone)]
 /// Represent seek range which can be used in query planning to emit range scan over table or index
-pub struct SeekRangeConstraint {
+pub struct SeekRangeConstraint<E = ast::Expr> {
     pub sort_order: SortOrder,
     pub nulls_order: ast::NullsOrder,
-    pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
-    pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-    pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub eq: Option<(ast::Operator, E, Affinity)>,
+    pub lower_bound: Option<(ast::Operator, E, Affinity)>,
+    pub upper_bound: Option<(ast::Operator, E, Affinity)>,
 }
 
-impl SeekRangeConstraint {
+impl<E> SeekRangeConstraint<E> {
     pub fn new_eq(
         sort_order: SortOrder,
         nulls_order: ast::NullsOrder,
-        eq: (ast::Operator, ast::Expr, Affinity),
+        eq: (ast::Operator, E, Affinity),
     ) -> Self {
         Self {
             sort_order,
@@ -1483,8 +1483,8 @@ impl SeekRangeConstraint {
     pub fn new_range(
         sort_order: SortOrder,
         nulls_order: ast::NullsOrder,
-        lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-        upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+        lower_bound: Option<(ast::Operator, E, Affinity)>,
+        upper_bound: Option<(ast::Operator, E, Affinity)>,
     ) -> Self {
         turso_assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
