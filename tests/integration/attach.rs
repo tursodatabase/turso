@@ -440,6 +440,43 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
 }
 
 #[test]
+fn test_attach_uri_readwrite_opens_sqlite_database_without_wal() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+    for (name, use_sqlite) in [("sqlite", true), ("turso", false)] {
+        let path = directory.path().join(format!("{name}-existing.db"));
+        {
+            let fixture = RusqliteConnection::open(&path)?;
+            fixture.execute_batch("CREATE TABLE t(x)")?;
+        }
+        let wal = path.with_file_name(format!("{name}-existing.db-wal"));
+        assert!(!wal.exists());
+        let sql = format!("ATTACH 'file:{}?mode=rw' AS aux", path.display());
+        if use_sqlite {
+            sqlite.execute_batch(&sql)?;
+            sqlite.execute_batch("INSERT INTO aux.t VALUES(7)")?;
+            assert_eq!(
+                sqlite.query_row("SELECT count(*) FROM aux.t", [], |row| row.get::<_, i64>(0))?,
+                1
+            );
+            sqlite.execute_batch("DETACH aux")?;
+        } else {
+            conn.execute(sql)?;
+            conn.execute("INSERT INTO aux.t VALUES(7)")?;
+            assert_eq!(
+                limbo_exec_rows(&conn, "SELECT count(*) FROM aux.t"),
+                vec![vec![rusqlite::types::Value::Integer(1)]]
+            );
+            assert!(wal.exists());
+            conn.execute("DETACH aux")?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_attach_uri_readwrite_requires_existing_main_database() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
     let sqlite = RusqliteConnection::open_in_memory()?;

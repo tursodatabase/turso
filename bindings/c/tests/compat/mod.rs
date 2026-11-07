@@ -495,6 +495,63 @@ mod tests {
     }
 
     #[test]
+    fn readwrite_existing_main_without_wal_can_open_and_insert() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            for use_uri in [false, true] {
+                let path = directory.path().join(format!("existing-{use_uri}.db"));
+                let filename = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                let mut original = ptr::null_mut();
+                assert_eq!(sqlite3_open(filename.as_ptr(), &mut original), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_exec(
+                        original,
+                        c"CREATE TABLE t(x)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_close(original), SQLITE_OK);
+                let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+                if wal.exists() {
+                    std::fs::remove_file(&wal).unwrap();
+                }
+                assert!(path.metadata().unwrap().len() > 0);
+                assert!(!wal.exists());
+
+                let (open_name, flags) = if use_uri {
+                    (
+                        std::ffi::CString::new(format!("file:{}?mode=rw", path.display())).unwrap(),
+                        6 | SQLITE_OPEN_URI,
+                    )
+                } else {
+                    (filename, SQLITE_OPEN_READWRITE)
+                };
+                let mut reopened = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(open_name.as_ptr(), &mut reopened, flags, ptr::null()),
+                    SQLITE_OK,
+                    "URI={use_uri}"
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        reopened,
+                        c"INSERT INTO t VALUES(7)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                scalar_query(reopened, "SELECT count(*) FROM t", 1);
+                assert_eq!(sqlite3_close(reopened), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
     fn uri_authority_is_validated_before_query_and_fragment() {
         unsafe {
             for uri in [
