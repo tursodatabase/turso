@@ -410,6 +410,205 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
     Ok(())
 }
 
+/// Where a file-backed `VACUUM INTO` builds its copy, and how the
+/// destination is left as it was found — absent, or an empty file — should
+/// the copy fail.
+///
+/// Normally the copy is built in a temporary file beside the destination
+/// and moved over it once complete and synced. The target is committed in
+/// batches, so until then the file is a valid database holding only some
+/// of the rows. Built under the destination's own name, that is what a
+/// statement that fails or a process that dies partway would leave behind —
+/// and a retry would refuse the "existing" output. This way the
+/// destination path only ever holds a complete copy, as it did when the
+/// whole copy was one transaction.
+///
+/// The temporary file is named for this process and this statement
+/// (`<destination>-vacuum-<pid>-<n>.tmp`), so it is never the source — a
+/// database may be named anything, `<destination>-vacuum` included — nor
+/// the copy another statement is building to the same destination, in
+/// this process or another. Only the files this statement created are
+/// ever removed: nothing beside the destination is swept, so what a
+/// process that died partway left behind stays, under that name, until
+/// someone removes it. The `.tmp` extension matters: the engine names a
+/// database's MVCC logical log by replacing the path's extension with
+/// `db-log` ([`logical_log_path`]), so the temporary copy's log is
+/// `<destination>-vacuum-<pid>-<n>.db-log` — its own, not the
+/// destination's — and moves to the destination's name with it.
+///
+/// A destination that already exists — an empty file — may be open
+/// elsewhere: attached on this connection, or created by another process
+/// that waits for it. The copy must land in that file, so it is built there
+/// directly, as it always was. The same goes for an IO that cannot rename a
+/// file ([`crate::IO::supports_rename`]). A copy built at the destination is
+/// one transaction, not batches (see `op_vacuum_into_inner`), so a failure
+/// rolls it back and leaves no rows; and since initialising a database
+/// writes its first page to the file outside any transaction, which the
+/// next `VACUUM INTO` would refuse as an existing output, the file is then
+/// truncated back to the empty file it was. A process killed partway cannot
+/// do that: it leaves an empty database (a header page, no schema, no rows)
+/// that a retry refuses until the file is removed or emptied, as before.
+pub(crate) struct VacuumIntoOutputFile {
+    io: Arc<dyn crate::IO>,
+    dest_path: String,
+    /// The temporary copy; None when the copy is built at the destination.
+    temp_path: Option<String>,
+}
+
+impl VacuumIntoOutputFile {
+    /// Names tried before giving up on a free one, which takes a process
+    /// that reuses the pid of one that died partway, that many times.
+    const NAME_ATTEMPTS: u32 = 64;
+
+    /// Where a copy to `dest_path` is built: a temporary file named so
+    /// that no file of it exists yet, or the destination itself when it
+    /// already exists or `io` cannot move a temporary file over it.
+    pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Self> {
+        if !io.supports_rename() || std::fs::metadata(dest_path).is_ok() {
+            return Ok(Self {
+                io,
+                dest_path: dest_path.to_string(),
+                temp_path: None,
+            });
+        }
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..Self::NAME_ATTEMPTS {
+            let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let this = Self {
+                io: io.clone(),
+                dest_path: dest_path.to_string(),
+                temp_path: Some(format!("{dest_path}-vacuum-{pid}-{seq}.tmp")),
+            };
+            if this
+                .temp_files()
+                .iter()
+                .all(|path| std::fs::metadata(path).is_err())
+            {
+                return Ok(this);
+            }
+        }
+        Err(LimboError::InternalError(format!(
+            "VACUUM INTO found no free name for its temporary copy beside {dest_path}"
+        )))
+    }
+
+    /// The path the copy is built at.
+    pub fn build_path(&self) -> &str {
+        self.temp_path.as_deref().unwrap_or(&self.dest_path)
+    }
+
+    /// Whether the copy is built in a temporary file, which may be
+    /// committed in batches: a failed or killed copy is discarded with it.
+    /// A copy built at the destination must be one transaction.
+    pub fn is_temporary(&self) -> bool {
+        self.temp_path.is_some()
+    }
+
+    /// The temporary copy and the files the engine keeps beside a database:
+    /// its WAL, shm and MVCC logical log. Nothing for a copy built at the
+    /// destination.
+    fn temp_files(&self) -> Vec<String> {
+        let Some(temp_path) = &self.temp_path else {
+            return Vec::new();
+        };
+        vec![
+            temp_path.clone(),
+            format!("{temp_path}-wal"),
+            format!("{temp_path}-shm"),
+            logical_log_path(temp_path),
+        ]
+    }
+
+    /// Leaves the destination as it was found after the copy failed: the
+    /// temporary copy and its WAL, shm and MVCC logical log — only ever
+    /// files this statement created — are removed; a destination the copy
+    /// was built at is truncated back to the empty file it was, unless the
+    /// copy's transaction `committed` and only what came after (its
+    /// checkpoint) failed: then the whole copy is in that destination's
+    /// WAL, and the file is left as it is, header page and all, as before.
+    /// The output database must be closed first.
+    pub fn discard(&self, committed: bool) -> Result<()> {
+        if self.temp_path.is_none() {
+            if committed {
+                return Ok(());
+            }
+            let file = self
+                .io
+                .open_file(&self.dest_path, crate::OpenFlags::NoLock, false)?;
+            let truncated = file.truncate(0, Completion::new_trunc(|_| {}))?;
+            self.io.wait_for_completion(truncated)?;
+            let synced = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)?;
+            return self.io.wait_for_completion(synced);
+        }
+        for path in self.temp_files() {
+            remove_file_if_exists(&*self.io, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Moves a finished temporary copy to the destination; a copy built at
+    /// the destination is there already. The copy was checkpointed under
+    /// `SyncMode::Full` and closed, so the file is self-contained and synced
+    /// and its WAL is empty; the WAL and shm are dropped and an MVCC copy's
+    /// logical log moves with it. The move is the IO's rename, so the
+    /// destination goes from absent to complete in one step, durably. The
+    /// log moves after the copy: should the process die between the two,
+    /// the destination holds a complete copy and the log is left under the
+    /// temporary name, where it troubles nothing (a log under the
+    /// destination's name beside no database would make a later non-MVCC
+    /// copy there look corrupt). Should the log fail to move, the copy is
+    /// moved back, so the destination is as it was found.
+    pub fn install(&self) -> Result<()> {
+        let Some(temp_path) = &self.temp_path else {
+            return Ok(());
+        };
+        for sidecar in ["-wal", "-shm"] {
+            remove_file_if_exists(&*self.io, &format!("{temp_path}{sidecar}"))?;
+        }
+        self.io.rename_file(temp_path, &self.dest_path)?;
+        let temp_log = logical_log_path(temp_path);
+        if std::fs::metadata(&temp_log).is_err() {
+            return Ok(());
+        }
+        let dest_log = logical_log_path(&self.dest_path);
+        if let Err(err) = self.io.rename_file(&temp_log, &dest_log) {
+            if let Err(undo) = self.io.rename_file(&self.dest_path, temp_path) {
+                tracing::warn!(
+                    "VACUUM INTO could not move its copy's MVCC log to {dest_log} ({err}) \
+                     nor move the copy back from {}: {undo}",
+                    self.dest_path
+                );
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// The MVCC logical log the engine keeps beside the database at `db_path`,
+/// by the rule `open_mv_store` opens it with.
+fn logical_log_path(db_path: &str) -> String {
+    crate::storage::journal_mode::logical_log_path(db_path)
+        .to_str()
+        .expect("a path derived from a str is a str")
+        .to_string()
+}
+
+fn remove_file_if_exists(io: &dyn crate::IO, path: &str) -> Result<()> {
+    not_found_is_ok(io.remove_file(path))
+}
+
+fn not_found_is_ok(result: Result<()>) -> Result<()> {
+    match result {
+        Err(LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => Ok(()),
+        result => result,
+    }
+}
+
 /// Copy functions, vtab modules, and index methods from one connection to
 /// another so that schema replay on the target sees the same symbols as
 /// the source.
@@ -470,6 +669,42 @@ pub(crate) struct VacuumTargetBuildConfig {
     pub target_auto_vacuum_mode: AutoVacuumMode,
     /// Whether to copy the source MVCC metadata table into the target image.
     pub copy_mvcc_metadata_table: bool,
+    /// Commit the target every so many copied rows / bytes instead of
+    /// building it in one write transaction. The commit path re-reads every
+    /// page a transaction spilled and holds a WAL frame per page until the
+    /// batch is submitted, so one transaction for the whole copy costs about
+    /// twice the database size in memory. `None` keeps the single transaction
+    /// (the in-place VACUUM temp image is copied back page-wise and relies
+    /// on it; a `VACUUM INTO` copy built at its destination relies on it to
+    /// leave nothing there on failure).
+    pub commit_every: Option<VacuumCommitBatch>,
+}
+
+/// Batch bounds for [`VacuumTargetBuildConfig::commit_every`]: the target
+/// is committed when either is reached.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VacuumCommitBatch {
+    pub rows: u64,
+    pub bytes: u64,
+    /// Committed batches between `TRUNCATE` checkpoints of the target WAL.
+    /// The in-memory frame index (`frame_cache`) holds an entry per frame
+    /// until the log is reset, and auto-actions are off on the target, so
+    /// without a periodic reset it — and the `-wal` file — grow with the
+    /// copy.
+    pub checkpoint_every_batches: u32,
+}
+
+impl VacuumCommitBatch {
+    /// What `VACUUM INTO` uses: a commit costs ~2 × its data in memory, so
+    /// this bounds the rows' share of the copy's peak at a few tens of MB
+    /// whatever the size. Each index is a transaction of its own (one
+    /// CREATE INDEX statement, which cannot be split), so with indexes the
+    /// peak is that or ~2 × the largest index, whichever is more.
+    pub const VACUUM_INTO: Self = Self {
+        rows: 20_000,
+        bytes: 8 * 1024 * 1024,
+        checkpoint_every_batches: 8,
+    };
 }
 
 /// Context for the vacuum target build. Holds the target connection and all
@@ -477,6 +712,14 @@ pub(crate) struct VacuumTargetBuildConfig {
 pub(crate) struct VacuumTargetBuildContext {
     target_conn: Arc<Connection>,
     phase: VacuumTargetBuildPhase,
+    /// Rows and bytes copied since the target was last committed, and
+    /// commits since its WAL was last truncated.
+    batch_rows: u64,
+    batch_bytes: u64,
+    batches_since_checkpoint: u32,
+    /// Whether the target's final transaction committed: the whole copy
+    /// is in the target's WAL, whatever happens after.
+    committed: bool,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
     /// Storage-backed tables to CREATE (excludes sqlite_sequence).
@@ -494,12 +737,46 @@ impl VacuumTargetBuildContext {
         Self {
             target_conn,
             phase: VacuumTargetBuildPhase::Init,
+            batch_rows: 0,
+            batch_bytes: 0,
+            batches_since_checkpoint: 0,
+            committed: false,
             schema_entries: Vec::new(),
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
             indexes_to_create: Vec::new(),
             post_data_entries: Vec::new(),
         }
+    }
+
+    /// Whether the target's final transaction committed, so the whole
+    /// copy is in the target whatever failed after.
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
+    }
+
+    /// Commits the target's transaction and opens the next, so the commit
+    /// path never holds more than what was written since the last commit.
+    /// Every `checkpoint_every_batches` commits — or at once, when
+    /// `checkpoint` asks — the target WAL is truncate-checkpointed first,
+    /// which resets its frame index (`frame_cache`) and the `-wal` file —
+    /// auto-actions are off on the target, so nothing else does. Nothing
+    /// reads the target while it is built, so the truncate always
+    /// completes.
+    fn commit_batch(&mut self, batch: VacuumCommitBatch, checkpoint: bool) -> Result<()> {
+        self.target_conn.execute("COMMIT")?;
+        self.batches_since_checkpoint += 1;
+        if checkpoint || self.batches_since_checkpoint >= batch.checkpoint_every_batches {
+            self.target_conn
+                .checkpoint(crate::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })?;
+            self.batches_since_checkpoint = 0;
+        }
+        self.target_conn.execute("BEGIN IMMEDIATE")?;
+        self.batch_rows = 0;
+        self.batch_bytes = 0;
+        Ok(())
     }
 
     pub(crate) fn cleanup_after_error(&mut self) -> Result<()> {
@@ -757,7 +1034,13 @@ pub(crate) fn vacuum_target_build_step(
                             }
                         })?;
                     }
-                    // Done creating tables, start copying data
+                    // Done creating tables, start copying data. The indexes
+                    // come after the rows, in every build: CREATE INDEX over
+                    // the copied rows sorts the keys and appends them, where
+                    // an index that exists while the rows are inserted takes
+                    // each key wherever it falls — for keys in no particular
+                    // order (text, UUIDs) that dirties a leaf page per row,
+                    // some three times the time of the sorted build.
                     state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
                 }
@@ -972,8 +1255,14 @@ pub(crate) fn vacuum_target_build_step(
                     for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
+                        state.batch_bytes += match &value {
+                            crate::Value::Text(t) => t.as_str().len() as u64,
+                            crate::Value::Blob(b) => b.len() as u64,
+                            _ => 8,
+                        };
                         target_insert_stmt.bind_at(index, value)?;
                     }
+                    state.batch_rows += 1;
 
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
@@ -1016,6 +1305,14 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("INSERT statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // Bound the target transaction: commit and reopen once
+                    // the batch is full, so the commit path never has to
+                    // re-read more than a batch's worth of spilled pages.
+                    if let Some(batch) = config.commit_every {
+                        if state.batch_rows >= batch.rows || state.batch_bytes >= batch.bytes {
+                            state.commit_batch(batch, false)?;
+                        }
+                    }
                     // Go back to get next row from source
                     state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
@@ -1051,6 +1348,20 @@ pub(crate) fn vacuum_target_build_step(
                     continue;
                 }
 
+                // A batched build gives each index a transaction of its
+                // own: the rows' last batch is committed before the first
+                // index, and every index is committed and checkpointed as
+                // it completes (`StepCreateIndex`). CREATE INDEX is one
+                // statement, so an index is the smallest transaction the
+                // build can make of it, and this way the commit path holds
+                // at most the largest index's pages rather than every
+                // index's.
+                if let Some(batch) = config.commit_every {
+                    if state.batch_rows > 0 {
+                        state.commit_batch(batch, true)?;
+                    }
+                }
+
                 let entry_ordinal = state.indexes_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
                 // Backing-btree indexes for custom index methods were filtered
@@ -1080,6 +1391,11 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // The index is one transaction; commit it and reset the
+                    // target WAL before the next (see `PrepareCreateIndex`).
+                    if let Some(batch) = config.commit_every {
+                        state.commit_batch(batch, true)?;
+                    }
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
@@ -1162,6 +1478,7 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
+                state.committed = true;
                 state.target_conn.publish_schema_if_newer();
                 return Ok(crate::IOResult::Done(()));
             }
@@ -2030,6 +2347,7 @@ fn vacuum_in_place_step(
                     target_mvcc_enabled: false,
                     target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
                     copy_mvcc_metadata_table: source_db.mvcc_enabled(),
+                    commit_every: None,
                 };
 
                 let target_build_context = VacuumTargetBuildContext::new(new_temp_db.conn.clone());
@@ -3179,6 +3497,7 @@ mod tests {
             target_mvcc_enabled: source_db.mvcc_enabled(),
             target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
             copy_mvcc_metadata_table: false,
+            commit_every: None,
         };
 
         let injector = OneShotTransactionYieldInjector::new();
@@ -3537,5 +3856,981 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// `VmHWM` of this process from `/proc/self/status`, in MiB: the
+    /// kernel's high-water mark of resident memory, which no later free
+    /// lowers.
+    #[cfg(target_os = "linux")]
+    fn process_peak_rss_mib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("VmHWM:"))
+            .expect("VmHWM in /proc/self/status");
+        let kib: u64 = line
+            .split_whitespace()
+            .nth(1)
+            .expect("VmHWM value")
+            .parse()
+            .expect("VmHWM is kB");
+        kib / 1024
+    }
+
+    /// `VACUUM INTO` must run in bounded memory: copying a database must
+    /// not need the whole database resident, let alone twice it, or a
+    /// backup of a database larger than the host's RAM budget is an OOM
+    /// kill. Builds a ~250 MiB file-backed fixture (a table of 1 KB blobs
+    /// with a secondary index on a key in rowid order), runs the plain
+    /// public statement, prints the process high-water mark before and
+    /// after, and asserts the peak stays under a bound well below twice
+    /// the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "writes ~500 MB and takes minutes unoptimised; run with: \
+                cargo test -p turso_core --release --lib vacuum_into_peak_rss -- --ignored --nocapture"]
+    fn vacuum_into_peak_rss_is_bounded() -> Result<()> {
+        vacuum_into_peak_rss_fixture_is_bounded("'key-' || printf('%012d', {row})", 256)
+    }
+
+    /// The same bound with the index on keys in no rowid order (random
+    /// text, as a UUID column is): the index is then built after the rows
+    /// by one CREATE INDEX, sorted, rather than taking a key per row
+    /// wherever it falls — the bound holds either way, and this is the
+    /// shape whose time regressed threefold when the index was created
+    /// first. Prints the peak and the time to compare by hand.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "writes ~500 MB and takes minutes unoptimised; run with: \
+                cargo test -p turso_core --release --lib vacuum_into_peak_rss -- --ignored --nocapture"]
+    fn vacuum_into_peak_rss_is_bounded_with_a_random_key_index() -> Result<()> {
+        vacuum_into_peak_rss_fixture_is_bounded("hex(randomblob(16))", 256)
+    }
+
+    /// Builds the fixture with `key_expr` (a SQL expression; `{row}` is
+    /// the row number) as the indexed key, copies it and asserts the
+    /// process peak RSS stays under `bound_mib`.
+    #[cfg(target_os = "linux")]
+    fn vacuum_into_peak_rss_fixture_is_bounded(key_expr: &str, bound_mib: u64) -> Result<()> {
+        const ROWS: usize = 200_000;
+        const ROWS_PER_TXN: usize = 1_000;
+        const PAYLOAD_BYTES: usize = 1_000;
+
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let dest_path = dir.path().join("copy.db");
+        let db = Database::open_file_with_flags(
+            io,
+            source_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT NOT NULL, v BLOB NOT NULL)")?;
+        conn.execute("CREATE INDEX t_k ON t(k)")?;
+        for row in 0..ROWS {
+            if row % ROWS_PER_TXN == 0 {
+                conn.execute("BEGIN")?;
+            }
+            let key = key_expr.replace("{row}", &row.to_string());
+            conn.execute(format!(
+                "INSERT INTO t(k, v) VALUES ({key}, randomblob({PAYLOAD_BYTES}))"
+            ))?;
+            if row % ROWS_PER_TXN == ROWS_PER_TXN - 1 {
+                conn.execute("COMMIT")?;
+            }
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let file_mib = std::fs::metadata(&source_path).unwrap().len() / (1024 * 1024);
+        assert!(file_mib >= 150, "fixture is only {file_mib} MiB");
+
+        let before = process_peak_rss_mib();
+        let started = std::time::Instant::now();
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let elapsed = started.elapsed();
+        let after = process_peak_rss_mib();
+        let copy_mib = std::fs::metadata(&dest_path).unwrap().len() / (1024 * 1024);
+        println!(
+            "VACUUM INTO of a {file_mib} MiB database (key {key_expr}): peak RSS {before} MiB \
+             before, {after} MiB after (+{} MiB); the copy is {copy_mib} MiB, took {elapsed:.1?}",
+            after.saturating_sub(before)
+        );
+        assert!(
+            copy_mib.abs_diff(file_mib) <= file_mib / 10,
+            "the copy is {copy_mib} MiB for a {file_mib} MiB source"
+        );
+        assert!(
+            after <= bound_mib,
+            "VACUUM INTO of a {file_mib} MiB database drove the process peak RSS to \
+             {after} MiB (bound {bound_mib} MiB)"
+        );
+        Ok(())
+    }
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    /// What the files of a copy go through in [`FailingWritesIo`].
+    struct FailingWritesState {
+        /// The destination path: it and the files the engine keeps beside
+        /// it (its temporary copy, WALs, shm) are the ones that fail.
+        prefix: String,
+        /// Bytes the files under `prefix` accept before writes fail.
+        budget: AtomicU64,
+        written: AtomicU64,
+        tripped: AtomicBool,
+        /// Whether the failure is the process dying rather than an I/O
+        /// error it can handle.
+        killed: bool,
+    }
+
+    impl FailingWritesState {
+        fn covers(&self, path: &str) -> bool {
+            path.starts_with(&self.prefix)
+        }
+
+        fn admit_write(&self, len: u64) -> Result<()> {
+            if self.tripped.load(StdOrdering::SeqCst) {
+                return Err(injected_failure("pwrite"));
+            }
+            let total = self.written.fetch_add(len, StdOrdering::SeqCst) + len;
+            if total > self.budget.load(StdOrdering::SeqCst) {
+                self.tripped.store(true, StdOrdering::SeqCst);
+                return Err(injected_failure("pwrite"));
+            }
+            Ok(())
+        }
+
+        /// Whether the process is dead, as far as these files can tell.
+        fn dead(&self) -> bool {
+            self.killed && self.tripped.load(StdOrdering::SeqCst)
+        }
+    }
+
+    fn injected_failure(op: &'static str) -> LimboError {
+        LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::Other,
+            op,
+        ))
+    }
+
+    /// The platform IO, except that the files under a prefix accept only so
+    /// many bytes of writes before every write there fails — a disk filling
+    /// up, or a file size limit, partway through a `VACUUM INTO`. In killed
+    /// mode nothing under the prefix can be written, synced or removed once
+    /// the budget is spent: what the file system sees of a process that
+    /// died partway is that what it wrote stays and no cleanup runs.
+    struct FailingWritesIo {
+        inner: Arc<crate::io::PlatformIO>,
+        state: Arc<FailingWritesState>,
+        /// Whether the IO can rename a file; without it a `VACUUM INTO`
+        /// must build its copy at the destination.
+        rename: bool,
+    }
+
+    impl FailingWritesIo {
+        fn new(prefix: &str, budget: u64, killed: bool) -> Result<Arc<Self>> {
+            Self::with_rename(prefix, budget, killed, true)
+        }
+
+        /// The same IO on a file system that cannot move a file over
+        /// another, as far as the engine is told.
+        fn without_rename(prefix: &str, budget: u64, killed: bool) -> Result<Arc<Self>> {
+            Self::with_rename(prefix, budget, killed, false)
+        }
+
+        fn with_rename(prefix: &str, budget: u64, killed: bool, rename: bool) -> Result<Arc<Self>> {
+            Ok(Arc::new(Self {
+                inner: Arc::new(crate::io::PlatformIO::new()?),
+                state: Arc::new(FailingWritesState {
+                    prefix: prefix.to_string(),
+                    budget: AtomicU64::new(budget),
+                    written: AtomicU64::new(0),
+                    tripped: AtomicBool::new(false),
+                    killed,
+                }),
+                rename,
+            }))
+        }
+
+        /// Room again: the disk was freed, the limit raised.
+        fn lift(&self) {
+            self.state.budget.store(u64::MAX, StdOrdering::SeqCst);
+            self.state.tripped.store(false, StdOrdering::SeqCst);
+        }
+
+        fn tripped(&self) -> bool {
+            self.state.tripped.load(StdOrdering::SeqCst)
+        }
+    }
+
+    impl Clock for FailingWritesIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for FailingWritesIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            if !self.state.covers(path) {
+                return Ok(inner);
+            }
+            Ok(Arc::new(FailingWritesFile {
+                inner,
+                state: self.state.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            if self.state.covers(path) && self.state.dead() {
+                return Err(injected_failure("remove_file"));
+            }
+            self.inner.remove_file(path)
+        }
+
+        fn supports_rename(&self) -> bool {
+            self.rename && self.inner.supports_rename()
+        }
+
+        fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+            assert!(self.rename, "the engine renamed on an IO that cannot");
+            if self.state.covers(from) && self.state.dead() {
+                return Err(injected_failure("rename"));
+            }
+            self.inner.rename_file(from, to)
+        }
+
+        fn step(&self) -> Result<()> {
+            self.inner.step()
+        }
+
+        fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.drain_completions(completions)
+        }
+
+        fn cancel(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.cancel(completions)
+        }
+
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            self.inner.file_id(path)
+        }
+    }
+
+    struct FailingWritesFile {
+        inner: Arc<dyn File>,
+        state: Arc<FailingWritesState>,
+    }
+
+    impl File for FailingWritesFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.state.admit_write(buffer.len() as u64)?;
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.state
+                .admit_write(buffers.iter().map(|b| b.len() as u64).sum())?;
+            self.inner.pwritev(pos, buffers, c)
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            if self.state.dead() {
+                return Err(injected_failure("sync"));
+            }
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            if self.state.dead() {
+                return Err(injected_failure("truncate"));
+            }
+            self.inner.truncate(len, c)
+        }
+    }
+
+    /// An operation a [`DeferredIo`] file has taken and not yet carried out.
+    type DeferredOp = Box<dyn FnOnce() -> Result<()> + Send>;
+
+    /// The platform IO, except that each read, write, sync and truncate is
+    /// carried out — and its completion signalled — by the next
+    /// [`IO::step`], as an asynchronous backend completes it later. A
+    /// statement that reads or writes a file then returns `StepResult::IO`
+    /// there, instead of running to completion inside one step; that is
+    /// what lets a test stop a statement partway.
+    struct DeferredIo {
+        inner: Arc<crate::io::PlatformIO>,
+        pending: Arc<crate::sync::Mutex<std::collections::VecDeque<DeferredOp>>>,
+    }
+
+    impl DeferredIo {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                inner: Arc::new(crate::io::PlatformIO::new()?),
+                pending: Arc::new(crate::sync::Mutex::new(std::collections::VecDeque::new())),
+            })
+        }
+    }
+
+    impl Clock for DeferredIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for DeferredIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            Ok(Arc::new(DeferredFile {
+                inner: self.inner.open_file(path, flags, direct)?,
+                pending: self.pending.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn supports_rename(&self) -> bool {
+            self.inner.supports_rename()
+        }
+
+        fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+            self.inner.rename_file(from, to)
+        }
+
+        /// Carries out every operation taken since the last step, in order.
+        fn step(&self) -> Result<()> {
+            let ops = std::mem::take(&mut *self.pending.lock());
+            for op in ops {
+                op()?;
+            }
+            self.inner.step()
+        }
+
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            self.inner.file_id(path)
+        }
+    }
+
+    struct DeferredFile {
+        inner: Arc<dyn File>,
+        pending: Arc<crate::sync::Mutex<std::collections::VecDeque<DeferredOp>>>,
+    }
+
+    impl DeferredFile {
+        /// Takes `op` for the next `step()` and hands back its completion,
+        /// which the engine waits on.
+        fn defer(
+            &self,
+            c: Completion,
+            op: impl FnOnce(&dyn File, Completion) -> Result<Completion> + Send + 'static,
+        ) -> Result<Completion> {
+            let inner = self.inner.clone();
+            let pending = c.clone();
+            // The platform IO carries the operation out and signals
+            // `pending` before returning; what it returns is that same
+            // completion, already finished.
+            self.pending
+                .lock()
+                .push_back(Box::new(move || op(&*inner, pending).map(drop)));
+            Ok(c)
+        }
+    }
+
+    impl File for DeferredFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.defer(c, move |file, c| file.pread(pos, c))
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.defer(c, move |file, c| file.pwrite(pos, buffer, c))
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.defer(c, move |file, c| file.pwritev(pos, buffers, c))
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.defer(c, move |file, c| file.sync(c, sync_type))
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.defer(c, move |file, c| file.truncate(len, c))
+        }
+    }
+
+    /// Rows of the atomicity fixture: three batches of the batched build.
+    const ATOMICITY_FIXTURE_ROWS: i64 = 60_000;
+    /// Writes the copy's files accept: enough for the first batch to
+    /// commit (the rows are about 1 MiB of WAL frames, a third of them per
+    /// batch), not for the rows to be checkpointed and the index (another
+    /// MiB or so) built on top.
+    const ATOMICITY_WRITE_BUDGET: u64 = 2 * 1024 * 1024;
+
+    fn open_file_db(
+        io: Arc<dyn crate::IO>,
+        path: &str,
+    ) -> Result<(Arc<Database>, Arc<Connection>)> {
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new())?;
+        Ok((db, conn))
+    }
+
+    fn create_atomicity_fixture(conn: &Arc<Connection>) -> Result<()> {
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT NOT NULL)")?;
+        conn.execute("CREATE INDEX t_k ON t(k)")?;
+        conn.execute(format!(
+            "INSERT INTO t(k) SELECT 'key-' || value FROM generate_series(1, {ATOMICITY_FIXTURE_ROWS})"
+        ))?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    fn scalar(conn: &Arc<Connection>, sql: &str) -> Result<crate::Value> {
+        let rows = conn.prepare(sql)?.run_collect_rows()?;
+        Ok(rows[0][0].clone())
+    }
+
+    /// Asserts that `path` holds a complete copy of the fixture: it passes
+    /// integrity_check and has every row and the index.
+    fn assert_complete_copy(path: &str) -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let (_db, conn) = open_file_db(io, path)?;
+        assert_eq!(
+            scalar(&conn, "PRAGMA integrity_check")?,
+            crate::Value::from_text("ok")
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT count(*) FROM t")?.as_int(),
+            Some(ATOMICITY_FIXTURE_ROWS)
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT count(*) FROM t INDEXED BY t_k WHERE k > ''")?.as_int(),
+            Some(ATOMICITY_FIXTURE_ROWS)
+        );
+        Ok(())
+    }
+
+    /// Asserts that the database file at `path` holds nothing: no schema,
+    /// so no rows of any table — what a destination a copy was built at
+    /// directly must look like after the copy failed.
+    fn assert_empty_database(path: &str) -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let (_db, conn) = open_file_db(io, path)?;
+        assert_eq!(
+            scalar(&conn, "SELECT count(*) FROM sqlite_schema")?.as_int(),
+            Some(0),
+            "the destination holds part of a copy"
+        );
+        Ok(())
+    }
+
+    /// The files beside `dest_path` named as a `VACUUM INTO` to it names
+    /// its temporary copy and the copy's WAL, shm and log:
+    /// `<destination>-vacuum-…`.
+    fn temp_copies_beside(dest_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let prefix = format!(
+            "{}-vacuum-",
+            dest_path.file_name().unwrap().to_str().unwrap()
+        );
+        let mut files: Vec<_> = std::fs::read_dir(dest_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&prefix)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A `VACUUM INTO` that fails partway, after at least one batch of the
+    /// copy was committed, must leave no copy at the destination — the whole
+    /// copy or nothing, as when it was one transaction and as SQLite — and a
+    /// retry to the same path must then succeed.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_that_fails_after_a_batch_commit_leaves_no_copy() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let io = FailingWritesIo::new(dest, ATOMICITY_WRITE_BUDGET, false)?;
+        let (_db, conn) = open_file_db(io.clone(), source_path.to_str().unwrap())?;
+        create_atomicity_fixture(&conn)?;
+
+        let err = conn
+            .execute(format!("VACUUM INTO '{dest}'"))
+            .expect_err("the copy's writes fail once the budget is spent");
+        assert!(io.tripped(), "the failure was not the injected one: {err}");
+        assert!(
+            !dest_path.exists(),
+            "a failed VACUUM INTO left a copy at the destination"
+        );
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "a failed VACUUM INTO left its temporary copy behind"
+        );
+
+        io.lift();
+        conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        assert_complete_copy(dest)?;
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "a complete VACUUM INTO left its temporary copy behind"
+        );
+        Ok(())
+    }
+
+    /// A process killed partway through a `VACUUM INTO` — after at least one
+    /// batch of the copy was committed — leaves whatever it had written and
+    /// runs no cleanup. The destination must still hold no copy, and a retry
+    /// to the same path, by a new process, must succeed. What the killed
+    /// process left stays as it was, under its own name: the retry builds
+    /// its copy under another and removes only that.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_killed_after_a_batch_commit_leaves_no_copy_and_can_be_retried() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let source = source_path.to_str().unwrap();
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let io = FailingWritesIo::new(dest, ATOMICITY_WRITE_BUDGET, true)?;
+        let (db, conn) = open_file_db(io.clone(), source)?;
+        create_atomicity_fixture(&conn)?;
+
+        let err = conn
+            .execute(format!("VACUUM INTO '{dest}'"))
+            .expect_err("the process dies once the budget is spent");
+        assert!(io.tripped(), "the failure was not the injected one: {err}");
+        assert!(
+            !dest_path.exists(),
+            "a killed VACUUM INTO left a copy at the destination"
+        );
+        let left_behind = temp_copies_beside(&dest_path);
+        let pid = std::process::id();
+        assert!(
+            left_behind.iter().any(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.starts_with(&format!("copy.db-vacuum-{pid}-")) && name.ends_with(".tmp")
+            }),
+            "the killed process could not have removed its temporary copy: {left_behind:?}"
+        );
+        let left_behind_sizes: Vec<u64> = left_behind
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .collect();
+        // The process is gone.
+        drop(conn);
+        drop(db);
+        drop(io);
+
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let (_db, conn) = open_file_db(io, source)?;
+        conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        assert_complete_copy(dest)?;
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            left_behind,
+            "the retry touched what the killed attempt left, or left its own copy behind"
+        );
+        assert_eq!(
+            temp_copies_beside(&dest_path)
+                .iter()
+                .map(|path| std::fs::metadata(path).unwrap().len())
+                .collect::<Vec<_>>(),
+            left_behind_sizes,
+            "the retry wrote into what the killed attempt left"
+        );
+        Ok(())
+    }
+
+    /// The temporary copy is named for the destination, the process and
+    /// the statement, with its MVCC log named for it in turn: two copies to
+    /// one destination, in one process or two, never share a file, and no
+    /// file of a copy is the destination, the destination's log, or the
+    /// `<destination>-vacuum` a database beside it may be named. No
+    /// temporary copy when the destination exists or the IO cannot rename.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_temporary_copies_are_named_apart() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+
+        let first = VacuumIntoOutputFile::prepare(io.clone(), dest)?;
+        let second = VacuumIntoOutputFile::prepare(io.clone(), dest)?;
+        let pid = std::process::id();
+        for copy in [&first, &second] {
+            assert!(
+                copy.is_temporary(),
+                "an absent destination on a renaming IO gets a temporary copy"
+            );
+            let temp = copy.build_path();
+            assert!(
+                temp.starts_with(&format!("{dest}-vacuum-{pid}-")) && temp.ends_with(".tmp"),
+                "{temp} is not named for its destination, process and statement"
+            );
+            let log = logical_log_path(temp);
+            assert!(
+                log.starts_with(&format!("{dest}-vacuum-{pid}-")) && log.ends_with(".db-log"),
+                "{log} is not the log of the temporary copy {temp}"
+            );
+            for file in [temp.to_string(), log] {
+                assert_ne!(file, dest);
+                assert_ne!(file, logical_log_path(dest));
+                assert_ne!(file, format!("{dest}-vacuum"));
+            }
+        }
+        assert_ne!(first.build_path(), second.build_path());
+        assert_ne!(
+            logical_log_path(first.build_path()),
+            logical_log_path(second.build_path())
+        );
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "naming the temporary copy created a file"
+        );
+
+        let no_rename: Arc<dyn crate::IO> = FailingWritesIo::without_rename(dest, u64::MAX, false)?;
+        let at_destination = VacuumIntoOutputFile::prepare(no_rename, dest)?;
+        assert!(
+            !at_destination.is_temporary() && at_destination.build_path() == dest,
+            "a temporary copy on an IO that cannot move it to the destination"
+        );
+        std::fs::File::create(&dest_path).unwrap();
+        let at_destination = VacuumIntoOutputFile::prepare(io, dest)?;
+        assert!(
+            !at_destination.is_temporary() && at_destination.build_path() == dest,
+            "a temporary copy for a destination that exists"
+        );
+        Ok(())
+    }
+
+    /// A database may be named anything — `<destination>-vacuum`, the name
+    /// an earlier build gave the temporary copy, included. A `VACUUM INTO`
+    /// must never remove or write a file it did not create, so copying
+    /// that database beside itself leaves it, its WAL included, exactly as
+    /// it was, and the copy is complete.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_leaves_a_source_named_like_its_old_temporary_copy_alone() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("copy.db-vacuum");
+        let source = source_path.to_str().unwrap();
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let (db, conn) = open_file_db(io.clone(), source)?;
+        create_atomicity_fixture(&conn)?;
+        // A row that lives only in the source's WAL, `copy.db-vacuum-wal`,
+        // until the next checkpoint.
+        conn.execute("INSERT INTO t(k) VALUES ('late')")?;
+        let source_wal = dir.path().join("copy.db-vacuum-wal");
+        assert!(
+            std::fs::metadata(&source_wal).unwrap().len() > 0,
+            "the late row did not land in the source's WAL"
+        );
+        let rows = ATOMICITY_FIXTURE_ROWS + 1;
+
+        conn.execute(format!("VACUUM INTO '{dest}'"))?;
+
+        let count = |conn: &Arc<Connection>| -> Result<Option<i64>> {
+            Ok(scalar(conn, "SELECT count(*) FROM t")?.as_int())
+        };
+        assert_eq!(count(&conn)?, Some(rows), "the source lost rows");
+        assert!(
+            source_path.exists() && source_wal.exists(),
+            "the source or its WAL was removed"
+        );
+        // The source as another process finds it on disk, WAL rows included.
+        drop(conn);
+        drop(db);
+        let (_db, reopened) = open_file_db(io.clone(), source)?;
+        assert_eq!(
+            count(&reopened)?,
+            Some(rows),
+            "the source lost its WAL rows on disk"
+        );
+
+        let (_db, copy) = open_file_db(io, dest)?;
+        assert_eq!(
+            scalar(&copy, "PRAGMA integrity_check")?,
+            crate::Value::from_text("ok")
+        );
+        assert_eq!(count(&copy)?, Some(rows), "the copy is not complete");
+        // Beside the destination, under the `copy.db-vacuum-` prefix: the
+        // source's own WAL and shm, nothing of the copy's.
+        let source_shm = dir.path().join("copy.db-vacuum-shm");
+        let stray: Vec<_> = temp_copies_beside(&dest_path)
+            .into_iter()
+            .filter(|path| path != &source_wal && path != &source_shm)
+            .collect();
+        assert_eq!(
+            stray,
+            Vec::<std::path::PathBuf>::new(),
+            "files were left beside the destination besides the source's own"
+        );
+        Ok(())
+    }
+
+    /// Two `VACUUM INTO` to one destination at the same time — here on two
+    /// connections, the first stepped partway, then the second run through,
+    /// then the first finished — build their copies apart: neither removes
+    /// or writes the other's, each moves a complete copy to the destination,
+    /// and nothing is left beside it.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn concurrent_vacuum_into_to_one_destination_build_their_copies_apart() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        // Stepping the first copy partway takes yields: on the platform IO
+        // a read or write completes as it is issued and a copy whose source
+        // is in its page cache runs from start to end inside one step. So
+        // the IO defers each operation to its `step()`, as an asynchronous
+        // backend completes it later, and the fixture is built on the
+        // second connection, so that the first reads the source from the
+        // file — and yields at each of those reads.
+        let io: Arc<dyn crate::IO> = Arc::new(DeferredIo::new()?);
+        let (db, second_conn) = open_file_db(io.clone(), source_path.to_str().unwrap())?;
+        create_atomicity_fixture(&second_conn)?;
+        let first_conn = db.connect(ConnectOpts::new())?;
+
+        let mut first = first_conn.prepare(format!("VACUUM INTO '{dest}'"))?;
+        let mut step_first = || -> Result<bool> {
+            Ok(match first.step()? {
+                crate::StepResult::Done => true,
+                crate::StepResult::Row => false,
+                crate::StepResult::IO
+                | crate::StepResult::Yield
+                | crate::StepResult::Sleep { .. } => {
+                    io.step()?;
+                    false
+                }
+                other @ (crate::StepResult::Interrupt | crate::StepResult::Busy) => {
+                    panic!("the first copy stopped: {other:?}")
+                }
+            })
+        };
+        // Step the first copy until it has committed a batch: its temporary
+        // copy's WAL holds frames. Nothing is written there before the first
+        // commit — the fixture is far smaller than the page cache, so no
+        // page spills ahead of it — and the WAL is first truncated at the
+        // index, after the rows, so the state is seen while the rows are
+        // still being copied.
+        let first_temp_wal = loop {
+            assert!(
+                !step_first()?,
+                "the first copy finished before the second began"
+            );
+            let wal = temp_copies_beside(&dest_path)
+                .into_iter()
+                .find(|path| path.to_str().unwrap().ends_with(".tmp-wal"));
+            if let Some(wal) = wal {
+                if std::fs::metadata(&wal).unwrap().len() > 4096 {
+                    break wal;
+                }
+            }
+        };
+        let first_temp_files = temp_copies_beside(&dest_path);
+        let first_temp_wal_len = std::fs::metadata(&first_temp_wal).unwrap().len();
+
+        second_conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        assert_complete_copy(dest)?;
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            first_temp_files,
+            "the second copy touched the first's files, or left its own"
+        );
+        assert_eq!(
+            std::fs::metadata(&first_temp_wal).unwrap().len(),
+            first_temp_wal_len,
+            "the second copy wrote into the first's WAL"
+        );
+
+        while !step_first()? {}
+        assert_complete_copy(dest)?;
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "a complete VACUUM INTO left files beside the destination"
+        );
+        Ok(())
+    }
+
+    /// A copy built at the destination itself — on an IO that cannot move
+    /// a temporary file over it, or into an empty file that already exists
+    /// there — is one transaction. A failure past the point where a batched
+    /// build would have committed its first batch (the write budget is twice
+    /// the first batch's frames) leaves no rows there, not a batch of them.
+    /// A failure the statement sees leaves the destination as it was found,
+    /// an empty file, and a retry on the same IO succeeds once there is room
+    /// again. A killed process leaves the header page initialising the
+    /// database wrote and nothing else — an empty database — which a retry
+    /// from a new process refuses as an existing output, as on main, until
+    /// the file is emptied; then it succeeds.
+    #[cfg(not(target_family = "wasm"))]
+    fn vacuum_into_built_at_the_destination_leaves_it_empty_on_failure(
+        rename: bool,
+        existing_destination: bool,
+        killed: bool,
+    ) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let source = source_path.to_str().unwrap();
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        if existing_destination {
+            std::fs::File::create(&dest_path).unwrap();
+        }
+        let io = FailingWritesIo::with_rename(dest, ATOMICITY_WRITE_BUDGET, killed, rename)?;
+        let (db, conn) = open_file_db(io.clone(), source)?;
+        create_atomicity_fixture(&conn)?;
+
+        let err = conn
+            .execute(format!("VACUUM INTO '{dest}'"))
+            .expect_err("the copy's writes fail once the budget is spent");
+        assert!(io.tripped(), "the failure was not the injected one: {err}");
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "the copy was not built at the destination"
+        );
+        assert!(
+            dest_path.exists(),
+            "the destination the copy was built at is gone"
+        );
+        assert_empty_database(dest)?;
+
+        if killed {
+            // The process is gone, so the destination was not emptied: it
+            // holds the header page initialising the database wrote, and
+            // nothing else. Another process retries on the same kind of
+            // IO, with room: refused, as on main, until the file is emptied.
+            drop(conn);
+            drop(db);
+            drop(io);
+            assert_eq!(
+                std::fs::metadata(&dest_path).unwrap().len(),
+                4096,
+                "the killed copy left more than the header page"
+            );
+            let io = FailingWritesIo::with_rename(dest, u64::MAX, false, rename)?;
+            let (_db, conn) = open_file_db(io, source)?;
+            let err = conn
+                .execute(format!("VACUUM INTO '{dest}'"))
+                .expect_err("a destination holding a header page is an existing output");
+            assert!(
+                err.to_string().contains("output file already exists"),
+                "{err}"
+            );
+            std::fs::File::create(&dest_path).unwrap();
+            conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        } else {
+            assert_eq!(
+                std::fs::metadata(&dest_path).unwrap().len(),
+                0,
+                "the failed copy did not empty the destination again"
+            );
+            io.lift();
+            conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        }
+        assert_complete_copy(dest)?;
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "the retry left files beside the destination"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_on_an_io_without_rename_that_fails_leaves_the_destination_empty() -> Result<()> {
+        vacuum_into_built_at_the_destination_leaves_it_empty_on_failure(false, false, false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_on_an_io_without_rename_killed_leaves_the_destination_empty() -> Result<()> {
+        vacuum_into_built_at_the_destination_leaves_it_empty_on_failure(false, false, true)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_an_existing_empty_destination_that_fails_leaves_it_empty() -> Result<()> {
+        vacuum_into_built_at_the_destination_leaves_it_empty_on_failure(true, true, false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_an_existing_empty_destination_killed_leaves_it_empty() -> Result<()> {
+        vacuum_into_built_at_the_destination_leaves_it_empty_on_failure(true, true, true)
     }
 }
