@@ -1,4 +1,5 @@
-use crate::catalog::PG_DATABASE_OWNER_OID;
+use crate::acl::{acl_role_name, Privileges as AclPrivileges};
+use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
@@ -302,7 +303,9 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    let role = acl_role_name(&role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string()));
+    let role = acl_role_name(
+        &role_name_by_oid(&conn.role_catalog(), owner).unwrap_or_else(|| owner.to_string()),
+    );
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -314,13 +317,6 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
     Ok(Some(turso_core::text_array_literal(
         entries.iter().map(String::as_str),
     )))
-}
-
-fn acl_role_name(name: &str) -> String {
-    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return name.to_string();
-    }
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[derive(strum::EnumString)]
@@ -358,20 +354,8 @@ impl AclObjectKind {
         let no_privileges = AclPrivileges::empty();
         match self {
             Self::Column => (no_privileges, no_privileges),
-            Self::Table => (
-                no_privileges,
-                AclPrivileges::INSERT
-                    | AclPrivileges::SELECT
-                    | AclPrivileges::UPDATE
-                    | AclPrivileges::DELETE
-                    | AclPrivileges::TRUNCATE
-                    | AclPrivileges::REFERENCES
-                    | AclPrivileges::TRIGGER,
-            ),
-            Self::Sequence => (
-                no_privileges,
-                AclPrivileges::SELECT | AclPrivileges::UPDATE | AclPrivileges::USAGE,
-            ),
+            Self::Table => (no_privileges, AclPrivileges::RELATION),
+            Self::Sequence => (no_privileges, AclPrivileges::SEQUENCE),
             Self::Database => (
                 AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
                 AclPrivileges::CREATE | AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
@@ -388,52 +372,6 @@ impl AclObjectKind {
             Self::ForeignDataWrapper | Self::ForeignServer => (no_privileges, AclPrivileges::USAGE),
             Self::Type => (AclPrivileges::USAGE, AclPrivileges::USAGE),
         }
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy)]
-    struct AclPrivileges: u16 {
-        const INSERT = 1 << 0;
-        const SELECT = 1 << 1;
-        const UPDATE = 1 << 2;
-        const DELETE = 1 << 3;
-        const TRUNCATE = 1 << 4;
-        const REFERENCES = 1 << 5;
-        const TRIGGER = 1 << 6;
-        const EXECUTE = 1 << 7;
-        const USAGE = 1 << 8;
-        const CREATE = 1 << 9;
-        const TEMPORARY = 1 << 10;
-        const CONNECT = 1 << 11;
-        const SET = 1 << 12;
-        const ALTER_SYSTEM = 1 << 13;
-    }
-}
-
-impl fmt::Display for AclPrivileges {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (privilege, letter) in [
-            (Self::INSERT, "a"),
-            (Self::SELECT, "r"),
-            (Self::UPDATE, "w"),
-            (Self::DELETE, "d"),
-            (Self::TRUNCATE, "D"),
-            (Self::REFERENCES, "x"),
-            (Self::TRIGGER, "t"),
-            (Self::EXECUTE, "X"),
-            (Self::USAGE, "U"),
-            (Self::CREATE, "C"),
-            (Self::TEMPORARY, "T"),
-            (Self::CONNECT, "c"),
-            (Self::SET, "s"),
-            (Self::ALTER_SYSTEM, "A"),
-        ] {
-            if self.contains(privilege) {
-                f.write_str(letter)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -661,16 +599,7 @@ fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
 }
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
-    role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
-}
-
-fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
-    if oid == PG_DATABASE_OWNER_OID {
-        return Some("pg_database_owner".to_string());
-    }
-    crate::catalog::postgres_roles(&conn.role_catalog())
-        .find(|role| crate::catalog::role_oid(role.id) == oid)
-        .map(|role| role.name)
+    role_name_by_oid(&conn.role_catalog(), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {

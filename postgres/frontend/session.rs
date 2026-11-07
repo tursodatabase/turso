@@ -29,8 +29,9 @@ use turso_pg_parser::sqlstate::{
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
-    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator, SerialSequence,
+    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgGrantSelectStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
 
@@ -614,7 +615,9 @@ enum DeferredOperation {
 
 enum DeferredCommand {
     Translated(ast::Cmd, String),
-    Namespace(ast::Stmt),
+    /// A statement the frontend built as an AST, with no text of its own
+    /// that a dialect parses: CREATE SCHEMA, DROP SCHEMA and GRANT.
+    Ast(ast::Stmt),
     Postgres(String),
     Sqlite(String),
 }
@@ -1107,6 +1110,12 @@ impl DeferredOperation {
                         }
                         return Ok(None);
                     }
+                    FrontendStmt::GrantSelect(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        grant_select_commands(conn, stmt)?
+                    }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
                     | FrontendStmt::Show(_)
@@ -1235,8 +1244,8 @@ impl CommandSequence {
                 conn.prepare_translated_cmd(cmd.clone(), sql)
                     .map_err(schema_error)?,
             ),
-            DeferredCommand::Namespace(stmt) => {
-                crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
+            DeferredCommand::Ast(stmt) => {
+                crate::Statement::new(conn.prepare_ast_stmt(stmt.clone()).map_err(schema_error)?)
             }
             DeferredCommand::Postgres(_) => {
                 prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
@@ -1255,7 +1264,7 @@ impl CommandSequence {
             DeferredCommand::Translated(_, sql)
             | DeferredCommand::Sqlite(sql)
             | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
-            DeferredCommand::Namespace(stmt) => stmt.to_string().into(),
+            DeferredCommand::Ast(stmt) => stmt.to_string().into(),
         }
     }
 
@@ -1703,7 +1712,8 @@ fn try_prepare_special(
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
-        | FrontendStmt::CommentOn(_)) => crate::Statement::with_deferred(
+        | FrontendStmt::CommentOn(_)
+        | FrontendStmt::GrantSelect(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1716,16 +1726,11 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
         ParseError::ParseError(message) => LimboError::ParseError(message),
         ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
-        ParseError::SchemaQualifiedName { ref schema, .. }
-            if !catalog::namespace_exists(conn, schema) =>
-        {
-            sqlstate_error(
-                SQLSTATE_INVALID_SCHEMA_NAME,
-                format!("schema \"{schema}\" does not exist"),
-            )
-        }
-        ParseError::SchemaQualifiedName { .. } => {
-            sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
+        ParseError::SchemaQualifiedName { ref schema, .. } => {
+            match check_schema_exists(conn, schema) {
+                Err(missing_schema) => missing_schema,
+                Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+            }
         }
     }
 }
@@ -1768,6 +1773,9 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
+        // Who may grant on each table is decided from its stored privileges
+        // when the engine's GRANT runs.
+        FrontendStmt::GrantSelect(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),
@@ -1793,6 +1801,75 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         }
     };
     Err(LimboError::PermissionDenied(Box::new(denial)))
+}
+
+/// The engine GRANT that stores a GRANT SELECT. The engine checks the
+/// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
+/// TABLES IN SCHEMA` names the tables, views and materialized views of each
+/// schema, and no statement when there are none.
+fn grant_select_commands(
+    conn: &Arc<Connection>,
+    stmt: &PgGrantSelectStmt,
+) -> Result<Vec<DeferredStatement>> {
+    let relations = match &stmt.tables {
+        PgGrantTables::Named(tables) => tables.clone(),
+        PgGrantTables::AllInSchemas(schemas) => {
+            let mut relations = Vec::new();
+            for schema in schemas {
+                check_schema_exists(conn, schema)?;
+                let schema = schema.to_lowercase();
+                relations.extend(
+                    schema_objects(conn, &schema)
+                        .into_iter()
+                        .filter_map(|object| match object {
+                            SchemaObject::Table(name) | SchemaObject::View(name) => Some(name),
+                            SchemaObject::Sequence(_) => None,
+                        })
+                        .map(|name| {
+                            ast::QualifiedName::fullname(
+                                ast::Name::exact(schema.clone()),
+                                ast::Name::exact(name),
+                            )
+                        }),
+                );
+            }
+            relations
+        }
+    };
+    if relations.is_empty() {
+        // With nothing to grant on, the roles are still checked, as in
+        // PostgreSQL; otherwise the dialect checks them.
+        let roles = conn.role_catalog();
+        for grantee in &stmt.roles {
+            if let PgGrantee::Role(name) = grantee {
+                if catalog::role_oid_by_name(&roles, name).is_none() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_UNDEFINED_OBJECT,
+                        format!("role \"{name}\" does not exist"),
+                    ));
+                }
+            }
+        }
+        return Ok(Vec::new());
+    }
+    Ok(vec![DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            privileges: vec![ast::Privilege::Select],
+            relations,
+            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
+        })),
+        context: CommandContext::Default,
+    }])
+}
+
+fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
+    if catalog::namespace_exists(conn, schema) {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INVALID_SCHEMA_NAME,
+        format!("schema \"{schema}\" does not exist"),
+    ))
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -2088,7 +2165,7 @@ fn create_schema_commands(
     }
 
     let mut commands = vec![DeferredStatement {
-        command: DeferredCommand::Namespace(ast::Stmt::CreateSchema {
+        command: DeferredCommand::Ast(ast::Stmt::CreateSchema {
             name: ast::Name::exact(name.clone()),
         }),
         context: CommandContext::Default,
@@ -2132,7 +2209,7 @@ fn drop_schema_commands(
         })
         .collect();
     commands.push(DeferredStatement {
-        command: DeferredCommand::Namespace(ast::Stmt::DropSchema {
+        command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name),
         }),
         context: CommandContext::DropSchema,

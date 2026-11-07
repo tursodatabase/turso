@@ -360,3 +360,210 @@ fn dropping_a_table_releases_the_sequences_it_owned() {
     pg.execute("DROP TABLE d").unwrap();
     pg.execute("ALTER SEQUENCE d_x_seq OWNER TO alice").unwrap();
 }
+
+/// The stored access control list of `relname`, as `pg_class.relacl` shows
+/// it, read through `conn`.
+fn relacl(conn: &turso_pg::Connection, relname: &str) -> Option<String> {
+    let rows = conn
+        .query(format!(
+            "SELECT relacl FROM pg_class WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{relname} has one pg_class row: {rows:?}");
+    match &rows[0][0] {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str().to_string()),
+        other => panic!("relacl is text or NULL, got {other:?}"),
+    }
+}
+
+/// The stored access control list of `relname`, read from the catalog
+/// table, where roles are oids: 10 is the superuser and the first created
+/// role is 16385.
+fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
+    let rows = conn
+        .prepare(format!(
+            "SELECT relacl FROM __turso_internal_classes WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{relname} has one class row: {rows:?}");
+    match &rows[0][0] {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str().to_string()),
+        other => panic!("relacl is text or NULL, got {other:?}"),
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn grant_select_stores_the_list_in_the_file_and_it_survives_a_reopen(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
+    assert_eq!(stored_relacl(&conn, "t"), None);
+
+    pg.execute("GRANT SELECT ON t, v TO reader").unwrap();
+    let stored = "{10=arwdDxtm/10,16385=r/10}";
+    let list = "{postgres=arwdDxtm/postgres,reader=r/postgres}";
+    assert_eq!(stored_relacl(&conn, "t").as_deref(), Some(stored));
+    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(stored));
+    assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
+
+    drop(pg);
+    drop(conn);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(stored));
+    assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
+    // The reopened database keeps granting on the stored list.
+    pg.execute("GRANT SELECT ON t TO PUBLIC").unwrap();
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres,=r/postgres}")
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn a_grant_is_seen_by_another_connection(db: TempDatabase) {
+    let granting = db.connect_postgres();
+    let watching = db.connect_postgres();
+    granting.execute("CREATE ROLE reader").unwrap();
+    granting.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    assert_eq!(relacl(&watching, "t"), None);
+
+    granting.execute("GRANT SELECT ON t TO reader").unwrap();
+    assert_eq!(
+        relacl(&watching, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}")
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn a_rolled_back_grant_leaves_the_list_as_it_was(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+    pg.execute("BEGIN").unwrap();
+    pg.execute("GRANT SELECT ON t TO reader").unwrap();
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}"),
+        "the transaction sees its own grant"
+    );
+    pg.execute("ROLLBACK").unwrap();
+    assert_eq!(stored_relacl(&conn, "t"), None);
+    assert_eq!(
+        relacl(&pg, "t"),
+        None,
+        "the in-memory catalog forgot it too"
+    );
+}
+
+/// Writes a database at `path` with the catalog as the first tursopg with
+/// one made it: six columns, no `relacl`, and a class row for the table
+/// `app.t`, written by hand.
+fn write_catalog_without_relacl(path: &str) {
+    let db = open_without_catalog(path);
+    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    conn.create_namespace("app").unwrap();
+    let app = conn.qualifier("app").unwrap().target.id.as_u32();
+    for sql in [
+        "CREATE TABLE __turso_internal_classes (oid INTEGER PRIMARY KEY, relname TEXT NOT NULL, \
+         relnamespace INTEGER NOT NULL, relkind TEXT NOT NULL, relowner INTEGER NOT NULL, \
+         relownedby INTEGER NOT NULL)"
+            .to_string(),
+        "CREATE UNIQUE INDEX __turso_internal_classes_name \
+         ON __turso_internal_classes (relnamespace, relname)"
+            .to_string(),
+        "CREATE TABLE sqlite_sequence(name,seq)".to_string(),
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16384)"
+            .to_string(),
+        "CREATE TABLE app.t (x int)".to_string(),
+        format!("INSERT INTO __turso_internal_classes VALUES (16384, 't', {app}, 'r', 0, 0)"),
+    ] {
+        conn.prepare_engine_schema_statement(&sql)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_catalog_made_before_relacl_gets_the_column_when_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relacl.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relacl(path);
+
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let db = turso_pg::open_database_with_io(
+        io,
+        path,
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    assert_eq!(stored_relacl(&conn, "t"), None);
+    assert_eq!(relacl(&pg, "t"), None);
+
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("GRANT SELECT ON app.t TO reader").unwrap();
+    assert_eq!(
+        stored_relacl(&conn, "t").as_deref(),
+        Some("{10=arwdDxtm/10,16385=r/10}")
+    );
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}")
+    );
+}
+
+#[test]
+fn a_catalog_made_before_relacl_opens_read_only_without_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relacl-read-only.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relacl(path);
+
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let db = turso_pg::open_database_with_io(
+        io,
+        path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    assert_eq!(relacl(&pg, "t"), None);
+    let rows = pg
+        .query("SELECT count(*) FROM app.t")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].as_int(), Some(0));
+
+    // Statements that rewrite a class row compile without the column and
+    // fail as any write to a read-only database does.
+    pg.execute("CREATE ROLE reader").unwrap_err();
+    for sql in [
+        "DROP TABLE app.t",
+        "ALTER TABLE app.t RENAME TO u",
+        "ALTER TABLE app.t OWNER TO postgres",
+        "GRANT SELECT ON app.t TO postgres",
+    ] {
+        let error = pg.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("readonly"), "{sql}: {error}");
+    }
+}

@@ -207,6 +207,9 @@ pub enum Stmt {
         /// role name
         role_name: String,
     },
+    /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
+    /// frontend with roles translates its own GRANT into this.
+    Grant(Grant),
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -1524,6 +1527,33 @@ pub enum RoleSpec {
     CurrentRole,
     /// `SESSION_USER`: the role the session logged in as.
     SessionUser,
+}
+
+/// `GRANT privileges ON relations TO grantees`. The relations are named one
+/// by one: a frontend expands a form like `ALL TABLES IN SCHEMA` before it
+/// builds this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Grant {
+    pub privileges: Vec<Privilege>,
+    pub relations: Vec<QualifiedName>,
+    pub grantees: Vec<Grantee>,
+}
+
+/// A privilege on a relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Privilege {
+    Select,
+}
+
+/// Whom a `GRANT` gives privileges to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Grantee {
+    /// `PUBLIC`: every role.
+    Public,
+    Role(RoleSpec),
 }
 
 /// Operator mapping in a `CREATE TYPE` body

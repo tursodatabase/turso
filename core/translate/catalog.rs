@@ -162,6 +162,14 @@ impl<'a> CatalogContext<'a> {
         self.with_database_scope(namespace, "view", view_name, f)
     }
 
+    /// The view whose query is being planned, innermost first, or None
+    /// outside any view.
+    pub(crate) fn enclosing_view(&self) -> Option<(NamespaceRef, String)> {
+        let scope = self.database_scope.borrow();
+        let scope = scope.as_ref()?;
+        (scope.kind == "view").then(|| (scope.namespace, scope.object_name.clone()))
+    }
+
     pub fn resolve_function(
         &self,
         func_name: &str,

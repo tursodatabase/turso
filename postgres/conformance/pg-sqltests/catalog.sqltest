@@ -643,7 +643,6 @@ expect {
     2608
 }
 
-@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test pg-depend-for-dump-table-query {
     CREATE TABLE dump_indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE);
     CREATE TABLE dump_plain (value TEXT);
@@ -686,8 +685,8 @@ test pg-depend-for-dump-table-query {
     ORDER BY relname;
 }
 expect {
-    1259|dump_indexed|1|{owner=arwdDxt/owner}||||heap
-    1259|dump_plain|0|{owner=arwdDxt/owner}||||heap
+    1259|dump_indexed|1|{owner=arwdDxtm/owner}||||heap
+    1259|dump_plain|0|{owner=arwdDxtm/owner}||||heap
 }
 
 test physical-catalog-tableoid {

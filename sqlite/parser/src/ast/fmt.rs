@@ -693,6 +693,7 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some("ROLE"))?;
                 s.append(TK_ID, Some(role_name))
             }
+            Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -1733,12 +1734,66 @@ impl ToTokens for AlterTableBody {
             Self::OwnerTo { role, .. } => {
                 s.append(TK_ID, Some("OWNER"))?;
                 s.append(TK_TO, None)?;
-                match role {
-                    crate::ast::RoleSpec::Name(name) => s.append(TK_ID, Some(name)),
-                    crate::ast::RoleSpec::CurrentRole => s.append(TK_ID, Some("CURRENT_ROLE")),
-                    crate::ast::RoleSpec::SessionUser => s.append(TK_ID, Some("SESSION_USER")),
-                }
+                role.to_tokens(s, context)
             }
+        }
+    }
+}
+
+impl_display_for_to_tokens!(RoleSpec);
+impl ToTokens for RoleSpec {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Name(name) => s.append(TK_ID, Some(name)),
+            Self::CurrentRole => s.append(TK_ID, Some("CURRENT_ROLE")),
+            Self::SessionUser => s.append(TK_ID, Some("SESSION_USER")),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(Grant);
+impl ToTokens for Grant {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ID, Some("GRANT"))?;
+        s.comma(&self.privileges, context)?;
+        s.append(TK_ON, None)?;
+        s.comma(&self.relations, context)?;
+        s.append(TK_TO, None)?;
+        s.comma(&self.grantees, context)
+    }
+}
+
+impl_display_for_to_tokens!(Privilege);
+impl ToTokens for Privilege {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Select => s.append(TK_SELECT, None),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(Grantee);
+impl ToTokens for Grantee {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Public => s.append(TK_ID, Some("PUBLIC")),
+            Self::Role(role) => role.to_tokens(s, context),
         }
     }
 }
