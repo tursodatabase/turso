@@ -6905,12 +6905,8 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+/// Copy of a generated-column expression with column references turned back into names.
+pub fn generated_expr_with_names(expr: &Expr, columns: &[Column]) -> Result<Expr> {
     let mut clone = expr.clone();
     walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
         if let Expr::Column { table, column, .. } = e {
@@ -6924,7 +6920,12 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
         }
         Ok(WalkControl::Continue)
     })?;
-    Ok(clone.to_string())
+    Ok(clone)
+}
+
+/// Re-render the SQL text of a generated-column expression using current column names.
+pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+    Ok(generated_expr_with_names(expr, columns)?.to_string())
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
