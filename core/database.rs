@@ -1159,51 +1159,6 @@ impl Database {
         Ok(())
     }
 
-    /// Look up a database in the process-wide registry by file identity.
-    /// Returns the cached Database if found, with encryption validation.
-    /// This avoids opening a file (and acquiring a file lock) when the
-    /// database is already open in this process.
-    fn lookup_in_registry(
-        path: &str,
-        encryption_opts: &Option<EncryptionOpts>,
-        dialect: &dyn Dialect,
-        page_codec: Option<&dyn PageCodec>,
-        flags: OpenFlags,
-    ) -> Result<Option<Arc<Database>>> {
-        if is_memory_like(path) {
-            return Ok(None);
-        }
-        let file_id = match io::get_file_id(path) {
-            Ok(id) => id,
-            Err(_) => return Ok(None), // file doesn't exist yet
-        };
-        let key = DatabaseKey::File(file_id);
-        let registry = DATABASE_MANAGER.lock();
-        let db = match registry.get(&key) {
-            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
-                Some(db) => db,
-                None => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        drop(registry);
-
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
-        }
-        db.validate_page_codec(page_codec)?;
-
-        Self::check_registry_dialect(&db, dialect)?;
-
-        Self::check_registry_access(&db, flags)?;
-        Ok(Some(db.with_open_access(flags)))
-    }
-
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
         match (self.page_codec_id, page_codec) {
             (Some(_), None) => Err(LimboError::InvalidArgument(
@@ -1245,39 +1200,13 @@ impl Database {
         )
     }
 
-    /// Resolve `OpenOptions::storage` for a file-backed open when the caller
-    /// did not supply pre-opened storage: optionally consult the registry, run
-    /// the legacy/multiprocess WAL probes, open the file, and fill in
-    /// `options.storage` and the effective flags in place. Returns `Some(db)`
-    /// when a registry hit short-circuits the open (only possible when
-    /// `use_registry` is set).
+    /// Open default file storage after the caller has handled the database registry.
     #[cfg(feature = "fs")]
     fn resolve_default_storage(
         io: &Arc<dyn IO>,
         path: &str,
         options: &mut OpenOptions,
-        use_registry: bool,
-    ) -> Result<Option<Arc<Database>>> {
-        // Check the registry before opening the file to avoid acquiring a file
-        // lock that would conflict with an already-open Database in this process.
-        if use_registry {
-            if let Some(db) = Self::lookup_in_registry(
-                path,
-                &options.encryption,
-                options.dialect.as_ref(),
-                options.page_codec.as_deref(),
-                options.flags,
-            )? {
-                if options.durable_storage.is_some() && db.durable_storage.is_none() {
-                    return Err(LimboError::InvalidArgument(
-                        "database already open without custom durable storage; \
-                         close the existing instance before reopening with a custom DurableStorage"
-                            .to_string(),
-                    ));
-                }
-                return Ok(Some(db));
-            }
-        }
+    ) -> Result<()> {
         // Mixed legacy/multiprocess opens are incompatible, but the two modes
         // advertise themselves through different lock domains (`.tshm` vs DB
         // file lock). We therefore probe both directions around the actual file
@@ -1312,7 +1241,7 @@ impl Database {
         )?;
         options.flags = effective_flags;
         options.storage = Some(Arc::new(DatabaseFile::new(file)));
-        Ok(None)
+        Ok(())
     }
 
     #[cfg(not(feature = "fs"))]
@@ -1320,8 +1249,7 @@ impl Database {
         _io: &Arc<dyn IO>,
         _path: &str,
         _options: &mut OpenOptions,
-        _use_registry: bool,
-    ) -> Result<Option<Arc<Database>>> {
+    ) -> Result<()> {
         Err(LimboError::InvalidArgument(
             "OpenOptions::storage is required to open a database without the `fs` feature"
                 .to_string(),
@@ -1455,7 +1383,7 @@ impl Database {
                 state.registry_key = Some(key);
             }
             if state.registry_key.is_none() && options.storage.is_none() {
-                Self::resolve_default_storage(&io, path, &mut options, false)?;
+                Self::resolve_default_storage(&io, path, &mut options)?;
                 if let Ok(file_id) = io.file_id(path) {
                     let key = DatabaseKey::File(file_id);
                     registry.insert(key.clone(), RegistryEntry::Opening);
@@ -1470,7 +1398,7 @@ impl Database {
         // Open the database (no registry lock held; never re-consults it).
         let result = (|| {
             if options.storage.is_none() {
-                Self::resolve_default_storage(&io, path, &mut options, false)?;
+                Self::resolve_default_storage(&io, path, &mut options)?;
                 state.resolved_options = Some(options.clone());
             }
             let storage = options.storage.clone().expect("default storage resolved");
@@ -1552,9 +1480,7 @@ impl Database {
     pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
         Self::validate_open_options(&options)?;
         if options.storage.is_none() {
-            // `use_registry = false`: the raw path never consults the registry,
-            // so this only opens the file and never returns a cached Database.
-            Self::resolve_default_storage(&io, path, &mut options, false)?;
+            Self::resolve_default_storage(&io, path, &mut options)?;
         }
         let mut state = OpenDbAsyncState::new();
         loop {
