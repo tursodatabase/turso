@@ -3148,6 +3148,17 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     let Ok(name) = CStr::from_ptr(name).to_str() else {
         return SQLITE_MISUSE;
     };
+    if func.is_none() && step.is_some() && final_.is_some() {
+        let mut inner = handle.inner.lock().unwrap();
+        if inner.connection().is_none() || !(-1..=1000).contains(&n_args) || name.len() > 255 {
+            return SQLITE_MISUSE;
+        }
+        return set_db_err_msg(
+            &mut inner,
+            SQLITE_ERROR,
+            "C aggregate callbacks are not supported",
+        );
+    }
     let name_c = CString::new(name).unwrap();
     let mut registration = match (func, step, final_) {
         (Some(callback), None, None) => {
