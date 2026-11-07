@@ -446,6 +446,13 @@ expect error {
     bigint out of range
 }
 
+test select-octal-and-binary-literals-above-int4-range {
+    SELECT 0o20000000000, 0b11111111111111111111111111111111, 0o777777777777777777777::int8, -0o20000000000;
+}
+expect {
+    2147483648|4294967295|9223372036854775807|-2147483648
+}
+
 test select-cast-int8-out-of-range-literal-in-unused-column-default {
     CREATE TABLE int8_default(a int8 DEFAULT 9223372036854775808::int8, b int);
     INSERT INTO int8_default VALUES (5, 1);

@@ -3521,7 +3521,9 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
+                    let text = octal_or_binary_literal_as_decimal(&f.fval)
+                        .unwrap_or_else(|| f.fval.clone());
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -6460,6 +6462,43 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
         magnitude += 1;
     }
     magnitude > limit
+}
+
+/// Writes an octal (`0o`) or binary (`0b`) integer literal in decimal digits,
+/// because Turso's numeric literal parser reads only decimal and hex text.
+/// Returns `None` for any other literal.
+fn octal_or_binary_literal_as_decimal(literal: &str) -> Option<String> {
+    let literal = literal.replace('_', "");
+    let (sign, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", literal.as_str()),
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => return None,
+    };
+    // Decimal digits, least significant first. A literal can be longer than
+    // any integer type, so the digits are converted one at a time.
+    let mut decimal = vec![0u32];
+    for c in unsigned[2..].chars() {
+        let mut carry = c.to_digit(radix)?;
+        for digit in decimal.iter_mut() {
+            let value = *digit * radix + carry;
+            *digit = value % 10;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal.push(carry % 10);
+            carry /= 10;
+        }
+    }
+    let digits: String = decimal
+        .iter()
+        .rev()
+        .map(|d| char::from_digit(*d, 10).unwrap())
+        .collect();
+    Some(format!("{sign}{digits}"))
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
