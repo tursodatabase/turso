@@ -1,0 +1,128 @@
+@database :memory:
+
+test mvcc-scan-reverse-over-chains-and-rowid-limits {
+    PRAGMA journal_mode=mvcc;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (-5, 'neg'), (1, 'a'), (2, 'b'), (3, 'c'), (9223372036854775807, 'max');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    UPDATE t SET v = 'B' WHERE id = 2;
+    DELETE FROM t WHERE id = 3;
+    INSERT INTO t VALUES (4, 'd');
+    SELECT id, v FROM t ORDER BY id DESC;
+    BEGIN;
+    UPDATE t SET v = v || '!' WHERE id > 0;
+    DELETE FROM t WHERE id % 2 = 0;
+    SELECT id, v FROM t ORDER BY id DESC;
+    COMMIT;
+}
+expect {
+    mvcc
+    0|0|0
+    9223372036854775807|max
+    4|d
+    2|B
+    1|a
+    -5|neg
+    9223372036854775807|max!
+    1|a!
+    -5|neg
+}
+
+test mvcc-exact-seeks-after-own-writes-and-rollback-to {
+    PRAGMA journal_mode=mvcc;
+    CREATE TABLE e(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO e VALUES (1, 'a'), (2, 'b');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    BEGIN;
+    INSERT INTO e VALUES (10, 'ten');
+    UPDATE e SET v = 'one' WHERE id = 1;
+    SAVEPOINT s;
+    DELETE FROM e WHERE id = 10;
+    UPDATE e SET v = 'x' WHERE id = 2;
+    ROLLBACK TO s;
+    RELEASE s;
+    SELECT (SELECT v FROM e WHERE id = 1), (SELECT v FROM e WHERE id = 2),
+           (SELECT v FROM e WHERE id = 10), (SELECT count(*) FROM e WHERE id = 3);
+    COMMIT;
+}
+expect {
+    mvcc
+    0|0|0
+    one|b|ten|0
+}
+
+test mvcc-count-with-and-without-chains {
+    PRAGMA journal_mode=mvcc;
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b BLOB);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100)
+    INSERT INTO c SELECT i, randomblob(5000) FROM n;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT count(*) FROM c;
+    DELETE FROM c WHERE id <= 10;
+    INSERT INTO c VALUES (1000, NULL);
+    BEGIN;
+    SAVEPOINT a;
+    DELETE FROM c;
+    SELECT count(*) FROM c;
+    ROLLBACK TO a;
+    RELEASE a;
+    SELECT count(*), sum(length(b) = 5000) FROM c;
+    COMMIT;
+}
+expect {
+    mvcc
+    0|0|0
+    100
+    0
+    91|90
+}
+
+test mvcc-scans-that-write-their-own-table {
+    PRAGMA journal_mode=mvcc;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO s VALUES (1, 10), (2, 20), (3, 30);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO s SELECT id + 10, v FROM s;
+    UPDATE s SET v = (SELECT max(v) FROM s) WHERE id < 3;
+    SELECT id, v FROM s ORDER BY id DESC;
+}
+expect {
+    mvcc
+    0|0|0
+    13|30
+    12|20
+    11|10
+    3|30
+    2|30
+    1|30
+}
+
+test mvcc-update-and-delete-every-row-over-btree-and-version-rows {
+    PRAGMA journal_mode=mvcc;
+    CREATE TABLE w(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO w VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO w VALUES (7, 70), (8, 80), (9, 90), (10, 100);
+    BEGIN;
+    UPDATE w SET v = v + 1;
+    DELETE FROM w WHERE id % 2 = 0;
+    SELECT id, v FROM w ORDER BY id;
+    SELECT id, v FROM w ORDER BY id DESC;
+    COMMIT;
+    SELECT count(*), sum(v) FROM w;
+}
+expect {
+    mvcc
+    0|0|0
+    1|11
+    3|31
+    5|51
+    7|71
+    9|91
+    9|91
+    7|71
+    5|51
+    3|31
+    1|11
+    5|255
+}
