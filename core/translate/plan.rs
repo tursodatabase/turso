@@ -2241,13 +2241,18 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Returns the CTE with the given name from the nearest enclosing scope.
+    /// Within one scope, a query's own WITH clause comes after the references
+    /// it inherits, so the last match wins.
     pub fn find_cte_outer_query_ref_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .rev()
+            .filter(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .min_by_key(|t| t.scope_depth)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
