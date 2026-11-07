@@ -4665,6 +4665,45 @@ mod database_tests {
     }
 
     #[test]
+    fn readonly_connection_allows_reserved_transactions_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-reservation.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
+            .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let verify = |reader: &Arc<Connection>, expected| {
+            reader.execute("PRAGMA query_only=OFF").unwrap();
+            for begin in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+                reader.execute(begin).unwrap();
+                assert_eq!(count_test_rows(reader), expected);
+                assert!(matches!(
+                    reader.execute("INSERT INTO test VALUES(2)"),
+                    Err(LimboError::ReadOnly)
+                ));
+                reader.execute("COMMIT").unwrap();
+            }
+        };
+        let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+        verify(&reader, 1);
+        writer.execute("INSERT INTO test VALUES(3)").unwrap();
+        assert_eq!(count_test_rows(&reader), 2);
+        drop(reader);
+        drop(writer);
+        drop(db);
+        let readonly = Database::open(
+            io,
+            path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        verify(&readonly.connect(ConnectOpts::new()).unwrap(), 2);
+    }
+
+    #[test]
     fn readonly_connection_cannot_checkpoint_shared_writable_storage() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("checkpoint.db");

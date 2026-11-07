@@ -4598,7 +4598,7 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let mut started_secondary_tx = false;
-                if write && conn.is_readonly(*db) {
+                if statement_writes_db && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly.into());
                 }
                 let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
