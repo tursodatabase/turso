@@ -2391,6 +2391,13 @@ impl Jsonb {
             }
         }
 
+        if has_keyword_continuation(input, pos + true_lit.len()) {
+            return Err(PError::Message {
+                msg: "Expected true".to_string(),
+                location: Some(pos),
+            });
+        }
+
         pos += true_lit.len();
         self.data.push(ElementType::TRUE as u8);
 
@@ -2406,6 +2413,13 @@ impl Jsonb {
                     location: Some(pos),
                 });
             }
+        }
+
+        if has_keyword_continuation(input, pos + false_lit.len()) {
+            return Err(PError::Message {
+                msg: "Expected false".to_string(),
+                location: Some(pos),
+            });
         }
 
         pos += false_lit.len();
@@ -2435,6 +2449,13 @@ impl Jsonb {
             && input[pos + 2] == b'l'
             && input[pos + 3] == b'l'
         {
+            if has_keyword_continuation(input, pos + 4) {
+                return Err(PError::Message {
+                    msg: "Expected null or nan".to_string(),
+                    location: Some(pos),
+                });
+            }
+
             pos += 4;
             self.data.push(ElementType::NULL as u8);
             return Ok(pos);
@@ -4252,6 +4273,12 @@ fn is_unquoted_key_char(input: &[u8], pos: usize) -> bool {
 /// the character.
 fn is_json5_id_char(b: u8, first: bool) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x7f || (!first && b.is_ascii_digit())
+}
+
+fn has_keyword_continuation(input: &[u8], pos: usize) -> bool {
+    input
+        .get(pos)
+        .is_some_and(|&b| is_json5_id_char(b, false) && json5_whitespace_len(&input[pos..]) == 0)
 }
 
 /// Length of the JSON5-only whitespace sequence at the start of

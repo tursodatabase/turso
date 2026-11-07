@@ -245,6 +245,39 @@ expect {
     2|3|7|4|2|3|4|3|3|4|0
 }
 
+test json_error_position_reports_malformed_literal_start {
+    SELECT json_error_position('true0'),
+           json_error_position('truex'),
+           json_error_position('{"x":true0}');
+}
+expect {
+    1|1|6
+}
+
+test json_error_position_reports_malformed_literals_in_containers {
+    SELECT json_error_position('false0'),
+           json_error_position('falsex'),
+           json_error_position('null0'),
+           json_error_position('nullx'),
+           json_error_position('  true0'),
+           json_error_position('[true0]'),
+           json_error_position('{"x":[false0]}'),
+           json_error_position('[{"x":null0}]');
+}
+expect {
+    1|1|1|1|3|2|7|7
+}
+
+test json_error_position_literal_errors_preserve_other_positions {
+    SELECT json_error_position('{"x":[true,false,null]}'),
+           json_error_position('[1,,2]'),
+           json_error_position('[true false]'),
+           json_error_position('true' || char(160));
+}
+expect {
+    0|4|7|0
+}
+
 # A sign with no digits after it is reported at the sign, even when an
 # exponent follows.
 test json_error_position_reports_sign_without_digits_before_exponent {
