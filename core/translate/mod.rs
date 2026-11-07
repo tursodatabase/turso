@@ -152,6 +152,7 @@ pub fn translate(
         },
         search_path.as_deref(),
     );
+    resolver.automatic_index = connection.automatic_index();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 

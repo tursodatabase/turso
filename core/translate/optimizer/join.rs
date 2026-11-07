@@ -65,7 +65,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
-            allow_automatic_index: true,
+            allow_automatic_index: resolver.automatic_index,
             resolver,
         }
     }

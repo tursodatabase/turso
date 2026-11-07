@@ -169,6 +169,7 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Foreign-key action programs currently being compiled by this resolver.
@@ -407,6 +408,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
+            automatic_index: true,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -442,6 +444,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -459,6 +462,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
