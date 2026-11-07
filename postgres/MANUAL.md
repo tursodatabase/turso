@@ -17,11 +17,12 @@ ALTER TABLE name DISABLE ROW LEVEL SECURITY
 `DISABLE ROW LEVEL SECURITY` turns it off. The `relrowsecurity` column of
 `pg_class` shows which tables have it.
 
-A table with row-level security shows no rows to a role that is not a
-superuser, as a PostgreSQL table with row-level security and no policies does.
-Queries return no rows from it, wherever the table appears in them: in joins,
-subqueries, common table expressions, views and `COPY ... TO STDOUT`. In a
-`LEFT JOIN`, the table's columns read as NULL. Superusers see every row.
+A table with row-level security shows no rows to a role that is neither a
+superuser nor the table's owner, as a PostgreSQL table with row-level security
+and no policies does. Queries return no rows from it, wherever the table
+appears in them: in joins, subqueries, common table expressions, views and
+`COPY ... TO STDOUT`. In a `LEFT JOIN`, the table's columns read as NULL.
+Superusers and the table's owner see every row.
 
 **Parameters:**
 
@@ -29,8 +30,9 @@ subqueries, common table expressions, views and `COPY ... TO STDOUT`. In a
 
 **Notes:**
 
-Policies and `CREATE POLICY` are not supported yet, so a role that is not a
-superuser cannot see any row of a table with row-level security.
+Policies and `CREATE POLICY` are not supported yet, so a role that is neither
+a superuser nor the table's owner cannot see any row of a table with row-level
+security.
 
 A view reads its tables as the role that runs the query, like a PostgreSQL view
 with `security_invoker`, so a view of a table with row-level security shows no

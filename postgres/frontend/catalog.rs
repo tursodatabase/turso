@@ -277,6 +277,16 @@ impl Dialect for PostgresDialect {
         crate::classes::role_may_read(schema, namespace, name, role)
     }
 
+    fn row_security_applies(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+        role: RoleId,
+    ) -> bool {
+        crate::classes::row_security_applies(schema, namespace, name, role)
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }
@@ -565,7 +575,9 @@ impl SnapshotRows for PgClassTable {
             let relnatts = btree.columns().len() as i64;
             let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
-            let relrowsecurity = i64::from(schema.policies.is_enabled(*namespace, name));
+            let relrowsecurity = i64::from(crate::classes::relation_row_security(
+                &schema, *namespace, name,
+            ));
 
             rows.push(vec![
                 Value::from_i64(table_oid),                                     // oid

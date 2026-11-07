@@ -428,7 +428,7 @@ Upgrade is not supported.
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
 | ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read the tables they own or were granted `SELECT` on, but not write rows, use sequences, or change the schema they do not own; `GRANT SELECT` on tables is the only `GRANT` accepted and is stored in `pg_class.relacl`; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
-| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; a table with it shows no rows to roles that are not superusers, as with no policies in PostgreSQL; policies, `CREATE POLICY` and `FORCE ROW LEVEL SECURITY` are not supported; views apply it as the querying role, and `RIGHT`/`FULL JOIN` with such a table is rejected for roles |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; a table with it shows no rows to roles other than superusers and the table's owner, as with no policies in PostgreSQL; policies, `CREATE POLICY` and `FORCE ROW LEVEL SECURITY` are not supported; views apply it as the querying role, and `RIGHT`/`FULL JOIN` with such a table is rejected for roles |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |

@@ -1951,14 +1951,6 @@ pub enum Insn {
         change: Box<crate::dialect::RelationChange>,
         value_regs: Vec<usize>,
     },
-    /// Enable or disable row-level security for a table in the in-memory
-    /// policy catalog after its row was inserted or deleted
-    SetRowSecurity {
-        db: usize,
-        namespace: crate::namespace::NamespaceId,
-        table_name: String,
-        enabled: bool,
-    },
 
     /// Close a cursor.
     Close {
@@ -2614,7 +2606,6 @@ impl InsnVariants {
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
             InsnVariants::RelationChange => execute::op_relation_change,
-            InsnVariants::SetRowSecurity => execute::op_set_row_security,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2763,7 +2754,6 @@ impl Insn {
             | Self::AddType { .. }
             | Self::AddRole { .. }
             | Self::RelationChange { .. }
-            | Self::SetRowSecurity { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

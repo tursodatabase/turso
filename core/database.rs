@@ -5,7 +5,6 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
-use crate::security::policy::{PolicyCatalog, ROW_SECURITY_TABLE_NAME};
 use crate::security::roles::ROLES_TABLE_NAME;
 use crate::security::roles::SELECT_ROLES_SQL;
 use crate::types::IOResultOr;
@@ -357,9 +356,6 @@ pub enum OpenDbAsyncPhase {
     LoadingRoles,
     /// Reads the dialect's own schema state, after the roles it refers to.
     LoadingDialectSchema,
-    /// Reads the row-level security table into the policy catalog, after
-    /// MVCC bootstrap for the same reason as `LoadingRoles`.
-    LoadingRowSecurity,
     Done,
 }
 
@@ -590,10 +586,6 @@ pub struct OpenDbAsyncState {
     /// read so far, held across yields.
     dialect_schema_stmt: Option<Box<Statement>>,
     dialect_schema_rows: Vec<Vec<Value>>,
-    /// The row-level security table scan of `LoadingRowSecurity` and the rows
-    /// read so far, held across yields.
-    row_security_stmt: Option<Box<Statement>>,
-    row_security_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -622,8 +614,6 @@ impl OpenDbAsyncState {
             role_rows: Vec::new(),
             dialect_schema_stmt: None,
             dialect_schema_rows: Vec::new(),
-            row_security_stmt: None,
-            row_security_rows: Vec::new(),
         }
     }
 }
@@ -1909,44 +1899,6 @@ impl Database {
                                 db.dialect()
                                     .build_schema_state(schema, &state.dialect_schema_rows)?,
                             );
-                            Ok(())
-                        })?;
-                    }
-
-                    state.phase = OpenDbAsyncPhase::LoadingRowSecurity;
-                }
-
-                OpenDbAsyncPhase::LoadingRowSecurity => {
-                    let db = state
-                        .db
-                        .as_ref()
-                        .expect("db must be initialized in Init phase");
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    if state.row_security_stmt.is_none() {
-                        let schema = db.schema.lock().clone();
-                        let has_row_security_table = db.dialect().supports_roles()
-                            && schema
-                                .get_btree_table(NamespaceId::ROOT, ROW_SECURITY_TABLE_NAME)
-                                .is_some();
-                        *conn.schema.write() = schema;
-                        if has_row_security_table {
-                            state.row_security_stmt =
-                                Some(Box::new(conn.prepare_row_security_read()?));
-                        }
-                    }
-                    if let Some(stmt) = state.row_security_stmt.as_mut() {
-                        let rows = &mut state.row_security_rows;
-                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                            rows.push(row.get_values().cloned().collect());
-                            Ok(())
-                        }));
-                        state.row_security_stmt = None;
-                        let policies = Arc::new(PolicyCatalog::new(&state.row_security_rows)?);
-                        db.with_schema_mut(|schema| {
-                            schema.policies = policies;
                             Ok(())
                         })?;
                     }

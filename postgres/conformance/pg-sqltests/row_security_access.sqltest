@@ -982,3 +982,39 @@ test role-cannot-delete-rows {
 expect error {
     permission denied for table ra_docs_58
 }
+
+# The owner of a table bypasses its row-level security, as in PostgreSQL,
+# unless FORCE ROW LEVEL SECURITY is set, which is not supported.
+test owner-reads-every-row {
+    CREATE ROLE ra_owner_59;
+    CREATE TABLE ra_docs_59 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_59 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_59 OWNER TO ra_owner_59;
+    SET ROLE ra_owner_59;
+    ALTER TABLE ra_docs_59 ENABLE ROW LEVEL SECURITY;
+    SELECT count(*) FROM ra_docs_59;
+}
+expect {
+    3
+}
+
+test former-owner-reads-no-rows {
+    CREATE ROLE ra_owner_60;
+    CREATE ROLE ra_role_60;
+    CREATE TABLE ra_docs_60 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_60 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_60 ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE ra_docs_60 OWNER TO ra_owner_60;
+    GRANT SELECT ON ra_docs_60 TO ra_role_60;
+    SET ROLE ra_owner_60;
+    SELECT count(*) FROM ra_docs_60;
+    RESET ROLE;
+    ALTER TABLE ra_docs_60 OWNER TO ra_role_60;
+    GRANT SELECT ON ra_docs_60 TO ra_owner_60;
+    SET ROLE ra_owner_60;
+    SELECT count(*) FROM ra_docs_60;
+}
+expect {
+    3
+    0
+}

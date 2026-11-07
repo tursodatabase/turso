@@ -15232,33 +15232,6 @@ pub fn op_relation_change(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_set_row_security(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        SetRowSecurity {
-            db,
-            namespace,
-            table_name,
-            enabled,
-        },
-        insn
-    );
-    program.connection.with_database_schema_mut(*db, |schema| {
-        let policies = Arc::make_mut(&mut schema.policies);
-        if *enabled {
-            policies.enable(*namespace, table_name);
-        } else {
-            policies.disable(*namespace, table_name);
-        }
-    })?;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads

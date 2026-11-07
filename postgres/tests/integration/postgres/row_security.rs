@@ -70,6 +70,7 @@ fn row_security_is_kept_after_reopening_the_database() {
 fn schema_is_read_again_after_enabling_row_security() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
     conn.execute("CREATE TABLE t (x int)").unwrap();
     conn.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
         .unwrap();
@@ -80,7 +81,11 @@ fn schema_is_read_again_after_enabling_row_security() {
     // database's shared schema, which still has the table.
     let schema = conn.inner().current_schema();
     let public = schema.namespace_named("public").unwrap();
-    assert!(schema.policies.is_enabled(public, "t"));
+    let alice = schema.roles.get_by_name("alice").unwrap().id;
+    assert!(conn
+        .inner()
+        .dialect()
+        .row_security_applies(&schema, public, "t", alice));
 }
 
 #[test]

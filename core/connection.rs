@@ -4,7 +4,6 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-use crate::security::policy::{PolicyCatalog, ROW_SECURITY_TABLE_NAME, SELECT_ROW_SECURITY_SQL};
 use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
@@ -276,11 +275,6 @@ enum ReparsePhase {
     /// Loading the dialect's own schema state, such as the PostgreSQL
     /// frontend's relation catalog.
     LoadDialectSchema {
-        stmt: Box<Statement>,
-        rows: Vec<Vec<Value>>,
-    },
-    /// Loading the tables with row-level security into the policy catalog.
-    LoadRowSecurity {
         stmt: Box<Statement>,
         rows: Vec<Vec<Value>>,
     },
@@ -1747,14 +1741,6 @@ impl Connection {
                     }));
                     inner.fresh.dialect_schema =
                         Some(self.db.dialect().build_schema_state(&inner.fresh, rows)?);
-                    inner.phase = self.load_row_security_phase(&inner.fresh)?;
-                }
-                ReparsePhase::LoadRowSecurity { stmt, rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        rows.push(row.get_values().cloned().collect());
-                        Ok(())
-                    }));
-                    inner.fresh.policies = Arc::new(PolicyCatalog::new(rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1784,7 +1770,7 @@ impl Connection {
     }
 
     /// Returns the phase that loads the roles table into `fresh`, moving on
-    /// to the dialect's schema state if the
+    /// to the dialect's schema state and then the stats refresh if the
     /// dialect has no roles or the database has no roles table. The fresh
     /// schema is installed first, because the current schema may not contain
     /// the roles table yet.
@@ -1804,8 +1790,8 @@ impl Connection {
     }
 
     /// Returns the phase that loads the dialect's own schema state into
-    /// `fresh`, or the row-level security phase if the dialect keeps none in
-    /// this database. `schema_installed` says whether the roles phase already
+    /// `fresh`, or the stats refresh phase if the dialect keeps none in this
+    /// database. `schema_installed` says whether the roles phase already
     /// installed the fresh schema on the connection.
     fn load_dialect_schema_phase(
         self: &Arc<Connection>,
@@ -1813,7 +1799,9 @@ impl Connection {
         schema_installed: bool,
     ) -> Result<ReparsePhase> {
         let Some(sql) = self.db.dialect().schema_state_query(fresh) else {
-            return self.load_row_security_phase(fresh);
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
         };
         if !schema_installed {
             self.install_schema_keeping_catalogs(fresh)?;
@@ -1875,42 +1863,17 @@ impl Connection {
         statement
     }
 
-    /// Returns the phase that loads the row-level security table into
-    /// `fresh`, or the stats refresh phase if the dialect has no roles or the
-    /// database has no such table. The fresh schema is installed first, as for
-    /// the roles table.
-    fn load_row_security_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !self.db.dialect().supports_roles()
-            || !fresh.has_table(NamespaceId::ROOT, ROW_SECURITY_TABLE_NAME)
-        {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
-        }
-        self.install_schema_keeping_catalogs(fresh)?;
-        let stmt = self.prepare_row_security_read()?;
-        Ok(ReparsePhase::LoadRowSecurity {
-            stmt: Box::new(stmt),
-            rows: Vec::new(),
-        })
-    }
-
-    /// Prepares the read of the row-level security table, in the same way as
-    /// [`Self::prepare_roles_read`].
-    pub(crate) fn prepare_row_security_read(self: &Arc<Connection>) -> Result<Statement> {
-        self.prepare_with_origin(SELECT_ROW_SECURITY_SQL, StatementOrigin::EngineMetadataRead)
-    }
-
     /// Installs a copy of `fresh` as the connection's schema while the schema
-    /// is still being read, keeping the roles and the row-level security
-    /// policies loaded before. The catalogs of `fresh` are empty until their
-    /// tables are read, and a statement compiled in between must not see
-    /// empty ones: an empty policy catalog lets every role read every row.
+    /// is still being read, keeping the roles and the dialect's schema state
+    /// loaded before. Both are empty in `fresh` until their tables are read,
+    /// and a statement compiled in between must not see them empty: without
+    /// the dialect's schema state, no table has an owner, privileges or
+    /// row-level security.
     fn install_schema_keeping_catalogs(&self, fresh: &Schema) -> Result<()> {
         self.with_schema_mut(|schema| {
             let mut installed = fresh.try_clone()?;
-            installed.roles = schema.roles.clone();
-            installed.policies = schema.policies.clone();
+            installed.roles.clone_from(&schema.roles);
+            installed.dialect_schema.clone_from(&schema.dialect_schema);
             *schema = installed;
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
@@ -5937,11 +5900,11 @@ mod tests {
         Ok(())
     }
 
-    /// The reparse of the schema installs a fresh schema before its
-    /// roles and policies are read, and a statement compiled meanwhile must
-    /// not see empty catalogs.
+    /// The reparse of the schema installs a fresh schema before its roles
+    /// and the dialect's schema state are read, and a statement compiled
+    /// meanwhile must not see them empty.
     #[test]
-    fn schema_installed_while_being_read_keeps_the_loaded_policies() {
+    fn schema_installed_while_being_read_keeps_the_loaded_dialect_schema() {
         let db = Database::open_file(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
@@ -5950,18 +5913,14 @@ mod tests {
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.with_schema_mut(|schema| {
-            Arc::make_mut(&mut schema.policies).enable(NamespaceId::ROOT, "t");
+            schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
         let fresh = Schema::with_options(false, &EngineDialect).unwrap();
-        assert!(!fresh.policies.is_enabled(NamespaceId::ROOT, "t"));
+        assert!(fresh.dialect_schema.is_none());
 
         conn.install_schema_keeping_catalogs(&fresh).unwrap();
 
-        assert!(conn
-            .schema
-            .read()
-            .policies
-            .is_enabled(NamespaceId::ROOT, "t"));
+        assert!(conn.schema.read().dialect_schema.is_some());
     }
 }

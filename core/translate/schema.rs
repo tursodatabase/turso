@@ -2242,7 +2242,6 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
-    crate::translate::row_security::emit_drop_table(namespace, name, resolver, program)?;
     let cdc_table = prepare_cdc_if_necessary(
         program,
         resolver.schema(),

@@ -1,13 +1,14 @@
 //! Row-level security limits which rows of a table a role may access.
 //!
 //! The statements that read and write rows call the hooks of this module,
-//! which ask [`PolicyCatalog::policy_for`] which rows the role may access and
-//! limit the statement to them. The role is the one the statement is compiled
+//! which ask the dialect whether row-level security applies to the role,
+//! [`crate::Dialect::row_security_applies`], and limit the statement to the
+//! rows the role may access. The role is the one the statement is compiled
 //! for, [`Resolver::row_security_role`].
 //!
-//! The module also compiles the statements that enable and disable row-level
-//! security, and keeps the stored tables with row-level security up to date
-//! when a table is renamed or dropped.
+//! Which tables have row-level security is the dialect's schema state, like
+//! the owner of a table. The module compiles the statements that enable and
+//! disable it into a [`RelationChange`] for the dialect to record.
 
 use std::sync::Arc;
 
@@ -15,24 +16,20 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
+    dialect::RelationChange,
     namespace::{NamespaceId, NamespaceRef},
-    schema::{BTreeTable, Table},
+    schema::{BTreeTable, Schema, Table},
     security::permission::{Action, Object, PermissionDenied},
-    security::policy::{
-        Command, Policy, PolicyCatalog, CREATE_ROW_SECURITY_TABLE_SQL, ROW_SECURITY_TABLE_NAME,
-    },
+    security::policy::{Command, Policy},
+    security::roles::{RoleCatalog, RoleId},
     translate::{
-        collate::CollationSeq,
         emitter::Resolver,
         plan::{JoinOrigin, TableReferences, WhereTerm, WhereTermOrigin},
-        schema::{emit_create_internal_table, emit_schema_cookie},
+        schema::emit_schema_cookie,
     },
-    vdbe::{
-        builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
-    },
+    vdbe::builder::ProgramBuilder,
     vtab::{VirtualTable, VirtualTableType},
-    Connection, LimboError, Result, MAIN_DB_ID,
+    Connection, Dialect, LimboError, Result, MAIN_DB_ID,
 };
 
 /// Limits the rows of the tables in `table_references` that the statement
@@ -125,9 +122,12 @@ pub(crate) fn check_blob_open(
     } else {
         (Command::Select, Action::Read)
     };
+    let dialect = connection.dialect();
     let policy = connection.with_schema(MAIN_DB_ID, |schema| {
-        schema.policies.policy_for(
+        policy_for(
+            dialect.as_ref(),
             &schema.roles,
+            schema,
             connection.current_role(),
             NamespaceId::ROOT,
             table_name,
@@ -143,9 +143,10 @@ pub(crate) fn check_blob_open(
 }
 
 /// Which rows of table `table_name` of `namespace` the role may access for
-/// `command`. The policies are those of the table's own database, so a table
-/// of an attached database with row-level security is limited too. The roles
-/// are those of the main database, which the role was set from.
+/// `command`. Whether the table has row-level security is a question for the
+/// table's own database, so a table of an attached database with row-level
+/// security is limited too. The roles are those of the main database, which
+/// the role was set from.
 fn policy(
     resolver: &Resolver,
     namespace: NamespaceRef,
@@ -154,14 +155,40 @@ fn policy(
 ) -> Policy {
     let roles = resolver.schema().roles.clone();
     resolver.with_schema(namespace.database_id, |schema| {
-        schema.policies.policy_for(
+        policy_for(
+            resolver.catalog.dialect.as_ref(),
             &roles,
+            schema,
             resolver.row_security_role,
             namespace.id,
             table_name,
             command,
         )
     })
+}
+
+/// Which rows of table `table_name` of `namespace` in `schema` `role` may
+/// access for `command`. Row-level security does not apply to superusers.
+fn policy_for(
+    dialect: &dyn Dialect,
+    roles: &RoleCatalog,
+    schema: &Schema,
+    role: RoleId,
+    namespace: NamespaceId,
+    table_name: &str,
+    command: Command,
+) -> Policy {
+    let table_name = crate::util::normalize_ident(table_name);
+    if roles.is_superuser(role)
+        || !dialect.row_security_applies(schema, namespace, &table_name, role)
+    {
+        return Policy::Allow;
+    }
+    // Policies cannot be created yet, and a table with row-level security and
+    // no policy for the command hides every row, as in PostgreSQL.
+    match command {
+        Command::Select | Command::Insert | Command::Update | Command::Delete => Policy::Deny,
+    }
 }
 
 /// A RIGHT or FULL JOIN emits the unmatched rows of its right side after the
@@ -196,208 +223,49 @@ fn no_rows() -> ast::Expr {
 }
 
 /// ALTER TABLE ... ENABLE ROW LEVEL SECURITY, or DISABLE when `enabled` is
-/// false. Enabling it for a table that already has it, or disabling it for a
-/// table that does not, changes nothing.
-pub fn translate_set_row_security(
-    namespace: NamespaceRef,
-    table_name: &str,
+/// false. The dialect records it with the table, so it follows the table
+/// when the table is renamed and goes away when the table is dropped.
+/// [`crate::translate::roles::check_statement_privileges`] lets the table's
+/// owner and superusers run it.
+pub(crate) fn translate_set_row_security(
+    qualified_name: &ast::QualifiedName,
     enabled: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
-    if !resolver.catalog.dialect.supports_roles() {
-        bail_parse_error!("row-level security is not supported");
-    }
+    let namespace = resolver.resolve_existing_table(qualified_name)?;
+    let table_name = crate::util::normalize_ident(qualified_name.name.as_str());
     if namespace.database_id != MAIN_DB_ID {
         bail_parse_error!("row-level security is only supported for tables in the main database");
     }
-    if resolver
-        .schema()
-        .policies
-        .is_enabled(namespace.id, table_name)
-        == enabled
-    {
-        return Ok(());
-    }
-    let rows = RowSecurityRows::open(resolver, program)?;
-    let stored_name = PolicyCatalog::stored_table_name(namespace.id, table_name);
-    if enabled {
-        rows.emit_insert(program, &stored_name);
-    } else {
-        rows.emit_delete(program, &stored_name);
-    }
-    emit_catalog_update(program, resolver, namespace.id, table_name, enabled);
-    Ok(())
-}
-
-/// Moves the row-level security of a renamed table to its new name.
-pub fn emit_rename_table(
-    namespace: NamespaceRef,
-    old_name: &str,
-    new_name: &str,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-) -> Result<()> {
-    if !has_row_security(namespace, old_name, resolver) {
-        return Ok(());
-    }
-    let rows = RowSecurityRows::open(resolver, program)?;
-    rows.emit_delete(
-        program,
-        &PolicyCatalog::stored_table_name(namespace.id, old_name),
-    );
-    rows.emit_insert(
-        program,
-        &PolicyCatalog::stored_table_name(namespace.id, new_name),
-    );
-    emit_catalog_update(program, resolver, namespace.id, old_name, false);
-    emit_catalog_update(program, resolver, namespace.id, new_name, true);
-    Ok(())
-}
-
-/// Removes the row-level security of a dropped table, so that a new table
-/// with the same name does not start with it.
-pub fn emit_drop_table(
-    namespace: NamespaceRef,
-    table_name: &str,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-) -> Result<()> {
-    if !has_row_security(namespace, table_name, resolver) {
-        return Ok(());
-    }
-    let rows = RowSecurityRows::open(resolver, program)?;
-    rows.emit_delete(
-        program,
-        &PolicyCatalog::stored_table_name(namespace.id, table_name),
-    );
-    emit_catalog_update(program, resolver, namespace.id, table_name, false);
-    Ok(())
-}
-
-fn has_row_security(namespace: NamespaceRef, table_name: &str, resolver: &Resolver) -> bool {
-    namespace.database_id == MAIN_DB_ID
-        && resolver
-            .schema()
-            .policies
-            .is_enabled(namespace.id, table_name)
-}
-
-/// Bumps the schema cookie and then changes the in-memory catalog. The cookie
-/// goes first because writing it is what fails when the transaction cannot
-/// change the schema, and a failed statement must not leave the in-memory
-/// catalog changed.
-fn emit_catalog_update(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    namespace: NamespaceId,
-    table_name: &str,
-    enabled: bool,
-) {
-    emit_schema_cookie(resolver, program);
-    program.emit_insn(Insn::SetRowSecurity {
-        db: MAIN_DB_ID,
-        namespace,
-        table_name: table_name.to_string(),
-        enabled,
-    });
-}
-
-/// A write cursor on `__turso_internal_row_security`, which is created on
-/// first use.
-struct RowSecurityRows {
-    cursor_id: usize,
-}
-
-impl RowSecurityRows {
-    fn open(resolver: &Resolver, program: &mut ProgramBuilder) -> Result<Self> {
-        let (table, root_page) = match resolver
-            .schema()
-            .get_btree_table(NamespaceId::ROOT, ROW_SECURITY_TABLE_NAME)
+    let schema = resolver.schema();
+    if schema.get_btree_table(namespace.id, &table_name).is_none() {
+        if schema.get_table(namespace.id, &table_name).is_some()
+            || schema.get_view(namespace.id, &table_name).is_some()
+            || schema
+                .get_materialized_view(namespace.id, &table_name)
+                .is_some()
         {
-            Some(table) => {
-                let root_page = RegisterOrLiteral::Literal(table.root_page);
-                (table, root_page)
-            }
-            None => {
-                let created = emit_create_internal_table(
-                    program,
-                    resolver,
-                    ROW_SECURITY_TABLE_NAME,
-                    CREATE_ROW_SECURITY_TABLE_SQL,
-                    &[],
-                )?;
-                (created.table, created.root_page)
-            }
-        };
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page,
-            db: MAIN_DB_ID,
-        });
-        Ok(Self { cursor_id })
+            bail_parse_error!("\"{table_name}\" is not a table");
+        }
+        bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(qualified_name)
+        );
     }
-
-    fn emit_insert(&self, program: &mut ProgramBuilder, table_name: &str) {
-        let rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::NewRowid {
-            cursor: self.cursor_id,
-            rowid_reg,
-            prev_largest_reg: 0,
-        });
-        let table_name_reg = program.emit_string8_new_reg(table_name.to_string());
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(table_name_reg),
-            count: to_u32(1),
-            dest_reg: to_u32(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: self.cursor_id,
-            key_reg: rowid_reg,
-            record_reg,
-            flag: InsertFlags::new().skip_last_rowid(),
-            table_name: ROW_SECURITY_TABLE_NAME.to_string(),
-        });
-    }
-
-    /// Deletes every row of the table stored as `table_name`.
-    fn emit_delete(&self, program: &mut ProgramBuilder, table_name: &str) {
-        let done = program.allocate_label();
-        let loop_start = program.allocate_label();
-        let next = program.allocate_label();
-        let table_name_reg = program.emit_string8_new_reg(table_name.to_string());
-        let column_reg = program.alloc_register();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: self.cursor_id,
-            pc_if_empty: done,
-        });
-        program.preassign_label_to_next_insn(loop_start);
-        program.emit_column_or_rowid(self.cursor_id, 0, column_reg);
-        program.emit_insn(Insn::Ne {
-            lhs: column_reg,
-            rhs: table_name_reg,
-            target_pc: next,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: self.cursor_id,
-            table_name: ROW_SECURITY_TABLE_NAME.to_string(),
-            is_part_of_update: false,
-        });
-        program.preassign_label_to_next_insn(next);
-        program.emit_insn(Insn::Next {
-            cursor_id: self.cursor_id,
-            pc_if_next: loop_start,
-            fullscan: false,
-            is_index: false,
-        });
-        program.preassign_label_to_next_insn(done);
-    }
+    let changes = [RelationChange::SetRowSecurity {
+        namespace: namespace.id,
+        name: table_name,
+        enabled,
+    }];
+    program.begin_write_on_database(MAIN_DB_ID, schema.schema_version)?;
+    resolver
+        .catalog
+        .dialect
+        .translate_relation_changes(program, schema, connection, &changes)?;
+    emit_schema_cookie(resolver, program);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -408,15 +276,73 @@ mod tests {
     use turso_parser::ast;
 
     use super::{policy, Command, Policy};
-    use crate::dialect::EngineDialect;
+    use crate::dialect::{Dialect, EngineDialect};
+    use crate::function::Func;
     use crate::namespace::{NamespaceId, NamespaceRef};
-    use crate::schema::Schema;
-    use crate::security::roles::RoleCatalog;
+    use crate::schema::{BTreeTable, Schema};
+    use crate::security::roles::{RoleCatalog, RoleId};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{Database, DatabaseCatalog, MemoryIO, Qualifiers, RwLock, SymbolTable, Value};
 
-    /// The policies of a table of an attached database are those of the
-    /// attached database, not of the main database.
+    /// The engine dialect, except that row-level security applies to every
+    /// table of a schema with dialect schema state.
+    struct RowSecurityInSchemasWithState;
+
+    impl Dialect for RowSecurityInSchemasWithState {
+        fn name(&self) -> &'static str {
+            EngineDialect.name()
+        }
+
+        fn parse(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
+            EngineDialect.parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            EngineDialect.parse_table_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<ast::Stmt> {
+            EngineDialect.parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            EngineDialect.table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &ast::QualifiedName,
+            body: &ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            EngineDialect.format_table_sql(input, tbl_name, body)
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            EngineDialect.register_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
+            EngineDialect.resolve_function(name, arg_count)
+        }
+
+        fn row_security_applies(
+            &self,
+            schema: &Schema,
+            _namespace: NamespaceId,
+            _name: &str,
+            _role: RoleId,
+        ) -> bool {
+            schema.dialect_schema.is_some()
+        }
+    }
+
+    /// Whether a table of an attached database has row-level security is a
+    /// question for the attached database, not for the main database.
     #[test]
     fn table_of_an_attached_database_with_row_security_denies_a_role() {
         let roles = RoleCatalog::new(&[vec![
@@ -429,7 +355,7 @@ mod tests {
         let mut main = Schema::default();
         main.roles = Arc::new(roles);
         let mut attached = Schema::default();
-        Arc::make_mut(&mut attached.policies).enable(NamespaceId::ROOT, "t");
+        attached.dialect_schema = Some(Arc::new(()));
         let attached_database_id = 2;
         let mut database_schemas = FxHashMap::default();
         database_schemas.insert(attached_database_id, Arc::new(attached));
@@ -447,7 +373,7 @@ mod tests {
             &syms,
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(EngineDialect),
+            Arc::new(RowSecurityInSchemasWithState),
             None,
             alice,
         );
@@ -463,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_row_security_fails_under_a_dialect_without_roles() {
+    fn enabling_row_security_fails_under_a_dialect_without_it() {
         let db = Database::open_file(
             Arc::new(MemoryIO::new()),
             ":memory:",
