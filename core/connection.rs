@@ -272,6 +272,12 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         rows: Vec<Vec<Value>>,
     },
+    /// Loading the dialect's own schema state, such as the PostgreSQL
+    /// frontend's relation catalog.
+    LoadDialectSchema {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -1145,7 +1151,13 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                // An engine schema statement is the engine's own SQLite text,
+                // whatever the database's dialect parses.
+                if matches!(origin, StatementOrigin::EngineSchemaWrite) {
+                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                } else {
+                    self.parse_sql(sql)?
+                }
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1728,6 +1740,19 @@ impl Connection {
                         Ok(())
                     }));
                     inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
+                    inner.phase = self.load_dialect_schema_phase(&inner.fresh, true)?;
+                }
+                ReparsePhase::LoadDialectSchema { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "dialect schema state must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.dialect_schema =
+                        Some(self.db.dialect().build_schema_state(&inner.fresh, rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1756,37 +1781,104 @@ impl Connection {
         }
     }
 
-    /// Returns the phase that loads the roles table into `fresh`, or the
-    /// stats refresh phase if the dialect has no roles or the database has no
-    /// roles table. The fresh
+    /// Returns the phase that loads the roles table into `fresh`, moving on
+    /// to the dialect's schema state and then the stats refresh if the
+    /// dialect has no roles or the database has no roles table. The fresh
     /// schema is installed first, because the current schema may not contain
     /// the roles table yet.
     fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !self.db.dialect().supports_roles()
-            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-        {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
+        if !self.db.dialect().supports_roles() {
+            return self.load_dialect_schema_phase(fresh, false);
+        }
+        if !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME) {
+            return self.load_dialect_schema_phase(fresh, false);
         }
         self.with_schema_mut(|schema| {
             *schema = fresh.try_clone()?;
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
-        let stmt = self.prepare_roles_read()?;
+        let stmt = self.prepare_engine_metadata_read(SELECT_ROLES_SQL)?;
         Ok(ReparsePhase::LoadRoles {
             stmt: Box::new(stmt),
             rows: Vec::new(),
         })
     }
 
-    /// Prepares the read of the roles table, for opening the database and
-    /// for reading the schema again. The table belongs to the engine, so its
-    /// name is looked up in every database, whatever the search path says.
-    /// The read is a top-level statement, so it runs in its own read
-    /// transaction when the schema is read outside a transaction.
-    pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
-        self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
+    /// Returns the phase that loads the dialect's own schema state into
+    /// `fresh`, or the stats refresh phase if the dialect keeps none in this
+    /// database. `schema_installed` says whether the roles phase already
+    /// installed the fresh schema on the connection.
+    fn load_dialect_schema_phase(
+        self: &Arc<Connection>,
+        fresh: &Schema,
+        schema_installed: bool,
+    ) -> Result<ReparsePhase> {
+        let Some(sql) = self.db.dialect().schema_state_query(fresh) else {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        };
+        if !schema_installed {
+            self.with_schema_mut(|schema| {
+                *schema = fresh.try_clone()?;
+                Ok::<_, crate::alloc::TryReserveError>(())
+            })??;
+        }
+        let stmt = self.prepare_engine_metadata_read(&sql)?;
+        Ok(ReparsePhase::LoadDialectSchema {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Prepares a read of an engine table that holds state the schema is
+    /// built from: the roles, or the dialect's own schema state. The table
+    /// belongs to the engine, so its name is looked up in every database,
+    /// whatever the search path says. The read is a top-level statement, so
+    /// it runs in its own read transaction when the schema is read outside
+    /// a transaction.
+    pub(crate) fn prepare_engine_metadata_read(
+        self: &Arc<Connection>,
+        sql: &str,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
+    }
+
+    /// Reads the dialect's own schema state into the database's schema and
+    /// this connection's. A frontend that creates its schema table when it
+    /// opens a database calls this after the creation commits, because the
+    /// open itself loaded the schema before the table existed.
+    pub fn reload_dialect_schema(self: &Arc<Connection>) -> Result<()> {
+        let dialect = self.db.dialect();
+        let Some(sql) = dialect.schema_state_query(&self.current_schema()) else {
+            return Ok(());
+        };
+        let rows = self
+            .prepare_engine_metadata_read(&sql)?
+            .run_collect_rows()?;
+        let state = self.with_schema(crate::MAIN_DB_ID, |schema| {
+            dialect.build_schema_state(schema, &rows)
+        })?;
+        self.db.with_schema_mut(|schema| {
+            schema.dialect_schema = Some(state.clone());
+            Ok(())
+        })?;
+        self.with_schema_mut(|schema| {
+            schema.dialect_schema = Some(state);
+        })?;
+        Ok(())
+    }
+
+    /// Prepares a schema statement of the engine's own: SQLite text whatever
+    /// the database's dialect, allowed to name the engine's reserved objects,
+    /// and run as an ordinary top-level statement with its own transaction
+    /// work. Frontends use it to create and fill their internal tables at
+    /// open, like the relation catalog of the PostgreSQL frontend.
+    pub fn prepare_engine_schema_statement(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        self.start_nested();
+        let statement = self.prepare_with_origin(sql, StatementOrigin::EngineSchemaWrite);
+        self.end_nested();
+        statement
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {

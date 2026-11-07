@@ -235,6 +235,23 @@ pub fn quote_identifier(name: &str) -> String {
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
+/// The name of automatic index `index_name` of table `old_table` once the
+/// table is named `new_table`, the tables by the names their schema rows
+/// have; None when the index is not an automatic index of `old_table`.
+pub fn renamed_automatic_index_name(
+    index_name: &str,
+    old_table: &str,
+    new_table: &str,
+) -> Option<String> {
+    let ordinal = index_name
+        .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)?
+        .strip_prefix(old_table)?
+        .strip_prefix('_')?;
+    Some(format!(
+        "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{new_table}_{ordinal}"
+    ))
+}
+
 /// Unparsed index that comes from a sql query, i.e not an automatic index
 ///
 /// CREATE INDEX idx ON table_name(sql)
@@ -1834,6 +1851,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::Optimize { .. }
         | ast::Stmt::CreateSequence { .. }
         | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::AlterSequenceOwnedBy { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
         | ast::Stmt::DropSchema { .. } => {}

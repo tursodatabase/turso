@@ -486,14 +486,6 @@ impl<'a> CatalogContext<'a> {
         schema.get_trigger(namespace, trigger_name).is_some()
     }
 
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.find_existing_sequence(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
-    }
-
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.find_unqualified_existing(seq_name, |schema, namespace, seq_name| {
             schema.get_sequence(namespace, seq_name).is_some()

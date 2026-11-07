@@ -366,6 +366,15 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `ALTER SEQUENCE name OWNED BY { table.column | NONE }`: PostgreSQL's
+    /// link from a sequence to the column that draws from it, which makes
+    /// the sequence belong to the table. Not SQLite syntax; a frontend
+    /// builds it, as the PostgreSQL frontend does for a `serial` column.
+    AlterSequenceOwnedBy {
+        seq_name: QualifiedName,
+        /// The table and its column, or None for `OWNED BY NONE`.
+        owner: Option<(QualifiedName, Name)>,
+    },
     /// `CREATE SCHEMA`: a namespace stored in the main database. Only a
     /// frontend that supports namespaces builds this statement; the SQLite
     /// parser has no such syntax.
@@ -1481,6 +1490,40 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `OWNER TO`: the relation's new owning role. Not SQLite syntax; a
+    /// frontend with roles translates its own OWNER TO into this.
+    OwnerTo {
+        /// The relation kind the statement names: `ALTER TABLE`,
+        /// `ALTER VIEW` and so on.
+        kind: RelationKind,
+        role: RoleSpec,
+        /// `IF EXISTS`: a missing relation is not an error.
+        if_exists: bool,
+    },
+}
+
+/// What kind of relation a schema object is. `ALTER ... OWNER TO` names
+/// one, and the engine's schema lists its relations by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+    Index,
+}
+
+/// A role named in DDL, like PostgreSQL's RoleSpec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RoleSpec {
+    /// A role by name.
+    Name(String),
+    /// `CURRENT_ROLE` and `CURRENT_USER`: the role the session runs as now.
+    CurrentRole,
+    /// `SESSION_USER`: the role the session logged in as.
+    SessionUser,
 }
 
 /// Operator mapping in a `CREATE TYPE` body

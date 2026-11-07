@@ -55,6 +55,16 @@ impl RoleId {
         assert!(rowid > 0, "role rowid must be positive, got {rowid}");
         RoleId(rowid)
     }
+
+    /// A role id read from a stored column, such as `relowner` in the classes
+    /// table: the bootstrap superuser (0) or a stored role's rowid.
+    pub fn from_stored(id: i64) -> Self {
+        if id == 0 {
+            RoleId::SUPERUSER
+        } else {
+            Self::from_rowid(id)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
