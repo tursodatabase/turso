@@ -856,3 +856,31 @@ expect {
     1|0
     1
 }
+
+test table-insert-values-shorter-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-longer-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3, 4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-shorter-row-without-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u VALUES (1, 2, 3), (4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-different-row-length-with-default {
+    CREATE TABLE u (id int, a int, b int DEFAULT 9);
+    INSERT INTO u VALUES (1, 2, DEFAULT), (3, 4);
+}
+@sqlstate 42601
+expect error {}
