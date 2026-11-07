@@ -2095,3 +2095,37 @@ test check_constraint_error_has_no_result_code_suffix {
 expect error {
     ^CHECK constraint failed: x<5$
 }
+
+# Like SQLite, a double-quoted name that is not a column is a string literal in a CHECK
+# constraint, and the error names the constraint as it was written. A double-quoted rowid
+# name is the rowid.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test check_constraint_double_quoted_string {
+    CREATE TABLE t(c CHECK (c <> "q"), d, CHECK (d <> "rowid"));
+    INSERT INTO t VALUES (1, 5);
+    INSERT INTO t VALUES ('q', 5);
+}
+expect error {
+    ^CHECK constraint failed: c <> "q"$
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test check_constraint_double_quoted_rowid_name {
+    CREATE TABLE t(c, d, CHECK (d <> "rowid"));
+    INSERT INTO t VALUES (1, 5);
+    INSERT INTO t VALUES (2, 2);
+}
+expect error {
+    ^CHECK constraint failed: d <> "rowid"$
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test check_constraint_double_quoted_string_in_added_column {
+    CREATE TABLE t(c);
+    ALTER TABLE t ADD COLUMN d CHECK (d <> "zz");
+    INSERT INTO t VALUES (1, 2);
+    INSERT INTO t VALUES (1, 'zz');
+}
+expect error {
+    ^CHECK constraint failed: d <> "zz"$
+}

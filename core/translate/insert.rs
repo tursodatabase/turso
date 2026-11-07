@@ -1423,6 +1423,7 @@ fn emit_partial_index_check(
         expr,
         &columns,
         &column_regs,
+        insertion.key_register(),
         table,
         reg,
     )?;
@@ -3574,6 +3575,7 @@ fn emit_index_column_value_for_insert(
             expr,
             &columns,
             &column_regs,
+            insertion.key_register(),
             table,
             dest_reg,
         )?;

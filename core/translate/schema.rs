@@ -51,7 +51,8 @@ use turso_parser::ast::ColumnDefinition;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,
-/// bind parameters, and subqueries.
+/// bind parameters, and subqueries. Like SQLite, a double-quoted name that is not a column
+/// is a string literal.
 pub(crate) fn validate_check_expr(
     expr: &ast::Expr,
     table_name: &str,
@@ -61,6 +62,7 @@ pub(crate) fn validate_check_expr(
     let normalized_table = normalize_ident(table_name);
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
+            ast::Expr::Id(name) if name.quoted_with('"') => {}
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
                 let n = normalize_ident(name.as_str());
                 if !column_names.iter().any(|c| normalize_ident(c) == n)
