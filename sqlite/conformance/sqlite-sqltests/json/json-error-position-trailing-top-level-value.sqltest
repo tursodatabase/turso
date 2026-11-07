@@ -1,0 +1,10 @@
+@database :memory:
+
+# SQLite reports position 1 when a complete top-level JSON value is followed
+# by another value.
+test json_error_position_reports_top_level_trailing_value {
+    SELECT json_error_position('1 2');
+}
+expect {
+    1
+}
