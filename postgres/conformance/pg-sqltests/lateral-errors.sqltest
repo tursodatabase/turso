@@ -403,3 +403,17 @@ expect {
     2|2
     3|0
 }
+
+# A CTE that a subquery reads does not make its columns visible in a LATERAL
+# subquery whose FROM clause does not name it.
+test lateral-cannot-read-columns-of-a-cte-it-does-not-select-from {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT 1 AS y) AS s, LATERAL (SELECT x WHERE EXISTS (SELECT 1 FROM c)) AS l;
+}
+@sqlstate 42703
+expect error {
+    column "x" does not exist
+}
+@sqlstate 42703
+expect @tursopg error {
+    no such column: x
+}
