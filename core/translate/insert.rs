@@ -3525,14 +3525,16 @@ fn translate_virtual_table_insert(
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
     let (num_values, rows) = match &mut body {
-        InsertBody::Select(select, None)
-            if !select.body.compounds.is_empty()
-                || !select.order_by.is_empty()
-                || select.limit.is_some() =>
-        {
+        InsertBody::Select(select, None) if !select.body.compounds.is_empty() => {
             crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT")
         }
         InsertBody::Select(select, None) => match &mut select.body.select {
+            OneSelect::Values(_) if !select.order_by.is_empty() => {
+                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause")
+            }
+            OneSelect::Values(_) if select.limit.is_some() => {
+                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause")
+            }
             OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
