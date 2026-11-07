@@ -1,0 +1,93 @@
+@database :memory:
+
+test view-rejects-parameter {
+    CREATE VIEW v AS SELECT ?;
+}
+expect error {
+    parameters are not allowed in views
+}
+
+test temp-view-rejects-nested-named-parameter {
+    CREATE TEMP VIEW v AS SELECT (SELECT :value);
+}
+expect error {
+    parameters are not allowed in views
+}
+
+test trigger-rejects-select-parameter {
+    CREATE TABLE t(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT ?; END;
+}
+expect error {
+    trigger cannot use variables
+}
+
+test temp-trigger-rejects-when-parameter {
+    CREATE TABLE t(x);
+    CREATE TEMP TRIGGER tr AFTER INSERT ON t WHEN :value BEGIN SELECT NEW.x; END;
+}
+expect error {
+    trigger cannot use variables
+}
+
+test trigger-rejects-update-parameter {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE u SET x=(SELECT ?); END;
+}
+expect error {
+    trigger cannot use variables
+}
+
+test trigger-rejects-delete-parameter {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM u WHERE x=:value; END;
+}
+expect error {
+    trigger cannot use variables
+}
+
+test trigger-rejects-upsert-parameter {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x PRIMARY KEY);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO u VALUES(NEW.x) ON CONFLICT(x) DO UPDATE SET x=:value;
+    END;
+}
+expect error {
+    trigger cannot use variables
+}
+
+test view-and-trigger-allow-question-mark-text {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    CREATE VIEW v AS SELECT '?' AS x;
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES(NEW.x || '?'); END;
+    INSERT INTO t VALUES('value');
+    SELECT x FROM v UNION ALL SELECT x FROM u;
+}
+expect {
+    ?
+    value?
+}
+
+test existing-view-still-rejects-parameter {
+    CREATE VIEW v AS SELECT 1;
+    CREATE VIEW IF NOT EXISTS v AS SELECT ?;
+}
+expect error {
+    parameters are not allowed in views
+}
+
+test existing-trigger-keeps-if-not-exists-noop {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES(NEW.x); END;
+    CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON t BEGIN SELECT ?; END;
+    INSERT INTO t VALUES(7);
+    SELECT x FROM u;
+}
+expect {
+    7
+}

@@ -31,6 +31,8 @@ A view is a virtual table defined by a SELECT statement. It does not store data 
 
 ### Behavior
 
+- Bind parameters such as `?` and `:name` are not allowed in the defining SELECT statement, including nested queries. This is also checked when `IF NOT EXISTS` names an existing view.
+
 - Views are read-only. INSERT, UPDATE, and DELETE on a view are not supported unless an INSTEAD OF trigger is defined on the view.
 - The SELECT statement is stored in the `sqlite_schema` table and parsed each time the view is referenced.
 - If a table referenced by the view is dropped or altered in an incompatible way, queries against the view produce an error.
