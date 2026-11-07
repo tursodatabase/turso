@@ -2952,11 +2952,22 @@ impl Jsonb {
                                 self.data
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
 
+                                let new_header_size = self.write_element_header(
+                                    pos,
+                                    ElementType::ARRAY,
+                                    root_size + placeholder_bytes.len(),
+                                    true,
+                                )?;
+                                let header_delta =
+                                    new_header_size as isize - root_header_size as isize;
+
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
                                     JsonLocationKind::DocumentRoot,
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
+                                    placeholder_bytes.len() as isize + header_delta,
+                                    arr_pos
+                                        .checked_add_signed(header_delta)
+                                        .expect("array contents cannot move before the header"),
                                 ));
                             }
 
@@ -3008,11 +3019,21 @@ impl Jsonb {
                             self.data
                                 .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
 
+                            let new_header_size = self.write_element_header(
+                                pos,
+                                ElementType::ARRAY,
+                                root_size + placeholder_bytes.len(),
+                                true,
+                            )?;
+                            let header_delta = new_header_size as isize - root_header_size as isize;
+
                             return Ok(JsonTraversalResult::with_array_index(
                                 pos,
                                 JsonLocationKind::DocumentRoot,
-                                placeholder_bytes.len() as isize,
-                                end_pos,
+                                placeholder_bytes.len() as isize + header_delta,
+                                end_pos
+                                    .checked_add_signed(header_delta)
+                                    .expect("array contents cannot move before the header"),
                             ));
                         }
                         _ => unreachable!(),

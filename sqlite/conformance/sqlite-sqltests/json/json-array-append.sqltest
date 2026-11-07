@@ -1,0 +1,66 @@
+@database :memory:
+
+test jsonb_insert_empty_array_append_is_strictly_valid {
+    SELECT json_valid(jsonb_insert('[]', '$[#]', 'x'), 8);
+}
+expect {
+    1
+}
+
+test jsonb_insert_empty_array_append_converts_to_text {
+    SELECT json(jsonb_insert('[]', '$[#]', 'x'));
+}
+expect {
+    ["x"]
+}
+
+test json_set_repeated_array_append {
+    SELECT json_set('[]', '$[#]', 'x', '$[#]', 'y');
+}
+expect {
+    ["x","y"]
+}
+
+test json_array_append_values_and_return_types {
+    SELECT json_insert('[1]', '$[#]', 32768),
+           json_insert('[]', '$[#]', 'x'),
+           json_insert('[1]', '$[#]', NULL),
+           json(jsonb_insert('[1]', '$[#]', 32768)),
+           json(jsonb_insert('[]', '$[#]', 'x')),
+           json(jsonb_insert('[1]', '$[#]', NULL)),
+           typeof(json_insert('[]', '$[#]', 'x')),
+           typeof(jsonb_insert('[]', '$[#]', 'x'));
+}
+expect {
+    [1,32768]|["x"]|[1,null]|[1,32768]|["x"]|[1,null]|text|blob
+}
+
+test jsonb_insert_root_index_append {
+    SELECT json(jsonb_insert('[1,2,3]', '$[3]', 32768)),
+           json_valid(jsonb_insert('[1,2,3]', '$[3]', 32768), 8);
+}
+expect {
+    [1,2,3,32768]|1
+}
+
+test jsonb_insert_root_append_grows_array_header {
+    SELECT json(jsonb_insert(json_array(
+               NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+               '$[#]', 'x')),
+           json_valid(jsonb_insert(json_array(
+               NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+               '$[#]', 'x'), 8);
+}
+expect {
+    [null,null,null,null,null,null,null,null,null,null,null,"x"]|1
+}
+
+test json_array_append_multiple_values_sequentially {
+    SELECT json_set('[]', '$[#]', 1, '$[#]', 'x', '$[#]', NULL),
+           json_insert('[]', '$[#]', 1, '$[#]', 'x', '$[#]', NULL),
+           json(jsonb_set('[]', '$[#]', 1, '$[#]', 'x', '$[#]', NULL)),
+           json(jsonb_insert('[]', '$[#]', 1, '$[#]', 'x', '$[#]', NULL));
+}
+expect {
+    [1,"x",null]|[1,"x",null]|[1,"x",null]|[1,"x",null]
+}
