@@ -43,7 +43,7 @@ Recovery classifies startup state using two checks:
 | Case | Startup artifacts | Recovery behavior |
 |---|---|---|
 | 1 | WAL has committed frames + log header valid | Complete interrupted checkpoint: backfill WAL into DB, sync DB, truncate WAL. Then run logical-log recovery with metadata cutoff. |
-| 2 | WAL has committed frames + log header missing (`NoLog`) | Fail closed with `Corrupt`. |
+| 2 | WAL has committed frames + log header missing (`NoLog`) | Complete interrupted checkpoint (as case 1), then write a fresh log header. A TRUNCATE checkpoint leaves this state when killed between steps 8 and 10; the log is only cleared once the WAL holds every frame it had. Passive checkpoints leave it as their steady state. |
 | 3 | WAL has committed frames + log header invalid/torn | Fail closed with `Corrupt`. |
 | 4 | WAL has no committed frames | Truncate/discard WAL tail bytes and continue logical-log recovery. |
 | 5 | No WAL + log header invalid/torn | Fail closed with `Corrupt`. |
