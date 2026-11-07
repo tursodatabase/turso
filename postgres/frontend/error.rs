@@ -314,8 +314,23 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+    } else if (msg.starts_with("sequence \"") || msg.starts_with("relation \""))
+        && msg.ends_with("\" does not exist")
+    {
         SQLSTATE_UNDEFINED_TABLE
+    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.starts_with('"') && msg.contains("\" is not a") {
+        SQLSTATE_WRONG_OBJECT_TYPE
+    } else if msg.starts_with("cannot change owner of sequence \"") {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg.starts_with("column \"")
+        && msg.contains("\" of relation \"")
+        && msg.ends_with("\" does not exist")
+    {
+        SQLSTATE_UNDEFINED_COLUMN
+    } else if msg == "sequence must have same owner as table it is linked to" {
+        SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
         || msg == "no schema has been selected to create in"
     {
@@ -490,6 +505,21 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
+            ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            (
+                "cannot change owner of sequence \"s\"",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "column \"c\" of relation \"t\" does not exist",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            (
+                "sequence must have same owner as table it is linked to",
+                SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            ),
             (
                 "table no such table already exists",
                 SQLSTATE_DUPLICATE_TABLE,

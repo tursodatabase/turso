@@ -24,17 +24,52 @@ pub struct TranslateResult {
     pub prereqs: Vec<ast::Stmt>,
     /// The main translated command.
     pub cmd: ast::Cmd,
+    /// Statements that run after the main command, as `ALTER SEQUENCE ...
+    /// OWNED BY` does for a serial column's sequence, which belongs to the
+    /// table once the table exists.
+    pub postreqs: Vec<ast::Stmt>,
+    /// The sequences of the serial columns of a CREATE TABLE statement.
+    pub serial_sequences: Vec<SerialSequence>,
 }
+
+/// The sequence of a serial column of a CREATE TABLE statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialSequence {
+    pub column: String,
+    /// The schema the sequence is in: the table's.
+    pub schema: String,
+    /// The sequence's bare name.
+    pub name: String,
+    /// Whether the name is `<table>_<column>_seq`, the one the statement's
+    /// text implies. A table whose sequence is named otherwise has to be
+    /// stored as text that names the sequence.
+    pub has_default_name: bool,
+}
+
+/// Whether a schema, by name, has a relation of a name.
+type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
+    /// None when nothing is known about the schema, as in tests.
+    relation_name_is_taken: Option<RelationNameCheck>,
 }
 
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A translator that names a serial column's sequence around the
+    /// relations its schema has, asking `is_taken(schema, name)`.
+    pub fn with_relation_name_check(
+        mut self,
+        is_taken: impl Fn(&str, &str) -> bool + 'static,
+    ) -> Self {
+        self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
@@ -147,6 +182,8 @@ impl PostgreSQLTranslator {
             return Ok(TranslateResult {
                 prereqs: translated.prereqs,
                 cmd: translated.cmd,
+                postreqs: translated.postreqs,
+                serial_sequences: translated.serial_sequences,
             });
         }
 
@@ -158,6 +195,8 @@ impl PostgreSQLTranslator {
         Ok(TranslateResult {
             prereqs: vec![],
             cmd,
+            postreqs: vec![],
+            serial_sequences: vec![],
         })
     }
 
@@ -194,6 +233,7 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::AlterSeqStmt(alter) => self.translate_alter_sequence(alter)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -271,7 +311,7 @@ impl PostgreSQLTranslator {
     fn translate_create_table(
         &self,
         create: &pg_query::protobuf::CreateStmt,
-    ) -> Result<(ast::Stmt, Vec<String>), ParseError> {
+    ) -> Result<(ast::Stmt, Vec<SerialSequence>), ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -314,7 +354,7 @@ impl PostgreSQLTranslator {
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
         // Collect implicit sequence names for serial columns
-        let mut serial_sequences: Vec<String> = Vec::new();
+        let mut serial_sequences: Vec<SerialSequence> = Vec::new();
 
         // Extract table name for serial sequence naming
         let tbl_name_str = tbl_name.name.as_str().to_string();
@@ -489,12 +529,12 @@ impl PostgreSQLTranslator {
         let namespace = serial_sequence_namespace(tbl_name);
 
         let prereqs = serial_sequences
-            .into_iter()
-            .map(|seq_name| ast::Stmt::CreateSequence {
-                if_not_exists: true,
+            .iter()
+            .map(|sequence| ast::Stmt::CreateSequence {
+                if_not_exists: false,
                 seq_name: ast::QualifiedName::fullname(
                     exact_name(&namespace),
-                    exact_name(seq_name),
+                    exact_name(&sequence.name),
                 ),
                 start: None,
                 increment: None,
@@ -503,11 +543,82 @@ impl PostgreSQLTranslator {
                 cycle: false,
             })
             .collect();
+        // PostgreSQL links a serial column's sequence to the column once the
+        // table exists, so the sequence belongs to the table.
+        let postreqs = serial_sequences
+            .iter()
+            .map(|sequence| ast::Stmt::AlterSequenceOwnedBy {
+                seq_name: ast::QualifiedName::fullname(
+                    exact_name(&namespace),
+                    exact_name(&sequence.name),
+                ),
+                owner: Some((tbl_name.clone(), exact_name(&sequence.column))),
+            })
+            .collect();
 
         Ok(TranslateResult {
             prereqs,
             cmd: ast::Cmd::Stmt(stmt),
+            postreqs,
+            serial_sequences,
         })
+    }
+
+    /// Translates `ALTER SEQUENCE name OWNED BY { table.column | NONE }`, the
+    /// one ALTER SEQUENCE form supported.
+    fn translate_alter_sequence(
+        &self,
+        alter: &pg_query::protobuf::AlterSeqStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(sequence) = &alter.sequence else {
+            return Err(ParseError::ParseError(
+                "ALTER SEQUENCE: missing name".to_string(),
+            ));
+        };
+        if alter.missing_ok {
+            return Err(not_supported("ALTER SEQUENCE IF EXISTS"));
+        }
+        let seq_name = self.qualified_name_from_range_var(sequence)?;
+        let mut owner = None;
+        for option in &alter.options {
+            let Some(Node::DefElem(elem)) = option.node.as_ref() else {
+                continue;
+            };
+            if elem.defname != "owned_by" {
+                return Err(not_supported(format!(
+                    "ALTER SEQUENCE {}",
+                    elem.defname.to_uppercase().replace('_', " ")
+                )));
+            }
+            let Some(Node::List(list)) = elem.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
+                return Err(ParseError::ParseError(
+                    "ALTER SEQUENCE OWNED BY: invalid owner".to_string(),
+                ));
+            };
+            let names = extract_key_columns(&list.items)?;
+            owner = Some(match names.as_slice() {
+                [none] if none.eq_ignore_ascii_case("none") => None,
+                [table, column] => Some((
+                    ast::QualifiedName::single(exact_name(table)),
+                    exact_name(column),
+                )),
+                [schema, table, column] => Some((
+                    ast::QualifiedName::fullname(exact_name(schema), exact_name(table)),
+                    exact_name(column),
+                )),
+                _ => {
+                    return Err(ParseError::ParseError(
+                        "invalid OWNED BY option".to_string(),
+                    ))
+                }
+            });
+        }
+        let Some(owner) = owner else {
+            return Err(not_supported("ALTER SEQUENCE without OWNED BY"));
+        };
+        Ok(ast::Stmt::AlterSequenceOwnedBy { seq_name, owner })
     }
 
     /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
@@ -517,7 +628,7 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
-        serial_sequences: &mut Vec<String>,
+        serial_sequences: &mut Vec<SerialSequence>,
         check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
@@ -629,11 +740,7 @@ impl PostgreSQLTranslator {
 
         // For serial columns, add DEFAULT nextval('namespace.tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let seq_name = format!(
-                "{}_{}_seq",
-                tbl_name.name.as_str().to_lowercase(),
-                name.to_lowercase()
-            );
+            let (seq_name, has_default_name) = self.serial_sequence_name(tbl_name, &name);
             // The stored text of a table of a schema names the table by its
             // mangled name, and the sequence's mangled name is that name with
             // the same suffix, so the default names the sequence that way.
@@ -642,12 +749,18 @@ impl PostgreSQLTranslator {
             } else {
                 format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
             };
-            serial_sequences.push(seq_name);
+            serial_sequences.push(SerialSequence {
+                column: name.clone(),
+                schema: serial_sequence_namespace(tbl_name),
+                name: seq_name,
+                has_default_name,
+            });
             default_expr = Some(ast::Expr::FunctionCall {
                 name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{sequence}'"
+                    "'{}'",
+                    sequence.replace('\'', "''")
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -718,6 +831,31 @@ impl PostgreSQLTranslator {
             col_type,
             constraints,
         })
+    }
+
+    /// The name of the sequence of serial column `column` of table
+    /// `tbl_name`, and whether it is `<table>_<column>_seq`. It is, unless a
+    /// relation of the table's schema has that name; then it is the first
+    /// of `<table>_<column>_seq1`, `<table>_<column>_seq2`, ... that none
+    /// has, as PostgreSQL names it.
+    fn serial_sequence_name(&self, tbl_name: &ast::QualifiedName, column: &str) -> (String, bool) {
+        let name = format!(
+            "{}_{}_seq",
+            tbl_name.name.as_str().to_lowercase(),
+            column.to_lowercase()
+        );
+        let Some(is_taken) = &self.relation_name_is_taken else {
+            return (name, true);
+        };
+        let schema = serial_sequence_namespace(tbl_name);
+        if !is_taken(&schema, &name) {
+            return (name, true);
+        }
+        let free_name = (1..)
+            .map(|n| format!("{name}{n}"))
+            .find(|name| !is_taken(&schema, name))
+            .expect("the numbers never run out");
+        (free_name, false)
     }
 
     /// Convert a PgForeignKey to an AST ForeignKeyClause.
@@ -840,18 +978,6 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation)?;
 
-        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
-            return Err(not_supported(format!(
-                "ALTER {}",
-                drop_object_type_name(
-                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
-                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
-                )
-            )));
-        }
-        if alter.missing_ok {
-            return Err(not_supported("ALTER TABLE IF EXISTS"));
-        }
         if alter.cmds.len() > 1 {
             return Err(not_supported("ALTER TABLE with multiple subcommands"));
         }
@@ -870,6 +996,43 @@ impl PostgreSQLTranslator {
 
         let subtype = AlterTableType::try_from(cmd.subtype)
             .map_err(|_| ParseError::ParseError("ALTER TABLE: invalid subtype".into()))?;
+        // OWNER TO works on every relation kind, so ALTER VIEW, ALTER
+        // MATERIALIZED VIEW, ALTER SEQUENCE and ALTER INDEX reach it too.
+        if subtype == AlterTableType::AtChangeOwner {
+            let kind = match pg_query::protobuf::ObjectType::try_from(alter.objtype) {
+                Ok(pg_query::protobuf::ObjectType::ObjectTable) => ast::RelationKind::Table,
+                Ok(pg_query::protobuf::ObjectType::ObjectView) => ast::RelationKind::View,
+                Ok(pg_query::protobuf::ObjectType::ObjectMatview) => {
+                    ast::RelationKind::MaterializedView
+                }
+                Ok(pg_query::protobuf::ObjectType::ObjectSequence) => ast::RelationKind::Sequence,
+                Ok(pg_query::protobuf::ObjectType::ObjectIndex) => ast::RelationKind::Index,
+                other => {
+                    return Err(not_supported(format!(
+                        "ALTER {} OWNER TO",
+                        drop_object_type_name(
+                            other.unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                        )
+                    )))
+                }
+            };
+            return Ok(ast::Stmt::AlterTable(ast::AlterTable {
+                name,
+                body: Self::translate_change_owner(cmd, kind, alter.missing_ok)?,
+            }));
+        }
+        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
+            return Err(not_supported(format!(
+                "ALTER {}",
+                drop_object_type_name(
+                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
+                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                )
+            )));
+        }
+        if alter.missing_ok {
+            return Err(not_supported("ALTER TABLE IF EXISTS"));
+        }
         if cmd.missing_ok {
             return Err(not_supported(format!(
                 "ALTER TABLE {} IF [NOT] EXISTS",
@@ -957,6 +1120,37 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Stmt::AlterTable(ast::AlterTable { name, body }))
+    }
+
+    /// Translates the `OWNER TO` subcommand of `ALTER TABLE`, `ALTER VIEW`,
+    /// `ALTER MATERIALIZED VIEW`, `ALTER SEQUENCE` and `ALTER INDEX`.
+    fn translate_change_owner(
+        cmd: &pg_query::protobuf::AlterTableCmd,
+        kind: ast::RelationKind,
+        if_exists: bool,
+    ) -> Result<ast::AlterTableBody, ParseError> {
+        use pg_query::protobuf::RoleSpecType;
+
+        let Some(new_owner) = &cmd.newowner else {
+            return Err(ParseError::ParseError("OWNER TO: missing role".into()));
+        };
+        let role = match RoleSpecType::try_from(new_owner.roletype) {
+            Ok(RoleSpecType::RolespecCstring) => ast::RoleSpec::Name(new_owner.rolename.clone()),
+            Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                ast::RoleSpec::CurrentRole
+            }
+            Ok(RoleSpecType::RolespecSessionUser) => ast::RoleSpec::SessionUser,
+            _ => {
+                return Err(ParseError::ParseError(
+                    "role \"public\" does not exist".into(),
+                ))
+            }
+        };
+        Ok(ast::AlterTableBody::OwnerTo {
+            kind,
+            role,
+            if_exists,
+        })
     }
 
     fn translate_rename_stmt(

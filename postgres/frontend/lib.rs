@@ -1,5 +1,6 @@
 mod auth_functions;
 mod catalog;
+mod classes;
 mod copy;
 mod error;
 mod functions;

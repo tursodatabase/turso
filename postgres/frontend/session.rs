@@ -30,7 +30,7 @@ use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
-    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
 
@@ -91,15 +91,20 @@ pub fn open_database_with_io(
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open(
+    let db = turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )
-    .map_err(Into::into)
+    )?;
+    // After the open, the classes table exists before the database holds
+    // any relation, and every relation gets its row from its CREATE. A
+    // database with relations but no catalog is from an earlier tursopg and
+    // is refused.
+    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
+    Ok(db)
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -418,10 +423,14 @@ fn prepare_statement_inner(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
-    let translator = PostgreSQLTranslator::new();
+    let conn_for_names = Arc::clone(&pg_conn.conn);
+    let translator = PostgreSQLTranslator::new().with_relation_name_check(move |schema, name| {
+        schema_has_relation(&conn_for_names, schema, name)
+    });
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
@@ -432,7 +441,7 @@ fn prepare_statement_inner(
     let role = tx_role(translated.cmd.stmt());
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
-    if translated.prereqs.is_empty() {
+    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
@@ -446,9 +455,11 @@ fn prepare_statement_inner(
             });
     }
 
-    // Validate prerequisites and the target command during prepare without
-    // executing any writes. Side-effecting prerequisites run atomically with
-    // the command only when the returned Statement is actually executed.
+    // Validate the prerequisites and the target command during prepare
+    // without executing any writes. What follows the command names what the
+    // command creates, so it can only be prepared once the command has run.
+    // Side-effecting prerequisites run atomically with the command only when
+    // the returned Statement is actually executed.
     for prereq in &translated.prereqs {
         let input = prereq.to_string();
         let _ = pg_conn
@@ -468,6 +479,7 @@ fn prepare_statement_inner(
             DeferredOperation::Translated {
                 prereqs: translated.prereqs,
                 cmd: Box::new(cmd),
+                postreqs: translated.postreqs,
                 sql: sql.into_owned(),
             },
         ),
@@ -592,6 +604,9 @@ enum DeferredOperation {
     Translated {
         prereqs: Vec<ast::Stmt>,
         cmd: Box<ast::Cmd>,
+        /// Statements that run after the command, as `ALTER SEQUENCE ...
+        /// OWNED BY` does for a serial column's sequence.
+        postreqs: Vec<ast::Stmt>,
         sql: String,
     },
     Frontend(FrontendStmt),
@@ -623,6 +638,9 @@ enum DeferredWork {
 
 struct PrerequisiteState {
     commands: CommandSequence,
+    /// The position of the command itself among the statements, after the
+    /// prerequisites and before what follows it.
+    target_index: usize,
     target_exists: bool,
 }
 
@@ -1016,27 +1034,33 @@ impl DeferredOperation {
         active: &mut Option<crate::Statement>,
     ) -> Result<Option<DeferredWork>> {
         match self {
-            Self::Translated { prereqs, cmd, sql } => {
-                let mut statements: Vec<_> = prereqs
-                    .iter()
-                    .map(|stmt| DeferredStatement {
-                        command: DeferredCommand::Translated(
-                            ast::Cmd::Stmt(stmt.clone()),
-                            stmt.to_string(),
-                        ),
-                        context: CommandContext::Default,
-                    })
-                    .collect();
+            Self::Translated {
+                prereqs,
+                cmd,
+                postreqs,
+                sql,
+            } => {
+                let translated = |stmt: &ast::Stmt| DeferredStatement {
+                    command: DeferredCommand::Translated(
+                        ast::Cmd::Stmt(stmt.clone()),
+                        stmt.to_string(),
+                    ),
+                    context: CommandContext::Default,
+                };
+                let mut statements: Vec<_> = prereqs.iter().map(translated).collect();
+                let target_index = statements.len();
                 statements.push(DeferredStatement {
                     command: DeferredCommand::Translated((**cmd).clone(), sql.clone()),
                     context: CommandContext::Default,
                 });
+                statements.extend(postreqs.iter().map(translated));
                 *active = prepare_create_table_target_check(conn, cmd)?.map(crate::Statement::new);
                 Ok(Some(DeferredWork::Prerequisites(PrerequisiteState {
                     commands: CommandSequence {
                         statements,
                         index: 0,
                     },
+                    target_index,
                     target_exists: false,
                 })))
             }
@@ -1189,7 +1213,11 @@ impl DeferredWork {
 impl PrerequisiteState {
     fn finish_inspection(&mut self) -> bool {
         if self.target_exists {
-            self.commands.index = self.commands.statements.len() - 1;
+            // Only the command itself runs, which then does nothing, as
+            // CREATE TABLE IF NOT EXISTS does: neither the prerequisites nor
+            // what follows the command.
+            self.commands.statements.truncate(self.target_index + 1);
+            self.commands.index = self.target_index;
         }
         !self.target_exists
     }
@@ -1435,12 +1463,7 @@ fn relation_name_is_taken(
             let ns = namespace.target.id;
             (
                 schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
-                schema.get_table(ns, name).is_some()
-                    || schema.get_view(ns, name).is_some()
-                    || schema.has_sequence(ns, name)
-                    || schema
-                        .indexes(ns)
-                        .any(|index| index.name.eq_ignore_ascii_case(name)),
+                schema.relation_kind(ns, name).is_some(),
             )
         });
         taken = name_exists;
@@ -1449,6 +1472,61 @@ fn relation_name_is_taken(
         }
     }
     Ok(taken)
+}
+
+/// Whether schema `schema` has a table, index, view or sequence named
+/// `name`, which makes PostgreSQL name a serial column's sequence otherwise.
+fn schema_has_relation(conn: &Arc<Connection>, schema: &str, name: &str) -> bool {
+    relation_lookup_namespaces(conn, Some(schema))
+        .iter()
+        .any(|namespace| {
+            conn.with_schema(namespace.database_id(), |s| {
+                s.relation_kind(namespace.target.id, name).is_some()
+            })
+        })
+}
+
+/// `sql`, a CREATE TABLE statement, with each serial column whose sequence
+/// is not named `<table>_<column>_seq` written out with its sequence. The
+/// table is loaded from its stored text, which otherwise implies that name.
+fn write_out_renamed_serial_columns<'a>(
+    conn: &Arc<Connection>,
+    sql: Cow<'a, str>,
+    sequences: &[SerialSequence],
+) -> Result<Cow<'a, str>> {
+    let mut sql = sql;
+    for sequence in sequences
+        .iter()
+        .filter(|sequence| !sequence.has_default_name)
+    {
+        let stored_name = stored_sequence_name(conn, &sequence.schema, &sequence.name)?;
+        let written_out =
+            turso_pg_parser::write_out_serial_column(&sql, &sequence.column, &stored_name)
+                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        sql = Cow::Owned(written_out);
+    }
+    Ok(sql)
+}
+
+/// The name the stored text of a table calls sequence `name` of schema
+/// `schema` by, which is how the loader resolves it: `public.name` for a
+/// sequence of the public schema, otherwise the mangled name, which is how
+/// the stored text names the table itself.
+fn stored_sequence_name(conn: &Arc<Connection>, schema: &str, name: &str) -> Result<String> {
+    let namespace = relation_lookup_namespaces(conn, Some(schema))
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_SCHEMA_NAME,
+                format!("schema \"{schema}\" does not exist"),
+            )
+        })?;
+    Ok(if namespace.is_database() {
+        format!("public.{name}")
+    } else {
+        namespace.mangle_name(name)
+    })
 }
 
 /// PostgreSQL refuses DROP VIEW and DROP MATERIALIZED VIEW on a relation of

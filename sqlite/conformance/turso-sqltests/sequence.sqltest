@@ -384,3 +384,11 @@ test currval-no-args {
 expect error {
     wrong number of arguments to function currval()
 }
+
+test nextval-of-a-sequence-whose-name-has-a-quote {
+    CREATE SEQUENCE "q'";
+    SELECT nextval('q''');
+}
+expect {
+    1
+}

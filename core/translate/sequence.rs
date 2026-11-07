@@ -11,6 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
+use crate::dialect::{NewOwner, RelationChange};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -732,6 +733,98 @@ pub(crate) fn emit_sqlite_sequence_sync(
     }) else {
         return Ok(false);
     };
+    emit_sqlite_sequence_row_write(
+        program,
+        sseq_table,
+        database_id,
+        autoinc_table_name,
+        value_reg,
+    );
+    Ok(true)
+}
+
+/// Emits the bytecode that scans the `sqlite_sequence` cursor
+/// `seq_cursor_id` for the row named by `name_reg` and leaves its `seq`
+/// in `value_reg`, zero when there is no such row, and its rowid in
+/// `rowid_reg`, NULL when there is none. `name_reg` gets the name as the
+/// row stores it, which may differ in case.
+pub fn emit_sqlite_sequence_row_read(
+    program: &mut ProgramBuilder,
+    seq_cursor_id: usize,
+    name_reg: usize,
+    value_reg: usize,
+    rowid_reg: usize,
+) {
+    program.emit_insn(Insn::Integer {
+        dest: value_reg,
+        value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: rowid_reg,
+        dest_end: None,
+    });
+
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    let next_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: seq_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let name_col_reg = program.alloc_register();
+    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: name_reg,
+        rhs: name_col_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default().jump_if_null(),
+        collation: CollationSeq::NOCASE,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: name_col_reg,
+        dst_reg: name_reg,
+        extra_amount: 0,
+    });
+
+    program.emit_column_or_rowid(seq_cursor_id, 1, value_reg);
+    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
+    program.emit_insn(Insn::AddImm {
+        register: value_reg,
+        value: 0,
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: seq_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_end_label,
+    });
+
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: seq_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(loop_end_label);
+}
+
+/// Emits the bytecode that makes `value_reg` the `seq` of the
+/// `sqlite_sequence` row named `name`, by deleting the rows of that name
+/// and inserting one. `sseq_table` is the `sqlite_sequence` table of
+/// database `database_id`. The write counts neither for `changes()` nor
+/// for `last_insert_rowid()`.
+pub fn emit_sqlite_sequence_row_write(
+    program: &mut ProgramBuilder,
+    sseq_table: Arc<BTreeTable>,
+    database_id: usize,
+    name: &str,
+    value_reg: usize,
+) {
     let sseq_root = sseq_table.root_page;
     let sseq_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sseq_table));
 
@@ -741,9 +834,9 @@ pub(crate) fn emit_sqlite_sequence_sync(
         db: database_id,
     });
 
-    let name_reg = program.emit_string8_new_reg(autoinc_table_name.to_string());
+    let name_reg = program.emit_string8_new_reg(name.to_string());
 
-    // Delete every existing row matching `name = autoinc_table_name`.
+    // Delete every existing row matching `name`.
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -815,7 +908,6 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_insn(Insn::Close {
         cursor_id: sseq_cursor,
     });
-    Ok(true)
 }
 
 /// If `seq` is an AUTOINCREMENT-backing sequence (its name begins with
@@ -924,6 +1016,9 @@ pub fn translate_create_sequence(
         );
     }
 
+    if schema::relation_name_is_taken(resolver, namespace, &normalized_name, if_not_exists)? {
+        return Ok(());
+    }
     // Check if sequence already exists
     let exists = resolver.with_schema(database_id, |s| {
         s.get_sequence(namespace.id, &normalized_name).is_some()
@@ -969,6 +1064,22 @@ pub fn translate_create_sequence(
         seq.max_value,
         seq.cycle,
     )?;
+
+    // The sequence is a relation of the dialect's; its backing table is an
+    // engine object and is not.
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[RelationChange::Create {
+                namespace: namespace.id,
+                name: normalized_name.clone(),
+                kind: crate::schema::RelationKind::Sequence,
+                table: None,
+            }],
+        )?;
+    }
 
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
@@ -1112,17 +1223,15 @@ pub fn translate_drop_sequence(
     seq_name: &ast::QualifiedName,
     if_exists: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(seq_name.name.as_str());
-    let namespace = if seq_name.namespace.is_some() {
-        resolver.resolve_namespace(seq_name)?
-    } else {
-        match resolver.find_existing_sequence(&normalized_name) {
-            Some(namespace) => namespace,
-            None if if_exists => return Ok(()),
-            None => bail_parse_error!("sequence \"{}\" does not exist", normalized_name),
+    let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
+        if if_exists {
+            return Ok(());
         }
+        bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
     };
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -1134,6 +1243,18 @@ pub fn translate_drop_sequence(
             return Ok(());
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
+    }
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[RelationChange::Drop {
+                namespace: namespace.id,
+                name: normalized_name.clone(),
+            }],
+        )?;
     }
 
     // Bump schema version so other connections detect the change
@@ -1186,6 +1307,129 @@ fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
     };
     *args = qualified_args.into_vec();
     true
+}
+
+/// The namespace of sequence `seq_name`: the one its qualifier names, or
+/// the first of the search path that has a sequence of the name. None when
+/// no namespace has the sequence; an error when the qualifier names no
+/// namespace.
+pub(crate) fn sequence_namespace(
+    seq_name: &ast::QualifiedName,
+    resolver: &Resolver,
+) -> Result<Option<NamespaceRef>> {
+    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let namespace = if seq_name.namespace.is_some() {
+        resolver.resolve_namespace(seq_name)?
+    } else {
+        match resolver.find_existing_sequence(&normalized_name) {
+            Some(namespace) => namespace,
+            None => return Ok(None),
+        }
+    };
+    let exists = resolver.with_schema(namespace.database_id, |schema| {
+        schema
+            .get_sequence(namespace.id, &normalized_name)
+            .is_some()
+    });
+    Ok(exists.then_some(namespace))
+}
+
+/// Translates `ALTER SEQUENCE name OWNED BY table.column`, or `OWNED BY
+/// NONE`: the dialect records which table the sequence belongs to in its
+/// own schema state, as PostgreSQL does for a `serial` column's sequence.
+/// The table must be in the sequence's namespace, have the column, and have
+/// the sequence's owner.
+pub fn translate_alter_sequence_owned_by(
+    seq_name: &ast::QualifiedName,
+    owner: Option<&(ast::QualifiedName, ast::Name)>,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
+        bail_parse_error!("sequence \"{normalized_name}\" does not exist");
+    };
+    let table = match owner {
+        Some((table_name, column)) => {
+            let normalized_table = normalize_ident(table_name.name.as_str());
+            // The lookup names a namespace even when no table has the name,
+            // so the table is looked up there before the namespace is trusted.
+            let table_namespace = resolver.find_existing_table(table_name)?;
+            let table = table_namespace.and_then(|table_namespace| {
+                resolver.with_schema(table_namespace.database_id, |schema| {
+                    schema.get_btree_table(table_namespace.id, &normalized_table)
+                })
+            });
+            let (Some(table_namespace), Some(table)) = (table_namespace, table) else {
+                bail_parse_error!("relation \"{normalized_table}\" does not exist");
+            };
+            if table_namespace.database_id != namespace.database_id
+                || table_namespace.id != namespace.id
+            {
+                bail_parse_error!("sequence must be in same schema as table it is linked to");
+            }
+            let has_column = table.get_column(column.as_str()).is_some();
+            if !has_column {
+                bail_parse_error!(
+                    "column \"{}\" of relation \"{normalized_table}\" does not exist",
+                    column.as_str()
+                );
+            }
+            let dialect = &resolver.catalog.dialect;
+            let (sequence_owner, table_owner) =
+                resolver.with_schema(namespace.database_id, |schema| {
+                    (
+                        dialect.relation_owner(schema, namespace.id, &normalized_name),
+                        dialect.relation_owner(schema, namespace.id, &normalized_table),
+                    )
+                });
+            if sequence_owner.is_some() && table_owner.is_some() && sequence_owner != table_owner {
+                bail_parse_error!("sequence must have same owner as table it is linked to");
+            }
+            Some(normalized_table)
+        }
+        None => None,
+    };
+    if !schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
+        return Ok(());
+    }
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_relation_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &[RelationChange::ChangeOwner {
+            namespace: namespace.id,
+            name: normalized_name,
+            owner: NewOwner::Table(table),
+        }],
+    )?;
+    schema::emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// The namespace and bare name of the sequence `name` names: `schema.name`,
+/// the mangled name of a sequence of a namespace, or a bare name found on
+/// the search path. None when the schema or the sequence does not exist.
+pub(crate) fn resolve_sequence_name(
+    name: &str,
+    resolver: &Resolver,
+) -> Option<(NamespaceRef, String)> {
+    if let Some((schema_name, bare_name)) = name.split_once('.') {
+        let namespace = resolver.namespace_named(&normalize_ident(schema_name))?;
+        let bare_name = normalize_ident(bare_name);
+        return resolver
+            .with_schema(namespace.database_id, |schema| {
+                schema.get_sequence(namespace.id, &bare_name).is_some()
+            })
+            .then_some((namespace, bare_name));
+    }
+    let bare_name = normalize_ident(name);
+    resolver
+        .sequence_of_mangled_name(&bare_name)
+        .or_else(|| Some((resolver.find_existing_sequence(&bare_name)?, bare_name)))
 }
 
 pub(crate) fn is_sequence_function(name: &str) -> bool {

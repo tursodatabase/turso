@@ -1046,9 +1046,9 @@ mod tests {
     #[test]
     fn copy_to_stdout_uses_the_schema_and_search_path() {
         let (mut client, conn) = copy_test_client();
-        conn.inner().execute("ATTACH ':memory:' AS other").unwrap();
         conn.execute(
-            r#"CREATE TABLE public.items (id INT);
+            r#"CREATE SCHEMA other;
+               CREATE TABLE public.items (id INT);
                INSERT INTO public.items VALUES (7);
                CREATE TABLE other.items (id INT, "Text Value" TEXT);
                INSERT INTO other.items VALUES (19, 'São Paulo');"#,
