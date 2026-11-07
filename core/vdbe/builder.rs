@@ -365,6 +365,8 @@ pub struct ProgramBuilder {
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
     pub trigger_conflict_override: Option<ResolveType>,
+    /// The foreign key whose ON DELETE or ON UPDATE action this program carries out.
+    pub fk_action: Option<Arc<crate::schema::ForeignKey>>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
@@ -829,6 +831,13 @@ impl ProgramBuilder {
         )
     }
 
+    /// Whether this program carries out the ON DELETE or ON UPDATE action of `fk`.
+    pub fn carries_out_action_of(&self, fk: &Arc<crate::schema::ForeignKey>) -> bool {
+        self.fk_action
+            .as_ref()
+            .is_some_and(|action_fk| Arc::ptr_eq(action_fk, fk))
+    }
+
     #[turso_macros::trace_stack]
     #[allow(clippy::too_many_arguments)]
     fn _new(
@@ -873,6 +882,7 @@ impl ProgramBuilder {
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
+            fk_action: None,
             cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),

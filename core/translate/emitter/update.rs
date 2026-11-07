@@ -17,10 +17,9 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_make_record,
+            check_expr_references_columns, emit_cdc_autocommit_commit, emit_cdc_full_record,
+            emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
+            emit_index_column_value_new_image, emit_index_column_value_old_image, emit_make_record,
             emit_partial_index_where_old_image, emit_program_for_select, OperationMode, Resolver,
             UpdateRowSource,
         },
@@ -677,38 +676,18 @@ fn emit_replace_delete<'a>(
     let table_name = target_table.table.get_name();
     let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(update_namespace.id, table_name)
-        }) {
-            ForeignKeyActions::prepare_fk_delete_actions(
-                program,
-                &mut t_ctx.resolver,
-                table_name,
-                target_table_cursor_id,
-                conflicting_rowid_reg,
-                new_row_registers,
-                update_namespace,
-            )?
-        } else {
-            ForeignKeyActions::default()
-        };
-        if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.has_child_fks(update_namespace.id, table_name)
-        }) {
-            emit_fk_child_decrement_on_delete(
-                program,
-                &target_table
-                    .table
-                    .btree()
-                    .expect("UPDATE target must be a BTree table"),
-                table_name,
-                target_table_cursor_id,
-                conflicting_rowid_reg,
-                update_namespace,
-                &t_ctx.resolver,
-            )?;
-        }
-        prepared
+        ForeignKeyActions::prepare_for_deleted_row(
+            program,
+            &mut t_ctx.resolver,
+            &target_table
+                .table
+                .btree()
+                .expect("UPDATE target must be a BTree table"),
+            target_table_cursor_id,
+            conflicting_rowid_reg,
+            new_row_registers,
+            update_namespace,
+        )?
     } else {
         ForeignKeyActions::default()
     };
@@ -2229,11 +2208,39 @@ fn emit_update_insns<'a>(
     //   check fails, the statement can stop without leaving partial mutations
     //   behind.
     //
-    // Both parent-side and child-side FK checks below run against the
+    // Both child-side and parent-side FK checks below run against the
     // pre-rewrite table image. Self-referential rows therefore need explicit
     // handling: table scans see OLD values, while the NEW parent/child keys
     // live in registers until the rewrite.
     let mut deferred_new_key_plans = Vec::new();
+    // Child-side checks ask whether the row's OLD and NEW child keys have a
+    // parent. Like SQLite, they run before the parent-side checks below: the
+    // decrement for an OLD key that has no parent is skipped while the
+    // statement counter is zero, so a row that was already missing its parent
+    // before the statement cannot cancel the violation its own key change
+    // counts on the parent side.
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.has_child_fks(update_namespace.id, table_name)
+            }) {
+                emit_fk_child_update_counters(
+                    program,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    effective_rowid_reg,
+                    &affected_columns,
+                    !affected_parent_fks.is_empty(),
+                    update_namespace,
+                    &t_ctx.resolver,
+                    &layout,
+                )?;
+            }
+        }
+    }
+
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
@@ -2267,32 +2274,6 @@ fn emit_update_insns<'a>(
                     new_key_probe_mode,
                     update_database_id,
                     &t_ctx.resolver,
-                )?;
-            }
-        }
-    }
-
-    // Child-side checks answer the opposite question: does the row's NEW child
-    // key have a parent? They also have to run after no-op conflict paths and
-    // before the physical rewrite, for the same counter and rollback reasons as
-    // the parent-side checks above.
-    if connection.foreign_keys_enabled() {
-        if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.has_child_fks(update_namespace.id, table_name)
-            }) {
-                emit_fk_child_update_counters(
-                    program,
-                    &table_btree,
-                    table_name,
-                    target_table_cursor_id,
-                    start,
-                    effective_rowid_reg,
-                    &affected_columns,
-                    !affected_parent_fks.is_empty(),
-                    update_namespace,
-                    &t_ctx.resolver,
-                    &layout,
                 )?;
             }
         }
