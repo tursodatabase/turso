@@ -416,7 +416,7 @@ CREATE TABLE events (
 
 ## Temporary Tables
 
-`CREATE TEMP TABLE` creates a table private to the connection. Temporary tables can be created and changed even when the main database is opened read-only.
+`CREATE TEMP TABLE` creates a table private to the connection. Temporary tables can be created and changed even when the main database is opened read-only. Changes confined to `temp`, including temporary triggers, `ALTER TABLE`, `ANALYZE temp`, and `PRAGMA temp.user_version`, keep the main database read-only.
 
 ## Unsupported Features
 

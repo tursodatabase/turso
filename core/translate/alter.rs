@@ -827,7 +827,6 @@ pub fn translate_alter_table(
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     let mangled_table_name = resolver.mangle_name(namespace, &normalize_ident(table_name));
     // For attached databases, qualify sqlite_schema with the database name
