@@ -288,6 +288,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn sum_counts_infinite_inputs(&self) -> bool {
+        true
+    }
+
     fn converts_strings_compared_with_custom_types(&self) -> bool {
         true
     }

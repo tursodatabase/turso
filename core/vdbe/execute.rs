@@ -7308,11 +7308,12 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// Initialize aggregate payload with default values.
 /// Payload layout by aggregate type:
 /// - Count/Count0: [Integer(0)]
-/// - Sum: [Null, Float(0.0), Integer(0), Integer(0), Integer(0)]
-///   // acc, r_err, approx, ovrfl, count
-/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0), Integer(0)]
+/// - Sum: [Null, Float(0.0), Integer(0), Integer(0), Integer(0), Integer(0), Integer(0)]
+///   // acc, r_err, approx, ovrfl, count, pos_inf, neg_inf
+/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0), Integer(0), Integer(0), Integer(0)]
 ///   // same but starts at 0.0
-/// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
+/// - Avg: [Float(0.0), Float(0.0), Integer(0), Integer(0), Integer(0)]
+///   // sum, r_err, count, pos_inf, neg_inf - uses KBN like SUM
 /// - Min/Max: [Null]
 /// - GroupConcat/StringAgg:
 ///   [Null|Text, Integer(count), Integer(first separator length),
@@ -7327,7 +7328,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
         }
         AggFunc::Sum | AggFunc::Total => {
-            payload.try_reserve_exact(5)?;
+            payload.try_reserve_exact(7)?;
             let acc = if matches!(func, AggFunc::Total) {
                 Value::from_f64(0.0)
             } else {
@@ -7338,11 +7339,15 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
         }
         AggFunc::Avg => {
-            payload.try_reserve_exact(3)?;
+            payload.try_reserve_exact(5)?;
             payload.push(Value::from_f64(0.0));
             payload.push(Value::from_f64(0.0));
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
         }
         AggFunc::Min | AggFunc::Max => {
@@ -7413,13 +7418,17 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// # Payload layouts (see `init_agg_payload` for initial values):
 /// - **Count**: `[count: Integer]` - increments if arg is not NULL
 /// - **Count0**: `[count: Integer]` - always increments (COUNT(*))
-/// - **Avg**: `[sum: Float, r_err: Float, count: Integer]` - uses KBN compensation like SUM
+/// - **Avg**: `[sum: Float, r_err: Float, count: Integer, pos_inf: Integer, neg_inf: Integer]`
+///   - uses KBN compensation like SUM
 /// - **Sum/Total**:
-///   `[acc, r_err: Float, approx: Integer, ovrfl: Integer, count: Integer]`
+///   `[acc, r_err: Float, approx: Integer, ovrfl: Integer, count: Integer,
+///     pos_inf: Integer, neg_inf: Integer]`
 ///   - `acc`: running sum (Null/Integer/Float depending on inputs)
 ///   - `r_err`: Kahan-Babuška-Neumaier compensation term for floating-point precision
 ///   - `approx`: 1 if result is approximate (float arithmetic used)
 ///   - `ovrfl`: 1 if integer overflow occurred (Total promotes to float, Sum errors)
+///   - `pos_inf`/`neg_inf`: number of +Inf/-Inf inputs, which are not added to `acc`
+///     when `counts_infinite_inputs` is set (see `Dialect::sum_counts_infinite_inputs`)
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
 /// - **GroupConcat/StringAgg**:
 ///   `[accumulated: Null|Text, count: Integer, first_separator_len: Integer,
@@ -7435,6 +7444,7 @@ fn update_agg_payload(
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
+    counts_infinite_inputs: bool,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -7465,40 +7475,50 @@ fn update_agg_payload(
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
-            let [sum_val, r_err_val, count_val, ..] = payload.as_mut_slice() else {
+            // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err),
+            // payload[2] is Integer (count), payload[3] and payload[4] are Integer (pos_inf, neg_inf)
+            let [sum_val, r_err_val, count_val, pos_inf, neg_inf, ..] = payload.as_mut_slice()
+            else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload too short".to_string(),
                 ));
             };
-            if matches!(*sum_val, Value::Null) {
-                return Ok(());
-            }
-            let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
             };
+            // Every non-NULL row is counted, even once the sum is NaN, so
+            // that removing the row from a window frame finds it counted.
+            *count = count.checked_add(1).or_overflow()?;
+            let parsed = classify_numeric_arg(arg);
+            if counts_infinite_inputs && add_to_infinity_count(&parsed, pos_inf, neg_inf, 1)? {
+                return Ok(());
+            }
+            if matches!(*sum_val, Value::Null) {
+                return Ok(());
+            }
+            let r_err = r_err_val.to_float_or_zero();
             let mut sum_state = SumAggState {
                 r_err,
                 ..Default::default()
             };
-            match classify_numeric_arg(arg) {
+            match parsed {
                 NumericArg::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
                 NumericArg::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
                 NumericArg::Null => unreachable!("NULL early-returned above"),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
-            *count = count.checked_add(1).or_overflow()?;
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
             // payload[1] is Float (r_err), payload[2] is Integer (approx),
-            // payload[3] is Integer (ovrfl), payload[4] is Integer (count)
-            let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload.as_mut_slice()
+            // payload[3] is Integer (ovrfl), payload[4] is Integer (count),
+            // payload[5] and payload[6] are Integer (pos_inf, neg_inf)
+            let [acc, r_err_val, approx_val, ovrfl_val, count_val, pos_inf, neg_inf, ..] =
+                payload.as_mut_slice()
             else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload too short".to_string(),
@@ -7530,6 +7550,24 @@ fn update_agg_payload(
             };
             if !matches!(arg, Value::Null) {
                 *count = count.checked_add(1).or_overflow()?;
+            }
+            if counts_infinite_inputs
+                && add_to_infinity_count(&classify_numeric_arg(arg), pos_inf, neg_inf, 1)?
+            {
+                // The result is a float, as for any other float input. A
+                // NULL total that is already a float stands for NaN.
+                match acc {
+                    Value::Null if *approx_i == 0 => *acc = Value::from_f64(0.0),
+                    Value::Numeric(Numeric::Integer(i)) => {
+                        let prev = *i;
+                        kbn_init_from_int(acc, prev, &mut sum_state);
+                        *r_err_val = Value::from_f64(sum_state.r_err);
+                    }
+                    _ => {}
+                }
+                *approx_i = 1;
+                *ovrfl_i = 0;
+                return Ok(());
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
                 return Ok(());
@@ -8080,8 +8118,8 @@ fn finalize_ivm_sum(
 pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
     match func {
         AggFunc::Count | AggFunc::Count0 => Some(1),
-        AggFunc::Avg => Some(3),
-        AggFunc::Sum | AggFunc::Total => Some(5),
+        AggFunc::Avg => Some(5),
+        AggFunc::Sum | AggFunc::Total => Some(7),
         _ => None,
     }
 }
@@ -8090,10 +8128,12 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
-            // Payload: [sum, r_err, count]
+            // Payload: [sum, r_err, count, pos_inf, neg_inf]
             let count = payload[2].as_int().unwrap_or(0);
             if count == 0 || matches!(&payload[0], Value::Null) {
                 Value::Null
+            } else if let Some(infinite_sum) = sum_of_infinite_inputs(&payload[3], &payload[4]) {
+                infinite_sum
             } else {
                 let sum = payload[0].to_float_or_zero();
                 let r_err = payload[1].to_float_or_zero();
@@ -8121,6 +8161,11 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 mark_unlikely();
                 return Err(LimboError::IntegerOverflow);
             }
+            if !matches!(acc, Value::Null) {
+                if let Some(infinite_sum) = sum_of_infinite_inputs(&payload[5], &payload[6]) {
+                    return Ok(infinite_sum);
+                }
+            }
             match acc {
                 Value::Null => Value::Null,
                 Value::Numeric(Numeric::Integer(i)) if !approx => Value::from_i64(*i),
@@ -8134,10 +8179,15 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             }
         }
         AggFunc::Total => {
-            // Payload: [acc, r_err, approx, ovrfl, count]
+            // Payload: [acc, r_err, approx, ovrfl, count, pos_inf, neg_inf]
             let acc = &payload[0];
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let r_err = payload[1].to_float_or_zero();
+            if !matches!(acc, Value::Null) {
+                if let Some(infinite_sum) = sum_of_infinite_inputs(&payload[5], &payload[6]) {
+                    return Ok(infinite_sum);
+                }
+            }
             match acc {
                 Value::Null if approx => Value::Null,
                 Value::Null => Value::from_f64(0.0),
@@ -8888,7 +8938,7 @@ fn op_window_inverse(
 }
 
 pub fn op_agg_inverse(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -8920,7 +8970,9 @@ pub fn op_agg_inverse(
         .into());
     };
     let payload = agg.payload_mut();
-    inverse_agg_payload(func, arg, payload)?;
+    let counts_infinite_inputs = matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
+        && program.connection.dialect().sum_counts_infinite_inputs();
+    inverse_agg_payload(func, arg, payload, counts_infinite_inputs)?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -8983,7 +9035,12 @@ fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// Subtract the contribution of a single row from the aggregate state,
 /// undoing a previous `update_agg_payload` call. Mirrors SQLite's
 /// xInverse implementations at `func.c:1859-1986`.
-fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Result<()> {
+fn inverse_agg_payload(
+    func: &AggFunc,
+    arg: Value,
+    payload: &mut [Value],
+    counts_infinite_inputs: bool,
+) -> Result<()> {
     match func {
         AggFunc::Count => {
             if !matches!(arg, Value::Null) {
@@ -9009,9 +9066,10 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
             }
-            let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload else {
+            let [acc, r_err_val, approx_val, ovrfl_val, count_val, pos_inf, neg_inf, ..] = payload
+            else {
                 unreachable!(
-                    "Sum/Total payload has acc/r_err/approx/ovrfl/count per init_agg_payload"
+                    "Sum/Total payload has acc/r_err/approx/ovrfl/count/pos_inf/neg_inf per init_agg_payload"
                 );
             };
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
@@ -9022,6 +9080,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             debug_assert!(*count > 0, "Sum/Total xInverse without matching xStep");
             *count -= 1;
+            if counts_infinite_inputs && add_to_infinity_count(&parsed, pos_inf, neg_inf, -1)? {
+                return Ok(());
+            }
             let r_err = r_err_val.to_float_or_zero();
             let ovrfl = matches!(ovrfl_val, Value::Numeric(Numeric::Integer(n)) if *n != 0);
             let mut sum_state = SumAggState {
@@ -9073,14 +9134,20 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
             }
-            let [sum_val, r_err_val, count_val, ..] = payload else {
-                unreachable!("Avg payload has sum/r_err/count per init_agg_payload");
+            let [sum_val, r_err_val, count_val, pos_inf, neg_inf, ..] = payload else {
+                unreachable!(
+                    "Avg payload has sum/r_err/count/pos_inf/neg_inf per init_agg_payload"
+                );
             };
             let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
                 unreachable!("Avg count slot is Integer per init_agg_payload");
             };
             debug_assert!(*count > 0, "Avg xInverse without matching xStep");
+            *count -= 1;
+            if counts_infinite_inputs && add_to_infinity_count(&parsed, pos_inf, neg_inf, -1)? {
+                return Ok(());
+            }
             let mut sum_state = SumAggState {
                 r_err,
                 ..Default::default()
@@ -9091,7 +9158,6 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                 NumericArg::Null => unreachable!("Null was early-returned above"),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
-            *count -= 1;
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
@@ -9217,8 +9283,48 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
     Ok(())
 }
 
+/// If `arg` is +Inf or -Inf, adds `delta` to the number of such inputs in
+/// `pos_inf` or `neg_inf` and returns true. Returns false for any other input.
+fn add_to_infinity_count(
+    arg: &NumericArg,
+    pos_inf: &mut Value,
+    neg_inf: &mut Value,
+    delta: i64,
+) -> Result<bool> {
+    let NumericArg::Float(f) = arg else {
+        return Ok(false);
+    };
+    if !f.is_infinite() {
+        return Ok(false);
+    }
+    let slot = if f.is_sign_positive() {
+        pos_inf
+    } else {
+        neg_inf
+    };
+    let Value::Numeric(Numeric::Integer(n)) = slot else {
+        unreachable!("sum/avg infinity counts are Integer per init_agg_payload");
+    };
+    *n = n.checked_add(delta).or_overflow()?;
+    debug_assert!(*n >= 0, "infinite input removed without a matching add");
+    Ok(true)
+}
+
+/// The sum of the infinite inputs counted by `add_to_infinity_count`: +Inf,
+/// -Inf, or NULL (NaN) when there are both. `None` when there are none.
+fn sum_of_infinite_inputs(pos_inf: &Value, neg_inf: &Value) -> Option<Value> {
+    let has_pos_inf = pos_inf.as_int().unwrap_or(0) > 0;
+    let has_neg_inf = neg_inf.as_int().unwrap_or(0) > 0;
+    match (has_pos_inf, has_neg_inf) {
+        (true, true) => Some(Value::Null),
+        (true, false) => Some(Value::from_f64(f64::INFINITY)),
+        (false, true) => Some(Value::from_f64(f64::NEG_INFINITY)),
+        (false, false) => None,
+    }
+}
+
 pub fn op_agg_step(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -9356,11 +9462,11 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(state, data)
+    op_agg_step_slow(program, state, data)
 }
 
 #[inline(never)]
-fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -9456,7 +9562,17 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
+            let counts_infinite_inputs =
+                matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
+                    && program.connection.dialect().sum_counts_infinite_inputs();
+            update_agg_payload(
+                func,
+                arg,
+                maybe_arg2.as_ref(),
+                payload,
+                collation,
+                counts_infinite_inputs,
+            )?;
         }
     };
 
@@ -21510,22 +21626,26 @@ mod tests {
     fn test_init_agg_payload_sum() {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
-        assert_eq!(payload.len(), 5);
+        assert_eq!(payload.len(), 7);
         assert_eq!(payload[0], Value::Null); // acc
         assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
         assert_eq!(payload[2], Value::from_i64(0)); // approx
         assert_eq!(payload[3], Value::from_i64(0)); // ovrfl
         assert_eq!(payload[4], Value::from_i64(0)); // count
+        assert_eq!(payload[5], Value::from_i64(0)); // pos_inf
+        assert_eq!(payload[6], Value::from_i64(0)); // neg_inf
     }
 
     #[test]
     fn test_init_agg_payload_avg() {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Avg, &mut payload).unwrap();
-        assert_eq!(payload.len(), 3);
+        assert_eq!(payload.len(), 5);
         assert_eq!(payload[0], Value::from_f64(0.0)); // sum
         assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
         assert_eq!(payload[2], Value::from_i64(0)); // count
+        assert_eq!(payload[3], Value::from_i64(0)); // pos_inf
+        assert_eq!(payload[4], Value::from_i64(0)); // neg_inf
     }
 
     #[test]
@@ -21537,6 +21657,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -21551,6 +21672,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -21564,6 +21686,8 @@ mod tests {
             Value::from_i64(0),
             Value::from_i64(0),
             Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ];
         update_agg_payload(
             &AggFunc::Sum,
@@ -21571,6 +21695,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -21581,6 +21706,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -21594,6 +21720,8 @@ mod tests {
             Value::from_i64(0),
             Value::from_i64(0),
             Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ];
         update_agg_payload(
             &AggFunc::Sum,
@@ -21601,6 +21729,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -21616,6 +21745,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -21627,6 +21757,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21638,6 +21769,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21645,10 +21777,12 @@ mod tests {
 
     #[test]
     fn test_update_avg() {
-        // Payload: [sum, r_err, count]
+        // Payload: [sum, r_err, count, pos_inf, neg_inf]
         let mut payload = crate::alloc::vec![
             Value::from_f64(0.0),
             Value::from_f64(0.0),
+            Value::from_i64(0),
+            Value::from_i64(0),
             Value::from_i64(0),
         ];
         update_agg_payload(
@@ -21657,6 +21791,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -21668,6 +21803,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -21683,11 +21819,13 @@ mod tests {
 
     #[test]
     fn test_finalize_avg() {
-        // Payload: [sum, r_err, count]
+        // Payload: [sum, r_err, count, pos_inf, neg_inf]
         let payload = vec![
             Value::from_f64(30.0),
             Value::from_f64(0.0),
             Value::from_i64(3),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::from_f64(10.0));
@@ -21695,10 +21833,12 @@ mod tests {
 
     #[test]
     fn test_finalize_avg_empty() {
-        // Payload: [sum, r_err, count]
+        // Payload: [sum, r_err, count, pos_inf, neg_inf]
         let payload = vec![
             Value::from_f64(0.0),
             Value::from_f64(0.0),
+            Value::from_i64(0),
+            Value::from_i64(0),
             Value::from_i64(0),
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
@@ -21711,6 +21851,8 @@ mod tests {
             Value::from_f64(0.0),
             Value::from_f64(0.0),
             Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ];
 
         update_agg_payload(
@@ -21719,6 +21861,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
         update_agg_payload(
@@ -21727,6 +21870,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::BINARY,
+            false,
         )
         .unwrap();
 
