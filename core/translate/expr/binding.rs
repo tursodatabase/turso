@@ -518,6 +518,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     if let Some(referenced_tables) = &mut referenced_tables {
                         if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
                             if func.needs_star_expansion() {
+                                resolver
+                                    .catalog
+                                    .dialect
+                                    .check_star_call_of_plain_function(name.as_str())?;
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
                                 let joined_tables = referenced_tables.joined_tables();
