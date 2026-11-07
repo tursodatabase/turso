@@ -1709,6 +1709,8 @@ pub fn op_vdestroy(
             .into());
         };
         conn.syms.write().vtabs.remove(table_name);
+        // Like SQLite, a destroyed table takes no part in the end of the transaction.
+        conn.vtab_txn_states.write().remove(&vtab.vtab_id);
         vtab.destroy()?;
     }
 
