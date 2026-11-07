@@ -4500,6 +4500,74 @@ mod database_tests {
 
     #[cfg(feature = "fs")]
     #[test]
+    fn schema_writes_to_temp_do_not_require_writable_main() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-main.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        {
+            let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+            let connection = db.connect(ConnectOpts::new()).unwrap();
+            connection
+                .execute("CREATE TABLE test(id INTEGER); INSERT INTO test VALUES(1)")
+                .unwrap();
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        let db = Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        let connection = db.connect(ConnectOpts::new()).unwrap();
+        let before = std::fs::read(path).unwrap();
+        connection.execute("CREATE TEMP TABLE scratch(value); INSERT INTO scratch VALUES(7); DROP TABLE scratch").unwrap();
+        assert_eq!(count_test_rows(&connection), 1);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn schema_writes_to_attached_database_keep_main_transaction_readonly() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open(
+            io,
+            ":memory:",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_attach(true)),
+        )
+        .unwrap();
+        let connection = db.connect(ConnectOpts::new()).unwrap();
+        connection.execute("ATTACH ':memory:' AS aux").unwrap();
+        let mut transactions = Vec::new();
+        connection
+            .prepare("EXPLAIN CREATE TABLE aux.only_aux(value)")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                if row.get::<&str>(1)? == "Transaction" {
+                    transactions.push((row.get::<i64>(2)?, row.get::<i64>(3)?));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            transactions.contains(&(
+                crate::MAIN_DB_ID as i64,
+                crate::TransactionMode::Read as i64
+            )),
+            "{transactions:?}"
+        );
+        assert!(transactions
+            .iter()
+            .any(|(db, mode)| *db >= 2 && *mode == crate::TransactionMode::Write as i64));
+        connection
+            .execute("CREATE TABLE aux.only_aux(value); INSERT INTO aux.only_aux VALUES(1)")
+            .unwrap();
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
     fn registry_entry_is_removed_when_last_database_reference_drops() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("registry-drop.db");
