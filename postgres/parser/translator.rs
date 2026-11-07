@@ -3521,8 +3521,8 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
-                    let text = octal_or_binary_literal_as_decimal(&f.fval)
-                        .unwrap_or_else(|| f.fval.clone());
+                    let text =
+                        non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
@@ -6464,16 +6464,18 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     magnitude > limit
 }
 
-/// Writes an octal (`0o`) or binary (`0b`) integer literal in decimal digits,
-/// because Turso's numeric literal parser reads only decimal and hex text.
-/// Returns `None` for any other literal.
-fn octal_or_binary_literal_as_decimal(literal: &str) -> Option<String> {
+/// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
+/// decimal digits. Turso's numeric literal parser reads only decimal and hex
+/// text, and reads hex the SQLite way, so a value above i64 wraps around.
+/// Returns `None` for a decimal literal.
+fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     let literal = literal.replace('_', "");
     let (sign, unsigned) = match literal.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", literal.as_str()),
     };
     let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => 16,
         Some("0o" | "0O") => 8,
         Some("0b" | "0B") => 2,
         _ => return None,
@@ -6556,7 +6558,10 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
     use pg_query::protobuf::node::Node;
     match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
         Some(Node::Integer(i)) => Some(i.ival as i64),
-        Some(Node::Float(f)) => f.fval.parse::<i64>().ok(),
+        Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
+            .unwrap_or_else(|| f.fval.clone())
+            .parse::<i64>()
+            .ok(),
         _ => None,
     }
 }
