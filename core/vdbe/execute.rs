@@ -1374,7 +1374,7 @@ pub fn op_open_read(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
-                )
+                )?
                 .into_boxed()
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
@@ -14487,7 +14487,7 @@ pub fn op_open_write(
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             table_rc.as_ref(),
                             num_columns,
-                        )),
+                        )?),
                         &program.connection,
                     )
                 }
@@ -17173,7 +17173,7 @@ pub fn op_open_dup(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                ))
+                )?)
             };
             let cursor = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {

@@ -6079,9 +6079,7 @@ impl BTreeTable {
             && self
                 .get_column(&self.primary_key_columns[0].0)
                 .is_some_and(|(_, col)| col.primary_key())
-            && self
-                .primary_key_constraint_collation(&self.primary_key_columns[0].0)
-                .is_none();
+            && self.primary_key_explicit_collation(0).is_none();
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -6173,7 +6171,7 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
-                push_collation(sql, self.primary_key_constraint_collation(&col.0));
+                push_collation(sql, self.primary_key_explicit_collation(i));
                 if col.1 == SortOrder::Desc {
                     sql.push_str(" DESC");
                 }
@@ -6340,17 +6338,53 @@ impl BTreeTable {
             })
     }
 
-    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<TextCollation> {
-        self.unique_sets
-            .iter()
-            .find(|unique_set| unique_set.is_primary_key)
-            .and_then(|unique_set| {
-                unique_set
-                    .columns
-                    .iter()
-                    .find(|column| column.name == column_name)
+    /// Fails for a WITHOUT ROWID table whose key Turso cannot store the way
+    /// SQLite does. See `primary_key_repeats_column_with_other_collation`.
+    pub fn check_without_rowid_key_is_supported(&self) -> Result<()> {
+        if self.primary_key_repeats_column_with_other_collation() {
+            return Err(LimboError::ParseError(format!(
+                "table {}: a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations is not supported",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// True when PRIMARY KEY(...) lists a column more than once with
+    /// different collations, e.g. PRIMARY KEY(a COLLATE NOCASE, a).
+    /// SQLite stores such a column once per PRIMARY KEY entry in a WITHOUT
+    /// ROWID key and Turso stores it once.
+    pub fn primary_key_repeats_column_with_other_collation(&self) -> bool {
+        let collation_of = |i: usize| {
+            let (name, _) = &self.primary_key_columns[i];
+            let (_, column) = self
+                .get_column(name)
+                .expect("primary key column should exist");
+            self.primary_key_collation(i, column)
+        };
+        let names = &self.primary_key_columns;
+        (0..names.len()).any(|i| {
+            (i + 1..names.len()).any(|j| {
+                names[i].0.eq_ignore_ascii_case(&names[j].0) && collation_of(i) != collation_of(j)
             })
-            .and_then(|column| column.collation)
+        })
+    }
+
+    /// Collation of the `i`-th PRIMARY KEY entry, whose column is `column`:
+    /// the COLLATE written in PRIMARY KEY(...), or else the column's own.
+    pub fn primary_key_collation(&self, i: usize, column: &Column) -> CollationSeq {
+        self.primary_key_explicit_collation(i)
+            .map_or_else(|| column.collation(), CollationSeq::Text)
+    }
+
+    /// The COLLATE written for the `i`-th entry of PRIMARY KEY(...), if any.
+    pub fn primary_key_explicit_collation(&self, i: usize) -> Option<TextCollation> {
+        let unique_set = self
+            .unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)?;
+        assert_eq!(unique_set.columns.len(), self.primary_key_columns.len());
+        unique_set.columns[i].collation
     }
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
@@ -10384,6 +10418,14 @@ mod tests {
         assert_eq!(index.columns[1].name, "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_primary_key_collation_stays_on_its_own_entry_in_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t (a, b, PRIMARY KEY (a COLLATE NOCASE, b, a))"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert_eq!(table.to_sql(), sql);
         Ok(())
     }
 

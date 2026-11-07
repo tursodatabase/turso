@@ -781,6 +781,7 @@ fn validate(
                         "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
                     );
                 }
+                table.check_without_rowid_key_is_supported()?;
             } else if table.has_autoincrement {
                 // SQLite allows AUTOINCREMENT only on a key declared exactly as
                 // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
