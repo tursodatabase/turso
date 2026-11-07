@@ -508,23 +508,63 @@ pub fn comparison_collation_across_queries(
     rhs: &Expr,
     rhs_context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    let catalog = lhs_context.catalog();
+    let lhs_field = field_collation(lhs, lhs_context, catalog)?;
+    let rhs_field = field_collation(rhs, rhs_context, catalog)?;
+    comparison_collation_of_fields(lhs, lhs_context, lhs_field, rhs, rhs_context, rhs_field)
+}
+
+/// How `lhs` and `rhs` compare when each brings the text collation its
+/// [FieldCollation] says, which a column of a row subquery takes from the
+/// subquery instead of from its expression here: the order of a common custom
+/// type first, else the text collation by SQLite's precedence.
+pub(crate) fn comparison_collation_of_fields(
+    lhs: &Expr,
+    lhs_context: &ExprContext<'_, '_>,
+    lhs_field: FieldCollation,
+    rhs: &Expr,
+    rhs_context: &ExprContext<'_, '_>,
+    rhs_field: FieldCollation,
+) -> Result<CollationSeq> {
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
         return Ok(CollationSeq::Type(ordering));
     }
-    let catalog = lhs_context.catalog();
-    let collation = if has_collate_operator(lhs) {
-        expr_collation_if_any(lhs, lhs_context, catalog)?
-    } else if has_collate_operator(rhs) {
-        expr_collation_if_any(rhs, rhs_context, catalog)?
+    Ok(CollationSeq::Text(text_collation_by_precedence(
+        lhs_field, rhs_field,
+    )))
+}
+
+/// The text collation an expression brings to a comparison, and whether a
+/// COLLATE operator gave it, which decides its precedence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FieldCollation {
+    pub(crate) collation: Option<TextCollation>,
+    pub(crate) explicit: bool,
+}
+
+pub(crate) fn field_collation(
+    expr: &Expr,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
+) -> Result<FieldCollation> {
+    Ok(FieldCollation {
+        collation: expr_collation_if_any(expr, metadata, catalog)?,
+        explicit: has_collate_operator(expr),
+    })
+}
+
+/// SQLite's rule for a comparison: a COLLATE operator on the left wins, then
+/// one on the right, then the collation the left operand has on its own,
+/// then the right's, then BINARY.
+fn text_collation_by_precedence(lhs: FieldCollation, rhs: FieldCollation) -> TextCollation {
+    let collation = if lhs.explicit {
+        lhs.collation
+    } else if rhs.explicit {
+        rhs.collation
     } else {
-        match expr_collation_if_any(lhs, lhs_context, catalog)? {
-            Some(collation) => Some(collation),
-            None => expr_collation_if_any(rhs, rhs_context, catalog)?,
-        }
+        lhs.collation.or(rhs.collation)
     };
-    Ok(CollationSeq::Text(
-        collation.unwrap_or(TextCollation::Binary),
-    ))
+    collation.unwrap_or(TextCollation::Binary)
 }
 
 /// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the

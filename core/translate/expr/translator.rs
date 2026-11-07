@@ -270,10 +270,11 @@ fn copy_cached_expr_reg(
     resolver: &Resolver,
     (reg, needs_decode): crate::translate::emitter::CachedExprRegHit,
 ) -> Result<()> {
+    // A cached row value, `(x, y) BETWEEN ...`, sits in consecutive registers.
     program.emit_insn(Insn::Copy {
         src_reg: reg,
         dst_reg: target_register,
-        extra_amount: 0,
+        extra_amount: expr_vector_size(expr)? - 1,
     });
     // Hash join payloads store raw encoded values; apply DECODE for custom
     // type columns so the result set contains human-readable text.

@@ -288,3 +288,87 @@ test row-value-null-in-both-lhs-rhs-in {
 expect {
     1
 }
+
+# SQLite reads a list of row values as a VALUES, so each column compares with
+# the collation and the affinity of the left operand's component first, else
+# of the component in the last row; the other rows bring neither.
+test row-value-in-list-compares-with-the-last-row-collation {
+    CREATE TABLE c(a TEXT COLLATE NOCASE);
+    INSERT INTO c VALUES('A');
+    SELECT ('a', 1) IN (('A', 1), ('x' COLLATE NOCASE, 2)), ('a', 1) IN (('x' COLLATE NOCASE, 2), ('A', 1)), ('a', 1) IN (('A', 1), ('x', 2));
+    SELECT ('a' COLLATE NOCASE, 1) IN (('A', 1), ('x', 2)), ('a', 1) IN (('A' COLLATE NOCASE, 1)), ('a', 1) IN (('q', 3), ('A', 1), ('x' COLLATE NOCASE, 2));
+    SELECT (a, 1) IN (('a' COLLATE BINARY, 1), ('z', 2)), ('a', 1) IN ((a, 1), ('z', 2)), ('a', 1) IN (('z', 2), (a, 1)) FROM c;
+}
+expect {
+    1|0|0
+    1|1|1
+    1|0|1
+}
+
+test row-value-in-list-compares-with-the-last-row-affinity {
+    SELECT (1, 2) IN ((CAST('1' AS TEXT), 2), (CAST('x' AS BLOB), 3)), (1, 2) IN ((CAST('x' AS BLOB), 3), (CAST('1' AS TEXT), 2)), (1, 2) IN ((CAST('1' AS TEXT), 2));
+    SELECT (1, 2) IN ((CAST('1' AS TEXT), 2), ('x', 3)), (1, 2) IN (('x', 3), (CAST('1' AS TEXT), 2)), (1, 2) IN (('1', 2), ('x', 3));
+}
+expect {
+    0|1|1
+    0|1|0
+}
+
+# When a NULL keeps a row from matching, SQLite answers NULL only if the other
+# components are equal with the left operand's own collation, not with the
+# collation the last row gave the comparison.
+test row-value-in-list-null-row-uses-the-left-collation {
+    CREATE TABLE c(a TEXT COLLATE NOCASE);
+    INSERT INTO c VALUES('A');
+    SELECT ('a', NULL) IN (('A', 1), ('x' COLLATE NOCASE, 2)), ('a', NULL) IN (('a', 1), ('x' COLLATE NOCASE, 2)), ('a' COLLATE NOCASE, NULL) IN (('A', 1), ('x', 2));
+    SELECT ('a', 1) IN (('A', NULL), ('z' COLLATE NOCASE, 2)), ('a', 1) IN (('a', NULL), ('z' COLLATE NOCASE, 2)), ('a', 1) NOT IN (('A', NULL), ('z' COLLATE NOCASE, 2)), ('a', 1) NOT IN (('a', NULL), ('z' COLLATE NOCASE, 2));
+    SELECT (NULL, 1) IN (('A', 1), ('x' COLLATE NOCASE, 2)), (NULL, 1) IN (('A', 2), ('x' COLLATE NOCASE, 2)), ('a', NULL) IN (('x' COLLATE NOCASE, 2), ('A', 1));
+    SELECT (a, NULL) IN (('a', 1), ('z', 2)), ('a', NULL) IN ((a, 1), ('z', 2)), ('a', NULL) IN (('z', 2), (a, 1)) FROM c;
+}
+expect {
+    0||
+    0||1|
+    |0|0
+    |0|0
+}
+
+# A row value BETWEEN compares component by component, in a result column as
+# well as in WHERE; the left side is evaluated once and copied whole.
+test row-value-between-compares-each-component {
+    CREATE TABLE n(a, b);
+    INSERT INTO n VALUES (1, 2);
+    SELECT (1, 2) BETWEEN (0, 0) AND (3, 3), (1, 2) NOT BETWEEN (0, 0) AND (3, 3), (4, 2) BETWEEN (0, 0) AND (3, 3);
+    SELECT (1, 2) BETWEEN (1, 2) AND (1, 2), (1, NULL) BETWEEN (0, 0) AND (3, 3), (1, 2) BETWEEN (1, 3) AND (1, 1);
+    SELECT (a, b) BETWEEN (0, 0) AND (3, 3), (a, b) NOT BETWEEN (1, 2) AND (1, 2), (a, b) BETWEEN (a, b) AND (a, b + 1) FROM n;
+    SELECT (1, 'b') BETWEEN (1, 'a') AND (1, 'c'), (1, 'B') BETWEEN (1, 'a') AND (1, 'c'), (1, 'B' COLLATE NOCASE) BETWEEN (1, 'a') AND (1, 'c');
+    SELECT (SELECT 1, 2) BETWEEN (0, 0) AND (3, 3), (1, 2, 3) BETWEEN (0, 0, 0) AND (3, 3, 3), CASE WHEN (1, 2) BETWEEN (0, 0) AND (3, 3) THEN 'y' ELSE 'n' END;
+}
+expect {
+    1|0|0
+    1|1|0
+    1|0|1
+    1|0|1
+    1|1|y
+}
+# In a list of two or more items a subquery is one term, as in SQLite; only
+# `x IN (SELECT ...)` and a list with that single subquery compare columns.
+test row-value-in-list-subquery-item-is-one-term {
+    SELECT ('a', 1) IN (('z', 2), (SELECT 'a', 1));
+}
+expect error {
+    element has 1 term - expected 2
+}
+
+test row-value-in-list-single-subquery-item-compares-columns {
+    SELECT ('a', 1) IN ((SELECT 'a', 1)), ('a', 1) IN ((SELECT 'z', 1)), 'a' IN ((SELECT 'a'), 'z');
+}
+expect {
+    1|0|1
+}
+
+test scalar-in-list-subquery-item-with-two-columns-is-an-error {
+    SELECT 'a' IN ((SELECT 'a', 1), 'z');
+}
+expect error {
+    sub-select returns 2 columns - expected 1
+}

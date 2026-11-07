@@ -96,8 +96,23 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::RowId { .. } => 1,
         Expr::InList { lhs, rhs, .. } => {
             let evs_lhs = expr_vector_size(lhs)?;
-            for rhs in rhs.iter() {
-                let evs_rhs = expr_vector_size(rhs)?;
+            for item in rhs.iter() {
+                // In a list of two or more items a subquery is one term, as in
+                // SQLite, where only `x IN (SELECT ...)` compares columns.
+                let evs_rhs = match item.as_ref() {
+                    Expr::SubqueryResult {
+                        query_type: SubqueryType::RowValue { num_regs, .. },
+                        ..
+                    } if rhs.len() > 1 => {
+                        if evs_lhs == 1 && *num_regs != 1 {
+                            crate::bail_parse_error!(
+                                "sub-select returns {num_regs} columns - expected 1"
+                            );
+                        }
+                        1
+                    }
+                    item => expr_vector_size(item)?,
+                };
                 if evs_lhs != evs_rhs {
                     // SQLite reports "row value misused" for a scalar LHS, but a
                     // dedicated arity error when the LHS is a row value.

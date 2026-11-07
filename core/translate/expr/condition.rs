@@ -138,15 +138,22 @@ pub(super) fn translate_in_list(
                 });
             }
         } else {
-            // Row-valued comparison path: compare each component
+            // Row-valued comparison path: compare each component. SQLite reads a
+            // list of row values as a VALUES, so every row compares with the
+            // affinity and collation of the left operand's component first,
+            // else of the component in the last row; the other rows bring none.
+            let last_item = rhs
+                .last()
+                .expect("the loop runs over rhs, so it has a last item");
             if !last_condition || false_null_jump_targets_differ {
                 // If all components match, jump to label_ok; otherwise skip to next RHS item
                 let skip_label = program.allocate_label();
 
                 // Check for unequal values and skip if one is found.
+                let mut components = Vec::with_capacity(lhs_arity);
                 for j in 0..lhs_arity {
                     let (aff, collation) =
-                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
+                        row_component_affinity_collation(lhs, last_item, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff);
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,
@@ -155,6 +162,7 @@ pub(super) fn translate_in_list(
                         flags,
                         collation,
                     });
+                    components.push((aff, collation));
                 }
 
                 // Checking for null values after fully confirming there are no inequalities.
@@ -187,6 +195,22 @@ pub(super) fn translate_in_list(
 
                 if check_null_in_row_values_reg != 0 {
                     program.preassign_label_to_next_insn(set_null_flag_label);
+                    // A NULL kept this row from matching. SQLite only answers NULL
+                    // when the other components are equal with the left operand's
+                    // own collation, not with the one the list gave the comparison.
+                    for (j, (aff, collation)) in components.iter().enumerate() {
+                        let own_collation = row_component_own_collation(lhs, j, &metadata)?;
+                        if own_collation == *collation {
+                            continue;
+                        }
+                        program.emit_insn(Insn::Ne {
+                            lhs: lhs_reg + j,
+                            rhs: rhs_reg + j,
+                            target_pc: skip_label,
+                            flags: CmpInsFlags::default().with_affinity(*aff),
+                            collation: own_collation,
+                        });
+                    }
                     program.emit_insn(Insn::Integer {
                         value: 1,
                         dest: check_null_in_row_values_reg,
@@ -198,7 +222,7 @@ pub(super) fn translate_in_list(
                 // Last condition, simple case: jump to false if any component doesn't match
                 for j in 0..lhs_arity {
                     let (aff, collation) =
-                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
+                        row_component_affinity_collation(lhs, last_item, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,

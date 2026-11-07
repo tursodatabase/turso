@@ -658,6 +658,11 @@ fn plan_subqueries_with_outer_query_access<'a>(
         for expr in exprs {
             let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
             walk_expr_mut(expr, &mut subquery_parser)?;
+            if let Some(subquery_id) = row_subquery_compared_by_a_where_term(expr, origin) {
+                resolver
+                    .row_value_subqueries
+                    .drop_column_collations(subquery_id);
+            }
             if has_subquery {
                 let expr: &ast::Expr = expr;
                 with_subqueries.push(expr);
@@ -671,6 +676,45 @@ fn plan_subqueries_with_outer_query_access<'a>(
         check_custom_types(expr, Some(referenced_tables), resolver)?;
     }
     Ok(())
+}
+
+/// The row subquery of a WHERE or ON term `(SELECT a, b ...) = (x, y)` or
+/// `... IS ...` with a subquery on exactly one side, once planned. SQLite
+/// turns such a term into one comparison per column against the subquery's
+/// columns, and those bring no collation, not even a COLLATE inside the
+/// subquery: in `WHERE (SELECT a, 1 FROM c) = ('a', 1)` a NOCASE column `a`
+/// compares as BINARY. The same comparison under OR or NOT, in HAVING, in a
+/// result column or in a trigger's WHEN keeps the column's collation.
+fn row_subquery_compared_by_a_where_term(
+    expr: &ast::Expr,
+    origin: SubqueryOrigin,
+) -> Option<TableInternalId> {
+    if !matches!(
+        origin,
+        SubqueryOrigin::SelectWhere | SubqueryOrigin::DmlWhere
+    ) {
+        return None;
+    }
+    let term = unwrap_parens(expr).ok()?;
+    let ast::Expr::Binary(lhs, ast::Operator::Equals | ast::Operator::Is, rhs) = term else {
+        return None;
+    };
+    let lhs = unwrap_parens(lhs).ok()?;
+    let rhs = unwrap_parens(rhs).ok()?;
+    let row_subquery_id = |side: &ast::Expr| match side {
+        ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type: SubqueryType::RowValue { num_regs, .. },
+            ..
+        } if *num_regs > 1 => Some(*subquery_id),
+        _ => None,
+    };
+    let is_subquery = |side: &ast::Expr| matches!(side, ast::Expr::SubqueryResult { .. });
+    match (row_subquery_id(lhs), row_subquery_id(rhs)) {
+        (Some(id), None) if !is_subquery(rhs) => Some(id),
+        (None, Some(id)) if !is_subquery(lhs) => Some(id),
+        _ => None,
+    }
 }
 
 /// Most subqueries can reference columns from the outer query,
@@ -916,17 +960,19 @@ fn get_subquery_parser<'a>(
                 let reg_start = program.alloc_registers(reg_count);
 
                 let env = TypeEnv::new(Some(&plan.table_references), resolver);
-                let columns: Vec<_> = plan
-                    .result_columns
-                    .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
-                        affinity: get_expr_affinity(
-                            &result_col.expr,
-                            &ExprContext::new(Some(&plan.table_references), resolver),
-                        ),
+                let context = ExprContext::new(Some(&plan.table_references), resolver);
+                let mut columns = Vec::with_capacity(plan.result_columns.len());
+                for result_col in &plan.result_columns {
+                    columns.push(RowValueSubqueryColumn {
+                        affinity: get_expr_affinity(&result_col.expr, &context),
                         expr_type: type_of(&result_col.expr, &env),
-                    })
-                    .collect();
+                        text_collation: crate::translate::collate::field_collation(
+                            &result_col.expr,
+                            &context,
+                            context.catalog(),
+                        )?,
+                    });
+                }
                 if let [column] = columns.as_slice() {
                     referenced_tables.add_scalar_subquery_affinity(subquery_id, column.affinity);
                 }
