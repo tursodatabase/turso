@@ -11,6 +11,7 @@ from .lib_sync import (
 from .lib_sync import (
     PartialSyncOpts,
     PyTursoSyncDatabaseStats,
+    RemoteEncryptionCipher,
 )
 from .lib_sync import (
     connect_sync as blocking_connect_sync,
@@ -65,7 +66,7 @@ class ConnectionSync(NonBlockingConnection):
 # Same signature as in the lib_sync.connect_sync
 def connect_sync(
     path: str,
-    remote_url: Union[str, Callable[[], Optional[str]]],
+    remote_url: Optional[Union[str, Callable[[], Optional[str]]]] = None,
     *,
     auth_token: Optional[Union[str, Callable[[], Optional[str]]]] = None,
     client_name: Optional[str] = None,
@@ -75,6 +76,9 @@ def connect_sync(
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
     timeout: float = 5.0,
+    remote_encryption_key: Optional[str] = None,
+    remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
+    local_encryption_key: Optional[str] = None,
     push_operations_threshold: Optional[int] = None,
     pull_bytes_threshold: Optional[int] = None,
     logical_mvcc_pull: Optional[bool] = None,
@@ -92,6 +96,9 @@ def connect_sync(
             experimental_features=experimental_features,
             isolation_level=isolation_level,
             timeout=timeout,
+            remote_encryption_key=remote_encryption_key,
+            remote_encryption_cipher=remote_encryption_cipher,
+            local_encryption_key=local_encryption_key,
             push_operations_threshold=push_operations_threshold,
             pull_bytes_threshold=pull_bytes_threshold,
             logical_mvcc_pull=logical_mvcc_pull,
