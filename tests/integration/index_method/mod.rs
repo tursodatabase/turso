@@ -7355,3 +7355,44 @@ fn rejected_index_method_value_keeps_row_and_index_consistent(tmp_db: TempDataba
     // and autocommit error rollback). Once that is fixed, assert
     // integrity_check here too.
 }
+
+#[turso_macros::test]
+fn fts_drop_index_fails_while_an_fts_query_is_reading(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)")
+        .unwrap();
+    for id in 1..=50 {
+        conn.execute(format!("INSERT INTO d VALUES ({id}, 'word{id} common')"))
+            .unwrap();
+    }
+
+    let mut select = conn
+        .prepare("SELECT id FROM d WHERE fts_match(body, 'common')")
+        .unwrap();
+    let mut rows = 0;
+    loop {
+        match select.step().unwrap() {
+            turso_core::StepResult::Row => {
+                rows += 1;
+                if rows == 1 {
+                    let err = conn.execute("DROP INDEX fx").unwrap_err();
+                    assert!(
+                        matches!(err, turso_core::LimboError::TableLocked),
+                        "{err:?}"
+                    );
+                }
+            }
+            turso_core::StepResult::IO => select._io().step().unwrap(),
+            turso_core::StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert_eq!(rows, 50);
+    drop(select);
+
+    conn.execute("DROP INDEX fx").unwrap();
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+}
