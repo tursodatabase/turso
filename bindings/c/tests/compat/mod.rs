@@ -1153,6 +1153,209 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn unsupported_aggregate_registration_reports_error_and_cleans_up() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::unsupported_aggregate_registration_child",
+                "--nocapture",
+            ])
+            .env("TURSO_UNSUPPORTED_AGGREGATE_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("aggregate rejection destructor deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn unsupported_aggregate_registration_child() {
+        if std::env::var_os("TURSO_UNSUPPORTED_AGGREGATE_CHILD").is_none() {
+            return;
+        }
+        struct Probe {
+            db: *mut sqlite3,
+            steps: usize,
+            finals: usize,
+            destroyed: usize,
+            observed_error: i32,
+        }
+        unsafe extern "C" fn step(ctx: *mut libc::c_void, _: i32, _: *mut *mut libc::c_void) {
+            (*sqlite3_user_data(ctx).cast::<Probe>()).steps += 1;
+        }
+        unsafe extern "C" fn final_(ctx: *mut libc::c_void) {
+            (*sqlite3_user_data(ctx).cast::<Probe>()).finals += 1;
+            sqlite3_result_int(ctx, 1);
+        }
+        unsafe extern "C" fn destroy(data: *mut libc::c_void) {
+            let probe = &mut *data.cast::<Probe>();
+            probe.destroyed += 1;
+            probe.observed_error = sqlite3_errcode(probe.db);
+        }
+        unsafe {
+            let scalar: unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void) = step;
+            let step = std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(step);
+            let final_ = std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(final_);
+            let directory = tempfile::tempdir().unwrap();
+            let missing =
+                std::ffi::CString::new(directory.path().join("absent/db").to_str().unwrap())
+                    .unwrap();
+            for failed_handle in [true, false] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open(
+                        if failed_handle {
+                            missing.as_ptr()
+                        } else {
+                            c":memory:".as_ptr()
+                        },
+                        &mut db,
+                    ),
+                    if failed_handle {
+                        SQLITE_CANTOPEN
+                    } else {
+                        SQLITE_OK
+                    }
+                );
+                let original_message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_owned();
+                let mut probe = Probe {
+                    db,
+                    steps: 0,
+                    finals: 0,
+                    destroyed: 0,
+                    observed_error: 0,
+                };
+                for (index, n_args) in [-1, 0, 1, 1000].into_iter().enumerate() {
+                    let attempt = index + 1;
+                    assert_eq!(
+                        sqlite3_create_function_v2(
+                            db,
+                            c"aggregate_unsupported".as_ptr(),
+                            n_args,
+                            SQLITE_UTF8,
+                            (&mut probe as *mut Probe).cast(),
+                            None,
+                            Some(step),
+                            Some(final_),
+                            Some(destroy),
+                        ),
+                        if failed_handle {
+                            SQLITE_MISUSE
+                        } else {
+                            SQLITE_ERROR
+                        }
+                    );
+                    assert_eq!(probe.destroyed, attempt);
+                    assert_eq!(probe.steps, 0);
+                    assert_eq!(probe.finals, 0);
+                    assert_eq!(
+                        probe.observed_error,
+                        if failed_handle {
+                            SQLITE_CANTOPEN
+                        } else {
+                            SQLITE_ERROR
+                        }
+                    );
+                    if failed_handle {
+                        assert_eq!(
+                            std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                            original_message.as_c_str()
+                        );
+                    } else {
+                        let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                            .to_str()
+                            .unwrap();
+                        assert!(
+                            message.contains("aggregate callbacks are not supported"),
+                            "{message}"
+                        );
+                    }
+                }
+                if !failed_handle {
+                    let oversized_name = std::ffi::CString::new("a".repeat(256)).unwrap();
+                    for (index, (n_args, func, step, final_)) in [
+                        (1, None, Some(step), None),
+                        (1, None, None, Some(final_)),
+                        (1, Some(scalar), Some(step), Some(final_)),
+                        (-2, None, Some(step), Some(final_)),
+                        (1001, None, Some(step), Some(final_)),
+                        (i32::MAX, None, Some(step), Some(final_)),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        assert_eq!(
+                            sqlite3_create_function_v2(
+                                db,
+                                c"aggregate_invalid".as_ptr(),
+                                n_args,
+                                SQLITE_UTF8,
+                                (&mut probe as *mut Probe).cast(),
+                                func,
+                                step,
+                                final_,
+                                Some(destroy),
+                            ),
+                            SQLITE_MISUSE
+                        );
+                        assert_eq!(probe.destroyed, index + 5);
+                        assert_eq!(probe.steps, 0);
+                        assert_eq!(probe.finals, 0);
+                    }
+                    assert_eq!(
+                        sqlite3_create_function_v2(
+                            db,
+                            oversized_name.as_ptr(),
+                            1,
+                            SQLITE_UTF8,
+                            (&mut probe as *mut Probe).cast(),
+                            None,
+                            Some(step),
+                            Some(final_),
+                            Some(destroy),
+                        ),
+                        SQLITE_MISUSE
+                    );
+                    assert_eq!(probe.destroyed, 11);
+                    let mut statement = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT aggregate_unsupported(1)".as_ptr(),
+                            -1,
+                            &mut statement,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_ERROR
+                    );
+                    assert!(statement.is_null());
+                    scalar_query(db, "SELECT 1", 1);
+                }
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+                assert_eq!(probe.destroyed, if failed_handle { 4 } else { 11 });
+            }
+        }
+    }
+
     #[test]
     fn scalar_prepared_replacement_keeps_userdata_alive() {
         unsafe {
