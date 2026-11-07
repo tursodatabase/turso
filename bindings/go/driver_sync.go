@@ -35,6 +35,13 @@ type TursoPartialSyncConfig struct {
 
 // Public configuration for a synced database.
 type TursoSyncDbConfig struct {
+	// One cipher for the cloud and local keys, e.g. "aes256gcm".
+	RemoteEncryptionCipher string
+	// Base64 cloud key. May be omitted when reopening offline.
+	RemoteEncryptionKey string
+	// Hex local key; never sent to the server.
+	LocalEncryptionKey string
+
 	// Path to the main database file locally.
 	// Supports DSN-style options: "mydb.db?_busy_timeout=5000"
 	// Supported options:
@@ -157,20 +164,37 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	}
 
 	remoteUrl := normalizeUrl(config.RemoteUrl)
+	features := config.ExperimentalFeatures
+	if config.LocalEncryptionKey != "" {
+		if config.RemoteEncryptionCipher == "" {
+			return nil, errors.New("local encryption requires RemoteEncryptionCipher")
+		}
+		if features == "" {
+			features = "encryption"
+		} else {
+			features += ",encryption"
+		}
+	}
 	// Create sync database holder
 	dbCfg := TursoDatabaseConfig{
 		Path:                 dbPath,
-		ExperimentalFeatures: config.ExperimentalFeatures,
+		ExperimentalFeatures: features,
 		AsyncIO:              true, // MUST be true for external IO handling
+		Encryption:           TursoDatabaseEncryptionOpts{Hexkey: config.LocalEncryptionKey},
+	}
+	if config.LocalEncryptionKey != "" {
+		dbCfg.Encryption.Cipher = config.RemoteEncryptionCipher
 	}
 	syncCfg := TursoSyncDatabaseConfig{
+		RemoteEncryptionCipher:         config.RemoteEncryptionCipher,
+		RemoteEncryptionKey:            config.RemoteEncryptionKey,
 		Path:                           dbPath,
 		RemoteUrl:                      remoteUrl,
 		Namespace:                      config.Namespace,
 		ClientName:                     clientName,
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,
-		ReservedBytes:                  0,
+		ReservedBytes:                  syncEncryptionReservedBytes(config.RemoteEncryptionCipher),
 		PartialBootstrapStrategyPrefix: config.PartialSyncExperimental.BootstrapStrategyPrefix,
 		PartialBootstrapStrategyQuery:  config.PartialSyncExperimental.BootstrapStrategyQuery,
 		PartialBootstrapSegmentSize:    config.PartialSyncExperimental.SegmentSize,
@@ -658,4 +682,17 @@ func parseSyncDSN(dsn string) (string, syncDSNOptions) {
 		}
 	}
 	return path, opts
+}
+
+func syncEncryptionReservedBytes(cipher string) int {
+	switch cipher {
+	case "aes128gcm", "aes256gcm", "chacha20poly1305":
+		return 28
+	case "aegis128l", "aegis128x2", "aegis128x4":
+		return 32
+	case "aegis256", "aegis256x2", "aegis256x4":
+		return 48
+	default:
+		return 0
+	}
 }
