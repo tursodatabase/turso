@@ -256,6 +256,7 @@ fn build_plan_for_connection(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        crate::security::roles::RoleId::SUPERUSER,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
     // names the same way CREATE did: within the view's own database, never

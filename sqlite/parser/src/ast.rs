@@ -1503,6 +1503,10 @@ pub enum AlterTableBody {
         /// `IF EXISTS`: a missing relation is not an error.
         if_exists: bool,
     },
+    /// `ENABLE ROW LEVEL SECURITY`
+    EnableRowSecurity,
+    /// `DISABLE ROW LEVEL SECURITY`
+    DisableRowSecurity,
 }
 
 /// What kind of relation a schema object is. `ALTER ... OWNER TO` names

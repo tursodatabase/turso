@@ -277,6 +277,16 @@ impl Dialect for PostgresDialect {
         crate::classes::role_may_read(schema, namespace, name, role)
     }
 
+    fn row_security_applies(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+        role: RoleId,
+    ) -> bool {
+        crate::classes::row_security_applies(schema, namespace, name, role)
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }
@@ -565,6 +575,9 @@ impl SnapshotRows for PgClassTable {
             let relnatts = btree.columns().len() as i64;
             let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
+            let relrowsecurity = i64::from(crate::classes::relation_row_security(
+                &schema, *namespace, name,
+            ));
 
             rows.push(vec![
                 Value::from_i64(table_oid),                                     // oid
@@ -582,24 +595,24 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),                                             // reltoastrelid
                 Value::from_i64(relhasindex),                                   // relhasindex
                 Value::from_i64(0),                                             // relisshared
-                Value::Text("p".into()),    // relpersistence (permanent)
-                Value::build_text(relkind), // relkind (regular table)
-                Value::from_i64(relnatts),  // relnatts
-                Value::from_i64(relchecks), // relchecks
-                Value::from_i64(0),         // relhasrules
-                Value::from_i64(0),         // relhastriggers
-                Value::from_i64(0),         // relhassubclass
-                Value::from_i64(0),         // relrowsecurity
-                Value::from_i64(0),         // relforcerowsecurity
-                Value::from_i64(1),         // relispopulated
-                Value::Text("d".into()),    // relreplident
-                Value::from_i64(0),         // relispartition
-                Value::from_i64(0),         // relrewrite
-                Value::from_i64(0),         // relfrozenxid
-                Value::from_i64(0),         // relminmxid
+                Value::Text("p".into()),         // relpersistence (permanent)
+                Value::build_text(relkind),      // relkind (regular table)
+                Value::from_i64(relnatts),       // relnatts
+                Value::from_i64(relchecks),      // relchecks
+                Value::from_i64(0),              // relhasrules
+                Value::from_i64(0),              // relhastriggers
+                Value::from_i64(0),              // relhassubclass
+                Value::from_i64(relrowsecurity), // relrowsecurity
+                Value::from_i64(0),              // relforcerowsecurity
+                Value::from_i64(1),              // relispopulated
+                Value::Text("d".into()),         // relreplident
+                Value::from_i64(0),              // relispartition
+                Value::from_i64(0),              // relrewrite
+                Value::from_i64(0),              // relfrozenxid
+                Value::from_i64(0),              // relminmxid
                 relation_acl(conn, &schema, *namespace, name), // relacl
-                Value::Null,                // reloptions
-                Value::Null,                // relpartbound
+                Value::Null,                     // reloptions
+                Value::Null,                     // relpartbound
             ]);
         }
 

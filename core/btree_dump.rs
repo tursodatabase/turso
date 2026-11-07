@@ -36,6 +36,10 @@ impl InternalVirtualTable for BtreeDumpTable {
         "CREATE TABLE btree_dump(record BLOB, name TEXT HIDDEN)".to_string()
     }
 
+    fn reads_raw_storage(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         let pager = conn.get_pager();
         let schema = conn.schema.read().clone();

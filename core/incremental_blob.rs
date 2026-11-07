@@ -288,6 +288,7 @@ impl Connection {
                 "incremental blob I/O is not supported in MVCC mode".to_string(),
             ));
         }
+        crate::translate::row_security::check_blob_open(self, table, read_write)?;
         let fk_enforced = self.foreign_keys_enabled();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
             if schema.is_materialized_view(NamespaceId::ROOT, table)
