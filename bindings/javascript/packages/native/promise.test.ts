@@ -31,6 +31,29 @@ test('in-memory-db-async', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
+test('binding dates, maps, array buffers, plain objects and undefined is refused', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(k, v)");
+    const ins = await db.prepare("INSERT INTO t VALUES (?, ?)");
+
+    // Each of these used to store as the value's toString() text, so the
+    // original value was silently lost; they must fail instead.
+    const refused = [new Date(), new Map([["a", 1]]), new ArrayBuffer(8), { a: 1 }, undefined];
+    for (const value of refused) {
+        await expect(ins.run("k", value)).rejects.toThrow(
+            "SQLite3 can only bind numbers, strings, bigints, buffers, and null",
+        );
+    }
+
+    // Buffers and typed arrays keep binding as blobs.
+    await ins.run("buf", Buffer.from([1, 2, 3]));
+    await ins.run("typed", new Uint8Array([4, 5]));
+    expect(await db.all("SELECT k, typeof(v) AS t FROM t ORDER BY rowid")).toEqual([
+        { k: "buf", t: "blob" },
+        { k: "typed", t: "blob" },
+    ]);
+})
+
 test('concurrent calls on one prepared statement use their own parameters', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE items (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
