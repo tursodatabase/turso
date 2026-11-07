@@ -101,7 +101,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// connection compilation state changes. Implementations must accept the
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
-    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)>;
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        engine::parse(sql)
+    }
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -110,7 +112,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// `sqlite_sequence`) are plain SQLite text and carry no frontend
     /// marker, so every implementation must fall back to SQLite parsing
     /// for text it does not recognize as its own.
-    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable>;
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        engine::reject_postgres_table_sql(sql)?;
+        BTreeTable::from_sql(sql, root_page)
+    }
 
     /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
     /// AST.
@@ -121,7 +126,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// [`Dialect::format_rewritten_table_sql`]. Internal engine tables use
     /// plain SQLite text, so implementations must retain the same SQLite
     /// fallback required by [`Dialect::parse_table_sql`].
-    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt>;
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+        engine::reject_postgres_table_sql(sql)?;
+        engine::parse_table_sql_ast(sql)
+    }
 
     /// Recover SQL that can be prepared to recreate a persisted table.
     ///
@@ -131,7 +139,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// persisted statement originally qualified the source database. Unmarked
     /// internal engine tables must retain the SQLite fallback used by the
     /// schema parsing methods.
-    fn table_sql_for_replay(&self, sql: &str) -> Result<String>;
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        engine::reject_postgres_table_sql(sql)?;
+        engine::table_sql_for_replay(sql)
+    }
 
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
@@ -143,10 +154,12 @@ pub trait Dialect: Send + Sync + 'static {
     /// recognize in [`Dialect::parse_table_sql`].
     fn format_table_sql(
         &self,
-        input: &str,
+        _input: &str,
         tbl_name: &QualifiedName,
         body: &CreateTableBody,
-    ) -> Result<String>;
+    ) -> Result<String> {
+        engine::format_table_sql(tbl_name, body)
+    }
 
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
@@ -174,7 +187,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// [`engine::register_builtin_catalog`] and then add their own tables
     /// (constructed with [`crate::VirtualTable::new_internal`], which
     /// requires no connection).
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()>;
+    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
+        engine::register_builtin_catalog(schema, enable_custom_types)
+    }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         options
@@ -190,7 +205,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// itself via [`Dialect::exec_scalar_function`]. Consulted
     /// before extension functions; engine-generated helper statements
     /// always resolve with SQLite semantics instead.
-    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>>;
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        engine::resolve_builtin_function(name, arg_count)
+    }
 
     /// Execute a dialect scalar function at runtime.
     ///
