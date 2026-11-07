@@ -61,6 +61,25 @@ k2|v2
 k3|v3
 k4|v4}
 
+# Turso inserts only a plain VALUES list into a virtual table. It must reject
+# the rest instead of dropping rows; SQLite inserts them.
+if {$is_turso} {
+    do_execsql_test_in_memory_error_content insert-values-union-all-into-vtab {
+        CREATE VIRTUAL TABLE v USING kv_store;
+        INSERT INTO v(key, value) VALUES ('a', '1') UNION ALL VALUES ('b', '2');
+    } {Virtual tables only support VALUES clause in INSERT}
+
+    do_execsql_test_in_memory_error_content insert-values-limit-into-vtab {
+        CREATE VIRTUAL TABLE v USING kv_store;
+        INSERT INTO v(key, value) VALUES ('a', '1'), ('b', '2') LIMIT 1;
+    } {Virtual tables only support VALUES clause in INSERT}
+
+    do_execsql_test_in_memory_error_content insert-values-order-by-into-vtab {
+        CREATE VIRTUAL TABLE v USING kv_store;
+        INSERT INTO v(key, value) VALUES ('b', '2'), ('a', '1') ORDER BY 1;
+    } {Virtual tables only support VALUES clause in INSERT}
+}
+
 do_execsql_test_in_memory_error_content drop-virtual-table-twice {
     CREATE VIRTUAL TABLE t USING kv_store;
     INSERT INTO t VALUES ('hello', 'world');
