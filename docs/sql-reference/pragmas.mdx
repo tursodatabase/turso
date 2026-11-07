@@ -194,8 +194,10 @@ PRAGMA index_xinfo(index-name);
 
 Returns one row per parent key column of each foreign key constraint on a table. `id`
 numbers the constraints, `seq` is the position of the column within that constraint, and
-`from` and `to` are the child and parent columns. `on_update` and `on_delete` are
-`NO ACTION` unless the constraint declares an action, and `match` is always `NONE`.
+`from` and `to` are the child and parent columns. When the constraint names no parent
+column (`REFERENCES parent` with no column list), it refers to the parent's primary key and
+`to` is NULL, as in SQLite. `on_update` and `on_delete` are `NO ACTION` unless the
+constraint declares an action, and `match` is always `NONE`.
 Constraints are reported newest declaration first, so a table-level `FOREIGN KEY` clause
 written last has `id` 0.
 
