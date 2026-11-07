@@ -2172,8 +2172,14 @@ mod tests {
         probe(true, "joined holder alive");
         drop(joined);
         probe(true, "joined holder dropped");
+        let mut readonly_config = config.clone();
+        readonly_config.open_flags = OpenFlags::ReadOnly;
+        let surviving_reader = TursoDatabase::new(readonly_config);
+        assert!(!surviving_reader.open().unwrap().is_io());
         drop(writer);
         drop(owner);
+        probe(true, "readonly holder outlives original owner");
+        drop(surviving_reader);
         probe(false, "all owners dropped");
     }
 
