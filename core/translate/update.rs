@@ -111,6 +111,7 @@ fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } => {
             if num_regs != target_count {
@@ -124,6 +125,7 @@ fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result
                     query_type: ast::SubqueryType::RowValue {
                         result_reg_start: result_reg_start + offset,
                         num_regs: 1,
+                        row_count_reg,
                     },
                 })
                 .collect())

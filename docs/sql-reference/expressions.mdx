@@ -375,7 +375,7 @@ A subquery enclosed in parentheses that returns a single value can be used as an
 (select-statement)
 ```
 
-The subquery must return exactly one column and at most one row. If the subquery returns no rows, the expression evaluates to NULL.
+The subquery must return exactly one column. If the subquery returns no rows, the expression evaluates to NULL. If it returns more than one row, the expression uses the first row, as in SQLite. Through the PostgreSQL frontend, reading the value of a subquery that returns more than one row raises the error `more than one row returned by a subquery used as an expression` (SQLSTATE 21000), as PostgreSQL does. A subquery whose value is not read, such as one in a `CASE` branch that is not taken, raises no error. A view or a subquery in `FROM` computes each of its columns for each row, so a subquery in one of its columns raises the error even when the outer query does not read that column. PostgreSQL removes that column and raises no error.
 
 ```sql
 SELECT name,
