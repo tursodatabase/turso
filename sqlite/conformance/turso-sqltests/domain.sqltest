@@ -80,6 +80,41 @@ test domain-not-null-fail {
 expect error {
 }
 
+# NULL skips the ENCODE of the domain's base type, so the error is the
+# domain's NOT NULL, not the error of an ENCODE that rejects NULL.
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-over-type-rejecting-null-insert {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    CREATE TABLE t1(a nn_pick) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+    NOT NULL constraint failed: t1.a
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-over-type-rejecting-null-update {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    CREATE TABLE t1(a nn_pick) STRICT;
+    INSERT INTO t1 VALUES ('a');
+    UPDATE t1 SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.a
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-over-type-rejecting-null-cast {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    SELECT CAST(NULL AS nn_pick);
+}
+expect error {
+    domain nn_pick does not allow null values
+}
+
 
 @requires custom_types "uses CREATE DOMAIN"
 test domain-default {

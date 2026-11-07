@@ -336,23 +336,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             continue;
         };
 
-        let skip_label = if !resolved.not_null() {
-            // Skip NULL values: jump over encode if NULL
-            let label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label,
-            });
-            Some(label)
-        } else {
-            None
-        };
-
         emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
-
-        if let Some(label) = skip_label {
-            program.preassign_label_to_next_insn(label);
-        }
     }
     Ok(())
 }
