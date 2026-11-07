@@ -553,4 +553,17 @@ fn a_catalog_made_before_relacl_opens_read_only_without_the_column() {
         .run_collect_rows()
         .unwrap();
     assert_eq!(rows[0][0].as_int(), Some(0));
+
+    // Statements that rewrite a class row compile without the column and
+    // fail as any write to a read-only database does.
+    pg.execute("CREATE ROLE reader").unwrap_err();
+    for sql in [
+        "DROP TABLE app.t",
+        "ALTER TABLE app.t RENAME TO u",
+        "ALTER TABLE app.t OWNER TO postgres",
+        "GRANT SELECT ON app.t TO postgres",
+    ] {
+        let error = pg.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("readonly"), "{sql}: {error}");
+    }
 }

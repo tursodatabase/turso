@@ -14,7 +14,6 @@ use crate::settings::{
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
-use turso_core::security::roles::{Role, RoleCatalog};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -2016,18 +2015,6 @@ fn is_core_database_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
 }
 
-/// The role named `name`, including the built-in roles that PostgreSQL has.
-fn find_role(roles: &RoleCatalog, name: &str) -> Result<Role> {
-    catalog::postgres_roles(roles)
-        .find(|role| role.name == name)
-        .ok_or_else(|| {
-            sqlstate_error(
-                SQLSTATE_UNDEFINED_OBJECT,
-                format!("role \"{name}\" does not exist"),
-            )
-        })
-}
-
 /// Makes `value` the current role, as SET ROLE does. `none`, or no value,
 /// makes the session's login role current again.
 pub(crate) fn set_role(
@@ -2039,7 +2026,12 @@ pub(crate) fn set_role(
         None => None,
         Some(name) => {
             let roles = conn.role_catalog();
-            let role = find_role(&roles, name)?;
+            let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    format!("role \"{name}\" does not exist"),
+                ));
+            };
             if !roles.can_set_role(conn.session_role(), role.id) {
                 return Err(LimboError::PermissionDenied(Box::new(
                     PermissionDenied::privilege(Action::SetRole, Object::Role(name.to_owned())),

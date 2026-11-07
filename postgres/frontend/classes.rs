@@ -772,6 +772,9 @@ struct ClassTableCursors {
     table_cursor_id: usize,
     index_cursor_id: usize,
     index_name: String,
+    /// False for a catalog made before it had `relacl` and opened read-only,
+    /// which has no column to read; the write that follows fails anyway.
+    has_acl_column: bool,
     /// Only opened when the statement inserts a row, which allocates an oid.
     seq_cursor_id: Option<usize>,
     seq_table: Option<Arc<BTreeTable>>,
@@ -829,6 +832,7 @@ fn open_class_table_for_writing(
         table_cursor_id,
         index_cursor_id,
         index_name: name_index.name.clone(),
+        has_acl_column: has_acl_column(&table),
         seq_cursor_id,
         seq_table,
     }))
@@ -1193,7 +1197,14 @@ fn emit_find_class_row(
     program.emit_column_or_rowid(cursors.table_cursor_id, 3, row.relkind_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 4, row.relowner_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 5, row.relownedby_reg);
-    program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
+    if cursors.has_acl_column {
+        program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: row.relacl_reg,
+            dest_end: None,
+        });
+    }
     found(program, &row);
     program.emit_insn(Insn::Goto { target_pc: done });
 
