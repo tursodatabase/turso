@@ -349,7 +349,7 @@ pub fn emit_aggregate_step(
             aggregate.fraction_reg,
         );
     };
-    let span_idx = program.constant_spans_next_idx();
+    let span_idx = program.constants_in_place_start();
     let key_count = aggregate.order_by().len();
     let column_count = key_count + 1 + 2 * aggregate.args.len();
     let start = program.alloc_registers(column_count);
@@ -384,7 +384,7 @@ pub fn emit_aggregate_step(
     }
     let record_reg = program.alloc_register();
     super::order_by::sorter_insert(program, start, column_count, cursor_id, record_reg);
-    program.constant_spans_invalidate_after(span_idx);
+    program.constants_in_place_end(span_idx);
     Ok(target_register)
 }
 
