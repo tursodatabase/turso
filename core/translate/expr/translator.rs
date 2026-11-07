@@ -547,6 +547,25 @@ fn translate_binary_expr(
     let ast::Expr::Binary(e1, op, e2) = expr else {
         unreachable!("translate_binary_expr expects Expr::Binary");
     };
+    // A column DEFAULT, a generated column or a CHECK constraint is translated
+    // straight from the schema, without the binding that folds `x AND 0` and
+    // `x OR 1`, so the operand that fold would have dropped must not run here
+    // either. An expression with an aggregate takes the normal path: binding
+    // kept its operands on purpose, and an aggregate where none is allowed,
+    // as in an ON clause, must still fail as a misuse. So does one with a
+    // column name this statement has no register for, as an unknown column
+    // in a trigger WHEN clause, which must still fail as no such column.
+    if let Some(value) = and_or_truth_value(expr) {
+        if !expr_contains_aggregate_or_window_function(expr, resolver)?
+            && every_column_name_has_a_register(expr, resolver)
+        {
+            program.emit_insn(Insn::Integer {
+                value: i64::from(value),
+                dest: target_register,
+            });
+            return Ok(target_register);
+        }
+    }
     // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
     // These use truth semantics (only non-zero numbers are truthy) rather than equality.
     if matches!(op, ast::Operator::Is | ast::Operator::IsNot) {
@@ -586,6 +605,27 @@ fn translate_binary_expr(
         BinaryEmitMode::Value,
     )?;
     Ok(target_register)
+}
+
+/// True when every column name still in `expr` has a register this statement
+/// gave it, as the columns of a CHECK constraint have. A name without one,
+/// like an unknown column in a trigger WHEN clause, must reach
+/// translate_id_expr and fail there.
+pub(super) fn every_column_name_has_a_register(expr: &ast::Expr, resolver: &Resolver) -> bool {
+    let mut every_name_has_one = true;
+    walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            ast::Expr::Id(_) | ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..)
+        ) && resolver.resolve_cached_expr_reg(e).is_none()
+        {
+            every_name_has_one = false;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression with an infallible visitor cannot fail");
+    every_name_has_one
 }
 
 #[inline(never)]
@@ -651,14 +691,27 @@ fn translate_case_expr(
         )?;
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            when_expr,
-            expr_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        // A WHEN without a base is a condition, which SQLite compiles with
+        // sqlite3ExprIfFalse, so an AND or OR there skips an operand once
+        // the other decides it, as it does in WHERE.
+        let jumped_on_condition = base_reg.is_none()
+            && translate_and_or_condition_jump(
+                program,
+                referenced_tables,
+                when_expr,
+                next_case_label,
+                resolver,
+            )?;
+        if !jumped_on_condition {
+            translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                when_expr,
+                expr_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
@@ -681,6 +734,7 @@ fn translate_case_expr(
                     &ExprContext::new(referenced_tables, resolver),
                 )?,
             }),
+            None if jumped_on_condition => {}
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
                 reg: expr_reg,
@@ -1450,63 +1504,27 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::Iif => {
                     let args = expect_arguments_min!(args, 2, srf);
-
-                    let iif_end_label = program.allocate_label();
-                    let condition_reg = program.alloc_register();
-
-                    for pair in args.chunks_exact(2) {
-                        let condition_expr = &pair[0];
-                        let value_expr = &pair[1];
-                        let next_check_label = program.allocate_label();
-
-                        translate_expr_no_constant_opt(
-                            program,
-                            referenced_tables,
-                            condition_expr,
-                            condition_reg,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-
-                        program.emit_insn(Insn::IfNot {
-                            reg: condition_reg,
-                            target_pc: next_check_label,
-                            jump_if_null: true,
-                        });
-
-                        translate_expr_no_constant_opt(
-                            program,
-                            referenced_tables,
-                            value_expr,
-                            target_register,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-                        program.emit_insn(Insn::Goto {
-                            target_pc: iif_end_label,
-                        });
-
-                        program.preassign_label_to_next_insn(next_check_label);
-                    }
-
-                    if args.len() % 2 != 0 {
-                        translate_expr_no_constant_opt(
-                            program,
-                            referenced_tables,
-                            args.last().unwrap(),
-                            target_register,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-                    } else {
-                        program.emit_insn(Insn::Null {
-                            dest: target_register,
-                            dest_end: None,
-                        });
-                    }
-
-                    program.preassign_label_to_next_insn(iif_end_label);
-                    Ok(target_register)
+                    // SQLite's parser turns iif(c, t, f) into
+                    // CASE WHEN c THEN t ELSE f END, so the condition is
+                    // compiled as a CASE WHEN condition is, and an AND or OR
+                    // in it skips an operand once the other decides it.
+                    let mut pairs = args.chunks_exact(2);
+                    let when_then_pairs = (&mut pairs)
+                        .map(|pair| (pair[0].clone(), pair[1].clone()))
+                        .collect();
+                    let else_expr = pairs.remainder().first().cloned();
+                    let case = ast::Expr::Case {
+                        base: None,
+                        when_then_pairs,
+                        else_expr,
+                    };
+                    translate_case_expr(
+                        program,
+                        referenced_tables,
+                        &case,
+                        target_register,
+                        resolver,
+                    )
                 }
 
                 ScalarFunc::Glob | ScalarFunc::Like => {
@@ -1898,34 +1916,7 @@ fn translate_function_call_expr(
                     Ok(target_register)
                 }
                 ScalarFunc::Likelihood => {
-                    if args.len() != 2 {
-                        crate::bail_parse_error!(
-                            "likelihood() function must have exactly 2 arguments",
-                        );
-                    }
-
-                    if let ast::Expr::Literal(ast::Literal::Numeric(ref value)) = args[1].as_ref() {
-                        if let Ok(probability) = value.parse::<f64>() {
-                            if !(0.0..=1.0).contains(&probability) {
-                                crate::bail_parse_error!(
-                                            "second argument to likelihood() must be a constant between 0.0 and 1.0",
-                                        );
-                            }
-                            if !value.contains('.') {
-                                crate::bail_parse_error!(
-                                            "second argument to likelihood() must be a floating point number with decimal point",
-                                        );
-                            }
-                        } else {
-                            crate::bail_parse_error!(
-                                "second argument to likelihood() must be a floating point constant",
-                            );
-                        }
-                    } else {
-                        crate::bail_parse_error!(
-                                    "second argument to likelihood() must be a constant between 0.0 and 1.0",
-                                );
-                    }
+                    check_likelihood_arguments(args)?;
                     translate_expr(
                         program,
                         referenced_tables,

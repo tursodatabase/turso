@@ -98,6 +98,100 @@ test having-moves-group-by-term-next-to-false {
 expect {
 }
 
+# `g = 2 AND 0` is folded to 0 by SQLite's parser before any term can move to
+# WHERE, so every group is aggregated; `false` is only resolved later.
+@setup overflow
+test having-integer-zero-folds-before-the-move {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND 0;
+}
+expect error {
+    integer overflow
+}
+
+# `0_0` is an integer literal SQLite's parser does not fold, so `g = 2` still
+# moves to WHERE and the overflowing group is never aggregated.
+@setup overflow
+test having-digit-separator-zero-still-moves-the-group-by-term {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND 0_0;
+}
+expect {
+}
+
+# SQLite's parser does not fold `x AND 0` when a term calls a function, so
+# `abs(g) = 2` still moves to WHERE and the overflowing group is never
+# aggregated.
+@setup overflow
+test having-function-term-next-to-integer-zero-still-moves {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING abs(g) = 2 AND 0;
+}
+expect {
+}
+
+# `g = 2 AND 0` is folded first; the `0 AND abs(1)` that is left keeps every
+# group aggregated, while `abs(1)` alone may move.
+@setup overflow
+test having-integer-zero-folded-before-a-function-term-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND 0 AND abs(1);
+}
+expect error {
+    integer overflow
+}
+
+# LIKE, GLOB and the JSON `->` operator are function calls to SQLite's parser
+# too, so these chains are not folded either and their term still moves.
+@setup overflow
+test having-like-term-next-to-integer-zero-still-moves {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g LIKE '2' AND 0;
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g GLOB '2' AND 0;
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g NOT LIKE '1' AND 0;
+}
+expect {
+}
+
+# Parentheses are not there for SQLite's parser: `TRUE AND (a AND 0)` is
+# `TRUE AND 0`, which it folds to 0, so the whole term stays in HAVING.
+@setup overflow
+test having-and-zero-inside-parentheses-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING TRUE AND (a AND 0);
+}
+expect error {
+    integer overflow
+}
+
+@setup overflow
+test having-and-zero-inside-parentheses-before-a-literal-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING (a AND 0) AND 1;
+}
+expect error {
+    integer overflow
+}
+
+# `a = 1 OR TRUE` is folded by SQLite's code generator, after havingToWhere()
+# has seen a term that reads `a`, so the term stays in HAVING.
+@setup overflow
+test having-or-true-under-not-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING NOT (a = 1 OR TRUE);
+}
+expect error {
+    integer overflow
+}
+
+@setup overflow
+test having-or-true-compared-to-zero-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING (a = 1 OR TRUE) = 0;
+}
+expect error {
+    integer overflow
+}
+
+# The same shape over a GROUP BY term still moves to WHERE.
+@setup overflow
+test having-or-true-under-not-over-group-by-term-still-moves {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING NOT (g = 2 OR TRUE);
+}
+expect {
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);

@@ -11,7 +11,9 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    apply_binding_rewrites, bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr,
+    expr_vector_size, integer_literal_truth_value, reject_unknown_collation, walk_expr,
+    walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -52,6 +54,7 @@ pub fn translate_select(
         &[],
         query_destination,
         connection,
+        false,
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
@@ -163,6 +166,11 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+/// `column_collations_looked_up` says that the collation of every result
+/// column is looked up, as SQLite does for a select that becomes a table (a
+/// subquery in FROM, a view, a CTE, CREATE TABLE AS) and for the columns of
+/// an IN subquery. A collation name in the operand that the AND/OR fold
+/// drops is checked then and left alone otherwise.
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -170,6 +178,7 @@ pub fn prepare_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    column_collations_looked_up: bool,
 ) -> Result<Plan> {
     prepare_select_plan_from_arms(
         select.body.select,
@@ -182,6 +191,7 @@ pub fn prepare_select_plan(
         outer_query_refs,
         query_destination,
         connection,
+        column_collations_looked_up,
     )
 }
 
@@ -202,6 +212,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    column_collations_looked_up: bool,
 ) -> Result<Plan> {
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
@@ -215,8 +226,18 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination,
             connection,
+            column_collations_looked_up,
+            &[],
         )?)));
     }
+
+    // UNION, INTERSECT and EXCEPT compare the rows of every arm by the
+    // collation of each result column; UNION ALL compares nothing.
+    let compound_arms: Vec<CompoundSelect> = compound_arms.collect();
+    let rows_are_compared = column_collations_looked_up
+        || compound_arms
+            .iter()
+            .any(|arm| arm.operator != ast::CompoundOperator::UnionAll);
 
     // The WITH clause applies to every arm, so each arm needs its own copy
     // while names are resolved.
@@ -230,9 +251,11 @@ pub(crate) fn prepare_select_plan_from_arms(
         outer_query_refs,
         query_destination.clone(),
         connection,
+        rows_are_compared,
+        &order_by,
     )?;
 
-    let mut left = Vec::with_capacity(compound_arms.size_hint().0);
+    let mut left = Vec::with_capacity(compound_arms.len());
     for CompoundSelect {
         select: compound_select,
         operator,
@@ -249,6 +272,8 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination.clone(),
             connection,
+            rows_are_compared,
+            &order_by,
         )?;
     }
 
@@ -294,6 +319,11 @@ pub(crate) fn prepare_select_plan_from_arms(
     })
 }
 
+/// `column_collations_looked_up` says that the collation of every result
+/// column is looked up (see [prepare_select_plan]); an arm of a UNION,
+/// INTERSECT or EXCEPT counts, as DISTINCT does. `compound_sort_keys` is
+/// the ORDER BY of the compound this select is an arm of: a key that names
+/// a result column by number or alias looks that column's collation up.
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 fn prepare_one_select_plan(
@@ -306,6 +336,8 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    column_collations_looked_up: bool,
+    compound_sort_keys: &[ast::SortedColumn],
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -440,7 +472,7 @@ fn prepare_one_select_plan(
                         })
                         .collect();
                     for expr in partition_by.iter_mut() {
-                        bind_and_rewrite_expr(
+                        bind_and_rewrite_sort_key(
                             expr,
                             Some(&mut plan.table_references),
                             None,
@@ -449,7 +481,7 @@ fn prepare_one_select_plan(
                         )?;
                     }
                     for (expr, _, _) in order_by.iter_mut() {
-                        bind_and_rewrite_expr(
+                        bind_and_rewrite_sort_key(
                             expr,
                             Some(&mut plan.table_references),
                             None,
@@ -535,7 +567,29 @@ fn prepare_one_select_plan(
                             )?;
                         }
                         ResultColumn::Expr(mut expr, maybe_alias) => {
-                            bind_and_rewrite_expr(
+                            // DISTINCT, UNION, INTERSECT and EXCEPT compare
+                            // the rows by the collation of each result
+                            // column, and a sort key names it by alias or
+                            // number.
+                            let bind = if plan.distinctness.is_distinct()
+                                || column_collations_looked_up
+                                || result_column_is_a_sort_key(
+                                    plan.result_columns.len(),
+                                    maybe_alias.as_ref(),
+                                    &order_by,
+                                    group_by.as_ref(),
+                                )
+                                || result_column_is_a_sort_key(
+                                    plan.result_columns.len(),
+                                    maybe_alias.as_ref(),
+                                    compound_sort_keys,
+                                    None,
+                                ) {
+                                bind_and_rewrite_sort_key
+                            } else {
+                                bind_and_rewrite_expr
+                            };
+                            bind(
                                 &mut expr,
                                 Some(&mut plan.table_references),
                                 None,
@@ -617,7 +671,7 @@ fn prepare_one_select_plan(
                                 &plan.result_columns,
                                 "GROUP BY",
                             )?;
-                            bind_and_rewrite_expr(
+                            bind_and_rewrite_sort_key(
                                 expr,
                                 Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
@@ -650,12 +704,21 @@ fn prepare_one_select_plan(
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
+                        let having = match having_predicates {
+                            Some(mut terms) => {
+                                for term in terms.iter_mut() {
+                                    apply_binding_rewrites(term, resolver)?;
+                                }
+                                Some(terms)
+                            }
+                            None => None,
+                        };
                         plan.group_by = Some(GroupBy {
                             sort_order: Vec::new(),
                             nulls_order: Vec::new(),
                             sort_elided: false,
                             exprs: vec![],
-                            having: having_predicates,
+                            having,
                             columns_read_by_group_subqueries: Vec::new(),
                         });
                     }
@@ -701,7 +764,7 @@ fn prepare_one_select_plan(
                     "ORDER BY",
                 )?;
 
-                bind_and_rewrite_expr(
+                bind_and_rewrite_sort_key(
                     &mut o.expr,
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
@@ -830,6 +893,19 @@ fn prepare_one_select_plan(
             }
 
             if !windows.is_empty() {
+                // A window's PARTITION BY and ORDER BY keys sort rows, so
+                // SQLite looks their collation up on the key as written, as
+                // for ORDER BY (see bind_and_rewrite_sort_key). A named window
+                // got that when it was bound; one written in OVER gets it here.
+                for window in windows.iter() {
+                    let keys = window
+                        .partition_by
+                        .iter()
+                        .chain(window.order_by.iter().map(|(expr, _, _)| expr));
+                    for key in keys {
+                        reject_unknown_collation(key, resolver)?;
+                    }
+                }
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
@@ -890,10 +966,15 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
+            let bind = if column_collations_looked_up {
+                bind_and_rewrite_sort_key
+            } else {
+                bind_and_rewrite_expr
+            };
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
                     // Before binding, we check for unquoted literals. Sqlite throws an error in this case
-                    bind_and_rewrite_expr(
+                    bind(
                         value,
                         Some(&mut table_references),
                         None,
@@ -959,6 +1040,40 @@ fn result_columns_contain_aggregate(
         }
     }
     Ok(false)
+}
+
+/// True when ORDER BY or GROUP BY names this result column by its alias or
+/// its number, so the column is a sort key and its collation is looked up.
+fn result_column_is_a_sort_key(
+    output_index: usize,
+    alias: Option<&ast::As>,
+    order_by: &[ast::SortedColumn],
+    group_by: Option<&ast::GroupBy>,
+) -> bool {
+    // SQLite reads an ORDER BY or GROUP BY term through parentheses and a
+    // leading `+` to decide whether it names a result column, so `(k)`,
+    // `((k))`, `(1)` and `+1` name it as `k` and `1` do. (A `-1` is the
+    // position -1, out of range, handled where positions are resolved.)
+    fn skip_parens(key: &ast::Expr) -> &ast::Expr {
+        match key {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => skip_parens(&exprs[0]),
+            ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => skip_parens(inner),
+            _ => key,
+        }
+    }
+    let names_column = |key: &ast::Expr| match skip_parens(key) {
+        ast::Expr::Literal(ast::Literal::Numeric(number)) => {
+            number.parse::<usize>().ok() == Some(output_index + 1)
+        }
+        ast::Expr::Id(name) => matches!(
+            alias,
+            Some(ast::As::As(alias) | ast::As::Elided(alias))
+                if alias.as_str().eq_ignore_ascii_case(name.as_str())
+        ),
+        _ => false,
+    };
+    order_by.iter().any(|key| names_column(&key.expr))
+        || group_by.is_some_and(|group_by| group_by.exprs.iter().any(|key| names_column(key)))
 }
 
 fn first_aggregate_without_over_clause<'a>(
@@ -1756,7 +1871,7 @@ fn process_having_clause(
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
 ) -> Result<Vec<ast::Expr>> {
     let mut predicates = vec![];
-    break_predicate_at_and_boundaries(&having, &mut predicates);
+    break_predicate_at_and_boundaries(&having, &mut predicates)?;
 
     // Before alias resolution replaces identifiers with their underlying expressions,
     // check for aliased aggregate misuse. SQLite does this during name resolution by
@@ -1767,8 +1882,12 @@ fn process_having_clause(
         check_aliased_aggregate_misuse(expr, result_columns)?;
     }
 
+    // The BINDING_REWRITES wait until move_group_by_only_having_terms_to_where
+    // has decided which terms move: SQLite's havingToWhere() sees the terms
+    // before its code generator folds `x OR 1`, so `NOT (a = 1 OR TRUE)`
+    // stays in HAVING and every group is still aggregated.
     for expr in predicates.iter_mut() {
-        bind_and_rewrite_expr(
+        bind_expr(
             expr,
             Some(table_references),
             Some(result_columns),
@@ -1838,16 +1957,17 @@ fn move_group_by_only_having_terms_to_where(
     where_clause: &mut Vec<WhereTerm>,
 ) -> Result<Vec<ast::Expr>> {
     let mut remaining = Vec::new();
-    for term in having {
-        if !is_literal_false(&term)
+    for mut term in having {
+        let moves = !is_literal_false(&term)
             && is_constant_or_group_by(
                 &term,
                 group_by_exprs,
                 aggregates,
                 table_references,
                 resolver,
-            )?
-        {
+            )?;
+        apply_binding_rewrites(&mut term, resolver)?;
+        if moves {
             where_clause.push(term.into());
         } else {
             remaining.push(term);
@@ -1856,20 +1976,17 @@ fn move_group_by_only_having_terms_to_where(
     Ok(remaining)
 }
 
-/// Matches the terms SQLite keeps in HAVING as always false (`EP_IsFalse`): integer
-/// literal zero (decimal or hex, without `_` separators), `FALSE` and `x IN ()`.
+/// Matches the terms SQLite keeps in HAVING as always false (`EP_IsFalse`): the
+/// integer literal zero that `integer_literal_truth_value` accepts (decimal or hex,
+/// without `_` separators), `FALSE` and `x IN ()`.
 /// `Expr::is_always_false()` is not used because it also matches other constant false
 /// expressions such as `0.0`, `'0'` and `NOT 1`, which SQLite moves into WHERE.
 /// SQLite's parser also folds `X AND 0` into `0` when X has no function call, so it
-/// keeps `HAVING g = 2 AND 0` in HAVING, while here `g = 2` is moved.
+/// keeps `HAVING g = 2 AND 0` in HAVING. break_predicate_at_and_boundaries folds that
+/// conjunction to `0` the same way, so it stays in HAVING here too.
 fn is_literal_false(expr: &ast::Expr) -> bool {
     match expr {
-        Expr::Literal(ast::Literal::Numeric(n)) => {
-            match n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
-                Some(hex_digits) => u64::from_str_radix(hex_digits, 16) == Ok(0),
-                None => n.parse::<i64>() == Ok(0),
-            }
-        }
+        Expr::Literal(ast::Literal::Numeric(_)) => integer_literal_truth_value(expr) == Some(false),
         Expr::Literal(ast::Literal::False) => true,
         Expr::InList {
             rhs, not: false, ..

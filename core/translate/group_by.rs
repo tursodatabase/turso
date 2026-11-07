@@ -9,7 +9,9 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
+    aggregation::{
+        emit_aggregate_filter_jump, emit_aggregate_final, emit_aggregate_step, AggArgumentSource,
+    },
     expression_index::selected_expression_index,
     order_by::EmitOrderBy,
     plan::{Aggregate, NonFromClauseSubquery},
@@ -787,19 +789,7 @@ pub fn group_by_process_single_group(
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
-                    let filter_reg = program.alloc_register();
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        filter_expr,
-                        filter_reg,
-                        &t_ctx.resolver,
-                    )?;
-                    program.emit_insn(Insn::IfNot {
-                        reg: filter_reg,
-                        target_pc: label,
-                        jump_if_null: true,
-                    });
+                    emit_aggregate_filter_jump(program, plan, filter_expr, label, &t_ctx.resolver)?;
                     Some(label)
                 } else {
                     None
@@ -841,19 +831,7 @@ pub fn group_by_process_single_group(
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
-                    let filter_reg = program.alloc_register();
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        filter_expr,
-                        filter_reg,
-                        &t_ctx.resolver,
-                    )?;
-                    program.emit_insn(Insn::IfNot {
-                        reg: filter_reg,
-                        target_pc: label,
-                        jump_if_null: true,
-                    });
+                    emit_aggregate_filter_jump(program, plan, filter_expr, label, &t_ctx.resolver)?;
                     Some(label)
                 } else {
                     None
