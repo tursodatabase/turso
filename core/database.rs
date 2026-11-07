@@ -4726,13 +4726,22 @@ mod database_tests {
         let verify = |reader: &Arc<Connection>, expected| {
             reader.execute("PRAGMA query_only=OFF").unwrap();
             for begin in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
-                reader.execute(begin).unwrap();
-                assert_eq!(count_test_rows(reader), expected);
-                assert!(matches!(
-                    reader.execute("INSERT INTO test VALUES(2)"),
-                    Err(LimboError::ReadOnly)
-                ));
-                reader.execute("COMMIT").unwrap();
+                for read_first in [None, Some(true), Some(false)] {
+                    reader.execute(begin).unwrap();
+                    if let Some(read_first) = read_first {
+                        if read_first {
+                            assert_eq!(count_test_rows(reader), expected);
+                        }
+                        assert!(matches!(
+                            reader.execute("INSERT INTO test VALUES(2)"),
+                            Err(LimboError::ReadOnly)
+                        ));
+                        if !read_first {
+                            assert_eq!(count_test_rows(reader), expected);
+                        }
+                    }
+                    reader.execute("COMMIT").unwrap();
+                }
             }
         };
         let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
@@ -4740,8 +4749,12 @@ mod database_tests {
         writer.execute("INSERT INTO test VALUES(3)").unwrap();
         assert_eq!(count_test_rows(&reader), 2);
         drop(reader);
+        writer.close().unwrap();
         drop(writer);
         drop(db);
+        let wal_path = format!("{}-wal", path.display());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        let main_before = std::fs::read(&path).unwrap();
         let readonly = Database::open(
             io,
             path.to_str().unwrap(),
@@ -4749,6 +4762,8 @@ mod database_tests {
         )
         .unwrap();
         verify(&readonly.connect(ConnectOpts::new()).unwrap(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
     }
 
     #[test]
