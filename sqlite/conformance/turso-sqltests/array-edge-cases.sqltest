@@ -1337,14 +1337,14 @@ expect {
     {10,20,99}
 }
 
-test subscript-set-out-of-bounds {
+test subscript-set-past-end-appends-nulls {
     CREATE TABLE sse3 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     INSERT INTO sse3 VALUES (1, '{10,20,30}');
-    UPDATE sse3 SET vals[100] = 99 WHERE id = 1;
+    UPDATE sse3 SET vals[6] = 99 WHERE id = 1;
     SELECT vals FROM sse3;
 }
 expect {
-    {10,20,30}
+    {10,20,30,NULL,NULL,99}
 }
 
 test subscript-zero-returns-null {

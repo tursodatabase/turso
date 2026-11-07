@@ -605,17 +605,22 @@ UPDATE table SET column[index] = value WHERE ...;
 CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
 INSERT INTO t VALUES (1, ARRAY['a','b','c']);
 
-UPDATE t SET tags[0] = 'X' WHERE id = 1;
+UPDATE t SET tags[1] = 'X' WHERE id = 1;
 SELECT tags FROM t;
--- ["X","b","c"]
+-- {X,b,c}
 
 -- Multiple subscripts in one UPDATE
-UPDATE t SET tags[0] = 'A', tags[2] = 'C' WHERE id = 1;
+UPDATE t SET tags[1] = 'A', tags[3] = 'C' WHERE id = 1;
 SELECT tags FROM t;
--- ["A","b","C"]
+-- {A,b,C}
+
+-- An index past the end extends the array with NULLs, as in PostgreSQL
+UPDATE t SET tags[5] = 'E' WHERE id = 1;
+SELECT tags FROM t;
+-- {A,b,C,NULL,E}
 ```
 
-Out-of-bounds assignments are silently ignored (the array is unchanged).
+Arrays always start at index 1, so an assignment that PostgreSQL would answer by moving the first index is an error: an index below 1, or an index above 1 on an empty or NULL array. A NULL or non-integer index is also an error. Assigning index 1 of a NULL array makes a one-element array.
 
 ---
 
