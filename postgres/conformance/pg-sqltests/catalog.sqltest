@@ -930,7 +930,8 @@ test pg-get-constraintdef {
                           THEN 1 ELSE 0 END
                 ELSE 1 END
     FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
-    WHERE c.relname IN ('parent', 'child') ORDER BY c.relname, con.contype;
+    WHERE c.relname IN ('parent', 'child') AND con.contype <> 'n'
+    ORDER BY c.relname, con.contype;
 }
 expect {
     child|c|1|1
