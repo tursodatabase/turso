@@ -1571,7 +1571,6 @@ pub fn op_vupdate(
             cursor_id,
             arg_count,
             start_reg,
-            conflict_action,
             ..
         },
         insn
@@ -1643,9 +1642,6 @@ pub fn op_vupdate(
             state.record_statement_change();
             if is_insert {
                 program.connection.update_last_rowid(new_rowid.unwrap_or(0));
-            } else if let Some(new_rowid) = new_rowid.filter(|_| *conflict_action == 5) {
-                // ResolveType::Replace
-                program.connection.update_last_rowid(new_rowid);
             }
             state.pc += 1;
         }
