@@ -85,6 +85,83 @@ fn open_plain_file(path: &std::path::Path) -> turso_core::Result<Arc<Database>> 
     )
 }
 
+#[test]
+fn test_existing_readwrite_database_creates_missing_wal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("existing.db");
+    let wal = directory.path().join("existing.db-wal");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1)")
+            .unwrap();
+    }
+    assert!(!wal.exists());
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let database = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::None,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let connection = database.connect(ConnectOpts::new()).unwrap();
+    connection.execute("INSERT INTO t VALUES(2)").unwrap();
+    assert!(wal.exists());
+    connection.close().unwrap();
+    drop(connection);
+    drop(database);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        sqlite
+            .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn test_existing_only_open_preserves_main_file_permissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.db");
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    assert!(Database::open_file_with_flags(
+        io.clone(),
+        missing.to_str().unwrap(),
+        OpenFlags::None,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .is_err());
+    assert!(!missing.exists());
+    assert!(!directory.path().join("missing.db-wal").exists());
+    let path = directory.path().join("readonly.db");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite.execute_batch("CREATE TABLE t(x)").unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let database = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let connection = database.connect(ConnectOpts::new()).unwrap();
+    assert!(matches!(
+        connection.execute("INSERT INTO t VALUES(1)"),
+        Err(turso_core::LimboError::ReadOnly)
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!directory.path().join("readonly.db-wal").exists());
+}
+
 /// SQLite must refuse the file as "file is not a database" (SQLITE_NOTADB).
 /// Opening is lazy in SQLite, so run a query to make it read the header.
 fn assert_sqlite_says_not_a_database(path: &std::path::Path) {
