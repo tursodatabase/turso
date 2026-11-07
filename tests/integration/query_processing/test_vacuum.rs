@@ -6818,11 +6818,12 @@ fn test_vacuum_into_followed_by_writes_and_indexed_read() -> anyhow::Result<()> 
 /// size runs in bounded memory. The copy must be the same database for all
 /// that. The fixture is sized to cross several row batches, several byte
 /// batches and a WAL truncation, and carries everything the build order
-/// touches: a custom type with an index on it (the indexes are now created
-/// before the rows), AUTOINCREMENT counters above max(rowid) (copied last),
-/// a generated column (left out of the copied column list), a trigger, views
-/// and materialized views (replayed after the rows), and a non-default page
-/// size.
+/// touches: a custom type with an index on it, an expression index whose
+/// keys are in no rowid order over a table larger than a row batch (the
+/// indexes are built after the rows, each committed on its own),
+/// AUTOINCREMENT counters above max(rowid) (copied last), a generated column
+/// (left out of the copied column list), a trigger, views and materialized
+/// views (replayed after the rows), and a non-default page size.
 #[test]
 fn test_vacuum_into_batched_copy_is_faithful() -> anyhow::Result<()> {
     let opts = DatabaseOpts::new().with_custom_types(true).with_views(true);
@@ -6851,6 +6852,11 @@ fn test_vacuum_into_batched_copy_is_faithful() -> anyhow::Result<()> {
          c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL)",
     )?;
     conn.execute("INSERT INTO gen(a, b) SELECT value, value * 2 FROM generate_series(1, 25000)")?;
+    // An index whose keys are scrambled with respect to the rowids (Knuth's
+    // multiplicative hash), over a table that crosses a row batch.
+    conn.execute("CREATE INDEX gen_scrambled ON gen((a * 2654435761) % 1000003)")?;
+    let scrambled_probe = "SELECT group_concat(a) FROM (SELECT a FROM gen \
+                           WHERE (a * 2654435761) % 1000003 BETWEEN 1000 AND 3000 ORDER BY a)";
 
     // Byte batches and a WAL truncation: 900 rows of 100 KB, 11 batches of
     // 8 MiB, the WAL truncated every 8 of them.
@@ -6907,6 +6913,17 @@ fn test_vacuum_into_batched_copy_is_faithful() -> anyhow::Result<()> {
         scalar_i64(&dest_conn, "SELECT sum(c) FROM gen WHERE c = a + b"),
         scalar_i64(&conn, "SELECT sum(c) FROM gen"),
     );
+    // The scrambled index answers a range probe with the same rows as the
+    // source — read through the index itself, not the table.
+    let source_probe: Vec<(String,)> = conn.exec_rows(scrambled_probe);
+    let dest_probe: Vec<(String,)> = dest_conn
+        .exec_rows(&scrambled_probe.replace("FROM gen ", "FROM gen INDEXED BY gen_scrambled "));
+    assert!(
+        source_probe[0].0.split(',').count() > 10,
+        "the probe should match many rows, got {:?}",
+        source_probe[0].0
+    );
+    assert_eq!(dest_probe, source_probe);
     assert_custom_type_ordering_fixture(&dest_conn);
     assert_materialized_views_equal_their_queries(&dest_conn);
 

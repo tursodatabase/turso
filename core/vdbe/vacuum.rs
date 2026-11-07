@@ -696,7 +696,10 @@ pub(crate) struct VacuumCommitBatch {
 
 impl VacuumCommitBatch {
     /// What `VACUUM INTO` uses: a commit costs ~2 × its data in memory, so
-    /// this bounds the copy's peak at a few tens of MB whatever the size.
+    /// this bounds the rows' share of the copy's peak at a few tens of MB
+    /// whatever the size. Each index is a transaction of its own (one
+    /// CREATE INDEX statement, which cannot be split), so with indexes the
+    /// peak is that or ~2 × the largest index, whichever is more.
     pub const VACUUM_INTO: Self = Self {
         rows: 20_000,
         bytes: 8 * 1024 * 1024,
@@ -750,6 +753,30 @@ impl VacuumTargetBuildContext {
     /// copy is in the target whatever failed after.
     pub(crate) fn committed(&self) -> bool {
         self.committed
+    }
+
+    /// Commits the target's transaction and opens the next, so the commit
+    /// path never holds more than what was written since the last commit.
+    /// Every `checkpoint_every_batches` commits — or at once, when
+    /// `checkpoint` asks — the target WAL is truncate-checkpointed first,
+    /// which resets its frame index (`frame_cache`) and the `-wal` file —
+    /// auto-actions are off on the target, so nothing else does. Nothing
+    /// reads the target while it is built, so the truncate always
+    /// completes.
+    fn commit_batch(&mut self, batch: VacuumCommitBatch, checkpoint: bool) -> Result<()> {
+        self.target_conn.execute("COMMIT")?;
+        self.batches_since_checkpoint += 1;
+        if checkpoint || self.batches_since_checkpoint >= batch.checkpoint_every_batches {
+            self.target_conn
+                .checkpoint(crate::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })?;
+            self.batches_since_checkpoint = 0;
+        }
+        self.target_conn.execute("BEGIN IMMEDIATE")?;
+        self.batch_rows = 0;
+        self.batch_bytes = 0;
+        Ok(())
     }
 
     pub(crate) fn cleanup_after_error(&mut self) -> Result<()> {
@@ -1007,17 +1034,14 @@ pub(crate) fn vacuum_target_build_step(
                             }
                         })?;
                     }
-                    // Done creating tables. A batched build creates the
-                    // indexes now (SQLite's vacuum.c order) so their pages
-                    // are committed by the row batches; one CREATE INDEX
-                    // over the copied data would be a transaction the size
-                    // of the index. A single-transaction build keeps the
-                    // index-after-data order for speed.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
-                    };
+                    // Done creating tables, start copying data. The indexes
+                    // come after the rows, in every build: CREATE INDEX over
+                    // the copied rows sorts the keys and appends them, where
+                    // an index that exists while the rows are inserted takes
+                    // each key wherever it falls — for keys in no particular
+                    // order (text, UUIDs) that dirties a leaf page per row,
+                    // some three times the time of the sorted build.
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
                 }
 
@@ -1078,13 +1102,8 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
-                    // Done copying all tables: deferred indexes, unless the
-                    // batched build created them up front.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
-                    };
+                    // Done copying all tables, proceed to deferred indexes.
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 };
                     continue;
                 }
 
@@ -1291,21 +1310,7 @@ pub(crate) fn vacuum_target_build_step(
                     // re-read more than a batch's worth of spilled pages.
                     if let Some(batch) = config.commit_every {
                         if state.batch_rows >= batch.rows || state.batch_bytes >= batch.bytes {
-                            state.target_conn.execute("COMMIT")?;
-                            state.batches_since_checkpoint += 1;
-                            if state.batches_since_checkpoint >= batch.checkpoint_every_batches {
-                                // Nothing reads the target while it is built,
-                                // so the truncate always completes.
-                                state
-                                    .target_conn
-                                    .checkpoint(crate::CheckpointMode::Truncate {
-                                        upper_bound_inclusive: None,
-                                    })?;
-                                state.batches_since_checkpoint = 0;
-                            }
-                            state.target_conn.execute("BEGIN IMMEDIATE")?;
-                            state.batch_rows = 0;
-                            state.batch_bytes = 0;
+                            state.commit_batch(batch, false)?;
                         }
                     }
                     // Go back to get next row from source
@@ -1338,14 +1343,23 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
                 if idx >= entries_len {
-                    // Done creating indexes: the rows next in a batched
-                    // build, otherwise the post-data objects.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
-                    };
+                    // Done creating indexes, move to post-data objects
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: 0 };
                     continue;
+                }
+
+                // A batched build gives each index a transaction of its
+                // own: the rows' last batch is committed before the first
+                // index, and every index is committed and checkpointed as
+                // it completes (`StepCreateIndex`). CREATE INDEX is one
+                // statement, so an index is the smallest transaction the
+                // build can make of it, and this way the commit path holds
+                // at most the largest index's pages rather than every
+                // index's.
+                if let Some(batch) = config.commit_every {
+                    if state.batch_rows > 0 {
+                        state.commit_batch(batch, true)?;
+                    }
                 }
 
                 let entry_ordinal = state.indexes_to_create[idx];
@@ -1377,6 +1391,11 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // The index is one transaction; commit it and reset the
+                    // target WAL before the next (see `PrepareCreateIndex`).
+                    if let Some(batch) = config.commit_every {
+                        state.commit_batch(batch, true)?;
+                    }
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
@@ -3863,18 +3882,40 @@ mod tests {
     /// not need the whole database resident, let alone twice it, or a
     /// backup of a database larger than the host's RAM budget is an OOM
     /// kill. Builds a ~250 MiB file-backed fixture (a table of 1 KB blobs
-    /// with a secondary index), runs the plain public statement, prints
-    /// the process high-water mark before and after, and asserts the peak
-    /// stays under a bound well below twice the file.
+    /// with a secondary index on a key in rowid order), runs the plain
+    /// public statement, prints the process high-water mark before and
+    /// after, and asserts the peak stays under a bound well below twice
+    /// the file.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "writes ~500 MB and takes minutes unoptimised; run with: \
                 cargo test -p turso_core --release --lib vacuum_into_peak_rss -- --ignored --nocapture"]
     fn vacuum_into_peak_rss_is_bounded() -> Result<()> {
+        vacuum_into_peak_rss_fixture_is_bounded("'key-' || printf('%012d', {row})", 256)
+    }
+
+    /// The same bound with the index on keys in no rowid order (random
+    /// text, as a UUID column is): the index is then built after the rows
+    /// by one CREATE INDEX, sorted, rather than taking a key per row
+    /// wherever it falls — the bound holds either way, and this is the
+    /// shape whose time regressed threefold when the index was created
+    /// first. Prints the peak and the time to compare by hand.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "writes ~500 MB and takes minutes unoptimised; run with: \
+                cargo test -p turso_core --release --lib vacuum_into_peak_rss -- --ignored --nocapture"]
+    fn vacuum_into_peak_rss_is_bounded_with_a_random_key_index() -> Result<()> {
+        vacuum_into_peak_rss_fixture_is_bounded("hex(randomblob(16))", 256)
+    }
+
+    /// Builds the fixture with `key_expr` (a SQL expression; `{row}` is
+    /// the row number) as the indexed key, copies it and asserts the
+    /// process peak RSS stays under `bound_mib`.
+    #[cfg(target_os = "linux")]
+    fn vacuum_into_peak_rss_fixture_is_bounded(key_expr: &str, bound_mib: u64) -> Result<()> {
         const ROWS: usize = 200_000;
         const ROWS_PER_TXN: usize = 1_000;
         const PAYLOAD_BYTES: usize = 1_000;
-        const BOUND_MIB: u64 = 256;
 
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let dir = tempfile::tempdir().unwrap();
@@ -3895,8 +3936,9 @@ mod tests {
             if row % ROWS_PER_TXN == 0 {
                 conn.execute("BEGIN")?;
             }
+            let key = key_expr.replace("{row}", &row.to_string());
             conn.execute(format!(
-                "INSERT INTO t(k, v) VALUES ('key-{row:012}', randomblob({PAYLOAD_BYTES}))"
+                "INSERT INTO t(k, v) VALUES ({key}, randomblob({PAYLOAD_BYTES}))"
             ))?;
             if row % ROWS_PER_TXN == ROWS_PER_TXN - 1 {
                 conn.execute("COMMIT")?;
@@ -3907,12 +3949,14 @@ mod tests {
         assert!(file_mib >= 150, "fixture is only {file_mib} MiB");
 
         let before = process_peak_rss_mib();
+        let started = std::time::Instant::now();
         conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let elapsed = started.elapsed();
         let after = process_peak_rss_mib();
         let copy_mib = std::fs::metadata(&dest_path).unwrap().len() / (1024 * 1024);
         println!(
-            "VACUUM INTO of a {file_mib} MiB database: peak RSS {before} MiB before, \
-             {after} MiB after (+{} MiB); the copy is {copy_mib} MiB",
+            "VACUUM INTO of a {file_mib} MiB database (key {key_expr}): peak RSS {before} MiB \
+             before, {after} MiB after (+{} MiB); the copy is {copy_mib} MiB, took {elapsed:.1?}",
             after.saturating_sub(before)
         );
         assert!(
@@ -3920,9 +3964,9 @@ mod tests {
             "the copy is {copy_mib} MiB for a {file_mib} MiB source"
         );
         assert!(
-            after <= BOUND_MIB,
+            after <= bound_mib,
             "VACUUM INTO of a {file_mib} MiB database drove the process peak RSS to \
-             {after} MiB (bound {BOUND_MIB} MiB)"
+             {after} MiB (bound {bound_mib} MiB)"
         );
         Ok(())
     }
@@ -4133,10 +4177,143 @@ mod tests {
         }
     }
 
+    /// An operation a [`DeferredIo`] file has taken and not yet carried out.
+    type DeferredOp = Box<dyn FnOnce() -> Result<()> + Send>;
+
+    /// The platform IO, except that each read, write, sync and truncate is
+    /// carried out — and its completion signalled — by the next
+    /// [`IO::step`], as an asynchronous backend completes it later. A
+    /// statement that reads or writes a file then returns `StepResult::IO`
+    /// there, instead of running to completion inside one step; that is
+    /// what lets a test stop a statement partway.
+    struct DeferredIo {
+        inner: Arc<crate::io::PlatformIO>,
+        pending: Arc<crate::sync::Mutex<std::collections::VecDeque<DeferredOp>>>,
+    }
+
+    impl DeferredIo {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                inner: Arc::new(crate::io::PlatformIO::new()?),
+                pending: Arc::new(crate::sync::Mutex::new(std::collections::VecDeque::new())),
+            })
+        }
+    }
+
+    impl Clock for DeferredIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for DeferredIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            Ok(Arc::new(DeferredFile {
+                inner: self.inner.open_file(path, flags, direct)?,
+                pending: self.pending.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn supports_rename(&self) -> bool {
+            self.inner.supports_rename()
+        }
+
+        fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+            self.inner.rename_file(from, to)
+        }
+
+        /// Carries out every operation taken since the last step, in order.
+        fn step(&self) -> Result<()> {
+            let ops = std::mem::take(&mut *self.pending.lock());
+            for op in ops {
+                op()?;
+            }
+            self.inner.step()
+        }
+
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            self.inner.file_id(path)
+        }
+    }
+
+    struct DeferredFile {
+        inner: Arc<dyn File>,
+        pending: Arc<crate::sync::Mutex<std::collections::VecDeque<DeferredOp>>>,
+    }
+
+    impl DeferredFile {
+        /// Takes `op` for the next `step()` and hands back its completion,
+        /// which the engine waits on.
+        fn defer(
+            &self,
+            c: Completion,
+            op: impl FnOnce(&dyn File, Completion) -> Result<Completion> + Send + 'static,
+        ) -> Result<Completion> {
+            let inner = self.inner.clone();
+            let pending = c.clone();
+            // The platform IO carries the operation out and signals
+            // `pending` before returning; what it returns is that same
+            // completion, already finished.
+            self.pending
+                .lock()
+                .push_back(Box::new(move || op(&*inner, pending).map(drop)));
+            Ok(c)
+        }
+    }
+
+    impl File for DeferredFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.defer(c, move |file, c| file.pread(pos, c))
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.defer(c, move |file, c| file.pwrite(pos, buffer, c))
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.defer(c, move |file, c| file.pwritev(pos, buffers, c))
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.defer(c, move |file, c| file.sync(c, sync_type))
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.defer(c, move |file, c| file.truncate(len, c))
+        }
+    }
+
     /// Rows of the atomicity fixture: three batches of the batched build.
     const ATOMICITY_FIXTURE_ROWS: i64 = 60_000;
     /// Writes the copy's files accept: enough for the first batch to
-    /// commit (about 1 MiB of WAL frames), not for all three.
+    /// commit (the rows are about 1 MiB of WAL frames, a third of them per
+    /// batch), not for the rows to be checkpointed and the index (another
+    /// MiB or so) built on top.
     const ATOMICITY_WRITE_BUDGET: u64 = 2 * 1024 * 1024;
 
     fn open_file_db(
@@ -4474,10 +4651,17 @@ mod tests {
         let source_path = dir.path().join("source.db");
         let dest_path = dir.path().join("copy.db");
         let dest = dest_path.to_str().unwrap();
-        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-        let (db, first_conn) = open_file_db(io.clone(), source_path.to_str().unwrap())?;
-        create_atomicity_fixture(&first_conn)?;
-        let second_conn = db.connect(ConnectOpts::new())?;
+        // Stepping the first copy partway takes yields: on the platform IO
+        // a read or write completes as it is issued and a copy whose source
+        // is in its page cache runs from start to end inside one step. So
+        // the IO defers each operation to its `step()`, as an asynchronous
+        // backend completes it later, and the fixture is built on the
+        // second connection, so that the first reads the source from the
+        // file — and yields at each of those reads.
+        let io: Arc<dyn crate::IO> = Arc::new(DeferredIo::new()?);
+        let (db, second_conn) = open_file_db(io.clone(), source_path.to_str().unwrap())?;
+        create_atomicity_fixture(&second_conn)?;
+        let first_conn = db.connect(ConnectOpts::new())?;
 
         let mut first = first_conn.prepare(format!("VACUUM INTO '{dest}'"))?;
         let mut step_first = || -> Result<bool> {
@@ -4496,7 +4680,11 @@ mod tests {
             })
         };
         // Step the first copy until it has committed a batch: its temporary
-        // copy's WAL holds more than the first batch's frames.
+        // copy's WAL holds frames. Nothing is written there before the first
+        // commit — the fixture is far smaller than the page cache, so no
+        // page spills ahead of it — and the WAL is first truncated at the
+        // index, after the rows, so the state is seen while the rows are
+        // still being copied.
         let first_temp_wal = loop {
             assert!(
                 !step_first()?,
@@ -4506,7 +4694,7 @@ mod tests {
                 .into_iter()
                 .find(|path| path.to_str().unwrap().ends_with(".tmp-wal"));
             if let Some(wal) = wal {
-                if std::fs::metadata(&wal).unwrap().len() > ATOMICITY_WRITE_BUDGET / 2 {
+                if std::fs::metadata(&wal).unwrap().len() > 4096 {
                     break wal;
                 }
             }
