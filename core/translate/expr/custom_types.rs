@@ -54,18 +54,41 @@ pub(super) fn emit_custom_type_operator(
     Ok(Some(result_reg))
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT)
-/// from the row's stored values in `column_regs`. Reading a custom-type column
-/// in the expression decodes it, so the expression sees the user's values.
+/// Evaluate an expression-index expression or partial-index WHERE clause in a DML
+/// context (INSERT/UPDATE/UPSERT) from the row's stored values in `column_regs`
+/// and its rowid in `rowid_reg`. Reading a custom-type column in the expression
+/// decodes it, so the expression sees the user's values.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut expr: ast::Expr,
     columns: &[Column],
     column_regs: &[usize],
+    rowid_reg: usize,
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
+    if table.has_rowid {
+        walk_expr_mut(&mut expr, &mut |e| {
+            if let ast::Expr::Id(name)
+            | ast::Expr::Qualified(_, name)
+            | ast::Expr::DoublyQualified(_, _, name) = e
+            {
+                if table.get_column(name.as_str()).is_none()
+                    && crate::translate::planner::ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
+                {
+                    *e = ast::Expr::Register {
+                        register: rowid_reg,
+                        custom_type: None,
+                    };
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
     let pairs = columns.iter().zip(column_regs.iter().copied());

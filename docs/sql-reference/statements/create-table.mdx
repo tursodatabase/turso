@@ -182,6 +182,8 @@ CREATE TABLE employees (
 );
 ```
 
+As in SQLite, a double-quoted name that is not a column of the table, such as `"none"` in `CHECK (name <> "none")`, is read as a string literal. A double-quoted `rowid`, `oid` or `_rowid_` is the rowid. The same rule applies to the expression of a generated column, where a rowid name is a string. `ALTER TABLE ... RENAME COLUMN` and `ALTER TABLE ... DROP COLUMN` rewrite such strings with single quotes in the stored table SQL. Without that rewrite, `ALTER TABLE ... ADD COLUMN` of that name makes the expression read the new column, as in SQLite. Use single quotes for string literals in new tables.
+
 ### REFERENCES (Foreign Key)
 
 Establishes a foreign key relationship between a column and a column in another table. See [Foreign Key Constraints](#foreign-key-constraints) for the full syntax.

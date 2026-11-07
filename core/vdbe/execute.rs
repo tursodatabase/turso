@@ -31,6 +31,7 @@ use crate::storage::pager::{
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
+use crate::translate::index::{double_quoted_names_to_strings, resolve_sorted_columns};
 use crate::types::IOResultOr;
 use crate::types::{
     compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
@@ -12079,6 +12080,171 @@ pub fn op_function(
 
                     (new_name, new_tbl_name, new_sql)
                 }
+                AlterTableFunc::QuoteFix => {
+                    let Value::Text(database_name) = &state.registers[*start_reg + 5].get_value()
+                    else {
+                        panic!("database parameter should be TEXT")
+                    };
+                    let database_id = program
+                        .connection
+                        .get_database_id_by_name(database_name.as_str())?;
+                    let get_table = |table_name: &str| {
+                        program
+                            .connection
+                            .with_schema(database_id, |schema| {
+                                let table_name = normalize_ident(table_name);
+                                let (namespace, table_name) = schema.demangle_name(&table_name);
+                                schema.get_btree_table(namespace, table_name)
+                            })
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "table {table_name} of {name} is not in the schema"
+                                ))
+                            })
+                    };
+
+                    let new_sql = 'sql: {
+                        let Value::Text(sql) = sql else {
+                            break 'sql None;
+                        };
+                        if !matches!(entry_type.as_str(), "index" | "table") {
+                            break 'sql None;
+                        }
+
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        match cmd {
+                            Some(ast::Cmd::Stmt(ast::Stmt::CreateIndex {
+                                tbl_name: index_tbl_name,
+                                mut columns,
+                                unique,
+                                if_not_exists,
+                                idx_name,
+                                mut where_clause,
+                                using,
+                                with_clause,
+                            })) => {
+                                let table = get_table(index_tbl_name.as_str())?;
+
+                                let mut changed = false;
+                                for column in &mut columns {
+                                    changed |= double_quoted_names_to_strings(
+                                        &mut column.expr,
+                                        &table,
+                                        false,
+                                    )?;
+                                }
+                                if let Some(where_clause) = &mut where_clause {
+                                    changed |=
+                                        double_quoted_names_to_strings(where_clause, &table, true)?;
+                                }
+                                if !changed {
+                                    break 'sql None;
+                                }
+                                // Like SQLite, fail when the rewritten index no longer loads, e.g. a
+                                // bare 'name' is read as a column name.
+                                let syms = program.connection.syms.read();
+                                program
+                                    .connection
+                                    .with_schema(database_id, |schema| {
+                                        resolve_sorted_columns(&table, &columns, schema, &syms)
+                                    })
+                                    .map_err(|e| match e {
+                                        LimboError::ParseError(message) => LimboError::ParseError(
+                                            format!("error in index {name}: {message}"),
+                                        ),
+                                        e => e,
+                                    })?;
+
+                                Some(
+                                    ast::Stmt::CreateIndex {
+                                        tbl_name: index_tbl_name,
+                                        columns,
+                                        unique,
+                                        if_not_exists,
+                                        idx_name,
+                                        where_clause,
+                                        using,
+                                        with_clause,
+                                    }
+                                    .to_string(),
+                                )
+                            }
+                            Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
+                                tbl_name: create_tbl_name,
+                                body:
+                                    ast::CreateTableBody::ColumnsAndConstraints {
+                                        mut columns,
+                                        mut constraints,
+                                        options,
+                                    },
+                                temporary,
+                                if_not_exists,
+                            })) => {
+                                let table = get_table(name.as_str())?;
+
+                                let mut changed = false;
+                                // The source text keeps the double quotes, so it is dropped
+                                // when the expression changes.
+                                let quote_fix_check =
+                                    |expr: &mut ast::Expr, source: &mut Option<String>| {
+                                        let changed =
+                                            double_quoted_names_to_strings(expr, &table, true)?;
+                                        if changed {
+                                            *source = None;
+                                        }
+                                        Ok::<_, LimboError>(changed)
+                                    };
+                                for column in &mut columns {
+                                    for constraint in &mut column.constraints {
+                                        match &mut constraint.constraint {
+                                            ast::ColumnConstraint::Check { expr, source } => {
+                                                changed |= quote_fix_check(expr, source)?;
+                                            }
+                                            ast::ColumnConstraint::Generated { expr, .. } => {
+                                                changed |= double_quoted_names_to_strings(
+                                                    expr, &table, false,
+                                                )?;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                for constraint in &mut constraints {
+                                    if let ast::TableConstraint::Check { expr, source } =
+                                        &mut constraint.constraint
+                                    {
+                                        changed |= quote_fix_check(expr, source)?;
+                                    }
+                                }
+                                if !changed {
+                                    break 'sql None;
+                                }
+
+                                Some(
+                                    ast::Stmt::CreateTable {
+                                        tbl_name: create_tbl_name,
+                                        body: ast::CreateTableBody::ColumnsAndConstraints {
+                                            columns,
+                                            constraints,
+                                            options,
+                                        },
+                                        temporary,
+                                        if_not_exists,
+                                    }
+                                    .to_string(),
+                                )
+                            }
+                            _ => None,
+                        }
+                    };
+
+                    (name, tbl_name, new_sql)
+                }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
@@ -18064,6 +18230,7 @@ pub fn op_drop_column(
         btree.shift_generated_column_indices_after_drop(*column_index)?;
         Ok(())
     })??;
+    conn.with_database_schema_mut(*db, single_quote_double_quoted_strings)??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for index in schema.indices_including_backing(*namespace, &normalized_table_name) {
@@ -18183,8 +18350,23 @@ pub fn op_add_column(
         // Update foreign keys to include any FK constraints from the new column
         btree.foreign_keys = new_foreign_keys;
 
+        btree.reload_expressions_after_add_column(
+            data.column
+                .name
+                .as_deref()
+                .expect("added column should be named"),
+            conn.dialect().supports_namespaces(),
+        )?;
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
+
+        for index_name in &data.reloaded_indexes {
+            let index = schema
+                .get_index(data.namespace, &normalized_table_name, index_name)
+                .expect("reloaded index should be in schema")
+                .clone();
+            schema.remove_index(data.namespace, &index);
+        }
         Ok(())
     })??;
 
@@ -18302,6 +18484,9 @@ pub fn op_alter_column(
         Vec::new()
     };
 
+    // Before the rename, as on disk, so a column renamed to a name used as a string does not
+    // read that string.
+    conn.with_database_schema_mut(*db, single_quote_double_quoted_strings)??;
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let (table_arc, indexes) = schema
             .table_with_indices_mut(*namespace, &normalized_table_name)
@@ -18416,6 +18601,7 @@ pub fn op_alter_column(
                 }
             }
             btree.check_constraints.extend(domain_checks);
+            btree.convert_double_quoted_check_names_to_strings()?;
             if domain_not_null {
                 btree.columns_mut()[*column_index].set_notnull(true);
             }
@@ -18509,6 +18695,20 @@ pub fn op_alter_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Does in memory what the QuoteFix rewrite of sqlite_schema does to the SQL of every table.
+fn single_quote_double_quoted_strings(schema: &mut Schema) -> Result<()> {
+    for (_, _, table) in schema.all_tables_mut() {
+        let Table::BTree(btree) = table.as_ref() else {
+            continue;
+        };
+        let mut fixed = btree.as_ref().clone();
+        if fixed.single_quote_double_quoted_strings()? {
+            *table = Arc::new(Table::BTree(Arc::new(fixed)));
+        }
+    }
+    Ok(())
 }
 
 fn replace_trigger_sql(
