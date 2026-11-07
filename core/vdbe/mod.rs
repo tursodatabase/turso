@@ -3912,6 +3912,13 @@ impl Program {
                         _ => 0,
                     };
                     self.connection.set_changes(last_change);
+                    // The rows FAIL keeps also count in total_changes(). An
+                    // autocommit statement added them when it committed; one
+                    // inside an open transaction adds them here.
+                    if matches!(effective_resolve, ResolveType::Fail) && !can_autocommit_now {
+                        self.connection
+                            .add_total_changes(state.n_total_change.swap(0, Ordering::SeqCst));
+                    }
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
