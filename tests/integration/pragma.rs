@@ -469,3 +469,19 @@ fn test_connection_pragma_waits_for_io() -> anyhow::Result<()> {
         .is_equal_to(vec![vec![Value::from_text("ok")]]);
     Ok(())
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/11278:
+/// PRAGMA table_info must report 'INTEGER' in uppercase for an INTEGER PRIMARY KEY
+/// column, matching SQLite behavior regardless of the declaration casing.
+#[turso_macros::test(mvcc)]
+fn test_pragma_table_info_integer_primary_key_type(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id integer primary key, x)")
+        .unwrap();
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT type FROM pragma_table_info('t')"
+    ))
+    .is_equal_to(vec![row!["INTEGER"], row![""]]);
+}
