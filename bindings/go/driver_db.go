@@ -38,6 +38,9 @@ type tursoDbConnection struct {
 	busyTimeout int // current busy timeout in milliseconds
 	// keep flags for configuration if needed
 	async bool
+
+	inTx  bool  // a transaction is open on the engine side
+	txErr error // error the engine rolled the open transaction back with, if any
 }
 
 type tursoDbStatement struct {
@@ -154,6 +157,9 @@ func (c *tursoDbConnection) PrepareContext(ctx context.Context, query string) (d
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	if err := c.txErrFor(query); err != nil {
+		return nil, err
+	}
 	stmt, err := turso_connection_prepare_single(c.conn, query)
 	if err != nil {
 		return nil, err
@@ -227,6 +233,10 @@ func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.txErrFor(query); err != nil {
+		return nil, err
+	}
+
 	offset := 0
 	first := true
 	var lastInsert int64 = 0
@@ -259,8 +269,10 @@ func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args 
 		_ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 		if err != nil {
+			c.noteTxErrorLocked(err)
 			return nil, err
 		}
+		c.inTx = !turso_connection_get_autocommit(c.conn)
 		// rows affected is capped at MaxInt64
 		if affected > uint64(math.MaxInt64-totalAffected) {
 			totalAffected = math.MaxInt64
@@ -286,6 +298,9 @@ func (c *tursoDbConnection) QueryContext(ctx context.Context, query string, args
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	if err := c.txErrFor(query); err != nil {
+		return nil, err
+	}
 	// Only single-statement queries supported here
 	stmt, err := turso_connection_prepare_single(c.conn, query)
 	if err != nil {
@@ -310,6 +325,60 @@ func (c *tursoDbConnection) checkOpen() error {
 		return ErrTursoConnClosed
 	}
 	return nil
+}
+
+// txErrFor returns the rollback error to new statements once the engine has
+// ended the open transaction, so they fail instead of silently running in
+// autocommit mode. Transaction boundary statements go through and clear the
+// dead transaction state. Callers must hold c.mu.
+func (c *tursoDbConnection) txErrFor(query string) error {
+	if c.txErr == nil {
+		return nil
+	}
+	if isTxLifecycle(query) {
+		c.txErr = nil
+		return nil
+	}
+	return c.txErr
+}
+
+// takeTxError returns and clears the recorded rollback error, if the engine
+// ended the transaction early.
+func (c *tursoDbConnection) takeTxError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.txErr
+	c.txErr = nil
+	return err
+}
+
+// noteTxErrorLocked records when a statement error left the engine in
+// autocommit mode, meaning it rolled back the open transaction. Callers must
+// hold c.mu.
+func (c *tursoDbConnection) noteTxErrorLocked(err error) {
+	if c.inTx && turso_connection_get_autocommit(c.conn) {
+		c.inTx = false
+		c.txErr = err
+	}
+}
+
+func (c *tursoDbConnection) noteTxError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.noteTxErrorLocked(err)
+}
+
+// isTxLifecycle reports whether query starts with a transaction statement.
+func isTxLifecycle(query string) bool {
+	fields := strings.Fields(query)
+	if len(fields) == 0 {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimRight(fields[0], ";")) {
+	case "BEGIN", "START", "COMMIT", "END", "ROLLBACK":
+		return true
+	}
+	return false
 }
 
 // SetBusyTimeout sets the busy timeout for this connection in milliseconds.
@@ -518,6 +587,7 @@ func (r *tursoDbRows) Next(dest []driver.Value) error {
 	for {
 		status, err := turso_statement_step(r.stmt)
 		if err != nil {
+			r.conn.noteTxError(err)
 			r.err = err
 			return err
 		}
@@ -567,6 +637,7 @@ func (r *tursoDbRows) Next(dest []driver.Value) error {
 				}
 			}
 			if err := turso_statement_run_io(r.stmt); err != nil {
+				r.conn.noteTxError(err)
 				r.err = err
 				return err
 			}
@@ -600,8 +671,14 @@ func (tx *tursoDbTx) Commit() error {
 	if tx.done {
 		return ErrTursoTxDone
 	}
-	_, err := tx.conn.ExecContext(context.Background(), "COMMIT", nil)
 	tx.done = true
+	// If the engine already rolled the transaction back, report that error
+	// instead of the engine's "cannot commit - no transaction is active".
+	if err := tx.conn.takeTxError(); err != nil {
+		return err
+	}
+	_, err := tx.conn.ExecContext(context.Background(), "COMMIT", nil)
+	_ = tx.conn.takeTxError()
 	return err
 }
 
@@ -609,8 +686,12 @@ func (tx *tursoDbTx) Rollback() error {
 	if tx.done {
 		return ErrTursoTxDone
 	}
-	_, err := tx.conn.ExecContext(context.Background(), "ROLLBACK", nil)
 	tx.done = true
+	if err := tx.conn.takeTxError(); err != nil {
+		return err
+	}
+	_, err := tx.conn.ExecContext(context.Background(), "ROLLBACK", nil)
+	_ = tx.conn.takeTxError()
 	return err
 }
 
