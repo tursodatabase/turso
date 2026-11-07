@@ -928,7 +928,7 @@ fn copy_from_file_not_found_repl() {
 }
 
 // ---------------------------------------------------------------------------
-// Wire protocol: COPY FROM returns "COPY N"
+// Wire protocol: COPY FROM a file is rejected
 // ---------------------------------------------------------------------------
 
 /// Start tursopg with --server on a port that the server's operating system
@@ -1321,35 +1321,26 @@ fn extract_command_tags(data: &[u8]) -> Vec<String> {
 }
 
 #[test]
-fn wire_copy_from_returns_copy_n() {
+fn wire_copy_from_file_is_rejected() {
     let (mut server, port) = start_tursopg_server();
 
     let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
 
     let mut client = PgTestClient::connect(port);
+    client.query_command_tags("CREATE TABLE users(id INT, name TEXT)");
 
-    // Create table
-    let tags = client.query_command_tags("CREATE TABLE users(id INT, name TEXT)");
+    // The server does not authenticate clients, so it must not read host files
+    // on their behalf.
+    client.send_query(&format!("COPY users FROM '{}'", path.display()));
+    let response = client.read_until_ready();
+    let text = String::from_utf8_lossy(&response);
     assert!(
-        tags.iter().any(|t| t.contains("CREATE")),
-        "expected CREATE tag, got: {tags:?}"
+        text.contains("42501") && text.contains("permission denied to COPY from a file"),
+        "expected COPY FROM a file to be rejected, got: {text}"
     );
 
-    // COPY FROM
-    let copy_sql = format!("COPY users FROM '{}'", path.display());
-    let tags = client.query_command_tags(&copy_sql);
-    assert!(
-        tags.iter().any(|t| t == "COPY 3"),
-        "expected 'COPY 3' tag, got: {tags:?}"
-    );
-
-    // Verify data via SELECT
-    let tags = client.query_command_tags("SELECT id, name FROM users ORDER BY id");
-    // SELECT produces a CommandComplete like "SELECT 3"
-    assert!(
-        tags.iter().any(|t| t.starts_with("SELECT")),
-        "expected SELECT tag, got: {tags:?}"
-    );
+    let tags = client.query_command_tags("SELECT id, name FROM users");
+    assert_eq!(tags, ["SELECT 0"], "the rejected COPY must insert nothing");
 
     std::fs::remove_file(&path).ok();
     server.kill().ok();

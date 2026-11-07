@@ -95,7 +95,7 @@ impl TursoPgServer {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let session = match PgConnection::connect_with(
+                            let session = match PgConnection::connect_unauthenticated(
                                 &self.db,
                                 self.connect_opts.clone(),
                             ) {
