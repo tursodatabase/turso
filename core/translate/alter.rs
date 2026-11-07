@@ -875,12 +875,11 @@ pub fn translate_alter_table(
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
-            let new_name_norm = normalize_ident(new_name.as_str());
             return translate_rename_virtual_table(
                 program,
                 tbl,
                 table_name,
-                new_name_norm,
+                new_name.as_str(),
                 resolver,
                 connection,
                 namespace,
@@ -3129,7 +3128,7 @@ fn translate_rename_virtual_table(
     program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
     old_name: &str,
-    new_name_norm: String,
+    new_name: &str,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     namespace: NamespaceRef,
@@ -3142,7 +3141,7 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
     });
 
-    let new_name_reg = program.emit_string8_new_reg(new_name_norm.clone());
+    let new_name_reg = program.emit_string8_new_reg(new_name.to_string());
     program.emit_insn(Insn::VRename {
         cursor_id: vtab_cur,
         new_name_reg,
@@ -3174,7 +3173,7 @@ fn translate_rename_virtual_table(
         program.emit_string8_new_reg(old_name.to_string());
         program.mark_last_insn_constant();
 
-        program.emit_string8_new_reg(new_name_norm.clone());
+        program.emit_string8_new_reg(new_name.to_string());
         program.mark_last_insn_constant();
 
         let out = program.alloc_registers(ncols);
@@ -3230,7 +3229,7 @@ fn translate_rename_virtual_table(
         db: database_id,
         namespace: namespace.id,
         from: old_name.to_owned(),
-        to: new_name_norm,
+        to: new_name.to_string(),
     });
 
     program.emit_insn(Insn::Close {
