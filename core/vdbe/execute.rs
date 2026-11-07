@@ -20262,10 +20262,11 @@ pub(crate) struct VacuumIntoOpContext {
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
     _output_db: Option<Arc<Database>>,
-    /// The temporary file a file-backed copy is built in, moved to the
-    /// destination once complete and removed on failure. None for an
-    /// in-memory output.
-    temp_output: Option<crate::vdbe::vacuum::VacuumIntoTempOutput>,
+    /// Where a file-backed copy is built — a temporary file moved to the
+    /// destination once complete, or the destination itself — and how the
+    /// destination is left as found on failure. None for an in-memory
+    /// output.
+    output_file: Option<crate::vdbe::vacuum::VacuumIntoOutputFile>,
     /// Configuration for the shared vacuum target build state machine.
     target_build_config: Option<VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
@@ -20355,16 +20356,22 @@ fn cleanup_op_vacuum_into(
         target_build_context.cleanup_after_error()?;
     }
 
+    let copy_committed = vacuum_state
+        .target_build_context
+        .as_ref()
+        .is_some_and(|target_build_context| target_build_context.committed());
     vacuum_state.target_build_context = None;
     vacuum_state._output_db = None;
-    // The destination was never touched; what the failed attempt built is
-    // in the temporary file, which goes.
+    // The output database is closed above; leave the destination as it
+    // was found: the temporary copy goes, or a destination the copy was
+    // built at is emptied again (unless the copy committed there and only
+    // its checkpoint failed).
     if let Err(err) = vacuum_state
-        .temp_output
+        .output_file
         .take()
-        .map_or(Ok(()), |temp_output| temp_output.remove_temp_files())
+        .map_or(Ok(()), |output_file| output_file.discard(copy_committed))
     {
-        tracing::warn!("VACUUM INTO could not remove its temporary copy: {err}");
+        tracing::warn!("VACUUM INTO could not discard its failed copy: {err}");
     }
 
     if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
@@ -20538,11 +20545,11 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // IO, so its copy goes through the platform's. The copy is
                 // built in a temporary file beside the destination and moved
                 // there once complete, unless the destination already exists or
-                // the IO cannot rename a file (see VacuumIntoTempOutput).
-                let (io, build_path, temp_output): (
+                // the IO cannot rename a file (see VacuumIntoOutputFile).
+                let (io, build_path, output_file): (
                     Arc<dyn crate::IO>,
                     String,
-                    Option<crate::vdbe::vacuum::VacuumIntoTempOutput>,
+                    Option<crate::vdbe::vacuum::VacuumIntoOutputFile>,
                 ) = if output_in_memory {
                     (
                         Arc::new(crate::MemoryIO::new()),
@@ -20560,14 +20567,12 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     } else {
                         target.path
                     };
-                    let temp_output =
-                        crate::vdbe::vacuum::VacuumIntoTempOutput::prepare(io.clone(), &dest_path)?;
-                    let build_path = temp_output
-                        .as_ref()
-                        .map_or(dest_path, |temp_output| temp_output.temp_path().to_string());
-                    (io, build_path, temp_output)
+                    let output_file =
+                        crate::vdbe::vacuum::VacuumIntoOutputFile::prepare(io.clone(), &dest_path)?;
+                    let build_path = output_file.build_path().to_string();
+                    (io, build_path, Some(output_file))
                 };
-                vacuum_state.temp_output = temp_output;
+                vacuum_state.output_file = output_file;
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
@@ -20609,7 +20614,21 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     target_mvcc_enabled: source_db.mvcc_enabled(),
                     target_auto_vacuum_mode: source_auto_vacuum_mode,
                     copy_mvcc_metadata_table: false,
-                    commit_every: Some(crate::vdbe::vacuum::VacuumCommitBatch::VACUUM_INTO),
+                    // Only a copy built in a temporary file is committed in
+                    // batches: a batch that failed, or a process that died,
+                    // leaves a partial copy there, which goes, and the
+                    // destination is untouched until the complete copy is
+                    // moved over it. A copy built at the destination itself —
+                    // an existing empty file, an IO that cannot rename, an
+                    // in-memory output — is one transaction, so that it is
+                    // all or nothing there too: a failure rolls it back and
+                    // leaves no rows. That costs the memory bound on those
+                    // paths, as the copy was before it was batched.
+                    commit_every: vacuum_state
+                        .output_file
+                        .as_ref()
+                        .filter(|output_file| output_file.is_temporary())
+                        .map(|_| crate::vdbe::vacuum::VacuumCommitBatch::VACUUM_INTO),
                 };
 
                 vacuum_state._output_db = Some(output_db);
@@ -20649,14 +20668,14 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .expect("VacuumTargetBuildContext must be set in FinalizeOutput state");
                 crate::vdbe::vacuum::finalize_vacuum_into_output(target_build_context)?;
                 // The copy is complete and synced: close it, then move it to
-                // the destination. Until the move the destination is untouched,
-                // and a failure here removes the temporary copy like any
-                // earlier failure.
+                // the destination (a copy built there is in place already).
+                // Until the move the destination is untouched, and a failure
+                // here discards the copy like any earlier failure.
                 vacuum_state.target_build_context = None;
                 vacuum_state._output_db = None;
-                if let Some(temp_output) = vacuum_state.temp_output.take() {
-                    if let Err(err) = temp_output.install() {
-                        vacuum_state.temp_output = Some(temp_output);
+                if let Some(output_file) = vacuum_state.output_file.take() {
+                    if let Err(err) = output_file.install() {
+                        vacuum_state.output_file = Some(output_file);
                         return Err(err.into());
                     }
                 }
