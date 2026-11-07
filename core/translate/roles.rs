@@ -6,9 +6,10 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
-//! may not write to any table, use a sequence or change the schema. It may
-//! read tables, which row-level security limits, and switch roles.
+//! Privileges other than ownership are not checked yet, so a role that is
+//! not a superuser may not write to any table, use a sequence or change the
+//! schema it does not own. It may read tables, which row-level security
+//! limits, and switch roles.
 
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
@@ -84,6 +85,9 @@ pub fn check_statement_privileges(
                 Object::Schema(MAIN_SCHEMA_NAME.to_string()),
             )
         }
+        // The dialect decides who may grant on each relation, from the
+        // privileges it stores.
+        ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
         // exists, as for CREATE TABLE.
@@ -287,6 +291,41 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     )))
 }
 
+/// Fails if the statement is compiled for a role that may not read relation
+/// `name` of `namespace`, a table, view or materialized view, which `object`
+/// names in the error. Inside a view, the view's owner is the reader, as in
+/// PostgreSQL, so a view shows its readers the tables its owner may read.
+/// Relations outside the main database, temp among them, have no
+/// privileges, and everyone reads them.
+pub(crate) fn check_read_privilege(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    object: Object,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let dialect = &resolver.catalog.dialect;
+    let schema = resolver.schema();
+    let reader = match resolver.catalog.enclosing_view() {
+        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => dialect
+            .relation_owner(schema, view_namespace.id, &view_name)
+            .unwrap_or_else(|| connection.current_role()),
+        _ => connection.current_role(),
+    };
+    if schema.roles.is_superuser(reader)
+        || dialect.role_may_read(schema, namespace.id, name, reader)
+    {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        object,
+    )))
+}
+
 /// Fails if the statement is compiled for a role that is not a superuser,
 /// which may not read a table-valued PRAGMA function. The function runs
 /// `pragma_name` as a statement of the engine's own, which is not checked, so
@@ -315,6 +354,57 @@ fn database_denial(action: Action) -> PermissionDenied {
 
 fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
+}
+
+/// `GRANT`: the dialect stores the privileges with each relation, through
+/// its relation hooks, as it stores ownership.
+pub fn translate_grant(
+    grant: &ast::Grant,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let mut changes = Vec::with_capacity(grant.relations.len());
+    for qualified_name in &grant.relations {
+        let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
+        // A schema that does not exist is reported as such, not as a
+        // missing relation.
+        if qualified_name.namespace.is_some() {
+            resolver.resolve_namespace(qualified_name)?;
+        }
+        let Some((namespace, kind)) =
+            crate::translate::alter::owned_relation(resolver, qualified_name, &normalized_name)
+        else {
+            bail_parse_error!(
+                "relation \"{}\" does not exist",
+                crate::util::table_name_for_error(qualified_name)
+            );
+        };
+        if kind == ast::RelationKind::Index {
+            bail_parse_error!("\"{normalized_name}\" is an index");
+        }
+        // Only the main database has dialect schema state to store the
+        // privileges in; a temp table has none, and nothing to store.
+        if namespace.database_id != MAIN_DB_ID {
+            continue;
+        }
+        changes.push(crate::RelationChange::Grant {
+            namespace: namespace.id,
+            name: normalized_name,
+            privileges: grant.privileges.clone(),
+            grantees: grant.grantees.clone(),
+        });
+    }
+    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_relation_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    emit_schema_cookie(resolver, program);
+    Ok(())
 }
 
 /// Creates a role that is not a superuser and cannot log in.

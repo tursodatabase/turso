@@ -24,6 +24,9 @@ use turso_sqlite::SqliteDialect;
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
 pub(crate) const PG_DATABASE_OWNER_OID: i64 = 6171;
+/// The owner of the public schema, which PostgreSQL makes for every database.
+/// It is listed in pg_roles but is not a role of the engine.
+pub(crate) const PG_DATABASE_OWNER_NAME: &str = "pg_database_owner";
 /// pg_depend uses column zero for a whole object; table columns are numbered from one.
 const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
 /// Catalog BOOLEAN values are stored as integers; one means true.
@@ -264,6 +267,16 @@ impl Dialect for PostgresDialect {
         crate::classes::relation_owner(schema, namespace, name)
     }
 
+    fn role_may_read(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+        role: RoleId,
+    ) -> bool {
+        crate::classes::role_may_read(schema, namespace, name, role)
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }
@@ -425,6 +438,20 @@ fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i6
     }
 }
 
+/// The `pg_class.relacl` of relation `name`: its stored access control list
+/// with the roles named, NULL until a `GRANT` touches it.
+fn relation_acl(conn: &Connection, schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
+    match crate::classes::relation_acl(schema, namespace, name) {
+        Some(acl) => {
+            let roles = conn.role_catalog();
+            Value::build_text(acl.display_text(&|oid| {
+                role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
+            }))
+        }
+        None => Value::Null,
+    }
+}
+
 /// The name of the role that owns relation `name`, for the owner columns of
 /// the information views, such as `pg_tables.tableowner`.
 fn relation_owner_name(
@@ -570,7 +597,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),         // relrewrite
                 Value::from_i64(0),         // relfrozenxid
                 Value::from_i64(0),         // relminmxid
-                Value::Null,                // relacl
+                relation_acl(conn, &schema, *namespace, name), // relacl
                 Value::Null,                // reloptions
                 Value::Null,                // relpartbound
             ]);
@@ -649,7 +676,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),
                 Value::from_i64(0),
                 Value::from_i64(0),
-                Value::Null,
+                relation_acl(conn, &schema, namespace, &sequence.name),
                 Value::Null,
                 Value::Null,
             ]);
@@ -897,6 +924,29 @@ pub(crate) fn role_oid(id: RoleId) -> i64 {
     }
 }
 
+/// The name of the role with PostgreSQL oid `oid`, including
+/// `pg_database_owner`, which `pg_roles` lists without its being a role of
+/// the engine.
+pub(crate) fn role_name_by_oid(roles: &RoleCatalog, oid: i64) -> Option<String> {
+    if oid == PG_DATABASE_OWNER_OID {
+        return Some(PG_DATABASE_OWNER_NAME.to_string());
+    }
+    postgres_roles(roles)
+        .find(|role| role_oid(role.id) == oid)
+        .map(|role| role.name)
+}
+
+/// The PostgreSQL oid of the role named `name`, the inverse of
+/// [`role_name_by_oid`].
+pub(crate) fn role_oid_by_name(roles: &RoleCatalog, name: &str) -> Option<i64> {
+    if name == PG_DATABASE_OWNER_NAME {
+        return Some(PG_DATABASE_OWNER_OID);
+    }
+    postgres_roles(roles)
+        .find(|role| role.name == name)
+        .map(|role| role_oid(role.id))
+}
+
 /// The roles that PostgreSQL has: its bootstrap superuser, which is the
 /// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.
 /// `public` is not a role in PostgreSQL, only a name for [RoleId::PUBLIC] in
@@ -938,11 +988,9 @@ impl SnapshotRows for PgRolesTable {
         let mut rows: Vec<_> = postgres_roles(&conn.role_catalog())
             .map(|role| role_row(&role))
             .collect();
-        // The owner of the public schema, which PostgreSQL makes for every
-        // database.
         rows.push(vec![
             Value::from_i64(PG_DATABASE_OWNER_OID),
-            Value::build_text("pg_database_owner"),
+            Value::build_text(PG_DATABASE_OWNER_NAME),
             Value::from_i64(0),
             Value::from_i64(1),
             Value::from_i64(0),

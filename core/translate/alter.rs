@@ -61,9 +61,14 @@ fn validate(
     alter_table: &ast::AlterTableBody,
     table_name: &str,
     supports_namespaces: bool,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    // Check if someone is trying to ALTER a system table
-    if crate::schema::is_system_table(table_name) {
+    // Only the engine's own statements, which run nested, may alter a system
+    // table, as a frontend does to add a column to its catalog table.
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && crate::schema::is_system_table(table_name)
+    {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
@@ -856,6 +861,7 @@ pub fn translate_alter_table(
         &alter_table,
         table_name,
         resolver.catalog.dialect.supports_namespaces(),
+        connection,
     )?;
     reject_alter_of_view(&alter_table, table_name, resolver, namespace)?;
 
@@ -2570,7 +2576,7 @@ fn relation_kind_phrase(kind: RelationKind) -> &'static str {
 /// The namespace and kind of the relation `qualified_name` names: a table,
 /// view, materialized view, sequence or index, whichever exists. None when
 /// none does.
-fn owned_relation(
+pub(crate) fn owned_relation(
     resolver: &Resolver,
     qualified_name: &ast::QualifiedName,
     normalized_name: &str,

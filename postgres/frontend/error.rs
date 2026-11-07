@@ -320,7 +320,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
         SQLSTATE_UNDEFINED_OBJECT
-    } else if msg.starts_with('"') && msg.contains("\" is not a") {
+    } else if msg.starts_with('"')
+        && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
+    {
         SQLSTATE_WRONG_OBJECT_TYPE
     } else if msg.starts_with("cannot change owner of sequence \"") {
         SQLSTATE_FEATURE_NOT_SUPPORTED
@@ -508,6 +510,7 @@ mod tests {
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
             (
                 "cannot change owner of sequence \"s\"",
                 SQLSTATE_FEATURE_NOT_SUPPORTED,

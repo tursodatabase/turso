@@ -1,3 +1,4 @@
+mod acl;
 mod auth_functions;
 mod catalog;
 mod classes;

@@ -1853,6 +1853,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::AlterSequenceOwnedBy { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::Grant(_)
         | ast::Stmt::DropSchema { .. } => {}
     }
     Ok(())

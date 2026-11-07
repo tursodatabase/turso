@@ -3601,7 +3601,7 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::CreateSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        self.prepare_namespace_stmt(statement)?.run_ignore_rows()?;
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()?;
         let namespace = self
             .current_qualifiers()
             .get(name)
@@ -3625,13 +3625,14 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::DropSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        self.prepare_namespace_stmt(statement)?.run_ignore_rows()
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()
     }
 
-    /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
+    /// Prepares a statement that a frontend built as an AST, such as CREATE
+    /// SCHEMA, DROP SCHEMA or GRANT. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
-    /// schema, translates the statement itself.
-    pub fn prepare_namespace_stmt(
+    /// schema, translates the AST itself.
+    pub fn prepare_ast_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {

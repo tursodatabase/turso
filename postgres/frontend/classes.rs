@@ -3,11 +3,11 @@
 //!
 //! `sqlite_schema` stays the source of truth for storage: type, name, root
 //! page and SQL text. The catalog holds what `sqlite_schema` does not: a
-//! stable `oid` that survives creating and dropping other relations, and the
-//! owning role. The columns use PostgreSQL's `pg_class` names and value
-//! conventions, because when `sqlite_schema` itself moves behind the
-//! engine's dialect hooks, this table becomes `pg_class`, by renaming and
-//! adding columns.
+//! stable `oid` that survives creating and dropping other relations, the
+//! owning role, and the privileges `GRANT` gave. The columns use
+//! PostgreSQL's `pg_class` names and value conventions, because when
+//! `sqlite_schema` itself moves behind the engine's dialect hooks, this
+//! table becomes `pg_class`, by renaming and adding columns.
 //!
 //! Core knows nothing of this table. [`crate::catalog::PostgresDialect`]
 //! maintains it through the engine's relation hooks: every statement that
@@ -36,6 +36,7 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
 };
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CmpInsFlags,
@@ -47,12 +48,21 @@ use turso_parser::ast;
 use turso_core::MAIN_DB_ID;
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
+use crate::acl::{Acl, PUBLIC_OID};
+use crate::catalog::{role_oid, role_oid_by_name};
+
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
 pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name";
 
 const SELECT_CLASSES_SQL: &str =
-    "SELECT oid, relname, relnamespace, relkind, relowner, relownedby \
+    "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, relacl \
+     FROM __turso_internal_classes";
+
+/// Reads a catalog made before it had `relacl`, which a read-only open
+/// cannot add.
+const SELECT_CLASSES_WITHOUT_ACL_SQL: &str =
+    "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, NULL AS relacl \
      FROM __turso_internal_classes";
 
 /// PostgreSQL's `FirstNormalObjectId`: the first oid given to a user
@@ -62,14 +72,25 @@ pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 /// The columns the rest of this module reads and writes. `relownedby` is
 /// the oid of the table whose serial column owns the relation, 0 when no
 /// relation owns it: what PostgreSQL records in `pg_depend` as an automatic
-/// dependency, kept here until there is a `pg_depend`.
+/// dependency, kept here until there is a `pg_depend`. `relacl` is the
+/// access control list in the text form of PostgreSQL's `aclitem[]`, NULL
+/// until the first `GRANT`, when the owner has every privilege and nobody
+/// else has any.
 const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     oid INTEGER PRIMARY KEY, \
     relname TEXT NOT NULL, \
     relnamespace INTEGER NOT NULL, \
     relkind TEXT NOT NULL, \
     relowner INTEGER NOT NULL, \
-    relownedby INTEGER NOT NULL)";
+    relownedby INTEGER NOT NULL, \
+    relacl TEXT)";
+
+const ACL_COLUMN_NAME: &str = "relacl";
+
+/// Adds `relacl` to a catalog made before it had the column.
+const ADD_ACL_COLUMN_SQL: &str = "ALTER TABLE __turso_internal_classes ADD COLUMN relacl TEXT";
+
+const CLASS_COLUMN_COUNT: usize = 7;
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
      ON __turso_internal_classes (relnamespace, relname)";
@@ -111,6 +132,8 @@ pub(crate) struct RelationClass {
     /// The oid of the table whose serial column owns this sequence; 0 when
     /// no relation owns it.
     pub(crate) relownedby: i64,
+    /// The privileges `GRANT` gave, None before the first `GRANT`.
+    pub(crate) relacl: Option<Acl>,
 }
 
 /// The class rows of a database, loaded as the engine's opaque dialect
@@ -123,7 +146,7 @@ pub(crate) struct ClassCatalog {
 
 impl ClassCatalog {
     /// Returns a catalog of the rows read from the classes table. Each row is
-    /// `(oid, relname, relnamespace, relkind, relowner)`.
+    /// `(oid, relname, relnamespace, relkind, relowner, relownedby, relacl)`.
     fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
@@ -158,7 +181,7 @@ impl ClassCatalog {
 
     /// Applies what a statement wrote to the stored rows. `values` are what
     /// the emitted instruction read back: a created relation's oid and
-    /// owner, or a changed owner.
+    /// owner, a changed owner with the list it leaves, or a granted list.
     fn apply(&mut self, change: &RelationChange, values: &[Value]) -> turso_core::Result<()> {
         match change {
             RelationChange::Create {
@@ -179,6 +202,7 @@ impl ClassCatalog {
                     relkind: *kind,
                     relowner: RoleId::from_stored(read_back_integer(owner)?),
                     relownedby: 0,
+                    relacl: None,
                 });
             }
             RelationChange::Drop { namespace, name } => {
@@ -223,16 +247,30 @@ impl ClassCatalog {
                 name,
                 owner: NewOwner::Role(_),
             } => {
-                let [owner] = values else {
+                let [owner, acl] = values else {
                     return Err(LimboError::InternalError(
-                        "an owner change carries the new owner".to_string(),
+                        "an owner change carries the new owner and the list it leaves".to_string(),
+                    ));
+                };
+                if let Some(oid) = self.oids_by_name.get(&(*namespace, name.to_string())) {
+                    let class = self.by_oid.get_mut(oid).expect("both maps hold the row");
+                    class.relowner = RoleId::from_stored(read_back_integer(owner)?);
+                    class.relacl = read_back_acl(acl)?;
+                }
+            }
+            RelationChange::Grant {
+                namespace, name, ..
+            } => {
+                let [acl] = values else {
+                    return Err(LimboError::InternalError(
+                        "a grant carries the list it leaves".to_string(),
                     ));
                 };
                 if let Some(oid) = self.oids_by_name.get(&(*namespace, name.to_string())) {
                     self.by_oid
                         .get_mut(oid)
                         .expect("both maps hold the row")
-                        .relowner = RoleId::from_stored(read_back_integer(owner)?);
+                        .relacl = read_back_acl(acl)?;
                 }
             }
         }
@@ -263,7 +301,7 @@ impl ClassCatalog {
 }
 
 fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
-    let [oid, relname, relnamespace, relkind, relowner, relownedby] = row else {
+    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl] = row else {
         return Err(corrupt_row(row));
     };
     match (oid, relname, relnamespace, relkind, relowner, relownedby) {
@@ -282,6 +320,13 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
             let Some(relkind) = relation_kind_of_letter(relkind.as_str()) else {
                 return Err(corrupt_row(row));
             };
+            let relacl = match relacl {
+                Value::Null => None,
+                Value::Text(text) => {
+                    Some(Acl::parse(text.as_str()).ok_or_else(|| corrupt_row(row))?)
+                }
+                _ => return Err(corrupt_row(row)),
+            };
             Ok(RelationClass {
                 oid: *oid,
                 relname: relname.as_str().to_string(),
@@ -289,6 +334,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 relkind,
                 relowner: RoleId::from_stored(*relowner),
                 relownedby: *relownedby,
+                relacl,
             })
         }
         _ => Err(corrupt_row(row)),
@@ -308,9 +354,16 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
 
 /// [`turso_core::Dialect::schema_state_query`] for the PostgreSQL frontend.
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
-    schema
-        .get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)
-        .map(|_| SELECT_CLASSES_SQL.to_string())
+    let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
+    Some(if has_acl_column(&table) {
+        SELECT_CLASSES_SQL.to_string()
+    } else {
+        SELECT_CLASSES_WITHOUT_ACL_SQL.to_string()
+    })
+}
+
+fn has_acl_column(table: &BTreeTable) -> bool {
+    table.get_column(ACL_COLUMN_NAME).is_some()
 }
 
 /// [`turso_core::Dialect::build_schema_state`] for the PostgreSQL frontend:
@@ -363,12 +416,59 @@ pub(crate) fn relation_owner(
     )
 }
 
+/// [`turso_core::Dialect::role_may_read`] for the PostgreSQL frontend: the
+/// owner may, and so may a role the list gives SELECT, by oid or through
+/// PUBLIC. A relation without a class row is the engine's, such as a catalog
+/// table, and everyone reads it.
+pub(crate) fn role_may_read(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+    role: RoleId,
+) -> bool {
+    let Some(class) =
+        class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
+    else {
+        return true;
+    };
+    class.relowner == role
+        || class
+            .relacl
+            .as_ref()
+            .is_some_and(|acl| acl.grants(role_oid(role), ast::Privilege::Select))
+}
+
+/// The access control list of relation `name` of `namespace`, or None when
+/// no `GRANT` has touched it.
+pub(crate) fn relation_acl(schema: &Schema, namespace: NamespaceId, name: &str) -> Option<Acl> {
+    class_catalog(schema)?
+        .get_by_name(namespace, name)?
+        .relacl
+        .clone()
+}
+
 /// An integer the emitted instruction read back from a register.
 fn read_back_integer(value: &Value) -> turso_core::Result<i64> {
     match value {
         Value::Numeric(Numeric::Integer(value)) => Ok(*value),
         other => Err(LimboError::InternalError(format!(
             "the relation change read back {other:?} where an integer was written"
+        ))),
+    }
+}
+
+/// An access control list, or NULL, that the emitted instruction read back
+/// from a register.
+fn read_back_acl(value: &Value) -> turso_core::Result<Option<Acl>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => Acl::parse(text.as_str()).map(Some).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "the relation change read back an invalid access control list {text:?}"
+            ))
+        }),
+        other => Err(LimboError::InternalError(format!(
+            "the relation change read back {other:?} where an access control list was written"
         ))),
     }
 }
@@ -380,7 +480,9 @@ fn read_back_integer(value: &Value) -> turso_core::Result<i64> {
 /// sets the owner, with PostgreSQL's errors for a missing role (42704) and
 /// a catalog relation (42501). A sequence a serial column owns changes
 /// owner with its table only, as in PostgreSQL: on its own it fails with
-/// `cannot change owner of sequence` (0A000).
+/// `cannot change owner of sequence` (0A000). `GRANT` adds to the access
+/// control list when the owner or a superuser runs it; anyone else grants
+/// nothing, as in PostgreSQL, which only warns.
 pub(crate) fn translate_relation_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -390,17 +492,17 @@ pub(crate) fn translate_relation_changes(
     let allocates_oids = changes
         .iter()
         .any(|change| matches!(change, RelationChange::Create { .. }));
-    let changes_owner = changes.iter().any(|change| {
+    let changes_owner_or_privileges = changes.iter().any(|change| {
         matches!(
             change,
             RelationChange::ChangeOwner {
                 owner: NewOwner::Role(_),
                 ..
-            }
+            } | RelationChange::Grant { .. }
         )
     });
     let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
-        if changes_owner {
+        if changes_owner_or_privileges {
             return Err(LimboError::ParseError(
                 "the database has no relation catalog".to_string(),
             ));
@@ -515,14 +617,15 @@ pub(crate) fn translate_relation_changes(
                         "cannot change owner of sequence \"{name}\""
                     )));
                 }
-                emit_class_row_set_owner(program, &cursors, *namespace, name, owner, new_owner);
                 // A table's indexes and what it owns, such as the sequences
                 // of its serial columns, go with it.
-                let mut with_it = class_catalog(schema)
-                    .into_iter()
-                    .flat_map(|catalog| catalog.owned_by(class.oid))
-                    .map(|owned| (owned.relnamespace, owned.relname.clone()))
-                    .collect::<Vec<_>>();
+                let mut with_it = vec![(*namespace, name.to_string())];
+                with_it.extend(
+                    class_catalog(schema)
+                        .into_iter()
+                        .flat_map(|catalog| catalog.owned_by(class.oid))
+                        .map(|owned| (owned.relnamespace, owned.relname.clone())),
+                );
                 with_it.extend(
                     schema
                         .get_indices(*namespace, name)
@@ -533,6 +636,14 @@ pub(crate) fn translate_relation_changes(
                         .map(|index| (*namespace, index.name.clone())),
                 );
                 for (other_namespace, other_name) in with_it {
+                    // The new owner takes the old one's place in the list.
+                    let acl = class_catalog(schema)
+                        .and_then(|catalog| catalog.get_by_name(other_namespace, &other_name))
+                        .and_then(|other| other.relacl.clone())
+                        .map(|mut acl| {
+                            acl.change_owner(role_oid(class.relowner), role_oid(owner));
+                            acl
+                        });
                     emit_class_row_set_owner(
                         program,
                         &cursors,
@@ -540,12 +651,82 @@ pub(crate) fn translate_relation_changes(
                         &other_name,
                         owner,
                         new_owner,
+                        acl.as_ref(),
                     );
                 }
+            }
+            RelationChange::Grant {
+                namespace,
+                name,
+                privileges,
+                grantees,
+            } => {
+                let grantees = grantees
+                    .iter()
+                    .map(|grantee| resolve_grantee(schema, connection, grantee))
+                    .collect::<turso_core::Result<Vec<_>>>()?;
+                // A relation without a class row is the engine's, such as a
+                // catalog table, and every role may read it already.
+                let Some(class) =
+                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+                else {
+                    continue;
+                };
+                let owner = role_oid(class.relowner);
+                let mut acl = class
+                    .relacl
+                    .clone()
+                    .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
+                // Only the owner may grant, and a superuser grants as the
+                // owner. As in PostgreSQL, anyone else is refused when the
+                // list gives it nothing on the relation, and grants nothing
+                // otherwise, for want of a grant option.
+                let may_grant = connection.current_role_is_superuser()
+                    || class.relowner == connection.current_role();
+                if !may_grant {
+                    if acl.gives_anything_to(role_oid(connection.current_role())) {
+                        continue;
+                    }
+                    return Err(LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(Action::Read, relation_object(class)),
+                    )));
+                }
+                for grantee in &grantees {
+                    acl.grant(*grantee, privileges, owner);
+                }
+                if class.relacl.as_ref() == Some(&acl) {
+                    continue;
+                }
+                emit_class_row_set_acl(program, &cursors, *namespace, name, &acl, change);
             }
         }
     }
     Ok(())
+}
+
+/// The relation of `class` as a permission error names it.
+fn relation_object(class: &RelationClass) -> Object {
+    match class.relkind {
+        RelationKind::View | RelationKind::MaterializedView => Object::View(class.relname.clone()),
+        RelationKind::Sequence => Object::Sequence(class.relname.clone()),
+        RelationKind::Table | RelationKind::Index => Object::Table(class.relname.clone()),
+    }
+}
+
+/// The role oid a `GRANT` stores for `grantee`, [`PUBLIC_OID`] for
+/// everyone. A named role must exist.
+fn resolve_grantee(
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    grantee: &ast::Grantee,
+) -> turso_core::Result<i64> {
+    Ok(match grantee {
+        ast::Grantee::Public => PUBLIC_OID,
+        ast::Grantee::Role(ast::RoleSpec::CurrentRole) => role_oid(connection.current_role()),
+        ast::Grantee::Role(ast::RoleSpec::SessionUser) => role_oid(connection.session_role()),
+        ast::Grantee::Role(ast::RoleSpec::Name(name)) => role_oid_by_name(&schema.roles, name)
+            .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
+    })
 }
 
 /// The role `ALTER ... OWNER TO new_owner` gives relation `name` of
@@ -591,6 +772,9 @@ struct ClassTableCursors {
     table_cursor_id: usize,
     index_cursor_id: usize,
     index_name: String,
+    /// False for a catalog made before it had `relacl` and opened read-only,
+    /// which has no column to read; the write that follows fails anyway.
+    has_acl_column: bool,
     /// Only opened when the statement inserts a row, which allocates an oid.
     seq_cursor_id: Option<usize>,
     seq_table: Option<Arc<BTreeTable>>,
@@ -648,6 +832,7 @@ fn open_class_table_for_writing(
         table_cursor_id,
         index_cursor_id,
         index_name: name_index.name.clone(),
+        has_acl_column: has_acl_column(&table),
         seq_cursor_id,
         seq_table,
     }))
@@ -704,7 +889,7 @@ fn emit_class_row_insert(
 
     // The oid is the rowid, so the record keeps NULL for it, as SQLite does
     // for an INTEGER PRIMARY KEY column.
-    let first_column_reg = program.alloc_registers(6);
+    let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
     program.emit_insn(Insn::Null {
         dest: first_column_reg,
         dest_end: None,
@@ -729,10 +914,15 @@ fn emit_class_row_insert(
         value: 0,
         dest: first_column_reg + 5,
     });
+    // No GRANT has touched a new relation.
+    program.emit_insn(Insn::Null {
+        dest: first_column_reg + 6,
+        dest_end: None,
+    });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
-        count: to_u32(6),
+        count: to_u32(CLASS_COLUMN_COUNT),
         dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
@@ -788,6 +978,7 @@ fn emit_class_row_set_owned_by(
             ClassRecordColumn::Register(row.relkind_reg),
             ClassRecordColumn::Register(row.relowner_reg),
             ClassRecordColumn::LiteralInt(table_oid),
+            ClassRecordColumn::Register(row.relacl_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -838,6 +1029,7 @@ fn emit_class_row_rename(
             ClassRecordColumn::Register(row.relkind_reg),
             ClassRecordColumn::Register(row.relowner_reg),
             ClassRecordColumn::Register(row.relownedby_reg),
+            ClassRecordColumn::Register(row.relacl_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -853,7 +1045,7 @@ fn emit_class_row_rename(
 }
 
 /// Sets the owner of the class row of relation `name` of `namespace` to
-/// `owner`, which `new_owner` named.
+/// `owner`, which `new_owner` named, and its access control list to `acl`.
 fn emit_class_row_set_owner(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -861,12 +1053,14 @@ fn emit_class_row_set_owner(
     name: &str,
     owner: RoleId,
     new_owner: &ast::RoleSpec,
+    acl: Option<&Acl>,
 ) {
     let owner_reg = program.alloc_register();
     program.emit_insn(Insn::Integer {
         value: owner.get(),
         dest: owner_reg,
     });
+    let acl_reg = emit_acl(program, acl);
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
@@ -875,6 +1069,7 @@ fn emit_class_row_set_owner(
             ClassRecordColumn::Register(row.relkind_reg),
             ClassRecordColumn::Register(owner_reg),
             ClassRecordColumn::Register(row.relownedby_reg),
+            ClassRecordColumn::Register(acl_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -885,8 +1080,53 @@ fn emit_class_row_set_owner(
             name: name.to_string(),
             owner: NewOwner::Role(new_owner.clone()),
         }),
-        value_regs: vec![owner_reg],
+        value_regs: vec![owner_reg, acl_reg],
     });
+}
+
+/// Sets the access control list of the class row of relation `name` of
+/// `namespace` to `acl`, which `change` granted.
+fn emit_class_row_set_acl(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+    acl: &Acl,
+    change: &RelationChange,
+) {
+    let acl_reg = emit_acl(program, Some(acl));
+    emit_find_class_row(program, cursors, namespace, name, |program, row| {
+        let record_reg = emit_class_record(
+            program,
+            ClassRecordColumn::Literal(name.to_string()),
+            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
+            ClassRecordColumn::Register(row.relkind_reg),
+            ClassRecordColumn::Register(row.relowner_reg),
+            ClassRecordColumn::Register(row.relownedby_reg),
+            ClassRecordColumn::Register(acl_reg),
+        );
+        emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
+    });
+    program.emit_insn(Insn::RelationChange {
+        db: MAIN_DB_ID,
+        change: Box::new(change.clone()),
+        value_regs: vec![acl_reg],
+    });
+}
+
+/// Puts `acl` in its stored form, or NULL for none, in a new register.
+fn emit_acl(program: &mut ProgramBuilder, acl: Option<&Acl>) -> usize {
+    match acl {
+        Some(acl) => program.emit_string8_new_reg(acl.stored_text()),
+        None => {
+            let acl_reg = program.alloc_register();
+            program.emit_insn(Insn::Null {
+                dest: acl_reg,
+                dest_end: None,
+            });
+            acl_reg
+        }
+    }
 }
 
 /// The registers that [`emit_find_class_row`] fills for the found row.
@@ -895,6 +1135,7 @@ struct FoundClassRow {
     relkind_reg: usize,
     relowner_reg: usize,
     relownedby_reg: usize,
+    relacl_reg: usize,
 }
 
 /// Scans the classes table for the row of relation `name` of `namespace` and
@@ -947,6 +1188,7 @@ fn emit_find_class_row(
         relkind_reg: program.alloc_register(),
         relowner_reg: program.alloc_register(),
         relownedby_reg: program.alloc_register(),
+        relacl_reg: program.alloc_register(),
     };
     program.emit_insn(Insn::RowId {
         cursor_id: cursors.table_cursor_id,
@@ -955,6 +1197,14 @@ fn emit_find_class_row(
     program.emit_column_or_rowid(cursors.table_cursor_id, 3, row.relkind_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 4, row.relowner_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 5, row.relownedby_reg);
+    if cursors.has_acl_column {
+        program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: row.relacl_reg,
+            dest_end: None,
+        });
+    }
     found(program, &row);
     program.emit_insn(Insn::Goto { target_pc: done });
 
@@ -977,8 +1227,8 @@ enum ClassRecordColumn {
 }
 
 /// Builds a class record
-/// `(NULL, relname, relnamespace, relkind, relowner, relownedby)` and
-/// returns its register.
+/// `(NULL, relname, relnamespace, relkind, relowner, relownedby, relacl)`
+/// and returns its register.
 fn emit_class_record(
     program: &mut ProgramBuilder,
     relname: ClassRecordColumn,
@@ -986,13 +1236,14 @@ fn emit_class_record(
     relkind: ClassRecordColumn,
     relowner: ClassRecordColumn,
     relownedby: ClassRecordColumn,
+    relacl: ClassRecordColumn,
 ) -> usize {
-    let first_column_reg = program.alloc_registers(6);
+    let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
     program.emit_insn(Insn::Null {
         dest: first_column_reg,
         dest_end: None,
     });
-    for (offset, column) in [relname, relnamespace, relkind, relowner, relownedby]
+    for (offset, column) in [relname, relnamespace, relkind, relowner, relownedby, relacl]
         .into_iter()
         .enumerate()
     {
@@ -1016,7 +1267,7 @@ fn emit_class_record(
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
-        count: to_u32(6),
+        count: to_u32(CLASS_COLUMN_COUNT),
         dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
@@ -1152,33 +1403,44 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
 
 /// Creates the classes table, its name index, the `sqlite_sequence` table
 /// and the oid watermark row in one write transaction, unless the table
-/// exists. A database that already has relations without the table is
-/// refused, and a read-only open can neither create nor need it: the
-/// database is empty. After this returns, every relation the database will
-/// ever hold has a class row from its CREATE.
+/// exists. A table made before it had `relacl` gets the column. A database
+/// that already has relations without the table is refused, and a read-only
+/// open can neither create nor need it: the database is empty. After this
+/// returns, every relation the database will ever hold has a class row from
+/// its CREATE.
 pub(crate) fn ensure_classes_table(
     db: &Arc<turso_core::Database>,
     read_only: bool,
 ) -> crate::Result<()> {
     let conn = db.connect(turso_core::ConnectOpts::new())?;
-    if table_exists(&conn, CLASSES_TABLE_NAME)? {
-        return Ok(());
+    if let Some(table) = classes_table(&conn) {
+        if has_acl_column(&table) || read_only {
+            return Ok(());
+        }
+        return in_write_transaction(&conn, add_acl_column);
     }
     refuse_relations_without_catalog(&conn)?;
     if read_only {
         return Ok(());
     }
-    run_internal(&conn, "BEGIN IMMEDIATE")?;
-    let result = create_classes_table(&conn);
-    match result {
-        Ok(()) => {
-            run_internal(&conn, "COMMIT")?;
-            // The open loaded the schema before the table existed, so the
-            // in-memory catalog is still unloaded.
-            conn.reload_dialect_schema().map_err(Into::into)
-        }
+    in_write_transaction(&conn, create_classes_table)?;
+    // The open loaded the schema before the table existed, so the in-memory
+    // catalog is still unloaded.
+    conn.reload_dialect_schema().map_err(Into::into)
+}
+
+/// Runs `change` in a write transaction of its own. Two processes can race
+/// to open the same file; BEGIN IMMEDIATE serializes them, and `change`
+/// finds what the winner did.
+fn in_write_transaction(
+    conn: &Arc<Connection>,
+    change: fn(&Arc<Connection>) -> crate::Result<()>,
+) -> crate::Result<()> {
+    run_internal(conn, "BEGIN IMMEDIATE")?;
+    match change(conn) {
+        Ok(()) => run_internal(conn, "COMMIT"),
         Err(error) => {
-            let _ = run_internal(&conn, "ROLLBACK");
+            let _ = run_internal(conn, "ROLLBACK");
             Err(error)
         }
     }
@@ -1198,8 +1460,6 @@ fn refuse_relations_without_catalog(conn: &Arc<Connection>) -> crate::Result<()>
 }
 
 fn create_classes_table(conn: &Arc<Connection>) -> crate::Result<()> {
-    // Two processes can race to open the same new file; BEGIN IMMEDIATE
-    // serializes them and the loser finds the table.
     if table_exists(conn, CLASSES_TABLE_NAME)? {
         return Ok(());
     }
@@ -1215,6 +1475,19 @@ fn create_classes_table(conn: &Arc<Connection>) -> crate::Result<()> {
             FIRST_NORMAL_OBJECT_ID - 1
         ),
     )
+}
+
+fn add_acl_column(conn: &Arc<Connection>) -> crate::Result<()> {
+    let has_column = classes_table(conn).is_some_and(|table| has_acl_column(&table));
+    if has_column {
+        return Ok(());
+    }
+    run_internal(conn, ADD_ACL_COLUMN_SQL)
+}
+
+fn classes_table(conn: &Arc<Connection>) -> Option<Arc<BTreeTable>> {
+    conn.current_schema()
+        .get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)
 }
 
 fn table_exists(conn: &Arc<Connection>, name: &str) -> crate::Result<bool> {

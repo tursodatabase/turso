@@ -413,7 +413,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE not supported at all |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT SELECT ON ALL TABLES IN SCHEMA` stores the privilege in each table's `pg_class.relacl` and lets the roles read the tables; other privileges, sequences, functions and REVOKE are not supported |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -427,7 +427,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read rows but not write them, use sequences, or change the schema, and `GRANT` is not supported; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
+| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read the tables they own or were granted `SELECT` on, but not write rows, use sequences, or change the schema they do not own; `GRANT SELECT` on tables is the only `GRANT` accepted and is stored in `pg_class.relacl`; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
 | Row-level security | ❌ Not supported | |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |

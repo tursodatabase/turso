@@ -25,7 +25,7 @@ use crate::{
     Connection, Func, LimboError, OpenOptions, Result, Value,
 };
 use std::{any::Any, sync::Arc};
-use turso_parser::ast::{Cmd, CreateTableBody, QualifiedName, RoleSpec, Stmt};
+use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -60,6 +60,13 @@ pub enum RelationChange {
         namespace: NamespaceId,
         name: String,
         owner: NewOwner,
+    },
+    /// `GRANT privileges ON relation TO grantees`.
+    Grant {
+        namespace: NamespaceId,
+        name: String,
+        privileges: Vec<Privilege>,
+        grantees: Vec<Grantee>,
     },
 }
 
@@ -291,8 +298,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership and refuses `ALTER ... OWNER TO` and
-    /// `ALTER SEQUENCE ... OWNED BY`.
+    /// has no ownership or privileges and refuses `ALTER ... OWNER TO`,
+    /// `ALTER SEQUENCE ... OWNED BY` and `GRANT`.
     fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -318,6 +325,9 @@ pub trait Dialect: Send + Sync + 'static {
                     return Err(LimboError::ParseError(
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
+                }
+                RelationChange::Grant { .. } => {
+                    return Err(LimboError::ParseError("GRANT is not supported".to_string()));
                 }
                 _ => {}
             }
@@ -358,6 +368,20 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Option<RoleId> {
         let _ = (schema, namespace, name);
         None
+    }
+
+    /// Whether `role` may read relation `name` of `namespace`, from the
+    /// privileges the dialect stores. A dialect without privileges lets
+    /// every role read.
+    fn role_may_read(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+        role: RoleId,
+    ) -> bool {
+        let _ = (schema, namespace, name, role);
+        true
     }
 
     /// Whether `PRAGMA capture_data_changes_conn` may create its change

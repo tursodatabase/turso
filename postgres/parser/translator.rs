@@ -3521,7 +3521,9 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
+                    let text =
+                        non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -6462,6 +6464,45 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     magnitude > limit
 }
 
+/// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
+/// decimal digits. Turso's numeric literal parser reads only decimal and hex
+/// text, and reads hex the SQLite way, so a value above i64 wraps around.
+/// Returns `None` for a decimal literal.
+fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
+    let literal = literal.replace('_', "");
+    let (sign, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", literal.as_str()),
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => return None,
+    };
+    // Decimal digits, least significant first. A literal can be longer than
+    // any integer type, so the digits are converted one at a time.
+    let mut decimal = vec![0u32];
+    for c in unsigned[2..].chars() {
+        let mut carry = c.to_digit(radix)?;
+        for digit in decimal.iter_mut() {
+            let value = *digit * radix + carry;
+            *digit = value % 10;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal.push(carry % 10);
+            carry /= 10;
+        }
+    }
+    let digits: String = decimal
+        .iter()
+        .rev()
+        .map(|d| char::from_digit(*d, 10).unwrap())
+        .collect();
+    Some(format!("{sign}{digits}"))
+}
+
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -6517,7 +6558,10 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
     use pg_query::protobuf::node::Node;
     match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
         Some(Node::Integer(i)) => Some(i.ival as i64),
-        Some(Node::Float(f)) => f.fval.parse::<i64>().ok(),
+        Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
+            .unwrap_or_else(|| f.fval.clone())
+            .parse::<i64>()
+            .ok(),
         _ => None,
     }
 }
@@ -7254,6 +7298,136 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// A GRANT SELECT statement on tables. The frontend checks that its tables
+/// and roles exist, expands `ALL TABLES IN SCHEMA`, and hands the engine a
+/// GRANT statement that stores the privilege with each table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgGrantSelectStmt {
+    pub tables: PgGrantTables,
+    pub roles: Vec<PgGrantee>,
+}
+
+/// The tables of a GRANT SELECT statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgGrantTables {
+    /// `ON [TABLE] t, s.u`: the names the tables have in the engine, as for
+    /// any other statement, so that `pg_catalog.pg_class` names the catalog
+    /// table.
+    Named(Vec<ast::QualifiedName>),
+    /// `ON ALL TABLES IN SCHEMA s, ...`: the schemas.
+    AllInSchemas(Vec<String>),
+}
+
+/// A role that a GRANT gives a privilege to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgGrantee {
+    /// `PUBLIC`, every role.
+    Public,
+    /// `CURRENT_ROLE` or `CURRENT_USER`: the role the session runs as now.
+    CurrentRole,
+    /// `SESSION_USER`: the role the session logged in as.
+    SessionUser,
+    /// A role by name.
+    Role(String),
+}
+
+impl PgGrantee {
+    /// The grantee as the engine's GRANT names it.
+    pub fn to_ast(&self) -> ast::Grantee {
+        match self {
+            PgGrantee::Public => ast::Grantee::Public,
+            PgGrantee::CurrentRole => ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+            PgGrantee::SessionUser => ast::Grantee::Role(ast::RoleSpec::SessionUser),
+            PgGrantee::Role(name) => ast::Grantee::Role(ast::RoleSpec::Name(name.clone())),
+        }
+    }
+}
+
+/// Extracts a GRANT SELECT statement on tables. Only SELECT on tables is
+/// stored, so any other GRANT, and REVOKE, are rejected rather than reported
+/// as done.
+pub fn try_extract_grant_select(
+    parse_result: &ParseResult,
+) -> Result<Option<PgGrantSelectStmt>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::GrantStmt(grant), ..)) = nodes.first() else {
+        return Ok(None);
+    };
+    if !grant.is_grant {
+        return Err(not_supported("REVOKE"));
+    }
+    let only_select = !grant.privileges.is_empty()
+        && grant.privileges.iter().all(|privilege| {
+            matches!(
+                &privilege.node,
+                Some(Node::AccessPriv(privilege))
+                    if privilege.priv_name.eq_ignore_ascii_case("select")
+                        && privilege.cols.is_empty()
+            )
+        });
+    if grant.objtype != ObjectType::ObjectTable as i32 || !only_select {
+        return Err(not_supported("GRANT other than GRANT SELECT on tables"));
+    }
+    if grant.grant_option {
+        return Err(not_supported("GRANT ... WITH GRANT OPTION"));
+    }
+    if grant.grantor.is_some() {
+        return Err(not_supported("GRANT ... GRANTED BY"));
+    }
+    let tables = match GrantTargetType::try_from(grant.targtype) {
+        Ok(GrantTargetType::AclTargetObject) => PgGrantTables::Named(
+            grant
+                .objects
+                .iter()
+                .map(|object| match &object.node {
+                    Some(Node::RangeVar(table)) => {
+                        PostgreSQLTranslator::new().qualified_name_from_range_var(table)
+                    }
+                    _ => Err(ParseError::ParseError(
+                        "GRANT: unexpected table node".into(),
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        Ok(GrantTargetType::AclTargetAllInSchema) => PgGrantTables::AllInSchemas(
+            grant
+                .objects
+                .iter()
+                .map(|object| match &object.node {
+                    Some(Node::String(schema)) => Ok(schema.sval.clone()),
+                    _ => Err(ParseError::ParseError(
+                        "GRANT: unexpected schema node".into(),
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        _ => return Err(not_supported("GRANT other than GRANT SELECT on tables")),
+    };
+    let roles = grant
+        .grantees
+        .iter()
+        .map(|grantee| {
+            let Some(Node::RoleSpec(role)) = &grantee.node else {
+                return Err(ParseError::ParseError("GRANT: unexpected role node".into()));
+            };
+            match RoleSpecType::try_from(role.roletype) {
+                Ok(RoleSpecType::RolespecPublic) => Ok(PgGrantee::Public),
+                Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                    Ok(PgGrantee::CurrentRole)
+                }
+                Ok(RoleSpecType::RolespecSessionUser) => Ok(PgGrantee::SessionUser),
+                Ok(RoleSpecType::RolespecCstring) => Ok(PgGrantee::Role(role.rolename.clone())),
+                _ => Err(ParseError::ParseError("GRANT: unknown role kind".into())),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some(PgGrantSelectStmt { tables, roles }))
+}
+
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
 /// compatibility but are not stored.
 #[derive(Debug, Clone)]
@@ -7493,6 +7667,7 @@ pub enum FrontendStmt {
     DropSchema(PgDropSchemaStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
+    GrantSelect(PgGrantSelectStmt),
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -7529,6 +7704,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_comment_on(parse_result) {
         return Ok(Some(FrontendStmt::CommentOn(stmt)));
+    }
+    if let Some(stmt) = try_extract_grant_select(parse_result)? {
+        return Ok(Some(FrontendStmt::GrantSelect(stmt)));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -8266,6 +8444,7 @@ mod tests {
                 FrontendStmt::DropSchema(_) => "drop schema",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
+                FrontendStmt::GrantSelect(_) => "grant select",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -8284,6 +8463,7 @@ mod tests {
             ("DROP SCHEMA app CASCADE", "drop schema"),
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
+            ("GRANT SELECT ON t TO alice", "grant select"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
             ("COPY t TO STDOUT", "copy to"),
         ] {
@@ -12224,5 +12404,107 @@ mod tests {
         assert!(
             !check_set_transaction(&crate::parse("SET search_path TO public").unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn grant_select_names_its_tables_and_roles() {
+        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap());
+
+        assert_eq!(
+            grant(
+                "GRANT SELECT ON t, app.\"Docs\" TO alice, \"Bob\", PUBLIC, CURRENT_USER, SESSION_USER"
+            )
+            .unwrap(),
+            Some(PgGrantSelectStmt {
+                tables: PgGrantTables::Named(vec![
+                    ast::QualifiedName::single(exact_name("t")),
+                    ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
+                ]),
+                roles: vec![
+                    PgGrantee::Role("alice".to_string()),
+                    PgGrantee::Role("Bob".to_string()),
+                    PgGrantee::Public,
+                    PgGrantee::CurrentRole,
+                    PgGrantee::SessionUser,
+                ],
+            })
+        );
+        assert_eq!(
+            grant("GRANT SELECT ON ALL TABLES IN SCHEMA public, app TO anon").unwrap(),
+            Some(PgGrantSelectStmt {
+                tables: PgGrantTables::AllInSchemas(vec!["public".to_string(), "app".to_string()]),
+                roles: vec![PgGrantee::Role("anon".to_string())],
+            })
+        );
+        assert_eq!(grant("SELECT 1").unwrap(), None);
+    }
+
+    #[test]
+    fn grant_select_names_catalog_tables_as_other_statements_do() {
+        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap();
+        let names = |sql: &str| match grant(sql).unwrap().tables {
+            PgGrantTables::Named(tables) => tables
+                .into_iter()
+                .map(|table| table.to_string())
+                .collect::<Vec<_>>(),
+            PgGrantTables::AllInSchemas(_) => unreachable!("tables are named"),
+        };
+
+        assert_eq!(
+            names(
+                "GRANT SELECT ON pg_class, pg_catalog.pg_roles, information_schema.schemata TO r"
+            ),
+            vec![
+                "main.pg_class",
+                "main.pg_roles",
+                "main.pg_information_schema_schemata"
+            ]
+        );
+    }
+
+    #[test]
+    fn grant_other_than_select_on_tables_is_not_supported() {
+        for (sql, message) in [
+            ("REVOKE SELECT ON t FROM alice", "REVOKE is not supported"),
+            (
+                "GRANT INSERT ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT, UPDATE ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT ALL ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT (a) ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT ON SEQUENCE s TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT USAGE ON SCHEMA public TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT ON t TO alice WITH GRANT OPTION",
+                "GRANT ... WITH GRANT OPTION is not supported",
+            ),
+            (
+                "GRANT SELECT ON t TO alice GRANTED BY postgres",
+                "GRANT ... GRANTED BY is not supported",
+            ),
+            (
+                "GRANT SELECT ON otherdb.public.t TO alice",
+                "a cross-database reference is not supported",
+            ),
+        ] {
+            let error = try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap_err();
+            assert_eq!(error.to_string(), message, "{sql}");
+        }
     }
 }

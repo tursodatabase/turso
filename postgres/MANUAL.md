@@ -52,6 +52,75 @@ SELECT rolname FROM pg_roles;
 (2 rows)
 ```
 
+### `GRANT SELECT` — let roles read tables
+
+**Synopsis:**
+
+```sql
+GRANT SELECT ON [ TABLE ] table_name [, ...] TO role_specification [, ...]
+GRANT SELECT ON ALL TABLES IN SCHEMA schema_name [, ...] TO role_specification [, ...]
+
+where role_specification is:
+    role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
+```
+
+**Description:**
+
+`GRANT SELECT` lets roles read tables. A role that is not a superuser reads
+a table, view or materialized view only when it owns it or `SELECT` on it
+was granted to it or to `PUBLIC`; otherwise reading it, directly or through
+a join, subquery or CTE, fails with `permission denied for table` (SQLSTATE
+42501). As in PostgreSQL, a view's tables are read as the view's owner, so
+`SELECT` on a view is enough when its owner may read its tables.
+
+The privilege is stored in the database file, in the table's access control
+list, which `pg_class.relacl` shows in PostgreSQL's form: after
+`GRANT SELECT ON accounts TO reader` by the owner `postgres`, it reads
+`{postgres=arwdDxtm/postgres,reader=r/postgres}`. The list is `NULL` until
+the first `GRANT`, when the owner has every privilege and nobody else has
+any, as in PostgreSQL. `pg_class` does not list views yet, so a view's list
+is stored but not shown.
+
+**Parameters:**
+
+- `table_name`: The name of an existing table, view, materialized view or
+  sequence, optionally qualified with its schema. Catalog tables such as
+  `pg_catalog.pg_class` can be named too.
+- `schema_name`: The name of an existing schema. `ALL TABLES IN SCHEMA` names
+  every table in it.
+- `role_name`: The name of an existing role.
+
+**Notes:**
+
+`GRANT SELECT` fails if a table, schema or role does not exist, if a name is
+an index, or if a name refers to another database, with the same errors as
+PostgreSQL. The tables are checked before the roles.
+
+As in PostgreSQL, the table's owner may grant, and a superuser grants as the
+owner, so the owner is the grantor in the list either way. Any other role
+gets `permission denied for table` (SQLSTATE 42501), unless the list gives
+it a privilege on the table, when the statement succeeds and stores
+nothing, as in PostgreSQL, which warns. `ALL TABLES IN SCHEMA` grants
+on the tables, views and materialized views of the schema, not on its
+sequences. A catalog table such as `pg_catalog.pg_class` can be named, but
+nothing is stored for it. `ALTER ... OWNER TO` puts the new owner in the
+new owner's place in the list, and a rename keeps it.
+
+Only `SELECT` on tables is accepted. Other privileges, column privileges,
+`WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of objects, and
+`REVOKE` fail as not supported, so that a script never believes it changed
+what a role may do when it did not. `GRANT role_name TO role_name` is not
+supported either.
+
+**Examples:**
+
+```sql
+CREATE ROLE reader;
+CREATE TABLE accounts (id int);
+GRANT SELECT ON accounts TO reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+```
+
 ### `SET ROLE` — set the current role
 
 **Synopsis:**
@@ -86,15 +155,16 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-`GRANT` and table privileges are not supported yet. A role that is not a
-superuser may read the rows of every table, and it may alter and drop the
-relations it owns (see `ALTER TABLE ... OWNER TO`), except that renaming a
+Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT SELECT`
+on tables is the only `GRANT` accepted (see `GRANT SELECT`). A role that is
+not a superuser may read the tables it owns or was granted `SELECT` on, and
+it may alter and drop the relations it owns, except that renaming a
 relation or creating an index on it also needs CREATE on the schema, which
-only a superuser has; it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create objects
-or roles, or `COPY FROM` a file. Creating objects stays superuser-only
-because PostgreSQL gates it on the schema's CREATE privilege, which does not
-exist yet.
+only a superuser has; it cannot insert, update, delete or truncate rows,
+call `nextval` or `setval`, create objects or roles, or `COPY FROM` a file.
+Creating objects stays superuser-only because PostgreSQL gates it on the
+schema's CREATE privilege, which does not exist yet. Catalog tables and
+sequences read as tables are not checked.
 
 **Examples:**
 
