@@ -61,8 +61,9 @@ k2|v2
 k3|v3
 k4|v4}
 
-# Turso inserts only a plain VALUES list into a virtual table. It must reject
-# the rest instead of dropping rows; SQLite inserts them.
+# Turso inserts only a plain VALUES list into a virtual table, so it rejects
+# the rest instead of dropping rows. SQLite inserts the rows of a compound
+# VALUES and rejects VALUES with LIMIT or ORDER BY as a syntax error.
 if {$is_turso} {
     do_execsql_test_in_memory_error_content insert-values-union-all-into-vtab {
         CREATE VIRTUAL TABLE v USING kv_store;
