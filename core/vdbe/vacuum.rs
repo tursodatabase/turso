@@ -428,82 +428,189 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
     Ok(())
 }
 
-/// Where a file-backed `VACUUM INTO` builds its copy: a temporary file
-/// beside the destination, moved over it once the copy is complete and
-/// synced. The target is committed in batches, so until then the file is a
-/// valid database holding only some of the rows. Built under the
-/// destination's own name, that is what a statement that fails or a process
-/// that dies partway would leave behind — and a retry would refuse the
-/// "existing" output. This way the destination path only ever holds a
-/// complete copy, as it did when the whole copy was one transaction.
+/// Where a file-backed `VACUUM INTO` builds its copy, and how the
+/// destination is left as it was found — absent, or an empty file — should
+/// the copy fail.
+///
+/// Normally the copy is built in a temporary file beside the destination
+/// and moved over it once complete and synced. The target is committed in
+/// batches, so until then the file is a valid database holding only some
+/// of the rows. Built under the destination's own name, that is what a
+/// statement that fails or a process that dies partway would leave behind —
+/// and a retry would refuse the "existing" output. This way the
+/// destination path only ever holds a complete copy, as it did when the
+/// whole copy was one transaction.
+///
+/// The temporary file is named for this process and this statement
+/// (`<destination>-vacuum-<pid>-<n>.tmp`), so it is never the source — a
+/// database may be named anything, `<destination>-vacuum` included — nor
+/// the copy another statement is building to the same destination, in
+/// this process or another. Only the files this statement created are
+/// ever removed: nothing beside the destination is swept, so what a
+/// process that died partway left behind stays, under that name, until
+/// someone removes it. The `.tmp` extension matters: the engine names a
+/// database's MVCC logical log by replacing the path's extension with
+/// `db-log` ([`logical_log_path`]), so the temporary copy's log is
+/// `<destination>-vacuum-<pid>-<n>.db-log` — its own, not the
+/// destination's — and moves to the destination's name with it.
 ///
 /// A destination that already exists — an empty file — may be open
 /// elsewhere: attached on this connection, or created by another process
 /// that waits for it. The copy must land in that file, so it is built there
-/// directly, as it always was; only that copy can be left partial. The
-/// same goes for an IO that cannot rename a file ([`crate::IO::supports_rename`]):
-/// the copy is built at the destination, which is where it would end up on
-/// an IO that keeps its files in memory, where no process dies partway.
-pub(crate) struct VacuumIntoTempOutput {
+/// directly, as it always was. The same goes for an IO that cannot rename a
+/// file ([`crate::IO::supports_rename`]). A copy built at the destination is
+/// one transaction, not batches (see `op_vacuum_into_inner`), so a failure
+/// rolls it back and leaves no rows; and since initialising a database
+/// writes its first page to the file outside any transaction, which the
+/// next `VACUUM INTO` would refuse as an existing output, the file is then
+/// truncated back to the empty file it was. A process killed partway cannot
+/// do that: it leaves an empty database (a header page, no schema, no rows)
+/// that a retry refuses until the file is removed or emptied, as before.
+pub(crate) struct VacuumIntoOutputFile {
     io: Arc<dyn crate::IO>,
-    temp_path: String,
     dest_path: String,
+    /// The temporary copy; None when the copy is built at the destination.
+    temp_path: Option<String>,
 }
 
-impl VacuumIntoTempOutput {
-    const SUFFIX: &'static str = "-vacuum";
+impl VacuumIntoOutputFile {
+    /// Names tried before giving up on a free one, which takes a process
+    /// that reuses the pid of one that died partway, that many times.
+    const NAME_ATTEMPTS: u32 = 64;
 
-    /// The temporary file for a copy to `dest_path`, after removing what an
-    /// attempt that died partway left there; None when the copy has to be
-    /// built at the destination: it already exists, or `io` cannot move
-    /// the temporary file over it.
-    pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Option<Self>> {
-        if !io.supports_rename() {
-            return Ok(None);
+    /// Where a copy to `dest_path` is built: a temporary file named so
+    /// that no file of it exists yet, or the destination itself when it
+    /// already exists or `io` cannot move a temporary file over it.
+    pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Self> {
+        if !io.supports_rename() || std::fs::metadata(dest_path).is_ok() {
+            return Ok(Self {
+                io,
+                dest_path: dest_path.to_string(),
+                temp_path: None,
+            });
         }
-        let this = Self {
-            io,
-            temp_path: format!("{dest_path}{}", Self::SUFFIX),
-            dest_path: dest_path.to_string(),
-        };
-        this.remove_temp_files()?;
-        if std::fs::metadata(dest_path).is_ok() {
-            return Ok(None);
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..Self::NAME_ATTEMPTS {
+            let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let this = Self {
+                io: io.clone(),
+                dest_path: dest_path.to_string(),
+                temp_path: Some(format!("{dest_path}-vacuum-{pid}-{seq}.tmp")),
+            };
+            if this
+                .temp_files()
+                .iter()
+                .all(|path| std::fs::metadata(path).is_err())
+            {
+                return Ok(this);
+            }
         }
-        Ok(Some(this))
+        Err(LimboError::InternalError(format!(
+            "VACUUM INTO found no free name for its temporary copy beside {dest_path}"
+        )))
     }
 
     /// The path the copy is built at.
-    pub fn temp_path(&self) -> &str {
-        &self.temp_path
+    pub fn build_path(&self) -> &str {
+        self.temp_path.as_deref().unwrap_or(&self.dest_path)
     }
 
-    /// Removes the temporary copy and the files the engine keeps beside a
-    /// database: its WAL, shm and MVCC logical log.
-    pub fn remove_temp_files(&self) -> Result<()> {
-        remove_file_if_exists(&*self.io, &self.temp_path)?;
-        for sidecar in ["-wal", "-shm", "-log"] {
-            remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
+    /// Whether the copy is built in a temporary file, which may be
+    /// committed in batches: a failed or killed copy is discarded with it.
+    /// A copy built at the destination must be one transaction.
+    pub fn is_temporary(&self) -> bool {
+        self.temp_path.is_some()
+    }
+
+    /// The temporary copy and the files the engine keeps beside a database:
+    /// its WAL, shm and MVCC logical log. Nothing for a copy built at the
+    /// destination.
+    fn temp_files(&self) -> Vec<String> {
+        let Some(temp_path) = &self.temp_path else {
+            return Vec::new();
+        };
+        vec![
+            temp_path.clone(),
+            format!("{temp_path}-wal"),
+            format!("{temp_path}-shm"),
+            logical_log_path(temp_path),
+        ]
+    }
+
+    /// Leaves the destination as it was found after the copy failed: the
+    /// temporary copy and its WAL, shm and MVCC logical log — only ever
+    /// files this statement created — are removed; a destination the copy
+    /// was built at is truncated back to the empty file it was, unless the
+    /// copy's transaction `committed` and only what came after (its
+    /// checkpoint) failed: then the whole copy is in that destination's
+    /// WAL, and the file is left as it is, header page and all, as before.
+    /// The output database must be closed first.
+    pub fn discard(&self, committed: bool) -> Result<()> {
+        if self.temp_path.is_none() {
+            if committed {
+                return Ok(());
+            }
+            let file = self
+                .io
+                .open_file(&self.dest_path, crate::OpenFlags::NoLock, false)?;
+            let truncated = file.truncate(0, Completion::new_trunc(|_| {}))?;
+            self.io.wait_for_completion(truncated)?;
+            let synced = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)?;
+            return self.io.wait_for_completion(synced);
+        }
+        for path in self.temp_files() {
+            remove_file_if_exists(&*self.io, &path)?;
         }
         Ok(())
     }
 
-    /// Moves the finished copy to the destination. The copy was
-    /// checkpointed under `SyncMode::Full` and closed, so the file is
-    /// self-contained and synced and its WAL is empty; the WAL and shm are
-    /// dropped and an MVCC copy's logical log moves with it. The move is
-    /// the IO's rename, so the destination goes from absent (or empty) to
-    /// complete in one step, durably.
+    /// Moves a finished temporary copy to the destination; a copy built at
+    /// the destination is there already. The copy was checkpointed under
+    /// `SyncMode::Full` and closed, so the file is self-contained and synced
+    /// and its WAL is empty; the WAL and shm are dropped and an MVCC copy's
+    /// logical log moves with it. The move is the IO's rename, so the
+    /// destination goes from absent to complete in one step, durably. The
+    /// log moves after the copy: should the process die between the two,
+    /// the destination holds a complete copy and the log is left under the
+    /// temporary name, where it troubles nothing (a log under the
+    /// destination's name beside no database would make a later non-MVCC
+    /// copy there look corrupt). Should the log fail to move, the copy is
+    /// moved back, so the destination is as it was found.
     pub fn install(&self) -> Result<()> {
+        let Some(temp_path) = &self.temp_path else {
+            return Ok(());
+        };
         for sidecar in ["-wal", "-shm"] {
-            remove_file_if_exists(&*self.io, &format!("{}{sidecar}", self.temp_path))?;
+            remove_file_if_exists(&*self.io, &format!("{temp_path}{sidecar}"))?;
         }
-        self.io.rename_file(&self.temp_path, &self.dest_path)?;
-        not_found_is_ok(self.io.rename_file(
-            &format!("{}-log", self.temp_path),
-            &format!("{}-log", self.dest_path),
-        ))
+        self.io.rename_file(temp_path, &self.dest_path)?;
+        let temp_log = logical_log_path(temp_path);
+        if std::fs::metadata(&temp_log).is_err() {
+            return Ok(());
+        }
+        let dest_log = logical_log_path(&self.dest_path);
+        if let Err(err) = self.io.rename_file(&temp_log, &dest_log) {
+            if let Err(undo) = self.io.rename_file(&self.dest_path, temp_path) {
+                tracing::warn!(
+                    "VACUUM INTO could not move its copy's MVCC log to {dest_log} ({err}) \
+                     nor move the copy back from {}: {undo}",
+                    self.dest_path
+                );
+            }
+            return Err(err);
+        }
+        Ok(())
     }
+}
+
+/// The MVCC logical log the engine keeps beside the database at `db_path`,
+/// by the rule `open_mv_store` opens it with.
+fn logical_log_path(db_path: &str) -> String {
+    crate::storage::journal_mode::logical_log_path(db_path)
+        .to_str()
+        .expect("a path derived from a str is a str")
+        .to_string()
 }
 
 fn remove_file_if_exists(io: &dyn crate::IO, path: &str) -> Result<()> {
@@ -586,7 +693,8 @@ pub(crate) struct VacuumTargetBuildConfig {
     /// batch is submitted, so one transaction for the whole copy costs about
     /// twice the database size in memory. `None` keeps the single transaction
     /// (the in-place VACUUM temp image is copied back page-wise and relies
-    /// on it).
+    /// on it; a `VACUUM INTO` copy built at its destination relies on it to
+    /// leave nothing there on failure).
     pub commit_every: Option<VacuumCommitBatch>,
 }
 
@@ -624,6 +732,9 @@ pub(crate) struct VacuumTargetBuildContext {
     batch_rows: u64,
     batch_bytes: u64,
     batches_since_checkpoint: u32,
+    /// Whether the target's final transaction committed: the whole copy
+    /// is in the target's WAL, whatever happens after.
+    committed: bool,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
     /// Storage-backed tables to CREATE (excludes sqlite_sequence).
@@ -644,12 +755,19 @@ impl VacuumTargetBuildContext {
             batch_rows: 0,
             batch_bytes: 0,
             batches_since_checkpoint: 0,
+            committed: false,
             schema_entries: Vec::new(),
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
             indexes_to_create: Vec::new(),
             post_data_entries: Vec::new(),
         }
+    }
+
+    /// Whether the target's final transaction committed, so the whole
+    /// copy is in the target whatever failed after.
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
     }
 
     pub(crate) fn cleanup_after_error(&mut self) -> Result<()> {
@@ -1373,6 +1491,7 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
+                state.committed = true;
                 state.target_conn.publish_schema_if_newer();
                 return Ok(crate::IOResult::Done(()));
             }

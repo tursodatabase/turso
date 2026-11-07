@@ -56,9 +56,17 @@ impl From<Version> for JournalMode {
     }
 }
 
+/// The MVCC logical log of the database at `db_path`: the database's path
+/// with its extension replaced by `db-log` (`a/b.db` → `a/b.db-log`,
+/// `a/b` → `a/b.db-log`). The one rule for the name, so that whatever
+/// else handles the log beside a database — `VACUUM INTO`'s temporary
+/// copy — finds the file [`open_mv_store`] writes.
+pub(crate) fn logical_log_path(db_path: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    db_path.as_ref().with_extension("db-log")
+}
+
 pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
-    let db_path = db_path.as_ref();
-    let log_path = db_path.with_extension("db-log");
+    let log_path = logical_log_path(db_path);
     std::path::Path::exists(log_path.as_path()) && log_path.as_path().metadata().unwrap().len() > 0
 }
 
@@ -86,8 +94,7 @@ pub fn open_mv_store(
         if let Some(storage) = durable_storage {
             storage
         } else {
-            let db_path = db_path.as_ref();
-            let log_path = db_path.with_extension("db-log");
+            let log_path = logical_log_path(db_path);
             let string_path = log_path
                 .as_os_str()
                 .to_str()
