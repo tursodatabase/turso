@@ -1,6 +1,10 @@
 # GRANT SELECT on tables through the PostgreSQL frontend.
 # PostgreSQL roles belong to the whole server, not to one database, so every
 # test uses its own role names.
+#
+# The privilege is stored in the relation's access control list, which
+# pg_class.relacl shows in PostgreSQL's aclitem[] form. The owner's default
+# entry lists every table privilege of PostgreSQL 17 and later.
 
 @database :memory:
 
@@ -263,4 +267,200 @@ test grant-select-to-pg-database-owner {
 }
 expect {
     1
+}
+
+# What GRANT stores: pg_class.relacl.
+
+test grant-select-is-stored-in-relacl {
+    CREATE ROLE gs_acl_reader;
+    CREATE TABLE gs_acl (id INT);
+    GRANT SELECT ON gs_acl TO gs_acl_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_reader=r/postgres}
+}
+
+test relacl-is-null-before-the-first-grant {
+    CREATE TABLE gs_untouched (id INT);
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'gs_untouched';
+}
+expect {
+    null
+}
+
+test grant-select-to-public-is-stored-with-an-empty-grantee {
+    CREATE TABLE gs_acl_public (id INT);
+    GRANT SELECT ON gs_acl_public TO PUBLIC;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_public';
+}
+expect {
+    {postgres=arwdDxtm/postgres,=r/postgres}
+}
+
+test grant-select-to-several-roles-is-stored-in-order {
+    CREATE ROLE gs_acl_first;
+    CREATE ROLE gs_acl_second;
+    CREATE TABLE gs_acl_many (id INT);
+    GRANT SELECT ON gs_acl_many TO gs_acl_first, PUBLIC, gs_acl_second;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_many';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_first=r/postgres,=r/postgres,gs_acl_second=r/postgres}
+}
+
+test grant-select-twice-is-stored-once {
+    CREATE ROLE gs_acl_twice;
+    CREATE TABLE gs_acl_twice_docs (id INT);
+    GRANT SELECT ON gs_acl_twice_docs TO gs_acl_twice;
+    GRANT SELECT ON gs_acl_twice_docs TO gs_acl_twice;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_twice_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_twice=r/postgres}
+}
+
+test grant-select-to-the-owner-stores-the-default-list {
+    CREATE TABLE gs_acl_owner (id INT);
+    GRANT SELECT ON gs_acl_owner TO postgres;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_owner';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test grant-select-to-a-mixed-case-role-is-stored-unquoted {
+    CREATE ROLE "GsAclCased";
+    CREATE TABLE gs_acl_cased (id INT);
+    GRANT SELECT ON gs_acl_cased TO "GsAclCased";
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_cased';
+}
+expect {
+    {postgres=arwdDxtm/postgres,GsAclCased=r/postgres}
+}
+
+test grant-select-on-sequence-is-stored-with-sequence-privileges {
+    CREATE ROLE gs_acl_seq_reader;
+    CREATE SEQUENCE gs_acl_seq;
+    GRANT SELECT ON gs_acl_seq TO gs_acl_seq_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_seq';
+}
+expect {
+    {postgres=rwU/postgres,gs_acl_seq_reader=r/postgres}
+}
+
+# Views are granted on too, which the Rust integration tests cover, because
+# pg_class does not list views yet.
+test grant-select-on-all-tables-in-schema-is-stored-on-each-table-but-not-sequences {
+    CREATE ROLE gs_acl_all;
+    CREATE TABLE gs_acl_all_a (id INT);
+    CREATE TABLE gs_acl_all_b (id INT);
+    CREATE SEQUENCE gs_acl_all_s;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO gs_acl_all;
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+    WHERE relname IN ('gs_acl_all_a', 'gs_acl_all_b', 'gs_acl_all_s') ORDER BY relname;
+}
+expect {
+    gs_acl_all_a|{postgres=arwdDxtm/postgres,gs_acl_all=r/postgres}
+    gs_acl_all_b|{postgres=arwdDxtm/postgres,gs_acl_all=r/postgres}
+    gs_acl_all_s|null
+}
+
+test grant-select-by-the-owner-names-the-owner-as-grantor {
+    CREATE ROLE gs_acl_owner_role;
+    CREATE ROLE gs_acl_owner_reader;
+    CREATE TABLE gs_acl_owned (id INT);
+    ALTER TABLE gs_acl_owned OWNER TO gs_acl_owner_role;
+    SET ROLE gs_acl_owner_role;
+    GRANT SELECT ON gs_acl_owned TO gs_acl_owner_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_owned';
+}
+expect {
+    {gs_acl_owner_role=arwdDxtm/gs_acl_owner_role,gs_acl_owner_reader=r/gs_acl_owner_role}
+}
+
+test grant-select-by-a-superuser-grants-as-the-owner {
+    CREATE ROLE gs_acl_su_owner;
+    CREATE ROLE gs_acl_su_reader;
+    CREATE TABLE gs_acl_su_owned (id INT);
+    ALTER TABLE gs_acl_su_owned OWNER TO gs_acl_su_owner;
+    GRANT SELECT ON gs_acl_su_owned TO gs_acl_su_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_su_owned';
+}
+expect {
+    {gs_acl_su_owner=arwdDxtm/gs_acl_su_owner,gs_acl_su_reader=r/gs_acl_su_owner}
+}
+
+test grant-select-by-a-role-without-privileges-fails {
+    CREATE ROLE gs_acl_stranger;
+    CREATE ROLE gs_acl_stranger_reader;
+    CREATE TABLE gs_acl_not_theirs (id INT);
+    SET ROLE gs_acl_stranger;
+    GRANT SELECT ON gs_acl_not_theirs TO gs_acl_stranger_reader;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_acl_not_theirs
+}
+
+# PostgreSQL warns that no privileges were granted and stores nothing.
+test grant-select-by-a-role-without-grant-option-stores-nothing {
+    CREATE ROLE gs_acl_no_option;
+    CREATE ROLE gs_acl_no_option_reader;
+    CREATE TABLE gs_acl_readable (id INT);
+    GRANT SELECT ON gs_acl_readable TO PUBLIC;
+    SET ROLE gs_acl_no_option;
+    GRANT SELECT ON gs_acl_readable TO gs_acl_no_option_reader;
+    SET ROLE postgres;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_readable';
+}
+expect {
+    {postgres=arwdDxtm/postgres,=r/postgres}
+}
+
+test owner-to-after-grant-puts-the-new-owner-in-the-list {
+    CREATE ROLE gs_acl_new_owner;
+    CREATE ROLE gs_acl_kept_reader;
+    CREATE TABLE gs_acl_handed_over (id INT);
+    GRANT SELECT ON gs_acl_handed_over TO gs_acl_kept_reader;
+    ALTER TABLE gs_acl_handed_over OWNER TO gs_acl_new_owner;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_handed_over';
+}
+expect {
+    {gs_acl_new_owner=arwdDxtm/gs_acl_new_owner,gs_acl_kept_reader=r/gs_acl_new_owner}
+}
+
+test grant-select-in-a-rolled-back-transaction-stores-nothing {
+    CREATE ROLE gs_acl_rolled_back;
+    CREATE TABLE gs_acl_rollback_docs (id INT);
+    BEGIN;
+    GRANT SELECT ON gs_acl_rollback_docs TO gs_acl_rolled_back;
+    ROLLBACK;
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'gs_acl_rollback_docs';
+}
+expect {
+    null
+}
+
+test grant-select-in-a-committed-transaction-is-stored {
+    CREATE ROLE gs_acl_committed;
+    CREATE TABLE gs_acl_commit_docs (id INT);
+    BEGIN;
+    GRANT SELECT ON gs_acl_commit_docs TO gs_acl_committed;
+    COMMIT;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_commit_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_committed=r/postgres}
+}
+
+test rename-after-grant-keeps-the-list {
+    CREATE ROLE gs_acl_renamed_reader;
+    CREATE TABLE gs_acl_before_rename (id INT);
+    GRANT SELECT ON gs_acl_before_rename TO gs_acl_renamed_reader;
+    ALTER TABLE gs_acl_before_rename RENAME TO gs_acl_after_rename;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_after_rename';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_renamed_reader=r/postgres}
 }

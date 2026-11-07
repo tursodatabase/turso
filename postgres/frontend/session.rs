@@ -617,7 +617,9 @@ enum DeferredOperation {
 
 enum DeferredCommand {
     Translated(ast::Cmd, String),
-    Namespace(ast::Stmt),
+    /// A statement the frontend built as an AST, with no text of its own
+    /// that a dialect parses: CREATE SCHEMA, DROP SCHEMA and GRANT.
+    Ast(ast::Stmt),
     Postgres(String),
     Sqlite(String),
 }
@@ -1114,8 +1116,7 @@ impl DeferredOperation {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        check_grant_select(conn, stmt)?;
-                        return Ok(None);
+                        grant_select_commands(conn, stmt)?
                     }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
@@ -1245,8 +1246,8 @@ impl CommandSequence {
                 conn.prepare_translated_cmd(cmd.clone(), sql)
                     .map_err(schema_error)?,
             ),
-            DeferredCommand::Namespace(stmt) => {
-                crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
+            DeferredCommand::Ast(stmt) => {
+                crate::Statement::new(conn.prepare_ast_stmt(stmt.clone())?)
             }
             DeferredCommand::Postgres(_) => {
                 prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
@@ -1265,7 +1266,7 @@ impl CommandSequence {
             DeferredCommand::Translated(_, sql)
             | DeferredCommand::Sqlite(sql)
             | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
-            DeferredCommand::Namespace(stmt) => stmt.to_string().into(),
+            DeferredCommand::Ast(stmt) => stmt.to_string().into(),
         }
     }
 
@@ -1774,9 +1775,8 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
-        // Every role may already read every table, so a GRANT SELECT by any
-        // role changes nothing. PostgreSQL also lets a role that may not
-        // grant run GRANT, and only warns that it granted nothing.
+        // Who may grant on each table is decided from its stored privileges
+        // when the engine's GRANT runs.
         FrontendStmt::GrantSelect(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
@@ -1805,11 +1805,15 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
     Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
-/// Checks that the tables and roles of a GRANT SELECT exist, with
-/// PostgreSQL's errors, tables first as in PostgreSQL. The grant itself
-/// changes nothing, because every role may already read every table.
-fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Result<()> {
-    match &stmt.tables {
+/// The engine GRANT that stores a GRANT SELECT, after checking that its
+/// tables and roles exist, with PostgreSQL's errors, tables first as in
+/// PostgreSQL. `ALL TABLES IN SCHEMA` names the tables, views and
+/// materialized views of each schema, and no statement when there are none.
+fn grant_select_commands(
+    conn: &Arc<Connection>,
+    stmt: &PgGrantSelectStmt,
+) -> Result<Vec<DeferredStatement>> {
+    let relations = match &stmt.tables {
         PgGrantTables::Named(tables) => {
             for table in tables {
                 if let Some(schema) = &table.schema {
@@ -1831,13 +1835,31 @@ fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Resul
                     }
                 }
             }
+            tables.iter().map(|table| table.name.clone()).collect()
         }
         PgGrantTables::AllInSchemas(schemas) => {
+            let mut relations = Vec::new();
             for schema in schemas {
                 check_schema_exists(conn, schema)?;
+                let schema = schema.to_lowercase();
+                relations.extend(
+                    schema_objects(conn, &schema)
+                        .into_iter()
+                        .filter_map(|object| match object {
+                            SchemaObject::Table(name) | SchemaObject::View(name) => Some(name),
+                            SchemaObject::Sequence(_) => None,
+                        })
+                        .map(|name| {
+                            ast::QualifiedName::fullname(
+                                ast::Name::exact(schema.clone()),
+                                ast::Name::exact(name),
+                            )
+                        }),
+                );
             }
+            relations
         }
-    }
+    };
     let roles = conn.role_catalog();
     for grantee in &stmt.roles {
         match grantee {
@@ -1846,10 +1868,20 @@ fn check_grant_select(conn: &Arc<Connection>, stmt: &PgGrantSelectStmt) -> Resul
             PgGrantee::Role(name) => {
                 find_role(&roles, name)?;
             }
-            PgGrantee::Public | PgGrantee::CurrentRole => {}
+            PgGrantee::Public | PgGrantee::CurrentRole | PgGrantee::SessionUser => {}
         }
     }
-    Ok(())
+    if relations.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            privileges: vec![ast::Privilege::Select],
+            relations,
+            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
+        })),
+        context: CommandContext::Default,
+    }])
 }
 
 fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
@@ -2191,7 +2223,7 @@ fn create_schema_commands(
     }
 
     let mut commands = vec![DeferredStatement {
-        command: DeferredCommand::Namespace(ast::Stmt::CreateSchema {
+        command: DeferredCommand::Ast(ast::Stmt::CreateSchema {
             name: ast::Name::exact(name.clone()),
         }),
         context: CommandContext::Default,
@@ -2235,7 +2267,7 @@ fn drop_schema_commands(
         })
         .collect();
     commands.push(DeferredStatement {
-        command: DeferredCommand::Namespace(ast::Stmt::DropSchema {
+        command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name),
         }),
         context: CommandContext::DropSchema,

@@ -428,6 +428,15 @@ fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i6
     }
 }
 
+/// The `pg_class.relacl` of relation `name`: its stored access control list,
+/// NULL until a `GRANT` touches it.
+fn relation_acl(schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
+    match crate::classes::relation_acl(schema, namespace, name) {
+        Some(acl) => Value::build_text(acl),
+        None => Value::Null,
+    }
+}
+
 /// The name of the role that owns relation `name`, for the owner columns of
 /// the information views, such as `pg_tables.tableowner`.
 fn relation_owner_name(
@@ -573,7 +582,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),         // relrewrite
                 Value::from_i64(0),         // relfrozenxid
                 Value::from_i64(0),         // relminmxid
-                Value::Null,                // relacl
+                relation_acl(&schema, *namespace, name), // relacl
                 Value::Null,                // reloptions
                 Value::Null,                // relpartbound
             ]);
@@ -652,7 +661,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),
                 Value::from_i64(0),
                 Value::from_i64(0),
-                Value::Null,
+                relation_acl(&schema, namespace, &sequence.name),
                 Value::Null,
                 Value::Null,
             ]);

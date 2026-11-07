@@ -7254,9 +7254,9 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// A GRANT SELECT statement on tables. Privileges are not stored: every role
-/// may already read every table, so granting SELECT changes nothing, and the
-/// statement only checks that its tables and roles exist.
+/// A GRANT SELECT statement on tables. The frontend checks that its tables
+/// and roles exist, expands `ALL TABLES IN SCHEMA`, and hands the engine a
+/// GRANT statement that stores the privilege with each table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgGrantSelectStmt {
     pub tables: PgGrantTables,
@@ -7299,14 +7299,29 @@ impl PgGrantTable {
 pub enum PgGrantee {
     /// `PUBLIC`, every role.
     Public,
-    /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`.
+    /// `CURRENT_ROLE` or `CURRENT_USER`: the role the session runs as now.
     CurrentRole,
+    /// `SESSION_USER`: the role the session logged in as.
+    SessionUser,
     /// A role by name.
     Role(String),
 }
 
-/// Extracts a GRANT SELECT statement on tables. Privileges are not stored, so
-/// any other GRANT, and REVOKE, are rejected rather than reported as done.
+impl PgGrantee {
+    /// The grantee as the engine's GRANT names it.
+    pub fn to_ast(&self) -> ast::Grantee {
+        match self {
+            PgGrantee::Public => ast::Grantee::Public,
+            PgGrantee::CurrentRole => ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+            PgGrantee::SessionUser => ast::Grantee::Role(ast::RoleSpec::SessionUser),
+            PgGrantee::Role(name) => ast::Grantee::Role(ast::RoleSpec::Name(name.clone())),
+        }
+    }
+}
+
+/// Extracts a GRANT SELECT statement on tables. Only SELECT on tables is
+/// stored, so any other GRANT, and REVOKE, are rejected rather than reported
+/// as done.
 pub fn try_extract_grant_select(
     parse_result: &ParseResult,
 ) -> Result<Option<PgGrantSelectStmt>, ParseError> {
@@ -7379,11 +7394,10 @@ pub fn try_extract_grant_select(
             };
             match RoleSpecType::try_from(role.roletype) {
                 Ok(RoleSpecType::RolespecPublic) => Ok(PgGrantee::Public),
-                Ok(
-                    RoleSpecType::RolespecCurrentRole
-                    | RoleSpecType::RolespecCurrentUser
-                    | RoleSpecType::RolespecSessionUser,
-                ) => Ok(PgGrantee::CurrentRole),
+                Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                    Ok(PgGrantee::CurrentRole)
+                }
+                Ok(RoleSpecType::RolespecSessionUser) => Ok(PgGrantee::SessionUser),
                 Ok(RoleSpecType::RolespecCstring) => Ok(PgGrantee::Role(role.rolename.clone())),
                 _ => Err(ParseError::ParseError("GRANT: unknown role kind".into())),
             }
@@ -12375,8 +12389,10 @@ mod tests {
         let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap());
 
         assert_eq!(
-            grant("GRANT SELECT ON t, app.\"Docs\" TO alice, \"Bob\", PUBLIC, CURRENT_USER")
-                .unwrap(),
+            grant(
+                "GRANT SELECT ON t, app.\"Docs\" TO alice, \"Bob\", PUBLIC, CURRENT_USER, SESSION_USER"
+            )
+            .unwrap(),
             Some(PgGrantSelectStmt {
                 tables: PgGrantTables::Named(vec![
                     PgGrantTable {
@@ -12395,6 +12411,7 @@ mod tests {
                     PgGrantee::Role("Bob".to_string()),
                     PgGrantee::Public,
                     PgGrantee::CurrentRole,
+                    PgGrantee::SessionUser,
                 ],
             })
         );
