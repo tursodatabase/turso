@@ -744,13 +744,6 @@ impl<'a> Resolver<'a> {
         self.catalog.resolve_existing_trigger(qualified_name)
     }
 
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.catalog.resolve_existing_sequence(seq_name)
-    }
-
     /// The namespace and bare name of the sequence whose mangled name is
     /// `mangled`.
     pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {

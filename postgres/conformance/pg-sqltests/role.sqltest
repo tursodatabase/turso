@@ -587,3 +587,406 @@ expect {
     readable
     readable
 }
+
+# Relation ownership: pg_class.relowner stores the owning role, ALTER ...
+# OWNER TO changes it, and the owner may drop and alter the relation.
+
+test relowner-is-the-creating-role {
+    CREATE TABLE ro_created (x int);
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_created';
+}
+expect {
+    postgres
+}
+
+test owner-to-stores-the-owner-for-pg-get-userbyid {
+    CREATE ROLE ro_alice;
+    CREATE TABLE ro_owned (x int);
+    ALTER TABLE ro_owned OWNER TO ro_alice;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_owned';
+}
+expect {
+    ro_alice
+}
+
+test owner-may-drop-the-table {
+    CREATE ROLE ro_dropper;
+    CREATE TABLE ro_to_drop (x int);
+    ALTER TABLE ro_to_drop OWNER TO ro_dropper;
+    SET ROLE ro_dropper;
+    DROP TABLE ro_to_drop;
+    SET ROLE postgres;
+    SELECT count(*) FROM pg_class WHERE relname = 'ro_to_drop';
+}
+expect {
+    0
+}
+
+# PostgreSQL also demands CREATE on the schema to rename, which Turso does
+# not have yet, so the rename runs as the superuser here; the owner-driven
+# rename is covered by the Rust integration tests.
+test rename-keeps-the-owner {
+    CREATE ROLE ro_renamer;
+    CREATE TABLE ro_to_rename (x int);
+    ALTER TABLE ro_to_rename OWNER TO ro_renamer;
+    ALTER TABLE ro_to_rename RENAME TO ro_renamed;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_renamed';
+}
+expect {
+    ro_renamer
+}
+
+test non-owner-may-not-drop-the-table {
+    CREATE ROLE ro_owner1;
+    CREATE ROLE ro_other1;
+    CREATE TABLE ro_guarded (x int);
+    ALTER TABLE ro_guarded OWNER TO ro_owner1;
+    SET ROLE ro_other1;
+    DROP TABLE ro_guarded;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table ro_guarded
+}
+
+test non-owner-may-not-alter-the-table {
+    CREATE ROLE ro_owner2;
+    CREATE ROLE ro_other2;
+    CREATE TABLE ro_guarded2 (x int);
+    ALTER TABLE ro_guarded2 OWNER TO ro_owner2;
+    SET ROLE ro_other2;
+    ALTER TABLE ro_guarded2 RENAME TO ro_stolen;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table ro_guarded2
+}
+
+test owner-may-not-transfer-ownership-yet {
+    CREATE ROLE ro_owner3;
+    CREATE ROLE ro_other3;
+    CREATE TABLE ro_guarded3 (x int);
+    ALTER TABLE ro_guarded3 OWNER TO ro_owner3;
+    SET ROLE ro_owner3;
+    ALTER TABLE ro_guarded3 OWNER TO ro_other3;
+}
+@sqlstate 42501
+expect error {}
+
+test owner-to-a-missing-role-fails {
+    CREATE TABLE ro_no_role (x int);
+    ALTER TABLE ro_no_role OWNER TO ro_missing_role;
+}
+@sqlstate 42704
+expect error {
+    role "ro_missing_role" does not exist
+}
+
+test owner-to-on-a-missing-table-fails {
+    ALTER TABLE ro_missing_table OWNER TO postgres;
+}
+@sqlstate 42P01
+expect error {
+    relation "ro_missing_table" does not exist
+}
+
+test owner-to-if-exists-tolerates-a-missing-table {
+    ALTER TABLE IF EXISTS ro_missing_table2 OWNER TO postgres;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+# ALTER INDEX ... OWNER TO changes nothing, as in PostgreSQL, so the count
+# checks only the sequence.
+test owner-to-works-on-views-and-sequences {
+    CREATE ROLE ro_kinds;
+    CREATE TABLE ro_base (x int);
+    CREATE VIEW ro_view AS SELECT x FROM ro_base;
+    CREATE SEQUENCE ro_seq;
+    CREATE INDEX ro_idx ON ro_base (x);
+    ALTER VIEW ro_view OWNER TO ro_kinds;
+    ALTER SEQUENCE ro_seq OWNER TO ro_kinds;
+    ALTER INDEX ro_idx OWNER TO ro_kinds;
+    SET ROLE ro_kinds;
+    DROP VIEW ro_view;
+    SET ROLE postgres;
+    SELECT count(*) FROM pg_class WHERE relname = 'ro_seq'
+    AND pg_get_userbyid(relowner) = 'ro_kinds';
+}
+expect {
+    1
+}
+
+test pg-tables-and-pg-sequences-report-the-owner {
+    CREATE ROLE ro_reporter;
+    CREATE TABLE ro_reported (x int);
+    CREATE SEQUENCE ro_reported_seq;
+    ALTER TABLE ro_reported OWNER TO ro_reporter;
+    ALTER SEQUENCE ro_reported_seq OWNER TO ro_reporter;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'ro_reported';
+    SELECT sequenceowner FROM pg_sequences WHERE sequencename = 'ro_reported_seq';
+}
+expect {
+    ro_reporter
+    ro_reporter
+}
+
+test owner-may-not-index-another-schemas-table-of-the-same-name {
+    CREATE ROLE ro_indexer;
+    CREATE SCHEMA ro_other_schema;
+    CREATE TABLE ro_same_name (x int);
+    CREATE TABLE ro_other_schema.ro_same_name (x int);
+    ALTER TABLE ro_same_name OWNER TO ro_indexer;
+    SET ROLE ro_indexer;
+    CREATE INDEX ro_sneaky ON ro_other_schema.ro_same_name (x);
+}
+@sqlstate 42501
+expect error {}
+
+test owner-to-on-a-table-moves-its-indexes-and-serial-sequences {
+    CREATE ROLE ro_bob;
+    CREATE TABLE ro_moved (id serial, x int UNIQUE);
+    CREATE INDEX ro_moved_i ON ro_moved (x);
+    ALTER TABLE ro_moved OWNER TO ro_bob;
+    SET ROLE ro_bob;
+    DROP INDEX ro_moved_i;
+    SET ROLE postgres;
+    SELECT count(*) FROM pg_class
+    WHERE relname IN ('ro_moved', 'ro_moved_id_seq')
+    AND pg_get_userbyid(relowner) = 'ro_bob';
+}
+expect {
+    2
+}
+
+test alter-index-owner-to-keeps-the-tables-owner {
+    CREATE ROLE ro_index_role;
+    CREATE TABLE ro_index_t (x int);
+    CREATE INDEX ro_index_i ON ro_index_t (x);
+    ALTER INDEX ro_index_i OWNER TO ro_index_role;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_index_i';
+}
+expect {
+    postgres
+}
+
+test alter-sequence-owner-to-refuses-a-table {
+    CREATE ROLE ro_kind_role;
+    CREATE TABLE ro_not_a_seq (x int);
+    ALTER SEQUENCE ro_not_a_seq OWNER TO ro_kind_role;
+}
+@sqlstate 42809
+expect error {
+    "ro_not_a_seq" is not a sequence
+}
+
+test alter-view-owner-to-refuses-a-table {
+    CREATE ROLE ro_kind_role2;
+    CREATE TABLE ro_not_a_view (x int);
+    ALTER VIEW ro_not_a_view OWNER TO ro_kind_role2;
+}
+@sqlstate 42809
+expect error {
+    "ro_not_a_view" is not a view
+}
+
+test an-index-a-superuser-creates-belongs-to-the-tables-owner {
+    CREATE ROLE ro_table_owner;
+    CREATE TABLE ro_owned_table (id int);
+    ALTER TABLE ro_owned_table OWNER TO ro_table_owner;
+    CREATE INDEX ro_owned_table_i ON ro_owned_table (id);
+    SET ROLE ro_table_owner;
+    DROP INDEX ro_owned_table_i;
+    SET ROLE postgres;
+    SELECT count(*) FROM pg_class WHERE relname = 'ro_owned_table_i';
+}
+expect {
+    0
+}
+
+test owner-may-not-rename-without-create-on-the-schema {
+    CREATE ROLE ro_renamer2;
+    CREATE TABLE ro_owned_rename (x int);
+    ALTER TABLE ro_owned_rename OWNER TO ro_renamer2;
+    SET ROLE ro_renamer2;
+    ALTER TABLE ro_owned_rename RENAME TO ro_owned_renamed;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test owner-may-not-index-without-create-on-the-schema {
+    CREATE ROLE ro_indexer2;
+    CREATE TABLE ro_owned_index (x int);
+    ALTER TABLE ro_owned_index OWNER TO ro_indexer2;
+    SET ROLE ro_indexer2;
+    CREATE INDEX ro_owned_index_i ON ro_owned_index (x);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test alter-sequence-owner-to-refuses-a-serial-sequence {
+    CREATE ROLE ro_serial_role;
+    CREATE TABLE ro_serial (id serial);
+    ALTER SEQUENCE ro_serial_id_seq OWNER TO ro_serial_role;
+}
+@sqlstate 0A000
+expect error {
+    cannot change owner of sequence "ro_serial_id_seq"
+}
+
+test a-sequence-a-default-draws-from-is-not-the-tables {
+    CREATE ROLE ro_seq_owner;
+    CREATE ROLE ro_table_owner2;
+    CREATE SEQUENCE ro_standalone_seq;
+    CREATE TABLE ro_draws (a int DEFAULT nextval('ro_standalone_seq'));
+    ALTER SEQUENCE ro_standalone_seq OWNER TO ro_seq_owner;
+    ALTER TABLE ro_draws OWNER TO ro_table_owner2;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_standalone_seq';
+}
+expect {
+    ro_seq_owner
+}
+
+test owner-to-after-renames-still-moves-the-serial-sequence {
+    CREATE ROLE ro_after_rename;
+    CREATE TABLE ro_st (id serial);
+    ALTER TABLE ro_st RENAME TO ro_su;
+    ALTER TABLE ro_su RENAME COLUMN id TO ident;
+    ALTER TABLE ro_su OWNER TO ro_after_rename;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_st_id_seq';
+}
+expect {
+    ro_after_rename
+}
+
+test a-serial-sequence-keeps-refusing-its-own-owner-to-after-a-rename {
+    CREATE ROLE ro_after_rename2;
+    CREATE TABLE ro_st2 (id serial);
+    ALTER TABLE ro_st2 RENAME TO ro_su2;
+    ALTER SEQUENCE ro_st2_id_seq OWNER TO ro_after_rename2;
+}
+@sqlstate 0A000
+expect error {
+    cannot change owner of sequence "ro_st2_id_seq"
+}
+
+test a-sequence-named-like-a-serial-one-is-not-the-tables {
+    CREATE ROLE ro_named_like;
+    CREATE SEQUENCE ro_nl_a_seq;
+    CREATE TABLE ro_nl (a int DEFAULT nextval('ro_nl_a_seq'));
+    ALTER SEQUENCE ro_nl_a_seq OWNER TO ro_named_like;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_nl_a_seq';
+}
+expect {
+    ro_named_like
+}
+
+test owned-by-links-a-sequence-to-a-table {
+    CREATE ROLE ro_linked;
+    CREATE SEQUENCE ro_link_seq;
+    CREATE TABLE ro_link_t (a int);
+    ALTER SEQUENCE ro_link_seq OWNED BY ro_link_t.a;
+    ALTER TABLE ro_link_t OWNER TO ro_linked;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_link_seq';
+}
+expect {
+    ro_linked
+}
+
+test owned-by-none-frees-a-serial-sequence {
+    CREATE ROLE ro_freed;
+    CREATE TABLE ro_free_t (id serial);
+    ALTER SEQUENCE ro_free_t_id_seq OWNED BY NONE;
+    ALTER SEQUENCE ro_free_t_id_seq OWNER TO ro_freed;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_free_t_id_seq';
+}
+expect {
+    ro_freed
+}
+
+test owned-by-refuses-a-table-of-another-owner {
+    CREATE ROLE ro_other_owner;
+    CREATE SEQUENCE ro_mismatch_seq;
+    CREATE TABLE ro_mismatch_t (a int);
+    ALTER TABLE ro_mismatch_t OWNER TO ro_other_owner;
+    ALTER SEQUENCE ro_mismatch_seq OWNED BY ro_mismatch_t.a;
+}
+@sqlstate 55000
+expect error {
+    sequence must have same owner as table it is linked to
+}
+
+test owned-by-a-missing-table-is-an-error {
+    CREATE SEQUENCE ro_orphan_seq;
+    ALTER SEQUENCE ro_orphan_seq OWNED BY ro_no_such_table.a;
+}
+@sqlstate 42P01
+expect error {
+    relation "ro_no_such_table" does not exist
+}
+
+test owned-by-a-missing-column-is-an-error {
+    CREATE SEQUENCE ro_orphan_seq2;
+    CREATE TABLE ro_has_no_b (a int);
+    ALTER SEQUENCE ro_orphan_seq2 OWNED BY ro_has_no_b.b;
+}
+@sqlstate 42703
+expect error {
+    column "b" of relation "ro_has_no_b" does not exist
+}
+
+test a-sequence-named-like-an-engine-table-is-a-relation-of-its-own {
+    CREATE ROLE ro_sqlite_named;
+    CREATE SEQUENCE sqlite_ro_seq;
+    ALTER SEQUENCE sqlite_ro_seq OWNER TO ro_sqlite_named;
+    SELECT relkind, pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'sqlite_ro_seq';
+}
+expect {
+    S|ro_sqlite_named
+}
+
+test owner-to-the-owner-a-serial-sequence-has-changes-nothing {
+    CREATE TABLE ro_same_owner (id serial);
+    ALTER SEQUENCE ro_same_owner_id_seq OWNER TO postgres;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_same_owner_id_seq';
+}
+expect {
+    postgres
+}
+
+test alter-index-owner-to-a-missing-role-is-an-error {
+    CREATE TABLE ro_index_role (x int);
+    CREATE INDEX ro_index_role_i ON ro_index_role (x);
+    ALTER INDEX ro_index_role_i OWNER TO ro_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "ro_no_such_role" does not exist
+}
+
+test the-owner-may-give-its-table-to-itself {
+    CREATE ROLE ro_self;
+    CREATE TABLE ro_self_t (x int);
+    ALTER TABLE ro_self_t OWNER TO ro_self;
+    SET ROLE ro_self;
+    ALTER TABLE ro_self_t OWNER TO CURRENT_USER;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_self_t';
+}
+expect {
+    ro_self
+}
+
+test owner-to-public-is-an-error {
+    CREATE TABLE ro_public_t (x int);
+    ALTER TABLE ro_public_t OWNER TO public;
+}
+@sqlstate 42704
+expect error {
+    role "public" does not exist
+}

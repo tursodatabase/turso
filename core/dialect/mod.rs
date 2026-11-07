@@ -17,13 +17,62 @@ pub mod engine;
 
 pub(crate) use engine::EngineDialect;
 
-use crate::schema::{BTreeTable, Schema};
-use crate::{Connection, Func, LimboError, OpenOptions, Result, Value};
-use turso_parser::ast::{Cmd, CreateTableBody, QualifiedName, Stmt};
+use crate::{
+    namespace::NamespaceId,
+    schema::{BTreeTable, RelationKind, Schema},
+    security::roles::RoleId,
+    vdbe::builder::ProgramBuilder,
+    Connection, Func, LimboError, OpenOptions, Result, Value,
+};
+use std::{any::Any, sync::Arc};
+use turso_parser::ast::{Cmd, CreateTableBody, QualifiedName, RoleSpec, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
+
+/// A change a statement makes to a relation of the main database. DDL
+/// translation tells the dialect about it through
+/// [`Dialect::translate_relation_changes`], and the dialect's own bytecode
+/// tells it back through [`Dialect::apply_relation_change`] once the change
+/// is written.
+#[derive(Debug, Clone)]
+pub enum RelationChange {
+    Create {
+        namespace: NamespaceId,
+        name: String,
+        kind: RelationKind,
+        /// For an index, the table it is on, in the same namespace. Its
+        /// owner owns the index.
+        table: Option<String>,
+    },
+    Drop {
+        namespace: NamespaceId,
+        name: String,
+    },
+    Rename {
+        namespace: NamespaceId,
+        old_name: String,
+        new_name: String,
+    },
+    /// Whom the relation belongs to from now on.
+    ChangeOwner {
+        namespace: NamespaceId,
+        name: String,
+        owner: NewOwner,
+    },
+}
+
+/// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
+#[derive(Debug, Clone)]
+pub enum NewOwner {
+    /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
+    /// table.column` names one for a sequence, or no table. What a table
+    /// owns changes owner with it, and not on its own.
+    Table(Option<String>),
+    /// A role, as `ALTER ... OWNER TO` names one.
+    Role(RoleSpec),
+}
 
 /// SQL dialect layered on top of the engine.
 ///
@@ -198,12 +247,128 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a relation name is unique within its schema across kinds, so
+    /// that a table and a sequence cannot share one. PostgreSQL's are.
+    /// SQLite lets a sequence take a table's name, and keeps its own rules
+    /// for tables, views and indexes.
+    fn relation_names_unique_across_kinds(&self) -> bool {
+        false
+    }
+
     /// Whether a database of this dialect stores roles in the roles table.
     ///
     /// SQLite has no roles, so a table named like the roles table is an
     /// ordinary table.
     fn supports_roles(&self) -> bool {
         false
+    }
+
+    /// SQL that reads the dialect's own schema state, such as the PostgreSQL
+    /// frontend's relation catalog table, or None when this database keeps
+    /// none. The statement runs with engine semantics after the schema rows
+    /// load, and its rows go to [`Dialect::build_schema_state`].
+    fn schema_state_query(&self, schema: &Schema) -> Option<String> {
+        let _ = schema;
+        None
+    }
+
+    /// Builds [`Schema::dialect_schema`] from the rows that
+    /// [`Dialect::schema_state_query`] returned. `schema` is the schema the
+    /// state is built for, already holding every other object.
+    fn build_schema_state(
+        &self,
+        schema: &Schema,
+        rows: &[Vec<Value>],
+    ) -> Result<Arc<dyn Any + Send + Sync>> {
+        let _ = (schema, rows);
+        Err(LimboError::InternalError(
+            "the dialect queried schema state it cannot build".to_string(),
+        ))
+    }
+
+    /// Translates `changes`, which the statement being compiled makes, into
+    /// the bytecode that records them in the dialect's own schema state, in
+    /// the same transaction as the statement's `sqlite_schema` rows. A table
+    /// comes with its automatic indexes in one call. Does nothing for a
+    /// dialect without schema state of its own, except that such a dialect
+    /// has no ownership and refuses `ALTER ... OWNER TO` and
+    /// `ALTER SEQUENCE ... OWNED BY`.
+    fn translate_relation_changes(
+        &self,
+        program: &mut ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        changes: &[RelationChange],
+    ) -> Result<()> {
+        let _ = (program, schema, connection);
+        for change in changes {
+            match change {
+                RelationChange::ChangeOwner {
+                    owner: NewOwner::Role(_),
+                    ..
+                } => {
+                    return Err(LimboError::ParseError(
+                        "ALTER ... OWNER TO is not supported".to_string(),
+                    ));
+                }
+                RelationChange::ChangeOwner {
+                    owner: NewOwner::Table(_),
+                    ..
+                } => {
+                    return Err(LimboError::ParseError(
+                        "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies `change`, which the running statement wrote to the dialect's
+    /// schema state, to the in-memory copy in `schema`. `values` are the
+    /// registers the dialect named when it emitted the instruction, such as
+    /// the id its state gave a created relation.
+    fn apply_relation_change(
+        &self,
+        schema: &mut Schema,
+        change: &RelationChange,
+        values: &[Value],
+    ) -> Result<()> {
+        let _ = (schema, change, values);
+        Ok(())
+    }
+
+    /// Whether relations can be created, renamed or dropped in an attached
+    /// database. The PostgreSQL frontend refuses it: its relation catalog
+    /// covers only the main database, so a database file with relations
+    /// made while it was attached could not be opened later.
+    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
+        true
+    }
+
+    /// The role that owns relation `name` of `namespace`, when the dialect
+    /// stores ownership. None means ownership is unknown, and only a
+    /// superuser may drop or alter the relation.
+    fn relation_owner(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<RoleId> {
+        let _ = (schema, namespace, name);
+        None
+    }
+
+    /// Whether `PRAGMA capture_data_changes_conn` may create its change
+    /// tables in a database of this dialect.
+    ///
+    /// The PostgreSQL frontend refuses it: CDC tables are created at run
+    /// time, outside the DDL that maintains the dialect's schema state, so
+    /// the PostgreSQL frontend would have relations missing from its
+    /// relation catalog.
+    fn supports_capture_data_changes(&self) -> bool {
+        true
     }
 
     /// The namespaces of a database that has never created or dropped one.

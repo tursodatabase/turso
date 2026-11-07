@@ -1,3 +1,4 @@
+use crate::dialect::RelationChange;
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -6,6 +7,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+
+use crate::schema::RelationKind;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
@@ -1221,6 +1224,9 @@ pub fn translate_create_table(
         );
     }
 
+    if relation_name_is_taken(resolver, namespace, &normalized_tbl_name, if_not_exists)? {
+        return Ok(());
+    }
     // Check for name conflicts with existing schema objects
     if let Some(object_type) = resolver.with_schema(database_id, |s| {
         s.get_object_type(namespace.id, &normalized_tbl_name)
@@ -1375,11 +1381,15 @@ pub fn translate_create_table(
     // the schema dialect format the SQL to store (the SQLite dialect renders
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
+    // The resolver's dialect is the one the statement was parsed with: the
+    // engine's own for an engine schema statement, which stores plain SQLite
+    // text, the connection's otherwise.
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else if bound_sequence_names {
-        connection
-            .dialect()
+        resolver
+            .catalog
+            .dialect
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
@@ -1387,8 +1397,9 @@ pub fn translate_create_table(
                 body: body.clone(),
             })?
     } else {
-        connection
-            .dialect()
+        resolver
+            .catalog
+            .dialect
             .format_table_sql(input, &tbl_name_in_sql, &body)?
     };
 
@@ -1474,6 +1485,7 @@ pub fn translate_create_table(
         Some(sql),
     )?;
 
+    let mut autoindex_names = vec![];
     if let Some(index_regs) = index_regs {
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
@@ -1492,7 +1504,31 @@ pub fn translate_create_table(
                 index_reg,
                 None,
             )?;
+            autoindex_names.push(index_name);
         }
+    }
+
+    if dialect_relation_hooks_apply(connection, database_id)? {
+        let mut changes = vec![RelationChange::Create {
+            namespace: namespace.id,
+            name: normalized_tbl_name.clone(),
+            kind: RelationKind::Table,
+            table: None,
+        }];
+        for index_name in autoindex_names {
+            changes.push(RelationChange::Create {
+                namespace: namespace.id,
+                name: index_name,
+                kind: RelationKind::Index,
+                table: Some(normalized_tbl_name.clone()),
+            });
+        }
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &changes,
+        )?;
     }
 
     // Create the backing table for the hidden AUTOINCREMENT sequence. The
@@ -2441,6 +2477,25 @@ pub fn translate_drop_table(
             .cloned()
             .collect()
     });
+
+    // Dropping a table also drops its indexes, the automatic ones among
+    // them, so the dialect hears about all of them.
+    if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
+        let mut changes = vec![RelationChange::Drop {
+            namespace: namespace.id,
+            name: normalize_ident(name),
+        }];
+        changes.extend(indices.iter().map(|index| RelationChange::Drop {
+            namespace: namespace.id,
+            name: index.name.clone(),
+        }));
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &changes,
+        )?;
+    }
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -3097,6 +3152,64 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
+}
+
+/// Whether the statement tells the dialect about the relations it creates,
+/// renames or drops, through the [`crate::Dialect`] relation hooks. Only new
+/// DDL of a user against the main database does: a nested statement replays
+/// stored schema text, as VACUUM does when it copies a database, and the
+/// MVCC bootstrap connection replays log entries; both carry the dialect's
+/// schema state as data already. Relations of other databases, temp among
+/// them, have no dialect schema state. Fails for DDL of a user against an
+/// attached database when the dialect does not allow it.
+pub(crate) fn dialect_relation_hooks_apply(
+    connection: &Arc<Connection>,
+    database_id: usize,
+) -> Result<bool> {
+    if connection.is_nested_stmt() || connection.is_mvcc_bootstrap_connection() {
+        return Ok(false);
+    }
+    if crate::is_attached_db(database_id)
+        && !connection
+            .db
+            .dialect()
+            .supports_relation_ddl_in_attached_databases()
+    {
+        bail_parse_error!(
+            "creating, renaming or dropping relations in an attached database is not supported"
+        );
+    }
+    Ok(database_id == MAIN_DB_ID)
+}
+
+/// Whether a relation of `namespace` already has `name`, in a dialect whose
+/// relation names are unique per schema across kinds. Ok(true) when
+/// `if_not_exists` makes the statement skip; an error when the name is
+/// taken and the statement has no IF NOT EXISTS; Ok(false) when the name
+/// is free, or the dialect keeps its own, kind-specific rules.
+pub(crate) fn relation_name_is_taken(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    name: &str,
+    if_not_exists: bool,
+) -> Result<bool> {
+    if !resolver
+        .catalog
+        .dialect
+        .relation_names_unique_across_kinds()
+    {
+        return Ok(false);
+    }
+    let taken = resolver.with_schema(namespace.database_id, |schema| {
+        schema.relation_kind(namespace.id, name).is_some()
+    });
+    if !taken {
+        return Ok(false);
+    }
+    if if_not_exists {
+        return Ok(true);
+    }
+    bail_parse_error!("relation \"{name}\" already exists")
 }
 
 pub fn translate_create_type(

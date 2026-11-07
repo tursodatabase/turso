@@ -1942,6 +1942,15 @@ pub enum Insn {
         name: String,
         superuser: bool,
     },
+    /// Tell the dialect that a relation of database `db` changed, after the
+    /// statement wrote the dialect's own schema state for it, so the
+    /// in-memory copy follows. `value_regs` name the registers the dialect
+    /// reads back, such as the id its state gave a created relation.
+    RelationChange {
+        db: usize,
+        change: Box<crate::dialect::RelationChange>,
+        value_regs: Vec<usize>,
+    },
 
     /// Close a cursor.
     Close {
@@ -2596,6 +2605,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::RelationChange => execute::op_relation_change,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2743,6 +2753,7 @@ impl Insn {
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::AddRole { .. }
+            | Self::RelationChange { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }
