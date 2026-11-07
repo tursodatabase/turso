@@ -5905,6 +5905,19 @@ impl BTreeTable {
         }
     }
 
+    /// Removes the column constraints of a column that is being dropped.
+    /// Does not remove the column itself.
+    pub(crate) fn drop_column_constraints(&mut self, column_name: &str) {
+        let column_name = normalize_ident(column_name);
+        self.check_constraints.retain(|c| {
+            c.column
+                .as_ref()
+                .is_none_or(|col| normalize_ident(col) != column_name)
+        });
+        self.foreign_keys
+            .retain(|fk| !fk.is_inline || normalize_ident(&fk.child_columns[0]) != column_name);
+    }
+
     /// Fill in what custom type columns get from their type:
     /// - SQLite's name-based type/affinity rules use the BASE type instead of
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
@@ -6157,6 +6170,19 @@ impl BTreeTable {
                     sql.push_str(&check_constraint.sql());
                 }
             }
+
+            for fk in self.foreign_keys.iter().filter(|fk| {
+                fk.is_inline
+                    && normalize_ident(&fk.child_columns[0]) == normalize_ident(column_name)
+            }) {
+                sql.push(' ');
+                if let Some(name) = &fk.constraint_name {
+                    sql.push_str("CONSTRAINT ");
+                    sql.push_str(&quote_ident(name));
+                    sql.push(' ');
+                }
+                push_references_clause(&mut sql, fk);
+            }
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
@@ -6234,7 +6260,7 @@ impl BTreeTable {
             push_table_pk(&mut sql);
         }
 
-        for fk in &self.foreign_keys {
+        for fk in self.foreign_keys.iter().filter(|fk| !fk.is_inline) {
             sql.push_str(", ");
             if let Some(name) = &fk.constraint_name {
                 sql.push_str("CONSTRAINT ");
@@ -6248,43 +6274,8 @@ impl BTreeTable {
                 }
                 sql.push_str(&quote_ident(col));
             }
-            sql.push_str(") REFERENCES ");
-            sql.push_str(&quote_ident(&fk.parent_table));
-            if !fk.parent_columns.is_empty() {
-                sql.push('(');
-                for (i, col) in fk.parent_columns.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&quote_ident(col));
-                }
-                sql.push(')');
-            }
-
-            // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
-            if fk.on_delete != RefAct::NoAction {
-                sql.push_str(" ON DELETE ");
-                sql.push_str(match fk.on_delete {
-                    RefAct::SetNull => "SET NULL",
-                    RefAct::SetDefault => "SET DEFAULT",
-                    RefAct::Cascade => "CASCADE",
-                    RefAct::Restrict => "RESTRICT",
-                    _ => "",
-                });
-            }
-            if fk.on_update != RefAct::NoAction {
-                sql.push_str(" ON UPDATE ");
-                sql.push_str(match fk.on_update {
-                    RefAct::SetNull => "SET NULL",
-                    RefAct::SetDefault => "SET DEFAULT",
-                    RefAct::Cascade => "CASCADE",
-                    RefAct::Restrict => "RESTRICT",
-                    _ => "",
-                });
-            }
-            if fk.deferred {
-                sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
-            }
+            sql.push_str(") ");
+            push_references_clause(&mut sql, fk);
         }
 
         // Add table-level CHECK constraints (column-level ones were emitted inline above)
@@ -6540,6 +6531,46 @@ impl BTreeTable {
             }
         }
         Ok(deps)
+    }
+}
+
+fn push_references_clause(sql: &mut String, fk: &ForeignKey) {
+    sql.push_str("REFERENCES ");
+    sql.push_str(&quote_ident(&fk.parent_table));
+    if !fk.parent_columns.is_empty() {
+        sql.push('(');
+        for (i, col) in fk.parent_columns.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&quote_ident(col));
+        }
+        sql.push(')');
+    }
+
+    // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
+    if fk.on_delete != RefAct::NoAction {
+        sql.push_str(" ON DELETE ");
+        sql.push_str(match fk.on_delete {
+            RefAct::SetNull => "SET NULL",
+            RefAct::SetDefault => "SET DEFAULT",
+            RefAct::Cascade => "CASCADE",
+            RefAct::Restrict => "RESTRICT",
+            _ => "",
+        });
+    }
+    if fk.on_update != RefAct::NoAction {
+        sql.push_str(" ON UPDATE ");
+        sql.push_str(match fk.on_update {
+            RefAct::SetNull => "SET NULL",
+            RefAct::SetDefault => "SET DEFAULT",
+            RefAct::Cascade => "CASCADE",
+            RefAct::Restrict => "RESTRICT",
+            _ => "",
+        });
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
     }
 }
 
@@ -7330,6 +7361,7 @@ pub fn create_table(
                             .unwrap_or(RefAct::NoAction),
                         deferred,
                         decl_order: table_fk_order,
+                        is_inline: false,
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
@@ -7793,6 +7825,9 @@ pub struct ForeignKey {
     ///
     /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
     pub decl_order: usize,
+    /// True if declared as a `REFERENCES` column constraint rather than a
+    /// table-level `FOREIGN KEY` constraint.
+    pub is_inline: bool,
 }
 #[inline]
 fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
@@ -7855,6 +7890,7 @@ impl ForeignKey {
                 d.deferrable && matches!(d.init_deferred, Some(InitDeferredPred::InitiallyDeferred))
             }),
             decl_order,
+            is_inline: true,
         })
     }
 
