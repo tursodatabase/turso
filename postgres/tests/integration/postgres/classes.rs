@@ -380,7 +380,9 @@ fn relacl(conn: &turso_pg::Connection, relname: &str) -> Option<String> {
     }
 }
 
-/// The stored access control list of `relname`, read from the catalog table.
+/// The stored access control list of `relname`, read from the catalog
+/// table, where roles are oids: 10 is the superuser and the first created
+/// role is 16385.
 fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
     let rows = conn
         .prepare(format!(
@@ -407,9 +409,10 @@ fn grant_select_stores_the_list_in_the_file_and_it_survives_a_reopen(db: TempDat
     assert_eq!(stored_relacl(&conn, "t"), None);
 
     pg.execute("GRANT SELECT ON t, v TO reader").unwrap();
+    let stored = "{10=arwdDxtm/10,16385=r/10}";
     let list = "{postgres=arwdDxtm/postgres,reader=r/postgres}";
-    assert_eq!(stored_relacl(&conn, "t").as_deref(), Some(list));
-    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(list));
+    assert_eq!(stored_relacl(&conn, "t").as_deref(), Some(stored));
+    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(stored));
     assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
 
     drop(pg);
@@ -417,7 +420,7 @@ fn grant_select_stores_the_list_in_the_file_and_it_survives_a_reopen(db: TempDat
     let db = db.reopen();
     let pg = db.connect_postgres();
     let conn = db.connect_limbo();
-    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(list));
+    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(stored));
     assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
     // The reopened database keeps granting on the stored list.
     pg.execute("GRANT SELECT ON t TO PUBLIC").unwrap();
@@ -516,9 +519,14 @@ fn a_catalog_made_before_relacl_gets_the_column_when_opened() {
 
     pg.execute("CREATE ROLE reader").unwrap();
     pg.execute("GRANT SELECT ON app.t TO reader").unwrap();
-    let list = "{postgres=arwdDxtm/postgres,reader=r/postgres}";
-    assert_eq!(stored_relacl(&conn, "t").as_deref(), Some(list));
-    assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
+    assert_eq!(
+        stored_relacl(&conn, "t").as_deref(),
+        Some("{10=arwdDxtm/10,16385=r/10}")
+    );
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}")
+    );
 }
 
 #[test]

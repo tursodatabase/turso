@@ -78,7 +78,8 @@ list, which `pg_class.relacl` shows in PostgreSQL's form: after
 `GRANT SELECT ON accounts TO reader` by the owner `postgres`, it reads
 `{postgres=arwdDxtm/postgres,reader=r/postgres}`. The list is `NULL` until
 the first `GRANT`, when the owner has every privilege and nobody else has
-any, as in PostgreSQL.
+any, as in PostgreSQL. `pg_class` does not list views yet, so a view's list
+is stored but not shown.
 
 **Parameters:**
 

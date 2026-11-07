@@ -48,8 +48,8 @@ use turso_parser::ast;
 use turso_core::MAIN_DB_ID;
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
-use crate::acl::{Acl, PUBLIC_GRANTEE};
-use crate::catalog::PG_DATABASE_OWNER_NAME;
+use crate::acl::{Acl, PUBLIC_OID};
+use crate::catalog::{role_oid, role_oid_by_name};
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -417,7 +417,7 @@ pub(crate) fn relation_owner(
 }
 
 /// [`turso_core::Dialect::role_may_read`] for the PostgreSQL frontend: the
-/// owner may, and so may a role the list gives SELECT, by name or through
+/// owner may, and so may a role the list gives SELECT, by oid or through
 /// PUBLIC. A relation without a class row is the engine's, such as a catalog
 /// table, and everyone reads it.
 pub(crate) fn role_may_read(
@@ -431,23 +431,20 @@ pub(crate) fn role_may_read(
     else {
         return true;
     };
-    if class.relowner == role {
-        return true;
-    }
-    let (Some(acl), Ok(role_name)) = (&class.relacl, role_name(schema, role)) else {
-        return false;
-    };
-    acl.grants(&role_name, ast::Privilege::Select)
+    class.relowner == role
+        || class
+            .relacl
+            .as_ref()
+            .is_some_and(|acl| acl.grants(role_oid(role), ast::Privilege::Select))
 }
 
-/// The access control list of relation `name` of `namespace` in the text
-/// form of `pg_class.relacl`, or None when no `GRANT` has touched it.
-pub(crate) fn relation_acl(schema: &Schema, namespace: NamespaceId, name: &str) -> Option<String> {
+/// The access control list of relation `name` of `namespace`, or None when
+/// no `GRANT` has touched it.
+pub(crate) fn relation_acl(schema: &Schema, namespace: NamespaceId, name: &str) -> Option<Acl> {
     class_catalog(schema)?
         .get_by_name(namespace, name)?
         .relacl
-        .as_ref()
-        .map(Acl::to_string)
+        .clone()
 }
 
 /// An integer the emitted instruction read back from a register.
@@ -638,15 +635,13 @@ pub(crate) fn translate_relation_changes(
                         })
                         .map(|index| (*namespace, index.name.clone())),
                 );
-                let old_owner_name = role_name(schema, class.relowner)?;
-                let new_owner_name = role_name(schema, owner)?;
                 for (other_namespace, other_name) in with_it {
                     // The new owner takes the old one's place in the list.
                     let acl = class_catalog(schema)
                         .and_then(|catalog| catalog.get_by_name(other_namespace, &other_name))
                         .and_then(|other| other.relacl.clone())
                         .map(|mut acl| {
-                            acl.change_owner(&old_owner_name, &new_owner_name);
+                            acl.change_owner(role_oid(class.relowner), role_oid(owner));
                             acl
                         });
                     emit_class_row_set_owner(
@@ -677,11 +672,11 @@ pub(crate) fn translate_relation_changes(
                 else {
                     continue;
                 };
-                let owner_name = role_name(schema, class.relowner)?;
+                let owner = role_oid(class.relowner);
                 let mut acl = class
                     .relacl
                     .clone()
-                    .unwrap_or_else(|| Acl::default_for(class.relkind, &owner_name));
+                    .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
                 // Only the owner may grant, and a superuser grants as the
                 // owner. As in PostgreSQL, anyone else is refused when the
                 // list gives it nothing on the relation, and grants nothing
@@ -689,8 +684,7 @@ pub(crate) fn translate_relation_changes(
                 let may_grant = connection.current_role_is_superuser()
                     || class.relowner == connection.current_role();
                 if !may_grant {
-                    let current_role_name = role_name(schema, connection.current_role())?;
-                    if acl.gives_anything_to(&current_role_name) {
+                    if acl.gives_anything_to(role_oid(connection.current_role())) {
                         continue;
                     }
                     return Err(LimboError::PermissionDenied(Box::new(
@@ -698,7 +692,7 @@ pub(crate) fn translate_relation_changes(
                     )));
                 }
                 for grantee in &grantees {
-                    acl.grant(grantee, privileges, &owner_name);
+                    acl.grant(*grantee, privileges, owner);
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;
@@ -719,51 +713,20 @@ fn relation_object(class: &RelationClass) -> Object {
     }
 }
 
-/// The name a `GRANT` stores for `grantee`: a role's name, or
-/// [`PUBLIC_GRANTEE`]. A role must exist, except `pg_database_owner`, which
-/// `pg_roles` lists without its being a role of the engine.
+/// The role oid a `GRANT` stores for `grantee`, [`PUBLIC_OID`] for
+/// everyone. A named role must exist.
 fn resolve_grantee(
     schema: &Schema,
     connection: &Arc<Connection>,
     grantee: &ast::Grantee,
-) -> turso_core::Result<String> {
+) -> turso_core::Result<i64> {
     Ok(match grantee {
-        ast::Grantee::Public => PUBLIC_GRANTEE.to_string(),
-        ast::Grantee::Role(ast::RoleSpec::CurrentRole) => {
-            role_name(schema, connection.current_role())?
-        }
-        ast::Grantee::Role(ast::RoleSpec::SessionUser) => {
-            role_name(schema, connection.session_role())?
-        }
-        ast::Grantee::Role(ast::RoleSpec::Name(name)) => {
-            let exists = name == BOOTSTRAP_SUPERUSER_NAME
-                || name == PG_DATABASE_OWNER_NAME
-                || schema.roles.get_by_name(name).is_some();
-            if !exists {
-                return Err(LimboError::ParseError(format!(
-                    "role \"{name}\" does not exist"
-                )));
-            }
-            name.clone()
-        }
+        ast::Grantee::Public => PUBLIC_OID,
+        ast::Grantee::Role(ast::RoleSpec::CurrentRole) => role_oid(connection.current_role()),
+        ast::Grantee::Role(ast::RoleSpec::SessionUser) => role_oid(connection.session_role()),
+        ast::Grantee::Role(ast::RoleSpec::Name(name)) => role_oid_by_name(&schema.roles, name)
+            .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
     })
-}
-
-/// The name of role `id`, as an access control list names it.
-fn role_name(schema: &Schema, id: RoleId) -> turso_core::Result<String> {
-    if id == RoleId::SUPERUSER {
-        return Ok(BOOTSTRAP_SUPERUSER_NAME.to_string());
-    }
-    schema
-        .roles
-        .get(id)
-        .map(|role| role.name.clone())
-        .ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "{CLASSES_TABLE_NAME} names role {} which does not exist",
-                id.get()
-            ))
-        })
 }
 
 /// The role `ALTER ... OWNER TO new_owner` gives relation `name` of
@@ -1147,10 +1110,10 @@ fn emit_class_row_set_acl(
     });
 }
 
-/// Puts `acl` in its text form, or NULL for none, in a new register.
+/// Puts `acl` in its stored form, or NULL for none, in a new register.
 fn emit_acl(program: &mut ProgramBuilder, acl: Option<&Acl>) -> usize {
     match acl {
-        Some(acl) => program.emit_string8_new_reg(acl.to_string()),
+        Some(acl) => program.emit_string8_new_reg(acl.stored_text()),
         None => {
             let acl_reg = program.alloc_register();
             program.emit_insn(Insn::Null {

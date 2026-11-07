@@ -438,11 +438,16 @@ fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i6
     }
 }
 
-/// The `pg_class.relacl` of relation `name`: its stored access control list,
-/// NULL until a `GRANT` touches it.
-fn relation_acl(schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
+/// The `pg_class.relacl` of relation `name`: its stored access control list
+/// with the roles named, NULL until a `GRANT` touches it.
+fn relation_acl(conn: &Connection, schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
     match crate::classes::relation_acl(schema, namespace, name) {
-        Some(acl) => Value::build_text(acl),
+        Some(acl) => {
+            let roles = conn.role_catalog();
+            Value::build_text(acl.display_text(&|oid| {
+                role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
+            }))
+        }
         None => Value::Null,
     }
 }
@@ -592,7 +597,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),         // relrewrite
                 Value::from_i64(0),         // relfrozenxid
                 Value::from_i64(0),         // relminmxid
-                relation_acl(&schema, *namespace, name), // relacl
+                relation_acl(conn, &schema, *namespace, name), // relacl
                 Value::Null,                // reloptions
                 Value::Null,                // relpartbound
             ]);
@@ -671,7 +676,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),
                 Value::from_i64(0),
                 Value::from_i64(0),
-                relation_acl(&schema, namespace, &sequence.name),
+                relation_acl(conn, &schema, namespace, &sequence.name),
                 Value::Null,
                 Value::Null,
             ]);
@@ -923,6 +928,29 @@ pub(crate) fn role_oid(id: RoleId) -> i64 {
 /// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.
 /// `public` is not a role in PostgreSQL, only a name for [RoleId::PUBLIC] in
 /// access control lists.
+/// The name of the role with PostgreSQL oid `oid`, including
+/// `pg_database_owner`, which `pg_roles` lists without its being a role of
+/// the engine.
+pub(crate) fn role_name_by_oid(roles: &RoleCatalog, oid: i64) -> Option<String> {
+    if oid == PG_DATABASE_OWNER_OID {
+        return Some(PG_DATABASE_OWNER_NAME.to_string());
+    }
+    postgres_roles(roles)
+        .find(|role| role_oid(role.id) == oid)
+        .map(|role| role.name)
+}
+
+/// The PostgreSQL oid of the role named `name`, the inverse of
+/// [`role_name_by_oid`].
+pub(crate) fn role_oid_by_name(roles: &RoleCatalog, name: &str) -> Option<i64> {
+    if name == PG_DATABASE_OWNER_NAME {
+        return Some(PG_DATABASE_OWNER_OID);
+    }
+    postgres_roles(roles)
+        .find(|role| role.name == name)
+        .map(|role| role_oid(role.id))
+}
+
 pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> + '_ {
     let superuser = Role {
         id: RoleId::SUPERUSER,
