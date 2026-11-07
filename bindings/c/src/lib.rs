@@ -209,12 +209,33 @@ struct sqlite3Inner {
     pub(crate) p_err: Option<CString>,
     pub(crate) filename: CString,
     pub(crate) stmt_list: *mut sqlite3_stmt,
-    /// Set when the caller opened "" and we created a private on-disk
-    /// database for it; the file is removed when the handle goes away.
+    /// Set when an empty decoded path needs a private on-disk database;
+    /// the file is removed when the handle goes away.
     pub(crate) temp_path: Option<std::path::PathBuf>,
 }
 
 impl sqlite3Inner {
+    fn new(conn: Option<Arc<turso_core::Connection>>, filename: CString) -> Self {
+        let e_open_state = if conn.is_some() {
+            SQLITE_STATE_OPEN
+        } else {
+            SQLITE_STATE_SICK
+        };
+        Self {
+            conn,
+            err_code: SQLITE_OK,
+            // Extended result codes are disabled by default, as in SQLite;
+            // sqlite3_extended_result_codes() widens the mask.
+            err_mask: 0xff,
+            malloc_failed: false,
+            e_open_state,
+            p_err: None,
+            filename,
+            stmt_list: std::ptr::null_mut(),
+            temp_path: None,
+        }
+    }
+
     fn connection(&self) -> Option<&Arc<turso_core::Connection>> {
         if matches!(self.e_open_state, SQLITE_STATE_OPEN | SQLITE_STATE_BUSY) {
             self.conn.as_ref()
@@ -244,19 +265,7 @@ impl sqlite3 {
     pub fn new(conn: Arc<turso_core::Connection>, filename: CString) -> Self {
         #[cfg(feature = "csv")]
         register_csv_module(&conn);
-        let inner = sqlite3Inner {
-            conn: Some(conn),
-            err_code: SQLITE_OK,
-            // Extended result codes are disabled by default, as in SQLite;
-            // sqlite3_extended_result_codes() widens the mask.
-            err_mask: 0xff,
-            malloc_failed: false,
-            e_open_state: SQLITE_STATE_OPEN,
-            p_err: None,
-            filename,
-            stmt_list: std::ptr::null_mut(),
-            temp_path: None,
-        };
+        let inner = sqlite3Inner::new(Some(conn), filename);
         Self {
             inner: Mutex::new(inner),
         }
@@ -707,17 +716,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
 }
 
 unsafe fn failed_open(db_out: *mut *mut sqlite3, code: i32, message: &str) -> i32 {
-    let mut inner = sqlite3Inner {
-        conn: None,
-        err_code: code,
-        err_mask: 0xff,
-        malloc_failed: false,
-        e_open_state: SQLITE_STATE_SICK,
-        p_err: None,
-        filename: CString::default(),
-        stmt_list: std::ptr::null_mut(),
-        temp_path: None,
-    };
+    let mut inner = sqlite3Inner::new(None, CString::default());
     set_db_err_msg(&mut inner, code, message);
     *db_out = sqlite3 {
         inner: Mutex::new(inner),

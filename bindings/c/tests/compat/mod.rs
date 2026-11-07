@@ -495,6 +495,97 @@ mod tests {
     }
 
     #[test]
+    fn readonly_connections_can_begin_reserved_transactions_without_writing() {
+        unsafe {
+            for keep_writer_open in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("readonly-transactions.db");
+                let filename = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                let mut writer = ptr::null_mut();
+                assert_eq!(sqlite3_open(filename.as_ptr(), &mut writer), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_exec(
+                        writer,
+                        c"CREATE TABLE t(x); INSERT INTO t VALUES(7)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                if !keep_writer_open {
+                    assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                }
+                let uri =
+                    std::ffi::CString::new(format!("file:{}?mode=ro", path.display())).unwrap();
+                let mut reader = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(
+                        uri.as_ptr(),
+                        &mut reader,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+                        ptr::null()
+                    ),
+                    SQLITE_OK
+                );
+                for begin in [c"BEGIN IMMEDIATE", c"BEGIN EXCLUSIVE"] {
+                    assert_eq!(sqlite3_get_autocommit(reader), 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            begin.as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK,
+                        "{begin:?}, cached writer={keep_writer_open}"
+                    );
+                    assert_eq!(sqlite3_get_autocommit(reader), 0);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"INSERT INTO t VALUES(9)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        8
+                    );
+                    assert_eq!(sqlite3_get_autocommit(reader), 0);
+                    scalar_query(reader, "SELECT count(*) FROM t", 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"COMMIT".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_get_autocommit(reader), 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"INSERT INTO t VALUES(9)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        8
+                    );
+                }
+                assert_eq!(sqlite3_close(reader), SQLITE_OK);
+                if keep_writer_open {
+                    scalar_query(writer, "SELECT count(*) FROM t", 1);
+                    assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn uri_encoded_readonly_restricts_a_reused_writer() {
         unsafe {
             let dir = tempfile::tempdir().unwrap();
