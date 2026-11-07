@@ -257,6 +257,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `CREATE TABLE` reads each column DEFAULT that is a quoted
+    /// string as a value of the column's type, and fails when the type
+    /// rejects it.
+    ///
+    /// PostgreSQL does, so `uuid DEFAULT 'nope'` fails at CREATE TABLE. SQLite
+    /// accepts any default and fails at each INSERT that uses it.
+    fn checks_string_defaults_at_create(&self) -> bool {
+        false
+    }
+
     /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
     /// in its indexed terms.
     ///
