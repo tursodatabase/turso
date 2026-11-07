@@ -448,6 +448,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    /// Whether RETURNING on `UPDATE ... FROM` can read the FROM tables.
+    ///
+    /// PostgreSQL allows it, and its `RETURNING *` includes their columns.
+    /// SQLite's RETURNING sees only the updated table.
+    fn returning_reads_from_tables(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

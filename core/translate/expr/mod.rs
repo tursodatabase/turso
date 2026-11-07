@@ -117,7 +117,7 @@ pub use emission::{
 };
 pub(crate) use emission::{
     emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
-    seed_returning_row_image_in_cache,
+    seed_returning_from_values_in_cache, seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
 pub(crate) use translator::is_sqlite_cast_to;
