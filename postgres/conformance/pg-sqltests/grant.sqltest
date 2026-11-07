@@ -185,6 +185,15 @@ expect error {
     schema "gs_no_such_schema" does not exist
 }
 
+test grant-select-on-all-tables-in-an-empty-schema-checks-the-role {
+    CREATE SCHEMA gs_empty_schema;
+    GRANT SELECT ON ALL TABLES IN SCHEMA gs_empty_schema TO gs_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "gs_no_such_role" does not exist
+}
+
 test grant-select-to-missing-role-fails {
     CREATE TABLE gs_missing_role_docs (id INT);
     GRANT SELECT ON gs_missing_role_docs TO gs_no_such_role;

@@ -12,7 +12,6 @@ use crate::settings::{
     SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
-use turso_core::schema::SchemaObjectType;
 use turso_core::schema::Table;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::{Role, RoleCatalog};
@@ -26,7 +25,7 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -1247,7 +1246,7 @@ impl CommandSequence {
                     .map_err(schema_error)?,
             ),
             DeferredCommand::Ast(stmt) => {
-                crate::Statement::new(conn.prepare_ast_stmt(stmt.clone())?)
+                crate::Statement::new(conn.prepare_ast_stmt(stmt.clone()).map_err(schema_error)?)
             }
             DeferredCommand::Postgres(_) => {
                 prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
@@ -1805,38 +1804,16 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
     Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
-/// The engine GRANT that stores a GRANT SELECT, after checking that its
-/// tables and roles exist, with PostgreSQL's errors, tables first as in
-/// PostgreSQL. `ALL TABLES IN SCHEMA` names the tables, views and
-/// materialized views of each schema, and no statement when there are none.
+/// The engine GRANT that stores a GRANT SELECT. The engine checks the
+/// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
+/// TABLES IN SCHEMA` names the tables, views and materialized views of each
+/// schema, and no statement when there are none.
 fn grant_select_commands(
     conn: &Arc<Connection>,
     stmt: &PgGrantSelectStmt,
 ) -> Result<Vec<DeferredStatement>> {
     let relations = match &stmt.tables {
-        PgGrantTables::Named(tables) => {
-            for table in tables {
-                if let Some(schema) = &table.schema {
-                    check_schema_exists(conn, schema)?;
-                }
-                match relation_type(conn, &table.name) {
-                    Some(RelationType::Index) => {
-                        return Err(sqlstate_error(
-                            SQLSTATE_WRONG_OBJECT_TYPE,
-                            format!("\"{}\" is an index", table.relname),
-                        ))
-                    }
-                    Some(RelationType::Readable) => {}
-                    None => {
-                        return Err(sqlstate_error(
-                            SQLSTATE_UNDEFINED_TABLE,
-                            format!("relation \"{}\" does not exist", table.written_name()),
-                        ))
-                    }
-                }
-            }
-            tables.iter().map(|table| table.name.clone()).collect()
-        }
+        PgGrantTables::Named(tables) => tables.clone(),
         PgGrantTables::AllInSchemas(schemas) => {
             let mut relations = Vec::new();
             for schema in schemas {
@@ -1860,18 +1837,20 @@ fn grant_select_commands(
             relations
         }
     };
-    let roles = conn.role_catalog();
-    for grantee in &stmt.roles {
-        match grantee {
-            // pg_roles lists it, so PostgreSQL scripts grant to it.
-            PgGrantee::Role(name) if name == catalog::PG_DATABASE_OWNER_NAME => {}
-            PgGrantee::Role(name) => {
-                find_role(&roles, name)?;
-            }
-            PgGrantee::Public | PgGrantee::CurrentRole | PgGrantee::SessionUser => {}
-        }
-    }
     if relations.is_empty() {
+        // With nothing to grant on, the roles are still checked, as in
+        // PostgreSQL; otherwise the dialect checks them.
+        let roles = conn.role_catalog();
+        for grantee in &stmt.roles {
+            if let PgGrantee::Role(name) = grantee {
+                if catalog::role_oid_by_name(&roles, name).is_none() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_UNDEFINED_OBJECT,
+                        format!("role \"{name}\" does not exist"),
+                    ));
+                }
+            }
+        }
         return Ok(Vec::new());
     }
     Ok(vec![DeferredStatement {
@@ -1892,35 +1871,6 @@ fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
         SQLSTATE_INVALID_SCHEMA_NAME,
         format!("schema \"{schema}\" does not exist"),
     ))
-}
-
-enum RelationType {
-    /// A table, view, materialized view or sequence.
-    Readable,
-    Index,
-}
-
-/// The type of the relation `name`, looked up in its schema, or in the search
-/// path when it has none.
-fn relation_type(conn: &Arc<Connection>, name: &ast::QualifiedName) -> Option<RelationType> {
-    let schema = name.namespace.as_ref().map(|schema| schema.as_str());
-    relation_lookup_namespaces(conn, schema)
-        .iter()
-        .find_map(|namespace| {
-            conn.with_schema(namespace.database_id(), |schema| {
-                let id = namespace.target.id;
-                let name = name.name.as_str();
-                match schema.get_object_type(id, name) {
-                    Some(SchemaObjectType::Index) => Some(RelationType::Index),
-                    Some(SchemaObjectType::Table | SchemaObjectType::View) => {
-                        Some(RelationType::Readable)
-                    }
-                    None => (schema.is_materialized_view(id, name)
-                        || schema.get_sequence(id, name).is_some())
-                    .then_some(RelationType::Readable),
-                }
-            })
-        })
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {

@@ -7266,32 +7266,12 @@ pub struct PgGrantSelectStmt {
 /// The tables of a GRANT SELECT statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgGrantTables {
-    /// `ON [TABLE] t, s.u`.
-    Named(Vec<PgGrantTable>),
+    /// `ON [TABLE] t, s.u`: the names the tables have in the engine, as for
+    /// any other statement, so that `pg_catalog.pg_class` names the catalog
+    /// table.
+    Named(Vec<ast::QualifiedName>),
     /// `ON ALL TABLES IN SCHEMA s, ...`: the schemas.
     AllInSchemas(Vec<String>),
-}
-
-/// A table named in a GRANT statement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PgGrantTable {
-    /// The schema as written, if one was.
-    pub schema: Option<String>,
-    /// The table name as written.
-    pub relname: String,
-    /// The name the table has in the engine, as for any other statement, so
-    /// that `pg_catalog.pg_class` names the catalog table.
-    pub name: ast::QualifiedName,
-}
-
-impl PgGrantTable {
-    /// The name as written, with its schema if one was written.
-    pub fn written_name(&self) -> String {
-        match &self.schema {
-            Some(schema) => format!("{schema}.{}", self.relname),
-            None => self.relname.clone(),
-        }
-    }
 }
 
 /// A role that a GRANT gives a privilege to.
@@ -7360,11 +7340,9 @@ pub fn try_extract_grant_select(
                 .objects
                 .iter()
                 .map(|object| match &object.node {
-                    Some(Node::RangeVar(table)) => Ok(PgGrantTable {
-                        schema: (!table.schemaname.is_empty()).then(|| table.schemaname.clone()),
-                        relname: table.relname.clone(),
-                        name: PostgreSQLTranslator::new().qualified_name_from_range_var(table)?,
-                    }),
+                    Some(Node::RangeVar(table)) => {
+                        PostgreSQLTranslator::new().qualified_name_from_range_var(table)
+                    }
                     _ => Err(ParseError::ParseError(
                         "GRANT: unexpected table node".into(),
                     )),
@@ -12395,16 +12373,8 @@ mod tests {
             .unwrap(),
             Some(PgGrantSelectStmt {
                 tables: PgGrantTables::Named(vec![
-                    PgGrantTable {
-                        schema: None,
-                        relname: "t".to_string(),
-                        name: ast::QualifiedName::single(exact_name("t")),
-                    },
-                    PgGrantTable {
-                        schema: Some("app".to_string()),
-                        relname: "Docs".to_string(),
-                        name: ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
-                    },
+                    ast::QualifiedName::single(exact_name("t")),
+                    ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
                 ]),
                 roles: vec![
                     PgGrantee::Role("alice".to_string()),
@@ -12431,7 +12401,7 @@ mod tests {
         let names = |sql: &str| match grant(sql).unwrap().tables {
             PgGrantTables::Named(tables) => tables
                 .into_iter()
-                .map(|table| table.name.to_string())
+                .map(|table| table.to_string())
                 .collect::<Vec<_>>(),
             PgGrantTables::AllInSchemas(_) => unreachable!("tables are named"),
         };

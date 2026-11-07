@@ -367,10 +367,18 @@ pub fn translate_grant(
     let mut changes = Vec::with_capacity(grant.relations.len());
     for qualified_name in &grant.relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
+        // A schema that does not exist is reported as such, not as a
+        // missing relation.
+        if qualified_name.namespace.is_some() {
+            resolver.resolve_namespace(qualified_name)?;
+        }
         let Some((namespace, kind)) =
             crate::translate::alter::owned_relation(resolver, qualified_name, &normalized_name)
         else {
-            bail_parse_error!("relation \"{normalized_name}\" does not exist");
+            bail_parse_error!(
+                "relation \"{}\" does not exist",
+                crate::util::table_name_for_error(qualified_name)
+            );
         };
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");

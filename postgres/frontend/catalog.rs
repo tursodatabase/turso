@@ -924,10 +924,6 @@ pub(crate) fn role_oid(id: RoleId) -> i64 {
     }
 }
 
-/// The roles that PostgreSQL has: its bootstrap superuser, which is the
-/// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.
-/// `public` is not a role in PostgreSQL, only a name for [RoleId::PUBLIC] in
-/// access control lists.
 /// The name of the role with PostgreSQL oid `oid`, including
 /// `pg_database_owner`, which `pg_roles` lists without its being a role of
 /// the engine.
@@ -951,6 +947,10 @@ pub(crate) fn role_oid_by_name(roles: &RoleCatalog, name: &str) -> Option<i64> {
         .map(|role| role_oid(role.id))
 }
 
+/// The roles that PostgreSQL has: its bootstrap superuser, which is the
+/// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.
+/// `public` is not a role in PostgreSQL, only a name for [RoleId::PUBLIC] in
+/// access control lists.
 pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> + '_ {
     let superuser = Role {
         id: RoleId::SUPERUSER,
