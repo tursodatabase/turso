@@ -547,6 +547,42 @@ fn test_cdc_custom_table(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn test_cdc_switch_custom_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id,cdc_a')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id,cdc_b')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM cdc_a"));
+    assert_eq!(rows, vec![v2_row(1, "t", 1, None, None, None), v2_commit()]);
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM cdc_b"));
+    assert_eq!(rows, vec![v2_row(1, "t", 2, None, None, None), v2_commit()]);
+    conn.execute("PRAGMA capture_data_changes_conn('id,CDC_B')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version ORDER BY table_name",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("cdc_a".to_string()),
+                Value::Text(CDC_VERSION_CURRENT.to_string()),
+            ],
+            vec![
+                Value::Text("cdc_b".to_string()),
+                Value::Text(CDC_VERSION_CURRENT.to_string()),
+            ],
+        ]
+    );
+}
+
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
 fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
