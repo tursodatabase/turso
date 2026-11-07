@@ -2192,6 +2192,67 @@ expect pattern {
     \d+\.\d+\.\d+
 }
 
+test sqlite-compileoption-used-math-functions {
+    SELECT sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS'),
+           sqlite_compileoption_used('sqlite_enable_math_functions'),
+           sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS' || char(0) || 'x');
+}
+expect {
+    1|1|1
+}
+
+test sqlite-compileoption-used-needs-the-whole-name {
+    SELECT sqlite_compileoption_used('ENABLE_MATH'),
+           sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS=1'),
+           sqlite_compileoption_used('SQLITE_SQLITE_ENABLE_MATH_FUNCTIONS'),
+           sqlite_compileoption_used(''),
+           sqlite_compileoption_used('NO_SUCH_OPTION'),
+           sqlite_compileoption_used(1);
+}
+expect {
+    0|0|0|0|0|0
+}
+
+test sqlite-compileoption-used-null {
+    SELECT typeof(sqlite_compileoption_used(NULL)), typeof(sqlite_compileoption_used('x'));
+}
+expect {
+    null|integer
+}
+
+test sqlite-compileoption-get-out-of-range {
+    SELECT typeof(sqlite_compileoption_get(-1)),
+           typeof(sqlite_compileoption_get(1000000)),
+           typeof(sqlite_compileoption_get(0));
+}
+expect {
+    null|null|text
+}
+
+test sqlite-compileoption-get-reads-argument-as-integer {
+    SELECT sqlite_compileoption_get(0) = sqlite_compileoption_get(NULL),
+           sqlite_compileoption_get(0) = sqlite_compileoption_get('0'),
+           sqlite_compileoption_get(0) = sqlite_compileoption_get(0.9),
+           sqlite_compileoption_get(0) = sqlite_compileoption_get(4294967296);
+}
+expect {
+    1|1|1|1
+}
+
+test sqlite-compileoption-used-wrong-argument-count {
+    SELECT sqlite_compileoption_used();
+}
+expect error {
+    wrong number of arguments to function sqlite_compileoption_used()
+}
+
+test sqlite-compileoption-get-wrong-argument-count {
+    SELECT sqlite_compileoption_get(1, 2);
+}
+expect error {
+    wrong number of arguments to function sqlite_compileoption_get()
+}
+
 test cast-large-text-to-numeric {
     SELECT typeof(CAST('9223372036854775808' AS NUMERIC)), CAST('9223372036854775808' AS NUMERIC);
 }

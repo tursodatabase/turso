@@ -381,8 +381,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | rtrim(X,Y)                   | ✅ Yes     |                                                      |
 | sign(X)                      | ✅ Yes     |                                                      |
 | soundex(X)                   | ✅ Yes     |                                                      |
-| sqlite_compileoption_get(N)  | ❌ No      |                                                      |
-| sqlite_compileoption_used(X) | ❌ No      |                                                      |
+| sqlite_compileoption_get(N)  | ✅ Yes     | Lists only the options whose features Turso has      |
+| sqlite_compileoption_used(X) | ✅ Yes     | Lists only the options whose features Turso has      |
 | sqlite_offset(X)             | ❌ No      |                                                      |
 | sqlite_source_id()           | ✅ Yes     |                                                      |
 | sqlite_version()             | ✅ Yes     |                                                      |

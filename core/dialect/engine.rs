@@ -30,6 +30,16 @@ pub const SQLITE_VERSION: &str = "3.50.4";
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
 pub const SQLITE_VERSION_NUMBER: i32 = 3_050_004;
 
+/// SQLite compile-time options whose features this build has, reported by
+/// `sqlite_compileoption_used()` and `sqlite_compileoption_get()`. Programs
+/// such as Django check these to decide which functions to define themselves.
+/// Sorted by name, like SQLite's own list.
+pub const COMPILE_OPTIONS: &[&str] = &[
+    "ENABLE_MATH_FUNCTIONS",
+    #[cfg(feature = "percentile")]
+    "ENABLE_PERCENTILE",
+];
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
@@ -442,6 +452,8 @@ pub(crate) fn resolve_builtin_function_name(
         "sqlite_version" => Ok(Some(Func::Scalar(ScalarFunc::SqliteVersion))),
         "turso_version" => Ok(Some(Func::Scalar(ScalarFunc::TursoVersion))),
         "sqlite_source_id" => Ok(Some(Func::Scalar(ScalarFunc::SqliteSourceId))),
+        "sqlite_compileoption_used" => Ok(Some(Func::Scalar(ScalarFunc::SqliteCompileOptionUsed))),
+        "sqlite_compileoption_get" => Ok(Some(Func::Scalar(ScalarFunc::SqliteCompileOptionGet))),
         "replace" => Ok(Some(Func::Scalar(ScalarFunc::Replace))),
         "likely" => Ok(Some(Func::Scalar(ScalarFunc::Likely))),
         "likelihood" => Ok(Some(Func::Scalar(ScalarFunc::Likelihood))),

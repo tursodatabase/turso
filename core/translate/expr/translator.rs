@@ -1549,6 +1549,8 @@ fn translate_function_call_expr(
                 | ScalarFunc::Sign
                 | ScalarFunc::Soundex
                 | ScalarFunc::ZeroBlob
+                | ScalarFunc::SqliteCompileOptionUsed
+                | ScalarFunc::SqliteCompileOptionGet
                 | ScalarFunc::SequenceWatermark => {
                     let args = expect_arguments_exact!(args, 1, srf);
                     let start_reg = program.alloc_register();
