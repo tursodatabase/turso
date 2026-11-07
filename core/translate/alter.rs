@@ -16,7 +16,7 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        self, check_column_type, validate_check_expr, validate_default_expr,
+        self, check_column_type, check_functions_exist, validate_check_expr, validate_default_expr,
         validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
@@ -1299,6 +1299,12 @@ pub fn translate_alter_table(
                 column.resolve_custom_type(resolver.schema())?;
                 let ty = column_type(&column, true, resolver.schema());
                 key_collation(column.text_collation(), &ty, resolver.schema())?;
+            }
+
+            if let Some(default) = &column.default {
+                if resolver.catalog.dialect.checks_functions_exist_at_create() {
+                    check_functions_exist(default, &resolver.catalog)?;
+                }
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
