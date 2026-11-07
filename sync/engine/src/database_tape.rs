@@ -25,6 +25,7 @@ pub struct DatabaseTape {
     pragma_query: String,
     cdc_version: std::sync::RwLock<Option<turso_core::CdcVersion>>,
     disable_auto_checkpoint: bool,
+    encryption_key: Option<turso_core::EncryptionKey>,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
@@ -161,17 +162,26 @@ impl DatabaseTape {
             pragma_query,
             cdc_version: std::sync::RwLock::new(None),
             disable_auto_checkpoint: opts.disable_auto_checkpoint,
+            encryption_key: None,
         }
     }
+    pub fn with_encryption_key(mut self, key: Option<turso_core::EncryptionKey>) -> Self {
+        self.encryption_key = key;
+        self
+    }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self
+            .inner
+            .connect(ConnectOpts::new().with_encryption_key(self.encryption_key.clone()))?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self
+            .inner
+            .connect(ConnectOpts::new().with_encryption_key(self.encryption_key.clone()))?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
@@ -232,7 +242,9 @@ impl DatabaseTape {
         opts: DatabaseChangesIteratorOpts,
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
-        let conn = self.inner.connect(ConnectOpts::new())?;
+        let conn = self
+            .inner
+            .connect(ConnectOpts::new().with_encryption_key(self.encryption_key.clone()))?;
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
