@@ -714,7 +714,10 @@ pub(crate) struct VacuumCommitBatch {
 
 impl VacuumCommitBatch {
     /// What `VACUUM INTO` uses: a commit costs ~2 × its data in memory, so
-    /// this bounds the copy's peak at a few tens of MB whatever the size.
+    /// this bounds the rows' share of the copy's peak at a few tens of MB
+    /// whatever the size. Each index is a transaction of its own (one
+    /// CREATE INDEX statement, which cannot be split), so with indexes the
+    /// peak is that or ~2 × the largest index, whichever is more.
     pub const VACUUM_INTO: Self = Self {
         rows: 20_000,
         bytes: 8 * 1024 * 1024,
@@ -768,6 +771,30 @@ impl VacuumTargetBuildContext {
     /// copy is in the target whatever failed after.
     pub(crate) fn committed(&self) -> bool {
         self.committed
+    }
+
+    /// Commits the target's transaction and opens the next, so the commit
+    /// path never holds more than what was written since the last commit.
+    /// Every `checkpoint_every_batches` commits — or at once, when
+    /// `checkpoint` asks — the target WAL is truncate-checkpointed first,
+    /// which resets its frame index (`frame_cache`) and the `-wal` file —
+    /// auto-actions are off on the target, so nothing else does. Nothing
+    /// reads the target while it is built, so the truncate always
+    /// completes.
+    fn commit_batch(&mut self, batch: VacuumCommitBatch, checkpoint: bool) -> Result<()> {
+        self.target_conn.execute("COMMIT")?;
+        self.batches_since_checkpoint += 1;
+        if checkpoint || self.batches_since_checkpoint >= batch.checkpoint_every_batches {
+            self.target_conn
+                .checkpoint(crate::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })?;
+            self.batches_since_checkpoint = 0;
+        }
+        self.target_conn.execute("BEGIN IMMEDIATE")?;
+        self.batch_rows = 0;
+        self.batch_bytes = 0;
+        Ok(())
     }
 
     pub(crate) fn cleanup_after_error(&mut self) -> Result<()> {
@@ -1039,17 +1066,14 @@ pub(crate) fn vacuum_target_build_step(
                             }
                         })?;
                     }
-                    // Done creating tables. A batched build creates the
-                    // indexes now (SQLite's vacuum.c order) so their pages
-                    // are committed by the row batches; one CREATE INDEX
-                    // over the copied data would be a transaction the size
-                    // of the index. A single-transaction build keeps the
-                    // index-after-data order for speed.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
-                    };
+                    // Done creating tables, start copying data. The indexes
+                    // come after the rows, in every build: CREATE INDEX over
+                    // the copied rows sorts the keys and appends them, where
+                    // an index that exists while the rows are inserted takes
+                    // each key wherever it falls — for keys in no particular
+                    // order (text, UUIDs) that dirties a leaf page per row,
+                    // some three times the time of the sorted build.
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
                 }
 
@@ -1110,13 +1134,8 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
-                    // Done copying all tables: deferred indexes, unless the
-                    // batched build created them up front.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
-                    };
+                    // Done copying all tables, proceed to deferred indexes.
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 };
                     continue;
                 }
 
@@ -1323,21 +1342,7 @@ pub(crate) fn vacuum_target_build_step(
                     // re-read more than a batch's worth of spilled pages.
                     if let Some(batch) = config.commit_every {
                         if state.batch_rows >= batch.rows || state.batch_bytes >= batch.bytes {
-                            state.target_conn.execute("COMMIT")?;
-                            state.batches_since_checkpoint += 1;
-                            if state.batches_since_checkpoint >= batch.checkpoint_every_batches {
-                                // Nothing reads the target while it is built,
-                                // so the truncate always completes.
-                                state
-                                    .target_conn
-                                    .checkpoint(crate::CheckpointMode::Truncate {
-                                        upper_bound_inclusive: None,
-                                    })?;
-                                state.batches_since_checkpoint = 0;
-                            }
-                            state.target_conn.execute("BEGIN IMMEDIATE")?;
-                            state.batch_rows = 0;
-                            state.batch_bytes = 0;
+                            state.commit_batch(batch, false)?;
                         }
                     }
                     // Go back to get next row from source
@@ -1370,14 +1375,23 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
                 if idx >= entries_len {
-                    // Done creating indexes: the rows next in a batched
-                    // build, otherwise the post-data objects.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
-                    };
+                    // Done creating indexes, move to post-data objects
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: 0 };
                     continue;
+                }
+
+                // A batched build gives each index a transaction of its
+                // own: the rows' last batch is committed before the first
+                // index, and every index is committed and checkpointed as
+                // it completes (`StepCreateIndex`). CREATE INDEX is one
+                // statement, so an index is the smallest transaction the
+                // build can make of it, and this way the commit path holds
+                // at most the largest index's pages rather than every
+                // index's.
+                if let Some(batch) = config.commit_every {
+                    if state.batch_rows > 0 {
+                        state.commit_batch(batch, true)?;
+                    }
                 }
 
                 let entry_ordinal = state.indexes_to_create[idx];
@@ -1409,6 +1423,11 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // The index is one transaction; commit it and reset the
+                    // target WAL before the next (see `PrepareCreateIndex`).
+                    if let Some(batch) = config.commit_every {
+                        state.commit_batch(batch, true)?;
+                    }
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
