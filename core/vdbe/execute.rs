@@ -91,6 +91,7 @@ use crate::{
             exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
             exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
+        datetime_input::exec_temporal_encode,
         printf::exec_printf,
     },
     stats::StatAccum,
@@ -11331,6 +11332,14 @@ pub fn op_function(
                         .into());
                     }
                 };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::TemporalEncode => {
+                check_arg_count!(arg_count, 2);
+                let result = exec_temporal_encode(
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                )?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericEncode => {

@@ -1511,7 +1511,7 @@ expect error {
     date/time field value out of range: "26-10-08"
 }
 expect @tursopg error {
-    invalid timestamp value
+    invalid input syntax for type timestamp with time zone: "26-10-08"
 }
 
 test age-of-a-zone-hour-out-of-range-errors {
@@ -1520,18 +1520,12 @@ test age-of-a-zone-hour-out-of-range-errors {
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+99:00"
 }
-expect @tursopg error {
-    invalid timestamp value
-}
 
 test age-of-a-zone-minute-out-of-range-errors {
     SELECT age('2026-10-08 12:34:56+05:61', '2025-01-01');
 }
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+05:61"
-}
-expect @tursopg error {
-    invalid timestamp value
 }
 
 test age-of-integers-errors {
@@ -1572,7 +1566,7 @@ expect error {
     invalid input syntax for type timestamp: "hello"
 }
 expect @tursopg error {
-    invalid timestamp value
+    invalid input syntax for type timestamp with time zone: "hello"
 }
 
 test check-constraint-calls-a-text-function {
