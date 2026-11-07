@@ -1,0 +1,20 @@
+@database :memory:
+
+# A JSON keyword must end at a value boundary. Report the start of the
+# malformed token, matching SQLite, both at the document root and in arrays.
+test json_error_position_rejects_keyword_suffixes {
+    SELECT json_valid('true0'), json_error_position('true0'),
+           json_error_position('[true0]'), json_error_position('[nullx]'),
+           json_error_position('[false1]');
+}
+expect {
+    0|1|2|2|2
+}
+
+test json_error_position_accepts_keyword_boundaries {
+    SELECT json_error_position('true'), json_error_position('[true, false, null]'),
+           json_error_position('true/* JSON5 comment */');
+}
+expect {
+    0|0|0
+}
