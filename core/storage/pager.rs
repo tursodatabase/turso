@@ -4560,6 +4560,12 @@ impl Pager {
 
             match state {
                 CommitState::PrepareWal => {
+                    if self.dirty_pages.read().is_empty() {
+                        // Lock-only transactions must not initialize a WAL that may be read-only.
+                        // WaitSync still syncs frames written through write_frame_raw.
+                        self.commit_info.write().state = CommitState::WaitSync;
+                        continue;
+                    }
                     let page_sz = self.get_page_size_unchecked();
                     let c = wal.prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
