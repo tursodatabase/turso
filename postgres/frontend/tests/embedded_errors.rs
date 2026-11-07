@@ -258,6 +258,11 @@ fn errors_report_postgres_sqlstates() {
         ("SELECT abs(-9223372036854775808)", "22003"),
         ("SELECT zeroblob(1000000001)", "22001"),
         ("SELECT nextval('s_exhaust')", "2200H"),
+        ("CREATE SEQUENCE s_dup START 1 START 2", "42601"),
+        (
+            "COPY t_present FROM '/tmp/nope.csv' (DELIMITER ',', DELIMITER ';')",
+            "42601",
+        ),
     ] {
         let e = exec_err(&conn, sql);
         assert_eq!(e.sqlstate, code, "wrong SQLSTATE for: {sql}, got {e:?}");
