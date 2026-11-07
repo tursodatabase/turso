@@ -201,6 +201,34 @@ pub fn create_table_name(parse_result: &ParseResult) -> Option<(Option<String>, 
     ))
 }
 
+/// The schema, if the statement names one, and name of the table being
+/// altered, when the statement is `ALTER TABLE t ADD COLUMN`. Returns None
+/// for all other statements.
+pub fn alter_table_add_column_table(
+    parse_result: &ParseResult,
+) -> Option<(Option<String>, String)> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::AlterTableType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::AlterTableStmt(alter), ..) = nodes.first()? else {
+        return None;
+    };
+    let relation = alter.relation.as_ref()?;
+    let cmd = alter.cmds.first()?;
+    let Some(Node::AlterTableCmd(cmd)) = &cmd.node else {
+        return None;
+    };
+    if AlterTableType::try_from(cmd.subtype).ok()? != AlterTableType::AtAddColumn {
+        return None;
+    }
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
 /// A table that a foreign key of a CREATE TABLE or ALTER TABLE statement
 /// refers to: the byte offset of its name in the statement, the schema the
 /// name has, if any, and the name itself, as PostgreSQL reads them.
