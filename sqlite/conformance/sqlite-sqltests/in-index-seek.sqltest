@@ -1020,3 +1020,32 @@ expect {
     |6|6
     |7|7
 }
+
+# An IN list on a column with no index must not look as selective as a primary
+# key lookup, or the planner scans the large table once per row of the small one.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test in-list-on-unindexed-column-keeps-primary-key-join-order {
+    CREATE TABLE process (id TEXT PRIMARY KEY, org_unit_id TEXT, _deleted INTEGER);
+    CREATE TABLE state (id TEXT PRIMARY KEY, process_id TEXT, _deleted INTEGER);
+    CREATE TABLE execution (id TEXT PRIMARY KEY, state_id TEXT, created_at REAL, finished_at REAL, _deleted INTEGER);
+
+    EXPLAIN QUERY PLAN
+    WITH ranked AS (
+      SELECT state.process_id, process.org_unit_id, execution.created_at, execution.finished_at,
+        ROW_NUMBER() OVER (PARTITION BY state.process_id ORDER BY execution.finished_at DESC) AS rn
+      FROM execution
+      JOIN state ON execution.state_id = state.id
+      JOIN process ON state.process_id = process.id
+      WHERE execution.finished_at IS NOT NULL
+        AND execution._deleted = 0 AND state._deleted = 0 AND process._deleted = 0
+        AND state.process_id IN ('p0','p1','p2','p3','p4','p5','p6','p7','p8','p9','p10','p11','p12','p13')
+    ) SELECT * FROM ranked WHERE rn <= 10;
+}
+expect {
+    1|0|0|SCAN ranked
+    3|1|0|SCAN window_subquery_0
+    5|3|0|SCAN execution
+    6|3|0|SEARCH state USING INDEX sqlite_autoindex_state_1 (id=?)
+    7|3|0|SEARCH process USING INDEX sqlite_autoindex_process_1 (id=?)
+    60|3|0|USE SORTER FOR ORDER BY
+}
