@@ -151,10 +151,20 @@ pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
 /// `sqlite3AddColumn` does: a name that starts with a quote and has no other
 /// quote characters before its last character loses its first and last
 /// characters, so `[x] INT` becomes `x] IN`. Other names go through [dequote].
-pub fn column_declared_type(type_name: &str) -> String {
-    match strip_type_name_quotes(type_name) {
+/// A type without parameters whose name is one of SQLite's standard type names
+/// (ANY, BLOB, INT, INTEGER, REAL, TEXT) in any letter case declares that name
+/// in upper case, so `id integer primary key` declares `INTEGER`, as
+/// `PRAGMA table_info` and `sqlite3_column_decltype` report it. Any other type,
+/// `int(4)` or `varchar` for example, keeps its spelling.
+pub fn column_declared_type(ty: &turso_parser::ast::Type) -> String {
+    if ty.size.is_none() && is_builtin_strict_type(&ty.name) {
+        return strip_type_name_quotes(&ty.name)
+            .unwrap_or(&ty.name)
+            .to_ascii_uppercase();
+    }
+    match strip_type_name_quotes(&ty.name) {
         Some(stripped) => stripped.to_string(),
-        None => dequote(type_name),
+        None => dequote(&ty.name),
     }
 }
 
@@ -170,7 +180,8 @@ pub fn strip_type_name_quotes(type_name: &str) -> Option<&str> {
     None
 }
 
-/// Returns true when a STRICT table accepts the written type name without a
+/// Returns true when the written type name is one of SQLite's six standard
+/// type names (`sqlite3StdType`), the ones a STRICT table accepts without a
 /// custom type. Like SQLite, quotes are only removed when they wrap the whole
 /// name, so `"INT"` is built in but `"INT" X` is not.
 pub fn is_builtin_strict_type(written_type_name: &str) -> bool {

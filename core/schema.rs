@@ -854,7 +854,7 @@ impl TypeDef {
                 let struct_fields: Vec<StructFieldDef> = fields
                     .iter()
                     .map(|f| {
-                        let type_name = column_declared_type(&f.field_type.name);
+                        let type_name = column_declared_type(&f.field_type);
                         StructFieldDef {
                             name: f.name.to_string(),
                             base_affinity: Affinity::affinity(&type_name),
@@ -887,7 +887,7 @@ impl TypeDef {
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
-                        let type_name = column_declared_type(&f.field_type.name);
+                        let type_name = column_declared_type(&f.field_type);
                         UnionVariantDef {
                             tag_name: f.name.to_string(),
                             tag_index: i as u8,
@@ -7366,7 +7366,7 @@ pub fn create_table(
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let ty_str = col_type
                     .as_ref()
-                    .map(|t| column_declared_type(&t.name))
+                    .map(column_declared_type)
                     .unwrap_or_default();
 
                 let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
@@ -7993,7 +7993,8 @@ pub struct Column {
     pub ty_str: String,
     /// The type name as written in the CREATE TABLE statement, when it is not
     /// the same as `ty_str`, which has its quotes removed and may not be
-    /// valid SQL, e.g. `[x] INT` has the declared type `x] IN`.
+    /// valid SQL, e.g. `[x] INT` has the declared type `x] IN`, and which
+    /// spells a standard type name in upper case, e.g. `integer` declares `INTEGER`.
     pub written_ty_str: Option<String>,
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
@@ -8230,7 +8231,7 @@ impl Column {
         let ty_str = value
             .col_type
             .as_ref()
-            .map(|t| column_declared_type(&t.name))
+            .map(column_declared_type)
             .unwrap_or_default();
 
         let (ty, typename_exactly_integer) = match value.col_type {
@@ -10005,7 +10006,8 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.ty_str, "InTeGeR");
+        assert_eq!(column.ty_str, "INTEGER");
+        assert_eq!(column.written_ty_str.as_deref(), Some("InTeGeR"));
         Ok(())
     }
 
