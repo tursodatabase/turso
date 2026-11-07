@@ -70,7 +70,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             exec_json_strip_nulls(args[0].get_value())?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
-            .map(|type_oid| exec_pg_format_type(type_oid, int_arg(args, 1, -1))),
+            .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -984,7 +984,8 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-fn exec_pg_format_type(type_oid: i64, typemod: i64) -> String {
+/// The name of a type as `format_type` prints it.
+fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),

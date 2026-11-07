@@ -288,8 +288,14 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
         || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
+        || (msg.starts_with("error in table ")
+            && msg.contains(" after drop column: no such column"))
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
+    } else if msg.starts_with("cannot INSERT into generated column ")
+        || msg.starts_with("cannot UPDATE generated column ")
+    {
+        SQLSTATE_GENERATED_ALWAYS
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("no such table")
@@ -386,6 +392,8 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
         || msg.contains("more than one row returned by a subquery used as an expression")
     {
         SQLSTATE_CARDINALITY_VIOLATION
+    } else if msg == "NOT NULL constraint failed" {
+        SQLSTATE_NOT_NULL_VIOLATION
     } else {
         SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
     }
@@ -398,6 +406,10 @@ fn raise_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_DATETIME_FORMAT
     } else if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg == "integer out of range for smallint" {
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
+    } else if msg == "value too long for varchar" {
+        SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else {
@@ -588,6 +600,18 @@ mod tests {
                 SQLSTATE_UNDEFINED_COLUMN,
             ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            (
+                "error in table t after drop column: no such column: a",
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            ),
+            (
+                "cannot INSERT into generated column \"b\"",
+                SQLSTATE_GENERATED_ALWAYS,
+            ),
+            (
+                "cannot UPDATE generated column \"b\"",
+                SQLSTATE_GENERATED_ALWAYS,
+            ),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
             (
