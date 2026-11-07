@@ -4,6 +4,7 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 from .lib import (  # noqa: E402
     BatchResult,
+    Binary,
     Connection,
     Cursor,
     DatabaseError,
@@ -45,6 +46,7 @@ __all__ = [
     "OperationalError",
     "ProgrammingError",
     "apilevel",
+    "Binary",
     "paramstyle",
     "sqlite_version",
     "sqlite_version_info",
