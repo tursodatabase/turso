@@ -71,6 +71,8 @@ public class TursoConnectionOptions
 
     public string RemoteEncryptionKey => _builder.RemoteEncryptionKey;
 
+    public string LocalEncryptionKey => _builder.LocalEncryptionKey;
+
     public long PushOperationsThreshold => _builder.PushOperationsThreshold;
 
     public long PullBytesThreshold => _builder.PullBytesThreshold;
@@ -95,6 +97,7 @@ public class TursoConnectionOptions
         || HasOption("Partial Sync Prefetch")
         || HasOption("Remote Encryption Cipher")
         || HasOption("Remote Encryption Key")
+        || HasOption("Local Encryption Key")
         || HasOption("Push Operations Threshold")
         || HasOption("Pull Bytes Threshold")
         || HasOption("Force Logical MVCC Pull")
@@ -114,7 +117,7 @@ public class TursoConnectionOptions
         var key = RemoteEncryptionKey;
         if (string.IsNullOrWhiteSpace(cipher) && string.IsNullOrWhiteSpace(key))
             return null;
-        if (string.IsNullOrWhiteSpace(cipher) || string.IsNullOrWhiteSpace(key))
+        if (string.IsNullOrWhiteSpace(cipher) || (string.IsNullOrWhiteSpace(key) && string.IsNullOrWhiteSpace(LocalEncryptionKey)))
         {
             throw new InvalidOperationException(
                 "Remote Encryption Cipher and Remote Encryption Key must be specified together.");
@@ -123,7 +126,7 @@ public class TursoConnectionOptions
         return new TursoRemoteEncryptionOptions
         {
             Cipher = TursoRemoteEncryptionOptions.ParseCipher(cipher),
-            Key = key,
+            Key = string.IsNullOrWhiteSpace(key) ? null : key,
         };
     }
 

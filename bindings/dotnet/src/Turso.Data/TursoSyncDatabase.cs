@@ -819,6 +819,7 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
             PartialBootstrapStrategyQuery = partial?.Query,
             PartialBootstrapSegmentSize = partial?.SegmentSize is null ? 0 : (nuint)partial.SegmentSize.Value,
             PartialBootstrapPrefetch = partial?.Prefetch ?? false,
+            LocalEncryptionKey = options.LocalEncryptionKey,
             RemoteEncryptionKey = encryption?.Key,
             RemoteEncryptionCipher = encryption?.NativeName,
             PushOperationsThreshold = options.PushOperationsThreshold is null
