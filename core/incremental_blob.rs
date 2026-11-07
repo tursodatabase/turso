@@ -283,13 +283,14 @@ impl Connection {
         rowid: i64,
         read_write: bool,
     ) -> Result<Blob> {
-        if self.mvcc_enabled() {
+        // MVCC cannot patch a row in place, so only read-only handles are allowed there.
+        if self.mvcc_enabled() && read_write {
             return Err(LimboError::InternalError(
-                "incremental blob I/O is not supported in MVCC mode".to_string(),
+                "incremental blob I/O writes are not supported in MVCC mode".to_string(),
             ));
         }
         let fk_enforced = self.foreign_keys_enabled();
-        let (table_ref, record_column) = self.with_schema_mut(|schema| {
+        let (table_ref, record_column) = self.with_schema(crate::MAIN_DB_ID, |schema| {
             if schema.is_materialized_view(NamespaceId::ROOT, table)
                 || schema.get_view(NamespaceId::ROOT, table).is_some()
             {
@@ -345,7 +346,7 @@ impl Connection {
                     ))
                 })?;
             Ok((tbl, record_column))
-        })??;
+        })?;
 
         let root = table_ref.root_page;
         let program = build_blob_program(self, table_ref, root, record_column, rowid, read_write)?;
@@ -526,7 +527,7 @@ fn build_blob_program(
     b.emit_halt_err(1, format!("no such rowid: {rowid}"));
     b.preassign_label_to_next_insn(l_end);
 
-    conn.with_schema_mut(|schema| b.epilogue(schema))?;
+    conn.with_schema(crate::MAIN_DB_ID, |schema| b.epilogue(schema));
     b.build(conn.clone(), false, "incremental blob io")
         .map_err(|e| LimboError::InternalError(format!("blob program build failed: {e}")))
 }
