@@ -1179,6 +1179,8 @@ pub fn translate_create_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
+    // sqlite_schema keeps the name as the user wrote it; lookups ignore case.
+    let stored_tbl_name = resolver.mangle_name(namespace, tbl_name.name.as_str());
     let tbl_name_in_sql = ast::QualifiedName {
         namespace: None,
         name: resolver.name_in_sql(namespace, &tbl_name.name),
@@ -1479,8 +1481,8 @@ pub fn translate_create_table(
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
-        &mangled_tbl_name,
-        &mangled_tbl_name,
+        &stored_tbl_name,
+        &stored_tbl_name,
         table_root_reg,
         Some(sql),
     )?;
@@ -1500,7 +1502,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &mangled_tbl_name,
+                &stored_tbl_name,
                 index_reg,
                 None,
             )?;
@@ -1569,7 +1571,7 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&mangled_tbl_name);
+    let escaped_tbl_name = escape_sql_string_literal(&stored_tbl_name);
     let mut parse_schema_where_clause = String::with_capacity(
         "tbl_name = '' AND type != 'trigger'".len()
             + escaped_tbl_name.len()
