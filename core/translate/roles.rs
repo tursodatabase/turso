@@ -291,6 +291,41 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     )))
 }
 
+/// Fails if the statement is compiled for a role that may not read relation
+/// `name` of `namespace`, a table, view or materialized view, which `object`
+/// names in the error. Inside a view, the view's owner is the reader, as in
+/// PostgreSQL, so a view shows its readers the tables its owner may read.
+/// Relations outside the main database, temp among them, have no
+/// privileges, and everyone reads them.
+pub(crate) fn check_read_privilege(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    object: Object,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let dialect = &resolver.catalog.dialect;
+    let schema = resolver.schema();
+    let reader = match resolver.catalog.enclosing_view() {
+        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => dialect
+            .relation_owner(schema, view_namespace.id, &view_name)
+            .unwrap_or_else(|| connection.current_role()),
+        _ => connection.current_role(),
+    };
+    if schema.roles.is_superuser(reader)
+        || dialect.role_may_read(schema, namespace.id, name, reader)
+    {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        object,
+    )))
+}
+
 /// Fails if the statement is compiled for a role that is not a superuser,
 /// which may not read a table-valued PRAGMA function. The function runs
 /// `pragma_name` as a statement of the engine's own, which is not checked, so

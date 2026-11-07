@@ -267,6 +267,16 @@ impl Dialect for PostgresDialect {
         crate::classes::relation_owner(schema, namespace, name)
     }
 
+    fn role_may_read(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+        role: RoleId,
+    ) -> bool {
+        crate::classes::role_may_read(schema, namespace, name, role)
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }

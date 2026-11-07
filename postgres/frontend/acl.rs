@@ -202,6 +202,16 @@ impl Acl {
         }
     }
 
+    /// Whether the list gives `role`, by name or through `PUBLIC`,
+    /// `privilege`.
+    pub(crate) fn grants(&self, role: &str, privilege: Privilege) -> bool {
+        let wanted = Privileges::of(privilege).granted;
+        self.items.iter().any(|item| {
+            (item.grantee == role || item.grantee == PUBLIC_GRANTEE)
+                && item.privileges.granted & wanted == wanted
+        })
+    }
+
     /// Whether the list gives `role`, by name or through `PUBLIC`, any
     /// privilege at all.
     pub(crate) fn gives_anything_to(&self, role: &str) -> bool {
@@ -341,12 +351,16 @@ mod tests {
     fn the_list_says_whom_it_gives_privileges() {
         let mut acl = Acl::default_for(RelationKind::Table, "postgres");
         assert!(acl.gives_anything_to("postgres"));
+        assert!(acl.grants("postgres", Privilege::Select));
         assert!(!acl.gives_anything_to("reader"));
+        assert!(!acl.grants("reader", Privilege::Select));
         acl.grant("reader", &[Privilege::Select], "postgres");
         assert!(acl.gives_anything_to("reader"));
+        assert!(acl.grants("reader", Privilege::Select));
         assert!(!acl.gives_anything_to("stranger"));
         acl.grant(PUBLIC_GRANTEE, &[Privilege::Select], "postgres");
         assert!(acl.gives_anything_to("stranger"));
+        assert!(acl.grants("stranger", Privilege::Select));
     }
 
     #[test]

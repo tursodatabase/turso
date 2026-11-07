@@ -4,7 +4,8 @@
 #
 # The privilege is stored in the relation's access control list, which
 # pg_class.relacl shows in PostgreSQL's aclitem[] form. The owner's default
-# entry lists every table privilege of PostgreSQL 17 and later.
+# entry lists every table privilege of PostgreSQL 17 and later. A role reads
+# a table only when it owns it or the list gives it SELECT.
 
 @database :memory:
 
@@ -463,4 +464,152 @@ test rename-after-grant-keeps-the-list {
 }
 expect {
     {postgres=arwdDxtm/postgres,gs_acl_renamed_reader=r/postgres}
+}
+
+# What GRANT allows: reading the table.
+
+test role-without-select-cannot-read-the-table {
+    CREATE ROLE gs_denied;
+    CREATE TABLE gs_closed (id INT);
+    SET ROLE gs_denied;
+    SELECT id FROM gs_closed;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed
+}
+
+test role-without-select-cannot-read-the-table-in-a-join {
+    CREATE ROLE gs_denied_join;
+    CREATE TABLE gs_open_j (id INT);
+    CREATE TABLE gs_closed_j (id INT);
+    GRANT SELECT ON gs_open_j TO gs_denied_join;
+    SET ROLE gs_denied_join;
+    SELECT o.id FROM gs_open_j o JOIN gs_closed_j c ON c.id = o.id;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_j
+}
+
+test role-without-select-cannot-read-the-table-in-a-subquery {
+    CREATE ROLE gs_denied_sub;
+    CREATE TABLE gs_closed_sub (id INT);
+    SET ROLE gs_denied_sub;
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM gs_closed_sub);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_sub
+}
+
+test role-without-select-cannot-read-the-table-in-a-cte {
+    CREATE ROLE gs_denied_cte;
+    CREATE TABLE gs_closed_cte (id INT);
+    SET ROLE gs_denied_cte;
+    WITH c AS (SELECT id FROM gs_closed_cte) SELECT id FROM c;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_cte
+}
+
+test role-without-select-cannot-read-the-view {
+    CREATE ROLE gs_denied_view;
+    CREATE TABLE gs_view_closed_base (id INT);
+    CREATE VIEW gs_closed_view AS SELECT id FROM gs_view_closed_base;
+    SET ROLE gs_denied_view;
+    SELECT id FROM gs_closed_view;
+}
+@sqlstate 42501
+expect error {
+    permission denied for view gs_closed_view
+}
+
+test select-on-the-view-is-enough-when-its-owner-reads-the-table {
+    CREATE ROLE gs_view_only;
+    CREATE TABLE gs_view_only_base (id INT);
+    INSERT INTO gs_view_only_base VALUES (7);
+    CREATE VIEW gs_view_only_view AS SELECT id FROM gs_view_only_base;
+    GRANT SELECT ON gs_view_only_view TO gs_view_only;
+    SET ROLE gs_view_only;
+    SELECT id FROM gs_view_only_view;
+}
+expect {
+    7
+}
+
+test select-on-the-view-is-not-enough-when-its-owner-cannot-read-the-table {
+    CREATE ROLE gs_view_owner;
+    CREATE ROLE gs_view_reader2;
+    CREATE TABLE gs_view_private_base (id INT);
+    CREATE VIEW gs_view_of_private AS SELECT id FROM gs_view_private_base;
+    ALTER VIEW gs_view_of_private OWNER TO gs_view_owner;
+    GRANT SELECT ON gs_view_of_private TO gs_view_reader2;
+    SET ROLE gs_view_reader2;
+    SELECT id FROM gs_view_of_private;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_view_private_base
+}
+
+test the-owner-reads-its-table-without-a-grant {
+    CREATE ROLE gs_owner_reads;
+    CREATE TABLE gs_owned_by_reader (id INT);
+    INSERT INTO gs_owned_by_reader VALUES (3);
+    ALTER TABLE gs_owned_by_reader OWNER TO gs_owner_reads;
+    SET ROLE gs_owner_reads;
+    SELECT id FROM gs_owned_by_reader;
+}
+expect {
+    3
+}
+
+test select-granted-to-public-lets-a-role-made-later-read {
+    CREATE TABLE gs_for_all (id INT);
+    INSERT INTO gs_for_all VALUES (5);
+    GRANT SELECT ON gs_for_all TO PUBLIC;
+    CREATE ROLE gs_latecomer;
+    SET ROLE gs_latecomer;
+    SELECT id FROM gs_for_all;
+}
+expect {
+    5
+}
+
+test select-granted-to-another-role-does-not-let-this-one-read {
+    CREATE ROLE gs_granted_other;
+    CREATE ROLE gs_not_granted;
+    CREATE TABLE gs_for_other (id INT);
+    GRANT SELECT ON gs_for_other TO gs_granted_other;
+    SET ROLE gs_not_granted;
+    SELECT id FROM gs_for_other;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_for_other
+}
+
+test reset-role-reads-again {
+    CREATE ROLE gs_back_to_super;
+    CREATE TABLE gs_after_reset (id INT);
+    INSERT INTO gs_after_reset VALUES (9);
+    SET ROLE gs_back_to_super;
+    RESET ROLE;
+    SELECT id FROM gs_after_reset;
+}
+expect {
+    9
+}
+
+test role-without-select-cannot-count-the-table {
+    CREATE ROLE gs_denied_count;
+    CREATE TABLE gs_closed_count (id INT);
+    SET ROLE gs_denied_count;
+    SELECT count(*) FROM gs_closed_count;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_count
 }

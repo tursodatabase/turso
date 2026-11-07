@@ -416,6 +416,30 @@ pub(crate) fn relation_owner(
     )
 }
 
+/// [`turso_core::Dialect::role_may_read`] for the PostgreSQL frontend: the
+/// owner may, and so may a role the list gives SELECT, by name or through
+/// PUBLIC. A relation without a class row is the engine's, such as a catalog
+/// table, and everyone reads it.
+pub(crate) fn role_may_read(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+    role: RoleId,
+) -> bool {
+    let Some(class) =
+        class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
+    else {
+        return true;
+    };
+    if class.relowner == role {
+        return true;
+    }
+    let (Some(acl), Ok(role_name)) = (&class.relacl, role_name(schema, role)) else {
+        return false;
+    };
+    acl.grants(&role_name, ast::Privilege::Select)
+}
+
 /// The access control list of relation `name` of `namespace` in the text
 /// form of `pg_class.relacl`, or None when no `GRANT` has touched it.
 pub(crate) fn relation_acl(schema: &Schema, namespace: NamespaceId, name: &str) -> Option<String> {
