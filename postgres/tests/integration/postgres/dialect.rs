@@ -704,6 +704,71 @@ fn rows_of(conn: &turso_pg::Connection, sql: &str) -> Vec<String> {
     values
 }
 
+/// ALTER TABLE stores the table as SQLite text, which VACUUM replays to create
+/// the table in the new file.
+#[test]
+fn vacuum_keeps_a_table_that_alter_table_rewrote() {
+    for (create, alter, table) in [
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, v text)",
+            "ALTER TABLE t ADD COLUMN w int",
+            "t",
+        ),
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, v text)",
+            "ALTER TABLE t RENAME COLUMN v TO w",
+            "t",
+        ),
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, v text)",
+            "ALTER TABLE t RENAME TO u",
+            "u",
+        ),
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, v text, w int)",
+            "ALTER TABLE t DROP COLUMN w",
+            "t",
+        ),
+        (
+            "CREATE TABLE t (id serial PRIMARY KEY, v text)",
+            "ALTER TABLE t ADD COLUMN w int",
+            "t",
+        ),
+        (
+            "CREATE TABLE app.t (id int PRIMARY KEY, v text)",
+            "ALTER TABLE app.t ADD COLUMN w int",
+            "app.t",
+        ),
+    ] {
+        let db = TempDatabase::builder().build();
+        let conn = db.connect_postgres();
+        conn.execute("CREATE SCHEMA app").unwrap();
+        conn.execute(create).unwrap();
+        conn.execute(alter).unwrap();
+        conn.execute(format!("INSERT INTO {table} (id) VALUES (1)"))
+            .unwrap();
+        drop(conn);
+
+        // VACUUM of an MVCC database needs its changes checkpointed first.
+        let core_conn = db.connect_limbo();
+        core_conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        core_conn.execute("VACUUM").unwrap();
+        drop(core_conn);
+
+        let db = db.reopen();
+        let conn = db.connect_postgres();
+        conn.execute(format!("INSERT INTO {table} (id) VALUES (2)"))
+            .unwrap();
+        assert_eq!(
+            rows_of(&conn, &format!("SELECT id FROM {table} ORDER BY id")),
+            ["1", "2"],
+            "{alter}"
+        );
+    }
+}
+
 #[turso_macros::test]
 fn checkpoint_keeps_the_table_index_and_sequence_of_a_schema(db: TempDatabase) {
     let conn = db.connect_postgres();
