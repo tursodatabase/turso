@@ -2920,8 +2920,9 @@ pub fn translate_drop_table(
 }
 
 /// Validate an encode or decode expression for safety.
-/// Rejects subqueries, aggregates, and window functions.
+/// Rejects bind parameters, subqueries, aggregates, and window functions.
 fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -> Result<()> {
+    reject_parameters_in_type_expr(expr, kind)?;
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
@@ -2962,6 +2963,18 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
                 );
             }
             _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Nothing binds a parameter in a type or domain expression, so it would
+/// always read as NULL.
+fn reject_parameters_in_type_expr(expr: &ast::Expr, kind: &str) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Variable(_) = e {
+            bail_parse_error!("parameters prohibited in {kind} expressions");
         }
         Ok(WalkControl::Continue)
     })?;
@@ -3249,6 +3262,7 @@ pub fn translate_create_type(
         ref encode,
         ref coerce,
         ref decode,
+        ref default,
         ..
     } = body
     {
@@ -3260,6 +3274,9 @@ pub fn translate_create_type(
         }
         if let Some(ref decode) = decode {
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
+        }
+        if let Some(ref default) = default {
+            reject_parameters_in_type_expr(default, "DEFAULT")?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
         let type_def =
