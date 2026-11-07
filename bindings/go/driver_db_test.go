@@ -1765,6 +1765,54 @@ func TestBusyTimeoutConnector(t *testing.T) {
 	fmt.Println("Busy timeout connector test passed")
 }
 
+func TestIsAutocommit(t *testing.T) {
+	db, err := sql.Open("turso", path.Join(t.TempDir(), "autocommit.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	var mode string
+	require.NoError(t, db.QueryRow("PRAGMA journal_mode = 'mvcc'").Scan(&mode))
+	require.Equal(t, "mvcc", mode)
+	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	mustExec(t, db, "INSERT INTO t VALUES (1, 0)")
+
+	a, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer a.Close()
+	b, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer b.Close()
+	isAutocommit := func(c *sql.Conn) bool {
+		var ac bool
+		require.NoError(t, c.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			var err error
+			ac, err = tc.IsAutocommit()
+			return err
+		}))
+		return ac
+	}
+	exec := func(c *sql.Conn, q string) error {
+		_, err := c.ExecContext(t.Context(), q)
+		return err
+	}
+
+	require.True(t, isAutocommit(b))
+	require.NoError(t, exec(b, "BEGIN CONCURRENT"))
+	require.False(t, isAutocommit(b))
+
+	// A constraint error leaves the transaction open.
+	require.ErrorIs(t, exec(b, "INSERT INTO t VALUES (1, 0)"), ErrTursoConstraint)
+	require.False(t, isAutocommit(b))
+
+	// A write-write conflict makes the engine roll it back.
+	require.NoError(t, exec(a, "BEGIN CONCURRENT"))
+	require.NoError(t, exec(a, "UPDATE t SET v = v + 1 WHERE id = 1"))
+	require.Error(t, exec(b, "UPDATE t SET v = v + 1 WHERE id = 1"))
+	require.True(t, isAutocommit(b))
+	require.NoError(t, exec(a, "COMMIT"))
+}
+
 func TestBusyTimeoutConcurrentWrites(t *testing.T) {
 	// This test verifies that with a busy timeout, concurrent writers succeed
 	// instead of immediately failing with SQLITE_BUSY
