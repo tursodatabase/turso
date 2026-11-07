@@ -9385,7 +9385,11 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
-    contents.overflow_cells.clear();
+    turso_assert!(
+        contents.overflow_cells.is_empty(),
+        "btree_init_page: page still has overflow cells from an earlier insert or balance",
+        { "page_id": page.get().id(), "overflow_count": contents.overflow_cells.len() }
+    );
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
         page.get().id(),
@@ -11518,6 +11522,19 @@ mod tests {
     struct Cell {
         pos: usize,
         payload: crate::alloc::Vec<u8>,
+    }
+
+    #[test]
+    #[should_panic(expected = "page still has overflow cells")]
+    fn btree_init_page_rejects_page_with_overflow_cells() {
+        let page = get_page(2);
+        let page_contents = page.get_contents();
+        let payload = [1u8; 3000];
+        insert_into_cell(page_contents, &payload, 0, 4096).unwrap();
+        insert_into_cell(page_contents, &payload, 1, 4096).unwrap();
+        assert_eq!(page_contents.overflow_cells.len(), 1);
+
+        btree_init_page(&page, PageType::TableLeaf, 0, 4096);
     }
 
     #[test]
