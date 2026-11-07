@@ -495,6 +495,32 @@ mod tests {
     }
 
     #[test]
+    fn uri_authority_is_validated_before_query_and_fragment() {
+        unsafe {
+            for uri in [
+                c"file://localhost?mode=ro",
+                c"file://#x",
+                c"file://?mode=memory",
+                c"file://localhost#fragment",
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_ERROR,
+                    "{uri:?}"
+                );
+                assert!(!db.is_null());
+                assert_eq!(sqlite3_errcode(db), SQLITE_ERROR);
+                let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                    .to_str()
+                    .unwrap();
+                assert!(message.starts_with("invalid uri authority:"), "{message}");
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
     fn readonly_connections_can_begin_reserved_transactions_without_writing() {
         unsafe {
             for keep_writer_open in [false, true] {

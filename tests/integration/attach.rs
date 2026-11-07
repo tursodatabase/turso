@@ -439,6 +439,78 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
     Ok(())
 }
 
+#[test]
+fn test_attach_uri_readwrite_requires_existing_main_database() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let sqlite = RusqliteConnection::open_in_memory()?;
+    let sqlite_path = directory.path().join("sqlite-missing.db");
+    assert!(sqlite
+        .execute_batch(&format!(
+            "ATTACH 'file:{}?mode=rw' AS aux",
+            sqlite_path.display()
+        ))
+        .is_err());
+    assert!(!sqlite_path.exists());
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let path = directory.path().join("turso-missing.db");
+    assert!(conn
+        .execute(format!("ATTACH 'file:{}?mode=rw' AS aux", path.display()))
+        .is_err());
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn test_attach_uri_access_and_percent_decoding_match_sqlite() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+    let path = directory.path().join("sqlite-restricted.db");
+    let sql = format!("ATTACH 'file:{}?mode=ro&mode=rw' AS aux", path.display());
+    let error = sqlite.execute_batch(&sql).unwrap_err();
+    assert!(error.to_string().contains("access mode not allowed: rw"));
+    assert!(!path.exists());
+    let path = directory.path().join("turso-restricted.db");
+    let error = conn
+        .execute(format!(
+            "ATTACH 'file:{}?mode=ro&mode=rw' AS aux",
+            path.display()
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("access mode not allowed: rw"));
+    assert!(!path.exists());
+
+    for (name, use_sqlite) in [("sqlite", true), ("turso", false)] {
+        let path = directory.path().join(format!("{name}-decoded"));
+        let sql = format!("ATTACH 'file:{}%00ignored.db' AS aux", path.display());
+        if use_sqlite {
+            sqlite.execute_batch(&sql)?;
+            sqlite.execute_batch("CREATE TABLE aux.t(x); INSERT INTO aux.t VALUES(7)")?;
+            assert_eq!(
+                sqlite.query_row("SELECT x FROM aux.t", [], |row| row.get::<_, i64>(0))?,
+                7
+            );
+            sqlite.execute_batch("DETACH aux")?;
+        } else {
+            conn.execute(sql)?;
+            conn.execute("CREATE TABLE aux.t(x); INSERT INTO aux.t VALUES(7)")?;
+            assert_eq!(
+                limbo_exec_rows(&conn, "SELECT x FROM aux.t"),
+                vec![vec![rusqlite::types::Value::Integer(7)]]
+            );
+            conn.execute("DETACH aux")?;
+        }
+        assert!(path.exists());
+        assert!(!path
+            .with_file_name(format!("{name}-decoded%00ignored.db"))
+            .exists());
+    }
+    Ok(())
+}
+
 #[turso_macros::test]
 fn test_attach_rejects_fresh_read_only_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = attach_enabled_db(DatabaseOpts::new());

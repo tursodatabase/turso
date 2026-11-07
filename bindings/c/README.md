@@ -14,9 +14,11 @@ This implementation provides SQLite3 API compatibility for Turso, allowing exist
 ## File access modes
 
 `sqlite3_open_v2` requires READONLY, READWRITE, or READWRITE with CREATE.
-READWRITE without CREATE and URI `mode=rw` require an existing file. With
+READWRITE without CREATE and URI `mode=rw` require an existing main database
+file; a writable open may create its WAL. With
 `SQLITE_OPEN_URI`, decoded `mode=ro`, `mode=rw`, and `mode=rwc` may narrow the
 requested file access; repeating these modes cannot widen an earlier restriction.
+C opens and SQL ATTACH use the same URI parser.
 `mode=memory` selects writable memory storage, as in SQLite. URI fragments do not
 supply query parameters. Malformed percent escapes remain literal characters,
 while valid escapes are decoded. An empty decoded path opens a private temporary

@@ -454,110 +454,6 @@ pub const SQLITE_OPEN_SHAREDCACHE: ffi::c_int = 0x00020000;
 pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
 pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
 
-/// Percent-decode a URI component, preserving malformed escapes as SQLite does.
-fn percent_decode(input: &str) -> Option<String> {
-    let input = input.as_bytes();
-    let mut bytes = Vec::with_capacity(input.len());
-    let mut index = 0;
-    while index < input.len() {
-        if input[index] == b'%' {
-            let decoded = input
-                .get(index + 1)
-                .zip(input.get(index + 2))
-                .and_then(|(&hi, &lo)| {
-                    Some(((hi as char).to_digit(16)? << 4 | (lo as char).to_digit(16)?) as u8)
-                });
-            if let Some(decoded) = decoded {
-                if decoded == 0 {
-                    break;
-                }
-                bytes.push(decoded);
-                index += 3;
-                continue;
-            }
-        }
-        bytes.push(input[index]);
-        index += 1;
-    }
-    String::from_utf8(bytes).ok()
-}
-
-struct ParsedFilename {
-    path: String,
-    memory: bool,
-    cache_shared: bool,
-    access: i32,
-}
-
-struct OpenError {
-    code: i32,
-    message: String,
-}
-
-fn parse_uri_filename(uri: &str, mut access: i32) -> Result<ParsedFilename, OpenError> {
-    let invalid = |message: String| OpenError {
-        code: SQLITE_ERROR,
-        message,
-    };
-    let after_file = uri[5..]
-        .split('#')
-        .next()
-        .expect("split always returns a component");
-    let (raw_path, query) = after_file.split_once('?').unwrap_or((after_file, ""));
-    let raw_path = if let Some(authority_path) = raw_path.strip_prefix("//") {
-        let (authority, path) = authority_path
-            .split_once('/')
-            .unwrap_or((authority_path, ""));
-        if !authority.is_empty() && authority != "localhost" {
-            return Err(invalid(format!("invalid uri authority: {authority}")));
-        }
-        if authority_path.contains('/') {
-            format!("/{path}")
-        } else {
-            String::new()
-        }
-    } else {
-        raw_path.to_owned()
-    };
-    let path = percent_decode(&raw_path).ok_or_else(|| invalid("invalid URI encoding".into()))?;
-    let mut cache_shared = false;
-    for parameter in query.split('&') {
-        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-        let key = percent_decode(key).ok_or_else(|| invalid("invalid URI encoding".into()))?;
-        let value = percent_decode(value).ok_or_else(|| invalid("invalid URI encoding".into()))?;
-        match key.as_str() {
-            "mode" => {
-                let mode = match value.as_str() {
-                    "ro" => SQLITE_OPEN_READONLY,
-                    "rw" => SQLITE_OPEN_READWRITE,
-                    "rwc" => SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                    "memory" => SQLITE_OPEN_MEMORY,
-                    _ => return Err(invalid(format!("no such access mode: {value}"))),
-                };
-                if mode != SQLITE_OPEN_MEMORY && mode > access {
-                    return Err(OpenError {
-                        code: SQLITE_PERM,
-                        message: format!("access mode not allowed: {value}"),
-                    });
-                }
-                access = mode;
-            }
-            "cache" => match value.as_str() {
-                "shared" => cache_shared = true,
-                "private" => cache_shared = false,
-                _ => return Err(invalid(format!("no such cache mode: {value}"))),
-            },
-            _ => {}
-        }
-    }
-    Ok(ParsedFilename {
-        memory: path == ":memory:" || access & SQLITE_OPEN_MEMORY != 0,
-        path,
-        cache_shared,
-        access,
-    })
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const ffi::c_char,
@@ -587,21 +483,25 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     if !matches!(access, SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE | 6) {
         return failed_open(db_out, SQLITE_MISUSE, "invalid access flags");
     }
-    let parsed = if flags & SQLITE_OPEN_URI != 0 && filename_str.starts_with("file:") {
-        match parse_uri_filename(filename_str, access | (flags & SQLITE_OPEN_MEMORY)) {
+    let (parsed, access) = if flags & SQLITE_OPEN_URI != 0 && filename_str.starts_with("file:") {
+        match turso_core::UriOpenOptions::parse_with_flags(
+            filename_str,
+            access | (flags & SQLITE_OPEN_MEMORY),
+        ) {
             Ok(parsed) => parsed,
             Err(error) => return failed_open(db_out, error.code, &error.message),
         }
     } else {
-        ParsedFilename {
-            path: filename_str.to_owned(),
-            memory: flags & SQLITE_OPEN_MEMORY != 0 || filename_str == ":memory:",
-            cache_shared: false,
-            access,
-        }
+        (
+            turso_core::UriOpenOptions {
+                path: filename_str.to_owned(),
+                ..Default::default()
+            },
+            access | (flags & SQLITE_OPEN_MEMORY),
+        )
     };
-    let use_memory = parsed.memory;
-    let cache_shared = parsed.cache_shared;
+    let use_memory = access & SQLITE_OPEN_MEMORY != 0 || parsed.path == ":memory:";
+    let cache_shared = parsed.cache == turso_core::CacheMode::Shared;
     let temp_path = if parsed.path.is_empty() && !use_memory {
         Some(temp_database_path())
     } else {
@@ -615,12 +515,12 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         && std::fs::metadata(&effective_filename)
             .map(|metadata| metadata.permissions().readonly())
             .unwrap_or(false);
-    let connection_readonly = parsed.access & SQLITE_OPEN_READONLY != 0 || file_is_readonly;
+    let connection_readonly = access & SQLITE_OPEN_READONLY != 0 || file_is_readonly;
     let file_open_flags = if temp_path.is_some() {
         turso_core::OpenFlags::Create
     } else if connection_readonly {
         turso_core::OpenFlags::ReadOnly
-    } else if parsed.access & SQLITE_OPEN_CREATE != 0 {
+    } else if access & SQLITE_OPEN_CREATE != 0 {
         turso_core::OpenFlags::Create
     } else {
         turso_core::OpenFlags::None
@@ -3785,28 +3685,6 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn percent_decoding_matches_ascii_component_rules() {
-        for byte in 1_u8..=127 {
-            let encoded = format!("left%{byte:02x}right");
-            let decoded = format!("left{}right", char::from(byte));
-            assert_eq!(percent_decode(&encoded), Some(decoded));
-        }
-        for byte in b' '..=b'~' {
-            if byte.is_ascii_hexdigit() {
-                continue;
-            }
-            let character = char::from(byte);
-            for value in [format!("%{character}a"), format!("%a{character}")] {
-                assert_eq!(percent_decode(&value), Some(value));
-            }
-        }
-        for value in ["%", "%a", "%G"] {
-            assert_eq!(percent_decode(value).as_deref(), Some(value));
-        }
-        assert_eq!(percent_decode("left%00ignored").as_deref(), Some("left"));
-    }
-
     #[test]
     fn structured_error_messages_preserve_payload_without_category() {
         for error in [

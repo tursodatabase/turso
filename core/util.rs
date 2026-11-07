@@ -1051,31 +1051,7 @@ pub enum CacheMode {
     Shared,
 }
 
-impl From<&str> for CacheMode {
-    fn from(s: &str) -> Self {
-        match s {
-            "private" => CacheMode::Private,
-            "shared" => CacheMode::Shared,
-            _ => CacheMode::Private,
-        }
-    }
-}
-
-impl OpenMode {
-    pub fn from_str(s: &str) -> Result<Self> {
-        let s_bytes = s.trim().as_bytes();
-        match_ignore_ascii_case!(match s_bytes {
-            b"ro" => Ok(OpenMode::ReadOnly),
-            b"rw" => Ok(OpenMode::ReadWrite),
-            b"memory" => Ok(OpenMode::Memory),
-            b"rwc" => Ok(OpenMode::ReadWriteCreate),
-            _ => Err(LimboError::InvalidArgument(format!(
-                "Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'"
-            ))),
-        })
-    }
-}
-
+#[cfg(target_os = "windows")]
 fn is_windows_path(path: &str) -> bool {
     path.len() >= 3
         && path.chars().nth(1) == Some(':')
@@ -1083,6 +1059,7 @@ fn is_windows_path(path: &str) -> bool {
 }
 
 /// converts windows-style paths to forward slashes, per SQLite spec.
+#[cfg(target_os = "windows")]
 fn normalize_windows_path(path: &str) -> String {
     let mut normalized = path.replace("\\", "/");
 
@@ -1102,60 +1079,76 @@ fn normalize_windows_path(path: &str) -> String {
     normalized
 }
 
+const URI_READONLY: i32 = 1;
+const URI_READWRITE: i32 = 2;
+const URI_CREATE: i32 = 4;
+const URI_MEMORY: i32 = 128;
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct UriError {
+    /// SQLite's primary open result: 1 for invalid URIs, 3 for access widening.
+    pub code: i32,
+    pub message: String,
+}
+
 impl<'a> OpenOptions<'a> {
-    /// Parses a SQLite URI, handling Windows and Unix paths separately.
+    /// Parses a SQLite URI with read-write-create access by default.
     pub fn parse(uri: &'a str) -> Result<OpenOptions<'a>> {
-        if !uri.starts_with("file:") {
-            return Ok(OpenOptions {
-                path: uri.to_string(),
-                ..Default::default()
-            });
-        }
+        Self::parse_with_flags(uri, URI_READWRITE | URI_CREATE)
+            .map(|(options, _)| options)
+            .map_err(|error| LimboError::InvalidArgument(error.message))
+    }
 
+    /// Parses using SQLite READONLY (1), READWRITE (2), CREATE (4), and MEMORY
+    /// (128) bits. Returns the effective access bits after ordered mode changes.
+    /// Invalid URIs return code 1; disallowed access widening returns code 3.
+    pub fn parse_with_flags(
+        uri: &'a str,
+        mut access: i32,
+    ) -> std::result::Result<(OpenOptions<'a>, i32), UriError> {
         let mut opts = OpenOptions::default();
-        let without_scheme = &uri[5..];
-
-        let (without_fragment, _) = without_scheme
-            .split_once('#')
-            .unwrap_or((without_scheme, ""));
-
-        let (without_query, query) = without_fragment
-            .split_once('?')
-            .unwrap_or((without_fragment, ""));
-        parse_query_params(query, &mut opts)?;
-
-        // handle authority + path separately
-        if let Some(after_slashes) = without_query.strip_prefix("//") {
-            let (authority, path) = match after_slashes.split_once('/') {
-                Some((authority, path)) => (authority, Some(path)),
-                None => (after_slashes, None),
-            };
-
-            // sqlite allows only `localhost` or empty authority.
-            if !(authority.is_empty() || authority == "localhost") {
-                return Err(LimboError::InvalidArgument(format!(
-                    "Invalid authority '{authority}'. Only '' or 'localhost' allowed."
-                )));
-            }
-            opts.authority = if authority.is_empty() {
-                None
-            } else {
-                Some(authority)
-            };
-
-            opts.path = match path {
-                Some(path) if is_windows_path(path) => {
-                    normalize_windows_path(&decode_percent(path))
+        if let Some(mut path_and_query) = uri.strip_prefix("file:") {
+            if let Some(authority_path) = path_and_query.strip_prefix("//") {
+                let authority_end = authority_path.find('/').unwrap_or(authority_path.len());
+                let (authority, path) = authority_path.split_at(authority_end);
+                if !authority.is_empty() && authority != "localhost" {
+                    return Err(invalid_uri(format!("invalid uri authority: {authority}")));
                 }
-                Some(path) => format!("/{}", decode_percent(path)),
-                None => String::new(),
-            };
+                opts.authority = (!authority.is_empty()).then_some(authority);
+                path_and_query = path;
+            }
+            let without_fragment = path_and_query
+                .split_once('#')
+                .map_or(path_and_query, |(path, _)| path);
+            let (raw_path, query) = without_fragment
+                .split_once('?')
+                .unwrap_or((without_fragment, ""));
+            opts.path = decode_uri_component(raw_path)?;
+            #[cfg(target_os = "windows")]
+            if opts.authority.is_some() || path_and_query.starts_with('/') {
+                if let Some(windows_path) = opts
+                    .path
+                    .strip_prefix('/')
+                    .filter(|path| is_windows_path(path))
+                {
+                    opts.path = normalize_windows_path(windows_path);
+                }
+            }
+            parse_query_params(query, &mut opts, &mut access)?;
         } else {
-            // no authority, must be a normal absolute or relative path.
-            opts.path = decode_percent(without_query);
+            uri.clone_into(&mut opts.path);
         }
-
-        Ok(opts)
+        opts.mode = if access & URI_MEMORY != 0 {
+            OpenMode::Memory
+        } else if access & URI_READONLY != 0 {
+            OpenMode::ReadOnly
+        } else if access & URI_CREATE != 0 {
+            OpenMode::ReadWriteCreate
+        } else {
+            OpenMode::ReadWrite
+        };
+        Ok((opts, access))
     }
 
     pub fn get_flags(&self) -> Result<OpenFlags> {
@@ -1169,89 +1162,95 @@ impl<'a> OpenOptions<'a> {
         Ok(match self.mode {
             OpenMode::ReadWriteCreate => OpenFlags::Create,
             OpenMode::ReadOnly => OpenFlags::ReadOnly,
-            _ => OpenFlags::default(),
+            OpenMode::ReadWrite => OpenFlags::None,
+            OpenMode::Memory => OpenFlags::default(),
         })
     }
 }
 
-// parses query parameters and updates OpenOptions
-fn parse_query_params(query: &str, opts: &mut OpenOptions) -> Result<()> {
+fn parse_query_params(
+    query: &str,
+    opts: &mut OpenOptions,
+    access: &mut i32,
+) -> std::result::Result<(), UriError> {
     for param in query.split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            let decoded_value = decode_percent(value);
-            match key {
-                "mode" => opts.mode = OpenMode::from_str(value)?,
-                "modeof" => opts.modeof = Some(decoded_value),
-                "cache" => opts.cache = decoded_value.as_str().into(),
-                "immutable" => opts.immutable = decoded_value == "1",
-                "vfs" => opts.vfs = Some(decoded_value),
-                "cipher" => opts.cipher = Some(decoded_value),
-                "hexkey" => opts.hexkey = Some(decoded_value),
-                _ => {}
+        let (key, value) = param.split_once('=').unwrap_or((param, ""));
+        let key = decode_uri_component(key)?;
+        let value = decode_uri_component(value)?;
+        match key.as_str() {
+            "mode" => {
+                let mode = match value.as_str() {
+                    "ro" => URI_READONLY,
+                    "rw" => URI_READWRITE,
+                    "rwc" => URI_READWRITE | URI_CREATE,
+                    "memory" => URI_MEMORY,
+                    _ => return Err(invalid_uri(format!("no such access mode: {value}"))),
+                };
+                if mode != URI_MEMORY && mode > *access {
+                    return Err(UriError {
+                        code: 3,
+                        message: format!("access mode not allowed: {value}"),
+                    });
+                }
+                *access = mode;
             }
+            "cache" => {
+                opts.cache = match value.as_str() {
+                    "shared" => CacheMode::Shared,
+                    "private" => CacheMode::Private,
+                    _ => return Err(invalid_uri(format!("no such cache mode: {value}"))),
+                }
+            }
+            "modeof" => opts.modeof = Some(value),
+            "immutable" => opts.immutable = value == "1",
+            "vfs" => opts.vfs = Some(value),
+            "cipher" => opts.cipher = Some(value),
+            "hexkey" => opts.hexkey = Some(value),
+            _ => {}
         }
     }
     Ok(())
 }
 
-/// Decodes percent-encoded characters
-/// this function was adapted from the 'urlencoding' crate. MIT
-pub fn decode_percent(uri: &str) -> String {
-    let from_hex_digit = |digit: u8| -> Option<u8> {
-        match digit {
-            b'0'..=b'9' => Some(digit - b'0'),
-            b'A'..=b'F' => Some(digit - b'A' + 10),
-            b'a'..=b'f' => Some(digit - b'a' + 10),
-            _ => None,
-        }
-    };
+fn invalid_uri(message: String) -> UriError {
+    UriError { code: 1, message }
+}
 
-    let offset = uri.chars().take_while(|&c| c != '%').count();
+fn decode_uri_component(input: &str) -> std::result::Result<String, UriError> {
+    String::from_utf8(decode_percent_bytes(input))
+        .map_err(|_| invalid_uri("invalid URI encoding".to_owned()))
+}
 
-    if offset >= uri.len() {
-        return uri.to_string();
-    }
+#[cfg(test)]
+fn decode_percent(uri: &str) -> String {
+    String::from_utf8_lossy(&decode_percent_bytes(uri)).into_owned()
+}
 
-    let mut decoded: Vec<u8> = Vec::with_capacity(uri.len());
-    let (ascii, mut data) = uri.as_bytes().split_at(offset);
-    decoded.extend_from_slice(ascii);
-
-    loop {
-        let mut parts = data.splitn(2, |&c| c == b'%');
-        let non_escaped_part = parts.next().unwrap();
-        let rest = parts.next();
-        if rest.is_none() && decoded.is_empty() {
-            return String::from_utf8_lossy(data).to_string();
-        }
-        decoded.extend_from_slice(non_escaped_part);
-        match rest {
-            Some(rest) => match rest.get(0..2) {
-                Some([first, second]) => match from_hex_digit(*first) {
-                    Some(first_val) => match from_hex_digit(*second) {
-                        Some(second_val) => {
-                            decoded.push((first_val << 4) | second_val);
-                            data = &rest[2..];
-                        }
-                        None => {
-                            decoded.extend_from_slice(&[b'%', *first]);
-                            data = &rest[1..];
-                        }
-                    },
-                    None => {
-                        decoded.push(b'%');
-                        data = rest;
-                    }
-                },
-                _ => {
-                    decoded.push(b'%');
-                    decoded.extend_from_slice(rest);
+fn decode_percent_bytes(input: &str) -> Vec<u8> {
+    let input = input.as_bytes();
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let decoded = input
+                .get(index + 1)
+                .zip(input.get(index + 2))
+                .and_then(|(&hi, &lo)| {
+                    Some(((hi as char).to_digit(16)? << 4 | (lo as char).to_digit(16)?) as u8)
+                });
+            if let Some(decoded) = decoded {
+                if decoded == 0 {
                     break;
                 }
-            },
-            None => break,
+                bytes.push(decoded);
+                index += 3;
+                continue;
+            }
         }
+        bytes.push(input[index]);
+        index += 1;
     }
-    String::from_utf8_lossy(&decoded).to_string()
+    bytes
 }
 
 pub fn trim_ascii_whitespace(s: &str) -> &str {
@@ -5392,6 +5391,111 @@ pub mod tests {
         assert!(check_ident_equivalency("\"foo\"", "`FOO`"));
         assert!(!check_ident_equivalency("\"foo\"", "[bar]"));
         assert!(!check_ident_equivalency("foo", "\"bar\""));
+    }
+
+    #[test]
+    fn percent_decoding_matches_ascii_component_rules() {
+        for byte in 1_u8..=127 {
+            let encoded = format!("left%{byte:02x}right");
+            let decoded = format!("left{}right", char::from(byte));
+            assert_eq!(decode_uri_component(&encoded), Ok(decoded));
+        }
+        for byte in b' '..=b'~' {
+            if byte.is_ascii_hexdigit() {
+                continue;
+            }
+            let character = char::from(byte);
+            for value in [format!("%{character}a"), format!("%a{character}")] {
+                assert_eq!(decode_uri_component(&value), Ok(value));
+            }
+        }
+        for value in ["%", "%a", "%G"] {
+            assert_eq!(decode_uri_component(value).as_deref(), Ok(value));
+        }
+        assert_eq!(
+            decode_uri_component("left%00ignored").as_deref(),
+            Ok("left")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uri_paths_preserve_unix_backslashes() {
+        for uri in [
+            r"file:/C:\directory\data.db",
+            r"file:///C:\directory\data.db",
+        ] {
+            assert_eq!(
+                OpenOptions::parse(uri).unwrap().path,
+                r"/C:\directory\data.db"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_flags_retain_initial_memory_access_and_error_codes() {
+        for (uri, flags, expected) in [
+            (
+                "file:x",
+                URI_READONLY | URI_MEMORY,
+                URI_READONLY | URI_MEMORY,
+            ),
+            ("file:x?mode=rw", URI_READONLY | URI_MEMORY, URI_READWRITE),
+            (
+                "file:x?mode=ro&mode=memory&mode=rwc",
+                URI_READWRITE | URI_CREATE,
+                URI_READWRITE | URI_CREATE,
+            ),
+        ] {
+            let (_, effective) = OpenOptions::parse_with_flags(uri, flags).unwrap();
+            assert_eq!(effective, expected, "{uri}");
+        }
+        let error = OpenOptions::parse_with_flags("file:x?mode=rw", URI_READONLY).unwrap_err();
+        assert_eq!(error.code, 3);
+        assert_eq!(error.message, "access mode not allowed: rw");
+        for uri in ["file:x?mode=RW", "file:x?cache=unknown", "file://#x"] {
+            assert_eq!(
+                OpenOptions::parse_with_flags(uri, URI_READWRITE | URI_CREATE)
+                    .unwrap_err()
+                    .code,
+                1,
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_components_follow_sqlite_percent_rules() {
+        for (uri, path, mode) in [
+            ("file:b%00c.db", "b", OpenMode::ReadWriteCreate),
+            ("file:a%zz.db", "a%zz.db", OpenMode::ReadWriteCreate),
+            ("file:é%20.db?m%6fde=r%6f", "é .db", OpenMode::ReadOnly),
+            ("file:x?mo%00junk=ro", "x", OpenMode::ReadWriteCreate),
+        ] {
+            let options = OpenOptions::parse(uri).unwrap();
+            assert_eq!(options.path, path, "{uri}");
+            assert_eq!(options.mode, mode, "{uri}");
+        }
+    }
+
+    #[test]
+    fn uri_modes_cannot_widen_access_without_memory_transition() {
+        for uri in ["file:x?mode=ro&mode=rw", "file:x?mode=rw&mode=rwc"] {
+            assert!(OpenOptions::parse(uri).is_err(), "{uri}");
+        }
+        let options = OpenOptions::parse("file:x?mode=ro&mode=memory&mode=rwc").unwrap();
+        assert_eq!(options.mode, OpenMode::ReadWriteCreate);
+    }
+
+    #[test]
+    fn uri_authority_includes_query_and_fragment_until_slash() {
+        for uri in [
+            "file://localhost?mode=ro",
+            "file://#x",
+            "file://?mode=memory",
+        ] {
+            assert!(OpenOptions::parse(uri).is_err(), "{uri}");
+        }
     }
 
     #[test]
