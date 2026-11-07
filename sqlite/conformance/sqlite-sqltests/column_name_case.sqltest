@@ -166,3 +166,102 @@ test quoted_identifiers {
 expect {
     MixedCase
 }
+
+# SQLite renames a subquery, CTE, view or CREATE TABLE AS column whose name
+# would be true or false to column<N>, so the name is never read back as the
+# boolean literal.
+@cross-check-integrity
+test true_false_subquery_columns_are_named_by_position {
+    SELECT column1, column2, typeof(column1) FROM (SELECT true, FALSE, NULL, 1);
+}
+expect {
+    1|0|integer
+}
+
+@cross-check-integrity
+test true_false_cte_columns_are_named_by_position {
+    WITH c AS (SELECT 1 AS a, true) SELECT column2 FROM c;
+    WITH c(a, "false") AS (SELECT 1, 2) SELECT column2 FROM c;
+    WITH RECURSIVE r AS (SELECT true UNION ALL SELECT column1 + 1 FROM r WHERE column1 < 3)
+    SELECT column1 FROM r;
+}
+expect {
+    1
+    2
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test true_false_view_columns_are_named_by_position {
+    CREATE VIEW v1 AS SELECT true, false, 1 AS "TRUE", 2 AS b;
+    SELECT group_concat(name) FROM pragma_table_info('v1');
+    SELECT column1, column2, column3, b FROM v1;
+    CREATE VIEW v2("false", b) AS SELECT 1, 2;
+    SELECT group_concat(name) FROM pragma_table_info('v2');
+    SELECT column1, b FROM v2;
+}
+expect {
+    column1,column2,column3,b
+    1|0|1|2
+    column1,b
+    1|2
+}
+
+@cross-check-integrity
+test true_false_ctas_columns_are_named_by_position {
+    CREATE TABLE t1 AS SELECT true, false AS x, 1 AS False;
+    SELECT group_concat(name) FROM pragma_table_info('t1');
+    SELECT * FROM t1;
+}
+expect {
+    column1,x,column3
+    1|0|1
+}
+
+@cross-check-integrity
+test true_false_table_columns_are_renamed_through_star {
+    CREATE TABLE t4("true", "False", b);
+    INSERT INTO t4 VALUES (1, 2, 3);
+    SELECT column1, column2, b FROM (SELECT * FROM t4);
+    CREATE TABLE t5 AS SELECT * FROM t4;
+    SELECT group_concat(name) FROM pragma_table_info('t5');
+}
+expect {
+    1|2|3
+    column1,column2,b
+}
+
+@cross-check-integrity
+test true_false_renamed_column_takes_a_suffix_when_its_name_is_taken {
+    SELECT * FROM (SELECT true, 2 AS column1) WHERE "column1:1" = 2;
+    CREATE TABLE t6 AS SELECT true, 2 AS column1;
+    SELECT group_concat(name) FROM pragma_table_info('t6');
+}
+expect {
+    1|2
+    column1,column1:1
+}
+
+@cross-check-integrity
+test true_false_view_column_follows_a_column_rename {
+    CREATE TABLE t7(a, "true");
+    INSERT INTO t7 VALUES (1, 2);
+    CREATE VIEW v7 AS SELECT * FROM t7;
+    CREATE VIEW v8 AS SELECT * FROM (SELECT * FROM t7);
+    CREATE VIEW v9 AS WITH c AS (SELECT * FROM t7) SELECT * FROM c;
+    SELECT group_concat(name) FROM pragma_table_info('v8');
+    ALTER TABLE t7 RENAME COLUMN "true" TO y;
+    SELECT group_concat(name) FROM pragma_table_info('v7');
+    SELECT group_concat(name) FROM pragma_table_info('v8');
+    SELECT group_concat(name) FROM pragma_table_info('v9');
+    SELECT y FROM v8;
+}
+expect {
+    a,column2
+    a,y
+    a,y
+    a,y
+    2
+}

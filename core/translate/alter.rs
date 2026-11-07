@@ -4094,6 +4094,7 @@ fn apply_select_for_column_rename(
                 NamespaceId::ROOT,
                 &select.with,
                 schema,
+                crate::util::ColumnNaming::Final,
                 &outer_target_qualifiers.ctes,
             )
         })?,

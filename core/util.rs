@@ -1588,13 +1588,28 @@ impl ViewColumnSchema {
             .collect()
     }
 
-    /// Name the view's columns from the column list of `CREATE VIEW v(x, y)`.
+    /// Name the columns from the column list of `CREATE VIEW v(x, y)` or
+    /// `WITH c(x, y) AS (...)`.
     pub fn rename_columns(&mut self, names: &[ast::IndexedColumn]) {
+        self.set_column_names(names);
+        self.name_columns();
+    }
+
+    fn set_column_names(&mut self, names: &[ast::IndexedColumn]) {
         for (view_column, name) in self.columns.iter_mut().zip(names) {
             // as_str: Display would render the quoted form, embedding literal
             // quote characters in the name
             view_column.column.name = Some(name.col_name.as_str().to_string());
         }
+    }
+
+    /// Give the columns their final names; see [name_derived_columns].
+    fn name_columns(&mut self) {
+        name_derived_columns(
+            self.columns
+                .iter_mut()
+                .map(|view_column| &mut view_column.column.name),
+        );
     }
 }
 
@@ -2299,6 +2314,7 @@ fn view_source_from_select_table(
     namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
+    naming: ColumnNaming,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<ViewSource> {
@@ -2366,7 +2382,10 @@ fn view_source_from_select_table(
             })
         }
         ast::SelectTable::Select { select, alias, .. } => {
-            let derived = extract_view_columns_inner(namespace, select, schema, ctes)?;
+            let mut derived = extract_view_columns_inner(namespace, select, schema, naming, ctes)?;
+            if naming == ColumnNaming::Final {
+                derived.name_columns();
+            }
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2387,10 +2406,10 @@ fn view_source_from_select_table(
                 }
                 | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
-            view_source_from_select_table(namespace, &source_table, schema, ctes, tables)
+            view_source_from_select_table(namespace, &source_table, schema, naming, ctes, tables)
         }
         ast::SelectTable::Sub(from, alias) => {
-            let sources = view_sources_from_clause(namespace, from, schema, ctes, tables)?;
+            let sources = view_sources_from_clause(namespace, from, schema, naming, ctes, tables)?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2481,10 +2500,12 @@ fn view_sources_from_clause(
     namespace: NamespaceId,
     from: &ast::FromClause,
     schema: &Schema,
+    naming: ColumnNaming,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<Vec<ViewSource>> {
-    let first = view_source_from_select_table(namespace, &from.select, schema, ctes, tables)?;
+    let first =
+        view_source_from_select_table(namespace, &from.select, schema, naming, ctes, tables)?;
     let mut sources = vec![first];
     // SQLite enables strict USING checks for the full list when any join keeps right rows.
     let has_right_or_full_join = from
@@ -2493,7 +2514,8 @@ fn view_sources_from_clause(
         .any(|join| JoinType::from_join_operator(&join.operator).keeps_right_rows());
 
     for join in &from.joins {
-        let right = view_source_from_select_table(namespace, &join.table, schema, ctes, tables)?;
+        let right =
+            view_source_from_select_table(namespace, &join.table, schema, naming, ctes, tables)?;
         let natural = matches!(
             join.operator,
             ast::JoinOperator::TypedJoin(Some(join_type))
@@ -2686,32 +2708,17 @@ fn view_merged_column(first_column: &ViewColumn) -> ViewColumn {
     }
 }
 
-fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<String, usize>) {
-    let name = column
-        .column
-        .name
-        .clone()
-        .unwrap_or_else(|| "?".to_string());
-    let count = counts.entry(normalize_ident(&name)).or_insert(0);
-    if *count > 0 {
-        column.column.name = Some(format!("{name}:{count}"));
-    } else {
-        column.column.name = Some(name);
-    }
-    *count += 1;
-}
-
 fn extract_view_columns_inner(
     namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
+    naming: ColumnNaming,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
-    let ctes = extract_cte_columns(namespace, &select_stmt.with, schema, outer_ctes)?;
+    let ctes = extract_cte_columns(namespace, &select_stmt.with, schema, naming, outer_ctes)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
-    let mut column_name_counts = HashMap::default();
 
     let ast::OneSelect::Select {
         from,
@@ -2724,7 +2731,7 @@ fn extract_view_columns_inner(
 
     let sources = from
         .as_ref()
-        .map(|from| view_sources_from_clause(namespace, from, schema, &ctes, &mut tables))
+        .map(|from| view_sources_from_clause(namespace, from, schema, naming, &ctes, &mut tables))
         .transpose()?
         .unwrap_or_default();
 
@@ -2739,7 +2746,6 @@ fn extract_view_columns_inner(
                     .unwrap_or_else(|| expr.to_string());
                 let mut column = view_result_column(expr, &sources);
                 column.column.name = Some(name);
-                deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
             }
             ast::ResultColumn::Star => {
@@ -2754,10 +2760,7 @@ fn extract_view_columns_inner(
                         ),
                     });
                 }
-                for mut column in expanded {
-                    deduplicate_view_column_name(&mut column, &mut column_name_counts);
-                    columns.push(column);
-                }
+                columns.extend(expanded);
             }
             ast::ResultColumn::TableStar(table_ref) => {
                 let qualifier = normalize_ident(table_ref.as_str());
@@ -2772,29 +2775,65 @@ fn extract_view_columns_inner(
                         .iter()
                         .filter(|column| !column.column.hidden())
                     {
-                        let mut column = view_star_column(&sources, source_index, source_column);
-                        deduplicate_view_column_name(&mut column, &mut column_name_counts);
-                        columns.push(column);
+                        columns.push(view_star_column(&sources, source_index, source_column));
                     }
                 }
             }
         }
     }
 
+    for column in &mut columns {
+        column.column.name.get_or_insert_with(|| "?".to_string());
+    }
     Ok(ViewColumnSchema { tables, columns })
+}
+
+/// Gives the columns of a subquery, CTE, view or CREATE TABLE AS their final
+/// names, as SQLite's `sqlite3ColumnsFromExprList` does. A column named `true`
+/// or `false`, in any case, is renamed to `column<N>`, N being its position
+/// from 1, so that it is never read back as the boolean literal. Then a name
+/// that repeats an earlier one, ignoring case and any `:<digits>` suffix, gets
+/// the first free `:<count>` suffix.
+pub(crate) fn name_derived_columns<'a>(names: impl IntoIterator<Item = &'a mut Option<String>>) {
+    let mut used_names = HashSet::default();
+    for (column_index, name) in names.into_iter().enumerate() {
+        let Some(name) = name else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false") {
+            *name = format!("column{}", column_index + 1);
+        }
+        let base_name = strip_numbered_suffix(name).to_string();
+        let mut count = 0;
+        while !used_names.insert(name.to_lowercase()) {
+            count += 1;
+            *name = format!("{base_name}:{count}");
+        }
+    }
+}
+
+fn strip_numbered_suffix(name: &str) -> &str {
+    let without_digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    match without_digits.strip_suffix(':') {
+        Some(base_name) if !base_name.is_empty() => base_name,
+        _ => name,
+    }
 }
 
 pub(crate) fn extract_cte_columns(
     namespace: NamespaceId,
     with: &Option<ast::With>,
     schema: &Schema,
+    naming: ColumnNaming,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<HashMap<String, ViewColumnSchema>> {
     let mut ctes = outer_ctes.clone();
     for cte in with.iter().flat_map(|with| &with.ctes) {
-        let mut derived = extract_view_columns_inner(namespace, &cte.select, schema, &ctes)?;
-        for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
-            column.column.name = Some(explicit_name.col_name.as_str().to_string());
+        let mut derived =
+            extract_view_columns_inner(namespace, &cte.select, schema, naming, &ctes)?;
+        derived.set_column_names(&cte.columns);
+        if naming == ColumnNaming::Final {
+            derived.name_columns();
         }
         ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
     }
@@ -2807,8 +2846,14 @@ pub(crate) fn select_table_column_names(
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<Vec<String>> {
-    let source =
-        view_source_from_select_table(namespace, select_table, schema, ctes, &mut Vec::new())?;
+    let source = view_source_from_select_table(
+        namespace,
+        select_table,
+        schema,
+        ColumnNaming::Final,
+        ctes,
+        &mut Vec::new(),
+    )?;
     Ok(source
         .columns
         .iter()
@@ -2903,7 +2948,40 @@ pub fn extract_view_columns(
     select_stmt: &ast::Select,
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
-    extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
+    let mut view_column_schema = extract_view_columns_inner(
+        namespace,
+        select_stmt,
+        schema,
+        ColumnNaming::Final,
+        &HashMap::default(),
+    )?;
+    view_column_schema.name_columns();
+    Ok(view_column_schema)
+}
+
+/// Like [extract_view_columns], but each column, also in the view's
+/// subqueries and CTEs, keeps the name the SELECT gives it, before
+/// [name_derived_columns] renames it.
+fn extract_view_columns_as_written(
+    namespace: NamespaceId,
+    select_stmt: &ast::Select,
+    schema: &Schema,
+) -> Result<ViewColumnSchema> {
+    extract_view_columns_inner(
+        namespace,
+        select_stmt,
+        schema,
+        ColumnNaming::AsWritten,
+        &HashMap::default(),
+    )
+}
+
+/// Whether the columns of a view's subqueries and CTEs get their final names
+/// from [name_derived_columns] or keep the names their SELECT gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnNaming {
+    Final,
+    AsWritten,
 }
 
 pub fn rewrite_fk_parent_cols_if_self_ref(
@@ -3060,7 +3138,9 @@ mod rename_column_view {
             let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
-            let view_column_schema = extract_view_columns(namespace, &select, schema)?;
+            // The rename matches the old column name, so it runs before the
+            // final naming can turn that name into `column<N>`.
+            let view_column_schema = extract_view_columns_as_written(namespace, &select, schema)?;
             let mut final_columns = apply_view_column_rename(view_column_schema, &ctx);
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
@@ -3068,6 +3148,7 @@ mod rename_column_view {
                     col.name = Some(indexed_col.col_name.as_str().to_string());
                 }
             }
+            name_derived_columns(final_columns.iter_mut().map(|column| &mut column.name));
 
             let columns_changed = !columns_equivalent(&original_columns, &final_columns);
 
@@ -3144,6 +3225,7 @@ mod rename_column_view {
                 col.name = Some(indexed_col.col_name.as_str().to_string());
             }
         }
+        name_derived_columns(columns.iter_mut().map(|column| &mut column.name));
         Ok(columns)
     }
 

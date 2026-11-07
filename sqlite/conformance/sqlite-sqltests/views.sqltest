@@ -561,3 +561,16 @@ expect {
     1|1
     2|3
 }
+
+# A name that repeats an earlier one gets the first free :N suffix, skipping a
+# column that is already named like a suffixed copy.
+@cross-check-integrity
+test view-column-names-skip-a-taken-numbered-name {
+    CREATE VIEW view_numbered AS SELECT 1 AS a, 2 AS a, 3 AS "a:1", 4 AS A;
+    SELECT group_concat(name) FROM pragma_table_info('view_numbered');
+    SELECT * FROM view_numbered;
+}
+expect {
+    a,a:1,a:2,A:3
+    1|2|3|4
+}
