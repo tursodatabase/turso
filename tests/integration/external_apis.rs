@@ -15,8 +15,8 @@ use std::{
 use turso_core::{ConnectOpts, Connection, ConnectionHooks, LimboError, SavepointMemo, StepResult};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
-    ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
-    ValueType as ExtValueType,
+    ScalarFunc, ScalarFunction, StepFunction, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
+    VTable, Value as ExtValue, ValueDestructor, ValueType as ExtValueType,
 };
 
 static CTX_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1481,5 +1481,162 @@ fn external_aggregate_cannot_be_used_as_window_function(
 
     let grouped: Vec<(i64,)> = conn.exec_rows("SELECT managed_sum(value) FROM data");
     assert_eq!(grouped, vec![(6,)]);
+    Ok(())
+}
+
+/// Writable virtual table whose rows live in the table instance, so every
+/// connection that uses the table sees the same rows.
+#[derive(VTabModuleDerive)]
+struct SharedRowsVTab;
+
+type SharedRows = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+struct SharedRowsTable {
+    rows: SharedRows,
+}
+
+struct SharedRowsCursor {
+    rows: SharedRows,
+    index: usize,
+}
+
+/// Set when a `shared_rows` table is destroyed, cleared when one is created.
+static SHARED_ROWS_DESTROYED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl VTabModule for SharedRowsVTab {
+    type Table = SharedRowsTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "shared_rows";
+    const READONLY: bool = false;
+
+    fn create(_args: &[ExtValue]) -> Result<(String, Self::Table), ResultCode> {
+        SHARED_ROWS_DESTROYED.store(false, AtomicOrdering::SeqCst);
+        Ok((
+            "CREATE TABLE x (value TEXT)".into(),
+            SharedRowsTable {
+                rows: Default::default(),
+            },
+        ))
+    }
+}
+
+impl VTable for SharedRowsTable {
+    type Cursor = SharedRowsCursor;
+    type Error = String;
+
+    fn open(&self, _conn: Option<Arc<turso_ext::Connection>>) -> Result<Self::Cursor, Self::Error> {
+        Ok(SharedRowsCursor {
+            rows: self.rows.clone(),
+            index: 0,
+        })
+    }
+
+    fn insert(&mut self, values: &[ExtValue]) -> Result<i64, Self::Error> {
+        let value = values[0].to_text().unwrap_or_default().to_string();
+        let mut rows = self.rows.borrow_mut();
+        rows.push(value);
+        Ok(rows.len() as i64)
+    }
+
+    fn commit(&mut self) -> Result<(), Self::Error> {
+        if SHARED_ROWS_DESTROYED.load(AtomicOrdering::SeqCst) {
+            return Err("commit on a destroyed table".into());
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), Self::Error> {
+        if SHARED_ROWS_DESTROYED.load(AtomicOrdering::SeqCst) {
+            return Err("rollback on a destroyed table".into());
+        }
+        Ok(())
+    }
+
+    fn destroy(&mut self) -> Result<(), Self::Error> {
+        SHARED_ROWS_DESTROYED.store(true, AtomicOrdering::SeqCst);
+        Ok(())
+    }
+}
+
+impl VTabCursor for SharedRowsCursor {
+    type Error = String;
+
+    fn filter(&mut self, _args: &[ExtValue], _idx_str: Option<(&str, i32)>) -> ResultCode {
+        self.index = 0;
+        if self.eof() {
+            ResultCode::EOF
+        } else {
+            ResultCode::OK
+        }
+    }
+
+    fn rowid(&self) -> i64 {
+        self.index as i64 + 1
+    }
+
+    fn column(&self, _idx: u32) -> Result<ExtValue, Self::Error> {
+        Ok(ExtValue::from_text(self.rows.borrow()[self.index].clone()))
+    }
+
+    fn eof(&self) -> bool {
+        self.index >= self.rows.borrow().len()
+    }
+
+    fn next(&mut self) -> ResultCode {
+        self.index += 1;
+        if self.eof() {
+            ResultCode::EOF
+        } else {
+            ResultCode::OK
+        }
+    }
+}
+
+fn connect_with_shared_rows(tmp_db: &TempDatabase) -> Arc<Connection> {
+    let conn = tmp_db.connect_limbo();
+    let api = unsafe { conn._build_turso_ext() };
+    let rc = unsafe { SharedRowsVTab::register_SharedRowsVTab(&api as *const _) };
+    unsafe { conn._free_extension_ctx(api) };
+    assert_eq!(rc, ResultCode::OK);
+    conn
+}
+
+#[turso_macros::test]
+#[serial]
+fn extension_vtab_can_be_written_and_dropped_from_another_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let connect = || connect_with_shared_rows(&tmp_db);
+
+    let creator = connect();
+    creator.execute("CREATE VIRTUAL TABLE v USING shared_rows")?;
+    creator.execute("INSERT INTO v(value) VALUES ('a')")?;
+
+    let writer = connect();
+    writer.execute("INSERT INTO v(value) VALUES ('b')")?;
+    let rows: Vec<(String,)> = writer.exec_rows("SELECT value FROM v");
+    assert_eq!(rows, vec![("a".to_string(),), ("b".to_string(),)]);
+
+    let dropper = connect();
+    dropper.execute("DROP TABLE v")?;
+    let names: Vec<(String,)> = dropper.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(names, vec![]);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn extension_vtab_dropped_in_transaction_is_not_committed_or_rolled_back(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_shared_rows(&tmp_db);
+    for end in ["COMMIT", "ROLLBACK"] {
+        conn.execute("CREATE VIRTUAL TABLE v USING shared_rows")?;
+        conn.execute("BEGIN")?;
+        conn.execute("INSERT INTO v(value) VALUES ('a')")?;
+        conn.execute("DROP TABLE v")?;
+        conn.execute(end)?;
+    }
     Ok(())
 }

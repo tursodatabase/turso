@@ -587,8 +587,8 @@ pub struct Connection {
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
-    /// Track when each virtual table instance is currently in transaction.
-    pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Virtual table instances currently in a transaction, by vtab id.
+    pub(crate) vtab_txn_states: RwLock<HashMap<u64, Arc<VirtualTable>>>,
     /// One prepared cursor per index-method attachment touched by the active
     /// database transaction. Statement reset transfers cursors here so the
     /// eventual transaction outcome is delivered exactly once per attachment.
