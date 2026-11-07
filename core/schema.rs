@@ -2023,7 +2023,7 @@ impl Schema {
 
     pub fn trigger_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Trigger>> {
         self.triggers_mut(namespace)
-            .find(|trigger| trigger.name == name)
+            .find(|trigger| trigger.name.eq_ignore_ascii_case(name))
     }
 
     /// Takes every trigger of `table_name` out of the namespace.
@@ -3040,11 +3040,12 @@ impl Schema {
     ) -> Option<Arc<Trigger>> {
         let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
-        let name = normalize_ident(name);
-        objects
-            .triggers
-            .get(&table_name)
-            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+        objects.triggers.get(&table_name).and_then(|triggers| {
+            triggers
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(name))
+                .cloned()
+        })
     }
 
     pub fn get_triggers_for_table(
@@ -3062,12 +3063,11 @@ impl Schema {
 
     pub fn get_trigger(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Trigger>> {
         let objects = self.namespace(namespace);
-        let name = normalize_ident(name);
         objects
             .triggers
             .values()
             .flatten()
-            .find(|t| t.name == name)
+            .find(|t| t.name.eq_ignore_ascii_case(name))
             .cloned()
     }
 

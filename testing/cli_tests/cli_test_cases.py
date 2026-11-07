@@ -295,6 +295,25 @@ def test_import_csv_multi_batch():
     shell.quit()
 
 
+def test_mixed_case_table_found_by_other_case():
+    shell = TestTursoShell()
+    shell.run_test("open-memory", ".open :memory:", "")
+    shell.run_test("create-mixed-case-table", 'CREATE TABLE "Pk6" (c1 INT, c2 REAL, c3 TEXT UNIQUE);', "")
+    shell.run_test(
+        "schema-mixed-case-table-other-case",
+        ".schema pk6",
+        'CREATE TABLE "Pk6" (c1 INT, c2 REAL, c3 TEXT UNIQUE);',
+    )
+    shell.run_test("indexes-mixed-case-table-other-case", ".indexes pk6", "sqlite_autoindex_pk6_1")
+    shell.run_test(
+        "import-mixed-case-table-other-case",
+        ".import --csv ./testing/cli_tests/test_files/test.csv pk6",
+        "",
+    )
+    shell.run_test("verify-mixed-case-import", 'select * from "Pk6";', "1|2.0|String'1\n3|4.0|String2")
+    shell.quit()
+
+
 def test_table_patterns():
     shell = TestTursoShell()
     shell.run_test("tables-pattern", ".tables us%", "users")
@@ -593,6 +612,7 @@ def main():
     test_import_csv_skip()
     test_import_csv_create_table_from_header()
     test_import_csv_multi_batch()
+    test_mixed_case_table_found_by_other_case()
     test_table_patterns()
     test_update_delete_reject_limit()
     test_uri_readonly()
