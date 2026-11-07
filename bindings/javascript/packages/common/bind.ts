@@ -7,8 +7,25 @@
 // The `params` parameter is an array of parameters.
 //
 // The function returns void.
-export function bindParams(stmt, params) {
-  const len = params?.length;
+export function bindParams(stmt, params, permanentlyBound = false) {
+  const len = params.length;
+  if (permanentlyBound && len === 0) {
+    return;
+  }
+  const named = len === 1 && isPlainObject(params[0]);
+  if (named) {
+    for (let i = 1; i <= stmt.parameterCount(); i++) {
+      const name = stmt.parameterName(i);
+      if (!name || params[0][name.substring(1)] === undefined || !Object.prototype.hasOwnProperty.call(params[0], name.substring(1))) {
+        throw new RangeError('Too few parameter values were provided');
+      }
+    }
+  } else {
+    const count = params.reduce((total, value) => total + (Array.isArray(value) ? value.length : 1), 0);
+    if (count < stmt.parameterCount()) {
+      throw new RangeError('Too few parameter values were provided');
+    }
+  }
   if (len === 0) {
     return;
   }

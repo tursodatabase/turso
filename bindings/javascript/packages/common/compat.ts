@@ -370,6 +370,7 @@ class Database {
 class Statement {
   stmt: NativeStatement;
   db: NativeDatabase;
+  private permanentlyBound = false;
 
   constructor(stmt: NativeStatement, db: NativeDatabase) {
     this.stmt = stmt;
@@ -436,7 +437,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, toBindArgs(params), this.permanentlyBound);
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
@@ -467,7 +468,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, toBindArgs(params), this.permanentlyBound);
     let row = undefined;
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
@@ -494,7 +495,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, toBindArgs(params), this.permanentlyBound);
 
     while (true) {
       const [stepResult] = stepSync(this.stmt);
@@ -520,7 +521,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, toBindArgs(params), this.permanentlyBound);
     const rows: any[] = [];
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
@@ -555,6 +556,7 @@ class Statement {
   bind(...bindParameters) {
     try {
       bindParams(this.stmt, bindParameters);
+      this.permanentlyBound = true;
       return this;
     } catch (err) {
       throw convertError(err);
