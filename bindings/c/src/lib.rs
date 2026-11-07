@@ -445,25 +445,30 @@ pub const SQLITE_OPEN_SHAREDCACHE: ffi::c_int = 0x00020000;
 pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
 pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
 
-/// Percent-decode a URI component (e.g., `%20` -> ` `, `%2F` -> `/`).
-/// Returns None if a percent sequence is malformed or the result is not valid UTF-8.
+/// Percent-decode a URI component, preserving malformed escapes as SQLite does.
 fn percent_decode(input: &str) -> Option<String> {
+    let input = input.as_bytes();
     let mut bytes = Vec::with_capacity(input.len());
-    let mut iter = input.as_bytes().iter();
-    while let Some(&b) = iter.next() {
-        if b == b'%' {
-            let hi = *iter.next()?;
-            let lo = *iter.next()?;
-            let hex = [hi, lo];
-            let s = std::str::from_utf8(&hex).ok()?;
-            let decoded = u8::from_str_radix(s, 16).ok()?;
-            if decoded == 0 {
-                break;
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let decoded = input
+                .get(index + 1)
+                .zip(input.get(index + 2))
+                .and_then(|(&hi, &lo)| {
+                    Some(((hi as char).to_digit(16)? << 4 | (lo as char).to_digit(16)?) as u8)
+                });
+            if let Some(decoded) = decoded {
+                if decoded == 0 {
+                    break;
+                }
+                bytes.push(decoded);
+                index += 3;
+                continue;
             }
-            bytes.push(decoded);
-        } else {
-            bytes.push(b);
         }
+        bytes.push(input[index]);
+        index += 1;
     }
     String::from_utf8(bytes).ok()
 }
@@ -588,7 +593,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     };
     let use_memory = parsed.memory;
     let cache_shared = parsed.cache_shared;
-    let temp_path = if filename_str.is_empty() && !use_memory {
+    let temp_path = if parsed.path.is_empty() && !use_memory {
         Some(temp_database_path())
     } else {
         None
@@ -601,9 +606,12 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         && std::fs::metadata(&effective_filename)
             .map(|metadata| metadata.permissions().readonly())
             .unwrap_or(false);
-    let file_open_flags = if parsed.access & SQLITE_OPEN_READONLY != 0 || file_is_readonly {
+    let connection_readonly = parsed.access & SQLITE_OPEN_READONLY != 0 || file_is_readonly;
+    let file_open_flags = if temp_path.is_some() {
+        turso_core::OpenFlags::Create
+    } else if connection_readonly {
         turso_core::OpenFlags::ReadOnly
-    } else if parsed.access & SQLITE_OPEN_CREATE != 0 || temp_path.is_some() {
+    } else if parsed.access & SQLITE_OPEN_CREATE != 0 {
         turso_core::OpenFlags::Create
     } else {
         turso_core::OpenFlags::None
@@ -675,9 +683,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect(
-        ConnectOpts::new().with_readonly(file_open_flags.contains(turso_core::OpenFlags::ReadOnly)),
-    ) {
+    match db.connect(ConnectOpts::new().with_readonly(connection_readonly)) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
@@ -3780,6 +3786,28 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn percent_decoding_matches_ascii_component_rules() {
+        for byte in 1_u8..=127 {
+            let encoded = format!("left%{byte:02x}right");
+            let decoded = format!("left{}right", char::from(byte));
+            assert_eq!(percent_decode(&encoded), Some(decoded));
+        }
+        for byte in b' '..=b'~' {
+            if byte.is_ascii_hexdigit() {
+                continue;
+            }
+            let character = char::from(byte);
+            for value in [format!("%{character}a"), format!("%a{character}")] {
+                assert_eq!(percent_decode(&value), Some(value));
+            }
+        }
+        for value in ["%", "%a", "%G"] {
+            assert_eq!(percent_decode(value).as_deref(), Some(value));
+        }
+        assert_eq!(percent_decode("left%00ignored").as_deref(), Some("left"));
+    }
+
     #[test]
     fn structured_error_messages_preserve_payload_without_category() {
         for error in [

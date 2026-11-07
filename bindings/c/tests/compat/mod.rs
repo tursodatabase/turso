@@ -222,12 +222,124 @@ const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
 const SQLITE_UTF8: i32 = 1;
+const SQLITE_OPEN_READONLY: i32 = 0x00000001;
 const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod tests {
     use super::*;
+    #[test]
+    fn uri_malformed_percent_sequences_remain_literal() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            for (index, suffix) in ["%zz.db", "%.db", "%2.db", "%G0.db"].iter().enumerate() {
+                let path = directory.path().join(format!("literal-{index}{suffix}"));
+                let uri =
+                    std::ffi::CString::new(format!("file:{}?%zz=50%&note=%2", path.display()))
+                        .unwrap();
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+                assert!(path.exists());
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn uri_empty_decoded_paths_open_private_temporary_databases() {
+        unsafe {
+            for uri in [
+                c"file:",
+                c"file:?mode=rwc",
+                c"file://",
+                c"file://localhost",
+                c"file:%00ignored?mode=rwc",
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(sqlite3_db_filename(db, c"main".as_ptr())),
+                    c""
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"CREATE TABLE t(x); INSERT INTO t VALUES(7)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                let mut other = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut other, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        other,
+                        c"SELECT * FROM t".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_ERROR
+                );
+                assert_eq!(sqlite3_close(other), SQLITE_OK);
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_empty_paths_open_private_temporary_databases() {
+        unsafe {
+            for (uri, flags) in [
+                (c"", SQLITE_OPEN_READONLY),
+                (c"file:?mode=ro", 6 | SQLITE_OPEN_URI),
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, flags, ptr::null()),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(sqlite3_db_filename(db, c"main".as_ptr())),
+                    c""
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"SELECT 1".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"CREATE TABLE t(x)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    8
+                );
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
     #[test]
     fn uri_readwrite_without_create_preserves_missing_path() {
         unsafe {

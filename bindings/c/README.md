@@ -18,7 +18,11 @@ READWRITE without CREATE and URI `mode=rw` require an existing file. With
 `SQLITE_OPEN_URI`, decoded `mode=ro`, `mode=rw`, and `mode=rwc` may narrow the
 requested file access; repeating these modes cannot widen an earlier restriction.
 `mode=memory` selects writable memory storage, as in SQLite. URI fragments do not
-supply query parameters.
+supply query parameters. Malformed percent escapes remain literal characters,
+while valid escapes are decoded. An empty decoded path opens a private temporary
+database, including `file:`, `file://`, and `file://localhost`. A read-only
+request for temporary storage allows opening and reading but rejects writes to
+its main schema.
 
 A read-only connection stays read-only when it shares an already writable
 database. Opening for writing can fail while the process retains a database
