@@ -18,10 +18,10 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
-    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
-    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
-    PageLocation, QueryMode, Statement, StepResult, IO,
+    types::AsValueRef, ConnectOpts, Connection, Database, DatabaseOpts, DatabaseStorage,
+    EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions, PageCodec,
+    PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode, Statement,
+    StepResult, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -1010,15 +1010,8 @@ impl TursoDatabase {
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
                     }
-                    let db_file = if let Some(db_file) = &self.config.db_file {
-                        db_file.clone()
-                    } else {
-                        let file = io.open_file(&self.config.path, open_flags, true)?;
-                        Arc::new(DatabaseFile::new(file))
-                    };
-
                     state.io = Some(io);
-                    state.db_file = Some(db_file);
+                    state.db_file = self.config.db_file.clone();
                     state.opts = Some(opts);
                     state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
@@ -1030,20 +1023,18 @@ impl TursoDatabase {
                         .as_ref()
                         .expect("io must be initialized in Init phase")
                         .clone();
-                    let db_file = state
-                        .db_file
-                        .as_ref()
-                        .expect("db_file must be initialized in Init phase")
-                        .clone();
+                    let db_file = state.db_file.clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
                     let open_flags = state.open_flags;
 
-                    let options = OpenOptions::new(Arc::new(SqliteDialect))
-                        .storage(db_file)
+                    let mut options = OpenOptions::new(Arc::new(SqliteDialect))
                         .flags(open_flags)
                         .db_opts(opts)
                         .encryption(self.config.encryption.clone())
                         .page_codec(self.config.page_codec.clone());
+                    if let Some(db_file) = db_file {
+                        options = options.storage(db_file);
+                    }
                     match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
@@ -1084,7 +1075,11 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly))
+                    .with_page_codec(page_codec.clone()),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1093,7 +1088,11 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly))
+                    .with_encryption_key(encryption_key),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -2098,6 +2097,119 @@ mod tests {
         let result = db.open().unwrap();
         assert!(!result.is_io());
         db
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn cached_sdk_join_preserves_existing_process_file_lock() {
+        use turso_core::IO;
+
+        const CHILD_PATH: &str = "TURSO_SDK_LOCK_PROBE_PATH";
+        const CHILD_BLOCKED: &str = "TURSO_SDK_LOCK_PROBE_BLOCKED";
+        if let Ok(path) = std::env::var(CHILD_PATH) {
+            let io = turso_core::PlatformIO::new().unwrap();
+            let result = io.open_file(&path, OpenFlags::None, true);
+            if std::env::var(CHILD_BLOCKED).unwrap() == "1" {
+                assert!(
+                    matches!(result, Err(LimboError::LockingError(_))),
+                    "another process must not open the SDK owner's locked file"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "lock must be released after all owners close"
+                );
+            }
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config_with_features(None);
+        config.path = directory
+            .path()
+            .join("locked.db")
+            .to_string_lossy()
+            .into_owned();
+        let probe = |blocked: bool, phase: &str| {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rsapi::tests::cached_sdk_join_preserves_existing_process_file_lock",
+                    "--nocapture",
+                ])
+                .env(CHILD_PATH, &config.path)
+                .env(CHILD_BLOCKED, if blocked { "1" } else { "0" })
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("nonblocking file-lock probe exceeded its deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "lock probe failed ({phase}):\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let owner = TursoDatabase::new(config.clone());
+        assert!(!owner.open().unwrap().is_io());
+        let writer = owner.connect().unwrap();
+        execute_sql(&writer, "CREATE TABLE t(x)");
+        probe(true, "before join");
+        let mut readonly_config = config.clone();
+        readonly_config.open_flags = OpenFlags::ReadOnly;
+        let joined = TursoDatabase::new(readonly_config);
+        assert!(!joined.open().unwrap().is_io());
+        probe(true, "joined holder alive");
+        drop(joined);
+        probe(true, "joined holder dropped");
+        let mut readonly_config = config.clone();
+        readonly_config.open_flags = OpenFlags::ReadOnly;
+        let surviving_reader = TursoDatabase::new(readonly_config);
+        assert!(!surviving_reader.open().unwrap().is_io());
+        drop(writer);
+        drop(owner);
+        probe(true, "readonly holder outlives original owner");
+        drop(surviving_reader);
+        probe(false, "all owners dropped");
+    }
+
+    #[test]
+    fn readonly_connection_cannot_write_through_cached_writable_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("mixed.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut config = config_with_features(None);
+        config.path = path;
+        let writer_db = TursoDatabase::new(config.clone());
+        assert!(!writer_db.open().unwrap().is_io());
+        let writer = writer_db.connect().unwrap();
+        execute_sql(&writer, "CREATE TABLE t(x)");
+        execute_sql(&writer, "INSERT INTO t VALUES(1)");
+        config.open_flags = OpenFlags::ReadOnly;
+        let reader_db = TursoDatabase::new(config);
+        assert!(!reader_db.open().unwrap().is_io());
+        let reader = reader_db.connect().unwrap();
+        execute_sql(&reader, "PRAGMA query_only=OFF");
+        let mut statement = reader.prepare_single("INSERT INTO t VALUES(2)").unwrap();
+        assert!(matches!(
+            statement.execute(None),
+            Err(TursoError::Readonly(_))
+        ));
+        execute_sql(&writer, "INSERT INTO t VALUES(3)");
+        assert_eq!(count_rows(&reader), Value::from_i64(2));
     }
 
     #[test]
