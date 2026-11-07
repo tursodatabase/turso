@@ -358,3 +358,18 @@ expect {
     index|Ix
     trigger|Tr
 }
+
+@cross-check-integrity
+test autoincrement-sequence-row-keeps-declared-table-name {
+    CREATE TABLE "Pk6"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO pk6(v) VALUES ('a');
+    INSERT INTO PK6(v) VALUES ('b');
+    DELETE FROM pk6;
+    INSERT INTO pk6(v) VALUES ('c');
+    SELECT * FROM sqlite_sequence;
+    SELECT * FROM "Pk6";
+}
+expect {
+    Pk6|3
+    3|c
+}

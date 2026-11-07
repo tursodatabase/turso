@@ -491,6 +491,28 @@ fn test_drop_sqlite_created_mixed_case_autoincrement_table() -> anyhow::Result<(
     Ok(())
 }
 
+/// Earlier Turso versions wrote the lowercased table name into
+/// sqlite_sequence. A rename must still find that row.
+#[test]
+fn test_rename_finds_lowercased_sqlite_sequence_row() -> anyhow::Result<()> {
+    let (_tmp_dir, db_path) = create_database_with_sqlite(
+        "CREATE TABLE Foo(a INTEGER PRIMARY KEY AUTOINCREMENT, b); \
+         INSERT INTO Foo(a, b) VALUES(5, 1); \
+         UPDATE sqlite_sequence SET name = 'foo'",
+    )?;
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+    conn.execute("ALTER TABLE foo RENAME TO \"Bar\"")?;
+    conn.execute("DELETE FROM bar")?;
+    conn.execute("INSERT INTO bar(b) VALUES(2)")?;
+    let rows: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+    assert_eq!(rows, vec![("Bar".into(), 6)]);
+    drop(conn);
+    drop(db);
+    rusqlite_integrity_check(&db_path)?;
+    Ok(())
+}
+
 #[test]
 fn test_mixed_case_table_and_view_names_survive_reopen() -> anyhow::Result<()> {
     let tmp_dir = tempfile::TempDir::new()?;

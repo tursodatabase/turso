@@ -814,8 +814,8 @@ pub fn emit_sqlite_sequence_row_read(
 }
 
 /// Emits the bytecode that makes `value_reg` the `seq` of the
-/// `sqlite_sequence` row named `name`, by deleting the rows of that name
-/// and inserting one. `sseq_table` is the `sqlite_sequence` table of
+/// `sqlite_sequence` row named `name`, by deleting the rows of that name,
+/// in any letter case, and inserting one. `sseq_table` is the `sqlite_sequence` table of
 /// database `database_id`. The write counts neither for `changes()` nor
 /// for `last_insert_rowid()`.
 pub fn emit_sqlite_sequence_row_write(
@@ -852,7 +852,7 @@ pub fn emit_sqlite_sequence_row_write(
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default().jump_if_null(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
@@ -926,7 +926,25 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
         return Ok(());
     };
-    emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    // Like SQLite, sqlite_sequence names the table as declared.
+    let declared_table_name = resolver
+        .with_schema(database_id, |s| {
+            let (namespace, name) = s.demangle_name(table_name);
+            s.get_btree_table(namespace, name)
+                .map(|table| crate::namespace::mangle_name(namespace, &table.declared_name))
+        })
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "no table for AUTOINCREMENT sequence \"{seq_name}\""
+            ))
+        })?;
+    emit_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &declared_table_name,
+        value_reg,
+    )?;
     Ok(())
 }
 
