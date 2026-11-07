@@ -3521,7 +3521,9 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
+                    let text =
+                        non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -6462,6 +6464,45 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     magnitude > limit
 }
 
+/// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
+/// decimal digits. Turso's numeric literal parser reads only decimal and hex
+/// text, and reads hex the SQLite way, so a value above i64 wraps around.
+/// Returns `None` for a decimal literal.
+fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
+    let literal = literal.replace('_', "");
+    let (sign, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", literal.as_str()),
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => return None,
+    };
+    // Decimal digits, least significant first. A literal can be longer than
+    // any integer type, so the digits are converted one at a time.
+    let mut decimal = vec![0u32];
+    for c in unsigned[2..].chars() {
+        let mut carry = c.to_digit(radix)?;
+        for digit in decimal.iter_mut() {
+            let value = *digit * radix + carry;
+            *digit = value % 10;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal.push(carry % 10);
+            carry /= 10;
+        }
+    }
+    let digits: String = decimal
+        .iter()
+        .rev()
+        .map(|d| char::from_digit(*d, 10).unwrap())
+        .collect();
+    Some(format!("{sign}{digits}"))
+}
+
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -6517,7 +6558,10 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
     use pg_query::protobuf::node::Node;
     match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
         Some(Node::Integer(i)) => Some(i.ival as i64),
-        Some(Node::Float(f)) => f.fval.parse::<i64>().ok(),
+        Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
+            .unwrap_or_else(|| f.fval.clone())
+            .parse::<i64>()
+            .ok(),
         _ => None,
     }
 }
