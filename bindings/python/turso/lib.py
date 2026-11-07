@@ -1015,7 +1015,7 @@ class Cursor:
                 # Set description to None
                 self._description = None
                 # Set lastrowid for INSERT/REPLACE (best-effort)
-                self._lastrowid = self._fetch_last_insert_rowid_if_needed(sql, result.rows_changed)
+                self._lastrowid = self._fetch_last_insert_rowid_if_needed(sql)
                 # Finalize the statement to release resources
                 stmt.finalize()
         except Exception as exc:  # noqa: BLE001
@@ -1028,8 +1028,8 @@ class Cursor:
 
         return self
 
-    def _fetch_last_insert_rowid_if_needed(self, sql: str, rows_changed: int) -> Optional[int]:
-        if rows_changed <= 0 or not _is_insert_or_replace(sql):
+    def _fetch_last_insert_rowid_if_needed(self, sql: str) -> Optional[int]:
+        if not _is_insert_or_replace(sql):
             return self._lastrowid
         rowid = self._connection._last_insert_rowid()
         # lastrowid remains unchanged when it cannot be determined.
