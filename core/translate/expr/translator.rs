@@ -1018,6 +1018,17 @@ fn translate_function_call_expr(
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
+        Func::External(function) if function.func.is_aggregate() => {
+            crate::bail_parse_error!(
+                "misuse of {} function {}()",
+                if filter_over.over_clause.is_some() {
+                    "window"
+                } else {
+                    "aggregate"
+                },
+                name.as_str()
+            )
+        }
         Func::External(_) | Func::Dialect(_) => {
             let regs = program.alloc_registers(args_count);
             for (i, arg_expr) in args.iter().enumerate() {
