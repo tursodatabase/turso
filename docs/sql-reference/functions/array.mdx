@@ -82,7 +82,7 @@ SELECT string_to_array('a,NULL,b', ',', 'NULL');
 
 ### Subscript Operator []
 
-Access individual elements using zero-based indexing. Returns NULL for out-of-bounds or negative indices.
+Access individual elements by index. As in PostgreSQL, the first element is at index 1. Returns NULL for an index that is out of bounds, zero or negative.
 
 ```sql
 array_expr[index]
@@ -90,15 +90,15 @@ array_expr[index]
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, items TEXT[]) STRICT;
-INSERT INTO t VALUES (1, '["first", "second", "third"]');
+INSERT INTO t VALUES (1, ARRAY['first', 'second', 'third']);
 
-SELECT items[0], items[1], items[2] FROM t;
+SELECT items[1], items[2], items[3] FROM t;
 -- first|second|third
 
 SELECT items[100] FROM t;
 -- NULL
 
-SELECT items[-1] FROM t;
+SELECT items[0] FROM t;
 -- NULL
 ```
 
@@ -108,16 +108,16 @@ Subscripts can be chained for multi-dimensional arrays:
 CREATE TABLE m (id INTEGER PRIMARY KEY, matrix INTEGER[][]) STRICT;
 INSERT INTO m VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]]);
 
-SELECT matrix[0][1] FROM m;
+SELECT matrix[1][2] FROM m;
 -- 2
 
-SELECT matrix[1][0] FROM m;
+SELECT matrix[2][1] FROM m;
 -- 3
 ```
 
 ### Slice Operator [start:end]
 
-Extract a sub-array using half-open range `[start, end)`.
+Extract the elements from index `start` to index `end`, both included.
 
 ```sql
 array_expr[start:end]
@@ -127,8 +127,8 @@ array_expr[start:end]
 CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
 INSERT INTO t VALUES (1, ARRAY['a','b','c','d']);
 
-SELECT tags[1:3] FROM t;
--- ["b","c"]
+SELECT tags[2:3] FROM t;
+-- {b,c}
 ```
 
 ---
@@ -340,7 +340,7 @@ SELECT array_contains('[1, 2, 3]', 5);
 
 ### array_position
 
-Returns the zero-based index of the first occurrence of an element.
+Returns the index of the first occurrence of an element. The first element is at index 1.
 
 ```sql
 array_position(array, element)
@@ -351,16 +351,16 @@ array_position(array, element)
 | `array` | BLOB/TEXT | The array to search |
 | `element` | any | The element to find |
 
-**Returns:** INTEGER -- the zero-based index, or NULL if not found.
+**Returns:** INTEGER -- the index, or NULL if not found.
 
 ```sql
-SELECT array_position('[10, 20, 30]', 20);
+SELECT array_position(ARRAY[10, 20, 30], 20);
+-- 2
+
+SELECT array_position(ARRAY[10, 20, 30], 10);
 -- 1
 
-SELECT array_position('[10, 20, 30]', 10);
--- 0
-
-SELECT array_position('[10, 20, 30]', 99);
+SELECT array_position(ARRAY[10, 20, 30], 99);
 -- NULL
 ```
 
@@ -375,17 +375,17 @@ array_slice(array, start, end)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `array` | BLOB/TEXT | The source array |
-| `start` | INTEGER | Start index (zero-based, inclusive). NULL means 0 |
-| `end` | INTEGER | End index (exclusive) |
+| `start` | INTEGER | Start index (inclusive; the first element is 1). NULL means 1 |
+| `end` | INTEGER | End index (inclusive) |
 
-**Returns:** BLOB -- a new array containing elements from `start` to `end - 1`.
+**Returns:** BLOB -- a new array containing elements from `start` to `end`.
 
 ```sql
-SELECT array_slice('[1, 2, 3, 4]', 1, 3);
--- [2,3]
+SELECT array_slice(ARRAY[1, 2, 3, 4], 2, 3);
+-- {2,3}
 
-SELECT array_slice('[1, 2, 3, 4]', NULL, 2);
--- [1,2]
+SELECT array_slice(ARRAY[1, 2, 3, 4], NULL, 2);
+-- {1,2}
 ```
 
 ### array_to_string

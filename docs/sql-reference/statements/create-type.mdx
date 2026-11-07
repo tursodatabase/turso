@@ -546,9 +546,9 @@ CREATE TABLE sensors (
     flags INTEGER[]
 ) STRICT;
 
-INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], ARRAY['temp','humidity'], '[0, 1, 1]');
+INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], ARRAY['temp','humidity'], '{0,1,1}');
 
-SELECT readings[0], labels[1], array_length(flags) FROM sensors;
+SELECT readings[1], labels[2], array_length(flags) FROM sensors;
 -- 1.5|humidity|3
 ```
 
@@ -561,11 +561,11 @@ CREATE TABLE matrices (
 ) STRICT;
 
 INSERT INTO matrices VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]]);
-SELECT data[1][0] FROM matrices;
+SELECT data[2][1] FROM matrices;
 -- 3
 ```
 
-Element types are validated on insert — an `INTEGER[]` column rejects values that cannot be stored as integers. Elements of an array of a custom type are stored as the type's BASE, as in a column of the type. Arrays are stored internally as compact record-format BLOBs and displayed as JSON arrays on output.
+Element types are validated on insert — an `INTEGER[]` column rejects values that cannot be stored as integers. Elements of an array of a custom type are stored as the type's BASE, as in a column of the type. Arrays are stored internally as compact record-format BLOBs and displayed in PostgreSQL's `{...}` form on output.
 
 An array of a custom type holds the values of its elements, as a column of the type does. Storing the array runs the type's ENCODE on each element, down to the innermost elements of a multi-dimensional array, and reading it runs DECODE on each element. `CAST(x AS ci[])` runs both on each element, as `CAST(x AS ci)` does on one value:
 
@@ -635,13 +635,13 @@ SELECT amount FROM invoices;
 Validate that inserted values are valid JSON:
 
 ```sql
-CREATE TYPE json BASE text
+CREATE TYPE checked_json BASE text
     ENCODE json(value)
     DECODE value;
 
 CREATE TABLE configs (
     id INTEGER PRIMARY KEY,
-    data json
+    data checked_json
 ) STRICT;
 
 INSERT INTO configs VALUES (1, '{"key": "value"}');
