@@ -245,7 +245,7 @@ export type Row = Record<string, SQLiteValue>;
  */
 export interface EncryptionOpts {
   /** base64 encoded encryption key (must be either 16 or 32 bytes depending on cipher) */
-  key: string;
+  key?: string;
   /**
    * encryption cipher algorithm
    * - aes256gcm, aes128gcm, chacha20poly1305: 28 reserved bytes
@@ -302,6 +302,9 @@ export interface DatabaseOpts {
    * Optional remote encryption parameters if cloud database was encrypted
    */
   remoteEncryption?: EncryptionOpts;
+
+  /** Hex local key. Uses remoteEncryption.cipher and is never sent to the server. */
+  localEncryptionKey?: string;
 
   /**
    * Optional long-polling timeout for pull operation
