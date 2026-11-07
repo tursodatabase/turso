@@ -56,6 +56,20 @@ mod shuttle_adapter {
                 unsafe { std::mem::transmute(guard) };
             ArcMutexGuard { _arc: arc, guard }
         }
+
+        /// Like [`Mutex::lock_arc`], but returns `None` instead of blocking
+        /// when the mutex is already locked.
+        pub fn try_lock_arc(self: &Arc<Self>) -> Option<ArcMutexGuard<T>>
+        where
+            T: 'static,
+        {
+            let arc = Arc::clone(self);
+            let guard = arc.0.try_lock().ok()?;
+            // Safety: see `lock_arc`
+            let guard: shuttle::sync::MutexGuard<'static, T> =
+                unsafe { std::mem::transmute(guard) };
+            Some(ArcMutexGuard { _arc: arc, guard })
+        }
     }
 
     impl<T: Default> Default for Mutex<T> {

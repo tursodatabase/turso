@@ -116,7 +116,7 @@ libm = "0.2"
 turso_macros = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
-parking_lot = { workspace = true, features = ["arc_lock"] }
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 crossbeam-epoch = "0.9.18"
 crossbeam-utils = "0.8.21"
 tracing = { workspace = true }
