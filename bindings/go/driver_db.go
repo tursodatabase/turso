@@ -32,6 +32,7 @@ type tursoDbConnection struct {
 	db      TursoDatabase
 	conn    TursoConnection
 	extraIo func() error
+	onClose func()
 
 	mu          sync.Mutex
 	closed      bool
@@ -187,6 +188,9 @@ func (c *tursoDbConnection) Close() error {
 		c.db = nil
 	}
 	c.closed = true
+	if c.onClose != nil {
+		c.onClose()
+	}
 	return nil
 }
 
