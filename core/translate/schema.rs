@@ -1172,7 +1172,6 @@ pub fn translate_create_table(
     };
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
     let tbl_name_in_sql = ast::QualifiedName {
@@ -1227,6 +1226,7 @@ pub fn translate_create_table(
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
             SchemaObjectType::Table | SchemaObjectType::View if if_not_exists => {
+                program.begin_noop_ddl(database_id, schema_cookie)?;
                 return Ok(());
             }
             _ => {
@@ -1249,6 +1249,7 @@ pub fn translate_create_table(
             }
         }
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Like SQLite, the body is only checked when the table is really created,
     // so IF NOT EXISTS on an existing table succeeds whatever the body says.
@@ -2173,6 +2174,8 @@ pub fn translate_drop_table(
 
     let Some(namespace) = resolver.find_existing_table(&tbl_name)? else {
         if if_exists {
+            let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+            program.begin_noop_ddl(crate::MAIN_DB_ID, schema_cookie)?;
             return Ok(());
         }
         bail_parse_error!(
@@ -2184,10 +2187,10 @@ pub fn translate_drop_table(
     let mangled_name = resolver.mangle_name(namespace, &normalize_ident(name));
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(namespace.id, name)) else {
         if if_exists {
+            program.begin_noop_ddl(database_id, schema_cookie)?;
             return Ok(());
         }
         bail_parse_error!(
@@ -2195,6 +2198,7 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
+    program.begin_write_on_database(database_id, schema_cookie)?;
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)

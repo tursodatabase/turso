@@ -2629,3 +2629,33 @@ fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempData
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
     assert_eq!(rows, vec![(1,)]);
 }
+
+// CREATE ... IF NOT EXISTS on an existing object and DROP ... IF EXISTS on a
+// missing one change nothing, so like SQLite they only read the schema and
+// must not wait for the write lock another connection holds.
+#[turso_macros::test]
+fn test_noop_ddl_does_not_need_write_lock(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    conn1.execute("CREATE INDEX i ON t(x)").unwrap();
+    conn1.execute("BEGIN IMMEDIATE").unwrap();
+
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS t(x)",
+        "CREATE INDEX IF NOT EXISTS i ON t(x)",
+        "DROP TABLE IF EXISTS nosuch",
+        "DROP INDEX IF EXISTS nosuch",
+    ] {
+        conn2
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+
+    // DDL that does change the schema still needs the lock.
+    let result = conn2.execute("CREATE TABLE IF NOT EXISTS u(x)");
+    assert!(matches!(result, Err(LimboError::Busy)), "{result:?}");
+
+    conn1.execute("COMMIT").unwrap();
+}

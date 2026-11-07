@@ -160,7 +160,6 @@ pub fn translate_create_index(
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
@@ -170,10 +169,12 @@ pub fn translate_create_index(
     if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
+            program.begin_noop_ddl(database_id, schema_cookie)?;
             return Ok(());
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
     // Materialized views store their rows in a real table btree (so plain
     // reads can use get_table() below like any other table), but writes to
     // that btree go through the DBSP maintenance path (sink.rs), which emits
@@ -1424,6 +1425,8 @@ pub fn translate_drop_index(
 
     let Some(namespace) = resolver.find_existing_index(qualified_name)? else {
         if if_exists {
+            let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+            program.begin_noop_ddl(crate::MAIN_DB_ID, schema_cookie)?;
             return Ok(());
         }
         return Err(crate::error::LimboError::InvalidArgument(format!(
@@ -1433,7 +1436,6 @@ pub fn translate_drop_index(
     };
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Find the index in Schema
     let mut maybe_index = None;
@@ -1451,6 +1453,7 @@ pub fn translate_drop_index(
     // then return normaly, otherwise show an error.
     if maybe_index.is_none() {
         if if_exists {
+            program.begin_noop_ddl(database_id, schema_cookie)?;
             return Ok(());
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
@@ -1459,6 +1462,7 @@ pub fn translate_drop_index(
             )));
         }
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
     // Return an error if the index is an auto-generated constraint-backing index.
     // User-created UNIQUE indexes (via CREATE UNIQUE INDEX) are allowed to be dropped.
     if let Some(ref idx) = maybe_index {
