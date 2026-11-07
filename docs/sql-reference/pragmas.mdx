@@ -386,6 +386,8 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
+Turning `query_only` off does not remove a read-only restriction chosen when opening or connecting to the database.
+
 ### full_column_names / short_column_names
 
 Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean.
@@ -611,6 +613,8 @@ the current setting.
 ## WAL Operations
 
 ### wal_checkpoint
+
+A connection cannot explicitly checkpoint a database that it opened or attached read-only, even when another connection has writable access to the same file.
 
 Forces a WAL checkpoint.
 

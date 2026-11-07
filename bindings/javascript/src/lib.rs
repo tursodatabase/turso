@@ -429,7 +429,11 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<(), String> {
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+        .connect(
+            ConnectOpts::new()
+                .with_readonly(flags.contains(turso_core::OpenFlags::ReadOnly))
+                .with_encryption_key(encryption_key),
+        )
         .map_err(to_sqlite_error)?;
 
     if let Some(busy_timeout) = busy_timeout {

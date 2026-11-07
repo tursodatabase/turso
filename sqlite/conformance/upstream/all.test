@@ -460,7 +460,7 @@ set test_files {
   readonly             pass
   recover              fail
   regexp1              fail
-  regexp2              fail
+  regexp2              pass
   reindex              fail
   resetdb              fail
   resolver01           fail
