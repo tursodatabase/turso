@@ -1943,18 +1943,10 @@ impl PostgreSQLTranslator {
                             "UPDATE of an array element or composite field",
                         ));
                     }
-                    let col_name = exact_name(&res_target.name);
-                    let expr = if let Some(val) = &res_target.val {
-                        Box::new(self.translate_expr(val)?)
-                    } else {
-                        return Err(ParseError::ParseError(
-                            "SET assignment missing value".into(),
-                        ));
-                    };
-                    sets.push(ast::Set {
-                        col_names: vec![col_name],
-                        expr,
-                    });
+                    let val = res_target.val.as_ref().ok_or_else(|| {
+                        ParseError::ParseError("SET assignment missing value".into())
+                    })?;
+                    self.push_set(&mut sets, exact_name(&res_target.name), val)?;
                 }
                 _ => {
                     return Err(ParseError::ParseError(
@@ -3223,6 +3215,16 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
                 self.translate_sublink(sub_link)
+            }
+            Some(pg_query::protobuf::node::Node::RowExpr(row)) => {
+                // The engine reads a one-element row value as a parenthesized scalar,
+                // so ROW(1) = 1 would be true where PostgreSQL rejects it.
+                if row.args.len() < 2 {
+                    return Err(not_supported(
+                        "a ROW constructor with fewer than two values",
+                    ));
+                }
+                self.translate_row(row)
             }
             Some(pg_query::protobuf::node::Node::NullTest(null_test)) => {
                 use pg_query::protobuf::NullTestType;
@@ -4517,7 +4519,9 @@ impl PostgreSQLTranslator {
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
-            SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ExprSublink | SubLinkType::MultiexprSublink => {
+                Ok(ast::Expr::Subquery(select))
+            }
             SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
                 let op = extract_key_columns(&sub_link.oper_name)?;
@@ -4876,18 +4880,10 @@ impl PostgreSQLTranslator {
                                     "ON CONFLICT DO UPDATE of an array element or composite field",
                                 ));
                             }
-                            let col_name = exact_name(&res_target.name);
-                            let expr = if let Some(val) = &res_target.val {
-                                Box::new(self.translate_expr(val)?)
-                            } else {
-                                return Err(ParseError::ParseError(
-                                    "ON CONFLICT SET missing value".into(),
-                                ));
-                            };
-                            sets.push(ast::Set {
-                                col_names: vec![col_name],
-                                expr,
-                            });
+                            let val = res_target.val.as_ref().ok_or_else(|| {
+                                ParseError::ParseError("ON CONFLICT SET missing value".into())
+                            })?;
+                            self.push_set(&mut sets, exact_name(&res_target.name), val)?;
                         }
                         _ => {
                             return Err(ParseError::ParseError(
@@ -4968,6 +4964,64 @@ impl PostgreSQLTranslator {
             do_clause,
             next: None,
         })))
+    }
+
+    /// Adds the assignment of `val` to `col_name` to the SET clause `sets`.
+    /// PostgreSQL splits `SET (a, b) = source` into one target per column, each
+    /// holding a `MultiAssignRef` with the column's position in the list.
+    fn push_set(
+        &self,
+        sets: &mut Vec<ast::Set>,
+        col_name: ast::Name,
+        val: &pg_query::protobuf::Node,
+    ) -> Result<(), ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(Node::MultiAssignRef(multi_assign)) = &val.node else {
+            sets.push(ast::Set {
+                col_names: vec![col_name],
+                expr: Box::new(self.translate_expr(val)?),
+            });
+            return Ok(());
+        };
+        if multi_assign.colno > 1 {
+            let set = sets
+                .last_mut()
+                .filter(|set| set.col_names.len() as i32 + 1 == multi_assign.colno)
+                .ok_or_else(|| {
+                    ParseError::ParseError("MultiAssignRef column out of order".into())
+                })?;
+            set.col_names.push(col_name);
+            return Ok(());
+        }
+        let source = multi_assign
+            .source
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("MultiAssignRef missing source".into()))?;
+        let expr = match &source.node {
+            Some(Node::RowExpr(row)) => self.translate_row(row)?,
+            Some(Node::SubLink(_)) => self.translate_expr(source)?,
+            _ => {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    message: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".into(),
+                })
+            }
+        };
+        sets.push(ast::Set {
+            col_names: vec![col_name],
+            expr: Box::new(expr),
+        });
+        Ok(())
+    }
+
+    fn translate_row(&self, row: &pg_query::protobuf::RowExpr) -> Result<ast::Expr, ParseError> {
+        let values = row
+            .args
+            .iter()
+            .map(|arg| self.translate_expr(arg).map(Box::new))
+            .collect::<Result<_, _>>()?;
+        Ok(ast::Expr::Parenthesized(values))
     }
 
     fn translate_order_by(
@@ -8387,6 +8441,28 @@ mod tests {
             ),
         ] {
             assert_eq!(translate(sql).unwrap_err().to_string(), error, "{sql}");
+        }
+    }
+
+    #[test]
+    fn row_constructors_become_row_values() {
+        let translate = |sql: &str| {
+            PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .map(|stmt| stmt.to_string())
+        };
+        for (sql, expected) in [
+            ("SELECT (1, 2) = (1, 2)", "SELECT (1, 2) = (1, 2)"),
+            ("SELECT ROW(1, 2) = ROW(1, 2)", "SELECT (1, 2) = (1, 2)"),
+        ] {
+            assert_eq!(translate(sql).unwrap(), expected, "{sql}");
+        }
+        for sql in ["SELECT ROW(1) = 1", "SELECT ROW() = ROW()"] {
+            assert_eq!(
+                translate(sql).unwrap_err().to_string(),
+                "a ROW constructor with fewer than two values is not supported",
+                "{sql}"
+            );
         }
     }
 

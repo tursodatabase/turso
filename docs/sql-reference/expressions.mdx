@@ -90,6 +90,8 @@ SELECT CAST(10 AS REAL) / 3;  -- 3.333...
 
 All comparison operators return `1` (true), `0` (false), or `NULL` (if either operand is NULL).
 
+Comparison operators, `IN` and `BETWEEN` also accept row values, which compare element by element: `(a, b) = (1, 2)`, `(a, b) < (1, 3)`, `(a, b) IN ((1, 2), (3, 4))`, `(a, b) BETWEEN (1, 1) AND (2, 0)`. The PostgreSQL frontend also accepts the `ROW(a, b)` spelling. As an expression, a `ROW` constructor needs at least two values. Anywhere a single value is expected, such as a result column, an inserted value, a function argument, a window key, or an element of another row value, a row value is an error (`row value misused`). The source of a multiple-column `SET`, as in `SET (a) = ROW(1)`, may have one value.
+
 ### Logical Operators
 
 | Operator | Description | Example |
