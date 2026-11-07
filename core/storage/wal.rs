@@ -528,6 +528,20 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        Ok(self.find_frame(page_id, min_frame, max_frame, frame_watermark))
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        Ok(self.iter_latest_frames(min_frame, max_frame))
+    }
+
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
 
@@ -693,12 +707,13 @@ pub trait Wal: Debug + Send + Sync {
 
     /// Read a raw WAL frame with its on-disk header and page body decoded by
     /// the configured encryption context or external page codec.
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion>;
+    fn read_frame_raw(&self, frame_id: u64, frame: Arc<Buffer>) -> Result<Completion>;
 
     /// Write an in-memory page as a WAL frame.
     ///
     /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
     /// any configured page transform to the body, and overwrites the checksum.
+    /// Returns an error if this connection does not hold the WAL write lock.
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -772,6 +787,8 @@ pub trait Wal: Debug + Send + Sync {
     fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
+    /// The epoch that pages read from this WAL are tagged with, see `Page::set_wal_tag`.
+    fn checkpoint_epoch(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
     /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
@@ -1944,6 +1961,7 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
+        let previous_snapshot = self.authority.snapshot();
         {
             let mut shared = self.shared.write();
             shared
@@ -1965,13 +1983,26 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        if self.authority.frame_index_overflowed() {
-            let snapshot = self.authority.snapshot();
-            let shared = self.shared.read();
-            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
-            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
-                coverage.record_snapshot(snapshot, commit.max_frame);
-            }
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+
+        // We record that process-local frame cache maps all committed WAL frames (is complete) if:
+        // * max_frame was 0, since this means we are the first commit of this WAL generation; or
+        // * before our commit, the coverage was already complete
+        if previous_snapshot.max_frame == 0
+            || coverage.covers(previous_snapshot, previous_snapshot.max_frame)
+        {
+            let max_frame = commit.max_frame;
+
+            // Committing doesn't change checkpoint_seq or the salts. Only WAL restarts do,
+            // and we already hold the WAL writer lock, so it's safe to not take a new snapshot and
+            // reuse these fields here.
+            coverage.record(
+                previous_snapshot.checkpoint_seq,
+                previous_snapshot.salt_1,
+                previous_snapshot.salt_2,
+                max_frame,
+            );
         }
     }
 
@@ -2036,6 +2067,29 @@ impl WalCoordination for ShmWalCoordination {
             return self.fallback.iter_latest_frames(min_frame, max_frame);
         }
         self.authority.iter_latest_frames(min_frame, max_frame)
+    }
+
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        if self.authority.frame_index_overflowed() {
+            return self
+                .fallback
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark);
+        }
+        self.authority
+            .try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        if self.authority.frame_index_overflowed() {
+            return self.fallback.try_iter_latest_frames(min_frame, max_frame);
+        }
+        self.authority.try_iter_latest_frames(min_frame, max_frame)
     }
 
     fn checkpoint_epoch(&self) -> u32 {
@@ -3038,20 +3092,6 @@ impl OverflowFallbackCoverage {
     }
 
     #[cfg(host_shared_wal)]
-    pub(crate) fn record_snapshot(
-        &mut self,
-        snapshot: SharedWalCoordinationHeader,
-        max_frame: u64,
-    ) {
-        self.record(
-            snapshot.checkpoint_seq,
-            snapshot.salt_1,
-            snapshot.salt_2,
-            max_frame,
-        );
-    }
-
-    #[cfg(host_shared_wal)]
     pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
         self.valid
             && self.checkpoint_seq == snapshot.checkpoint_seq
@@ -3547,8 +3587,15 @@ impl Wal for WalFile {
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            // A checkpoint that only advanced nbackfills leaves our snapshot current: the
+            // backfilled frames stay in the WAL while we hold our read lock, and commits do
+            // not publish nbackfills. SQLite also leaves nBackfill out of this comparison.
+            let local_state = self.connection_state();
+            let shared_snapshot = WalSnapshot {
+                nbackfills: local_state.snapshot.nbackfills,
+                ..self.load_coordination_snapshot()
+            };
+            let db_changed = self.db_changed_against(shared_snapshot, local_state);
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
@@ -3557,7 +3604,7 @@ impl Wal for WalFile {
                 tracing::debug!(
                     "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
                     self.max_frame.load(Ordering::Acquire),
-                    self.load_coordination_snapshot().max_frame
+                    shared_snapshot.max_frame
                 );
                 self.coordination.end_write_tx();
                 return Err(LimboError::BusySnapshot);
@@ -3694,9 +3741,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark)?;
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -3925,9 +3972,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    // todo(sivukhin): change API to accept Buffer or some other owned type
-    // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
+    fn read_frame_raw(&self, frame_id: u64, frame: Arc<Buffer>) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
@@ -3937,10 +3982,6 @@ impl Wal for WalFile {
                 frame.len()
             )));
         }
-
-        // HACK: *mut u8 can't be Sent between threads safely, cast it to usize then
-        // for the time of writing this comment - this is *safe* as all callers immediately call synchronous method wait_for_completion and hold necessary references
-        let (frame_ptr, frame_len) = (frame.as_mut_ptr() as usize, frame.len());
 
         let page_transform = self.io_ctx.read().page_transform().clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -3958,10 +3999,7 @@ impl Wal for WalFile {
                     actual: bytes_read as usize,
                 });
             }
-            let frame_ptr = frame_ptr as *mut u8;
-            let frame_ref: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
-
+            let frame_ref = frame.as_mut_slice();
             frame_ref[..WAL_FRAME_HEADER_SIZE]
                 .copy_from_slice(&buf.as_slice()[..WAL_FRAME_HEADER_SIZE]);
             let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(buf.as_slice());
@@ -4012,6 +4050,11 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        if !self.holds_write_lock() {
+            return Err(LimboError::TxError(
+                "cannot write raw WAL frame without holding the WAL write lock".to_string(),
+            ));
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -4223,6 +4266,10 @@ impl Wal for WalFile {
         self.load_coordination_snapshot().checkpoint_seq
     }
 
+    fn checkpoint_epoch(&self) -> u32 {
+        self.coordination.checkpoint_epoch()
+    }
+
     fn get_max_frame(&self) -> u64 {
         self.max_frame.load(Ordering::Acquire)
     }
@@ -4404,7 +4451,9 @@ impl Wal for WalFile {
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
         let frame_count = self.get_max_frame();
         let page_size = self.page_size();
-        let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
+        let frame = Arc::new(Buffer::new_temporary(
+            page_size as usize + WAL_FRAME_HEADER_SIZE,
+        ));
         let mut seen = FxHashSet::default();
         turso_assert!(
             frame_count >= frame_watermark,
@@ -4413,9 +4462,9 @@ impl Wal for WalFile {
         );
         let mut pages = Vec::with_capacity((frame_count - frame_watermark) as usize);
         for frame_no in frame_watermark + 1..=frame_count {
-            let c = self.read_frame_raw(frame_no, &mut frame)?;
+            let c = self.read_frame_raw(frame_no, frame.clone())?;
             self.io.wait_for_completion(c)?;
-            let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
+            let (header, _) = sqlite3_ondisk::parse_wal_frame_header(frame.as_slice());
             if seen.insert(header.page_number) {
                 pages.push(header.page_number);
             }
@@ -5023,7 +5072,7 @@ impl WalFile {
                         Vec::new()
                     } else {
                         self.coordination
-                            .iter_latest_frames(oc_min_frame, oc_max_frame)
+                            .try_iter_latest_frames(oc_min_frame, oc_max_frame)?
                     };
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
@@ -5830,9 +5879,7 @@ impl WalFileShared {
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
         if snapshot.max_frame > snapshot.nbackfills
-            && authority
-                .iter_latest_frames(0, snapshot.max_frame)
-                .is_empty()
+            && !authority.has_visible_frame(snapshot.max_frame)?
         {
             tracing::debug!(
                 max_frame = snapshot.max_frame,
@@ -6118,7 +6165,7 @@ pub mod test {
     };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{
         io::FileSyncType,
         storage::{
@@ -6132,9 +6179,9 @@ pub mod test {
         },
         types::IOResult,
         util::IOExt,
-        Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
-        Database, File, IOContext, LimboError, MemoryIO, OpenFlags, PlatformIO, Result, SyncMode,
-        WalFileShared, IO,
+        Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, ConnectOpts,
+        Connection, Database, File, IOContext, LimboError, MemoryIO, OpenFlags, PlatformIO, Result,
+        SyncMode, WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -6173,7 +6220,7 @@ pub mod test {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         // db + tmp directory
@@ -6287,7 +6334,7 @@ pub mod test {
     #[test]
     fn test_truncate_file() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test (id integer primary key, value text)")
             .unwrap();
         let _ = conn.execute("insert into test (value) values ('test1'), ('test2'), ('test3')");
@@ -6310,7 +6357,7 @@ pub mod test {
         let (db, path) = get_database();
         let walpath = path.path().join("test.db-wal");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test (id integer primary key, value text)")
             .unwrap();
         for _i in 0..25 {
@@ -6353,7 +6400,7 @@ pub mod test {
         let (db, path) = get_database();
         let walpath = path.path().join("test.db-wal");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test (id integer primary key, value text)")
             .unwrap();
         conn.execute("insert into test (value) values ('v1'), ('v2')")
@@ -6427,7 +6474,7 @@ pub mod test {
     fn test_wal_checkpoint_defers_backfill_publication_until_db_sync() {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -6449,7 +6496,7 @@ pub mod test {
     fn test_checkpoint_sync_mode_off_leaves_backfill_unpublished() {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -6477,15 +6524,15 @@ pub mod test {
         let db = Database::open_file(
             shared_wal_test_io(),
             path.to_str().unwrap(),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let writer = db.connect().unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
         writer
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&writer, 20, 10);
-        let reader = db.connect().unwrap();
+        let reader = db.connect(ConnectOpts::new()).unwrap();
         reader.execute("begin").unwrap();
         let reader_rows = count_test_table(&reader);
         let pager = writer.pager.load();
@@ -6550,6 +6597,8 @@ pub mod test {
         }
         let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
         io.wait_for_completion(c).unwrap();
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
 
         (io, buffer_pool, wal)
     }
@@ -6974,10 +7023,15 @@ pub mod test {
         wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
             .unwrap();
 
-        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
-        let completion = wal.read_frame_raw(1, &mut frame).unwrap();
+        let frame = Arc::new(Buffer::new_temporary(
+            WAL_FRAME_HEADER_SIZE + page_size as usize,
+        ));
+        let completion = wal.read_frame_raw(1, frame.clone()).unwrap();
         io.wait_for_completion(completion).unwrap();
-        assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+        assert_eq!(
+            &frame.as_slice()[WAL_FRAME_HEADER_SIZE..],
+            expected.as_slice()
+        );
     }
 
     #[test]
@@ -7029,8 +7083,8 @@ pub mod test {
 
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + page_size as usize;
         for frame_len in [expected_frame_len - 1, expected_frame_len + 1] {
-            let mut frame = vec![0; frame_len];
-            match wal.read_frame_raw(1, &mut frame) {
+            let frame = Arc::new(Buffer::new_temporary(frame_len));
+            match wal.read_frame_raw(1, frame) {
                 Err(LimboError::InvalidArgument(message)) => assert_eq!(
                     message,
                     format!(
@@ -7073,10 +7127,15 @@ pub mod test {
         wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
             .unwrap();
 
-        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
-        let completion = wal.read_frame_raw(1, &mut frame).unwrap();
+        let frame = Arc::new(Buffer::new_temporary(
+            WAL_FRAME_HEADER_SIZE + page_size as usize,
+        ));
+        let completion = wal.read_frame_raw(1, frame.clone()).unwrap();
         io.wait_for_completion(completion).unwrap();
-        assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+        assert_eq!(
+            &frame.as_slice()[WAL_FRAME_HEADER_SIZE..],
+            expected.as_slice()
+        );
     }
 
     #[cfg(feature = "checksum")]
@@ -7109,8 +7168,10 @@ pub mod test {
         let source_pages = vec![page_with_pattern(43, 0x43, &buffer_pool)];
         append_test_pages(&io, &wal, page_size, &source_pages);
 
-        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
-        let c = wal.read_frame_raw(1, &mut frame).unwrap();
+        let frame = Arc::new(Buffer::new_temporary(
+            WAL_FRAME_HEADER_SIZE + page_size as usize,
+        ));
+        let c = wal.read_frame_raw(1, frame).unwrap();
         let err = wait_for_completion_error(&io, c);
 
         assert!(matches!(
@@ -8272,6 +8333,62 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
+    fn test_shm_coordination_open_keeps_sibling_read_tx_reader_slot_after_disk_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-sibling-reader-repair.db-wal");
+        let shm_path = dir.path().join("test-sibling-reader-repair.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 2,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+        }
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let first = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let guard = first.try_begin_read_tx(snapshot).unwrap();
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame)
+        );
+
+        let second = ShmWalCoordination::new(shared, authority.clone());
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame),
+            "opening another connection must keep the live reader slot"
+        );
+        assert_eq!(active_shared_reader_slot_count(&authority), 1);
+
+        first.end_read_tx(guard);
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
+        drop(second);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
     fn test_shm_coordination_uses_one_published_slot_per_active_snapshot_generation() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-mixed-snapshot-readers.db-wal");
@@ -8705,6 +8822,42 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
+    fn live_overflow_uses_complete_local_frame_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-covered-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-covered-live-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+
+        authority.mark_frame_index_overflowed_for_tests();
+        coordination.cache_frame(9, 2);
+        coordination.cache_frame(11, 3);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 3,
+            last_checksum: (41, 43),
+            transaction_count: 2,
+        });
+
+        let snapshot = coordination.load_snapshot();
+        coordination
+            .ensure_local_frame_cache_covers(&io, snapshot)
+            .expect("same-process commits must keep the overflow fallback complete");
+        assert_eq!(coordination.find_frame(11, 0, 3, None), Some(3));
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
     fn test_open_shared_from_authority_exclusive_rebuilds_positive_snapshot_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-exclusive-positive.db-wal");
@@ -9018,7 +9171,7 @@ pub mod test {
         let (db, path) = get_database();
         let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -9106,7 +9259,7 @@ pub mod test {
         let (db, path) = get_database();
         let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -10147,7 +10300,7 @@ pub mod test {
 
         let walpath = path.path().join("test.db-wal");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
@@ -10238,8 +10391,8 @@ pub mod test {
     #[test]
     fn test_wal_passive_partial_then_complete() {
         let (db, _tmp) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -10321,8 +10474,8 @@ pub mod test {
     #[test]
     fn test_wal_restart_blocks_readers() {
         let (db, _temp_dir) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
         // Start a read transaction
         conn2
@@ -10390,7 +10543,7 @@ pub mod test {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 10, 5);
@@ -10425,7 +10578,7 @@ pub mod test {
     #[test]
     fn test_wal_concurrent_readers_during_checkpoint() {
         let (db, _path) = get_database();
-        let conn_writer = db.connect().unwrap();
+        let conn_writer = db.connect(ConnectOpts::new()).unwrap();
 
         conn_writer
             .execute("create table test(id integer primary key, value text)")
@@ -10433,8 +10586,8 @@ pub mod test {
         bulk_inserts(&conn_writer, 5, 10);
 
         // Start multiple readers at different points
-        let conn_r1 = db.connect().unwrap();
-        let conn_r2 = db.connect().unwrap();
+        let conn_r1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn_r2 = db.connect(ConnectOpts::new()).unwrap();
 
         // R1 starts reading
         let r1_max_frame = {
@@ -10486,7 +10639,7 @@ pub mod test {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 10, 5);
@@ -10516,8 +10669,8 @@ pub mod test {
     #[test]
     fn test_wal_writer_blocks_restart_checkpoint() {
         let (db, _path) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -10561,7 +10714,7 @@ pub mod test {
     #[should_panic(expected = "must have a read transaction to begin a write transaction")]
     fn test_wal_read_transaction_required_before_write() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -10590,7 +10743,7 @@ pub mod test {
     #[test]
     fn test_wal_multiple_readers_at_different_frames() {
         let (db, _path) = get_database();
-        let conn_writer = db.connect().unwrap();
+        let conn_writer = db.connect(ConnectOpts::new()).unwrap();
 
         conn_writer
             .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)")
@@ -10606,17 +10759,17 @@ pub mod test {
 
         bulk_inserts(&conn_writer, 3, 5);
 
-        let conn1 = &db.connect().unwrap();
+        let conn1 = &db.connect(ConnectOpts::new()).unwrap();
         let (r1_frame, _stmt) = start_reader(conn1); // reader 1
 
         bulk_inserts(&conn_writer, 3, 5);
 
-        let conn_r2 = db.connect().unwrap();
+        let conn_r2 = db.connect(ConnectOpts::new()).unwrap();
         let (r2_frame, _stmt2) = start_reader(&conn_r2); // reader 2
 
         bulk_inserts(&conn_writer, 3, 5);
 
-        let conn_r3 = db.connect().unwrap();
+        let conn_r3 = db.connect(ConnectOpts::new()).unwrap();
         let (r3_frame, _stmt3) = start_reader(&conn_r3); // reader 3
 
         assert!(r1_frame < r2_frame && r2_frame < r3_frame);
@@ -10662,7 +10815,7 @@ pub mod test {
     #[test]
     fn test_checkpoint_truncate_reset_handling() {
         let (db, path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let walpath = path.path().join("test.db-wal");
 
@@ -10716,7 +10869,7 @@ pub mod test {
     #[test]
     fn test_wal_checkpoint_truncate_db_file_contains_data() {
         let (db, path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let walpath = path.path().join("test.db-wal");
 
@@ -10805,8 +10958,8 @@ pub mod test {
     #[test]
     fn test_wal_stale_snapshot_in_write_transaction() {
         let (db, _path) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -10847,8 +11000,8 @@ pub mod test {
     #[test]
     fn test_wal_readlock0_optimization_behavior() {
         let (db, _path) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -10910,7 +11063,7 @@ pub mod test {
     #[test]
     fn test_wal_full_backfills_all() {
         let (db, _tmp) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Write some data to put frames in the WAL
         conn.execute("create table test(id integer primary key, value text)")
@@ -10943,8 +11096,8 @@ pub mod test {
     #[test]
     fn test_wal_full_waits_for_old_reader_then_succeeds() {
         let (db, _tmp) = get_database();
-        let writer = db.connect().unwrap();
-        let reader = db.connect().unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        let reader = db.connect(ConnectOpts::new()).unwrap();
 
         writer
             .execute("create table test(id integer primary key, value text)")
@@ -11036,7 +11189,7 @@ pub mod test {
     #[test]
     fn test_rollback_releases_read_lock() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("BEGIN").unwrap();
@@ -11066,7 +11219,7 @@ pub mod test {
     #[test]
     fn test_rollback_releases_shared_read_lock_slot() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("BEGIN").unwrap();
@@ -11097,7 +11250,7 @@ pub mod test {
     #[test]
     fn test_rollback_releases_slot_zero_read_lock() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE test(id integer primary key, value text)")
             .unwrap();
@@ -11140,7 +11293,7 @@ pub mod test {
     #[test]
     fn test_savepoint_rollback_preserves_read_lock() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
             .unwrap();
@@ -11184,8 +11337,8 @@ pub mod test {
     #[test]
     fn test_savepoint_then_tx_rollback_allows_restart_checkpoint_from_other_connection() {
         let (db, _path) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
         conn1
             .execute("CREATE TABLE test(id integer primary key, value text)")
@@ -11255,7 +11408,7 @@ pub mod test {
     #[test]
     fn test_checkpoint_succeeds_after_rollback() {
         let (db, _path) = get_database();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE test(id integer primary key, value text)")
             .unwrap();

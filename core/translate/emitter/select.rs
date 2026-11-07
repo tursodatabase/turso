@@ -10,13 +10,16 @@ use crate::{
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
+        expr::expr_references_subquery_id,
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
+        optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
             NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryState, TableReferences,
+            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
+            TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -33,7 +36,7 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{self, Expr};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -86,13 +89,6 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    // Register parameters from EXISTS subquery result columns that were dropped
-    // during semi/anti-join unnesting. No code is emitted for these, but the
-    // parameter slots must exist for bind-time validation to succeed.
-    for variable in &plan.phantom_params {
-        program.register_variable(variable);
-    }
-
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
     emit_non_from_clause_subqueries_for_eval_at(
@@ -107,7 +103,13 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
-        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+        init_limit(
+            program,
+            t_ctx,
+            &plan.limit,
+            &plan.offset,
+            after_main_loop_label,
+        )?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
@@ -119,9 +121,16 @@ pub fn emit_query<'a>(
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
+    // It also tells whether any row reached the aggregate, which a correlated
+    // subquery in the result columns needs even when every column contains an
+    // aggregate: if no row did, the subquery runs again against the NULL row.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || plan
+                .non_from_clause_subqueries
+                .iter()
+                .any(|s| s.correlated && s.origin == SubqueryOrigin::SelectList));
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
@@ -209,7 +218,21 @@ pub fn emit_query<'a>(
         emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
     }
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+    let end_label = program.allocate_label();
+    init_limit(program, t_ctx, &plan.limit, &plan.offset, end_label)?;
+
+    for aggregate in &mut plan.aggregates {
+        if aggregate.order_by().is_empty() {
+            continue;
+        }
+        aggregate.order_cursor = Some(program.alloc_cursor_id(CursorType::Sorter));
+        crate::translate::aggregation::open_aggregate_sorter(
+            program,
+            &plan.table_references,
+            &t_ctx.resolver,
+            aggregate,
+        )?;
+    }
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -235,11 +258,12 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
-        // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
-        // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
-        // Without resolving this label before the early return, bytecode assembly fails
-        // with an unresolved IfNot target.
+        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+            let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+            program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+        }
         program.preassign_label_to_next_insn(after_main_loop_label);
+        program.preassign_label_to_next_insn(end_label);
         return Ok(t_ctx.reg_result_cols_start.unwrap());
     }
 
@@ -309,6 +333,7 @@ pub fn emit_query<'a>(
         EmitOrderBy::emit(program, t_ctx, plan)?;
     }
 
+    program.preassign_label_to_next_insn(end_label);
     Ok(t_ctx.reg_result_cols_start.unwrap())
 }
 
@@ -645,6 +670,57 @@ fn prune_join_order_for_materialized_inputs(
     }
     plan.join_order
         .retain(|member| !tables_to_remove.get(member.original_idx));
+
+    // The columns of the removed tables are read from the hash payload, so a
+    // correlated subquery that reads one of them must run in the probe loop.
+    // A WHERE subquery whose terms the build input already applied is not
+    // needed by the probe loop.
+    let payload_loop = plan
+        .join_order
+        .iter()
+        .position(|member| {
+            matches!(
+                &plan.table_references.joined_tables()[member.original_idx].op,
+                Operation::HashJoin(hash_join_op)
+                    if build_inputs
+                        .get(&hash_join_op.build_table_idx)
+                        .is_some_and(|input| !input.requires_build_table())
+            )
+        })
+        .expect("a materialized build input removed tables, so its probe loop remains");
+    let payload_probe_table_id = plan.join_order[payload_loop].table_id;
+    for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        let reads_removed_table =
+            subquery_plan
+                .used_outer_query_ref_ids()
+                .iter()
+                .any(|outer_ref_id| {
+                    plan.table_references
+                        .joined_tables()
+                        .iter()
+                        .position(|table| table.internal_id == *outer_ref_id)
+                        .is_some_and(|table_idx| tables_to_remove.get(table_idx))
+                });
+        let only_used_by_applied_where_terms = subquery.origin == SubqueryOrigin::SelectWhere
+            && plan
+                .where_clause
+                .iter()
+                .filter(|term| expr_references_subquery_id(&term.expr, subquery.internal_id))
+                .all(|term| term.consumed);
+        if reads_removed_table
+            && !only_used_by_applied_where_terms
+            && subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
+                < EvalAt::Loop(payload_loop)
+        {
+            subquery.preferred_eval_after_table = Some(payload_probe_table_id);
+        }
+    }
     Ok(())
 }
 
@@ -808,6 +884,8 @@ fn build_materialized_build_input_plan(
     // terms for access methods (e.g. ephemeral autoindex seeks) that get
     // overwritten to scans inside the subplan. Reset each term's consumed
     // flag: only terms referencing tables outside the prefix are consumed.
+    // Terms implied by a partial index that the subplan still reads are
+    // consumed again below, after the access methods are checked.
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -819,6 +897,12 @@ fn build_materialized_build_input_plan(
         // because those tables are available during probe loops. Use the broader "included"
         // set when deciding which WHERE terms can be evaluated inside the materialization.
         term.consumed = !included_tables.contains_all_set_bits_of(&mask);
+        // A literal true replaces each term that the subplan cannot evaluate. Such a term
+        // can use a subquery that is left out of the subplan below, and looking it up
+        // there would fail.
+        if term.consumed {
+            term.expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        }
     }
 
     // Clone table references and then "sanitize" each access method so that
@@ -934,6 +1018,19 @@ fn build_materialized_build_input_plan(
             // access paths that are valid within the prefix join order.
             joined_table.op = Operation::default_scan_for(&joined_table.table);
         }
+
+        if let Some(index) = partial_index(joined_table.op.index()) {
+            let is_outer_join = joined_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer());
+            mark_partial_index_predicate_terms_consumed(
+                index,
+                joined_table,
+                &mut where_clause,
+                is_outer_join,
+            );
+        }
     }
 
     let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
@@ -990,7 +1087,7 @@ fn build_materialized_build_input_plan(
     };
 
     // The WHERE terms that use a subquery reading tables outside the prefix are
-    // consumed above, so the subquery must not be emitted in this subplan either.
+    // replaced above, so the subquery must not be emitted in this subplan either.
     let non_from_clause_subqueries = plan
         .non_from_clause_subqueries
         .iter()
@@ -1027,7 +1124,6 @@ fn build_materialized_build_input_plan(
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

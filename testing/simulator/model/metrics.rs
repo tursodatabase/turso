@@ -174,7 +174,7 @@ impl InteractionStats {
 
     fn query_stat(&mut self, q: &Query) {
         match q {
-            Query::Select(_) => self.select_count += 1,
+            Query::Select(_) | Query::LateralSelect(_) => self.select_count += 1,
             Query::Insert(_) => self.insert_count += 1,
             Query::Delete(_) => self.delete_count += 1,
             Query::Create(_) => self.create_count += 1,

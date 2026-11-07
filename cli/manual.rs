@@ -1,10 +1,11 @@
 use include_dir::{include_dir, Dir};
 use rand::seq::SliceRandom;
 use std::io::{stdout, IsTerminal, Write};
+use std::ops::ControlFlow;
 
 use termimad::{
     crossterm::{
-        event::{read, Event, KeyCode},
+        event::{read, Event, KeyCode, KeyEventKind},
         queue,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -181,24 +182,8 @@ fn render_in_terminal(content: &str) -> anyhow::Result<()> {
         view.write_on(&mut w)?;
         w.flush()?;
 
-        match read()? {
-            Event::Key(key) => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => view.try_scroll_lines(-1),
-                KeyCode::Down | KeyCode::Char('j') => view.try_scroll_lines(1),
-                KeyCode::PageUp => view.try_scroll_pages(-1),
-                KeyCode::PageDown => view.try_scroll_pages(1),
-                KeyCode::Char('g') => view.scroll = 0,
-                KeyCode::Char('G') => view.try_scroll_lines(i32::MAX),
-
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => break,
-
-                _ => {}
-            },
-            Event::Resize(width, height) => {
-                let new_area = Area::new(0, 0, width, height);
-                view.resize(&new_area);
-            }
-            _ => {}
+        if handle_event(&mut view, read()?).is_break() {
+            break;
         }
     }
 
@@ -207,6 +192,29 @@ fn render_in_terminal(content: &str) -> anyhow::Result<()> {
     w.flush()?;
 
     Ok(())
+}
+
+fn handle_event(view: &mut MadView, event: Event) -> ControlFlow<()> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => view.try_scroll_lines(-1),
+            KeyCode::Down | KeyCode::Char('j') => view.try_scroll_lines(1),
+            KeyCode::PageUp => view.try_scroll_pages(-1),
+            KeyCode::PageDown => view.try_scroll_pages(1),
+            KeyCode::Char('g') => view.scroll = 0,
+            KeyCode::Char('G') => view.try_scroll_lines(i32::MAX),
+
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return ControlFlow::Break(()),
+
+            _ => {}
+        },
+        Event::Resize(width, height) => {
+            let new_area = Area::new(0, 0, width, height);
+            view.resize(&new_area);
+        }
+        _ => {}
+    }
+    ControlFlow::Continue(())
 }
 
 fn list_available_manuals(writer: &mut dyn Write) -> anyhow::Result<()> {
@@ -229,4 +237,41 @@ fn list_available_manuals(writer: &mut dyn Write) -> anyhow::Result<()> {
     writeln!(writer, "Usage: .manual <page>  or  .man <page>")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use termimad::crossterm::event::{KeyEvent, KeyEventState, KeyModifiers};
+
+    fn key_event(code: KeyCode, kind: KeyEventKind) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn test_view() -> MadView {
+        let content = (0..100).map(|i| format!("line {i}\n")).collect::<String>();
+        MadView::from(content, Area::new(0, 0, 80, 10), MadSkin::default())
+    }
+
+    #[test]
+    fn enter_release_does_not_close_manual_viewer() {
+        let mut view = test_view();
+        let release = key_event(KeyCode::Enter, KeyEventKind::Release);
+        assert_eq!(handle_event(&mut view, release), ControlFlow::Continue(()));
+        let press = key_event(KeyCode::Enter, KeyEventKind::Press);
+        assert_eq!(handle_event(&mut view, press), ControlFlow::Break(()));
+    }
+
+    #[test]
+    fn key_release_does_not_scroll_manual_viewer() {
+        let mut view = test_view();
+        let _ = handle_event(&mut view, key_event(KeyCode::Down, KeyEventKind::Press));
+        let _ = handle_event(&mut view, key_event(KeyCode::Down, KeyEventKind::Release));
+        assert_eq!(view.scroll, 1);
+    }
 }

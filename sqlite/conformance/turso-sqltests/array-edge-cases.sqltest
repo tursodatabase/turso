@@ -781,7 +781,7 @@ test negative-zero-float-equality {
     SELECT COUNT(DISTINCT vals) FROM nz3;
 }
 expect {
-    2
+    1
 }
 
 test negative-zero-in-mixed-array {
@@ -1057,9 +1057,9 @@ test mixed-type-order-by {
     SELECT id, vals FROM mto1 ORDER BY vals;
 }
 expect {
-    3|{NULL,1}
     2|{1,2}
     1|{1,hello}
+    3|{NULL,1}
 }
 
 test order-by-null-elements {
@@ -1070,9 +1070,9 @@ test order-by-null-elements {
     SELECT id, vals FROM one1 ORDER BY vals;
 }
 expect {
-    2|{1,NULL,3}
     3|{1,2}
     1|{1,2,3}
+    2|{1,NULL,3}
 }
 
 test order-by-empty-and-null-arrays {
@@ -1085,9 +1085,9 @@ test order-by-empty-and-null-arrays {
 }
 expect {
     3|{}
+    2|{0}
     1|{NULL}
     4|{NULL,NULL}
-    2|{0}
 }
 
 test chained-array-functions {
@@ -1917,4 +1917,62 @@ test group-by-array-column {
 expect {
     {1,2}|3
     {3,4}|3
+}
+
+test array-to-string-one-arg-column {
+    CREATE TABLE ats1 (a TEXT[]) STRICT;
+    INSERT INTO ats1 VALUES (ARRAY['1','2']);
+    SELECT array_to_string(a) FROM ats1;
+}
+expect error {
+    wrong number of arguments to function array_to_string()
+}
+
+test array-to-string-one-arg-literal {
+    SELECT array_to_string(ARRAY['1','2']);
+}
+expect error {
+    wrong number of arguments to function array_to_string()
+}
+
+test array-to-string-four-args {
+    SELECT array_to_string(ARRAY['1','2'], ',', 'x', 'y');
+}
+expect error {
+    wrong number of arguments to function array_to_string()
+}
+
+test array-length-no-args {
+    SELECT array_length();
+}
+expect error {
+    wrong number of arguments to function array_length()
+}
+
+test string-to-array-one-arg {
+    SELECT string_to_array('a');
+}
+expect error {
+    wrong number of arguments to function string_to_array()
+}
+
+test array-slice-two-args {
+    SELECT array_slice(ARRAY[1,2,3], 1);
+}
+expect error {
+    wrong number of arguments to function array_slice()
+}
+
+test array-element-one-arg {
+    SELECT array_element(ARRAY[1]);
+}
+expect error {
+    wrong number of arguments to function array_element()
+}
+
+test array-set-element-two-args {
+    SELECT array_set_element(ARRAY[1], 1);
+}
+expect error {
+    wrong number of arguments to function array_set_element()
 }

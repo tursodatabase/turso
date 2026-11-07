@@ -13,13 +13,21 @@ pub enum Backend {
     Cli,
     /// JavaScript bindings backend
     Js,
-    /// PostgreSQL wire-protocol backend (tursopg server)
-    Pg,
+    /// tursopg server, driven over the PostgreSQL wire protocol
+    Tursopg,
+    /// A real PostgreSQL server, driven over the PostgreSQL wire protocol
+    Postgres,
 }
 
 impl Backend {
     /// All known backend variants
-    pub const ALL: &'static [Backend] = &[Backend::Rust, Backend::Cli, Backend::Js, Backend::Pg];
+    pub const ALL: &'static [Backend] = &[
+        Backend::Rust,
+        Backend::Cli,
+        Backend::Js,
+        Backend::Tursopg,
+        Backend::Postgres,
+    ];
 }
 
 impl Display for Backend {
@@ -28,7 +36,8 @@ impl Display for Backend {
             Backend::Rust => write!(f, "rust"),
             Backend::Cli => write!(f, "cli"),
             Backend::Js => write!(f, "js"),
-            Backend::Pg => write!(f, "pg"),
+            Backend::Tursopg => write!(f, "tursopg"),
+            Backend::Postgres => write!(f, "postgres"),
         }
     }
 }
@@ -41,9 +50,10 @@ impl FromStr for Backend {
             "rust" => Ok(Backend::Rust),
             "cli" => Ok(Backend::Cli),
             "js" => Ok(Backend::Js),
-            "pg" => Ok(Backend::Pg),
+            "tursopg" => Ok(Backend::Tursopg),
+            "postgres" => Ok(Backend::Postgres),
             _ => Err(format!(
-                "unknown backend '{s}', valid backends are: rust, cli, js, pg"
+                "unknown backend '{s}', valid backends are: rust, cli, js, tursopg, postgres"
             )),
         }
     }
@@ -60,6 +70,8 @@ pub enum Capability {
     MaterializedViews,
     /// Support for custom types (CREATE TYPE / DROP TYPE)
     CustomTypes,
+    /// Support for CREATE INDEX ... USING <index method> (experimental)
+    IndexMethod,
 }
 
 impl Capability {
@@ -69,6 +81,7 @@ impl Capability {
         Capability::Strict,
         Capability::MaterializedViews,
         Capability::CustomTypes,
+        Capability::IndexMethod,
     ];
 
     /// Get all capabilities as a HashSet (convenience for backends that support everything)
@@ -84,6 +97,7 @@ impl Display for Capability {
             Capability::Strict => write!(f, "strict"),
             Capability::MaterializedViews => write!(f, "materialized_views"),
             Capability::CustomTypes => write!(f, "custom_types"),
+            Capability::IndexMethod => write!(f, "index_method"),
         }
     }
 }
@@ -118,8 +132,11 @@ pub struct Requirement {
 pub struct TestFile {
     /// Database configurations to run tests against
     pub databases: Vec<DatabaseConfig>,
+    /// Verify every materialized view against its defining SELECT after each
+    /// successful test statement on backends that preserve typed results.
+    pub verify_materialized_views: bool,
     /// Named setup blocks that can be composed
-    pub setups: HashMap<String, String>,
+    pub setups: HashMap<String, Setup>,
     /// Test cases
     pub tests: Vec<TestCase>,
     /// Snapshot test cases (for EXPLAIN output)
@@ -130,6 +147,18 @@ pub struct TestFile {
     pub global_skip: Vec<Skip>,
     /// Global capability requirements that apply to all tests in the file
     pub global_requires: Vec<Requirement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Setup {
+    pub sql: String,
+    pub backend: Option<Backend>,
+}
+
+impl Setup {
+    pub fn runs_on(&self, backend: Backend) -> bool {
+        self.backend.is_none_or(|only| only == backend)
+    }
 }
 
 /// A setup reference with its span in the source
@@ -312,6 +341,8 @@ pub enum SkipCondition {
     Mvcc,
     /// Skip when running against the sqlite CLI backend
     Sqlite,
+    /// Skip when running against a real PostgreSQL server
+    Postgres,
 }
 
 /// What we expect from executing the SQL
@@ -323,8 +354,23 @@ pub enum Expectation {
     Pattern(String),
     /// Compare as sets (order doesn't matter)
     Unordered(Vec<String>),
-    /// Expect an error with optional pattern match
-    Error(Option<String>),
+    /// Expect an error
+    Error {
+        /// SQLSTATE that the error must have, set by `@sqlstate`
+        sqlstate: Option<String>,
+        /// Regex that the error message must match
+        pattern: Option<String>,
+    },
+}
+
+impl Expectation {
+    /// SQLSTATE that this expectation requires, if any
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Expectation::Error { sqlstate, .. } => sqlstate.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Collection of expectations with optional backend-specific overrides

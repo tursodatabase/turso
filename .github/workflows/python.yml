@@ -21,6 +21,10 @@ env:
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
+  # Wheels are only published from tags. Pull requests only check that the
+  # wheels build, so they use lib-release (no LTO) instead of the slow
+  # release-official profile.
+  WHEEL_PROFILE: ${{ github.event_name == 'pull_request' && 'lib-release' || 'release-official' }}
 
 jobs:
   test:
@@ -54,6 +58,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Build Rust (debug)
@@ -68,6 +73,16 @@ jobs:
         uses: useblacksmith/setup-uv@v4
         with:
           enable-cache: true
+
+      # `uv sync` builds the extension with maturin, which defaults to an
+      # optimized release build with LTO. On pull requests, build it in debug
+      # mode instead: much faster, and it reuses what "Build Rust (debug)"
+      # built. main keeps testing the release build, which has code paths
+      # debug builds don't (e.g. panic=abort, release-only branches).
+      - name: Build the extension in debug mode on pull requests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo "MATURIN_PEP517_ARGS=--profile dev" >> "$GITHUB_ENV"
 
       - name: Install the project
         working-directory: ${{ env.working-directory }}
@@ -147,7 +162,7 @@ jobs:
           - target: x86_64
             runner: blacksmith-4vcpu-ubuntu-2404
           - target: aarch64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -159,8 +174,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --profile release-official --out dist
-          sccache: 'true'
+          args: --profile ${{ env.WHEEL_PROFILE }} --out dist
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -176,7 +190,11 @@ jobs:
         working-directory: ${{ env.working-directory }}
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        # On pull requests, skip the aarch64 wheel: the macOS test job
+        # already builds the same extension for aarch64 (uv sync builds a
+        # wheel through maturin) and runs the tests against it. x86_64 is
+        # the only PR build for that target, so it stays.
+        target: ${{ github.event_name == 'pull_request' && fromJSON('["x86_64"]') || fromJSON('["x86_64", "aarch64"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -190,8 +208,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --profile release-official --out dist
-          sccache: 'true'
+          args: --profile ${{ env.WHEEL_PROFILE }} --out dist
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

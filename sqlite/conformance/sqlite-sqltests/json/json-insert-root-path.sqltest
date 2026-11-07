@@ -1,0 +1,38 @@
+# json_insert() and jsonb_insert() only add values that do not exist yet.
+# The document root always exists, so inserting at '$' leaves the document
+# unchanged, while json_set() and json_replace() still replace it.
+
+@database :memory:
+
+test json-insert-root-leaves-document-unchanged {
+    SELECT json_insert('[]', '$', 1),
+           json_insert('{"a":2}', '$', 1),
+           json_insert('[5]', '$', json('{"b":1}')),
+           json_insert('3', '$', 1);
+}
+expect {
+    []|{"a":2}|[5]|3
+}
+
+test jsonb-insert-root-leaves-document-unchanged {
+    SELECT json(jsonb_insert('[5]', '$', 1)),
+           json(jsonb_insert('{"a":2}', '$', 1));
+}
+expect {
+    [5]|{"a":2}
+}
+
+test json-insert-root-then-new-key {
+    SELECT json_insert('{"a":2}', '$', 1, '$.b', 3);
+}
+expect {
+    {"a":2,"b":3}
+}
+
+test json-set-and-replace-root-replace-document {
+    SELECT json_set('[5]', '$', 1),
+           json_replace('[5]', '$', 1);
+}
+expect {
+    1|1
+}

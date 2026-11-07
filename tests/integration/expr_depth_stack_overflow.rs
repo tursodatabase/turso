@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
-use turso_core::{Database, MemoryIO, IO};
+use turso_core::{ConnectOpts, Database, MemoryIO, IO};
 use turso_parser::MAX_EXPR_DEPTH;
 
 struct GenExpr {
@@ -111,7 +111,7 @@ fn run_with_stack(stack_size: usize, statements: Vec<String>) -> turso_core::Res
         .spawn(move || -> turso_core::Result<()> {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
             for sql in &statements {
                 conn.execute(sql)?;
             }
@@ -124,8 +124,7 @@ fn run_with_stack(stack_size: usize, statements: Vec<String>) -> turso_core::Res
 
 #[test]
 fn over_limit_is_a_graceful_depth_error() {
-    let expected =
-        format!("Parse error: Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})");
+    let expected = format!("Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})");
 
     for gen_expr in GEN_EXPRS {
         let err = run_on_big_stack((gen_expr.build)(MAX_EXPR_DEPTH)).expect_err(gen_expr.name);

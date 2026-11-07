@@ -689,7 +689,6 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 || e_string.contains("has no column named")
                 || e_string.contains("no such column:")
                 || e_string.contains("cannot drop column")
-                || e_string.contains("DDL statements require an exclusive transaction")
         };
         let requires_rollback = |e: &turso::Error| -> bool {
             let e_string = e.to_string();
@@ -757,17 +756,15 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 println!("Connection {conn_id}(op={op_num}): {operation}, is_in_tx={is_in_tx_str}, has_snapshot={has_snapshot}");
 
                 match operation {
-                    Operation::Begin { concurrent } => {
+                    Operation::Begin { concurrent: _ } => {
                         let query = operation.to_string();
 
                         let result = conn.execute(query.as_str(), ()).await;
                         match result {
                             Ok(_) => {
+                                // BEGIN CONCURRENT is deferred like BEGIN: the
+                                // snapshot is taken by the first statement.
                                 shared_shadow_db.begin_transaction(next_tx_id, false);
-                                if concurrent {
-                                    // in tursodb, BEGIN CONCURRENT immediately starts a transaction.
-                                    shared_shadow_db.take_snapshot_if_not_exists(next_tx_id);
-                                }
                                 *current_tx_id = Some(next_tx_id);
                                 next_tx_id += 1;
                             }

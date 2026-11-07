@@ -352,7 +352,10 @@ impl SimIO for MemorySimIO {
     fn persist_files(&self) -> anyhow::Result<()> {
         let files = self.files.borrow();
         for (file_path, file) in files.iter() {
-            if file_path.ends_with(".db") || file_path.ends_with("wal") || file_path.ends_with("lg")
+            if file_path.ends_with(".db")
+                || file_path.ends_with("wal")
+                || file_path.ends_with("lg")
+                || file_path.ends_with(".db-log")
             {
                 let state = file.state.borrow();
                 let mut output = BufWriter::new(std::fs::File::create(file_path)?);

@@ -23,18 +23,32 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
-    /// Collecting digits after "#-". The sign has to live in the state,
-    /// not in the sign of the accumulated number: while the digits seen
-    /// so far are all zeros the accumulator is plain 0 and cannot
-    /// remember that "#-02" means two from the end.
+    /// Collecting digits after "#-".
     CollectingNegativeNumbers,
-    IsMax,
 }
 
 /// Describes a JSON path, which is a sequence of keys and/or array locators.
 #[derive(Clone, Debug)]
 pub struct JsonPath<'a> {
     pub elements: Vec<PathElement<'a>>,
+}
+
+impl JsonPath<'_> {
+    pub fn into_owned(self) -> JsonPath<'static> {
+        let elements = self
+            .elements
+            .into_iter()
+            .map(|element| match element {
+                PathElement::Root() => PathElement::Root(),
+                PathElement::Key(key, raw) => PathElement::Key(Cow::Owned(key.into_owned()), raw),
+                PathElement::ArrayLocator(index) => PathElement::ArrayLocator(index),
+                PathElement::BracketQuotedKey(key) => {
+                    PathElement::BracketQuotedKey(Cow::Owned(key.into_owned()))
+                }
+            })
+            .collect();
+        JsonPath { elements }
+    }
 }
 
 type RawString = bool;
@@ -54,19 +68,21 @@ pub enum PathElement<'a> {
     BracketQuotedKey(Cow<'a, str>),
 }
 
-type IsMaxNumber = bool;
-
-fn collect_num(current: i128, adding: i128, negative: bool) -> (i128, IsMaxNumber) {
-    let ten = 10i128;
-
-    let result = if negative {
-        current.saturating_mul(ten).saturating_sub(adding)
-    } else {
-        current.saturating_mul(ten).saturating_add(adding)
-    };
-
-    let is_max = result == i128::MAX || result == i128::MIN;
-    (result, is_max)
+impl PathElement<'_> {
+    /// Array locator for `[index]`, or for `[#-index]` when `from_end` is set.
+    pub fn array_locator(index: u32, from_end: bool) -> PathElement<'static> {
+        // An index that does not fit in an i32 becomes i32::MAX or i32::MIN.
+        // Only an array of more than 2^31 elements could match those, so in
+        // practice the path finds nothing, as in SQLite.
+        match (from_end, index) {
+            // "#-0" addresses the same one-past-the-end position as a bare "#".
+            (true, 0) => PathElement::ArrayLocator(None),
+            (true, _) => PathElement::ArrayLocator(Some(
+                i32::try_from(-i64::from(index)).unwrap_or(i32::MIN),
+            )),
+            (false, _) => PathElement::ArrayLocator(Some(i32::try_from(index).unwrap_or(i32::MAX))),
+        }
+    }
 }
 
 fn estimate_path_capacity(input: &str) -> usize {
@@ -84,7 +100,7 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     let mut parser_state = PPState::Start;
     let mut index_state = ArrayIndexState::Start;
     let mut key_start = 0;
-    let mut index_buffer: i128 = 0;
+    let mut index_buffer: u32 = 0;
     let mut path_components = Vec::with_capacity(estimate_path_capacity(path));
     let mut path_iter = path.char_indices();
 
@@ -166,7 +182,7 @@ fn handle_after_root(
     parser_state: &mut PPState,
     index_state: &mut ArrayIndexState,
     key_start: &mut usize,
-    index_buffer: &mut i128,
+    index_buffer: &mut u32,
     path: &str,
 ) -> crate::Result<()> {
     match ch {
@@ -191,7 +207,7 @@ fn handle_in_key<'a>(
     parser_state: &mut PPState,
     index_state: &mut ArrayIndexState,
     key_start: &mut usize,
-    index_buffer: &mut i128,
+    index_buffer: &mut u32,
     path_components: &mut Vec<PathElement<'a>>,
     path_iter: &mut std::str::CharIndices,
     path: &'a str,
@@ -254,7 +270,7 @@ fn handle_array_index<'a>(
     ch: (usize, char),
     parser_state: &mut PPState,
     index_state: &mut ArrayIndexState,
-    index_buffer: &mut i128,
+    index_buffer: &mut u32,
     path_components: &mut Vec<PathElement<'a>>,
     path_iter: &mut std::str::CharIndices,
     path: &'a str,
@@ -266,7 +282,7 @@ fn handle_array_index<'a>(
         (ArrayIndexState::Start, '0'..='9') => {
             *index_buffer = ch.1.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-            })? as i128;
+            })?;
             *index_state = ArrayIndexState::CollectingNumbers;
         }
         // Bracket-notation quoted key, e.g. $["key with spaces"] or $['key'].
@@ -284,38 +300,22 @@ fn handle_array_index<'a>(
             path_components.push(PathElement::ArrayLocator(None));
         }
         (
-            state @ (ArrayIndexState::CollectingNumbers
-            | ArrayIndexState::CollectingNegativeNumbers),
+            ArrayIndexState::CollectingNumbers | ArrayIndexState::CollectingNegativeNumbers,
             '0'..='9',
         ) => {
-            let negative = matches!(state, ArrayIndexState::CollectingNegativeNumbers);
-            let (new_num, is_max) = collect_num(
-                *index_buffer,
-                ch.1.to_digit(10).ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-                })? as i128,
-                negative,
-            );
-            if is_max {
-                *index_state = ArrayIndexState::IsMax;
-            }
-            *index_buffer = new_num;
+            let digit = ch.1.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+            })?;
+            // Like SQLite, accumulate in a u32 so that long indexes wrap modulo 2^32.
+            *index_buffer = index_buffer.wrapping_mul(10).wrapping_add(digit);
         }
-        (ArrayIndexState::IsMax, '0'..='9') => (),
-        (ArrayIndexState::CollectingNegativeNumbers, ']') if *index_buffer == 0 => {
-            // "#-0" (any number of zeros) addresses the same one-past-the-end
-            // position as a bare "#".
+        (ArrayIndexState::CollectingNumbers, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(None));
+            path_components.push(PathElement::array_locator(*index_buffer, false));
         }
-        (
-            ArrayIndexState::CollectingNumbers
-            | ArrayIndexState::CollectingNegativeNumbers
-            | ArrayIndexState::IsMax,
-            ']',
-        ) => {
+        (ArrayIndexState::CollectingNegativeNumbers, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+            path_components.push(PathElement::array_locator(*index_buffer, true));
         }
         (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
     }
@@ -374,15 +374,15 @@ fn handle_bracket_quoted_key<'a>(
 
 fn handle_negative_index(
     index_state: &mut ArrayIndexState,
-    index_buffer: &mut i128,
+    index_buffer: &mut u32,
     path_iter: &mut std::str::CharIndices,
     path: &str,
 ) -> crate::Result<()> {
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
-            *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
+            *index_buffer = next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
-            })? as i128);
+            })?;
             *index_state = ArrayIndexState::CollectingNegativeNumbers;
             Ok(())
         } else {
@@ -398,7 +398,7 @@ fn handle_expect_dot_or_bracket(
     parser_state: &mut PPState,
     index_state: &mut ArrayIndexState,
     key_start: &mut usize,
-    index_buffer: &mut i128,
+    index_buffer: &mut u32,
     path: &str,
 ) -> crate::Result<()> {
     match ch {

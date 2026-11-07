@@ -917,8 +917,9 @@ fn calculate_row_indents(rows: &[Vec<String>]) -> Vec<usize> {
         let addr = addr as i64;
 
         if AZ_NEXT.contains(opcode) {
-            // These indent all opcodes between p2 and themselves
-            if *p2 < addr {
+            // These indent all opcodes between p2 and themselves. A subroutine
+            // Return has p2 = 0, which SQLite's shell does not treat as a loop.
+            if 0 < *p2 && *p2 < addr {
                 loop_ranges.push((*p2, addr));
             }
         } else if *opcode == "Goto" && *p2 < addr {
@@ -1510,6 +1511,38 @@ mod tests {
         assert!(
             !opcode_halt.starts_with(' '),
             "Halt should not be indented: '{opcode_halt}'"
+        );
+    }
+
+    #[test]
+    fn test_subroutine_return_does_not_indent() {
+        let rows: Vec<Vec<String>> = [
+            ("Init", "0", "9"),
+            ("OpenRead", "0", "2"),
+            ("Rewind", "0", "8"),
+            ("Gosub", "2", "6"),
+            ("ResultRow", "1", "1"),
+            ("Next", "0", "3"),
+            ("Null", "0", "1"),
+            ("Return", "2", "0"),
+            ("Halt", "0", "0"),
+            ("Goto", "0", "1"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(addr, (opcode, p1, p2))| {
+            vec![
+                addr.to_string(),
+                opcode.to_string(),
+                p1.to_string(),
+                p2.to_string(),
+            ]
+        })
+        .collect();
+
+        assert_eq!(
+            calculate_row_indents(&rows),
+            vec![0, 0, 0, 1, 1, 0, 0, 0, 0, 0]
         );
     }
 

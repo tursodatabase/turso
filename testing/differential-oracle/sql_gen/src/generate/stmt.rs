@@ -14,7 +14,7 @@ use crate::generate::expr::{generate_condition, generate_expr};
 use crate::generate::literal::generate_literal;
 use crate::generate::select::{generate_select, generate_with_clause};
 use crate::policy::AlterTableConfig;
-use crate::schema::DataType;
+use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::{Origin, StmtKind};
 use sql_gen_macros::trace_gen;
 
@@ -785,6 +785,7 @@ pub fn generate_create_table<C: Capabilities>(
         unique: false,
         default: None,
         check: None,
+        generated: None,
     });
 
     // Generate additional columns
@@ -809,8 +810,8 @@ pub fn generate_create_table<C: Capabilities>(
             ];
             *ctx.choose(&base_types).unwrap()
         };
-        let not_null = ctx.gen_bool_with_prob(create_table_config.not_null_probability);
-        let unique = ctx.gen_bool_with_prob(create_table_config.unique_probability);
+        let mut not_null = ctx.gen_bool_with_prob(create_table_config.not_null_probability);
+        let mut unique = ctx.gen_bool_with_prob(create_table_config.unique_probability);
         let default = if ctx.gen_bool_with_prob(create_table_config.default_probability) {
             let lit = generate_literal(ctx, data_type, generator.policy());
             Some(Expr::literal(ctx, lit))
@@ -826,6 +827,27 @@ pub fn generate_create_table<C: Capabilities>(
             None
         };
 
+        // Generated columns cannot have DEFAULT, NOT NULL, or UNIQUE.
+        let generated = if default.is_none()
+            && !matches!(
+                data_type,
+                DataType::Blob
+                    | DataType::Null
+                    | DataType::IntegerArray
+                    | DataType::RealArray
+                    | DataType::TextArray
+            )
+            && ctx.gen_bool_with_prob(create_table_config.generated_column_probability)
+        {
+            generate_gencol_expr(generator, ctx, &columns).ok()
+        } else {
+            None
+        };
+        if generated.is_some() {
+            not_null = false;
+            unique = false;
+        }
+
         columns.push(ColumnDefStmt {
             name,
             data_type,
@@ -834,6 +856,7 @@ pub fn generate_create_table<C: Capabilities>(
             unique,
             default,
             check,
+            generated,
         });
     }
 
@@ -866,11 +889,13 @@ pub fn generate_create_table<C: Capabilities>(
     let strict = has_array_column || ctx.gen_bool_with_prob(create_table_config.strict_probability);
 
     // STRICT tables don't allow untyped (Null) columns — convert to Integer.
+    // The bundled SQLite does not type-check generated columns in STRICT tables, so drop them.
     if strict {
         for col in &mut columns {
             if col.data_type == DataType::Null {
                 col.data_type = DataType::Integer;
             }
+            col.generated = None;
         }
     }
 
@@ -989,7 +1014,7 @@ fn generate_alter_table_action<C: Capabilities>(
             let data_type = *ctx.choose(&types).unwrap();
             let not_null = ctx.gen_bool_with_prob(config.not_null_probability);
 
-            Ok(AlterTableAction::AddColumn(ColumnDefStmt {
+            Ok(AlterTableAction::AddColumn(Box::new(ColumnDefStmt {
                 name: col_name,
                 data_type,
                 primary_key: false,
@@ -997,7 +1022,8 @@ fn generate_alter_table_action<C: Capabilities>(
                 unique: false,
                 default: None,
                 check: None,
-            }))
+                generated: None,
+            })))
         }
         AlterTableActionKind::DropColumn => {
             let col = ctx.choose(&droppable_columns).unwrap();
@@ -1659,6 +1685,42 @@ fn generate_autoincrement<C: Capabilities>(
     _ctx: &mut Context,
 ) -> Result<(), GenError> {
     todo!("AUTOINCREMENT generation")
+}
+
+/// Generates an expression over the columns declared so far, without subqueries or window functions.
+fn generate_gencol_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    existing_cols: &[ColumnDefStmt],
+) -> Result<Expr, GenError> {
+    let scope_cols: Vec<ColumnDef> = existing_cols
+        .iter()
+        .filter(|c| {
+            !matches!(
+                c.data_type,
+                DataType::Blob | DataType::IntegerArray | DataType::RealArray | DataType::TextArray
+            )
+        })
+        .map(|c| ColumnDef::new(c.name.clone(), c.data_type))
+        .collect();
+
+    if scope_cols.is_empty() {
+        return Err(GenError::exhausted("gencol", "no referenceable columns"));
+    }
+
+    let scope_table = Table::new("self".to_string(), scope_cols);
+
+    let mut policy = generator.policy().clone();
+    policy.expr_weights.subquery = 0;
+    policy.expr_weights.in_subquery = 0;
+    policy.expr_weights.window_function = 0;
+    policy.expr_weights.column_ref = 40;
+    policy.max_expr_depth = 3;
+    let gencol_gen = SqlGen::<C>::new(generator.schema().clone(), policy);
+
+    ctx.with_table_scope([(scope_table, None)], |ctx| {
+        generate_expr(&gencol_gen, ctx, 0)
+    })
 }
 
 #[trace_gen(Origin::GeneratedColumn)]

@@ -64,6 +64,12 @@ This project depends on windows-sys, distributed by the Microsoft:
 * License: licenses/core/windows-mit-license.md (MIT License)
 * Homepage: https://github.com/microsoft/windows-rs
 
+The sdk-kit build script depends on find-msvc-tools, distributed by the rust-lang project:
+
+* License: licenses/sdk-kit/find-msvc-tools-apache-license.md (Apache License v2.0)
+* License: licenses/sdk-kit/find-msvc-tools-mit-license.md (MIT License)
+* Homepage: https://github.com/rust-lang/cc-rs
+
 This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
@@ -78,3 +84,35 @@ The FTS profiler depends on spin, distributed by the spin-rs authors:
 
 * License: licenses/perf/spin-mit-license.md (MIT License)
 * Homepage: https://github.com/mvdnes/spin-rs
+
+The PostgreSQL frontend depends on Chumsky, distributed by the Chumsky authors:
+
+* License: licenses/chumsky-mit-license.md (MIT License)
+* Homepage: https://codeberg.org/zesterer/chumsky
+
+The PostgreSQL dump fuzzer uses Hegel, distributed by Antithesis, LLC:
+
+* License: licenses/testing/hegeltest-mit-license.md (MIT License)
+* Homepage: https://github.com/hegeldev/hegel-rust
+
+The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
+
+* License: licenses/testing/comfy-table-mit-license.md (MIT License)
+* Homepage: https://github.com/nukesor/comfy-table
+
+The PostgreSQL frontend vendors the default bool, integer, float, and bytea
+text-formatting routines from pgwire 0.36.3 in
+postgres/frontend/copy/pgwire_text.rs, with local buffer and API adaptations:
+
+* License: licenses/pgwire-mit-license.md (MIT License)
+* Homepage: https://github.com/sunng87/pgwire
+
+The PostgreSQL frontend depends on hex, distributed by its authors:
+
+* License: licenses/hex-mit-license.md (MIT License)
+* Homepage: https://github.com/KokaKiwi/rust-hex
+
+The PostgreSQL frontend depends on Ryū, distributed by its authors:
+
+* License: licenses/ryu-boost-license.md (Boost Software License 1.0)
+* Homepage: https://github.com/dtolnay/ryu

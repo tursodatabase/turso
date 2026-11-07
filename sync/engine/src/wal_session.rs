@@ -70,9 +70,10 @@ mod tests {
         Arc,
     };
     use turso_core::{
-        Clock, Completion, Database, DatabaseOpts, File, MemoryIO, OpenFlags, Result as CoreResult,
-        SqliteDialect, IO,
+        Clock, Completion, ConnectOpts, Database, DatabaseOpts, File, MemoryIO, OpenFlags,
+        Result as CoreResult, IO,
     };
+    use turso_sqlite::SqliteDialect;
 
     #[derive(Clone)]
     struct FailWalPwritevIo {
@@ -208,7 +209,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
 

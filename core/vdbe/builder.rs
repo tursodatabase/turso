@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
@@ -12,7 +12,7 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
-        plan::{ResultSetColumn, TableReferences},
+        plan::{ColumnMask, ResultSetColumn, TableReferences},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -41,8 +41,9 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
-    PrepareContext, PreparedProgram, Program,
+    affinity::{apply_integer_affinity, Affinity},
+    explain::ExplainInfo,
+    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
 };
 use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
@@ -133,10 +134,39 @@ enum DmlColumnRegisters {
     },
 }
 
+/// Which form the registers of a row being written hold. A custom-type column
+/// holds either the value the user sees or the value ENCODE produced, and an
+/// expression that reads the column, such as a generated column `val * 2`,
+/// must see the user's value. Reading a stored value therefore runs DECODE.
+#[derive(Clone, Debug)]
+pub enum DmlRowForm {
+    /// Every column holds the user's value, as before ENCODE in INSERT.
+    UserFacing,
+    /// Every column holds the stored value, as after ENCODE or when read from
+    /// the table.
+    Stored,
+    /// UPDATE before ENCODE: the SET columns hold the user's values and the
+    /// other columns hold the stored values read from the table.
+    StoredExceptUpdated(ColumnMask),
+}
+
+impl DmlRowForm {
+    /// Whether column `col_idx` holds the value ENCODE stored rather than the
+    /// user's value.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        match self {
+            DmlRowForm::UserFacing => false,
+            DmlRowForm::Stored => true,
+            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
+    form: DmlRowForm,
 }
 
 impl DmlColumnContext {
@@ -145,6 +175,7 @@ impl DmlColumnContext {
         base_reg: usize,
         rowid_reg: usize,
         layout: ColumnLayout,
+        form: DmlRowForm,
     ) -> Self {
         let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
 
@@ -155,10 +186,14 @@ impl DmlColumnContext {
                 layout,
             },
             rowid_alias_col,
+            form,
         }
     }
 
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+    pub fn from_column_reg_mapping<'a>(
+        pairs: impl Iterator<Item = (&'a Column, usize)>,
+        form: DmlRowForm,
+    ) -> Self {
         let mut rowid_alias_col = None;
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
@@ -170,7 +205,24 @@ impl DmlColumnContext {
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
+            form,
         }
+    }
+
+    /// The same registers after a step such as ENCODE changed their form.
+    pub fn with_form(&self, form: DmlRowForm) -> Self {
+        Self {
+            form,
+            ..self.clone()
+        }
+    }
+
+    /// Whether the register of column `col_idx` holds the value ENCODE
+    /// stored rather than the user's value. A virtual generated column
+    /// follows the row's form like any other column: in a row of stored
+    /// values, its expression's value is ENCODEd too.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        self.rowid_alias_col != Some(col_idx) && self.form.holds_stored_value(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
@@ -246,6 +298,9 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    /// What `Statement::get_column_type_info` reports for each result column. Only
+    /// filled in when custom types are enabled.
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -262,8 +317,6 @@ pub struct ProgramBuilder {
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
-    /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
-    collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
@@ -332,6 +385,12 @@ pub struct ProgramBuilder {
     /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
     /// type before translating the value argument.
     pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
+    /// Whether the schema this program was translated against has any
+    /// materialized views at all, set once by `epilogue()`. A schema change
+    /// bumps the schema cookie, which forces a reprepare (see
+    /// `PreparedProgram::has_materialized_views`), so this can't go stale
+    /// while the built program runs.
+    has_materialized_views: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -348,6 +407,8 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
+    const READS_STORED_VALUES: u16 = 1 << 9;
+    const WRITES_STORED_VALUES: u16 = 1 << 10;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -443,15 +504,47 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
+    /// When set, a custom-type column is read in its stored form, without
+    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
+    /// compares stored values.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }
     #[inline]
     pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
         self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
+    }
+
+    #[inline]
+    /// When set, a custom-type column is read as its stored value, without
+    /// DECODE, and an array result stays a record blob instead of becoming
+    /// display text. Engine-internal statements (e.g. VACUUM's table copy)
+    /// write these values back to storage as they are.
+    pub const fn reads_stored_values(self) -> bool {
+        self.get(Self::READS_STORED_VALUES)
+    }
+    #[inline]
+    pub const fn set_reads_stored_values(&mut self, v: bool) {
+        self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// Whether reading a custom-type column runs its DECODE.
+    pub const fn decodes_custom_type_columns(self) -> bool {
+        !self.suppress_custom_type_decode() && !self.reads_stored_values()
+    }
+
+    #[inline]
+    /// When set, the values INSERT and UPDATE write to custom-type columns
+    /// are already stored values, so they are written without ENCODE. Set
+    /// for statements that copy rows, such as VACUUM's table copy and an
+    /// ON UPDATE CASCADE action.
+    pub const fn writes_stored_values(self) -> bool {
+        self.get(Self::WRITES_STORED_VALUES)
+    }
+    #[inline]
+    pub const fn set_writes_stored_values(&mut self, v: bool) {
+        self.set(Self::WRITES_STORED_VALUES, v)
     }
 
     #[inline]
@@ -503,6 +596,17 @@ pub struct MaterializedCteInfo {
     pub table: Arc<BTreeTable>,
     /// Number of result columns.
     pub num_columns: usize,
+    /// Subroutine that fills the table the first time it runs. A later reference
+    /// calls it before `OpenDup`, because the first reference can be on a path
+    /// that never runs. A CTE that reads an outer row is never shared, so each of
+    /// its references fills its own table.
+    pub fill_subroutine: Subroutine,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Subroutine {
+    pub label: BranchOffset,
+    pub return_reg: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -517,6 +621,13 @@ pub enum CursorType {
         Arc<BTreeTable>,
         Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
     ),
+    /// Read-only cursor over the transaction's captured delta for one base
+    /// table of a materialized view. Rows are the base columns plus a
+    /// trailing weight column; opened by maintenance programs at commit time.
+    ViewDelta {
+        view_name: String,
+        table: Arc<BTreeTable>,
+    },
 }
 
 impl CursorType {
@@ -537,7 +648,7 @@ impl CursorType {
                         .columns()
                         .iter()
                         .map(|col| {
-                            if let Some(coll) = col.collation_opt() {
+                            if let Some(coll) = col.text_collation() {
                                 format!("{coll}")
                             } else {
                                 "B".to_string()
@@ -562,10 +673,9 @@ impl CursorType {
                                 SortOrder::Asc => "",
                                 SortOrder::Desc => "-",
                             };
-                            if let Some(coll) = col.collation {
-                                format!("{sign}{coll}")
-                            } else {
-                                format!("{sign}B")
+                            match col.collation {
+                                CollationSeq::BINARY => format!("{sign}B"),
+                                coll => format!("{sign}{coll}"),
                             }
                         })
                         .collect::<Vec<_>>()
@@ -667,13 +777,25 @@ impl ProgramBuilder {
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, false)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            false,
+            false,
+        )
     }
+    /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
+    /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
+    /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
+    /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
+        mvcc_enabled: bool,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -681,25 +803,41 @@ impl ProgramBuilder {
             opts,
             Some(trigger),
             true,
+            mvcc_enabled,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
     /// an existing transaction and doesn't emit Transaction instructions.
+    ///
+    /// `mvcc_enabled` must match the parent program's `is_mvcc_enabled()`: the
+    /// subprogram runs inside the same transaction as its parent statement, so code
+    /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
+    /// or MVCC-unaware path the parent takes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
+        mvcc_enabled: bool,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            true,
+            mvcc_enabled,
+        )
     }
 
     #[turso_macros::trace_stack]
+    #[allow(clippy::too_many_arguments)]
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
+        mvcc_enabled: bool,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -715,14 +853,14 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            result_column_types: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
-            collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
-            mvcc_enabled: false,
+            mvcc_enabled,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -746,6 +884,7 @@ impl ProgramBuilder {
             views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
+            has_materialized_views: false,
         }
     }
 
@@ -860,6 +999,27 @@ impl ProgramBuilder {
         self.resolve_type = resolve_type;
     }
 
+    /// The resolve type a constraint Halt must carry for a constraint whose
+    /// effective conflict resolution is `effective`. A statement's own OR
+    /// clause is applied through the program's resolve_type, except in a
+    /// trigger: its program holds every trigger step, each with its own OR
+    /// clause, so each Halt carries its step's resolve type, as in SQLite.
+    /// A trigger fired with an ABORT override (by an UPSERT's DO UPDATE, or
+    /// by an explicit OR ABORT) carries ABORT too, or under DO UPDATE the
+    /// error would take the outer statement's OR clause.
+    pub fn constraint_halt_on_error(&self, effective: ResolveType) -> Option<ResolveType> {
+        if self.flags.has_statement_conflict() && self.trigger.is_none() {
+            return None;
+        }
+        match effective {
+            ResolveType::Fail | ResolveType::Rollback => Some(effective),
+            ResolveType::Abort if self.trigger_conflict_override == Some(ResolveType::Abort) => {
+                Some(effective)
+            }
+            _ => None,
+        }
+    }
+
     /// Set the trigger conflict override. When set, all triggers fired from this program
     /// should use this conflict resolution instead of their own OR clauses.
     pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
@@ -955,6 +1115,16 @@ impl ProgramBuilder {
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// Whether this program has already emitted a call to a trigger or FK action
+    /// subprogram (an `Insn::Program`). Used to tell whether a trigger or FK action fired
+    /// during the statement, which may have captured a CDC row even when this program's own
+    /// target table was not captured (e.g. a TEMP table).
+    pub fn has_emitted_program_call(&self) -> bool {
+        self.insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Program { .. }))
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
@@ -1364,6 +1534,7 @@ impl ProgramBuilder {
 
     fn emit_halt(&mut self, rollback: bool) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: 0,
             description: if rollback {
                 "rollback".to_string()
@@ -1381,6 +1552,7 @@ impl ProgramBuilder {
     #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code,
             description,
             on_error: None,
@@ -1962,22 +2134,6 @@ impl ProgramBuilder {
             .map(|(_, cursor_type)| cursor_type)
     }
 
-    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
-        self.collation = c
-    }
-
-    pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
-        self.collation
-    }
-
-    pub fn curr_collation(&self) -> Option<CollationSeq> {
-        self.collation.map(|c| c.0)
-    }
-
-    pub const fn reset_collation(&mut self) {
-        self.collation = None;
-    }
-
     #[inline]
     pub fn nested<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
         self.incr_nesting();
@@ -2082,6 +2238,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
+        self.has_materialized_views = schema.has_materialized_views();
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
@@ -2090,6 +2247,7 @@ impl ProgramBuilder {
                 "fk action"
             };
             self.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,
@@ -2169,7 +2327,11 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
+    pub fn cursor_loop<R>(
+        &mut self,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut ProgramBuilder, usize) -> R,
+    ) -> R {
         let loop_start = self.allocate_label();
         let loop_end = self.allocate_label();
 
@@ -2191,7 +2353,7 @@ impl ProgramBuilder {
             target_pc: loop_end,
         });
 
-        f(self, rowid);
+        let result = f(self, rowid);
 
         self.emit_insn(Insn::Next {
             cursor_id,
@@ -2200,6 +2362,7 @@ impl ProgramBuilder {
             is_index: false,
         });
         self.preassign_label_to_next_insn(loop_end);
+        result
     }
 
     pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
@@ -2227,7 +2390,9 @@ impl ProgramBuilder {
 
     /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
     /// cursor's record has a field at the given logical column index.
-    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    /// Also jumps on a NULL row (the unmatched side of a LEFT JOIN), so the
+    /// column stays NULL. Falls through if the record is short (ALTER TABLE
+    /// ADD COLUMN).
     pub fn emit_column_has_field(
         &mut self,
         cursor_id: CursorID,
@@ -2248,6 +2413,9 @@ impl ProgramBuilder {
 
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        if matches!(affinity, Affinity::Blob | Affinity::None) {
+            return;
+        }
         self.emit_insn(Insn::Affinity {
             start_reg: register,
             count: NonZeroUsize::MIN,
@@ -2318,6 +2486,14 @@ impl ProgramBuilder {
                 };
             }
 
+            if matches!(affinity, Affinity::Integer | Affinity::Numeric) {
+                if let Some(ValueRef::Numeric(integer)) =
+                    apply_integer_affinity(value.as_value_ref())
+                {
+                    value = Value::from(integer);
+                }
+            }
+
             Some(value)
         };
 
@@ -2339,6 +2515,7 @@ impl ProgramBuilder {
     pub fn build_prepared_program(
         mut self,
         prepare_context: PrepareContext,
+        custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<PreparedProgram> {
@@ -2366,6 +2543,8 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
+        self.explain.build_ephemeral_cursors(&self.insns);
+
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
@@ -2384,6 +2563,7 @@ impl ProgramBuilder {
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
+            result_column_types: self.result_column_types,
             table_references: self.table_references,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
@@ -2394,10 +2574,13 @@ impl ProgramBuilder {
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
+            is_multi_write: self.flags.is_multi_write(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
+            has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,
+            custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
         };
@@ -2412,7 +2595,12 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
-        let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
+        let prepared = self.build_prepared_program(
+            prepare_context,
+            connection.custom_collations(),
+            change_cnt_on,
+            sql,
+        )?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }

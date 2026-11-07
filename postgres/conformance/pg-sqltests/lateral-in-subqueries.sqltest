@@ -1,0 +1,493 @@
+@database :memory:
+
+# LATERAL subqueries inside scalar subqueries, EXISTS, IN, CTEs, views,
+# recursive CTEs and compound selects.
+# The statements run through the PostgreSQL frontend (tursopg).
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    CREATE TABLE t3(c INT, e TEXT);
+    INSERT INTO t1 VALUES (1, 'p'), (2, 'q'), (3, 'r'), (4, 's');
+    INSERT INTO t2 VALUES (1, 10, 'x'), (2, 20, 'y'), (2, 30, 'z'), (3, 40, 'w'), (5, 50, 'v');
+    INSERT INTO t3 VALUES (10, 'k'), (20, 'l'), (30, 'm'), (30, 'n'), (60, 'o');
+}
+
+@setup data
+test lateral-in-a-scalar-subquery-reads-its-own-left-table {
+    SELECT t1.a, (SELECT count(*) FROM t2, LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s WHERE t2.a = t1.a) FROM t1 ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|0
+    4|0
+}
+
+@setup data
+test lateral-in-a-scalar-subquery-reads-the-outer-query {
+    SELECT t1.a, (SELECT max(s.v) FROM t2, LATERAL (SELECT t2.c + t1.a AS v) AS s) FROM t1 ORDER BY 1;
+}
+expect {
+    1|51
+    2|52
+    3|53
+    4|54
+}
+
+@setup data
+test lateral-in-a-scalar-subquery-reads-only-the-outer-query {
+    SELECT t1.a, (SELECT s.v FROM LATERAL (SELECT t1.a * 7 AS v) AS s) FROM t1 ORDER BY 1;
+}
+expect {
+    1|7
+    2|14
+    3|21
+    4|28
+}
+
+@setup data
+test lateral-in-a-scalar-subquery-with-limit {
+    SELECT t1.a, (SELECT s.e FROM t2, LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s WHERE t2.a = t1.a ORDER BY s.e DESC LIMIT 1) FROM t1 ORDER BY 1;
+}
+expect {
+    1|k
+    2|n
+    3|
+    4|
+}
+
+@setup data
+test lateral-in-a-scalar-subquery-in-where {
+    SELECT t1.a FROM t1 WHERE (SELECT count(*) FROM t2, LATERAL (SELECT t2.c WHERE t2.a = t1.a) AS s) > 1 ORDER BY 1;
+}
+expect {
+    2
+}
+
+@setup data
+test lateral-in-a-scalar-subquery-in-order-by {
+    SELECT t1.a FROM t1 ORDER BY (SELECT sum(s.v) FROM t2, LATERAL (SELECT t2.c * t1.a AS v WHERE t2.a >= t1.a) AS s) DESC NULLS LAST, 1;
+}
+expect {
+    2
+    3
+    4
+    1
+}
+
+@setup data
+test lateral-in-exists {
+    SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2, LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s WHERE t2.a = t1.a) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+@setup data
+test lateral-in-not-exists {
+    SELECT t1.a FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2, LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s WHERE t2.a = t1.a) ORDER BY 1;
+}
+expect {
+    3
+    4
+}
+
+@setup data
+test lateral-in-exists-reads-the-outer-query-inside-lateral {
+    SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t3, LATERAL (SELECT 1 AS x WHERE t3.c = t1.a * 10) AS s) ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup data
+test lateral-in-an-in-subquery {
+    SELECT t1.a FROM t1 WHERE t1.a IN (SELECT s.v FROM t2, LATERAL (SELECT t2.a AS v WHERE t2.c > 15) AS s) ORDER BY 1;
+}
+expect {
+    2
+    3
+}
+
+@setup data
+test lateral-in-a-not-in-subquery {
+    SELECT t1.a FROM t1 WHERE t1.a NOT IN (SELECT s.v FROM t2, LATERAL (SELECT t2.a AS v WHERE t2.c > 15) AS s) ORDER BY 1;
+}
+expect {
+    1
+    4
+}
+
+@setup data
+test lateral-in-a-correlated-in-subquery {
+    SELECT t1.a FROM t1 WHERE 30 IN (SELECT s.c FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s) ORDER BY 1;
+}
+expect {
+    2
+}
+
+@setup data
+test lateral-in-a-cte {
+    WITH w AS (SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s)
+    SELECT a, c FROM w ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-in-a-cte-used-twice {
+    WITH w AS (SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s)
+    SELECT x.a, y.c FROM w AS x JOIN w AS y ON x.a = y.a AND x.c < y.c ORDER BY 1, 2;
+}
+expect {
+    2|30
+}
+
+@setup data
+test lateral-in-a-materialized-cte {
+    WITH w AS MATERIALIZED (SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s)
+    SELECT a, n FROM w WHERE n > 0 ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|1
+}
+
+@setup data
+test lateral-reads-a-cte-that-contains-a-lateral {
+    WITH w AS (SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s)
+    SELECT w.a, w.c, u.e FROM w, LATERAL (SELECT e FROM t3 WHERE t3.c = w.c) AS u ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test lateral-in-a-view {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT a, c FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-in-a-view-with-where-outside {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT a, c FROM v1 WHERE c > 15 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-in-a-view-with-left-join {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+    SELECT a, c FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test lateral-in-a-view-with-aggregate {
+    CREATE VIEW v1 AS SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s;
+    SELECT a, n FROM v1 ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|4
+    4|4
+}
+
+@setup data
+test lateral-reads-a-view-that-contains-a-lateral {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT v1.a, v1.c, u.e FROM v1, LATERAL (SELECT e FROM t3 WHERE t3.c = v1.c) AS u ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test view-with-lateral-joined-to-a-table {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT v1.a, t3.e FROM v1 JOIN t3 ON t3.c = v1.c ORDER BY 1, 2;
+}
+expect {
+    1|k
+    2|l
+    2|m
+    2|n
+}
+
+@setup data
+test view-with-lateral-read-in-a-scalar-subquery {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT t3.c, (SELECT count(*) FROM v1 WHERE v1.c = t3.c) FROM t3 ORDER BY 1, 2;
+}
+expect {
+    10|1
+    20|1
+    30|1
+    30|1
+    60|0
+}
+
+@setup data
+test view-of-a-view-with-lateral {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    CREATE VIEW v2 AS SELECT a, sum(c) AS total FROM v1 GROUP BY a;
+    SELECT a, total FROM v2 ORDER BY 1;
+}
+expect {
+    1|10
+    2|50
+    3|40
+}
+
+@setup data
+test lateral-in-the-recursive-part-of-a-cte {
+    WITH RECURSIVE r(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT s.y FROM r, LATERAL (SELECT r.x * 2 AS y) AS s WHERE r.x < 20
+    )
+    SELECT x FROM r ORDER BY 1;
+}
+expect {
+    1
+    2
+    4
+    8
+    16
+    32
+}
+
+@setup data
+test lateral-in-the-recursive-part-reads-a-table {
+    WITH RECURSIVE r(a, depth) AS (
+        SELECT 1, 0
+        UNION ALL
+        SELECT s.a, r.depth + 1 FROM r, LATERAL (SELECT t2.a FROM t2 WHERE t2.a = r.a + 1 ORDER BY t2.c LIMIT 1) AS s
+    )
+    SELECT a, depth FROM r ORDER BY 2;
+}
+expect {
+    1|0
+    2|1
+    3|2
+}
+
+@setup data
+test lateral-in-the-recursive-part-with-several-rows {
+    WITH RECURSIVE r(n, v) AS (
+        SELECT 0, 1
+        UNION ALL
+        SELECT r.n + 1, s.column1 FROM r, LATERAL (VALUES (r.v * 2), (r.v * 2 + 1)) AS s WHERE r.n < 2
+    )
+    SELECT n, v FROM r ORDER BY 1, 2;
+}
+expect {
+    0|1
+    1|2
+    1|3
+    2|4
+    2|5
+    2|6
+    2|7
+}
+
+@setup data
+test lateral-in-the-initial-part-of-a-recursive-cte {
+    WITH RECURSIVE r(a, v) AS (
+        SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.a * 10 AS v) AS s WHERE t1.a < 3
+        UNION ALL
+        SELECT a, v + 1 FROM r WHERE v < a * 10 + 2
+    )
+    SELECT a, v FROM r ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|11
+    1|12
+    2|20
+    2|21
+    2|22
+}
+
+@setup data
+test lateral-reads-a-recursive-cte-and-a-table {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+    SELECT r.n, s.d FROM r, LATERAL (SELECT d FROM t2 WHERE t2.a = r.n ORDER BY d LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|x
+    2|y
+    3|w
+}
+
+@setup data
+test lateral-in-the-first-arm-of-union-all {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s
+    UNION ALL
+    SELECT 0, c FROM t3
+    ORDER BY 1, 2;
+}
+expect {
+    0|10
+    0|20
+    0|30
+    0|30
+    0|60
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-in-the-second-arm-of-union {
+    SELECT 0, c FROM t3
+    UNION
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    0|10
+    0|20
+    0|30
+    0|60
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-in-an-arm-of-a-compound-in-a-from-subquery {
+    SELECT q.v FROM (SELECT s.v FROM t1, LATERAL (SELECT t1.a + 100 AS v) AS s UNION ALL SELECT c FROM t2) AS q ORDER BY 1;
+}
+expect {
+    10
+    20
+    30
+    40
+    50
+    101
+    102
+    103
+    104
+}
+
+@setup data
+test lateral-inside-a-lateral-in-a-scalar-subquery {
+    SELECT t1.a, (
+        SELECT sum(s.v) FROM t2, LATERAL (SELECT u.v FROM LATERAL (SELECT t2.c + t1.a AS v) AS u) AS s WHERE t2.a <= t1.a
+    ) FROM t1 ORDER BY 1;
+}
+expect {
+    1|11
+    2|66
+    3|112
+    4|116
+}
+
+@setup data
+test scalar-subquery-in-lateral-contains-a-lateral {
+    SELECT t1.a, s.v FROM t1, LATERAL (
+        SELECT (SELECT count(*) FROM t2, LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS u WHERE t2.a = t1.a) AS v
+    ) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|0
+    4|0
+}
+
+@setup data
+test exists-in-lateral-contains-a-lateral {
+    SELECT t1.a, s.v FROM t1, LATERAL (
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM t2, LATERAL (SELECT t2.c WHERE t2.a = t1.a) AS u) THEN 1 ELSE 0 END AS v
+    ) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|0
+}
+
+@setup data
+test lateral-in-select-list-subquery-of-a-lateral {
+    SELECT t1.a, s.c, s.n FROM t1, LATERAL (
+        SELECT c, (SELECT count(*) FROM t3, LATERAL (SELECT t3.e WHERE t3.c = t2.c) AS u) AS n FROM t2 WHERE t2.a = t1.a
+    ) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10|1
+    2|20|1
+    2|30|2
+    3|40|0
+}
+
+@setup data
+test lateral-in-a-subquery-of-the-on-clause {
+    SELECT t1.a, t2.c FROM t1 JOIN t2 ON t2.c IN (SELECT s.v FROM LATERAL (SELECT t1.a * 10 AS v UNION ALL SELECT t1.a * 10 + 10) AS s) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|20
+    2|20
+    2|30
+    3|30
+    3|40
+    4|40
+    4|50
+}
+
+@setup data
+test lateral-without-outer-reference-in-a-subquery-of-having {
+    SELECT t2.a, count(*) FROM t2 GROUP BY t2.a HAVING t2.a = (SELECT s.v FROM LATERAL (SELECT 3 AS v) AS s) ORDER BY 1;
+}
+expect {
+    3|1
+}
+
+@setup data
+test lateral-in-a-subquery-of-the-select-list-of-a-grouped-query {
+    SELECT t2.a, (SELECT s.v FROM LATERAL (SELECT t2.a - 1 AS v) AS s) FROM t2 GROUP BY t2.a ORDER BY 1;
+}
+expect {
+    1|0
+    2|1
+    3|2
+    5|4
+}

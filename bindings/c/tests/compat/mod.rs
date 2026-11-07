@@ -52,6 +52,8 @@ extern "C" {
         arg: *mut libc::c_void,
         errmsg: *mut *mut libc::c_char,
     ) -> i32;
+    fn sqlite3_errcode(db: *mut sqlite3) -> i32;
+    fn sqlite3_errmsg(db: *mut sqlite3) -> *const libc::c_char;
     fn sqlite3_free(ptr: *mut libc::c_void);
     fn sqlite3_prepare_v2(
         db: *mut sqlite3,
@@ -655,9 +657,11 @@ mod tests {
             let name2_str = std::ffi::CStr::from_ptr(name2).to_str().unwrap();
             assert_eq!(name2_str, "value");
 
-            // will lead to panic
-            //let invalid = sqlite3_column_name(stmt, 5);
-            //assert!(invalid.is_null());
+            for invalid_idx in [-1, 2, 5, i32::MIN, i32::MAX] {
+                assert!(sqlite3_column_name(stmt, invalid_idx).is_null());
+                assert!(sqlite3_column_table_name(stmt, invalid_idx).is_null());
+                assert!(sqlite3_column_decltype(stmt, invalid_idx).is_null());
+            }
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -812,7 +816,7 @@ mod tests {
             let col2_len = sqlite3_column_bytes(stmt, 0);
             assert!(!col2_ptr.is_null());
 
-            let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
+            let col2_slice = std::slice::from_raw_parts(col2_ptr.cast::<u8>(), col2_len as usize);
             let col2_str = std::str::from_utf8(col2_slice).unwrap().to_owned();
 
             assert_eq!(col2_str, "abc");
@@ -910,6 +914,76 @@ mod tests {
             let col2_len = sqlite3_column_bytes(stmt, 0);
             let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
             assert_eq!(col2_slice, &data2[..2]);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn test_sqlite3_bind_blob_negative_len_is_misuse() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_bind_blob_nlen (data BLOB)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO test_bind_blob_nlen (data) VALUES (?)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let data = b"abc\0def";
+            // A NULL value ignores n. A pointer with n < 0 is SQLITE_MISUSE.
+            assert_eq!(sqlite3_bind_blob(stmt, 1, ptr::null(), -1, None), SQLITE_OK);
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, -1, None),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, 3, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT data FROM test_bind_blob_nlen".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let col = sqlite3_column_blob(stmt, 0);
+            let n = sqlite3_column_bytes(stmt, 0);
+            let got = std::slice::from_raw_parts(col as *const u8, n as usize);
+            assert_eq!(got, b"abc");
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -1338,6 +1412,11 @@ mod tests {
 
             assert_eq!(rc, SQLITE_ABORT);
             assert_eq!(count, 1); // Only processed one row before aborting
+            assert_eq!(sqlite3_errcode(db), SQLITE_ABORT);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                c"query aborted"
+            );
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
@@ -1366,6 +1445,13 @@ mod tests {
             );
 
             assert_eq!(rc, SQLITE_ERROR);
+            assert_eq!(sqlite3_errcode(db), SQLITE_ERROR);
+            assert!(!err_msg.is_null());
+            assert_eq!(
+                std::ffi::CStr::from_ptr(err_msg),
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+            );
+            sqlite3_free(err_msg as *mut std::ffi::c_void);
 
             // Verify third statement didn't execute
             let mut stmt = ptr::null_mut();
@@ -1381,9 +1467,22 @@ mod tests {
             assert_eq!(sqlite3_step(stmt), SQLITE_DONE); // No rows = table doesn't exist
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
 
-            if !err_msg.is_null() {
-                sqlite3_free(err_msg as *mut std::ffi::c_void);
-            }
+            // A successful exec clears the error left by the failed one.
+            let mut err_msg = ptr::null_mut();
+            let rc = sqlite3_exec(
+                db,
+                c"INSERT INTO test VALUES(1)".as_ptr(),
+                None,
+                ptr::null_mut(),
+                &mut err_msg,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert!(err_msg.is_null());
+            assert_eq!(sqlite3_errcode(db), SQLITE_OK);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                c"not an error"
+            );
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
@@ -1462,6 +1561,39 @@ mod tests {
             );
             assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
             assert_eq!(sqlite3_column_int(stmt, 0), 2);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Semicolons in comments and in a trigger body do not end a statement.
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE source(value); CREATE TABLE log(value);\
+                  -- comment with ; semicolon\n\
+                  CREATE TRIGGER source_log AFTER INSERT ON source BEGIN\
+                  \x20INSERT INTO log VALUES (new.value); INSERT INTO log VALUES (new.value + 1); END;\
+                  /* block ; comment */ INSERT INTO source VALUES (42); /* ; */"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT group_concat(value) FROM log".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0) as *const libc::c_char),
+                c"42,43"
+            );
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
@@ -2788,6 +2920,8 @@ mod tests {
             );
 
             assert_eq!(sqlite3_step(stmt), SQLITE_INTERRUPT);
+            assert_eq!(sqlite3_errcode(db), SQLITE_INTERRUPT);
+            assert_eq!(std::ffi::CStr::from_ptr(sqlite3_errmsg(db)), c"interrupted");
             assert!(
                 ctx.calls.load(std::sync::atomic::Ordering::SeqCst) >= ctx.interrupt_after,
                 "progress handler did not fire enough times"
@@ -2950,6 +3084,35 @@ mod tests {
             assert_eq!(r1v1.to_str().unwrap(), "bob");
 
             sqlite3_free_table(result);
+
+            // Rows with different column counts make the row callback fail;
+            // sqlite3_get_table reports the callback's SQLITE_ERROR, not SQLITE_ABORT.
+            assert_eq!(
+                sqlite3_get_table(
+                    db,
+                    c"SELECT 1; SELECT 1, 2".as_ptr(),
+                    &mut result,
+                    &mut n_row,
+                    &mut n_col,
+                    &mut err_msg,
+                ),
+                SQLITE_ERROR
+            );
+            assert!(result.is_null());
+            assert_eq!(n_row, 0);
+            assert_eq!(n_col, 0);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(err_msg).to_str().unwrap(),
+                "sqlite3_get_table() called with two or more incompatible queries"
+            );
+            sqlite3_free(err_msg as *mut _);
+            assert_eq!(sqlite3_errcode(db), SQLITE_ERROR);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                    .to_str()
+                    .unwrap(),
+                "SQL logic error"
+            );
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }

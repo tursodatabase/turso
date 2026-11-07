@@ -8,10 +8,10 @@
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use turso_core::{
-    CheckpointMode, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
+    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
     SharedWalCoordinationOpenTelemetryMode, SharedWalTestingSnapshot, StepResult, Value,
 };
 
@@ -72,7 +72,7 @@ pub fn run_worker(
     }
 
     let connections = (0..connections_per_process)
-        .map(|_| db.connect())
+        .map(|_| db.connect(ConnectOpts::new()))
         .collect::<turso_core::Result<Vec<_>>>()?;
 
     if enable_mvcc {

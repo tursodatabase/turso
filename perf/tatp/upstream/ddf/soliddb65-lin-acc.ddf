@@ -1,0 +1,19 @@
+//tatp_ddf
+// DDF file for Accelerator builds (note DSN=localserver)
+// The folling values have to exist in TIRDB
+db_name = "solidDB" 
+db_version = "6.5.6" 
+os_name = "Linux" 
+os_version = "SLES10"
+hardware_id = "sut2_Xeon5570"  
+// --- end TIRDB ------------------------
+db_connect = "DSN=localserver;UID=dba;PWD=dba"
+configuration_file = "solid.ini"
+configuration_code = "acc-mme-relaxed"
+configuration_comments = "solidDB, accelerator, relaxed logging, default checkpoint"
+// ==== Target database initialization file 
+//TargetDBInit = "targetDBInit.sql"
+// ==== Target database schema file 
+TargetDBSchema = "targetDBSchema.sql"
+// target database transaction file
+transaction_file = "tr_mix_solid.sql"

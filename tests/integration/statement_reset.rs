@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
@@ -8,7 +8,7 @@ use asserting::prelude::*;
 use rusqlite::StatementStatus;
 use turso_core::vdbe::StepResult;
 use turso_core::StatementStatusCounter;
-use turso_core::{Database, LimboError};
+use turso_core::{ConnectOpts, Database, LimboError};
 
 /// Helper: step a statement through IO until it returns Row or Done.
 fn step_blocking(stmt: &mut turso_core::Statement) -> turso_core::Result<StepResult> {
@@ -377,7 +377,7 @@ fn dropping_explicit_commit_waiting_on_io_rolls_back_transaction() -> anyhow::Re
         "queued-explicit-commit-drop.db",
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
 
     conn.execute("CREATE TABLE t(x INTEGER)")?;
     conn.execute("BEGIN")?;

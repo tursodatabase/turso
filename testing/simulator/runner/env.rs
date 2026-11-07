@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_core::ConnectOpts;
+use turso_sqlite::SqliteDialect;
 
 use bitmaps::Bitmap;
 use garde::Validate;
@@ -13,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::model::query::Insert;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
@@ -37,15 +39,13 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
             io.clone(),
             aux_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_attach(true)
-                .with_generated_columns(true),
+            turso_core::DatabaseOpts::new().with_attach(true),
             None,
             Arc::new(SqliteDialect),
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
-            .connect()
+            .connect(ConnectOpts::new())
             .expect("Failed to connect to aux DB for MVCC setup");
         aux_conn
             .execute("PRAGMA journal_mode = 'mvcc'")
@@ -126,6 +126,18 @@ pub enum TxOperation {
         old_name: String,
         new_column: sql_generation::model::table::Column,
     },
+    CreateSequence {
+        sequence: ShadowSequence,
+    },
+    DropSequence {
+        name: String,
+    },
+    /// `nextval` or `setval` left the sequence at this value.
+    SetSequenceValue {
+        name: String,
+        current_value: i64,
+        is_called: bool,
+    },
 }
 
 /// Database snapshot
@@ -133,10 +145,17 @@ pub enum TxOperation {
 pub struct Snapshot {
     /// The current state after applying transaction's changes (used for reads within the transaction)
     current_tables: Vec<Table>,
+    /// The sequences as this transaction sees them, including its own changes
+    current_sequences: Vec<ShadowSequence>,
     /// Operations recorded during this transaction, in order
     operations: Vec<TxOperation>,
     /// Named savepoint snapshots in this transaction.
     savepoints: Vec<ShadowSavepoint>,
+    /// Attached databases that statements in this transaction have used. Like SQLite, the
+    /// engine starts the transaction on an attached database when a statement first uses it,
+    /// so that database's tables are copied from the committed tables then, not when the
+    /// snapshot is created.
+    started_attached_dbs: HashSet<String>,
 
     transaction_mode: TransactionMode,
 }
@@ -152,6 +171,7 @@ impl Snapshot {
 pub struct ShadowSavepoint {
     name: String,
     current_tables: Vec<Table>,
+    current_sequences: Vec<ShadowSequence>,
     operation_len: usize,
     starts_transaction: bool,
 }
@@ -318,13 +338,14 @@ impl TransactionTables {
 pub struct ShadowTables<'a> {
     commited_tables: &'a Vec<Table>,
     transaction_tables: Option<&'a TransactionTables>,
+    commited_sequences: &'a Vec<ShadowSequence>,
 }
 
 #[derive(Debug)]
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
     transaction_tables: &'a mut Option<TransactionTables>,
-    sequences: &'a mut Vec<ShadowSequence>,
+    commited_sequences: &'a mut Vec<ShadowSequence>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -332,6 +353,12 @@ impl<'a> ShadowTables<'a> {
         self.transaction_tables
             .and_then(|v| v.as_snaphot_opt())
             .map_or(self.commited_tables, |v| &v.current_tables)
+    }
+
+    fn sequences(&self) -> &'a Vec<ShadowSequence> {
+        self.transaction_tables
+            .and_then(|v| v.as_snaphot_opt())
+            .map_or(self.commited_sequences, |v| &v.current_sequences)
     }
 }
 
@@ -462,7 +489,30 @@ where
         }
     }
 
-    /// Create a new sequence. Sequences are global and transaction-independent.
+    fn sequences(&self) -> &Vec<ShadowSequence> {
+        self.transaction_tables
+            .as_ref()
+            .map_or(self.commited_sequences, |v| {
+                &v.expect_snaphot().current_sequences
+            })
+    }
+
+    fn sequences_mut(&mut self) -> &mut Vec<ShadowSequence> {
+        self.transaction_tables
+            .as_mut()
+            .map_or(self.commited_sequences, |v| {
+                &mut v.expect_snapshot_mut().current_sequences
+            })
+    }
+
+    /// Record a sequence change made during the current transaction
+    fn record_sequence_operation(&mut self, operation: TxOperation) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.expect_snapshot_mut().operations.push(operation);
+        }
+    }
+
+    /// Create a new sequence.
     pub fn create_sequence(
         &mut self,
         name: String,
@@ -478,10 +528,10 @@ where
         // duplicate as a no-op rather than an error. Match that here:
         // a second create on the same name is a no-op (params from
         // the original creation stay authoritative).
-        if self.sequences.iter().any(|s| s.name == name) {
+        if self.sequences().iter().any(|s| s.name == name) {
             return Ok(vec![]);
         }
-        self.sequences.push(ShadowSequence {
+        let sequence = ShadowSequence {
             name,
             current_value: start,
             increment_by: increment,
@@ -489,25 +539,32 @@ where
             max_value,
             is_called: false,
             cycle,
+        };
+        self.record_sequence_operation(TxOperation::CreateSequence {
+            sequence: sequence.clone(),
         });
+        self.sequences_mut().push(sequence);
         Ok(vec![])
     }
 
     /// Drop a sequence.
     pub fn drop_sequence(&mut self, name: &str) -> anyhow::Result<Vec<Vec<SimValue>>> {
         let pos = self
-            .sequences
+            .sequences()
             .iter()
             .position(|s| s.name == name)
             .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
-        self.sequences.remove(pos);
+        self.record_sequence_operation(TxOperation::DropSequence {
+            name: name.to_string(),
+        });
+        self.sequences_mut().remove(pos);
         Ok(vec![])
     }
 
     /// Advance a sequence and return its next value. Mirrors core/schema.rs Sequence::nextval.
     pub fn nextval(&mut self, name: &str) -> anyhow::Result<i64> {
         let seq = self
-            .sequences
+            .sequences_mut()
             .iter_mut()
             .find(|s| s.name == name)
             .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
@@ -544,13 +601,18 @@ where
             }
         };
 
+        self.record_sequence_operation(TxOperation::SetSequenceValue {
+            name: name.to_string(),
+            current_value: value,
+            is_called: true,
+        });
         Ok(value)
     }
 
     /// Set a sequence's current value.
     pub fn setval(&mut self, name: &str, value: i64, is_called: bool) -> anyhow::Result<i64> {
         let seq = self
-            .sequences
+            .sequences_mut()
             .iter_mut()
             .find(|s| s.name == name)
             .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
@@ -567,6 +629,11 @@ where
 
         seq.current_value = value;
         seq.is_called = is_called;
+        self.record_sequence_operation(TxOperation::SetSequenceValue {
+            name: name.to_string(),
+            current_value: value,
+            is_called,
+        });
         Ok(value)
     }
 
@@ -589,6 +656,7 @@ where
         snapshot.savepoints.push(ShadowSavepoint {
             name,
             current_tables: snapshot.current_tables.clone(),
+            current_sequences: snapshot.current_sequences.clone(),
             operation_len: snapshot.operations.len(),
             starts_transaction,
         });
@@ -606,6 +674,7 @@ where
         };
         let savepoint = snapshot.savepoints[savepoint_idx].clone();
         snapshot.current_tables = savepoint.current_tables;
+        snapshot.current_sequences = savepoint.current_sequences;
         snapshot.operations.truncate(savepoint.operation_len);
         // ROLLBACK TO keeps the target savepoint active and discards nested ones.
         snapshot.savepoints.truncate(savepoint_idx + 1);
@@ -667,6 +736,53 @@ where
                 }
             }
         }
+        self.start_attached_dbs(query);
+    }
+
+    /// Copies the committed tables of each attached database that `query` uses for the first
+    /// time in the current transaction. The transaction has not changed those tables yet, so
+    /// the savepoints get the same copy. After BEGIN IMMEDIATE no other connection can commit,
+    /// so the copy matches what the snapshot already has.
+    fn start_attached_dbs(&mut self, query: &Query) {
+        let Some(snapshot) = self
+            .transaction_tables
+            .as_mut()
+            .and_then(TransactionTables::as_snapshot_mut_opt)
+        else {
+            return;
+        };
+        let mut used_tables = query.uses();
+        if let Query::Insert(Insert::Select { select, .. }) = query {
+            used_tables.extend(select.dependencies());
+        }
+        for table_name in used_tables {
+            let Some((database, _)) = table_name.split_once('.') else {
+                continue;
+            };
+            if !snapshot.started_attached_dbs.insert(database.to_string()) {
+                continue;
+            }
+            let in_database = |table: &Table| {
+                table
+                    .name
+                    .split_once('.')
+                    .is_some_and(|(db, _)| db == database)
+            };
+            let committed: Vec<Table> = self
+                .commited_tables
+                .iter()
+                .filter(|table| in_database(table))
+                .cloned()
+                .collect();
+            let savepoint_tables = snapshot
+                .savepoints
+                .iter_mut()
+                .map(|savepoint| &mut savepoint.current_tables);
+            for tables in std::iter::once(&mut snapshot.current_tables).chain(savepoint_tables) {
+                tables.retain(|table| !in_database(table));
+                tables.extend(committed.iter().cloned());
+            }
+        }
     }
 
     #[inline]
@@ -678,8 +794,10 @@ where
     pub fn create_snapshot(&mut self, transaction_mode: TransactionMode) {
         *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
             current_tables: self.commited_tables.clone(),
+            current_sequences: self.commited_sequences.clone(),
             operations: Vec::new(),
             savepoints: Vec::new(),
+            started_attached_dbs: HashSet::new(),
             transaction_mode,
         }));
     }
@@ -908,6 +1026,25 @@ where
                             }
                         }
                     }
+                    TxOperation::CreateSequence { sequence } => {
+                        self.commited_sequences.push(sequence.clone());
+                    }
+                    TxOperation::DropSequence { name } => {
+                        self.commited_sequences.retain(|s| &s.name != name);
+                    }
+                    TxOperation::SetSequenceValue {
+                        name,
+                        current_value,
+                        is_called,
+                    } => {
+                        let committed = self
+                            .commited_sequences
+                            .iter_mut()
+                            .find(|s| &s.name == name)
+                            .expect("Sequence should exist in committed sequences");
+                        committed.current_value = *current_value;
+                        committed.is_called = *is_called;
+                    }
                 }
             }
         }
@@ -935,16 +1072,48 @@ impl<'a> DerefMut for ShadowTablesMut<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sql_generation::model::query::transaction::{Begin, Commit};
 
     fn shadow_tables_mut<'a>(
         commited_tables: &'a mut Vec<Table>,
         transaction_tables: &'a mut Option<TransactionTables>,
-        sequences: &'a mut Vec<ShadowSequence>,
+        commited_sequences: &'a mut Vec<ShadowSequence>,
     ) -> ShadowTablesMut<'a> {
         ShadowTablesMut {
             commited_tables,
             transaction_tables,
-            sequences,
+            commited_sequences,
+        }
+    }
+
+    #[test]
+    fn mvcc_generation_requires_explicit_rowids() {
+        use clap::Parser;
+        for mvcc in [false, true] {
+            let output = tempfile::tempdir().unwrap();
+            let args = SimulatorCLI::parse_from([
+                "limbo_sim",
+                "--io-backend",
+                "memory",
+                "--mvcc",
+                if mvcc { "true" } else { "false" },
+            ]);
+            let env = SimulatorEnv::new(
+                1,
+                &args,
+                Paths::new(output.path()),
+                SimulationType::Default,
+                &Profile::default(),
+            );
+            assert_eq!(
+                env.profile
+                    .query
+                    .gen_opts
+                    .query
+                    .insert
+                    .allow_implicit_rowids,
+                !mvcc
+            );
         }
     }
 
@@ -1153,10 +1322,256 @@ mod tests {
             .expect_snaphot();
         assert!(snapshot.savepoints.is_empty());
     }
+
+    #[test]
+    fn deferred_transaction_reads_attached_database_when_first_used() {
+        use sql_generation::model::query::Select;
+        use sql_generation::model::query::predicate::Predicate;
+        use sql_generation::model::table::{Column, ColumnType};
+
+        let int_row = |v: i64| vec![SimValue(turso_core::Value::from_i64(v))];
+        let table = |name: &str, rows: Vec<Vec<SimValue>>| Table {
+            name: name.to_string(),
+            columns: vec![Column {
+                name: "x".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows,
+            indexes: vec![],
+        };
+        let select_aux = || Query::Select(Select::simple("aux0.u".to_string(), Predicate::true_()));
+
+        let mut commited_tables = vec![table("t", vec![]), table("aux0.u", vec![int_row(1)])];
+        let mut transaction_tables = Some(TransactionTables::Deferred);
+        let mut sequences = Vec::new();
+
+        // BEGIN; SAVEPOINT sp; INSERT INTO t VALUES (1);
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        tables.savepoint("sp".to_string());
+        Query::Insert(Insert::Values {
+            table: "t".to_string(),
+            values: vec![int_row(1)],
+            on_conflict: None,
+        })
+        .shadow(&mut tables)
+        .unwrap();
+
+        // Another connection commits a row into aux0.u.
+        commited_tables[1].rows.push(int_row(2));
+
+        // The transaction has not used aux0 yet, so it sees that row.
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        assert_eq!(select_aux().shadow(&mut tables).unwrap().len(), 2);
+        tables.rollback_to_savepoint("sp").unwrap();
+        assert_eq!(select_aux().shadow(&mut tables).unwrap().len(), 2);
+
+        // Now that aux0 is in use, later commits there are not visible.
+        commited_tables[1].rows.push(int_row(3));
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        assert_eq!(select_aux().shadow(&mut tables).unwrap().len(), 2);
+    }
+
+    fn create_sequence_query(name: &str, start: i64, min_value: i64, max_value: i64) -> Query {
+        Query::CreateSequence(crate::model::CreateSequence {
+            name: name.to_string(),
+            start,
+            increment: if start > 0 { 1 } else { -1 },
+            min_value,
+            max_value,
+            cycle: false,
+        })
+    }
+
+    fn sequence_state(sequences: &[ShadowSequence]) -> Vec<(String, i64, i64, i64, bool)> {
+        sequences
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.min_value,
+                    s.max_value,
+                    s.current_value,
+                    s.is_called,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rollback_undoes_sequence_changes() {
+        use crate::model::{DropSequence, Nextval, Setval};
+
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+        let mut commited_sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut commited_sequences,
+        );
+        create_sequence_query("s", 1, 1, i64::MAX)
+            .shadow(&mut tables)
+            .unwrap();
+        let committed = sequence_state(tables.sequences());
+
+        // BEGIN; DROP SEQUENCE s; ROLLBACK;
+        Query::Begin(Begin::Deferred).shadow(&mut tables).unwrap();
+        Query::DropSequence(DropSequence {
+            name: "s".to_string(),
+        })
+        .shadow(&mut tables)
+        .unwrap();
+        assert!(tables.sequences().is_empty());
+        Query::Rollback(Rollback).shadow(&mut tables).unwrap();
+        assert_eq!(sequence_state(tables.sequences()), committed);
+
+        // s still exists, so this CREATE SEQUENCE IF NOT EXISTS does nothing and
+        // a value outside the range of s is refused.
+        create_sequence_query("s", -1, i64::MIN + 1, -1)
+            .shadow(&mut tables)
+            .unwrap();
+        assert_eq!(sequence_state(tables.sequences()), committed);
+        assert!(
+            Query::Setval(Setval {
+                name: "s".to_string(),
+                value: -5,
+                is_called: true,
+            })
+            .shadow(&mut tables)
+            .is_err()
+        );
+
+        // BEGIN; CREATE SEQUENCE t; nextval('s'); setval('s', 7); ROLLBACK;
+        Query::Begin(Begin::Deferred).shadow(&mut tables).unwrap();
+        create_sequence_query("t", 1, 1, 10)
+            .shadow(&mut tables)
+            .unwrap();
+        Query::Nextval(Nextval {
+            name: "s".to_string(),
+        })
+        .shadow(&mut tables)
+        .unwrap();
+        Query::Setval(Setval {
+            name: "s".to_string(),
+            value: 7,
+            is_called: true,
+        })
+        .shadow(&mut tables)
+        .unwrap();
+        Query::Rollback(Rollback).shadow(&mut tables).unwrap();
+        assert_eq!(sequence_state(tables.sequences()), committed);
+    }
+
+    #[test]
+    fn rollback_to_savepoint_undoes_sequence_changes() {
+        use crate::model::{DropSequence, Nextval};
+
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+        let mut commited_sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut commited_sequences,
+        );
+        Query::Begin(Begin::Immediate).shadow(&mut tables).unwrap();
+        create_sequence_query("s", 1, 1, i64::MAX)
+            .shadow(&mut tables)
+            .unwrap();
+        tables.savepoint("sp".to_string());
+        let at_savepoint = sequence_state(tables.sequences());
+
+        Query::Nextval(Nextval {
+            name: "s".to_string(),
+        })
+        .shadow(&mut tables)
+        .unwrap();
+        Query::DropSequence(DropSequence {
+            name: "s".to_string(),
+        })
+        .shadow(&mut tables)
+        .unwrap();
+        create_sequence_query("t", 1, 1, 10)
+            .shadow(&mut tables)
+            .unwrap();
+        tables.rollback_to_savepoint("sp").unwrap();
+        assert_eq!(sequence_state(tables.sequences()), at_savepoint);
+
+        // COMMIT keeps the CREATE SEQUENCE made before the savepoint.
+        Query::Commit(Commit).shadow(&mut tables).unwrap();
+        assert_eq!(sequence_state(&commited_sequences), at_savepoint);
+    }
+
+    #[test]
+    fn commit_applies_sequence_changes() {
+        use crate::model::{DropSequence, Nextval};
+
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+        let mut commited_sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut commited_sequences,
+        );
+        create_sequence_query("dropped", 1, 1, 10)
+            .shadow(&mut tables)
+            .unwrap();
+
+        // BEGIN; CREATE SEQUENCE s; nextval('s') twice; DROP SEQUENCE dropped;
+        Query::Begin(Begin::Deferred).shadow(&mut tables).unwrap();
+        create_sequence_query("s", 1, 1, i64::MAX)
+            .shadow(&mut tables)
+            .unwrap();
+        for _ in 0..2 {
+            Query::Nextval(Nextval {
+                name: "s".to_string(),
+            })
+            .shadow(&mut tables)
+            .unwrap();
+        }
+        Query::DropSequence(DropSequence {
+            name: "dropped".to_string(),
+        })
+        .shadow(&mut tables)
+        .unwrap();
+        let in_transaction = sequence_state(tables.sequences());
+
+        // Other connections do not see the changes before COMMIT.
+        assert_eq!(
+            sequence_state(&commited_sequences),
+            vec![("dropped".to_string(), 1, 10, 1, false)]
+        );
+
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut commited_sequences,
+        );
+        Query::Commit(Commit).shadow(&mut tables).unwrap();
+        assert_eq!(
+            in_transaction,
+            vec![("s".to_string(), 1, i64::MAX, 2, true)]
+        );
+        assert_eq!(sequence_state(&commited_sequences), in_transaction);
+    }
 }
 
-/// Shadow model for a sequence. Sequences are global (not per-connection) and their
-/// advances are never rolled back, matching PostgreSQL semantics.
+/// Shadow model for a sequence. Like the engine, which stores each sequence in a
+/// backing table, a rollback undoes CREATE SEQUENCE, DROP SEQUENCE, nextval and setval.
 #[derive(Debug, Clone)]
 pub struct ShadowSequence {
     pub name: String,
@@ -1194,8 +1609,8 @@ pub(crate) struct SimulatorEnv {
     pub committed_tables: Vec<Table>,
     /// Names of attached databases (e.g. ["aux0", "aux1", "aux2"])
     pub(crate) attached_dbs: Vec<String>,
-    /// Sequences are global objects, not affected by transactions/savepoints
-    pub sequences: Vec<ShadowSequence>,
+    /// Sequences that are committed into the database or wal
+    pub committed_sequences: Vec<ShadowSequence>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -1221,7 +1636,7 @@ impl SimulatorEnv {
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
-            sequences: self.sequences.clone(),
+            committed_sequences: self.committed_sequences.clone(),
         }
     }
 
@@ -1294,8 +1709,7 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+                .with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1309,7 +1723,7 @@ impl SimulatorEnv {
         // Re-enable MVCC mode if the profile says to use MVCC
         if self.profile.mvcc {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1352,7 +1766,8 @@ impl SimulatorEnv {
         env
     }
 
-    pub fn sequence_info(&self) -> Vec<(String, i64, i64)> {
+    /// Name, MINVALUE and MAXVALUE of each sequence that connection `conn_index` sees.
+    pub fn sequence_info(&self, conn_index: usize) -> Vec<(String, i64, i64)> {
         // Filter out sequences reserved by the SequenceMonotonicity
         // property — that property's assertion expects a fresh seq
         // returning `start` on the first nextval. If the regular
@@ -1360,7 +1775,8 @@ impl SimulatorEnv {
         // drop on it between the property's CREATE SEQUENCE and its
         // first nextval, the assertion observes engine state already
         // moved by another connection and bails.
-        self.sequences
+        self.get_conn_tables(conn_index)
+            .sequences()
             .iter()
             .filter(|s| !s.name.starts_with("seq_mono_"))
             .map(|s| (s.name.clone(), s.min_value, s.max_value))
@@ -1411,6 +1827,7 @@ impl SimulatorEnv {
             disable_where_true_false_null: cli_opts.disable_where_true_false_null,
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
+            disable_lateral_matches_json_each: cli_opts.disable_lateral_matches_json_each,
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
@@ -1461,6 +1878,9 @@ impl SimulatorEnv {
         if let Some(mvcc) = cli_opts.mvcc {
             profile.mvcc = mvcc;
         }
+        if profile.mvcc {
+            profile.query.gen_opts.query.insert.allow_implicit_rowids = false;
+        }
         if let Some(latency_prob) = cli_opts.latency_probability {
             profile.io.latency.latency_probability = latency_prob;
         }
@@ -1488,6 +1908,9 @@ impl SimulatorEnv {
             profile.query.drop_sequence_weight = 0;
             profile.query.nextval_weight = 0;
             profile.query.setval_weight = 0;
+
+            // SQLite does not have LATERAL joins, so we can't use this property.
+            opts.disable_lateral_matches_json_each = true;
         }
 
         profile.validate().unwrap();
@@ -1522,8 +1945,7 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+                .with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1536,7 +1958,7 @@ impl SimulatorEnv {
         // Switch to MVCC mode if the profile says to use MVCC
         if profile.mvcc {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1569,7 +1991,7 @@ impl SimulatorEnv {
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
             attached_dbs,
-            sequences: Vec::new(),
+            committed_sequences: Vec::new(),
         }
     }
 
@@ -1589,7 +2011,7 @@ impl SimulatorEnv {
                     .db
                     .as_ref()
                     .expect("db to be Some")
-                    .connect()
+                    .connect(ConnectOpts::new())
                     .expect("Failed to connect to Limbo database");
                 if self.opts.cache_size != DEFAULT_CACHE_SIZE {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
@@ -1630,7 +2052,7 @@ impl SimulatorEnv {
         self.committed_tables.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
-        self.sequences.clear();
+        self.committed_sequences.clear();
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1703,6 +2125,7 @@ impl SimulatorEnv {
         ShadowTables {
             transaction_tables: self.connection_tables.get(conn_index).unwrap().as_ref(),
             commited_tables: &self.committed_tables,
+            commited_sequences: &self.committed_sequences,
         }
     }
 
@@ -1710,7 +2133,7 @@ impl SimulatorEnv {
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
-            sequences: &mut self.sequences,
+            commited_sequences: &mut self.committed_sequences,
         }
     }
 }
@@ -1773,6 +2196,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_drop_select: bool,
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
+    pub(crate) disable_lateral_matches_json_each: bool,
     pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,

@@ -4,7 +4,8 @@
 //! must not accumulate per-database state in process-global structures.
 
 use std::sync::{Arc, Weak};
-use turso_core::{Database, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Database, OpenFlags, StepResult};
+use turso_sqlite::SqliteDialect;
 
 /// Run a small MVCC workload on a fresh database at `path`, then drop all
 /// handles and return weak references to the `Database` and its `MvStore`.
@@ -18,11 +19,11 @@ fn open_run_drop_mvcc(
         OpenFlags::Create,
         turso_core::DatabaseOpts::new(),
         None,
-        Arc::new(turso_core::SqliteDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
 
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")

@@ -1,0 +1,27 @@
+# Copyright 2025 the Limbo authors. All rights reserved. MIT license.
+
+[package]
+name = "tatp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TATP benchmark for Turso and SQLite"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tatp"
+path = "main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+libc = "0.2.172"
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+turso = { workspace = true }

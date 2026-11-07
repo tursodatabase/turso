@@ -450,3 +450,62 @@ WHERE build_side.name = 'keep' ORDER BY probe_side.v";
     ];
     assert_eq!(rows, expected);
 }
+
+#[test]
+// SQLite stores a whole-number REAL as an integer on disk and turns it back
+// into a REAL when it reads the column, so the hash build must do the same for
+// the payload columns it reads from the build table.
+fn hash_join_payload_reads_sqlite_stored_real_as_real() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    for strict in ["", " STRICT"] {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let db_path = tmp_dir.path().join("test.db");
+        rusqlite::Connection::open(&db_path)?.execute_batch(&format!(
+            "CREATE TABLE r(a REAL, b INT){strict};
+             INSERT INTO r VALUES(3.0, 1);
+             CREATE TABLE u(y INT);
+             INSERT INTO u VALUES(1);
+             CREATE TABLE x(v);"
+        ))?;
+
+        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let conn = tmp_db.connect_limbo();
+
+        let join = "SELECT r.a, typeof(r.a), r.a/2 FROM r JOIN u ON u.y = r.b";
+        let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {join}"));
+        assert!(
+            explain_rows
+                .iter()
+                .any(|row| row.get(1).and_then(value_as_text) == Some("HashBuild")),
+            "expected a hash join"
+        );
+
+        let expected = vec![vec![
+            Value::Real(3.0),
+            Value::Text("real".to_string()),
+            Value::Real(1.5),
+        ]];
+        assert_eq!(limbo_exec_rows(&conn, join), expected, "{strict}");
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT r.a, typeof(r.a), r.a/2 FROM r"),
+            expected,
+            "{strict}"
+        );
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT r.a, typeof(r.a) FROM r LEFT JOIN u ON u.y = r.b"
+            ),
+            vec![vec![Value::Real(3.0), Value::Text("real".to_string())]],
+            "{strict}"
+        );
+
+        limbo_exec_rows(&conn, "INSERT INTO x SELECT r.a FROM r JOIN u ON u.y = r.b");
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT v, typeof(v) FROM x"),
+            vec![vec![Value::Real(3.0), Value::Text("real".to_string())]],
+            "{strict}"
+        );
+    }
+    Ok(())
+}

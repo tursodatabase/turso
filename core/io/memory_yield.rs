@@ -211,8 +211,8 @@ impl File for MemoryYieldFile {
 mod tests {
     use super::*;
     use crate::vdbe::StepResult;
-    use crate::SqliteDialect;
-    use crate::{Database, IOResult, OpenFlags};
+    use crate::EngineDialect;
+    use crate::{ConnectOpts, Database, IOResult, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct StepGuardedIO {
@@ -357,9 +357,9 @@ mod tests {
     fn engine_yields_and_round_trips() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryYieldIO::new());
-        let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(SqliteDialect))
+        let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(EngineDialect))
             .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Step statements manually so we can observe the cooperative-yield path.
         // Returns (rows, number of StepResult::IO yields).
@@ -408,10 +408,10 @@ mod tests {
         let db = Database::open_file(
             io.clone(),
             "journal_mode_mvcc_yield.db",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut stmt = conn.prepare("PRAGMA journal_mode = 'mvcc'").unwrap();
 
         let mut rows = Vec::new();
@@ -453,10 +453,10 @@ mod tests {
             OpenFlags::Create,
             crate::DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let run = |sql: &str| {
             let mut stmt = conn.prepare(sql).unwrap();
@@ -496,9 +496,9 @@ mod tests {
     fn pager_allocate_and_free_yield_for_header_reads_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(SqliteDialect))
+        let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(EngineDialect))
             .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
 
         let pager = conn.get_pager();
@@ -528,10 +528,10 @@ mod tests {
         let db = Database::open_file(
             io.clone(),
             "overflow_delete_yield.db",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x BLOB)").unwrap();
         conn.execute("INSERT INTO t VALUES (zeroblob(20000))")
             .unwrap();
@@ -589,10 +589,10 @@ mod tests {
         let db = Database::open_file(
             io.clone(),
             "wasm_opfs_spill_hang.db",
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Drive one statement to completion exactly like the WASM/OPFS JS
         // binding does: step, and on StepResult::IO hand control back to the

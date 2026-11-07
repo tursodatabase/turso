@@ -93,3 +93,39 @@ test group-by-window-constant-order-by {
 expect {
     a
 }
+
+@setup schema
+test order-by-float-does-not-change-integer-min-result-column {
+    SELECT -9223372036854775808, typeof(-9223372036854775808) FROM t ORDER BY -9.223372036854776e18 LIMIT 1;
+}
+expect {
+    -9223372036854775808|integer
+}
+
+@setup schema
+test group-by-float-does-not-change-integer-min-result-column {
+    SELECT -9223372036854775808 FROM t GROUP BY -9.223372036854776e18;
+}
+expect {
+    -9223372036854775808
+}
+
+@setup schema
+test order-by-integer-min-does-not-change-float-result-column {
+    SELECT -9.223372036854776e18 FROM t ORDER BY -9223372036854775808 LIMIT 1;
+}
+expect {
+    -9.22337203685478e+18
+}
+# JS outputs large numbers as full integers rather than scientific notation
+expect @js {
+    -9223372036854776000
+}
+
+@setup schema
+test order-by-out-of-range-integer-does-not-change-integer-min-result-column {
+    SELECT -9223372036854775808 FROM t ORDER BY -9223372036854775809 LIMIT 1;
+}
+expect {
+    -9223372036854775808
+}

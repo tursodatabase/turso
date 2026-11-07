@@ -66,6 +66,15 @@ fi
 export PATH="$HOME/.local/node-v24/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/go/bin:$PATH"
 printf '[orb setup] Shell tool paths ready in %ss\n' "$((SECONDS - step_started))"
 
+printf '\n[orb setup] Checking gh stack\n'
+step_started=$SECONDS
+if ! gh extension list | grep -Fq 'github/gh-stack'; then
+    gh extension install github/gh-stack
+else
+    printf '[orb setup] gh stack is already installed\n'
+fi
+printf '[orb setup] gh stack ready in %ss\n' "$((SECONDS - step_started))"
+
 printf '\n[orb setup] Checking Rust toolchain\n'
 step_started=$SECONDS
 if ! command -v rustup >/dev/null 2>&1; then

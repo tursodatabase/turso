@@ -10,7 +10,7 @@ sidebarTitle: CREATE DOMAIN
 **Turso Extension**: CREATE DOMAIN is a Turso-specific statement not available in standard SQLite. Domains require STRICT tables and the custom types experimental feature. This feature must be [enabled before use](/docs/sql-reference/experimental-features).
 </Info>
 
-The CREATE DOMAIN statement defines a named type alias with optional constraints. Unlike [CREATE TYPE](/docs/sql-reference/statements/create-type), a domain does not specify custom ENCODE/DECODE logic or OPERATORs. Instead, a domain adds NOT NULL and CHECK constraints on top of a base type, and values are stored using the base type's native storage format.
+The CREATE DOMAIN statement defines a named type alias with optional constraints. Unlike [CREATE TYPE](/docs/sql-reference/statements/create-type), a domain does not specify custom ENCODE/DECODE logic. Instead, a domain adds NOT NULL and CHECK constraints on top of a base type. Values are stored in the base type's format, and arithmetic uses the base type's operators.
 
 ## Syntax
 
@@ -29,6 +29,8 @@ A domain wraps a base type with validation constraints. When a value is written 
 Domains are transparent to the query engine for operations like ORDER BY, indexing, arithmetic, and aggregation. A domain column behaves exactly like a column of its base type, with the addition of input validation.
 
 Domains work only with STRICT tables. Using a domain name in a non-STRICT table has no effect.
+
+`CREATE DOMAIN d` fails while a type, index, CHECK constraint, generated column, column default, view or trigger already uses `CAST(... AS d)`: that CAST converts to NUMERIC until `d` exists, and creating `d` would change what it gives. Create the domain first. A domain whose own CHECK or DEFAULT casts to it fails with `cannot create domain d: it casts to itself`.
 
 ## Clauses
 
@@ -182,13 +184,16 @@ UPDATE items SET stock = -1 WHERE id = 1;
 
 ## CAST Support
 
-CAST applies the domain's validation constraints:
+CAST applies the domain's validation constraints. A CAST to a domain over a plain SQL type first converts the value as a CAST to that type does:
 
 ```sql
 CREATE DOMAIN positive_int AS integer CHECK (value > 0);
 
 SELECT CAST(42 AS positive_int);
 -- 42
+
+SELECT CAST('42' AS positive_int), typeof(CAST('42' AS positive_int));
+-- 42|integer
 
 SELECT CAST(-1 AS positive_int);
 -- Error: domain positive_int constraint violation
@@ -202,6 +207,8 @@ CREATE DOMAIN notnull_int AS integer NOT NULL;
 SELECT CAST(NULL AS notnull_int);
 -- Error: domain notnull_int does not allow null values
 ```
+
+In the PostgreSQL frontend, casting an integer to a domain over `boolean` gives true for any nonzero integer and false for 0, as in PostgreSQL. With SQLite syntax the cast accepts only 0 and 1, the values the `boolean` type stores.
 
 ## CHECK Constraints with Table-Level Checks
 

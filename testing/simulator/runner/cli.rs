@@ -147,6 +147,12 @@ pub struct SimulatorCLI {
     pub disable_union_all_preserves_cardinality: bool,
     #[clap(
         long,
+        help = "disable Lateral-Matches-Json-Each Property",
+        default_value_t = false
+    )]
+    pub disable_lateral_matches_json_each: bool,
+    #[clap(
+        long,
         help = "disable Savepoint-Rollback Property",
         default_value_t = false
     )]

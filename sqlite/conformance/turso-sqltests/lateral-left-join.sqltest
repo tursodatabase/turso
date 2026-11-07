@@ -1,0 +1,614 @@
+@database :memory:
+
+# LEFT JOIN LATERAL: rows of the left side without a match get NULLs.
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    CREATE TABLE t3(c INT, e TEXT);
+    INSERT INTO t1 VALUES (1, 'p'), (2, 'q'), (3, 'r'), (4, 's');
+    INSERT INTO t2 VALUES (1, 10, 'x'), (2, 20, 'y'), (2, 30, 'z'), (3, 40, 'w'), (5, 50, 'v');
+    INSERT INTO t3 VALUES (10, 'k'), (20, 'l'), (30, 'm'), (30, 'n'), (60, 'o');
+}
+
+setup t2-index {
+    CREATE INDEX t2_a ON t2(a);
+}
+
+@setup data
+test empty-subquery-gives-one-null-row-per-left-row {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE false) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+}
+
+@setup data
+test subquery-empty-for-some-left-rows {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+@setup t2-index
+test subquery-empty-for-some-left-rows-with-index {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test subquery-without-from-and-false-where {
+    SELECT t1.a, s.v FROM t1 LEFT JOIN LATERAL (SELECT t1.a * 2 AS v WHERE t1.a % 2 = 0) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|4
+    3|
+    4|8
+}
+
+@setup data
+test on-condition-reads-the-subquery {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON s.c > 15 ORDER BY 1, 2;
+}
+expect {
+    1|
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test on-condition-reads-the-left-table {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON t1.a <> 2 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|
+    3|40
+    4|
+}
+
+@setup data
+test on-condition-reads-both-sides {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a <= t1.a) AS s ON s.c = t1.a * 10 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|40
+}
+
+@setup data
+test on-false-gives-only-null-rows {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON false ORDER BY 1;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+}
+
+@setup data
+test on-condition-is-null-for-every-row {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON NULL ORDER BY 1;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+}
+
+@setup data
+test where-filters-on-the-null-side {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c IS NULL ORDER BY 1;
+}
+expect {
+    4|
+}
+
+@setup data
+test where-on-the-null-side-removes-null-rows {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c > 15 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test where-is-not-null-on-the-null-side {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c IS NOT NULL ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test where-on-the-left-table {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE t1.a >= 3 ORDER BY 1, 2;
+}
+expect {
+    3|40
+    4|
+}
+
+@setup data
+test where-with-coalesce-on-the-null-side {
+    SELECT t1.a, coalesce(s.c, -1) FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE coalesce(s.c, 0) < 25 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    4|-1
+}
+
+@setup data
+test where-with-or-on-the-null-side {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c IS NULL OR s.c = 30 ORDER BY 1, 2;
+}
+expect {
+    2|30
+    4|
+}
+
+@setup data
+test count-star-without-group-by-gives-one-row {
+    SELECT t1.a, s.n FROM t1 LEFT JOIN LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|1
+    4|0
+}
+
+@setup data
+test sum-without-group-by-gives-null-for-no-rows {
+    SELECT t1.a, s.total FROM t1 LEFT JOIN LATERAL (SELECT sum(c) AS total FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1;
+}
+expect {
+    1|10
+    2|50
+    3|40
+    4|
+}
+
+@setup data
+test aggregate-subquery-with-on-condition-that-fails {
+    SELECT t1.a, s.n FROM t1 LEFT JOIN LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ON s.n > 0 ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|1
+    4|
+}
+
+@setup data
+test inner-join-aggregate-subquery-always-matches {
+    SELECT t1.a, s.n, s.m FROM t1 JOIN LATERAL (SELECT count(*) AS n, max(c) AS m FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1;
+}
+expect {
+    1|1|10
+    2|2|30
+    3|1|40
+    4|0|
+}
+
+@setup data
+test aggregate-with-group-by-gives-no-row-for-no-match {
+    SELECT t1.a, s.n FROM t1 LEFT JOIN LATERAL (SELECT a, count(*) AS n FROM t2 WHERE t2.a = t1.a GROUP BY a) AS s ON true ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|1
+    4|
+}
+
+@setup data
+test aggregate-with-having-that-removes-the-row {
+    SELECT t1.a, s.n FROM t1 LEFT JOIN LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a HAVING count(*) > 1) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|2
+    3|
+    4|
+}
+
+@setup data
+test limit-zero-gives-null-rows {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a LIMIT 0) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+}
+
+@setup data
+test offset-past-the-end-gives-null-rows {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c LIMIT 1 OFFSET 1) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|30
+    3|
+    4|
+}
+
+@setup data
+test null-side-constant-column-is-null {
+    SELECT t1.a, s.k, s.c FROM t1 LEFT JOIN LATERAL (SELECT 'k' AS k, c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 3;
+}
+expect {
+    1|k|10
+    2|k|20
+    2|k|30
+    3|k|40
+    4||
+}
+
+@setup data
+test null-side-column-that-reads-the-left-table-is-null {
+    SELECT t1.a, s.v FROM t1 LEFT JOIN LATERAL (SELECT t1.a * 10 AS v FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|20
+    3|30
+    4|
+}
+
+@setup data
+test null-side-in-a-select-expression {
+    SELECT t1.a, s.c + 1, s.c IS NULL FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|11|0
+    2|21|0
+    2|31|0
+    3|41|0
+    4||1
+}
+
+@setup data
+test two-left-join-laterals {
+    SELECT t1.a, x.c, y.e
+    FROM t1
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS x ON true
+    LEFT JOIN LATERAL (SELECT e FROM t3 WHERE t3.c = t1.a * 10) AS y ON true
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|l
+    3|40|m
+    3|40|n
+    4||
+}
+
+@setup data
+test second-left-join-lateral-reads-the-null-side-of-the-first {
+    SELECT t1.a, x.c, y.e
+    FROM t1
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS x ON true
+    LEFT JOIN LATERAL (SELECT e FROM t3 WHERE t3.c = x.c) AS y ON true
+    ORDER BY 1, 2 NULLS FIRST, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+    3|40|
+    4||
+}
+
+@setup data
+test second-lateral-reads-a-null-column-of-the-first {
+    SELECT t1.a, x.c, y.v
+    FROM t1
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS x ON true
+    CROSS JOIN LATERAL (SELECT coalesce(x.c, -1) AS v) AS y
+    ORDER BY 1, 3;
+}
+expect {
+    1|10|10
+    2|20|20
+    2|30|30
+    3|40|40
+    4||-1
+}
+
+@setup data
+test inner-lateral-after-left-lateral-removes-null-rows {
+    SELECT t1.a, x.c, y.e
+    FROM t1
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS x ON true
+    JOIN LATERAL (SELECT e FROM t3 WHERE t3.c = x.c) AS y ON true
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test aggregate-lateral-reads-the-null-side-of-a-left-lateral {
+    SELECT t1.a, x.c, y.n
+    FROM t1
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS x ON true
+    CROSS JOIN LATERAL (SELECT count(*) AS n FROM t3 WHERE t3.c = x.c) AS y
+    ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10|1
+    2|20|1
+    2|30|2
+    3|40|0
+    4||0
+}
+
+@setup data
+test lateral-reads-the-null-side-of-a-left-join {
+    SELECT t1.a, t2.c, s.v FROM t1 LEFT JOIN t2 ON t2.a = t1.a, LATERAL (SELECT t2.c * 2 AS v) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10|20
+    2|20|40
+    2|30|60
+    3|40|80
+    4||
+}
+
+@setup data
+test lateral-filters-on-the-null-side-of-a-left-join {
+    SELECT t1.a, t2.c, s.e FROM t1 LEFT JOIN t2 ON t2.a = t1.a, LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test left-lateral-reads-the-null-side-of-a-left-join {
+    SELECT t1.a, t2.c, s.e
+    FROM t1 LEFT JOIN t2 ON t2.a = t1.a LEFT JOIN LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s ON true
+    ORDER BY 1, 2 NULLS FIRST, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+    3|40|
+    4||
+}
+
+@setup data
+@setup t2-index
+test left-lateral-reads-the-null-side-of-a-left-join-with-index {
+    SELECT t1.a, t2.c, s.e
+    FROM t1 LEFT JOIN t2 ON t2.a = t1.a LEFT JOIN LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS s ON true
+    ORDER BY 1, 2 NULLS FIRST, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+    3|40|
+    4||
+}
+
+@setup data
+test lateral-counts-on-the-null-side-of-a-left-join {
+    SELECT t1.a, t2.c, s.n FROM t1 LEFT JOIN t2 ON t2.a = t1.a, LATERAL (SELECT count(*) AS n FROM t3 WHERE t3.c = t2.c) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10|1
+    2|20|1
+    2|30|2
+    3|40|0
+    4||0
+}
+
+@setup data
+test lateral-checks-null-on-the-null-side-of-a-left-join {
+    SELECT t1.a, s.v FROM t1 LEFT JOIN t2 ON t2.a = t1.a AND t2.c > 20, LATERAL (SELECT CASE WHEN t2.c IS NULL THEN 'none' ELSE t2.d END AS v) AS s ORDER BY 1, 2;
+}
+expect {
+    1|none
+    2|z
+    3|w
+    4|none
+}
+
+@setup data
+test left-join-table-after-a-left-lateral {
+    SELECT t1.a, s.c, t3.e
+    FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true LEFT JOIN t3 ON t3.c = s.c
+    ORDER BY 1, 2 NULLS FIRST, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+    3|40|
+    4||
+}
+
+@setup data
+test inner-join-table-after-a-left-lateral {
+    SELECT t1.a, s.c, t3.e
+    FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true JOIN t3 ON t3.c = s.c
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test left-lateral-inside-a-left-lateral {
+    SELECT t1.a, s.c, s.e
+    FROM t1 LEFT JOIN LATERAL (
+        SELECT t2.c, u.e FROM t2 LEFT JOIN LATERAL (SELECT e FROM t3 WHERE t3.c = t2.c) AS u ON true WHERE t2.a = t1.a
+    ) AS s ON true
+    ORDER BY 1, 2 NULLS FIRST, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+    3|40|
+    4||
+}
+
+@setup data
+test left-lateral-with-limit-one-per-row {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS s ON true ORDER BY 1;
+}
+expect {
+    1|10
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test left-lateral-with-distinct {
+    SELECT t1.a, s.a FROM t1 LEFT JOIN LATERAL (SELECT DISTINCT a FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|
+}
+
+@setup data
+test left-lateral-with-union {
+    SELECT t1.a, s.v FROM t1 LEFT JOIN LATERAL (SELECT c AS v FROM t2 WHERE t2.a = t1.a UNION SELECT c FROM t3 WHERE t3.c = t1.a * 10) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|30
+    3|40
+    4|
+}
+
+@setup data
+test left-lateral-with-values-and-on-condition {
+    SELECT t1.a, s.column1 FROM t1 LEFT JOIN LATERAL (VALUES (t1.a * 10), (t1.a * 100)) AS s ON s.column1 IN (10, 200, 300) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|200
+    3|300
+    4|
+}
+
+@setup data
+test left-lateral-group-by-outer-in-select {
+    SELECT t1.b, count(s.c) AS n FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true GROUP BY t1.b ORDER BY 1;
+}
+expect {
+    p|1
+    q|2
+    r|1
+    s|0
+}
+
+@setup data
+test left-lateral-count-star-and-count-column {
+    SELECT count(*), count(s.c) FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+}
+expect {
+    5|4
+}
+
+@setup data
+test left-lateral-reads-a-left-lateral-on-the-null-side-twice {
+    SELECT t1.a, x.c, y.v, z.w
+    FROM t1
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > 20) AS x ON true
+    LEFT JOIN LATERAL (SELECT x.c + 1 AS v) AS y ON true
+    LEFT JOIN LATERAL (SELECT y.v + 1 AS w WHERE y.v IS NOT NULL) AS z ON true
+    ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|||
+    2|30|31|32
+    3|40|41|42
+    4|||
+}
+
+@setup data
+test left-lateral-without-a-left-reference {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE c > 40) AS s ON s.c > t1.a * 12 ORDER BY 1, 2;
+}
+expect {
+    1|50
+    2|50
+    3|50
+    4|50
+}
+
+@setup data
+test left-lateral-after-comma-tables {
+    SELECT t1.a, t3.c, s.d
+    FROM t1, t3 LEFT JOIN LATERAL (SELECT d FROM t2 WHERE t2.c = t3.c AND t2.a = t1.a) AS s ON true
+    WHERE t1.a <= 2 AND t3.c <= 30
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|x
+    1|20|
+    1|30|
+    1|30|
+    2|10|
+    2|20|y
+    2|30|z
+    2|30|z
+}

@@ -85,6 +85,16 @@ android: $(ARCHS_ANDROID)
 	cp "$(SDK_KIT_DIR)/turso.h" libs/android
 	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/android
 
+# Builds one Android architecture into libs/android/<abi>, so CI can build
+# the architectures in parallel, e.g.
+#   make android-arch TARGET=aarch64-linux-android ABI=arm64-v8a
+android-arch: $(TARGET)
+	mkdir -p libs/android/$(ABI)
+	cp ../../target/$(TARGET)/release/$(LIB_FILE) libs/android/$(ABI)/$(LIB_FILE)
+	cp "$(SDK_KIT_DIR)/turso.h" libs/android
+	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/android
+.PHONY: android-arch
+
 $(ARCHS_ANDROID): %:
 	rustup target add $@
 	cargo ndk --target $@ --platform 31 build --package turso_sync_sdk_kit --release

@@ -1,0 +1,40 @@
+# JSON functions must keep a whole-number REAL as REAL even when the
+# previous row passed the same value as an INTEGER, and the other way round.
+
+@database :memory:
+
+test json-real-after-equal-integer {
+    CREATE TABLE t(c);
+    INSERT INTO t VALUES (1), (1.0), (0), (0.0);
+    SELECT typeof(c), typeof(json_extract(c, '$')), typeof(c ->> '$'), json_set(c, '$.a', 1) FROM t;
+}
+expect {
+    integer|integer|integer|1
+    real|real|real|1.0
+    integer|integer|integer|0
+    real|real|real|0.0
+}
+
+test json-integer-after-equal-real {
+    CREATE TABLE t(c);
+    INSERT INTO t VALUES (1.0), (1);
+    SELECT typeof(c), typeof(json_extract(c, '$')), typeof(c ->> '$'), json_set(c, '$.a', 1) FROM t;
+}
+expect {
+    real|real|real|1.0
+    integer|integer|integer|1
+}
+
+test json-real-format {
+    CREATE TABLE ordered_json_reals(v REAL);
+    INSERT INTO ordered_json_reals VALUES (-573353.6912624366), (440020.30658628535);
+    SELECT json_group_array(v) FROM (SELECT v FROM ordered_json_reals ORDER BY v);
+    SELECT json_group_array(json_array(v)) FROM (SELECT v FROM ordered_json_reals ORDER BY v);
+    SELECT json_array(v), json_quote(v), json_object('v', v) FROM ordered_json_reals ORDER BY v;
+}
+expect {
+    [-573353.691262437,440020.306586285]
+    [[-573353.691262437],[440020.306586285]]
+    [-573353.691262437]|-573353.691262437|{"v":-573353.691262437}
+    [440020.306586285]|440020.306586285|{"v":440020.306586285}
+}

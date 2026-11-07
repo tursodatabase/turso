@@ -1,0 +1,135 @@
+@database :memory:
+
+# SQLite moves each HAVING term that reads only constants and GROUP BY terms
+# into WHERE (havingToWhere() in select.c), so the rows of the groups it
+# removes are never aggregated and their aggregate errors never happen.
+
+setup overflow {
+    CREATE TABLE t(a, g, s TEXT COLLATE nocase);
+    INSERT INTO t VALUES (9223372036854775807, 1, 'A'), (1, 1, 'a'), (5, 2, 'b');
+}
+
+@setup overflow
+test having-group-by-term-skips-sum-of-removed-group {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2;
+}
+expect {
+    2|5
+}
+
+@setup overflow
+test having-group-by-term-skips-json-error-of-removed-group {
+    SELECT g, max(json(CASE WHEN g = 1 THEN char(123) ELSE '1' END)) FROM t GROUP BY g HAVING g = 2;
+}
+expect {
+    2|1
+}
+
+@setup overflow
+test having-null-with-group-by-null-skips-sum {
+    SELECT sum(a) FROM t GROUP BY NULL HAVING NULL;
+}
+expect {
+}
+
+@setup overflow
+test having-moves-group-by-term-and-keeps-aggregate-term {
+    SELECT g, sum(a), count(*) FROM t GROUP BY g HAVING g = 2 AND count(*) = 1;
+}
+expect {
+    2|5|1
+}
+
+@setup overflow
+test having-expression-of-group-by-term-skips-sum {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING abs(g) + 1 = 3;
+}
+expect {
+    2|5
+}
+
+@setup overflow
+test having-result-alias-of-group-by-term-skips-sum {
+    SELECT g + 1 AS x, sum(a) FROM t GROUP BY g HAVING x = 3;
+}
+expect {
+    3|5
+}
+
+@setup overflow
+test having-literal-false-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING 0;
+}
+expect error {
+}
+
+@setup overflow
+test having-hex-zero-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING 0x0;
+}
+expect error {
+}
+
+@setup overflow
+test having-zero-with-digit-separator-skips-sum {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING 0_0;
+}
+expect {
+}
+
+@setup overflow
+test having-false-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING false;
+}
+expect error {
+}
+
+@setup overflow
+test having-empty-in-list-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g IN ();
+}
+expect error {
+}
+
+@setup overflow
+test having-moves-group-by-term-next-to-false {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND false;
+}
+expect {
+}
+
+@setup overflow
+test having-subquery-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);
+}
+expect error {
+}
+
+@setup overflow
+test having-without-group-by-still-aggregates {
+    SELECT sum(a) FROM t HAVING 1 = 2;
+}
+expect error {
+}
+
+@setup overflow
+test having-or-with-aggregate-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 OR sum(a) < 0;
+}
+expect error {
+}
+
+@setup overflow
+test having-on-nocase-group-by-term-still-aggregates {
+    SELECT s, sum(a) FROM t GROUP BY s HAVING s = 'b';
+}
+expect error {
+}
+
+@setup overflow
+test having-on-nocase-group-by-term-keeps-group-members {
+    SELECT s, count(*) FROM t GROUP BY s HAVING s = 'A' COLLATE binary;
+}
+expect {
+    A|2
+}

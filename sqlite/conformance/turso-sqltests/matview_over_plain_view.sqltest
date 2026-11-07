@@ -1,0 +1,51 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# Reproducer for #3655: a materialized view built on top of a plain VIEW
+# recorded the plain view's name as its only dependency. Writes land on the
+# view's own underlying table, not on the view itself, so the materialized
+# view never saw a reason to run maintenance and silently went stale.
+test matview-over-plain-view-tracks-base-table-writes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v AS SELECT id, val FROM t;
+    CREATE MATERIALIZED VIEW mv AS SELECT id, val FROM v;
+    INSERT INTO t VALUES (1, 'hello');
+    SELECT * FROM mv ORDER BY id;
+    UPDATE t SET val = 'world' WHERE id = 1;
+    SELECT * FROM mv ORDER BY id;
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM mv ORDER BY id;
+}
+expect {
+    1|hello
+    1|world
+}
+
+# Views over views: the dependency must expand all the way down to the real
+# table, not stop at the first plain view.
+test matview-over-view-of-view-tracks-base-table-writes {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v2a AS SELECT id, val FROM t2;
+    CREATE VIEW v2b AS SELECT id, val FROM v2a;
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, val FROM v2b;
+    INSERT INTO t2 VALUES (1, 'hello');
+    SELECT * FROM mv2 ORDER BY id;
+}
+expect {
+    1|hello
+}
+
+# A materialized view depending (through a plain view) on a table must block
+# DROP VIEW on that plain view, the same way DROP TABLE on the real table is
+# already blocked, instead of leaving the materialized view silently stale.
+test matview-over-plain-view-blocks-drop-view {
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY);
+    CREATE VIEW v3 AS SELECT id FROM t3;
+    CREATE MATERIALIZED VIEW mv3 AS SELECT id FROM v3;
+    DROP VIEW v3;
+}
+expect error {
+    cannot drop view "v3": it has dependent materialized view.{0,4}: mv3
+}

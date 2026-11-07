@@ -6,6 +6,7 @@
 <p align="center">
   An in-process SQL database, compatible with SQLite, and now with a Postgres frontend too.
 </p>
+<p align="center"><b>English</b> | <a href="./README.zh-CN.md">简体中文</a></p>
 
 <p align="center">
   <a title="Build Status" target="_blank" href="https://github.com/tursodatabase/turso/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/tursodatabase/turso/rust.yml?style=flat-square"></a>

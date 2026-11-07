@@ -39,6 +39,7 @@ jobs:
         with:
           prefix-key: "v1-serverless-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Turso CLI
         run: |

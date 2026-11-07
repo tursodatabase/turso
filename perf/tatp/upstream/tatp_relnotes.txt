@@ -1,0 +1,83 @@
+TATP Benchmark Suite Version 1.1.0
+
+RELEASE NOTES
+=============
+2012-01-27
+
+TATP Benchmark Suite is a database performance testing software. It 
+was known before as TM1 (Telecom One). The first version of the 
+software was released in January 2004. In March 2009, the benchmark was
+renamed TATP and the corresponding Benchmark Suite republished.
+
+This version supersedes all previous versions. It is fully compatible with 
+TATP 1.0 in all respects. New features are added and various bugs fixed.
+
+
+CHANGELOG
+-------------------------------------------------------------------------------
+* Version 1.1.1 (Released 2012-01-27)
+
+- fixed a bug that prevented using Remote nodes
+
+-------------------------------------------------------------------------------
+* Version 1.1.0 (Released 2011-07-04)
+
+- A new TATP command line option "-h" to print the usage help 
+- A new TATP command line option "-a" (for "add") whereby the missing TIRDB mandatory 
+  column values (hardware.hardware_id, operating_systems.name & version, _databases.name 
+  & version) are extracted from the DDF file. 
+- Adaptive connect info for the target database and TIRDB. The connect info can given 
+  either in the data source name format (DSN=) or as a direct connect string. The latter
+  one is to be used especially with directly linked drivers.
+- Added the incremental population mode:
+    populate incrementally min_subscriber_id=500001
+- New test sequence directive in TDF: 
+    execute file="foo.sql"
+  The given SQL script file is executed at this point
+- New test sequence directive in TDF: 
+    execute sql="DELETE FROM TPS;" 
+  The given SQL statement is executed at this point. However, no output is produced. 
+- New run directive parameter in TDF, to repeat the run execution a number 
+  of times: 
+    run repeats=<number>
+- New parameter in ddf: 
+      ConnectionInit = "sessionInit.sql" 
+  in which an sql script file name is given. The commands in the file will be processed 
+  on each target database connection prior to any other action.
+- Random number generator improved by introducing time-based seed.
+- Support for the solidDB shared memory access (SMA) driver added to project files 
+  and makefiles
+
+-------------------------------------------------------------------------------
+* Version 1.0.3 (Released 2009-04-20)
+
+- Client threads can be distributed among multiple processes (client 
+  distribution syntax extended)
+- It is now possible to set the listening port for a Remote Control, which
+  makes it possible to run Remote Control(s) in the same node with Main Control
+- Fixed a bug that caused a crash when using '-c' option with a long
+  working directory path
+- waitDatabaseStart parameter was not sent to Remote Control(s), fixed
+- fixed Windows compilation errors
+- Statistics no more crashes when started without command line arguments
+
+-------------------------------------------------------------------------------
+* Version 1.0.2 (Released 2009-04-20)
+
+- Fixed a memory leak in previous release (Windows version was not affected)
+- Added new feature: 'sleep' execution directive in tdf files (section [Test sequence]).
+  Usage: e.g. sleep duration=20  (will pause execution for 20 seconds)
+- Cleans up statistics process zombie after the test run (only Linux version)
+
+-------------------------------------------------------------------------------
+* Version 1.0.1 (Released 2009-04-17)
+
+- Fixed parsing of the error codes in the transaction file to be thread-safe
+- Fixed errors in running transaction mixes that did not use all defined
+  transactions
+- Fixed memory leaks
+
+-------------------------------------------------------------------------------
+* Version 1.0.0 (Released 2009-03-27)
+-------------------------------------------------------------------------------
+End of Changelog

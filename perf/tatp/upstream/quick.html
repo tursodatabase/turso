@@ -1,0 +1,273 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><title>TATP Quick Start</title>
+
+
+
+  <meta name="description" content="">
+  <meta name="keywords" content="">
+  <link rel="stylesheet" type="text/css" href="images/styles.css">
+  <link rel="stylesheet" type="text/css" href="images/position.css"></head><body leftmargin="0" topmargin="0" bgcolor="#dddcdb" link="#566782" marginheight="0" marginwidth="0" text="#4d4d4d" vlink="#566782">
+    
+<table border="0" cellpadding="0" cellspacing="0" width="100%">
+
+      <tbody>
+        <tr>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+          <td valign="top" width="800"><a name="top"></a>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="3" width="18"><img src="images/nav_left.gif" alt="" border="0" height="73" width="18"></td>
+                  <td colspan="3" valign="top" width="764"><img src="images/logo_top.gif" alt="" border="0" height="10" width="764"></td>
+                  <td rowspan="3" width="18"><img src="images/nav_right.gif" alt="" border="0" height="73" width="18"></td>
+                </tr>
+                <tr>
+                  <td align="center" width="141"><img alt="TATP" src="images/tatp-logo.gif" height="63" width="141"></td>
+                  <td width="3"><img src="images/logo_right.gif" alt="" border="0" height="63" width="3"></td>
+                  <td bgcolor="#75b2dd" width="620">
+            <table border="0" cellpadding="0" cellspacing="0" width="570">
+
+                      <tbody><tr>
+                        <td width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="20"></td>
+                        <td class="mission" align="right" width="510">Telecom Application Transaction Processing Benchmark<br>
+</td>
+                      </tr>
+                    </tbody>
+            </table>
+</td>
+                </tr>
+                <tr>
+                  <td colspan="3" bgcolor="#ffffff" valign="top" width="764"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">
+                    <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                      <tbody>
+                        <tr>
+                          <td height="150" valign="top">
+
+                            <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                              <tbody>
+                                <tr>
+                                  <td colspan="4"><img src="images/clear.gif" alt="" border="0" height="29" width="138"></td>
+                                </tr>
+                                <tr>
+                                  <td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+                                </tr>
+                                <tr height="17">
+                                  <td width="10">&nbsp;</td>
+                                  <td colspan="3" class="note" valign="top"><a href="index.html"><b>Home</b></a></td>
+                                </tr>
+                                <tr>
+                                  <td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+                                </tr>
+                                
+                              </tbody>
+                            </table>
+
+                          </td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#c1def1"><img src="images/clear.gif" alt="" border="0" height="20" width="138"></td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="138"></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="30"></td>
+                  <td bgcolor="#ffffff" valign="top" width="550">
+<br>
+<!--#java-include-image()-->
+<table border="0" cellpadding="2" cellspacing="0" width="550">
+<tbody><tr>
+<td>
+
+                  <h1>Quick Start Guide for New TATP Users<br>
+</h1>
+                  <h2>Introduction</h2>The purpose of this Quick
+Start Guide is to provide guidance to executing a trial run of
+TATP on a single computer. While this is not a reasonable
+configuration for production testing, a trial run will get you acquainted with TATP and the way it functions.<br>
+                  <br>
+You need two Database Management System (DBMS) products. One is needed
+to run the Test Input and Result Database (TIRDB) and the other to run
+the System Under Test (SUT) database (that is, the one being tested).
+You can also use one DBMS
+product to run both, but we recommend selecting the product you are
+going to use with TIRDB already at this step. <br>
+
+                  
+                  <h2>Running TATP without TIRDB<br>
+</h2>This is the simplest way to run TATP. After the run, the resulting
+Mean Qualified Throughput (MQTh) in transactions per second) and the response time results will be
+displayed on the console and printed in the TATP log ('bin/tatp.log').
+All the other information, such as throughput sampling, histogram
+data, and the session and run information, will be lost.<br>
+                  <ol>
+<li>Set up your target database.</li>
+                    <li>Create
+an ODBC Data Source Name (DSN) for the target database. (Note for Linux
+users: you do not have to worry about that if you use the solidDB ODBC
+library directly with the binaries included in the package. Otherwise,
+if you need a DBMS agnostic build, you have to build TATP with unixODBC
+first, and then configure a unixODBC data source)</li>
+                    <li>The instructions below assume that you will run
+TATP in the bin/ directory. Alternatively, you can setup a working
+directory and place your all test configuration files there.<br>
+                    </li>
+
+                    <li>Comment out the line specifying TIRDB in the
+'bin/tatp.ini' file,. The line starts with "TIRDBConnect =". The comment
+mark is "//".<br>
+                    </li>
+<li>Study
+the Database Description Files (DDF) in
+'ddf/. There is one file for each example target database. You can use any
+one of those, or create a new one to reflect your target
+database. Make sure that the transaction mix file corresponds to
+the product you are using as a target database. If there is no
+transaction file for the product you are using, use
+'bin/tr_mix_generic.sql'. <br>
+ </li><li>Write the DSN for the target database in the DDF file you
+have selected for execution. If no driver manager is used, enter the
+database connect string.<br>
+</li><li>Look at the 'tdf/example.tdf' file. It specifies a short
+test, with 1 minute ramp-up time and 3 minutes
+sampling time, using 4 client processes. It will also populate the
+target database with 10000 subscribers. The whole run will take about 4-5
+minutes. <br>
+                    </li><li>In the 'bin' directory, run<br>
+                      <tt>tatp ../ddf/&lt;file you have picked&gt; ../tdf/example.tdf</tt><br>The
+console output will produce the resulting MQTH values for each test run
+specified in the TDF file(s). If there are problems, analyze 'tatp.log'
+for possible errors. Note: it is really necessary to change the working directory to 'bin', before running TATP.</li>
+                  </ol>
+                  <h2>Running TATP with TIRDB</h2>
+To include TIRDB in your run, proceed as follows:<br>
+                  <ol>
+                    <li>Set up an empty database designated to be TIRDB.</li>
+                    <li>Uncomment the line starting with "TIRDBConnect =" in the 'bin/tatp.ini' file.<br>
+                    </li>
+
+                    <li>Create an ODBC Data Source Name (DSN) for
+TIRDB. Use "TIRDB", as it is preset in the configuration file
+'bin/tatp.ini'. If you choose a different DSN, update 'tatp.ini' accordingly.<br>
+                    </li>
+                    <li>Start TIRDB and, using any SQL query tool, execute the schema script 'tirdb/tirdb.sql'.</li>
+                    <li>Preload TIRDB with
+the data on your SUT and the target databases. The script
+'tirdb/initDataExample.sql' preloads the necessary data on an example
+SUT platform and some database products. You can modify the script to add a product, or
+a version you would like to use in the trial. <br>
+                    </li>
+                    <li>Execute the 'tirdb/initDataExample.sql'  script. Your TIRDB is ready to run.</li>
+                    <li>Run TATP as described in the previous section.<br>
+                    </li>
+<li>Retrieve the test results from TIRDB by using, for example, the statement:<br>
+                      <br>
+                      <tt>-- TATP Benchmark TIRDB query<br>
+-- retrieve all TATP test runs<br>
+SELECT <br>
+se.session_id, session_name, test_run_id, test_name, <br>
+te.start_date, te.start_time, te.stop_time,<br>
+db_name, db_version, config_name, mqth_avg, subscribers<br>
+FROM test_sessions se JOIN test_runs te <br>
+ON se.session_id = te.session_id<br>
+ORDER BY se.session_id DESC;<br>
+                      </tt><br>
+                    </li>
+                    <li>Now,
+you can start thinking about organizing your production testing
+environment. The best location for TIRDB is a stationary, centrally
+accessed server, for best sharing of the test results. The client
+processes may be dispersed among various computers that must be
+specified in 'bin/remoteNodes.ini', in the main client computer. You
+do not need that file if you only use one computer to generate the
+load. <br>
+</li>
+                    <li><br>
+                    </li>
+
+
+                  </ol>
+
+
+
+
+</td></tr>
+
+</tbody></table>
+
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="43"><img src="images/clear.gif" alt="" border="0" height="1" width="43"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">&nbsp;</td>
+                  <td bgcolor="#ffffff" valign="top" width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="30"></td>
+                  <td bgcolor="#ffffff" valign="top" width="550">&nbsp;<cite>Updated 2009-03-28</cite><br>
+</td>
+                  <td bgcolor="#ffffff" valign="top" width="43"><img src="images/clear.gif" alt="" border="0" height="1" width="43"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138"><img src="images/clear.gif" alt="" border="0" height="25" width="138"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td align="center" bgcolor="#0072c6" width="617">
+                    <table border="0" cellpadding="0" cellspacing="0" width="550">
+                      <tbody>
+                        <tr>
+                          <td class="footer">
+                          <br>
+</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td colspan="5" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td width="21"><img src="images/footer_left.gif" alt="" border="0" height="24" width="21"></td>
+                  <td class="copyright" align="center" bgcolor="#96938e" width="758">March 2009<br>
+</td>
+                  <td width="21"><img src="images/footer_right.gif" alt="" border="0" height="24" width="21"></td>
+                </tr>
+                <tr>
+                  <td colspan="3"><img src="images/footer_bottom.gif" alt="" border="0" height="13" width="800"></td>
+                </tr>
+              </tbody>
+            </table>
+          </td>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+        </tr>
+      </tbody>
+    
+</table>
+
+
+
+
+
+  </body></html>

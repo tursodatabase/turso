@@ -1,0 +1,7 @@
+#nav { POSITION: relative }
+#productspull { LEFT: 215px; POSITION: absolute; TOP: 26px; VISIBILITY: hidden }
+#supportpull { LEFT: 285px; POSITION: absolute; TOP: 26px; VISIBILITY: hidden }
+#developerspull { LEFT: 354px; POSITION: absolute; TOP: 26px; VISIBILITY: hidden }
+#partnerspull { LEFT: 504px; POSITION: absolute; TOP: 26px; VISIBILITY: hidden }
+#customerspull { LEFT: 579px; POSITION: absolute; TOP: 26px; VISIBILITY: hidden }
+#companypull { LEFT: 663px; POSITION: absolute; TOP: 26px; VISIBILITY: hidden }

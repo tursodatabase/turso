@@ -12,9 +12,8 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
-use turso_core::{
-    Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value as CoreValue,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, Value as CoreValue};
+use turso_sqlite::SqliteDialect;
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
     ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
@@ -1427,7 +1426,7 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     conn.wal_auto_actions_disable();
     Ok(Arc::new(DbHandle {
         conn: Mutex::new(conn),

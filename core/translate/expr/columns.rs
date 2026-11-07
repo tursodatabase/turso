@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::emitter::gencol::emit_virtual_column_store;
 
 /// Read a single column from a BTreeTable cursor, transparently computing
 /// virtual generated columns inline instead of hitting `emit_column`.
@@ -71,15 +72,131 @@ pub(super) fn do_emit_table_column(
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
+            let end_column_emission = match self_table_context {
+                SelfTableContext::ForSelect { .. } => {
+                    let end = program.allocate_label();
+                    program.emit_insn(Insn::IfNullRow {
+                        cursor_id,
+                        target_pc: end,
+                        dest: target_register,
+                    });
+                    Some(end)
+                }
+                SelfTableContext::ForDML { .. } => None,
+            };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                if end_column_emission.is_some() {
+                    translate_expr_no_constant_opt(
+                        program,
+                        referenced_tables,
+                        expr,
+                        target_register,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                } else {
+                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                }
                 Ok(())
             })?;
+            let table = match self_table_context {
+                SelfTableContext::ForSelect {
+                    table_ref_id,
+                    referenced_tables,
+                } => referenced_tables
+                    .find_table_by_internal_id(*table_ref_id)
+                    .and_then(|(_, table)| table.btree())
+                    .expect("a virtual column read in a query belongs to a btree table in it"),
+                SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+            };
+            emit_virtual_column_store(program, resolver, column, target_register, &table)?;
             program.emit_column_affinity(target_register, column.affinity());
+            if let Some(end) = end_column_emission {
+                program.preassign_label_to_next_insn(end);
+            }
         }
         _ => {
-            program.emit_column_or_rowid(cursor_id, column_index, target_register);
+            emit_stored_column(program, cursor_id, column_index, target_register, resolver)?;
+            maybe_apply_affinity(column.ty(), target_register, program);
         }
     }
     Ok(())
+}
+
+pub fn emit_stored_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
+    // A row written before ADD COLUMN reads the column's default, which must be
+    // turned into what the column stores: an array is stored as a record blob,
+    // and a custom type stores what its ENCODE and COERCE return.
+    let encoded_default = match table.as_ref() {
+        Some(table) => {
+            let column = &table.columns()[column_index];
+            let custom_type = resolver
+                .schema()
+                .resolve_type(&column.ty_str, table.is_strict)?;
+            match (column.default.as_ref(), custom_type) {
+                (Some(default_expr), Some(_)) => Some((table, column, default_expr)),
+                (Some(default_expr), None) if column.is_array() => {
+                    Some((table, column, default_expr))
+                }
+                // A plain column's default is stored as written; without a
+                // DEFAULT, a row written before ADD COLUMN reads NULL.
+                (Some(_), None) | (None, _) => None,
+            }
+        }
+        None => None,
+    };
+    let Some((table, column, default_expr)) = encoded_default else {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        return Ok(());
+    };
+    program.flags.set_suppress_column_default(true);
+    program.emit_column_or_rowid(cursor_id, column_index, target_register);
+    let has_field_label = program.allocate_label();
+    program.emit_column_has_field(cursor_id, column_index, has_field_label);
+    emit_encoded_default(
+        program,
+        column,
+        default_expr,
+        &table.name,
+        target_register,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(has_field_label);
+    Ok(())
+}
+
+/// Evaluates the DEFAULT of a custom-type column into `target_register` and
+/// encodes it as the type stores it.
+pub(crate) fn emit_encoded_default(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    default_expr: &ast::Expr,
+    table_name: &str,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        default_expr,
+        target_register,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    emit_custom_type_encode_columns(
+        program,
+        resolver,
+        std::slice::from_ref(column),
+        target_register,
+        None,
+        table_name,
+        &ColumnLayout::Identity { column_count: 1 },
+    )
 }

@@ -1,0 +1,18 @@
+//tatp_ddf
+// The folling values have to exist in TIRDB
+db_name = "solidDB" 
+db_version = "6.5.6"
+os_name = "Linux" 
+os_version = "Fedora Core"
+hardware_id = "sut1_x86"
+// --- end TIRDB ------------------------
+db_connect = "DSN=tcp localhost 1964;UID=dba;PWD=dba"
+configuration_file = "solid.ini"
+configuration_code = "solid_default"
+configuration_comments = "Default solidDB params: MME, relaxed durability"
+// target database initialization file
+//TargetDBInit = "targetDBInit.sql"
+// target database schema file 
+TargetDBSchema = "targetDBSchema.sql"
+// target database transaction file
+transaction_file = "tr_mix_solid.sql"

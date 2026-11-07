@@ -275,7 +275,7 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::Begin { typ, name } => {
+            Self::Begin { typ, name, .. } => {
                 s.append(TK_BEGIN, None)?;
                 if let Some(typ) = typ {
                     typ.to_tokens(s, context)?;
@@ -688,6 +688,12 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CreateRole { role_name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                s.append(TK_ID, Some(role_name))
+            }
+            Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -716,6 +722,7 @@ impl ToTokens for Stmt {
                         params,
                         base,
                         encode,
+                        coerce,
                         decode,
                         operators,
                         default,
@@ -741,6 +748,11 @@ impl ToTokens for Stmt {
                         if let Some(ref encode) = encode {
                             s.append(TK_ID, Some("ENCODE"))?;
                             encode.to_tokens(s, context)?;
+                        }
+                        // COERCE
+                        if let Some(ref coerce) = coerce {
+                            s.append(TK_ID, Some("COERCE"))?;
+                            coerce.to_tokens(s, context)?;
                         }
                         // DECODE
                         if let Some(ref decode) = decode {
@@ -868,6 +880,33 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::AlterSequenceOwnedBy { seq_name, owner } => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_ID, Some("SEQUENCE"))?;
+                seq_name.to_tokens(s, context)?;
+                s.append(TK_ID, Some("OWNED"))?;
+                s.append(TK_BY, None)?;
+                match owner {
+                    Some((table, column)) => {
+                        table.to_tokens(s, context)?;
+                        s.append(TK_DOT, None)?;
+                        column.to_tokens(s, context)
+                    }
+                    None => s.append(TK_ID, Some("NONE")),
+                }
+            }
+            Self::CreateSchema { name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::DropSchema { name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,
@@ -917,7 +956,7 @@ impl ToTokens for Expr {
                 op.to_tokens(s, context)?;
                 rhs.to_tokens(s, context)
             }
-            Self::Register(reg) => {
+            Self::Register { register: reg, .. } => {
                 // This is for internal use only, not part of SQL syntax
                 // Use a special notation that won't conflict with SQL
                 s.append(TK_VARIABLE, Some(&format!("$r{reg}")))
@@ -1501,7 +1540,14 @@ impl ToTokens for SelectTable {
                 }
                 Ok(())
             }
-            Self::Select(select, alias) => {
+            Self::Select {
+                select,
+                alias,
+                lateral,
+            } => {
+                if *lateral {
+                    s.append(TK_LATERAL, None)?;
+                }
                 s.append(TK_LP, None)?;
                 select.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
@@ -1635,7 +1681,7 @@ impl ToTokens for QualifiedName {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        if let Some(ref db_name) = self.db_name {
+        if let Some(ref db_name) = self.namespace {
             db_name.to_tokens(s, context)?;
             s.append(TK_DOT, None)?;
         }
@@ -1685,6 +1731,69 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::OwnerTo { role, .. } => {
+                s.append(TK_ID, Some("OWNER"))?;
+                s.append(TK_TO, None)?;
+                role.to_tokens(s, context)
+            }
+        }
+    }
+}
+
+impl_display_for_to_tokens!(RoleSpec);
+impl ToTokens for RoleSpec {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Name(name) => s.append(TK_ID, Some(name)),
+            Self::CurrentRole => s.append(TK_ID, Some("CURRENT_ROLE")),
+            Self::SessionUser => s.append(TK_ID, Some("SESSION_USER")),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(Grant);
+impl ToTokens for Grant {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ID, Some("GRANT"))?;
+        s.comma(&self.privileges, context)?;
+        s.append(TK_ON, None)?;
+        s.comma(&self.relations, context)?;
+        s.append(TK_TO, None)?;
+        s.comma(&self.grantees, context)
+    }
+}
+
+impl_display_for_to_tokens!(Privilege);
+impl ToTokens for Privilege {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Select => s.append(TK_SELECT, None),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(Grantee);
+impl ToTokens for Grantee {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Public => s.append(TK_ID, Some("PUBLIC")),
+            Self::Role(role) => role.to_tokens(s, context),
         }
     }
 }
@@ -1719,6 +1828,9 @@ impl ToTokens for CreateTableBody {
                     }
                 }
                 if let Some(ref strict) = options.strict_text {
+                    if options.contains_without_rowid() {
+                        s.append(TK_COMMA, None)?;
+                    }
                     s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())
@@ -1837,7 +1949,19 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                let parses_without_parentheses = match expr.as_ref() {
+                    Expr::Literal(_) | Expr::Id(_) | Expr::Parenthesized(_) => true,
+                    Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, operand) => {
+                        matches!(operand.as_ref(), Expr::Literal(_))
+                    }
+                    _ => false,
+                };
+                if parses_without_parentheses {
+                    return expr.to_tokens(s, context);
+                }
+                s.append(TK_LP, None)?;
+                expr.to_tokens(s, context)?;
+                s.append(TK_RP, None)
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
+use turso_core::{Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, Row, IO};
+use turso_sqlite::SqliteDialect;
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -39,7 +40,7 @@ pub struct TempDatabase {
 }
 unsafe impl Send for TempDatabase {}
 
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct TempDatabaseBuilder {
     db_name: Option<String>,
     db_path: Option<PathBuf>,
@@ -49,6 +50,7 @@ pub struct TempDatabaseBuilder {
     enable_mvcc: bool,
     io_uring: bool,
     enable_views: bool,
+    dialect: Option<Arc<dyn Dialect>>,
 }
 
 struct TestIo {
@@ -117,8 +119,14 @@ impl IO for TestIo {
     }
 }
 
+impl Default for TempDatabaseBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TempDatabaseBuilder {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             db_name: None,
             db_path: None,
@@ -128,6 +136,7 @@ impl TempDatabaseBuilder {
             enable_mvcc: false,
             io_uring: false,
             enable_views: false,
+            dialect: None,
         }
     }
 
@@ -184,6 +193,11 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_dialect(mut self, dialect: Arc<dyn Dialect>) -> Self {
+        self.dialect = Some(dialect);
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let mut opts = self
             .opts
@@ -233,19 +247,20 @@ impl TempDatabaseBuilder {
                 })
             }
         };
+        let dialect = self.dialect.unwrap_or_else(|| Arc::new(SqliteDialect));
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
             opts,
             None,
-            Arc::new(SqliteDialect),
+            dialect,
         )
         .unwrap();
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -264,7 +279,7 @@ impl TempDatabaseBuilder {
 
 #[allow(clippy::arc_with_non_send_sync)]
 impl TempDatabase {
-    pub const fn builder() -> TempDatabaseBuilder {
+    pub fn builder() -> TempDatabaseBuilder {
         TempDatabaseBuilder::new()
     }
 
@@ -310,7 +325,7 @@ impl TempDatabase {
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
         log::debug!("conneting to limbo");
 
-        let conn = self.db.connect().unwrap();
+        let conn = self.db.connect(ConnectOpts::new()).unwrap();
         log::debug!("connected to limbo");
         conn
     }
@@ -697,8 +712,8 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::TempDir;
-    use turso_core::SqliteDialect;
-    use turso_core::{Database, StepResult, IO};
+    use turso_core::{ConnectOpts, Database, StepResult, IO};
+    use turso_sqlite::SqliteDialect;
 
     use crate::common::{do_flush, ExecRows};
 
@@ -979,11 +994,11 @@ mod tests {
         let mut connections = Vec::new();
 
         // Create a new connection to verify persistence
-        let verification_conn = db.connect()?;
+        let verification_conn = db.connect(ConnectOpts::new())?;
         // Create multiple connections and create a table from each
 
         for i in 0..NUM_CONNECTIONS {
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
             connections.push(conn);
 
             // Create a unique table name for this connection

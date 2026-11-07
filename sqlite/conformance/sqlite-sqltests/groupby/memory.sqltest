@@ -103,6 +103,60 @@ expect {
     A
 }
 
+setup group_key_json {
+    CREATE TABLE j(a, b);
+    INSERT INTO j VALUES (1, 'x'), (2, 'y'), (3, 'x');
+}
+
+@setup group_key_json
+test group-by-json-key-nested-result {
+    SELECT json_array(json_object('k', b)) FROM j GROUP BY json_object('k', b);
+    SELECT json_quote(json_quote(b)) FROM j GROUP BY json_quote(b);
+    SELECT json_array(json(a || '')) FROM j GROUP BY json(a || '');
+    SELECT json_array(json_object('k', b)) FROM j GROUP BY 1;
+}
+expect {
+    [{"k":"x"}]
+    [{"k":"y"}]
+    "x"
+    "y"
+    [1]
+    [2]
+    [3]
+    [{"k":"x"}]
+    [{"k":"y"}]
+}
+
+@setup group_key_json
+test group-by-json-key-selected-and-nested {
+    SELECT json_object('k', b), json_array(json_object('k', b)), count(*)
+    FROM j GROUP BY json_object('k', b)
+    ORDER BY json_array(json_object('k', b)) DESC;
+}
+expect {
+    {"k":"y"}|[{"k":"y"}]|1
+    {"k":"x"}|[{"k":"x"}]|2
+}
+
+@setup group_key_json
+test group-by-json-key-having {
+    SELECT count(*) FROM j GROUP BY json_object('k', b)
+    HAVING json_array(json_object('k', b)) = '[{"k":"x"}]';
+}
+expect {
+    2
+}
+
+@setup group_key_json
+test group-by-json-arrow-key-nested-result {
+    SELECT json_array(json_object('k', b) -> '$.k'), sum(a)
+    FROM j GROUP BY json_object('k', b) -> '$.k';
+}
+expect {
+    ["x"]|4
+    ["y"]|2
+}
+
 @cross-check-integrity
 test group_by_no_sorting_required_reordered_columns {
     create table t0 (a INT, b INT, c INT);
@@ -490,4 +544,45 @@ test group-by-negative {
 }
 expect error {
     1st GROUP BY term out of range - should be between 1 and 2
+}
+
+setup group_key_predicate {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, c TEXT);
+    INSERT INTO t VALUES (1, 'y'), (2, 'xy'), (3, 'z');
+}
+
+# A HAVING predicate that repeats a GROUP BY term must read the stored group
+# value, not the table column after the scan has finished.
+@setup group_key_predicate
+test having-repeats-group-by-is-null {
+    SELECT c FROM t GROUP BY c, a IS NULL HAVING a IS NULL;
+}
+expect {
+}
+
+@setup group_key_predicate
+test having-repeats-group-by-comparison {
+    SELECT c, a > 1 FROM t GROUP BY c, a > 1 HAVING a > 1 ORDER BY c;
+}
+expect {
+    xy|1
+    z|1
+}
+
+@setup group_key_predicate
+test having-repeats-group-by-in-list {
+    SELECT c FROM t GROUP BY c, a IN (2, 3) HAVING a IN (2, 3) ORDER BY c;
+}
+expect {
+    xy
+    z
+}
+
+@setup group_key_predicate
+test having-repeats-group-by-term-inside-or {
+    SELECT c FROM t GROUP BY c, a = 2 HAVING a = 2 OR c = 'y' ORDER BY c;
+}
+expect {
+    xy
+    y
 }

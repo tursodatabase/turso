@@ -16,13 +16,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::Opts;
 use tracing::{debug, error, info};
-use turso_core::{Database, DatabaseOpts, LimboError, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, LimboError, OpenFlags};
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
 use crate::operations::{FiberState, OpResult, Operation, TxMode};
@@ -277,7 +277,7 @@ impl MultiprocessWhopper {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
 
             if opts.enable_mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'")?;

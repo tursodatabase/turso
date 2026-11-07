@@ -53,16 +53,16 @@ The Limbo deterministic simulator
 Usage: limbo_sim [OPTIONS]
 
 Options:
-  -s, --seed <SEED>                  set seed for reproducible runs
-  -d, --doublecheck                  enable doublechecking, run the simulator with the plan twice and check output equality
-  -n, --maximum-size <MAXIMUM_SIZE>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
-  -k, --minimum-size <MINIMUM_SIZE>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
-  -t, --maximum-time <MAXIMUM_TIME>  change the maximum time of the simulation(in seconds) [default: 3600]
-  -l, --load <LOAD>                  load plan from the bug base
-  -w, --watch                        enable watch mode that reruns the simulation on file changes
-      --differential                 run differential testing between sqlite and Limbo
-  -h, --help                         Print help
-  -V, --version                      Print version
+  -s, --seed <SEED>                    set seed for reproducible runs
+  -d, --doublecheck                    enable doublechecking, run the simulator with the plan twice and check output equality
+  -n, --maximum-tests <MAXIMUM_TESTS>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
+  -k, --minimum-tests <MINIMUM_TESTS>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
+  -t, --maximum-time <MAXIMUM_TIME>    change the maximum time of the simulation(in seconds) [default: 3600]
+  -l, --load <LOAD>                    load plan from the bug base
+  -w, --watch                          enable watch mode that reruns the simulation on file changes
+      --differential                   run differential testing between sqlite and Limbo
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 ## Adding new properties
@@ -136,3 +136,15 @@ Notes:
 - [(video) "Testing Distributed Systems w/ Deterministic Simulation" by Will Wilson](https://www.youtube.com/watch?v=4fFDFbi3toc)
 - [(video) FF meetup #4 - Deterministic simulation testing](https://www.youtube.com/live/29Vz5wkoUR8)
 - [(code) Hiisi: a proof of concept libSQL written in Rust following TigerBeetle-style with deterministic simulation testing](https://github.com/penberg/hiisi)
+
+## MVCC validation
+
+MVCC generation uses explicit INTEGER PRIMARY KEY values in INSERTs and UPSERTs.
+Its row model predicts implicit keys from the currently visible maximum, but
+MVCC allocation can retain reservations after rollback. Comparing those
+predicted keys would report a false failure. WAL generation retains implicit-key
+generation.
+
+The final integrity check uses Turso for MVCC and SQLite for WAL. Memory-I/O
+exports include the MVCC logical log so retained failure artifacts can be
+reopened with their committed state.

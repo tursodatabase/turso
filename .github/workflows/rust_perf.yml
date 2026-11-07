@@ -43,6 +43,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Generate graph-queries DB
         if: matrix.bench == 'graph_queries_benchmark'
         run: |
@@ -62,6 +63,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 24
@@ -81,6 +83,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache TPC-H
         id: cache-primes
@@ -107,6 +110,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: TPC-H
         env:
           RUST_LOG: "off"
@@ -122,6 +126,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: cargo build --release --verbose --locked

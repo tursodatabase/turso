@@ -1,5 +1,59 @@
 @database :memory:
 
+test jsonb-extract-containers {
+    SELECT typeof(jsonb_extract('{"a":[1],"b":{"c":2}}', '$.a')),
+           json(jsonb_extract('{"a":[1],"b":{"c":2}}', '$.a')),
+           typeof(jsonb_extract(jsonb('{"a":[1],"b":{"c":2}}'), '$.b')),
+           json(jsonb_extract(jsonb('{"a":[1],"b":{"c":2}}'), '$.b'));
+}
+expect {
+    blob|[1]|blob|{"c":2}
+}
+
+test jsonb-extract-root-and-empty-containers {
+    SELECT typeof(jsonb_extract('[1]', '$')),
+           json(jsonb_extract('[1]', '$')),
+           typeof(jsonb_extract('{"a":[],"b":{}}', '$.a')),
+           json(jsonb_extract('{"a":[],"b":{}}', '$.a')),
+           typeof(jsonb_extract('{"a":[],"b":{}}', '$.b')),
+           json(jsonb_extract('{"a":[],"b":{}}', '$.b'));
+}
+expect {
+    blob|[1]|blob|[]|blob|{}
+}
+
+test jsonb-extract-multiple-paths {
+    SELECT typeof(jsonb_extract('{"a":[1],"b":{"c":2}}', '$.a', '$.b', '$.missing')),
+           json(jsonb_extract('{"a":[1],"b":{"c":2}}', '$.a', '$.b', '$.missing'));
+}
+expect {
+    blob|[[1],{"c":2},null]
+}
+
+test jsonb-extract-container-bytes {
+    SELECT hex(jsonb_extract('{"a":[1],"b":{"c":2}}', '$.b')),
+           hex(jsonb_extract(jsonb('{"a":{"x":"y"}}'), '$.a')),
+           hex(jsonb_extract('{"a":[1]}', '$.a', '$.a'));
+}
+expect {
+    4C17631332|4C17781779|6B2B13312B1331
+}
+
+test jsonb-extract-scalar-types {
+    SELECT typeof(jsonb_extract('{"a":1,"b":1.5,"c":"x","d":true,"e":null}', '$.a')),
+           typeof(jsonb_extract('{"a":1,"b":1.5,"c":"x","d":true,"e":null}', '$.b')),
+           typeof(jsonb_extract('{"a":1,"b":1.5,"c":"x","d":true,"e":null}', '$.c')),
+           jsonb_extract('{"a":1,"b":1.5,"c":"x","d":true,"e":null}', '$.c'),
+           jsonb_extract('{"a":1,"b":1.5,"c":"x","d":true,"e":null}', '$.d'),
+           jsonb_extract('{"a":1,"b":1.5,"c":"x","d":true,"e":null}', '$.e') IS NULL,
+           jsonb_extract('{}', '$.missing') IS NULL,
+           jsonb_extract(NULL, '$') IS NULL,
+           typeof(json_extract('{"a":[1]}', '$.a'));
+}
+expect {
+    integer|real|text|x|1|1|1|1|text
+}
+
 test non-string-path {
     SELECT * FROM json_each('{}', 123);
 }

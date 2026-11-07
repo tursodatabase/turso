@@ -1,0 +1,60 @@
+@database :memory:
+
+# Text with no digit before the exponent, such as '.', '-.' or '+e5', is not a
+# number. SQLite refuses it as an INTEGER PRIMARY KEY or LIMIT value with
+# "datatype mismatch". Turso parsed it as 0 and stored rowid 0.
+
+test rowid-dot-is-datatype-mismatch {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES ('.');
+}
+expect error {
+    datatype mismatch
+}
+
+test rowid-signed-dot-is-datatype-mismatch {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES ('-.');
+}
+expect error {
+    datatype mismatch
+}
+
+test rowid-exponent-without-mantissa-is-datatype-mismatch {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES ('+e5');
+}
+expect error {
+    datatype mismatch
+}
+
+test limit-dot-is-datatype-mismatch {
+    SELECT 1 LIMIT '.';
+}
+expect error {
+    datatype mismatch
+}
+
+# Numbers with digits on one side of the point are still accepted.
+test rowid-digit-before-or-after-dot-still-works {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES ('5.');
+    INSERT INTO t VALUES (' 7.0 ');
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    5
+    7
+}
+
+# Casting digitless text still gives 0, as in SQLite.
+test cast-dot-to-numeric-is-zero {
+    SELECT CAST('.' AS NUMERIC), CAST('-.' AS INTEGER), CAST('+e5' AS REAL);
+}
+expect {
+    0|0|0.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    0|0|0
+}

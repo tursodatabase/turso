@@ -376,6 +376,20 @@ expect error {
 
 # --- currval session semantics ---
 
+test currval-matches-nextval-whatever-the-name-spelling {
+    CREATE SEQUENCE sp;
+    SELECT nextval('sp');
+    SELECT currval('s' || 'p');
+    SELECT currval('main.sp');
+    SELECT currval('SP');
+}
+expect {
+    1
+    1
+    1
+    1
+}
+
 # currval is per-connection-and-per-sequence; nextval establishes it,
 # DROP SEQUENCE removes the underlying sequence so subsequent currval
 # errors with "does not exist" (the stale per-session value is shadowed

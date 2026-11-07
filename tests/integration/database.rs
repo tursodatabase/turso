@@ -1,9 +1,10 @@
+use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
-use turso_core::SqliteDialect;
-use turso_core::{Database, OpenFlags};
+use turso_core::{ConnectOpts, Database, OpenFlags};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
+use turso_sqlite::SqliteDialect;
 
 /// Regression test: DATABASE_MANAGER registry returns stale Database after
 /// the underlying file is renamed.
@@ -33,7 +34,7 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect().unwrap();
+    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -66,7 +67,7 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect().unwrap();
+    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -171,6 +172,125 @@ fn test_open_refuses_file_with_unknown_virtual_table_module() {
     }
 }
 
+/// A double-quoted argument may hold a single quote or a comma, as in the usual
+/// fts5 `tokenize="unicode61 tokenchars '_'"` option. Opening such a file must
+/// get as far as looking up the module, like any other fts5 table.
+#[test]
+fn test_open_file_with_double_quoted_virtual_table_argument() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("fts5_tokenize.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            r#"CREATE VIRTUAL TABLE f USING fts5(text, tokenize="unicode61 tokenchars '_'");
+               CREATE VIRTUAL TABLE g USING fts5(text, tokenize="unicode61 separators ',.'");"#,
+        )
+        .unwrap();
+    drop(sqlite);
+
+    match open_plain_file(&path) {
+        Err(turso_core::LimboError::ExtensionError(msg)) => {
+            assert_that!(msg).contains("Virtual table module not found: fts5");
+        }
+        Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
+        Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
+    }
+}
+
+/// The SQLite dialect must refuse a table written by the PostgreSQL frontend,
+/// as sqlite3 does. Reading it as a plain SQLite table drops the PostgreSQL
+/// column types and rowid alias, so writes store values tursopg cannot read.
+#[test]
+fn test_open_refuses_file_with_postgres_table() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("postgres.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE t(id serial PRIMARY KEY, n numeric(10,2));
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = '/* turso_frontend:postgres */ ' || sql
+              WHERE name = 't';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let err = match open_plain_file(&path) {
+        Err(err) => err,
+        Ok(_) => panic!("expected malformed schema error, got a successful open"),
+    };
+    let turso_core::LimboError::Corrupt(msg) = err else {
+        panic!("expected malformed schema error, got {err:?}");
+    };
+    assert_that!(msg).contains("malformed database schema");
+}
+
+/// Earlier Turso versions accepted built-in function calls with an argument
+/// count the function does not take, such as `lpad` with 4 arguments, in
+/// generated columns and expression indexes. A database with such a schema must
+/// still open; only statements that evaluate the call fail.
+#[test]
+fn test_open_file_with_wrong_argument_count_in_schema() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("wrong_arg_count.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE g(a, b AS (upper(a)));
+             CREATE TABLE i(a);
+             CREATE INDEX ia ON i(upper(a));
+             INSERT INTO g(a) VALUES ('x');
+             INSERT INTO i VALUES ('y');
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = 'CREATE TABLE g(a, b AS (lpad(a, 3, ''x'', ''y'')))'
+              WHERE name = 'g';
+             UPDATE sqlite_schema SET sql = 'CREATE INDEX ia ON i(lpad(a, 3, ''x'', ''y''))'
+              WHERE name = 'ia';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = crate::common::TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT 1");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM g");
+    assert_eq!(rows, vec![("x".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM i");
+    assert_eq!(rows, vec![("y".to_string(),)]);
+
+    for sql in ["SELECT b FROM g", "INSERT INTO i VALUES ('z')"] {
+        let err = conn.execute(sql).unwrap_err();
+        assert_that!(err.to_string()).contains("wrong number of arguments to function lpad()");
+    }
+}
+
+/// The SQLite dialect has no roles, so a table named like the roles table of
+/// the PostgreSQL frontend is an ordinary table, as it is to sqlite3.
+#[test]
+fn test_open_file_with_table_named_like_the_roles_table() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("roles.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE __turso_internal_roles(x);
+             INSERT INTO __turso_internal_roles VALUES (1);
+             CREATE TABLE t(a);
+             INSERT INTO t VALUES (5);",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = open_plain_file(&path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.force_reparse_schema_without_publish().unwrap();
+
+    let mut stmt = conn.prepare("SELECT a FROM t").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_that!(rows).is_equal_to(vec![vec![turso_core::Value::from_i64(5)]]);
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
@@ -256,7 +376,7 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect().unwrap();
+    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -285,7 +405,7 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -428,5 +548,124 @@ fn test_do_open_skips_registry() {
     assert!(
         Arc::ptr_eq(&registered, &registered_again),
         "open() must still return the registered instance; do_open must not replace it"
+    );
+}
+
+/// Division by zero is a dialect property: a dialect that overrides
+/// `errors_on_zero_divisor()` to return `true` raises `LimboError::DivisionByZero`;
+/// the default SQLite dialect returns NULL. A NULL dividend returns NULL in
+/// both cases.
+#[test]
+fn test_errors_on_zero_divisor_dialect() {
+    use crate::common::TempDatabase;
+    use std::sync::Arc;
+    use turso_core::{Dialect, LimboError};
+    use turso_sqlite::SqliteDialect;
+
+    struct DivisionRaisesErrorDialect;
+    impl Dialect for DivisionRaisesErrorDialect {
+        fn name(&self) -> &'static str {
+            SqliteDialect.name()
+        }
+        fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+        fn parse_table_sql(
+            &self,
+            sql: &str,
+            root_page: i64,
+        ) -> turso_core::Result<turso_core::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> turso_core::Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> turso_core::Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> turso_core::Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+        fn register_catalog(
+            &self,
+            schema: &mut turso_core::schema::Schema,
+            enable_custom_types: bool,
+        ) -> turso_core::Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+        fn resolve_function(
+            &self,
+            name: &str,
+            arg_count: usize,
+        ) -> turso_core::Result<Option<turso_core::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
+        fn errors_on_zero_divisor(&self) -> bool {
+            true
+        }
+    }
+
+    let raising = TempDatabase::builder()
+        .with_dialect(Arc::new(DivisionRaisesErrorDialect))
+        .build();
+    let conn = raising.connect_limbo();
+    for sql in ["SELECT 1/0", "SELECT 1 % 0", "SELECT 1/0.0"] {
+        let err = conn.execute(sql).expect_err(sql);
+        assert!(
+            matches!(err, LimboError::DivisionByZero),
+            "{sql}: expected DivisionByZero, got {err:?}"
+        );
+    }
+    let mut stmt = conn.prepare("SELECT NULL/0").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert!(matches!(rows[0][0], turso_core::Value::Null));
+
+    let defaulted = TempDatabase::builder().build();
+    let conn = defaulted.connect_limbo();
+    for sql in ["SELECT 1/0", "SELECT 1 % 0", "SELECT 1/0.0"] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(
+            matches!(rows[0][0], turso_core::Value::Null),
+            "{sql}: default must return NULL, got {:?}",
+            rows[0][0]
+        );
+    }
+}
+
+/// SQLite lets a user create a table named like the namespaces table of a
+/// database that supports namespaces. Under the SQLite dialect it is an
+/// ordinary table, and loading the schema must not read it as one.
+#[test]
+fn test_a_sqlite_table_named_like_the_namespaces_table_is_an_ordinary_table() {
+    use crate::common::{limbo_exec_rows, TempDatabase};
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("main.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE __turso_internal_namespaces(x); \
+             CREATE TABLE t(a); INSERT INTO t VALUES(5);",
+        )
+        .unwrap();
+    let db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_vacuum(true),
+    );
+    let conn = db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a FROM t"),
+        vec![vec![rusqlite::types::Value::Integer(5)]]
+    );
+    // VACUUM reloads the schema afterwards.
+    conn.execute("VACUUM").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a FROM t"),
+        vec![vec![rusqlite::types::Value::Integer(5)]]
     );
 }

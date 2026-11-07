@@ -5,7 +5,7 @@ use rand::Rng;
 use turso::Value;
 use turso_stress::ThreadId;
 
-use crate::conn::StressConn;
+use crate::conn::{assert_not_engine_bug, StressConn};
 use crate::opts::TxMode;
 use crate::sql_logging::SqlLogger;
 use crate::ThreadRng;
@@ -54,11 +54,9 @@ pub async fn run_wal_checkpoint(
                 turso::Error::Busy(_) | turso::Error::BusySnapshot(_) => {
                     sql_logger.log(thread, &sql, "SKIPPED: database busy");
                 }
-                turso::Error::Corrupt(e) => {
-                    turso_macros::turso_assert_unreachable!("corrupt error running checkpoint", { "thread": thread, "mode": mode, "error": e });
-                }
                 e => {
                     sql_logger.log(thread, &sql, &format!("ERROR: {e}"));
+                    assert_not_engine_bug(thread, &sql, &e);
                 }
             }
             return;
@@ -109,11 +107,9 @@ pub async fn run_wal_checkpoint(
         Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
             sql_logger.log(thread, &sql, "SKIPPED: database busy");
         }
-        Err(turso::Error::Corrupt(e)) => {
-            turso_macros::turso_assert_unreachable!("corrupt error reading checkpoint result", { "thread": thread, "mode": mode, "error": e });
-        }
         Err(e) => {
             sql_logger.log(thread, &sql, &format!("ERROR: {e}"));
+            assert_not_engine_bug(thread, &sql, &e);
         }
     }
 }

@@ -31,9 +31,19 @@ runs:
       with:
         toolchain: ${{ inputs.toolchain }}
 
+    # Set the same env vars dtolnay/rust-toolchain sets on the install path.
+    # rust-cache hashes CARGO_* env vars into its cache key, so without these
+    # a job's Rust cache key would depend on whether this toolchain cache hit.
     - name: Activate cached Rust toolchain
       if: steps.cache.outputs.cache-hit == 'true'
       shell: bash
       run: |
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         "$HOME/.cargo/bin/rustup" default ${{ inputs.toolchain }}
+        echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+        if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        fi
+        if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+          echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+        fi

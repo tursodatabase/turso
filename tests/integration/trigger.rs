@@ -1,4 +1,4 @@
-use crate::common::{do_flush, ExecRows, TempDatabase};
+use crate::common::{do_flush, rusqlite_integrity_check, ExecRows, TempDatabase};
 use asserting::expectations::{any, StringContains};
 use asserting::prelude::*;
 
@@ -2087,4 +2087,177 @@ fn test_changes_after_foreign_key_failure_reset_to_zero(db: TempDatabase) {
 
     let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
     assert_eq!(total_changes, vec![(2,)]);
+}
+
+fn open_sqlite_created_database(sql: &str) -> (tempfile::TempDir, TempDatabase) {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+    let db = TempDatabase::new_with_existent(&db_path);
+    (tmp_dir, db)
+}
+
+#[test]
+fn test_update_with_before_trigger_keeps_real_column_real_in_index_key() {
+    let (_tmp_dir, db) = open_sqlite_created_database(
+        "CREATE TABLE t(a REAL, b);
+         INSERT INTO t VALUES (128.0, 1), (64.0, 1);
+         CREATE INDEX i ON t(typeof(a), b);
+         CREATE TRIGGER g BEFORE UPDATE ON t BEGIN SELECT 1; END;",
+    );
+    let conn = db.connect_limbo();
+
+    for sql in [
+        "UPDATE t SET b = 2 WHERE rowid = 1",
+        "UPDATE t SET b = 3 WHERE rowid = 1",
+        "INSERT INTO t(rowid, a, b) VALUES (2, 0, 0) ON CONFLICT DO UPDATE SET b = 2",
+        "INSERT INTO t(rowid, a, b) VALUES (2, 0, 0) ON CONFLICT DO UPDATE SET b = 3",
+    ] {
+        conn.execute(sql).unwrap();
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)], "after {sql}");
+    }
+    let rows: Vec<(String, i64)> = conn.exec_rows("SELECT quote(a), b FROM t ORDER BY rowid");
+    assert_eq!(
+        rows,
+        vec![("128.0".to_string(), 3), ("64.0".to_string(), 3)]
+    );
+
+    drop(conn);
+    rusqlite_integrity_check(&db.path).unwrap();
+}
+
+#[test]
+fn test_old_values_and_returning_read_real_column_as_real() {
+    let (_tmp_dir, db) = open_sqlite_created_database(
+        "CREATE TABLE t(a REAL, b);
+         INSERT INTO t VALUES (128.0, 1), (64.0, 2);
+         CREATE TABLE log(x);
+         CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+           INSERT INTO log VALUES ('before update ' || typeof(OLD.a));
+         END;
+         CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+           INSERT INTO log VALUES ('after update ' || typeof(OLD.a));
+         END;
+         CREATE TRIGGER ad AFTER DELETE ON t BEGIN
+           INSERT INTO log VALUES ('after delete ' || typeof(OLD.a));
+         END;",
+    );
+    let conn = db.connect_limbo();
+
+    conn.execute("UPDATE t SET b = 3 WHERE b = 1").unwrap();
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("DELETE FROM t WHERE b = 2 RETURNING typeof(a), quote(a)");
+    assert_eq!(rows, vec![("real".to_string(), "64.0".to_string())]);
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT x FROM log ORDER BY rowid");
+    assert_eq!(
+        log,
+        vec![
+            ("before update real".to_string(),),
+            ("after update real".to_string(),),
+            ("after delete real".to_string(),),
+        ]
+    );
+}
+
+// `Connection::set_triggers_enabled`: the sync engine's row replay turns
+// triggers off so that a trigger's effect, already captured as its own CDC
+// row, is not also applied a second time by the target re-running it
+// (#10147). These tests cover the setting itself, not the replay: see
+// `sync/engine/src/database_tape.rs` for the replay-session tests.
+
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_false_skips_non_temp_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    conn.set_triggers_enabled(false);
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, Vec::<(String,)>::new());
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+// A TEMP trigger keeps firing even while non-TEMP triggers are off, matching
+// SQLite's SQLITE_DBCONFIG_ENABLE_TRIGGER=0 rule (trigger.c: triggersReallyExist
+// truncates the trigger list to TEMP triggers only, it does not empty it).
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_false_keeps_temp_trigger_firing(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('temp fired'); END",
+    )
+    .unwrap();
+
+    conn.set_triggers_enabled(false);
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, vec![("temp fired".to_string(),)]);
+}
+
+// Turning `triggers_enabled` back on makes an already-prepared statement fire
+// triggers again: the same `Statement` is reused (reset + stepped) across the
+// setting change, so this exercises `PrepareContext::matches_connection` /
+// `Statement::reprepare`, not just a fresh compile picking up the new setting.
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_reprepare_on_setting_change(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    conn.set_triggers_enabled(false);
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    conn.set_triggers_enabled(true);
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,), (1,), (1,)]);
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, vec![("fired".to_string(),), ("fired".to_string(),)]);
+}
+
+/// `has_triggers_including_temp` (used to decide whether an UPDATE needs the
+/// trigger-driven stable-write-set path) must agree with `get_triggers_including_temp`
+/// (used to actually fire triggers) about whether `triggers_enabled` is off: with it off,
+/// no AFTER UPDATE trigger fires, so the UPDATE must not take that path either.
+#[turso_macros::test]
+fn test_update_skips_stable_write_set_when_triggers_disabled(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    conn.set_triggers_enabled(false);
+    let rows = crate::common::limbo_exec_rows(&conn, "EXPLAIN UPDATE t SET x = 1");
+    let uses_stable_write_set = rows.iter().any(
+        |row| matches!(&row[1], rusqlite::types::Value::Text(op) if op.as_str() == "OpenEphemeral"),
+    );
+    assert!(
+        !uses_stable_write_set,
+        "with triggers disabled no trigger will fire, so the UPDATE must not \
+         materialize a stable write set for one; EXPLAIN rows: {rows:#?}"
+    );
 }

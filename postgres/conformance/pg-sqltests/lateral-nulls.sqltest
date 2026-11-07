@@ -1,0 +1,421 @@
+@database :memory:
+
+# NULL values in the left side, in join keys and in IN lists of LATERAL
+# subqueries.
+# The statements run through the PostgreSQL frontend (tursopg).
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE n1(id INT, a INT, b TEXT);
+    CREATE TABLE n2(a INT, c INT);
+    INSERT INTO n1 VALUES (1, 1, 'p'), (2, NULL, 'q'), (3, 2, NULL), (4, NULL, NULL), (5, 3, 'r');
+    INSERT INTO n2 VALUES (1, 10), (NULL, 20), (2, NULL), (2, 30), (3, 40), (NULL, NULL);
+}
+
+setup n2-index {
+    CREATE INDEX n2_a ON n2(a);
+}
+
+@setup data
+test null-outer-value-in-the-select-list {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT n1.a + 1 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|
+    3|3
+    4|
+    5|4
+}
+
+@setup data
+test null-outer-value-in-an-equality-filter {
+    SELECT n1.id, s.c FROM n1, LATERAL (SELECT c FROM n2 WHERE n2.a = n1.a) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    3|
+    3|30
+    5|40
+}
+
+@setup data
+@setup n2-index
+test null-outer-value-in-an-equality-filter-with-index {
+    SELECT n1.id, s.c FROM n1, LATERAL (SELECT c FROM n2 WHERE n2.a = n1.a) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    3|
+    3|30
+    5|40
+}
+
+@setup data
+test null-outer-value-with-is-not-distinct-from {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE n2.a IS NOT DISTINCT FROM n1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|2
+    4|2
+    5|1
+}
+
+@setup data
+test null-outer-value-with-is-null-check {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE (n2.a IS NULL AND n1.a IS NULL) OR n2.a = n1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|2
+    4|2
+    5|1
+}
+
+@setup data
+@setup n2-index
+test null-outer-value-with-is-null-check-and-index {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE (n2.a IS NULL AND n1.a IS NULL) OR n2.a = n1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|2
+    4|2
+    5|1
+}
+
+@setup data
+test null-outer-value-in-a-range-filter {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE n2.a >= n1.a) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|0
+    3|3
+    4|0
+    5|1
+}
+
+@setup data
+@setup n2-index
+test null-outer-value-in-a-range-filter-with-index {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE n2.a >= n1.a) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|0
+    3|3
+    4|0
+    5|1
+}
+
+@setup data
+test null-outer-value-in-an-in-list {
+    SELECT n1.id, s.c FROM n1, LATERAL (SELECT c FROM n2 WHERE n2.a IN (n1.a, 3)) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    1|40
+    2|40
+    3|
+    3|30
+    3|40
+    4|40
+    5|40
+}
+
+@setup data
+@setup n2-index
+test null-outer-value-in-an-in-list-with-index {
+    SELECT n1.id, s.c FROM n1, LATERAL (SELECT c FROM n2 WHERE n2.a IN (n1.a, 3)) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    1|40
+    2|40
+    3|
+    3|30
+    3|40
+    4|40
+    5|40
+}
+
+@setup data
+test null-in-a-not-in-list {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE n2.a NOT IN (n1.a, 3)) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|0
+    3|1
+    4|0
+    5|3
+}
+
+@setup data
+test outer-value-in-a-list-of-inner-values-with-null {
+    SELECT n1.id, s.n FROM n1, LATERAL (SELECT count(*) AS n FROM n2 WHERE n1.a IN (n2.a, n2.c)) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|0
+    3|2
+    4|0
+    5|1
+}
+
+@setup data
+test outer-value-in-a-subquery-with-nulls {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT CASE WHEN n1.a IN (SELECT a FROM n2) THEN 'in' WHEN n1.a NOT IN (SELECT a FROM n2) THEN 'out' ELSE 'unknown' END AS v) AS s ORDER BY 1;
+}
+expect {
+    1|in
+    2|unknown
+    3|in
+    4|unknown
+    5|in
+}
+
+@setup data
+test outer-value-in-a-subquery-without-nulls {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT CASE WHEN n1.a IN (SELECT a FROM n2 WHERE a IS NOT NULL) THEN 'in' WHEN n1.a NOT IN (SELECT a FROM n2 WHERE a IS NOT NULL) THEN 'out' ELSE 'unknown' END AS v) AS s ORDER BY 1;
+}
+expect {
+    1|in
+    2|unknown
+    3|in
+    4|unknown
+    5|in
+}
+
+@setup data
+test null-outer-value-in-exists {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT CASE WHEN EXISTS (SELECT 1 FROM n2 WHERE n2.a = n1.a) THEN 1 ELSE 0 END AS v) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|0
+    3|1
+    4|0
+    5|1
+}
+
+@setup data
+test null-outer-value-in-a-scalar-subquery {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT (SELECT max(c) FROM n2 WHERE n2.a = n1.a) AS v) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|
+    3|30
+    4|
+    5|40
+}
+
+@setup data
+test null-outer-value-in-coalesce {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT coalesce(n1.a, -1) * 10 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|-10
+    3|20
+    4|-10
+    5|30
+}
+
+@setup data
+test null-outer-text-value-concatenated {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT n1.b || 'x' AS v) AS s ORDER BY 1;
+}
+expect {
+    1|px
+    2|qx
+    3|
+    4|
+    5|rx
+}
+
+@setup data
+test null-outer-value-in-case {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT CASE WHEN n1.a IS NULL THEN 'none' WHEN n1.a > 1 THEN 'big' ELSE 'small' END AS v) AS s ORDER BY 1;
+}
+expect {
+    1|small
+    2|none
+    3|big
+    4|none
+    5|big
+}
+
+@setup data
+test null-outer-value-in-where-without-from {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT n1.a AS v WHERE n1.a IS NOT NULL) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    3|2
+    5|3
+}
+
+@setup data
+test null-outer-value-with-left-join-lateral {
+    SELECT n1.id, s.c FROM n1 LEFT JOIN LATERAL (SELECT c FROM n2 WHERE n2.a = n1.a) AS s ON true ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    2|
+    3|
+    3|30
+    4|
+    5|40
+}
+
+@setup data
+test null-inner-value-on-left-join-lateral-on-condition {
+    SELECT n1.id, s.c FROM n1 LEFT JOIN LATERAL (SELECT c FROM n2 WHERE n2.a = n1.a) AS s ON s.c IS NOT NULL ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    2|
+    3|30
+    4|
+    5|40
+}
+
+@setup data
+test null-values-in-a-lateral-aggregate {
+    SELECT n1.id, s.n, s.k, s.total FROM n1, LATERAL (SELECT count(*) AS n, count(c) AS k, sum(c) AS total FROM n2 WHERE n2.a = n1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1|1|10
+    2|0|0|
+    3|2|1|30
+    4|0|0|
+    5|1|1|40
+}
+
+@setup data
+test null-values-in-a-lateral-group-by {
+    SELECT n1.id, s.a, s.n FROM n1, LATERAL (SELECT a, count(*) AS n FROM n2 WHERE n2.c > coalesce(n1.a, 0) * 10 OR n2.c IS NULL GROUP BY a) AS s WHERE n1.id <= 2 ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1||2
+    1|2|2
+    1|3|1
+    2||2
+    2|1|1
+    2|2|2
+    2|3|1
+}
+
+@setup data
+test null-values-in-lateral-distinct {
+    SELECT n1.id, s.a FROM n1, LATERAL (SELECT DISTINCT a FROM n2 WHERE n2.c IS NULL OR n2.c > 25) AS s WHERE n1.id = 1 ORDER BY 2 NULLS FIRST;
+}
+expect {
+    1|
+    1|2
+    1|3
+}
+
+@setup data
+test null-values-in-a-lateral-order-by-limit {
+    SELECT n1.id, s.c FROM n1, LATERAL (SELECT c FROM n2 ORDER BY c NULLS LAST LIMIT 1) AS s WHERE n1.id < 3 ORDER BY 1;
+}
+expect {
+    1|10
+    2|10
+}
+
+@setup data
+test null-values-sorted-first-in-a-lateral-limit {
+    SELECT n1.id, s.a FROM n1, LATERAL (SELECT a FROM n2 WHERE n2.c = 20 OR n2.c = 10 ORDER BY a NULLS FIRST LIMIT 1) AS s WHERE n1.id < 3 ORDER BY 1;
+}
+expect {
+    1|
+    2|
+}
+
+@setup data
+test null-join-key-between-left-table-and-lateral {
+    SELECT n1.id, s.a FROM n1 JOIN LATERAL (SELECT a FROM n2 WHERE n2.c IS NULL) AS s ON s.a = n1.a ORDER BY 1;
+}
+expect {
+    3|2
+}
+
+@setup data
+test null-join-key-using {
+    SELECT n1.id, a, s.c FROM n1 JOIN LATERAL (SELECT a, c FROM n2 WHERE n2.c IS NULL OR n2.c >= n1.id * 10) AS s USING (a) ORDER BY 1, 3 NULLS FIRST;
+}
+expect {
+    1|1|10
+    3|2|
+    3|2|30
+}
+
+@setup data
+test null-values-in-union-inside-lateral {
+    SELECT n1.id, s.v FROM n1, LATERAL (SELECT n1.a AS v UNION SELECT NULL) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|
+    1|1
+    2|
+    3|
+    3|2
+    4|
+    5|
+    5|3
+}
+
+@setup data
+test null-values-in-lateral-values {
+    SELECT n1.id, s.column1 FROM n1, LATERAL (VALUES (n1.a), (NULL)) AS s WHERE n1.id < 3 ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|
+    1|1
+    2|
+    2|
+}
+
+@setup data
+test null-values-counted-in-the-outer-query {
+    SELECT count(*), count(s.c), count(DISTINCT s.c) FROM n1, LATERAL (SELECT c FROM n2 WHERE n2.a = n1.a OR n1.a IS NULL) AS s;
+}
+expect {
+    16|11|4
+}
+
+@setup data
+test null-outer-value-in-a-recursive-cte-bound {
+    SELECT n1.id, s.n FROM n1, LATERAL (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < n1.a) SELECT count(*) AS n FROM r) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|1
+    5|3
+}
+
+@setup data
+test null-outer-value-in-a-window-partition {
+    SELECT n1.id, s.c, s.r FROM n1, LATERAL (SELECT c, rank() OVER (ORDER BY c NULLS FIRST) AS r FROM n2 WHERE n2.a = n1.a OR (n2.a IS NULL AND n1.a IS NULL)) AS s ORDER BY 1, 3;
+}
+expect {
+    1|10|1
+    2||1
+    2|20|2
+    3||1
+    3|30|2
+    4||1
+    4|20|2
+    5|40|1
+}

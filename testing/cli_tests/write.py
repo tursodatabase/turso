@@ -39,16 +39,19 @@ class InsertTest(BaseModel):
         big_stmt.append("SELECT count(*) FROM test;")
         expected.append(str(self.vals * 2))
 
-        big_stmt.append("DELETE FROM test;")
-        big_stmt.append("SELECT count(*) FROM test;")
-        expected.append(str(0))
-
         big_stmt = "".join(big_stmt)
         expected = "\n".join(expected)
 
         limbo.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), self.name)
 
-    def test_compat(self):
+    def run_delete(self, limbo: TestTursoShell):
+        limbo.run_test_fn(
+            "DELETE FROM test;SELECT count(*) FROM test;",
+            lambda res: validate_with_expected(res, "0"),
+            f"{self.name} (delete all rows)",
+        )
+
+    def test_compat(self, expected_rows: int):
         console.info("Testing in SQLite\n")
 
         with TestTursoShell(
@@ -68,8 +71,8 @@ class InsertTest(BaseModel):
             )
             sqlite.run_test_fn(
                 "SELECT count(*) FROM test;",
-                lambda res: res == str(self.vals * 2),
-                "Counting total rows inserted",
+                lambda res: res == str(expected_rows),
+                f"Counting rows (expecting {expected_rows})",
             )
             sqlite.run_test_fn(
                 "PRAGMA integrity_check;",
@@ -148,11 +151,18 @@ def main():
             test.db_path = tmp.name
             try:
                 # Use with syntax to automatically close shell on error
+                # Check the file in sqlite3 after Turso inserts the rows, and
+                # again after Turso deletes them all.
                 with TestTursoShell("") as limbo:
                     limbo.execute_dot(f".open {test.db_path}")
                     test.run(limbo)
                 sleep(0.3)
-                test.test_compat()
+                test.test_compat(expected_rows=test.vals * 2)
+                with TestTursoShell("") as limbo:
+                    limbo.execute_dot(f".open {test.db_path}")
+                    test.run_delete(limbo)
+                sleep(0.3)
+                test.test_compat(expected_rows=0)
 
             except Exception as e:
                 console.error(f"Test FAILED: {e}")

@@ -36,10 +36,8 @@ use tantivy::directory::{
 use tantivy::HasLen;
 use tantivy_common::StableDeref;
 
-#[cfg(not(nightly))]
-use crate::alloc::TursoVecInExt;
 use crate::alloc::{
-    try_arc_slice_from_slice_in, ArcSlice, DynAllocator, DynVec, TursoFromIterator,
+    try_arc_slice_from_slice_in, ArcSlice, DynAllocator, DynVec, TursoFromIterator, TursoVecInExt,
 };
 use crate::sync::Arc;
 
@@ -309,7 +307,7 @@ impl TerminatingWrite for CaptureWriter {
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
         let data = Arc::new(std::mem::replace(
             &mut self.buffer,
-            DynVec::new_in(self.allocator.clone()),
+            <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(self.allocator.clone()),
         ));
         self.inner.write().files.insert(self.path.clone(), data);
         Ok(())
@@ -363,7 +361,7 @@ impl Directory for BuildDirectory {
         }
         let writer: Box<dyn TerminatingWrite + Send + Sync> = Box::new(CaptureWriter {
             path: path.to_path_buf(),
-            buffer: DynVec::new_in(self.allocator.clone()),
+            buffer: <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(self.allocator.clone()),
             allocator: self.allocator.clone(),
             inner: Arc::clone(&self.inner),
         });
@@ -411,7 +409,7 @@ mod tests {
         let path = PathBuf::from("segment.term");
         let mut writer = CaptureWriter {
             path: path.clone(),
-            buffer: DynVec::new_in(allocator.clone()),
+            buffer: <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(allocator.clone()),
             allocator,
             inner: Arc::clone(&inner),
         };

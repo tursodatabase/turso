@@ -1,0 +1,177 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# Reads of a materialized view go through the same cursor operations as reads
+# of a table: rowid range seeks, backward scans, and rowid lookups with text
+# or real keys. The view cursor used to support only forward scans and exact
+# integer lookups, so range seeks and backward scans panicked with "Cursor is
+# not a btree cursor", and WHERE rowid = '1' or rowid = 1.0 found no row.
+# Expected rows match SQLite running the same queries on
+# CREATE TABLE tm AS <the view's SELECT>.
+
+test matview-rowid-range-seeks {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, type TEXT, amt INT);
+    INSERT INTO t VALUES (1, 'x', 2), (2, 'y', 3), (3, 'z', 4);
+    CREATE MATERIALIZED VIEW tm AS SELECT type, sum(amt) AS totamt FROM t GROUP BY type;
+    SELECT 'gt', totamt FROM tm WHERE rowid > 1;
+    SELECT 'ge', totamt FROM tm WHERE rowid >= 2;
+    SELECT 'between', totamt FROM tm WHERE rowid BETWEEN 1 AND 2;
+    SELECT 'gt-real', totamt FROM tm WHERE rowid > 1.5;
+    SELECT 'gt-text', totamt FROM tm WHERE rowid > '1';
+    SELECT 'gt-non-numeric', totamt FROM tm WHERE rowid > 'abc';
+}
+expect {
+    gt|3
+    gt|4
+    ge|3
+    ge|4
+    between|2
+    between|3
+    gt-real|3
+    gt-real|4
+    gt-text|3
+    gt-text|4
+}
+
+test matview-rowid-backward-scans {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, type TEXT, amt INT);
+    INSERT INTO t VALUES (1, 'x', 2), (2, 'y', 3), (3, 'z', 4);
+    CREATE MATERIALIZED VIEW tm AS SELECT type, sum(amt) AS totamt FROM t GROUP BY type;
+    SELECT 'desc', rowid, totamt FROM tm ORDER BY rowid DESC LIMIT 2;
+    SELECT 'max', max(rowid) FROM tm;
+    SELECT 'min', min(rowid) FROM tm;
+    SELECT 'lt-desc', totamt FROM tm WHERE rowid < 3 ORDER BY rowid DESC;
+    SELECT 'le-real-desc', totamt FROM tm WHERE rowid <= 2.5 ORDER BY rowid DESC;
+    SELECT 'lt-non-numeric-desc', totamt FROM tm WHERE rowid < 'abc' ORDER BY rowid DESC;
+}
+expect {
+    desc|3|4
+    desc|2|3
+    max|3
+    min|1
+    lt-desc|3
+    lt-desc|2
+    le-real-desc|3
+    le-real-desc|2
+    lt-non-numeric-desc|4
+    lt-non-numeric-desc|3
+    lt-non-numeric-desc|2
+}
+
+test matview-rowid-lookup-converts-text-and-real-keys {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, type TEXT, amt INT);
+    INSERT INTO t VALUES (1, 'x', 2), (2, 'y', 3), (3, 'z', 4);
+    CREATE MATERIALIZED VIEW tm AS SELECT type, sum(amt) AS totamt FROM t GROUP BY type;
+    SELECT 'text', totamt FROM tm WHERE rowid = '1';
+    SELECT 'real', totamt FROM tm WHERE rowid = 1.0;
+    SELECT 'fraction', totamt FROM tm WHERE rowid = 2.5;
+    SELECT 'in', totamt FROM tm WHERE rowid IN ('1', 2.0);
+    SELECT 'left-join', k.v, tm.totamt
+    FROM (SELECT '2' AS v UNION ALL SELECT 2.0 UNION ALL SELECT 2.5) AS k
+    LEFT JOIN tm ON tm.rowid = k.v;
+}
+expect {
+    text|2
+    real|2
+    in|2
+    in|3
+    left-join|2|3
+    left-join|2.0|3
+    left-join|2.5|
+}
+
+test matview-empty-view-reads {
+    CREATE TABLE e(a INTEGER);
+    CREATE MATERIALIZED VIEW ve AS SELECT a FROM e;
+    SELECT 'count', count(*), max(rowid) FROM ve;
+    SELECT 'gt', a FROM ve WHERE rowid > 0;
+    SELECT 'desc', a FROM ve ORDER BY rowid DESC;
+    SELECT 'text', a FROM ve WHERE rowid = '1';
+}
+expect {
+    count|0|
+}
+
+test matview-rowid-reads-see-uncommitted-changes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amt INT);
+    INSERT INTO t VALUES (1, 2), (2, 3), (3, 4);
+    CREATE MATERIALIZED VIEW tp AS SELECT id, amt FROM t;
+    BEGIN;
+    INSERT INTO t VALUES (7, 5);
+    DELETE FROM t WHERE id = 2;
+    SELECT 'desc', rowid, amt FROM tp WHERE rowid > 1 ORDER BY rowid DESC;
+    SELECT 'max', max(rowid) FROM tp;
+    SELECT 'text', amt FROM tp WHERE rowid = '7';
+    ROLLBACK;
+    SELECT 'after', rowid, amt FROM tp WHERE rowid >= 2 ORDER BY rowid DESC;
+}
+expect {
+    desc|7|5
+    desc|3|4
+    max|7
+    text|5
+    after|3|4
+    after|2|3
+}
+
+# The trigger reads the view while the INSERT is still running, so each read
+# first applies the rows the statement has written so far.
+test matview-trigger-reads-view-by-rowid-range {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amt INT);
+    INSERT INTO t VALUES (1, 2), (2, 3), (3, 4);
+    CREATE MATERIALIZED VIEW tp AS SELECT id, amt FROM t;
+    CREATE TABLE lg(n INT, mx INT, last_amt INT);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO lg
+        SELECT count(*), max(rowid), (SELECT amt FROM tp ORDER BY rowid DESC LIMIT 1)
+        FROM tp WHERE rowid >= 2;
+    END;
+    INSERT INTO t VALUES (4, 5), (5, 6);
+    SELECT * FROM lg;
+}
+expect {
+    3|4|5
+    4|5|6
+}
+
+# A view large enough to span many pages, with gaps between rowids, so seeks
+# land at page boundaries and must step to the next or previous page. Each
+# sweep seeks once per key from 0 to 6003, before and inside a transaction
+# that deletes every seventh row. Expected sums match SQLite on a table with
+# the same rowids.
+test matview-rowid-seeks-across-pages {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amt INT, pad TEXT);
+    INSERT INTO t SELECT value * 3, value, printf('%.200c', 'x') FROM generate_series(1, 2000);
+    CREATE MATERIALIZED VIEW tp AS SELECT id, amt, pad FROM t;
+    SELECT 'gt', sum((SELECT count(*) FROM tp WHERE rowid > g.value)) FROM generate_series(0, 6003) AS g;
+    SELECT 'ge-min', sum((SELECT min(rowid) FROM tp WHERE rowid >= g.value)) FROM generate_series(0, 6003) AS g;
+    SELECT 'le-max', sum((SELECT max(rowid) FROM tp WHERE rowid <= g.value)) FROM generate_series(0, 6003) AS g;
+    SELECT 'lt-desc', sum((SELECT rowid FROM tp WHERE rowid < g.value ORDER BY rowid DESC LIMIT 1)) FROM generate_series(0, 6003) AS g;
+    SELECT 'gt-real', sum((SELECT min(rowid) FROM tp WHERE rowid > g.value + 0.5)) FROM generate_series(0, 6003) AS g;
+    SELECT 'eq-text', count((SELECT amt FROM tp WHERE rowid = CAST(g.value AS TEXT))) FROM generate_series(0, 6003) AS g;
+    SELECT 'null', count(*) FROM tp WHERE rowid = NULL OR rowid > NULL;
+    SELECT 'desc-all', count(*), sum(rowid) FROM (SELECT rowid FROM tp ORDER BY rowid DESC);
+    BEGIN;
+    DELETE FROM t WHERE amt % 7 = 0;
+    SELECT 'txn-gt', sum((SELECT count(*) FROM tp WHERE rowid > g.value)) FROM generate_series(0, 6003) AS g;
+    SELECT 'txn-le-max', sum((SELECT max(rowid) FROM tp WHERE rowid <= g.value)) FROM generate_series(0, 6003) AS g;
+    SELECT 'txn-lt-desc', sum((SELECT rowid FROM tp WHERE rowid < g.value ORDER BY rowid DESC LIMIT 1)) FROM generate_series(0, 6003) AS g;
+    ROLLBACK;
+    SELECT 'after', count(*) FROM tp;
+}
+expect {
+    gt|6003000
+    ge-min|18009003
+    le-max|18015000
+    lt-desc|18009000
+    gt-real|18009000
+    eq-text|2000
+    null|0
+    desc-all|2000|6003000
+    txn-gt|5147145
+    txn-le-max|18012435
+    txn-lt-desc|18006435
+    after|2000
+}

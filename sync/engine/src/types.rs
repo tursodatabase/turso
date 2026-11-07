@@ -182,6 +182,8 @@ pub struct DatabaseMetadata {
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
     #[serde(default)]
     pub fresh_bootstrap_pending_cdc_ack: bool,
+    #[serde(default)]
+    pub fresh_bootstrap_catch_up_pending: bool,
     /// Detected remote sync protocol; source of truth for pull dispatch.
     /// Metadata files written before this field existed deserialize to
     /// `Unknown` and are pinned to `Pages` in [`DatabaseMetadata::load`]
@@ -792,6 +794,7 @@ mod tests {
 
         assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
         assert!(!meta.fresh_bootstrap_pending_cdc_ack);
+        assert!(!meta.fresh_bootstrap_catch_up_pending);
         assert!(!meta.logical_mvcc_pull_active());
         assert!(meta.logical_table_names_by_stable_id.is_empty());
     }

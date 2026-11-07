@@ -117,8 +117,11 @@ class TursoServer:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                self._user_url = f"http://localhost:{port}"
-                self._db_url = f"http://localhost:{port}"
+                # The server listens on IPv4 only. On Windows, "localhost"
+                # resolves to ::1 first, and each connection waits for that
+                # attempt to fail before trying 127.0.0.1.
+                self._user_url = f"http://127.0.0.1:{port}"
+                self._db_url = f"http://127.0.0.1:{port}"
                 self._host = ""
                 # wait for server to be available
                 deadline = time.time() + 30

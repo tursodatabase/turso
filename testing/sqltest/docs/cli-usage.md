@@ -30,11 +30,24 @@ sqltest run <PATHS>... [OPTIONS]
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
+| `--backend <NAME>` | | `rust` | Where the tests run: `rust`, `cli`, `js`, `tursopg`, or `postgres` (see [Backends](#backends)) |
 | `--binary <PATH>` | | `tursodb` | Path to the tursodb CLI binary |
+| `--fail-fast` | | | Stop at the first failed test or error |
 | `--filter <PATTERN>` | `-f` | | Filter tests by name (glob pattern) |
 | `--jobs <N>` | `-j` | CPU count | Maximum concurrent test jobs |
 | `--output <FORMAT>` | `-o` | `pretty` | Output format: `pretty` or `json` |
 | `--timeout <SECS>` | | `30` | Timeout per query in seconds |
+| `--postgres-dsn <URL>` | | | With `--backend postgres`: the URL of the PostgreSQL server, for example `postgres://sqltest@127.0.0.1:5432/postgres` |
+
+#### Backends
+
+| Backend | Runs the tests on |
+|---------|-------------------|
+| `rust` | The Turso Rust bindings, in the runner process |
+| `cli` | A `tursodb` (or `sqlite3`) process that `--binary` names |
+| `js` | The Turso JavaScript bindings, in a Node.js process |
+| `tursopg` | A `tursopg` server that `--binary` names. The runner starts one server for each test database. |
+| `postgres` | The real PostgreSQL server at `--postgres-dsn` |
 
 #### Examples
 
@@ -60,6 +73,10 @@ sqltest run sqlite/conformance/sqlite-sqltests/ -j 4
 
 # JSON output for CI
 sqltest run sqlite/conformance/sqlite-sqltests/ -o json
+
+# Run the PostgreSQL corpus against a real PostgreSQL server
+sqltest run postgres/conformance/pg-sqltests/ --backend postgres \
+    --postgres-dsn postgres://sqltest@127.0.0.1:5432/postgres
 ```
 
 ### `check` - Validate Syntax
@@ -190,7 +207,13 @@ The `--filter` option supports simple glob patterns:
 
 ### Exit on First Failure
 
-Currently, all tests run to completion. A `--fail-fast` option may be added in the future.
+By default, all tests run to completion. Use `--fail-fast` to stop at the first failed test or
+error. Tests that are still running are cancelled, and tests that have not started are not run. The
+summary only counts the tests that finished.
+
+```bash
+sqltest run sqlite/conformance/sqlite-sqltests/ --fail-fast
+```
 
 ## Performance Tips
 

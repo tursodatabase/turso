@@ -1,0 +1,392 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><title>TATP-TM1 Compatibility Notes</title>
+
+
+
+
+  
+
+  <meta name="description" content="">
+
+  <meta name="keywords" content="">
+
+  <link rel="stylesheet" type="text/css" href="images/styles.css">
+
+  <link rel="stylesheet" type="text/css" href="images/position.css"></head><body leftmargin="0" topmargin="0" bgcolor="#dddcdb" link="#566782" marginheight="0" marginwidth="0" text="#4d4d4d" vlink="#566782">
+
+<table border="0" cellpadding="0" cellspacing="0" width="100%">
+
+
+      <tbody>
+        <tr>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+          <td valign="top" width="800"><a name="top"></a>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="3" width="18"><img src="images/nav_left.gif" alt="" border="0" height="73" width="18"></td>
+                  <td colspan="3" valign="top" width="764"><img src="images/logo_top.gif" alt="" border="0" height="10" width="764"></td>
+                  <td rowspan="3" width="18"><img src="images/nav_right.gif" alt="" border="0" height="73" width="18"></td>
+                </tr>
+                <tr>
+                  <td align="center" width="141"><a href="index.html"><img alt="TATP" src="images/tatp-logo.gif" border="0" height="63" width="141"></a><a href="index.html"><br>
+            </a></td>
+                  <td width="3"><img src="images/logo_right.gif" alt="" border="0" height="63" width="3"></td>
+                  <td bgcolor="#75b2dd" width="620">
+            <table border="0" cellpadding="0" cellspacing="0" width="570">
+
+                      <tbody><tr>
+                        <td width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="20"></td>
+                        <td class="mission" align="right" width="510">Telecom Application Transaction Processing Benchmark<br>
+</td>
+                      </tr>
+                    </tbody>
+            </table>
+</td>
+                </tr>
+                <tr>
+                  <td colspan="3" bgcolor="#ffffff" valign="top" width="764"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">
+                    <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                      <tbody>
+                        <tr>
+                          <td height="150" valign="top">
+
+                            <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+<tbody>
+<tr>
+<td colspan="4"><img src="images/clear.gif" alt="" border="0" height="29" width="138"></td>
+</tr>
+<tr>
+<td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+</tr>
+<tr height="17">
+<td width="10">&nbsp;</td>
+<td colspan="3" class="note" valign="top"><a href="index.html"><b>Home</b></a></td>
+</tr>
+<tr>
+<td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+</tr>
+
+</tbody>
+</table>
+
+                          </td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#c1def1"><br>
+</td>
+                        </tr>
+                        <tr>
+                          
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="30"></td>
+                  <td bgcolor="#ffffff" valign="top" width="550">
+
+<!--#java-include-image()-->
+<table border="0" cellpadding="2" cellspacing="0" width="550">
+<tbody><tr>
+<td>
+                  
+<div class="sect1"><h1 class="sect1">Compatibility Notes for TM1 users <br>
+                              </h1>TATP
+Benchmark was
+known before as TM1 (Telecom One). The first version of TATP Benchmark
+Suite supersedes&nbsp; TM1 Test Suite 4.1.4 and 4.1.5. As a whole, the
+TATP benchmark Suite is not compatible with TM1 Test Suite in some
+respects.<br>
+                  
+                  <h2><b>Summary of changes between TM1 4.1.5 and TATP 1.0</b></h2>
+
+                  <ul>
+                    <li>The benchmark definition has not changed.</li>
+                    <li>The target (SUT) test database schema has not changed.</li>
+                    <li>The TATP test results are fully consistent with the results of TM1 version 4.1.2 and later.</li>
+                    <li>The TIRDB schema has slightly changed: some
+table names has been changed, new columns have been added and some
+referential integrity constraints were removed.</li>
+                    <li>Some test configuration directives were moved between the configuration files (for example, from a TDF file to a DDF file).</li>
+                    <li>New features were added.</li>
+                  </ul>
+When migrating from TM1 to TATP, the following steps are recommended:<br>
+                  <ol>
+                    <li>Setup a new TIRDB using the new TIRDB schema</li>
+                    <li>Write a new TIRDB initialization script to
+populate TIRDB with database product names and versions, OS names and
+hardware names. You may use the example script for that.<br>
+                    </li>
+
+                    <li>Modify all the configurations files: .ini, .ddf and .tdf to correspond to the new definitions</li>
+                    <li>Get acquainted with the new features</li>
+                    <li>If you have test databases populated withTM1, you can use them<br>
+                    </li>
+
+                    <li>Run the tests</li>
+                  </ol>
+                  <h2>Detailed changes</h2>
+                  <h3>TIRDB changes</h3>
+                  <ul>
+                    <li>Table name changes: the table name postfix "_TM1" was removed from tables<br>
+TEST_RUNS_TM1<br>
+MONITORING_DATA_TM1<br>
+CONFIG_DATA_TM1</li>
+                    <li>Table definition changes: Column names have been changed and new columns added in tables:<br>
+HARDWARE<br>
+PROCESSOR_TYPES<br>
+MEMORY_TYPES<br>
+BUS_TYPES<br>
+DISK_TYPES</li>
+                    <li>Foreign key definitions were removed from table HARDWARE</li>
+                  </ul>
+                  <h3>Test configuration file changes</h3>
+                  <ul>
+                    <li>tatp.ini (was:tm1.ini)<br>
+- directive " TargetDBInit" moved to the DDF file<br>
+- a new directive  added: waitDatabaseStart= &lt;integer<br>
+&nbsp;&nbsp;&nbsp;&nbsp; -1 == polling (default)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 0 == (wait until user press Enter)<br>
+&nbsp;&nbsp;&nbsp; &gt;0 == x seconds</li>
+                    
+                    <li>DDF file<br>
+- directive " TargetDBInit" moved from the .ini file<br>
+-&nbsp; directive "transaction_file" moved from the TDF file<br>
+                    </li>
+
+                    <li>TDF file<br>
+- directive "transaction_file" moved to the DDF file<br>
+- new directive: check_targetdb = "yes"|"no"</li>
+                  </ul>
+                  <h3>New command line options</h3>
+                  <ul>
+                    <li>-c&nbsp;&nbsp;&nbsp; Set the working directory
+to the directory path given as an argument. The directory is expected
+to contain all the files that are needed to run TATP benchmark (see
+Input files for details), During and after the benchmark run, log files
+are created and collected in the working directory.</li>
+                    <li>-s&nbsp;&nbsp;&nbsp; Show more detailed
+statistics after the TATP run, which will include amounts of&nbsp;
+executed/rolled back/ignored transactions for each client. The
+parameter will be propagated to Remote Controls from the Main Control.</li>
+                    <li>-t&nbsp;&nbsp;&nbsp; Turn on the TPS table processing.</li>
+                    <li>-i&nbsp;&nbsp;&nbsp; Set the INI file name to the name given as an argument.<br>
+                      <br>
+                    </li>
+                  </ul>
+
+
+                  
+
+
+                              
+                  <hr size="2" width="100%">
+                              
+                  <h2><a name="ChangeLog"></a>Change Log from TM1 v. 3 until the lat TM1 release<br>
+</h2>
+
+                              
+                  <hr size="2" width="100%">
+
+                  <h3>v 4.1.5&nbsp; (2009-03-02)</h3>
+		  <ul>
+		    <li>To avoid problems that occurred in Linux 64-bit
+		    environment, TM1 now uses Solid header file
+		    'solidodbc3.h' instead of unixODBC headers when linked directly to Solid driver.</li>
+		  </ul>		  
+
+                  <h3>v. 4.1.4 (2008-08-08)</h3>
+		  <ul>
+		    <li>New feature: it is now possible to define <i>s_id</i> (subscriber ID) range for each client node separately, in the TDF file</li>
+                    
+                    <li>Response time 90% percentile values (in microseconds) are now stored in a new TIRDB, table:<br>
+                      <tt>CREATE TABLE result_response_90percentile (<br>
+&nbsp;&nbsp;&nbsp; test_run_id INTEGER NOT NULL,<br>
+&nbsp;&nbsp;&nbsp; transaction_type CHAR(32) NOT NULL,<br>
+&nbsp;&nbsp;&nbsp; resp_time INTEGER,<br>
+&nbsp;&nbsp;&nbsp; PRIMARY KEY (test_run_id, transaction_type),<br>
+&nbsp;&nbsp;&nbsp; CONSTRAINT fk_rrs90 FOREIGN KEY (test_run_id) <br>
+&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp; REFERENCES test_runs_tm1(test_run_id)<br>
+&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp; ON UPDATE CASCADE<br>
+&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp; ON DELETE CASCADE);<br>
+                      </tt>The above statement should be run in against
+a TIRDB of any previous TM1 version, in&nbsp; order for the test run to
+succeed (if TIRDB is used).<br>
+                    </li>
+
+                    <li>A new test sequence directive, "execute", is
+added, to the TDF file, to be able run SQL scripts between test runs,
+e.g. execute file="run.sql".</li>
+                    <li>Added automatic Informix-specific session setting (SET LOCK MODE TO WAIT).</li>
+                    <li>Target database schema checking accepts both lower and upper case names.</li>
+                    <li>Socket option SO_REUSEADDR is enabled for better recovery of connections after a program failure.</li>
+                    <li>When compiled in the solidDB Accelerator mode, the program waits for 60 seconds for the database to become operational.</li>
+                    <li>solidDB-specific builds are upgraded to use the libraries of v. 6.1.<br>
+                    </li>
+
+                  </ul>
+                  <h3>v. 4.1.3 (2008-05-09)</h3>
+                  <ul>
+                    <li>IDS ODBC compatibility fix (SQLBindParameter())</li>
+                    <li>Other minor fixes</li>
+                    <li>Fixes facilitating 64b Linux builds with unixODBC<br>
+                    </li>
+                  </ul>
+                  <h3>v. 4.1.2 (2008-03-22)<br>
+
+			</h3>
+
+
+				<ul>
+
+					<li>
+
+Workload generator program ('client') has been changed to multithreaded model 
+
+as compared to multi-process model in the previous versions.
+
+					</li>
+
+					<li>
+
+Response time measurement has been modified to enable microsecond-scale 
+
+resolution for data sources with low latency such as embedded engines. The 
+
+resolution of a system timer used in measurement is statistically estimated and 
+
+reported during the run. Please note that with microsecond-scale resolution the 
+
+actual measurement error can be greater than the nominal measurement 
+
+resolution. The actual error cannot be estimated due to timing uncertainties in 
+
+non-realtime systems but it should be small enough to do a comparative testing.
+
+					</li>
+
+					<li>
+Response time distribution is now reported using a new kind of
+histogram with fixed set of category boundaries of logarithmic scale. A
+new table has been added to TIRDB database to facilitate
+logarithmic-scale histogram. Please note that the new table must be
+added manually in a TIRDB database that was created with older TM1
+versions. The table is, however, included in the TIRDB schema
+distributed with this version. See <a href="#V401">the table definition</a> for more information.
+
+					</li>
+
+			</ul>                  
+			<h3>v. 4.0.1 (2007-11-21)<br>
+</h3>
+                  <ul>
+                    <li>The search key
+distribution for generating the Subscriber ID (s_id) has been changed.
+By default, non-uniform distribution is used. The non-uniform key
+distribution simulates discrete hot spots and models a more realistic
+load pattern by including subscribers of different network activity.
+The change in the key distribution makes the results of 4.0.
+incompatible with the results obtained with previous versions. The old,
+uniform distribution is still available by using a new 'uniform'
+directive in a TDF file. If the value is set to "yes", the program is
+fully compatible with v. 3.1.0.<br>
+                    </li>
+                  </ul>
+                  <hr size="2" width="100%">
+                  
+					<h3><a name="V401"></a> New TiRDB table in TM1 Test Suite 4.1<br>
+</h3>
+
+					<hr size="2" width="100%"><br>
+<pre>CREATE TABLE result_response_scale (<br>    test_run_id INTEGER NOT NULL,<br>    transaction_type CHAR(32) NOT NULL,<br>    slot INTEGER NOT NULL,<br>    bound INTEGER NOT NULL,<br>    num_of_hits INTEGER NULL,<br>    PRIMARY KEY (test_run_id, transaction_type, slot),<br>    CONSTRAINT fk_rrs_test_run FOREIGN KEY (test_run_id) <br>		REFERENCES test_runs_tm1(test_run_id)<br>		ON UPDATE CASCADE<br>		ON DELETE CASCADE</pre><br>
+
+
+                              
+                  <pre><br></pre>
+
+
+</div></td></tr>
+
+</tbody></table>
+
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="43"><img src="images/clear.gif" alt="" border="0" height="1" width="43"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">&nbsp;</td>
+                  <td bgcolor="#ffffff" valign="top" width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="30"></td>
+                  <td bgcolor="#ffffff" valign="top" width="550">&nbsp;</td>
+                  <td bgcolor="#ffffff" valign="top" width="43"><img src="images/clear.gif" alt="" border="0" height="1" width="43"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138"><img src="images/clear.gif" alt="" border="0" height="25" width="138"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td align="center" bgcolor="#0072c6" width="617">
+                    <table border="0" cellpadding="0" cellspacing="0" width="550">
+                      <tbody>
+                        <tr>
+                          <td class="footer">
+                          <br>
+</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td colspan="5" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td width="21"><img src="images/footer_left.gif" alt="" border="0" height="24" width="21"></td>
+                  <td class="copyright" align="center" bgcolor="#96938e" width="758">March 2009<br>
+</td>
+                  <td width="21"><img src="images/footer_right.gif" alt="" border="0" height="24" width="21"></td>
+                </tr>
+                <tr>
+                  <td colspan="3"><img src="images/footer_bottom.gif" alt="" border="0" height="13" width="800"></td>
+                </tr>
+              </tbody>
+            </table>
+          </td>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+        </tr>
+      </tbody>
+    
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  </body></html>
