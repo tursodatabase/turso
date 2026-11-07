@@ -166,6 +166,8 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
+#[cfg(feature = "json")]
+pub use json::get_json;
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
@@ -192,7 +194,7 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
-pub use vdbe::array::{array_values_from_any, text_array_literal};
+pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};
 pub use vdbe::builder::{CursorType, ProgramBuilder};
 pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 pub use vdbe::{
