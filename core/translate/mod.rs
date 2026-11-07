@@ -51,6 +51,9 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+#[cfg(all(test, feature = "fs"))]
+mod temp_schema_write_tests;
+
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
