@@ -4,6 +4,8 @@ mod assert_details;
 #[macro_use]
 mod assertions;
 mod attach;
+#[cfg(feature = "unstable-btree-api")]
+mod btree_cursor_api;
 mod checkpoint_crash_atomicity;
 mod checkpoint_stale_page_size;
 mod common;
