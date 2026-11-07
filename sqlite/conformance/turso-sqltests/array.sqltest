@@ -581,14 +581,14 @@ expect {
     {a,b}
 }
 
-test array-set-element-out-of-bounds {
+test array-set-element-past-end-appends-nulls {
     CREATE TABLE t_oob (id INTEGER PRIMARY KEY, tags text[]) STRICT;
     INSERT INTO t_oob VALUES (1, ARRAY['a','b','c']);
-    UPDATE t_oob SET tags[100] = 'x' WHERE id = 1;
-    SELECT tags FROM t_oob;
+    UPDATE t_oob SET tags[5] = 'x' WHERE id = 1;
+    SELECT changes(), tags, array_length(tags) FROM t_oob;
 }
 expect {
-    {a,b,c}
+    1|{a,b,c,NULL,x}|5
 }
 
 test array-set-multiple-subscripts {
@@ -599,6 +599,88 @@ test array-set-multiple-subscripts {
 }
 expect {
     {X,b,Z}
+}
+
+test array-set-multiple-subscripts-past-end {
+    CREATE TABLE t_multi2 (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_multi2 VALUES (1, ARRAY['a']);
+    UPDATE t_multi2 SET tags[1] = 'X', tags[4] = 'Z' WHERE id = 1;
+    SELECT tags FROM t_multi2;
+}
+expect {
+    {X,NULL,NULL,Z}
+}
+
+test array-set-element-index-zero-is-error {
+    CREATE TABLE t_zero (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_zero VALUES (1, ARRAY['a','b','c']);
+    UPDATE t_zero SET tags[0] = 'x' WHERE id = 1;
+}
+expect error {
+    array subscript 0 is out of range: arrays start at 1
+}
+
+test array-set-element-null-index-is-error {
+    CREATE TABLE t_nullidx (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_nullidx VALUES (1, ARRAY['a','b','c']);
+    UPDATE t_nullidx SET tags[NULL] = 'x' WHERE id = 1;
+}
+expect error {
+    array subscript in assignment must not be null
+}
+
+test array-set-element-text-index-is-error {
+    CREATE TABLE t_textidx (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_textidx VALUES (1, ARRAY['a','b','c']);
+    UPDATE t_textidx SET tags['2'] = 'x' WHERE id = 1;
+}
+expect error {
+    array subscript in assignment must be an integer, got TEXT
+}
+
+test array-set-element-empty-array-index-two-is-error {
+    CREATE TABLE t_emptyidx (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_emptyidx VALUES (1, ARRAY[]);
+    UPDATE t_emptyidx SET tags[2] = 'x' WHERE id = 1;
+}
+expect error {
+    array subscript 2 is out of range: the first element of an empty array is 1
+}
+
+test array-set-element-first-of-empty-and-null-array {
+    CREATE TABLE t_emptyset (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_emptyset VALUES (1, ARRAY[]), (2, NULL);
+    UPDATE t_emptyset SET tags[1] = 'x';
+    SELECT id, tags FROM t_emptyset ORDER BY id;
+}
+expect {
+    1|{x}
+    2|{x}
+}
+
+test array-set-element-function-on-text-array {
+    SELECT array_set_element('{1,2}', 1, 5), array_set_element('{1,2}', 4, 5), array_set_element(NULL, 1, 5);
+}
+expect {
+    {5,2}|{1,2,NULL,5}|{5}
+}
+
+test array-set-element-past-maximum-is-error {
+    CREATE TABLE t_maxidx (id INTEGER PRIMARY KEY, tags text[]) STRICT;
+    INSERT INTO t_maxidx VALUES (1, ARRAY['a']);
+    UPDATE t_maxidx SET tags[100001] = 'x' WHERE id = 1;
+}
+expect error {
+    array subscript 100001 exceeds the maximum element count
+}
+
+test array-set-element-past-end-checks-element-type {
+    CREATE TABLE t_settype (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
+    INSERT INTO t_settype VALUES (1, ARRAY[1]);
+    UPDATE t_settype SET vals[3] = 'abc' WHERE id = 1;
+}
+expect error {
+    cannot store TEXT value in INTEGER
 }
 
 test array-slice-null-start {
@@ -1058,14 +1140,14 @@ test array-oob-index-returns-null {
 expect {
 }
 
-test array-set-element-oob-preserves-original {
+test array-set-element-one-past-end-appends {
     CREATE TABLE t_setoob (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     INSERT INTO t_setoob VALUES (1, '{10,20,30}');
-    UPDATE t_setoob SET vals[99] = 42 WHERE id = 1;
+    UPDATE t_setoob SET vals[4] = 42 WHERE id = 1;
     SELECT vals FROM t_setoob;
 }
 expect {
-    {10,20,30}
+    {10,20,30,42}
 }
 
 test array-any-rejects-invalid-blob {
@@ -1161,14 +1243,13 @@ expect {
 # Data corruption regression tests
 # ============================================================
 
-test dc1-set-element-negative-index-preserves-array {
+test dc1-set-element-negative-index-is-error {
     CREATE TABLE t_dc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     INSERT INTO t_dc1 VALUES (1, '{10,20,30}');
     UPDATE t_dc1 SET vals[-1] = 99 WHERE id = 1;
-    SELECT vals FROM t_dc1;
 }
-expect {
-    {10,20,30}
+expect error {
+    array subscript -1 is out of range: arrays start at 1
 }
 
 test dc2-empty-blob-rejected-for-any-array {
