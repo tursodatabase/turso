@@ -1,4 +1,5 @@
 use super::{
+    collate::CollationSeq,
     emitter::Resolver,
     expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
@@ -48,8 +49,8 @@ use crate::{
     },
     types::SeekOp,
     util::{
-        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
-        try_capture_parameters_column_agnostic,
+        count_fts_column_args, exprs_are_equivalent, normalize_ident, simple_bind_expr,
+        try_capture_parameters, try_capture_parameters_column_agnostic,
     },
     vdbe::{
         affinity::Affinity,
@@ -110,6 +111,7 @@ impl AvailableIndexes {
                     resolver.with_schema(jt.namespace.database_id, |schema| {
                         schema
                             .indices_including_backing(jt.namespace.id, jt.table.get_name())
+                            .filter(|index| !index.has_unknown_collation())
                             .cloned()
                             .collect()
                     });
@@ -2366,6 +2368,7 @@ fn where_term_rejects_null_row(
 /// Enforce INDEXED BY / NOT INDEXED hints by validating index existence and
 /// filtering constraint candidates accordingly.
 fn enforce_indexed_by_hints(
+    resolver: &Resolver,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
     where_clause: &[WhereTerm],
@@ -2395,6 +2398,19 @@ fn enforce_indexed_by_hints(
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
                 let Some(forced_index) = forced_index else {
+                    let skipped_for_unknown_collation =
+                        resolver.with_schema(table_ref.namespace.database_id, |schema| {
+                            schema
+                                .get_index(
+                                    table_ref.namespace.id,
+                                    table_ref.table.get_name(),
+                                    &normalize_ident(idx_name),
+                                )
+                                .is_some_and(|index| index.has_unknown_collation())
+                        });
+                    if skipped_for_unknown_collation {
+                        crate::bail_parse_error!("no query solution");
+                    }
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
                 // A partial index can omit rows that a later RIGHT or FULL JOIN must keep.
@@ -2712,6 +2728,7 @@ fn find_table_access_plan(
     // a null-rejecting WHERE term can turn a LEFT JOIN into an INNER JOIN and
     // then safely prove a forced partial index.
     enforce_indexed_by_hints(
+        resolver,
         table_references,
         available_indexes,
         where_clause,
@@ -4326,12 +4343,15 @@ fn ephemeral_index_build(
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
                 GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
             };
+            let is_search_column = constraint_refs
+                .iter()
+                .any(|constraint| constraint.table_col_pos == Some(i));
             IndexColumn {
                 name: c.name.clone().unwrap(),
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: c.collation(),
+                collation: automatic_index_collation(c, is_search_column),
                 explicit_collation: None,
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
@@ -4385,6 +4405,18 @@ fn ephemeral_index_build(
     };
 
     Ok(ephemeral_index)
+}
+
+/// The collation an automatic index compares a column with. As in SQLite,
+/// the columns after the search columns compare with BINARY. They only order
+/// rows whose search columns are equal, so a lookup never depends on their
+/// collation.
+fn automatic_index_collation(column: &Column, is_search_column: bool) -> CollationSeq {
+    if is_search_column {
+        column.collation()
+    } else {
+        CollationSeq::BINARY
+    }
 }
 
 /// Find conditions that can filter rows while an automatic index is built.

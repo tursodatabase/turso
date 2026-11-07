@@ -22,7 +22,10 @@ use crate::{
 };
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
+use super::{
+    access_method::AccessMethod, automatic_index_collation,
+    cost::index_access_is_unique_point_lookup, join::JoinN,
+};
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
@@ -939,9 +942,13 @@ fn temporary_index_order_consumed(
         .count();
     let rowid_alias_col = columns.iter().position(|column| column.is_rowid_alias());
     let key_columns = constraint_refs.iter().map(|constraint| {
-        constraint
+        let column_pos = constraint
             .table_col_pos
-            .expect("a temporary index key must name a table column")
+            .expect("a temporary index key must name a table column");
+        (
+            column_pos,
+            automatic_index_collation(&columns[column_pos], true),
+        )
     });
     let other_columns = columns
         .iter()
@@ -952,17 +959,19 @@ fn temporary_index_order_consumed(
                 .iter()
                 .any(|constraint| constraint.table_col_pos == Some(*column_pos))
         })
-        .map(|(column_pos, _)| column_pos);
-    let index_columns = key_columns.chain(other_columns).map(|column_pos| {
-        let column = &columns[column_pos];
-        IndexOrderColumn {
-            pos_in_table: column_pos,
-            order: SortOrder::Asc,
-            nulls_order: None,
-            collation: column.collation(),
-            expr: column.generated_expr(),
-        }
-    });
+        .map(|(column_pos, column)| (column_pos, automatic_index_collation(column, false)));
+    let index_columns = key_columns
+        .chain(other_columns)
+        .map(|(column_pos, collation)| {
+            let column = &columns[column_pos];
+            IndexOrderColumn {
+                pos_in_table: column_pos,
+                order: SortOrder::Asc,
+                nulls_order: None,
+                collation,
+                expr: column.generated_expr(),
+            }
+        });
 
     index_columns_order_consumed(
         table_ref,

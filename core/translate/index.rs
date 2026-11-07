@@ -1091,8 +1091,16 @@ fn resolve_sorted_columns_with_catalog(
             resolve_index_column(unwrapped_expr, table)
         {
             let ty = column_type(column, table.is_strict, schema);
-            let collation = key_collation(explicit_collation, &ty, schema)?
-                .unwrap_or_else(|| column.collation());
+            let collation = match (key_collation(explicit_collation, &ty, schema)?, resolver) {
+                (Some(collation), _) => collation,
+                (None, Some(resolver)) => {
+                    let collation = column.text_collation().unwrap_or(TextCollation::Binary);
+                    CollationSeq::Text(index_key_collation(
+                        resolver.resolve_schema_collation(collation)?,
+                    )?)
+                }
+                (None, None) => column.collation(),
+            };
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
@@ -1203,12 +1211,11 @@ fn extract_collation<'a>(
             Expr::Collate(inner, seq) => {
                 if coll.is_none() {
                     let collation = match resolver {
-                        Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-                        None => TextCollation::new(seq.as_str())?,
+                        Some(resolver) => {
+                            index_key_collation(resolver.resolve_collation(seq.as_str())?)?
+                        }
+                        None => TextCollation::from_schema(seq.as_str()),
                     };
-                    if collation.is_custom() {
-                        crate::bail_parse_error!("custom collations are not supported in indexes");
-                    }
                     coll = Some(collation);
                 }
                 current = inner.as_ref();
@@ -1216,6 +1223,15 @@ fn extract_collation<'a>(
             _ => return Ok((coll, current)),
         }
     }
+}
+
+/// The collation a new index compares its keys with. Index b-trees cannot
+/// compare with a custom collation yet.
+fn index_key_collation(collation: TextCollation) -> crate::Result<TextCollation> {
+    if collation.is_custom() {
+        crate::bail_parse_error!("custom collations are not supported in indexes");
+    }
+    Ok(collation)
 }
 
 /// For a given Index Expression, attempts to resolve it to a column position in the table.
