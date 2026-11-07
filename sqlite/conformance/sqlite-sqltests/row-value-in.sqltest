@@ -191,6 +191,137 @@ expect {
     2|2
 }
 
+setup row_value_null_component_schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, c INT);
+    INSERT INTO t VALUES
+        (1,1,2,3),(2,NULL,2,3),(3,1,NULL,3),(4,NULL,9,3),(5,NULL,NULL,3),(6,NULL,2,NULL),(7,5,5,5);
+    CREATE TABLE s(x INT, y INT, z INT);
+    INSERT INTO s VALUES (1,2,3),(4,5,6);
+}
+
+# A NULL in the row value must not stop the later components from being read:
+# they can still rule out every row of the subquery.
+@setup row_value_null_component_schema
+test row-value-null-first-component-not-in-subquery {
+    SELECT id, (a,b,c) NOT IN (SELECT x,y,z FROM s) FROM t ORDER BY id;
+}
+expect {
+    1|0
+    2|
+    3|
+    4|1
+    5|
+    6|
+    7|1
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-in-subquery {
+    SELECT id, (a,b,c) IN (SELECT x,y,z FROM s) FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|
+    3|
+    4|0
+    5|
+    6|
+    7|0
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-not-in-subquery-where {
+    SELECT id FROM t WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s) ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-not-in-subquery-left-join-on {
+    SELECT t.id, u.id FROM t LEFT JOIN t AS u ON (t.a,t.b,t.c) NOT IN (SELECT x,y,z FROM s) AND u.id = 1 ORDER BY 1;
+}
+expect {
+    1|
+    2|
+    3|
+    4|1
+    5|
+    6|
+    7|1
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-under-not {
+    SELECT id FROM t WHERE NOT (a,b,c) IN (SELECT x,y,z FROM s) ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-update-where {
+    UPDATE t SET c = 99 WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s);
+    SELECT id FROM t WHERE c = 99 ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-delete-where {
+    DELETE FROM t WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s);
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+    6
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-view {
+    CREATE VIEW v AS SELECT id FROM t WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s);
+    SELECT id FROM v ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-trigger-when {
+    CREATE TABLE log(id INT);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN (new.a,new.b,new.c) NOT IN (SELECT x,y,z FROM s)
+    BEGIN
+        INSERT INTO log VALUES (new.id);
+    END;
+    INSERT INTO t VALUES (20,NULL,9,3),(21,NULL,2,3);
+    SELECT id FROM log ORDER BY id;
+}
+expect {
+    20
+}
+
+# Row 2 follows a row whose second component is 9. The 9 must not be compared in
+# place of the NULL read for row 2.
+test row-value-null-component-does-not-reuse-previous-row-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    INSERT INTO t VALUES (1,9,9),(2,NULL,NULL);
+    CREATE TABLE s(x INT, y INT);
+    INSERT INTO s VALUES (1,2);
+    SELECT id, (coalesce(a,b),b) NOT IN (SELECT x,y FROM s) FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|
+}
+
 test row-value-false-null-first-in {
     SELECT ((NULL,1) IN ((1,1))) IS NULL;
 }
