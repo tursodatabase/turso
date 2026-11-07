@@ -3,7 +3,10 @@ use std::fmt::Write;
 
 use crate::numeric::Numeric;
 use crate::types::{ImmutableRecord, Value, ValueIterator};
-use crate::Result;
+use crate::{LimboError, Result};
+
+/// The most elements an array value can hold.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
 
 /// Extract values from a record-format array blob.
 /// Returns Err if the blob is not a valid record.
@@ -404,6 +407,52 @@ fn array_find_streaming(
         }
     }
     None
+}
+
+/// Set the element at a 1-based `index`, as PostgreSQL's `a[index] = value`
+/// does for a one-dimensional array. An index past the end extends the array
+/// with NULLs. Turso arrays always start at 1, so an assignment PostgreSQL
+/// answers by moving the lower bound (an index below 1, or an index above 1
+/// into an empty array) is an error rather than a silent no-op.
+pub(crate) fn exec_array_set_element(arr: &Value, index: &Value, value: &Value) -> Result<Value> {
+    let index = match index {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Null => {
+            return Err(LimboError::InvalidArgument(
+                "array subscript in assignment must not be null".into(),
+            ))
+        }
+        other => {
+            return Err(LimboError::InvalidArgument(format!(
+                "array subscript in assignment must be an integer, got {}",
+                other.value_type()
+            )))
+        }
+    };
+    let Some(mut elements) = array_values_from_any(arr) else {
+        return Ok(Value::Null);
+    };
+    if index < 1 {
+        return Err(LimboError::InvalidArgument(format!(
+            "array subscript {index} is out of range: arrays start at 1"
+        )));
+    }
+    if elements.is_empty() && index > 1 {
+        return Err(LimboError::InvalidArgument(format!(
+            "array subscript {index} is out of range: the first element of an empty array is 1"
+        )));
+    }
+    let position = (index - 1) as usize;
+    if position >= MAX_ARRAY_ELEMENTS {
+        return Err(LimboError::InvalidArgument(format!(
+            "array subscript {index} exceeds the maximum element count ({MAX_ARRAY_ELEMENTS})"
+        )));
+    }
+    if position >= elements.len() {
+        elements.resize(position + 1, Value::Null);
+    }
+    elements[position] = value.clone();
+    values_to_record_blob(&elements)
 }
 
 pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Result<Value> {
