@@ -1052,6 +1052,40 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
 }
 
 #[test]
+fn external_aggregates_preserve_outer_subquery_ownership() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+            ExternalFunc::new_native_aggregate(
+                "weighted".into(),
+                2,
+                WeightedSum {
+                    queue: queue.clone(),
+                    created: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .unwrap(),
+        ),
+    );
+    for (sql, expected) in [
+        ("WITH t(x) AS (VALUES (1),(2)) SELECT (SELECT weighted(t.x, t.x)) FROM t", 5),
+        ("WITH t(x) AS (VALUES (1),(2)), e(x) AS (SELECT 1 WHERE 0) SELECT coalesce((SELECT weighted(t.x,t.x) FROM e), -1) FROM t", -1),
+        ("WITH t(x) AS (VALUES (1),(2)) SELECT abs(weighted(x,x)) FROM t", 5),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(collect(&mut stmt, &queue), vec![vec![Value::from_i64(expected)]], "{sql}");
+    }
+    for sql in [
+        "WITH t(x) AS (VALUES (1),(2)) SELECT max(weighted(x,x)) FROM t",
+        "WITH t(x) AS (VALUES (1),(2)) SELECT sum((SELECT weighted(t.x,t.x))) FROM t",
+        "WITH t(x) AS (VALUES (1),(2)) SELECT x FROM t WHERE (SELECT weighted(t.x,t.x))>0",
+    ] {
+        let error = conn.prepare(sql).unwrap_err().to_string();
+        assert!(error.contains("misuse of aggregate"), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn native_variadic_aggregates_use_callsite_argument_count() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
