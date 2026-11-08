@@ -15996,7 +15996,7 @@ pub fn op_parse_schema(
     // Store state for resumption across IO boundaries
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
-        rows: crate::alloc::Vec::new(),
+        rows: TursoAllocExt::new(),
         trigger_target_database_id: *trigger_target_database_id,
         db: *db,
         previous_auto_commit,
@@ -16077,7 +16077,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 conn.with_database_schema_mut(db, |schema| {
                     let attached_resolver =
                         |alias: &str| qualifiers.database_id(&crate::util::normalize_ident(alias));
-                    let mut from_sql_indexes = crate::alloc::Vec::new();
+                    let mut from_sql_indexes = crate::alloc::Vec::try_with_capacity_ext(10)?;
                     let mut automatic_indices = crate::HashMap::default();
                     let mut dbsp_state_roots = crate::HashMap::default();
                     let mut dbsp_state_index_roots = crate::HashMap::default();
