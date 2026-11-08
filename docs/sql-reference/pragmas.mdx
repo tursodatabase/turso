@@ -213,6 +213,29 @@ PRAGMA main.foreign_key_list(child);
 SELECT * FROM pragma_foreign_key_list('child');
 ```
 
+### foreign_key_check
+
+Finds rows that break a foreign key. Returns one row for each child row that has no matching
+parent row.
+
+```sql
+PRAGMA foreign_key_check;
+PRAGMA foreign_key_check(child);
+-- table | rowid | parent | fkid
+-- child | 3     | parent | 0
+```
+
+table is the child table, rowid is the broken row, parent is the table the key points at, and
+fkid is the id that foreign_key_list gives the key. A row that breaks two keys is returned
+twice. A row with a NULL in the key is skipped. The result is the same whether foreign_keys is
+on or off.
+
+Without an argument all tables are checked. With a table name only that table is checked, and
+an unknown name is an error. If the parent table does not exist, every row with no NULL in the
+key is returned. If the parent columns are not a PRIMARY KEY or a UNIQUE index, the pragma
+fails with a foreign key mismatch error. An optional schema prefix selects the database, and
+pragma_foreign_key_check() returns the same rows as a table-valued function.
+
 ### collation_list
 
 Returns one row for each collating sequence available on the connection.
