@@ -10,22 +10,60 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
     }
 }
 
-/// The value of an aggregated argument: `None` for NULL, `error` for TEXT or BLOB
+/// The value of an aggregated argument: `None` for NULL, an error for TEXT or BLOB
 /// (as in SQLite's ext/misc/percentile.c), the number otherwise.
-fn numeric_input(value: Option<&Value>, error: &'static str) -> Result<Option<f64>, &'static str> {
+fn numeric_input(value: Option<&Value>) -> Result<Option<f64>, ()> {
     match value.map(Value::value_type) {
-        Some(ValueType::Text | ValueType::Blob) => Err(error),
+        Some(ValueType::Text | ValueType::Blob) => Err(()),
         _ => Ok(value.and_then(Value::to_float)),
     }
 }
 
-/// Values, fraction, first error about the fraction, first non-numeric input error.
-type PercentileState = (
-    Vec<f64>,
-    Option<f64>,
-    Option<&'static str>,
-    Option<&'static str>,
-);
+/// Values, fraction and the first error. Like SQLite's ext/misc/percentile.c, which stops at the
+/// first error, `finalize` reports it before anything else.
+type PercentileState = (Vec<f64>, Option<f64>, Option<String>);
+
+/// Step of percentile, percentile_cont and percentile_disc, in the order of SQLite's percentStep:
+/// the fraction must be a number in [0, `max_fraction`] and the same on every row, then a NULL
+/// value is skipped and any other non-numeric value is an error.
+fn fraction_step(state: &mut PercentileState, args: &[Value], name: &str, max_fraction: f64) {
+    let (values, fraction, error) = state;
+    if error.is_some() {
+        return;
+    }
+    let p = match args.get(1) {
+        Some(p)
+            if matches!(
+                p.value_type(),
+                ValueType::Integer | ValueType::Float | ValueType::Text
+            ) =>
+        {
+            p.to_float()
+        }
+        _ => None,
+    };
+    let Some(p) = p.filter(|p| (0.0..=max_fraction).contains(p)) else {
+        *error = Some(format!(
+            "the fraction argument to {name}() is not between 0.0 and {max_fraction:.1}"
+        ));
+        return;
+    };
+    match *fraction {
+        None => *fraction = Some(p),
+        Some(first) if ((first - p) / max_fraction).abs() > 0.001 => {
+            *error = Some(format!(
+                "the fraction argument to {name}() is not the same for all input rows"
+            ));
+            return;
+        }
+        Some(_) => {}
+    }
+    match numeric_input(args.first()) {
+        Ok(Some(y)) => values.push(y),
+        Ok(None) => {}
+        Err(()) => *error = Some(format!("input to {name}() is not numeric")),
+    }
+}
 
 #[derive(AggregateDerive)]
 struct Median;
@@ -38,11 +76,11 @@ impl AggFunc for Median {
 
     fn step(state: &mut Self::State, args: &[Value]) {
         let (values, input_err) = state;
-        match numeric_input(args.first(), "input to median() is not numeric") {
+        match numeric_input(args.first()) {
             Ok(Some(val)) => values.push(val),
             Ok(None) => {}
-            Err(err) => {
-                input_err.get_or_insert(err);
+            Err(()) => {
+                input_err.get_or_insert("input to median() is not numeric");
             }
         }
     }
@@ -74,47 +112,21 @@ struct Percentile;
 
 impl AggFunc for Percentile {
     type State = PercentileState;
-    type Error = &'static str;
+    type Error = String;
     const NAME: &'static str = "percentile";
     const ARGS: i32 = 2;
 
     fn step(state: &mut Self::State, args: &[Value]) {
-        let (values, p_value, err_value, input_err) = state;
-        let y = match numeric_input(args.first(), "input to percentile() is not numeric") {
-            Ok(y) => y,
-            Err(err) => {
-                input_err.get_or_insert(err);
-                return;
-            }
-        };
-        if let (Some(y), Some(p)) = (y, args.get(1).and_then(Value::to_float)) {
-            if !(0.0..=100.0).contains(&p) {
-                err_value.get_or_insert("Invalid percentile value");
-                return;
-            }
-
-            if let Some(existing_p) = *p_value {
-                if (existing_p - p).abs() >= 0.001 {
-                    err_value.get_or_insert("Inconsistent percentile values across rows");
-                    return;
-                }
-            } else {
-                *p_value = Some(p);
-            }
-            values.push(y);
-        }
+        fraction_step(state, args, Self::NAME, 100.0);
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        let (mut values, p_value, err_value, input_err) = state;
-        if let Some(err) = input_err {
+        let (mut values, p_value, error) = state;
+        if let Some(err) = error {
             return Err(err);
         }
         if values.is_empty() {
             return Ok(Value::null());
-        }
-        if let Some(err) = err_value {
-            return Err(err);
         }
         if values.len() == 1 {
             return Ok(Value::from_float(values[0]));
@@ -143,24 +155,21 @@ struct PercentileCont;
 
 impl AggFunc for PercentileCont {
     type State = PercentileState;
-    type Error = &'static str;
+    type Error = String;
     const NAME: &'static str = "percentile_cont";
     const ARGS: i32 = 2;
 
     fn step(state: &mut Self::State, args: &[Value]) {
-        fraction_step(state, args, "input to percentile_cont() is not numeric");
+        fraction_step(state, args, Self::NAME, 1.0);
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        let (mut values, p_value, err_state, input_err) = state;
-        if let Some(err) = input_err {
+        let (mut values, p_value, error) = state;
+        if let Some(err) = error {
             return Err(err);
         }
         if values.is_empty() {
             return Ok(Value::null());
-        }
-        if let Some(err) = err_state {
-            return Err(err);
         }
         if values.len() == 1 {
             return Ok(Value::from_float(values[0]));
@@ -184,40 +193,12 @@ impl AggFunc for PercentileCont {
     }
 }
 
-/// Step of percentile_cont and percentile_disc: the fraction is in [0, 1].
-fn fraction_step(state: &mut PercentileState, args: &[Value], input_error: &'static str) {
-    let (values, p_value, err_state, input_err) = state;
-    let y = match numeric_input(args.first(), input_error) {
-        Ok(y) => y,
-        Err(err) => {
-            input_err.get_or_insert(err);
-            return;
-        }
-    };
-    if let (Some(y), Some(p)) = (y, args.get(1).and_then(Value::to_float)) {
-        if !(0.0..=1.0).contains(&p) {
-            err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
-            return;
-        }
-
-        if let Some(existing_p) = *p_value {
-            if (existing_p - p).abs() >= 0.001 {
-                err_state.get_or_insert("Inconsistent percentile values across rows");
-                return;
-            }
-        } else {
-            *p_value = Some(p);
-        }
-        values.push(y);
-    }
-}
-
 #[derive(AggregateDerive)]
 struct PercentileDisc;
 
 impl AggFunc for PercentileDisc {
     type State = PercentileState;
-    type Error = &'static str;
+    type Error = String;
     const NAME: &'static str = "percentile_disc";
     const ARGS: i32 = 2;
 
@@ -226,19 +207,16 @@ impl AggFunc for PercentileDisc {
         // in SQLite's ext/misc/percentile.c and PostgreSQL. Using
         // Percentile::step admitted p up to 100 while finalize indexes by
         // fraction, so percentile_disc(x, 100) ran off the end.
-        fraction_step(state, args, "input to percentile_disc() is not numeric");
+        fraction_step(state, args, Self::NAME, 1.0);
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        let (mut values, p_value, err_value, input_err) = state;
-        if let Some(err) = input_err {
+        let (mut values, p_value, error) = state;
+        if let Some(err) = error {
             return Err(err);
         }
         if values.is_empty() {
             return Ok(Value::null());
-        }
-        if let Some(err) = err_value {
-            return Err(err);
         }
 
         let p = p_value.ok_or("percentile value must be provided")?;
@@ -299,7 +277,6 @@ impl AggFunc for StandardDeviation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turso_ext::ValueType;
 
     type PctState = PercentileState;
 
@@ -324,19 +301,15 @@ mod tests {
         // Used to inherit percentile()'s [0, 100] validation while indexing by
         // fraction, reading past the end of the sorted values.
         for p in [100.0, 2.0, 1.5, -0.5] {
-            // All rows rejected, so NULL rather than an out-of-bounds read.
-            assert_eq!(
-                run::<PercentileDisc>(&[1.0, 2.0], p).unwrap().value_type(),
-                ValueType::Null,
-                "percentile_disc should not index with p = {p}"
-            );
-            // A leading valid row keeps values non-empty, so finalize reports
-            // the rejection instead of collapsing to NULL.
-            assert_eq!(
-                run_rows::<PercentileDisc>(&[(1.0, 0.5), (2.0, p)]).err(),
-                Some("Percentile value must be between 0.0 and 1.0 inclusive"),
-                "percentile_disc should reject p = {p}"
-            );
+            // Rejected whether or not an earlier row was accepted, never an
+            // out-of-bounds read.
+            for rows in [&[(1.0, p), (2.0, p)][..], &[(1.0, 0.5), (2.0, p)][..]] {
+                assert_eq!(
+                    run_rows::<PercentileDisc>(rows).err().as_deref(),
+                    Some("the fraction argument to percentile_disc() is not between 0.0 and 1.0"),
+                    "percentile_disc should reject p = {p}"
+                );
+            }
         }
     }
 
@@ -373,8 +346,10 @@ mod tests {
             Some(32.0)
         );
         assert_eq!(
-            run_rows::<Percentile>(&[(10.0, 50.0), (20.0, 101.0)]).err(),
-            Some("Invalid percentile value")
+            run_rows::<Percentile>(&[(10.0, 50.0), (20.0, 101.0)])
+                .err()
+                .as_deref(),
+            Some("the fraction argument to percentile() is not between 0.0 and 100.0")
         );
     }
 }
