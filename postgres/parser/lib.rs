@@ -229,6 +229,25 @@ pub fn alter_table_add_column_table(
     ))
 }
 
+/// Returns the (schema, table) of a positional VALUES INSERT (no explicit column list).
+/// Returns None for any other statement, for INSERT with a column list, or for DEFAULT VALUES.
+pub fn positional_insert_table(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::InsertStmt(insert), ..) = nodes.first()? else {
+        return None;
+    };
+    if !insert.cols.is_empty() || insert.select_stmt.is_none() {
+        return None;
+    }
+    let relation = insert.relation.as_ref()?;
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
 /// A table that a foreign key of a CREATE TABLE or ALTER TABLE statement
 /// refers to: the byte offset of its name in the statement, the schema the
 /// name has, if any, and the name itself, as PostgreSQL reads them.

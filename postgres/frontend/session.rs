@@ -443,6 +443,26 @@ fn prepare_statement_inner(
                 })
         })
         .unwrap_or_default();
+    if let Some((schema, table)) = turso_pg_parser::positional_insert_table(&parse_result) {
+        let has_generated = relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
+            .into_iter()
+            .find_map(|ns| {
+                pg_conn.conn.with_schema(ns.database_id(), |s| {
+                    s.get_btree_table(ns.target.id, &table)
+                        .map(|t| t.columns().iter().any(|c| c.is_generated()))
+                })
+            })
+            .unwrap_or(false);
+        if has_generated {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "positional INSERT into table \"{table}\" with generated columns \
+                     requires an explicit column list"
+                ),
+            ));
+        }
+    }
     let conn_for_names = Arc::clone(&pg_conn.conn);
     let translator = PostgreSQLTranslator::new()
         .with_relation_name_check(move |schema, name| {
