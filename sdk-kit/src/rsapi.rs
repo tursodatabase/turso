@@ -1189,6 +1189,16 @@ impl TursoConnection {
     pub fn interrupt(&self) {
         self.connection.interrupt();
     }
+    /// Invoke `handler` approximately every `ops` virtual machine instructions
+    /// while a statement runs on this connection. A handler that returns
+    /// `true` interrupts the statement. `None` or `ops == 0` removes it.
+    pub fn set_progress_handler(
+        &self,
+        ops: u64,
+        handler: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    ) {
+        self.connection.set_progress_handler(ops, handler);
+    }
     /// Set the maximum wall-clock duration a single statement is allowed to run
     /// before it is interrupted. `Duration::ZERO` disables the timeout.
     pub fn set_query_timeout(&self, duration: Duration) {

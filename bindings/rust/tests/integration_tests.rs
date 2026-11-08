@@ -2917,6 +2917,60 @@ async fn test_query_timeout_interrupts_a_runaway_statement() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_progress_handler_interrupts_when_it_returns_true() {
+    let conn = memory_connection().await;
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = calls.clone();
+    conn.set_progress_handler(
+        1000,
+        Some(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    )
+    .unwrap();
+    let mut rows = conn
+        .query(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) SELECT count(*) FROM c",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 100000);
+    drop(rows);
+    assert!(
+        calls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "a handler that returns false runs without stopping the statement"
+    );
+
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let token = cancelled.clone();
+    conn.set_progress_handler(
+        1000,
+        Some(move || token.load(std::sync::atomic::Ordering::Acquire)),
+    )
+    .unwrap();
+    let canceller = cancelled.clone();
+    let cancel = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        canceller.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let started = std::time::Instant::now();
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    cancel.join().unwrap();
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // Removing the handler lets the next statement run to completion.
+    conn.set_progress_handler(0, None::<fn() -> bool>).unwrap();
+    let mut rows = conn.query("SELECT 3", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_interrupt_from_another_thread_stops_a_running_statement() {
     let conn = memory_connection().await;
 
