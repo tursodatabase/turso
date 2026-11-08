@@ -150,7 +150,7 @@ change when they are converted to text.
 | SELECT ... NATURAL JOIN   | ✅ Yes     |                                                                                   |
 | UPDATE                    | ✅ Yes     |                                                                                   |
 | VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
-| WITH clause               | 🚧 Partial | WITH RECURSIVE not yet supported.  |
+| WITH clause               | ✅ Yes     | Includes WITH RECURSIVE.           |
 | WINDOW functions             | 🚧 Partial | Aggregate functions, `row_number`, `rank`, `dense_rank`, `first_value`, `last_value`, and `nth_value` work with the default frame. Missing: `percent_rank`, `cume_dist`, `ntile`, `lag`, and `lead`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) are not yet supported. |
 | GENERATED                 | 🚧 Partial      | virtual columns only (partial affinity support). |
 | WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. Effectively **insert-only**: CREATE / INSERT / SELECT work (incl. composite PK), but UPDATE, DELETE, UPSERT, `INSERT OR REPLACE`, secondary UNIQUE constraints, secondary `CREATE INDEX`, `FOREIGN KEY`, CDC, and materialized views are all rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |

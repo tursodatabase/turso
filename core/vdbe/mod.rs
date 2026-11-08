@@ -1676,14 +1676,14 @@ impl ProgramState {
             .expect("an instruction that reports IO leaves its completion in the state")
     }
 
-    /// Runs `f` on the metrics of this statement including its active and
-    /// cached subprograms, without copying them when there is no subprogram.
+    /// Runs `f` on the metrics of this statement including its active
+    /// subprogram, without copying them when there is no active subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
+        let has_active_subprogram = matches!(
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
+        );
+        if has_active_subprogram {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1695,18 +1695,12 @@ impl ProgramState {
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
-        for statement in self.subprogram_stmt_cache.values() {
-            metrics.merge(&statement.metrics());
-        }
         metrics
     }
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_metrics();
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_metrics();
         }
     }
@@ -1719,13 +1713,11 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
             crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::Run => self.metrics.runs = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_stmt_status(counter);
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_stmt_status(counter);
         }
     }
@@ -2739,6 +2731,10 @@ impl Program {
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
+                    Ok(InsnFunctionStepResult::Interrupt) => {
+                        state.interrupt();
+                        program.interrupted_during_step(state, pager)
+                    }
                     Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
@@ -2846,7 +2842,7 @@ impl Program {
                 // its own rows, so roll back the whole transaction while
                 // returning the real preparation error to the caller.
                 let rollback_error =
-                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.clone());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
                     tracing::error!(
                         "Abort also failed after FAIL index-method preparation: \
@@ -4528,7 +4524,7 @@ mod tests {
         for trace in [false, true] {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
-                crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+                crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();

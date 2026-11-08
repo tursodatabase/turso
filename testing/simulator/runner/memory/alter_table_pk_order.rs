@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, StepResult,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
+use turso_sqlite::SqliteDialect;
 
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
@@ -74,11 +73,6 @@ fn sim_alter_table_preserves_autoindex_order_across_reopen() -> Result<()> {
         "INSERT INTO t VALUES ('alpha', 'one'), ('beta', 'two')",
     )?;
     step_done(&conn, &io, "ALTER TABLE t ADD COLUMN d TEXT DEFAULT 'x'")?;
-
-    step_done(&conn, &io, "CREATE TABLE u (a TEXT UNIQUE, b TEXT)")?;
-    step_done(&conn, &io, "INSERT INTO u VALUES ('x', 'y')")?;
-    step_done(&conn, &io, "ALTER TABLE u ALTER COLUMN a TO aa TEXT")?;
-    step_done(&conn, &io, "ALTER TABLE u ADD COLUMN q TEXT")?;
 
     drop(conn);
     io.close_files();

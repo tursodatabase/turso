@@ -138,7 +138,7 @@ enum DmlColumnRegisters {
 /// holds either the value the user sees or the value ENCODE produced, and an
 /// expression that reads the column, such as a generated column `val * 2`,
 /// must see the user's value. Reading a stored value therefore runs DECODE.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DmlRowForm {
     /// Every column holds the user's value, as before ENCODE in INSERT.
     UserFacing,
@@ -148,6 +148,18 @@ pub enum DmlRowForm {
     /// UPDATE before ENCODE: the SET columns hold the user's values and the
     /// other columns hold the stored values read from the table.
     StoredExceptUpdated(ColumnMask),
+}
+
+impl DmlRowForm {
+    /// Whether column `col_idx` holds the value ENCODE stored rather than the
+    /// user's value.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        match self {
+            DmlRowForm::UserFacing => false,
+            DmlRowForm::Stored => true,
+            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -206,17 +218,11 @@ impl DmlColumnContext {
     }
 
     /// Whether the register of column `col_idx` holds the value ENCODE
-    /// stored rather than the user's value. A virtual generated column's
-    /// register holds the result of its expression, which is the user's value.
-    pub fn holds_stored_value(&self, col_idx: usize, column: &Column) -> bool {
-        if column.is_virtual_generated() || self.rowid_alias_col == Some(col_idx) {
-            return false;
-        }
-        match &self.form {
-            DmlRowForm::UserFacing => false,
-            DmlRowForm::Stored => true,
-            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
-        }
+    /// stored rather than the user's value. A virtual generated column
+    /// follows the row's form like any other column: in a row of stored
+    /// values, its expression's value is ENCODEd too.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        self.rowid_alias_col != Some(col_idx) && self.form.holds_stored_value(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
@@ -401,7 +407,8 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
-    const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
+    const READS_STORED_VALUES: u16 = 1 << 9;
+    const WRITES_STORED_VALUES: u16 = 1 << 10;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -497,9 +504,9 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
+    /// When set, a custom-type column is read in its stored form, without
+    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
+    /// compares stored values.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }
@@ -509,16 +516,35 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, array result columns are returned as their stored record
-    /// blobs instead of being converted to display text. Engine-internal
-    /// statements (e.g. VACUUM's table copy) write these values back to
-    /// storage, and the text form does not keep element types.
-    pub const fn keep_array_results_as_blobs(self) -> bool {
-        self.get(Self::KEEP_ARRAY_RESULTS_AS_BLOBS)
+    /// When set, a custom-type column is read as its stored value, without
+    /// DECODE, and an array result stays a record blob instead of becoming
+    /// display text. Engine-internal statements (e.g. VACUUM's table copy)
+    /// write these values back to storage as they are.
+    pub const fn reads_stored_values(self) -> bool {
+        self.get(Self::READS_STORED_VALUES)
     }
     #[inline]
-    pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
-        self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
+    pub const fn set_reads_stored_values(&mut self, v: bool) {
+        self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// Whether reading a custom-type column runs its DECODE.
+    pub const fn decodes_custom_type_columns(self) -> bool {
+        !self.suppress_custom_type_decode() && !self.reads_stored_values()
+    }
+
+    #[inline]
+    /// When set, the values INSERT and UPDATE write to custom-type columns
+    /// are already stored values, so they are written without ENCODE. Set
+    /// for statements that copy rows, such as VACUUM's table copy and an
+    /// ON UPDATE CASCADE action.
+    pub const fn writes_stored_values(self) -> bool {
+        self.get(Self::WRITES_STORED_VALUES)
+    }
+    #[inline]
+    pub const fn set_writes_stored_values(&mut self, v: bool) {
+        self.set(Self::WRITES_STORED_VALUES, v)
     }
 
     #[inline]

@@ -975,9 +975,8 @@ expect @tursopg {
     {"a": "x\ny\u0001\"\/\u00e9\t"}
 }
 
-# A CHECK constraint sees a uuid column as the stored blob, but auth.uid()
-# returns the uuid as text, so tursopg refuses the comparison instead of
-# rejecting every row.
+# A CHECK constraint sees a uuid column as a query reads it, so comparing it
+# with auth.uid() finds them equal.
 @setup auth_functions
 test auth-uid-in-a-check-constraint-on-a-uuid-column {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
@@ -989,13 +988,10 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg error {
-    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
-}
 
 # coalesce(), nullif() and CASE give auth.uid()'s value unchanged, so comparing
-# them with a uuid column is refused as well. tursopg cannot find the type of
-# the CASE at all, so it refuses that CHECK constraint for that reason.
+# them with a uuid column works as well. tursopg cannot find the type of the
+# CASE, so it refuses that CHECK constraint.
 @setup auth_functions
 test auth-uid-in-coalesce-in-a-check-constraint-on-a-uuid-column {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
@@ -1006,9 +1002,6 @@ test auth-uid-in-coalesce-in-a-check-constraint-on-a-uuid-column {
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
-}
-expect @tursopg error {
-    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
 }
 
 @setup auth_functions
@@ -1021,9 +1014,6 @@ test auth-uid-in-nullif-in-a-check-constraint-on-a-uuid-column {
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
-}
-expect @tursopg error {
-    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
 }
 
 @setup auth_functions

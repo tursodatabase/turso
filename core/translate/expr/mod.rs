@@ -1,10 +1,13 @@
-use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{comparison_collation, first_collation, in_list_collation, CollationSeq};
+use super::collate::{
+    check_collate_operand, check_expr_collation, comparison_collation, first_collation,
+    in_list_collation, CollationSeq,
+};
 use super::emitter::Resolver;
 use super::expr_context::{ExprContext, ExprProperties};
 use super::optimizer::Optimizable;
@@ -27,7 +30,7 @@ use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
-    insn::{CmpInsFlags, InsertFlags, Insn},
+    insn::{CmpInsFlags, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
@@ -90,18 +93,25 @@ pub(crate) use affinity::{
     StorageClassMask,
 };
 pub(crate) use arrays::{
-    emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
+    emit_array_decode, emit_array_leaf_loop, emit_custom_type_decode_columns,
+    emit_custom_type_encode_columns, ArrayInput,
 };
+pub(crate) use binary::{row_value_component_expr, row_value_len};
+pub(crate) use binding::check_custom_types;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
+pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
-pub(crate) use custom_type_operators::{custom_operator_call, emit_operator_call_on_registers};
-pub(crate) use custom_types::runs_custom_type_function;
+pub(crate) use custom_type_operators::{
+    check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
+};
 pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
+    emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
+pub(crate) use custom_types::{runs_custom_type_function, takes_input_of_type};
 pub use emission::{
     emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,
 };
@@ -110,6 +120,7 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
+pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };

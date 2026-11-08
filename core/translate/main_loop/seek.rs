@@ -43,8 +43,8 @@ pub(super) fn encode_seek_keys_for_custom_types(
             break;
         }
         let idx_col = &seek_index.columns[idx_col_pos];
-        // An expression column holds the expression's value, not the column's.
-        if idx_col.expr.is_some() {
+        // An expression column holds the expression's value, not a column's.
+        if idx_col.expression().is_some() {
             continue;
         }
         let table_col = match columns.get(idx_col.pos_in_table) {
@@ -75,19 +75,45 @@ pub(super) fn encode_seek_keys_for_custom_types(
         // does not run: the column's limits apply to what it stores, not to
         // what it is compared with. `n = 3.504` on a numeric(10,2) column
         // matches no row instead of matching 3.50.
+        // An array index holds arrays whose elements are encoded. A text key
+        // such as '{1,2}' is parsed into an array first, as when it is stored.
         let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-        for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
-                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
-            }
+        if table_col.is_array() {
+            crate::translate::expr::emit_array_leaf_loop(
+                program,
+                reg,
+                table_col.array_dimensions(),
+                crate::translate::expr::ArrayInput::TextIfArray,
+                |program, leaf_reg| emit_seek_key_encode(program, &resolved, leaf_reg, resolver),
+            )?;
+        } else {
+            emit_seek_key_encode(program, &resolved, reg, resolver)?;
         }
-        program.preassign_label_to_next_insn(skip_label);
     }
+    Ok(())
+}
+
+/// Emits the ENCODE of each of `chain`'s types on the key in `reg`. NULL is
+/// left as it is.
+fn emit_seek_key_encode(
+    program: &mut ProgramBuilder,
+    resolved: &crate::schema::ResolvedType,
+    reg: usize,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    crate::translate::expr::emit_encode_for_comparison(
+        program,
+        &resolved.chain,
+        resolved.storage_class()?,
+        reg,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 

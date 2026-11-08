@@ -646,6 +646,11 @@ fn update_pragma(
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
+            if !connection.dialect().supports_capture_data_changes() {
+                crate::bail_parse_error!(
+                    "capture_data_changes is not supported with this frontend"
+                );
+            }
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             // InitCdcVersion handles everything at execution time:
@@ -1271,15 +1276,6 @@ fn query_pragma(
                 resolver.with_schema(table_namespace.database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(table_namespace.id, &table_name) {
                         let btree = table.btree();
-                        let pk_cols: Vec<String> = btree
-                            .as_ref()
-                            .map(|bt| {
-                                bt.primary_key_columns
-                                    .iter()
-                                    .map(|(name, _)| name.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
                         let without_rowid_pk_index = match &btree {
                             Some(bt) => without_rowid_primary_key_index(bt)?,
                             None => None,
@@ -1290,19 +1286,13 @@ fn query_pragma(
                             .map(|index| index.as_ref())
                             .chain(without_rowid_pk_index.as_ref());
                         for (seq, index) in indices.enumerate() {
-                            let origin = if index.name.starts_with("sqlite_autoindex_") {
-                                let idx_cols: Vec<&str> =
-                                    index.columns.iter().map(|c| c.name.as_str()).collect();
-                                if idx_cols.len() == pk_cols.len()
-                                    && idx_cols
-                                        .iter()
-                                        .zip(pk_cols.iter())
-                                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                                {
-                                    "pk"
-                                } else {
-                                    "u"
-                                }
+                            let origin = if btree
+                                .as_ref()
+                                .is_some_and(|bt| bt.is_primary_key_index(index))
+                            {
+                                "pk"
+                            } else if index.name.starts_with("sqlite_autoindex_") {
+                                "u"
                             } else {
                                 "c"
                             };
@@ -2020,6 +2010,8 @@ fn emit_columns_for_table_info(
             1
         } else if column.is_virtual_generated() {
             2
+        } else if column.is_stored_generated() {
+            3
         } else {
             // normal column
             0
@@ -2038,7 +2030,34 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        program.emit_string8(column.ty_str.clone(), base_reg + 2);
+        let mut declared_type = column.ty_str.clone();
+        let written_type = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
+        if !column.ty_params.is_empty()
+            && !matches!(
+                written_type.as_bytes().first(),
+                Some(b'"' | b'\'' | b'`' | b'[')
+            )
+        {
+            declared_type.push('(');
+            for (i, param) in column.ty_params.iter().enumerate() {
+                if i > 0 {
+                    declared_type.push(',');
+                }
+                match param.as_ref() {
+                    Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                        declared_type.push('-');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                        declared_type.push('+');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    _ => declared_type.push_str(&param.to_string()),
+                }
+            }
+            declared_type.push(')');
+        }
+        program.emit_string8(declared_type, base_reg + 2);
 
         // notnull
         program.emit_bool(

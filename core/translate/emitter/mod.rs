@@ -9,9 +9,9 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, emit_table_column,
-        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
-        WalkControl,
+        bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
+        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
+        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -29,7 +29,7 @@ use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
+    Table,
 };
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
@@ -46,7 +46,9 @@ use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
-    util::{check_expr_references_column, exprs_are_equivalent, parse_numeric_literal},
+    util::{
+        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
     CaptureDataChangesExt, Connection, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -176,6 +178,9 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// The statement is compiled for a role that is not a superuser, which may
+    /// not use a sequence or a PRAGMA anywhere, including inside a view.
+    pub(crate) role_is_not_superuser: bool,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -196,6 +201,15 @@ impl RegisterColumn {
             affinity: column.affinity(),
             collation: crate::translate::collate::column_collation(column),
             column_type: column_type(column, is_strict, schema),
+        }
+    }
+
+    /// A column of the table being written whose register holds the value
+    /// DECODE gave, so comparisons use the affinity of that value's kind.
+    pub fn decoded_table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
+        Self {
+            affinity: column.comparison_affinity(),
+            ..Self::table_column(column, is_strict, schema)
         }
     }
 
@@ -290,16 +304,26 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => {
-                Some(table.columns().iter().map(|c| c.affinity()).collect())
-            }
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.comparison_affinity())
+                    .collect(),
+            ),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.comparison_affinity())
+                        .collect()
+                }),
         };
 
         Self {
@@ -344,7 +368,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::dialect::SqliteDialect),
+            Arc::new(crate::EngineDialect),
             None,
         )
     }
@@ -386,6 +410,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            role_is_not_superuser: false,
         }
     }
 
@@ -420,6 +445,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            role_is_not_superuser: self.role_is_not_superuser,
         }
     }
 
@@ -436,6 +462,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            role_is_not_superuser: self.role_is_not_superuser,
         }
     }
 
@@ -715,13 +742,6 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
     ) -> Result<NamespaceRef> {
         self.catalog.resolve_existing_trigger(qualified_name)
-    }
-
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.catalog.resolve_existing_sequence(seq_name)
     }
 
     /// The namespace and bare name of the sequence whose mangled name is
@@ -2064,8 +2084,8 @@ pub(crate) fn emit_index_column_value_old_image(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -2089,16 +2109,6 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
-                let column = &table.columns()[idx_col.pos_in_table];
-                if column.is_virtual_generated() {
-                    program.emit_column_affinity(dest_reg, column.affinity());
-                }
-            }
-        }
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
@@ -2185,8 +2195,8 @@ fn emit_index_column_value_new_image(
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let expr = expr.clone();
         let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
@@ -2212,10 +2222,10 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
+            GeneratedType::Virtual { .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    expr,
+                    col_in_table,
                     dest_reg,
                     columns_start_reg,
                     columns,
@@ -2225,6 +2235,14 @@ fn emit_index_column_value_new_image(
                     table,
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::Stored { .. } => {
+                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
             }
             GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {
@@ -2325,13 +2343,24 @@ fn emit_check_constraint_bytecode(
                 let col_regs: Vec<usize> = column_mappings.iter().map(|(_, r)| *r).collect();
                 let col_names: Vec<String> =
                     column_mappings.iter().map(|(n, _)| n.to_string()).collect();
+                let mut constraint_info = ConstraintInfo::check(
+                    table_name,
+                    check_constraint.name.clone(),
+                    col_regs,
+                    col_names,
+                );
+                if let Some(table) = referenced_tables
+                    .and_then(|tables| tables.joined_tables().first())
+                    .and_then(|joined_table| joined_table.table.btree())
+                {
+                    // Turn off the column register cache, or a column named
+                    // `value` would replace the `value` that DECODE reads.
+                    resolver.expr_to_reg_cache_enabled = false;
+                    emit_constraint_values_decode(program, resolver, &table, &mut constraint_info)?;
+                    resolver.enable_expr_to_reg_cache();
+                }
                 program.emit_insn(Insn::Halt {
-                    constraint_info: Some(Box::new(ConstraintInfo::check(
-                        table_name,
-                        check_constraint.name.clone(),
-                        col_regs,
-                        col_names,
-                    ))),
+                    constraint_info: Some(Box::new(constraint_info)),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: halt_on_error,
@@ -2356,16 +2385,17 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
-/// Takes column-to-register mappings as an iterator to avoid heap allocation.
+/// `stored_columns` gives each column's register, holding the row's stored
+/// value, after ENCODE.
 /// `halt_on_error` is the resolve type carried by the Halt of a failed CHECK.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
-    table_name: &str,
+    table: &BTreeTable,
     rowid_reg: usize,
-    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
     halt_on_error: Option<ResolveType>,
@@ -2376,7 +2406,41 @@ pub(crate) fn emit_check_constraints<'a>(
         return Ok(());
     }
 
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
+    let table_name = table.name.as_str();
+    let mut stored_column_mappings = Vec::new();
+    // A CHECK sees the values a SELECT reads, so it reads a custom-type column
+    // after DECODE, as `ceil(n)` on a numeric must compute from 4.50, not
+    // from the stored blob. Only the columns the CHECKs name are decoded.
+    let mut column_mappings = Vec::new();
+    for (column, stored_reg) in stored_columns {
+        let Some(col_name) = column.name.as_deref() else {
+            continue;
+        };
+        stored_column_mappings.push((col_name, stored_reg));
+        let is_named_by_a_check = || {
+            let normalized_name = normalize_ident(col_name);
+            check_constraints
+                .iter()
+                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
+        };
+        let register = if resolver.schema().column_has_decode(column, table.is_strict)
+            && is_named_by_a_check()
+        {
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                stored_reg,
+                decoded_reg,
+                column,
+                table.is_strict,
+                resolver,
+            )?;
+            decoded_reg
+        } else {
+            stored_reg
+        };
+        column_mappings.push((col_name, register));
+    }
     let initial_cache_size = resolver.expr_to_reg_cache.len();
     let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
 
@@ -2445,7 +2509,7 @@ pub(crate) fn emit_check_constraints<'a>(
         skip_row_label,
         referenced_tables,
         table_name,
-        &column_mappings,
+        &stored_column_mappings,
     );
 
     // Always restore resolver state, even on error.

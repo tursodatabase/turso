@@ -8,7 +8,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use turso_core::{
     CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags,

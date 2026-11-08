@@ -262,9 +262,9 @@ expect error {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-test custom-type-vs-integer-error {
+test custom-type-vs-real-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(amount cents CHECK(amount < 50)) STRICT;
+    CREATE TABLE t(amount cents CHECK(amount < 0.5)) STRICT;
 }
 expect error {
     type mismatch
@@ -290,13 +290,13 @@ expect error {
 }
 
 # ============================================================================
-# Custom type with CAST — valid, and CHECK works correctly
+# Custom type compared with a literal — CHECK sees the value a read gives
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-test custom-type-cast-valid-insert {
+test custom-type-literal-valid-insert {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents CHECK(amount < 50)) STRICT;
     INSERT INTO t VALUES(1, 42);
     SELECT id, amount FROM t;
 }
@@ -305,9 +305,9 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test custom-type-cast-check-violation {
+test custom-type-literal-check-violation {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    CREATE TABLE t(amount cents CHECK(amount < 50)) STRICT;
     INSERT INTO t VALUES(60);
 }
 expect error {
@@ -315,9 +315,9 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test custom-type-cast-greater-than-zero {
+test custom-type-literal-greater-than-zero {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(amount cents CHECK(amount > CAST(0 AS cents))) STRICT;
+    CREATE TABLE t(amount cents CHECK(amount > 0)) STRICT;
     INSERT INTO t VALUES(10);
     SELECT amount FROM t;
 }
@@ -326,9 +326,9 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test custom-type-cast-greater-than-zero-violation {
+test custom-type-literal-greater-than-zero-violation {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(amount cents CHECK(amount > CAST(0 AS cents))) STRICT;
+    CREATE TABLE t(amount cents CHECK(amount > 0)) STRICT;
     INSERT INTO t VALUES(-5);
 }
 expect error {
@@ -347,25 +347,147 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test custom-type-between-cast {
+test custom-type-between-literals {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(amount cents CHECK(amount BETWEEN CAST(0 AS cents) AND CAST(100 AS cents))) STRICT;
+    CREATE TABLE t(amount cents CHECK(amount BETWEEN 0 AND 100)) STRICT;
     INSERT INTO t VALUES(50);
-    SELECT amount FROM t;
+    INSERT INTO t VALUES(130);
 }
-expect {
-    50
+expect error {
+    CHECK constraint failed
 }
 
 @requires strict "uses STRICT tables"
-test custom-type-in-list-cast {
+test custom-type-in-list-literals {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t(amount cents CHECK(amount IN (CAST(10 AS cents), CAST(20 AS cents), CAST(30 AS cents)))) STRICT;
+    CREATE TABLE t(amount cents CHECK(amount IN (10, 20, 30))) STRICT;
     INSERT INTO t VALUES(20);
-    SELECT amount FROM t;
+    INSERT INTO t VALUES(25);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# -5 is an integer like 5, so it compares with a cents column, whose type
+# takes integers as input, as 5 does.
+@requires strict "uses STRICT tables"
+test custom-type-negative-literals {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(
+        amount cents CHECK(amount > -5),
+        n numeric(10,2) CHECK(n BETWEEN -5.5 AND 5) CHECK(n IN (-1, -4.5))
+    ) STRICT;
+    INSERT INTO t VALUES(-4, -4.5);
+    SELECT amount, n FROM t;
 }
 expect {
-    20
+    -4|-4.50
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-negative-literal-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount > -5)) STRICT;
+    INSERT INTO t VALUES(-6);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# A CHECK sees a custom-type column as a SELECT reads it, so the column
+# compares with any integer value when its type takes integers as input: an
+# expression such as -5 - 1 or another integer column, not only a literal.
+@requires strict "uses STRICT tables"
+test custom-type-compares-with-values-of-its-input-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(
+        amount cents CHECK(amount > -5 - 1),
+        lim integer,
+        CHECK(amount < lim)
+    ) STRICT;
+    INSERT INTO t VALUES(-5, 0);
+    SELECT amount, lim FROM t;
+}
+expect {
+    -5|0
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-input-type-expression-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount > -5 - 1)) STRICT;
+    INSERT INTO t VALUES(-6);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-integer-column-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents, lim integer, CHECK(amount < lim)) STRICT;
+    INSERT INTO t VALUES(60, 50);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-in-check-compares-like-select {
+    -- CAST(50 AS cents) gives 50, the value a read gives, and the CHECK
+    -- compares it with the amount as a SELECT does.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    INSERT INTO t VALUES(40);
+    SELECT amount, amount < CAST(50 AS cents) FROM t;
+}
+expect {
+    40|1
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-in-check-compares-like-select-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    INSERT INTO t VALUES(60);
+}
+expect error {
+    CHECK constraint failed: amount < CAST\(50 AS cents\)
+}
+
+# A CAST gives the decoded value whether or not it is inside another CAST.
+@requires strict "uses STRICT tables"
+test cast-inside-cast-in-check-gives-decoded-value {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(i integer CHECK (CAST(CAST(i AS cents) AS integer) = 6 AND CAST(i AS cents) = 6)) STRICT;
+    INSERT INTO t VALUES (6);
+    SELECT i FROM t;
+}
+expect {
+    6
+}
+
+@requires strict "uses STRICT tables"
+test integrity-check-sees-custom-type-column-like-insert {
+    -- INSERT and integrity_check both run the CHECK on the decoded 'ba'.
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TABLE t(s rev CHECK (s LIKE 'b%')) STRICT;
+    INSERT INTO t VALUES ('ba');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test integrity-check-sees-cast-in-check-like-insert {
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TABLE t(s text CHECK (CAST(s AS rev) LIKE 'b%')) STRICT;
+    INSERT INTO t VALUES ('ba');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
 }
 
 # ============================================================================
@@ -479,6 +601,79 @@ test function-call-abs-valid {
 }
 expect {
     -42
+}
+
+@requires strict "uses STRICT tables"
+test function-call-abs-of-text-is-a-number {
+    -- abs converts text to a number first.
+    CREATE TABLE t(a TEXT CHECK(abs(a) < 100)) STRICT;
+    INSERT INTO t VALUES('-42');
+    SELECT a FROM t;
+}
+expect {
+    -42
+}
+
+@requires strict "uses STRICT tables"
+test function-call-coalesce-min-max-of-mixed-types {
+    -- coalesce, min and max may return any of their arguments, so with an
+    -- integer and a text argument the result may be either.
+    CREATE TABLE t(
+        a TEXT,
+        b INTEGER,
+        CHECK(coalesce(b, a) <> 'x'),
+        CHECK(ifnull(b, a) <> 'x'),
+        CHECK(min(b, a) <> 'x'),
+        CHECK(max(b, a) <> 'x')
+    ) STRICT;
+    INSERT INTO t VALUES('y', NULL);
+    SELECT a FROM t;
+}
+expect {
+    y
+}
+
+@requires strict "uses STRICT tables"
+test function-call-iif-else-value {
+    -- iif may return its last value, not only its first.
+    CREATE TABLE t(a TEXT, b INTEGER, CHECK(iif(b > 0, b, a) <> 'x')) STRICT;
+    INSERT INTO t VALUES('y', 0);
+    SELECT a FROM t;
+}
+expect {
+    y
+}
+
+@requires strict "uses STRICT tables"
+test function-call-coalesce-of-text-vs-integer-error {
+    CREATE TABLE t(a TEXT, b TEXT, CHECK(coalesce(a, b) > 1)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test function-call-coalesce-of-mixed-types-in-arithmetic {
+    -- coalesce of an integer and text may be a number, so arithmetic on it is allowed.
+    CREATE TABLE t(
+        a INTEGER,
+        b TEXT,
+        CHECK(coalesce(a, b) + 1 > 0),
+        CHECK(-ifnull(a, 'none') < 1)
+    ) STRICT;
+    INSERT INTO t VALUES (5, 'x');
+    SELECT * FROM t;
+}
+expect {
+    5|x
+}
+
+@requires strict "uses STRICT tables"
+test arithmetic-on-text-column-error {
+    CREATE TABLE t(a TEXT, CHECK(a + 1 > 0)) STRICT;
+}
+expect error {
+    arithmetic requires numeric types, got TEXT and INTEGER
 }
 
 @requires strict "uses STRICT tables"
@@ -640,4 +835,138 @@ test bitwise-produces-integer {
 }
 expect {
     4
+}
+
+# ============================================================================
+# A CHECK sees a custom-type column as SELECT reads it, after DECODE
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test check-ceil-of-numeric {
+    CREATE TABLE t(n numeric(10,2), CHECK(ceil(n) > 4)) STRICT;
+    INSERT INTO t VALUES(4.5);
+    INSERT INTO t VALUES(-4.5);
+}
+expect error {
+    CHECK constraint failed: ceil\(n\) > 4
+}
+
+@requires strict "uses STRICT tables"
+test check-round-of-numeric {
+    CREATE TABLE t(n numeric(10,2), CHECK(round(n) > 4)) STRICT;
+    INSERT INTO t VALUES(4.5);
+    SELECT n, round(n) > 4 FROM t;
+}
+expect {
+    4.50|1
+}
+
+@requires strict "uses STRICT tables"
+test check-abs-of-numeric {
+    CREATE TABLE t(n numeric(10,2), CHECK(abs(n) < 10)) STRICT;
+    INSERT INTO t VALUES(-5);
+    INSERT INTO t VALUES(-20);
+}
+expect error {
+    CHECK constraint failed: abs\(n\) < 10
+}
+
+@requires strict "uses STRICT tables"
+test check-substr-of-numeric {
+    CREATE TABLE t(n numeric(10,2), CHECK(substr(n, 1, 1) <> '-')) STRICT;
+    INSERT INTO t VALUES(4.5);
+    INSERT INTO t VALUES(-4.5);
+}
+expect error {
+    CHECK constraint failed: substr\(n, 1, 1\) <> '-'
+}
+
+@requires strict "uses STRICT tables"
+test check-arithmetic-on-numeric {
+    CREATE TABLE t(n numeric(10,2), CHECK(substr(n, 1) + 0 > 0), CHECK(CAST(n AS REAL) * 2 < 10)) STRICT;
+    INSERT INTO t VALUES(4.5);
+    SELECT n FROM t;
+}
+expect {
+    4.50
+}
+
+@requires strict "uses STRICT tables"
+test check-arithmetic-on-numeric-violation {
+    CREATE TABLE t(n numeric(10,2), CHECK(CAST(n AS REAL) * 2 < 10)) STRICT;
+    INSERT INTO t VALUES(20);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test check-numeric-vs-literal {
+    CREATE TABLE t(n numeric(10,2), CHECK(n > 4)) STRICT;
+    INSERT INTO t VALUES(4.5);
+    INSERT INTO t VALUES(3);
+}
+expect error {
+    CHECK constraint failed: n > 4
+}
+
+@requires strict "uses STRICT tables"
+test check-length-of-uuid {
+    CREATE TABLE t(id uuid, CHECK(length(id) = 36), CHECK(substr(id, 15, 1) = '4')) STRICT;
+    INSERT INTO t VALUES('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT id FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+@requires strict "uses STRICT tables"
+test check-uuid-violation {
+    CREATE TABLE t(id uuid, CHECK(substr(id, 15, 1) = '4')) STRICT;
+    INSERT INTO t VALUES('a0eebc99-9c0b-1ef8-bb6d-6bb9bd380a11');
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test check-on-update-and-upsert-sees-decoded-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), m numeric(10,2), CHECK(ceil(n) > 4)) STRICT;
+    INSERT INTO t VALUES(1, 4.5, 1);
+    UPDATE t SET m = 2;
+    INSERT INTO t VALUES(1, 4.5, 3) ON CONFLICT(id) DO UPDATE SET n = 5.5;
+    SELECT n, m FROM t;
+}
+expect {
+    5.50|2.00
+}
+
+@requires strict "uses STRICT tables"
+test check-on-update-violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), CHECK(ceil(n) > 4)) STRICT;
+    INSERT INTO t VALUES(1, 4.5);
+    UPDATE t SET n = -4.5;
+}
+expect error {
+    CHECK constraint failed: ceil\(n\) > 4
+}
+
+@requires strict "uses STRICT tables"
+test check-on-upsert-violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), CHECK(ceil(n) > 4)) STRICT;
+    INSERT INTO t VALUES(1, 4.5);
+    INSERT INTO t VALUES(1, 4.5) ON CONFLICT(id) DO UPDATE SET n = -4.5;
+}
+expect error {
+    CHECK constraint failed: ceil\(n\) > 4
+}
+
+@requires strict "uses STRICT tables"
+test check-added-by-alter-sees-decoded-values {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES(-4.5);
+    ALTER TABLE t ADD COLUMN m INTEGER CHECK(ceil(n) > 4);
+}
+expect error {
+    CHECK constraint failed
 }

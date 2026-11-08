@@ -4,6 +4,7 @@ use turso_pg::{
     Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags, StepResult,
     TransactionState,
 };
+use turso_sqlite::SqliteDialect;
 
 fn pg_connection() -> (Arc<dyn turso_core::IO>, Connection) {
     let (io, db) =
@@ -260,6 +261,34 @@ fn errors_report_postgres_sqlstates() {
     ] {
         let e = exec_err(&conn, sql);
         assert_eq!(e.sqlstate, code, "wrong SQLSTATE for: {sql}, got {e:?}");
+    }
+}
+
+#[test]
+fn array_types_with_more_than_seven_dimensions_are_not_supported() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE DOMAIN posint AS INT").unwrap();
+    conn.execute("CREATE TABLE seven (a INT[][][][][][][])")
+        .unwrap();
+    conn.execute("ALTER TABLE seven ADD COLUMN b posint[][][][][][][]")
+        .unwrap();
+    conn.execute("SELECT '{}'::int[][][][][][][]").unwrap();
+    for sql in [
+        "CREATE TABLE v3 (c4 INT[][][][][][][][])",
+        "CREATE TABLE v3 (c4 posint[][][][][][][][])",
+        "CREATE TABLE v3 (c4 _int4[][][][][][][])",
+        "ALTER TABLE seven ADD COLUMN c int[][][][][][][][]",
+        "SELECT '{}'::int[][][][][][][][]",
+        "SELECT CAST('{}' AS posint[][][][][][][][])",
+        "SELECT * FROM json_to_recordset('[]') AS x(a int[][][][][][][][])",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "0A000", "{sql}: {e:?}");
+        assert_eq!(
+            e.to_string(),
+            "an array type with 8 dimensions (at most 7) is not supported",
+            "{sql}"
+        );
     }
 }
 
@@ -563,6 +592,95 @@ fn foreign_key_update_reports_structured_fields() {
         stmt.run_collect_rows().unwrap(),
         vec![vec![Value::from_i64(1)]]
     );
+}
+
+#[test]
+fn constraint_details_show_custom_type_values_as_the_user_wrote_them() {
+    let (_io, conn) = pg_connection();
+    for sql in [
+        "CREATE TABLE t_pk (id uuid PRIMARY KEY)",
+        "INSERT INTO t_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "CREATE TABLE t_j (j jsonb UNIQUE)",
+        "INSERT INTO t_j VALUES ('{\"a\":1}')",
+        "CREATE TABLE t_u (k INT PRIMARY KEY, id uuid UNIQUE)",
+        "INSERT INTO t_u VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        // A column named `value` must not stand in for the value DECODE reads.
+        "CREATE TABLE t_ck (value INT, id uuid, n INT CHECK (n > 0))",
+        "CREATE TABLE t_nn (id uuid, n INT NOT NULL, b uuid NOT NULL)",
+        "CREATE TABLE t_arr (a INT[] UNIQUE, ids uuid[], n INT CHECK (n > 0))",
+        "INSERT INTO t_arr VALUES ('{1,2}', NULL, 1)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for (sql, detail) in [
+        (
+            "INSERT INTO t_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+            "Key (id)=(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
+        ),
+        (
+            "INSERT INTO t_j VALUES ('{\"a\":1}')",
+            "Key (j)=({\"a\":1}) already exists.",
+        ),
+        (
+            "UPDATE t_u SET id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' WHERE k = 2",
+            "Key (id)=(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
+        ),
+        (
+            "INSERT INTO t_u VALUES (1, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') \
+             ON CONFLICT (k) DO UPDATE SET id = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+            "Key (id)=(b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
+        ),
+        (
+            "INSERT INTO t_ck VALUES (5, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 0)",
+            "Failing row contains (5, a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, 0).",
+        ),
+        // `n` is checked before the row is encoded, `b` after.
+        (
+            "INSERT INTO t_nn VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', NULL, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+            "Failing row contains (a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, null, b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11).",
+        ),
+        (
+            "INSERT INTO t_nn VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 1, NULL)",
+            "Failing row contains (a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, 1, null).",
+        ),
+        (
+            "INSERT INTO t_arr VALUES ('{1,2}', NULL, 1)",
+            "Key (a)=({1,2}) already exists.",
+        ),
+        (
+            "INSERT INTO t_arr VALUES ('{3}', '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}', 0)",
+            "Failing row contains ({3}, {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}, 0).",
+        ),
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(constraint_violation(&e).detail.as_deref(), Some(detail), "{sql}");
+    }
+}
+
+#[test]
+fn foreign_key_details_show_custom_type_values_as_the_user_wrote_them() {
+    let (_io, conn) = pg_connection_with_fk();
+    for sql in [
+        "CREATE TABLE parent (id uuid PRIMARY KEY)",
+        "CREATE TABLE child (id INT PRIMARY KEY, pid uuid REFERENCES parent(id))",
+        "INSERT INTO parent VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "INSERT INTO child VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let detail =
+        "Key (pid)=(b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) is not present in table \"parent\".";
+    for sql in [
+        "INSERT INTO child VALUES (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "UPDATE child SET pid = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(
+            constraint_violation(&e).detail.as_deref(),
+            Some(detail),
+            "{sql}"
+        );
+    }
 }
 
 #[test]
@@ -1889,7 +2007,7 @@ fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>)
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(turso_core::SqliteDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();

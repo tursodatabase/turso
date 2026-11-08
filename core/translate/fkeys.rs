@@ -3,7 +3,9 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
+use crate::translate::expr::{
+    emit_constraint_values_decode, emit_stored_column, emit_table_column_for_dml,
+};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
 use crate::{
@@ -1416,7 +1418,9 @@ pub fn emit_fk_child_update_counters(
             // missing: violation (immediate HALT or deferred +1)
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            let constraint_info = (!fk_ref.fk.deferred).then(|| {
+            let constraint_info = if fk_ref.fk.deferred {
+                None
+            } else {
                 let regs = fk_ref
                     .fk
                     .child_columns
@@ -1430,8 +1434,10 @@ pub fn emit_fk_child_update_counters(
                         }
                     })
                     .collect();
-                Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
-            });
+                Some(Box::new(fk_constraint_info(
+                    program, resolver, child_tbl, &fk_ref.fk, regs,
+                )?))
+            };
             emit_fk_violation(program, &fk_ref.fk, constraint_info)?;
         } else {
             let parent_tbl = resolver
@@ -1479,7 +1485,9 @@ pub fn emit_fk_child_update_counters(
                 ncols,
                 |_p| Ok(()),
                 |p| {
-                    let constraint_info = (!fk_ref.fk.deferred).then(|| {
+                    let constraint_info = if fk_ref.fk.deferred {
+                        None
+                    } else {
                         let regs = fk_ref
                             .fk
                             .child_columns
@@ -1493,8 +1501,10 @@ pub fn emit_fk_child_update_counters(
                                 }
                             })
                             .collect();
-                        Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
-                    });
+                        Some(Box::new(fk_constraint_info(
+                            p, resolver, child_tbl, &fk_ref.fk, regs,
+                        )?))
+                    };
                     emit_fk_violation(p, &fk_ref.fk, constraint_info)?;
                     Ok(())
                 },
@@ -1509,14 +1519,26 @@ pub fn emit_fk_child_update_counters(
     Ok(())
 }
 
+/// Builds the error info for a missing parent row, and emits the decode of the
+/// child key values it reports. Emit it on the violation path only.
 pub(crate) fn fk_constraint_info(
-    child_table: &str,
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    child_table: &BTreeTable,
     fk: &ForeignKey,
     regs: Vec<usize>,
-) -> ConstraintInfo {
+) -> Result<ConstraintInfo> {
     let columns = fk.child_columns.to_vec();
     let name = fk.constraint_name.clone();
-    ConstraintInfo::fk(child_table, name, columns, regs, fk.parent_table.clone())
+    let mut info = ConstraintInfo::fk(
+        &child_table.name,
+        name,
+        columns,
+        regs,
+        fk.parent_table.clone(),
+    );
+    emit_constraint_values_decode(program, resolver, child_table, &mut info)?;
+    Ok(info)
 }
 
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.
@@ -1699,6 +1721,9 @@ pub struct FkActionContext {
     pub old_key_registers: Vec<usize>,
     /// Registers containing NEW parent key values (for UPDATE only)
     pub new_key_registers: Option<Vec<usize>>,
+    /// Whether the NEW key registers hold the parent's stored key, which the
+    /// action writes into the child without ENCODE.
+    pub new_key_is_stored: bool,
 }
 
 impl FkActionContext {
@@ -1706,13 +1731,19 @@ impl FkActionContext {
         Self {
             old_key_registers,
             new_key_registers: None,
+            new_key_is_stored: false,
         }
     }
 
-    pub fn new_for_update(old_key_registers: Vec<usize>, new_key_registers: Vec<usize>) -> Self {
+    pub fn new_for_update(
+        old_key_registers: Vec<usize>,
+        new_key_registers: Vec<usize>,
+        new_key_is_stored: bool,
+    ) -> Self {
         Self {
             old_key_registers,
             new_key_registers: Some(new_key_registers),
+            new_key_is_stored,
         }
     }
 
@@ -1888,6 +1919,9 @@ fn emit_fk_action_subprogram(
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
         );
+        subprogram_builder
+            .flags
+            .set_writes_stored_values(ctx.new_key_is_stored);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
@@ -2514,13 +2548,42 @@ pub fn fire_fk_update_actions(
             new_rowid_reg,
             new_key_start,
         )?;
+        // ON UPDATE CASCADE copies the parent's stored key into a child column
+        // of the same type, as PostgreSQL copies a value assigned to a column
+        // of its own type. A child column of another type, or of a type whose
+        // DECODE changes values, gets the parent's value and runs its own
+        // ENCODE. When no key column has a DECODE, the decoded key below is
+        // the stored key.
+        let new_key_is_stored = matches!(fk_ref.fk.on_update, RefAct::Cascade)
+            && child_key_takes_parent_stored_key(resolver, &parent_bt, fk_ref)?;
+        let key_has_decode = parent_cols.iter().any(|pcol| {
+            parent_bt
+                .get_column(pcol)
+                .is_some_and(|(_, col)| resolver.schema().column_has_decode(col, true))
+        });
+        let new_stored_key_start = if new_key_is_stored && key_has_decode {
+            let start = program.alloc_registers(ncols);
+            copy_key_from_values(
+                program,
+                &parent_bt,
+                parent_cols,
+                new_values_start,
+                &new_image_layout,
+                new_rowid_reg,
+                start,
+            )?;
+            start
+        } else {
+            new_key_start
+        };
 
         // Decode encoded values so they match the subprogram's decoded column reads
         decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
         decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
-        let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
+        let new_key_registers: Vec<usize> =
+            (new_stored_key_start..new_stored_key_start + ncols).collect();
 
         // Check if parent key changed - skip action if all values are equal
         let skip_action = program.allocate_label();
@@ -2536,7 +2599,11 @@ pub fn fire_fk_update_actions(
 
         program.preassign_label_to_next_insn(key_changed);
 
-        let ctx = FkActionContext::new_for_update(old_key_registers, new_key_registers);
+        let ctx = FkActionContext::new_for_update(
+            old_key_registers,
+            new_key_registers,
+            new_key_is_stored,
+        );
 
         match fk_ref.fk.on_update {
             RefAct::Cascade => {
@@ -2557,6 +2624,49 @@ pub fn fire_fk_update_actions(
     }
 
     Ok(())
+}
+
+/// Whether the parent's stored key is also the child's stored key, so ON UPDATE
+/// CASCADE can copy it. Holds when every child key column has the type of its
+/// parent key column and that type's DECODE returns the stored value
+/// unchanged. Columns without a custom type always qualify: their stored form
+/// is their value.
+///
+/// The cascade finds child rows by decoded key. A DECODE that changes values
+/// could read two stored keys back as one value (`DECODE lower(value)` reads
+/// 'A' and 'a' as 'a'), and copying the stored key would then move the child
+/// of another parent.
+fn child_key_takes_parent_stored_key(
+    resolver: &Resolver,
+    parent_bt: &BTreeTable,
+    fk_ref: &ResolvedFkRef,
+) -> Result<bool> {
+    let schema = resolver.schema();
+    let child_bt = &fk_ref.child_table;
+    for (pcol, &cpos) in fk_ref.parent_cols.iter().zip(fk_ref.child_pos.iter()) {
+        let child_col = &child_bt.columns()[cpos];
+        let (_, parent_col) = parent_bt
+            .get_column(pcol)
+            .ok_or_else(|| LimboError::InternalError(format!("parent col {pcol} missing")))?;
+        let child_has_custom_type = schema.column_has_custom_type(child_col, child_bt.is_strict);
+        let parent_has_custom_type = schema.column_has_custom_type(parent_col, parent_bt.is_strict);
+        if !child_has_custom_type && !parent_has_custom_type {
+            continue;
+        }
+        if !(child_has_custom_type
+            && parent_has_custom_type
+            && parent_col.has_same_declared_type(child_col))
+        {
+            return Ok(false);
+        }
+        let decode_changes_values = schema
+            .resolve_type(&parent_col.ty_str, parent_bt.is_strict)?
+            .is_some_and(|resolved| !resolved.reads_stored_values_unchanged());
+        if decode_changes_values {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Emit pre-DROP FK checks and actions for a table.

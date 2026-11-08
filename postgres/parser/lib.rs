@@ -111,6 +111,60 @@ pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
     sql
 }
 
+/// `sql`, a CREATE TABLE statement, with its serial column `column` written
+/// out as what `serial` stands for: the integer type, NOT NULL and a
+/// DEFAULT of `nextval` of `sequence`, the string the stored text passes to
+/// `nextval`. A table is loaded from its stored text, so the text has to
+/// name the sequence when the sequence is not named `<table>_<column>_seq`.
+pub fn write_out_serial_column(
+    sql: &str,
+    column: &str,
+    sequence: &str,
+) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let parse_result = parse(sql)?;
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateStmt(create), ..)) = nodes.first() else {
+        return Err(ParseError::ParseError(
+            "not a CREATE TABLE statement".to_string(),
+        ));
+    };
+    let type_name = create
+        .table_elts
+        .iter()
+        .find_map(|element| match &element.node {
+            Some(Node::ColumnDef(col_def)) if col_def.colname == column => {
+                col_def.type_name.as_ref()
+            }
+            _ => None,
+        })
+        .ok_or_else(|| ParseError::ParseError(format!("no column \"{column}\"")))?;
+    let type_word = type_name.names.last().and_then(|name| match &name.node {
+        Some(Node::String(word)) => Some(word.sval.to_lowercase()),
+        _ => None,
+    });
+    let integer_type = match type_word.as_deref() {
+        Some("serial" | "serial4") => "integer",
+        Some("bigserial" | "serial8") => "bigint",
+        Some("smallserial" | "serial2") => "smallint",
+        _ => {
+            return Err(ParseError::ParseError(format!(
+                "column \"{column}\" is not a serial column"
+            )))
+        }
+    };
+    let location = type_name.location as usize;
+    let end = qualified_name_end(sql, location)?;
+    let sequence = sequence.replace('\'', "''");
+    Ok(format!(
+        "{}{integer_type} NOT NULL DEFAULT nextval('{sequence}'){}",
+        &sql[..location],
+        &sql[end..]
+    ))
+}
+
 /// `sql`, a CREATE TABLE statement, with its table named `name` and no
 /// schema. `sql` is returned as it is when the table is already called
 /// `name` or when `sql` is not a CREATE TABLE statement.
@@ -195,6 +249,18 @@ fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<
 /// `sql` with the name that starts at byte offset `location`, which may
 /// have a schema in front of it, replaced by `name` alone.
 pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseError> {
+    let end = qualified_name_end(sql, location)?;
+    Ok(format!(
+        "{}{}{}",
+        &sql[..location],
+        quote_identifier(name),
+        &sql[end..]
+    ))
+}
+
+/// The byte offset just past the name that starts at byte offset
+/// `location` of `sql`, with the schema that may be in front of it.
+fn qualified_name_end(sql: &str, location: usize) -> Result<usize, ParseError> {
     use pg_query::protobuf::Token;
 
     let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
@@ -216,12 +282,7 @@ pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseEr
             end = ident.end as usize;
         }
     }
-    Ok(format!(
-        "{}{}{}",
-        &sql[..location],
-        quote_identifier(name),
-        &sql[end..]
-    ))
+    Ok(end)
 }
 
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its

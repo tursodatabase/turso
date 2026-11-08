@@ -13,42 +13,42 @@
 @requires custom_types "uses custom types"
 test cascade-update-basic {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
+    INSERT INTO parent VALUES ('a');
+    INSERT INTO child VALUES (1, 'a');
 
-    UPDATE parent SET id = 2 WHERE id = 1;
+    UPDATE parent SET id = 'b' WHERE id = 'A';
     SELECT parent_id FROM child;
 }
 expect {
-    2
+    B
 }
 
 @requires strict "uses STRICT tables"
 @requires custom_types "uses custom types"
 test cascade-update-multiple-children {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (10);
-    INSERT INTO child VALUES (1, 10);
-    INSERT INTO child VALUES (2, 10);
-    INSERT INTO child VALUES (3, 10);
+    INSERT INTO parent VALUES ('x');
+    INSERT INTO child VALUES (1, 'x');
+    INSERT INTO child VALUES (2, 'x');
+    INSERT INTO child VALUES (3, 'x');
 
-    UPDATE parent SET id = 20 WHERE id = 10;
+    UPDATE parent SET id = 'y' WHERE id = 'X';
     SELECT id, parent_id FROM child ORDER BY id;
 }
 expect {
-    1|20
-    2|20
-    3|20
+    1|Y
+    2|Y
+    3|Y
 }
 
 # ============================================================================
@@ -59,15 +59,15 @@ expect {
 @requires custom_types "uses custom types"
 test cascade-delete-basic {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON DELETE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
+    INSERT INTO parent VALUES ('a');
+    INSERT INTO child VALUES (1, 'a');
 
-    DELETE FROM parent WHERE id = 1;
+    DELETE FROM parent WHERE id = 'A';
     SELECT COUNT(*) FROM child;
 }
 expect {
@@ -78,16 +78,16 @@ expect {
 @requires custom_types "uses custom types"
 test cascade-delete-multiple-children {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON DELETE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (5);
-    INSERT INTO child VALUES (1, 5);
-    INSERT INTO child VALUES (2, 5);
+    INSERT INTO parent VALUES ('e');
+    INSERT INTO child VALUES (1, 'e');
+    INSERT INTO child VALUES (2, 'e');
 
-    DELETE FROM parent WHERE id = 5;
+    DELETE FROM parent WHERE id = 'E';
     SELECT COUNT(*) FROM child;
 }
 expect {
@@ -102,15 +102,15 @@ expect {
 @requires custom_types "uses custom types"
 test set-null-delete {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON DELETE SET NULL) STRICT;
 
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
+    INSERT INTO parent VALUES ('a');
+    INSERT INTO child VALUES (1, 'a');
 
-    DELETE FROM parent WHERE id = 1;
+    DELETE FROM parent WHERE id = 'A';
     SELECT id, COALESCE(parent_id, 'NULL') FROM child;
 }
 expect {
@@ -125,37 +125,37 @@ expect {
 @requires custom_types "uses custom types"
 test cascade-update-then-delete {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
+    INSERT INTO parent VALUES ('a');
+    INSERT INTO child VALUES (1, 'a');
 
     -- Update cascades
-    UPDATE parent SET id = 2 WHERE id = 1;
+    UPDATE parent SET id = 'b' WHERE id = 'A';
     SELECT parent_id FROM child;
 }
 expect {
-    2
+    B
 }
 
 @requires strict "uses STRICT tables"
 @requires custom_types "uses custom types"
 test cascade-update-then-delete-part2 {
     PRAGMA foreign_keys = ON;
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
         REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE) STRICT;
 
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
-    UPDATE parent SET id = 2 WHERE id = 1;
+    INSERT INTO parent VALUES ('a');
+    INSERT INTO child VALUES (1, 'a');
+    UPDATE parent SET id = 'b' WHERE id = 'A';
 
     -- Delete cascades
-    DELETE FROM parent WHERE id = 2;
+    DELETE FROM parent WHERE id = 'B';
     SELECT COUNT(*) FROM child;
 }
 expect {
@@ -183,4 +183,151 @@ test cascade-text-based-type {
 }
 expect {
     WORLD
+}
+
+# ============================================================================
+# CASCADE UPDATE copies the parent's stored key without running ENCODE again
+# ============================================================================
+
+# ENCODE value+1 with DECODE value does not undo ENCODE, so a DECODE then
+# ENCODE round trip would write 11 into the child instead of the parent's 10.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-copies-stored-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value;
+    CREATE TABLE parent(id plus1 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id plus1
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (5);
+    INSERT INTO child VALUES (1, 5);
+
+    UPDATE parent SET id = 9 WHERE id = 6;
+    SELECT p.id, c.parent_id FROM parent p, child c;
+}
+expect {
+    10|10
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-encode-only-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value;
+    CREATE TABLE parent(id x100 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id x100
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    UPDATE parent SET id = 2;
+    SELECT p.id, c.parent_id FROM parent p, child c;
+}
+expect {
+    200|200
+}
+
+# A child column of a different type than the parent's gets the parent's
+# value, as an assignment would: it goes through the child type's ENCODE and
+# is converted to the child type's BASE.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-key-of-different-type {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE sh BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id integer PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id sh
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    UPDATE parent SET id = 2;
+    SELECT p.id, c.parent_id, typeof(c.parent_id) FROM parent p, child c;
+}
+expect {
+    2|2|text
+}
+
+# The same type with other parameters is another type: the child's varchar(3)
+# still checks the length of the cascaded key.
+@requires strict "uses STRICT tables"
+test cascade-update-into-shorter-varchar-checks-length {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id varchar(10) PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id varchar(3)
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES ('abc');
+    INSERT INTO child VALUES (1, 'abc');
+
+    UPDATE parent SET id = 'abcdef';
+}
+expect error {
+    value too long for varchar
+}
+
+# Indexes on the child key see the child's values: the cascade finds the child
+# through its index, and a partial index drops the old entry when the new key
+# no longer matches its WHERE.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-keeps-child-indexes-in-sync {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
+    CREATE TABLE parent(id x100 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id x100
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+    CREATE INDEX child_parent ON child(parent_id);
+    CREATE INDEX child_small_parent ON child(parent_id) WHERE parent_id < 150;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    UPDATE parent SET id = 2;
+    SELECT parent_id FROM child;
+    SELECT count(*) FROM child INDEXED BY child_parent WHERE parent_id = 200;
+    SELECT count(*) FROM child INDEXED BY child_small_parent WHERE parent_id < 150;
+}
+expect {
+    200
+    1
+    0
+}
+
+# A DECODE that changes values reads 'A' and 'a' back as 'a', so a cascade
+# that finds children by that value would also find the child of 'a'. Such a
+# type can't be a key.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test key-whose-decode-changes-values-is-refused {
+    CREATE TYPE ci BASE text ENCODE value DECODE lower(value);
+    CREATE TABLE parent(id ci PRIMARY KEY) STRICT;
+}
+expect error {
+    column 'id' of type 'ci' cannot be a key
+}
+
+# A SET DEFAULT action writes the column's DEFAULT, which is a user value, so
+# it still goes through ENCODE.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test set-default-encodes-default-value {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value;
+    CREATE TABLE parent(id plus1 PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id plus1 DEFAULT 7
+        REFERENCES parent(id) ON DELETE SET DEFAULT) STRICT;
+
+    INSERT INTO parent VALUES (5);
+    INSERT INTO parent VALUES (7);
+    INSERT INTO child VALUES (1, 5);
+
+    DELETE FROM parent WHERE id = 6;
+    SELECT parent_id FROM child;
+}
+expect {
+    8
 }

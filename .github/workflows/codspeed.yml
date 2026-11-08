@@ -69,7 +69,7 @@ jobs:
           # The slowest benchmark targets run in several jobs. Each job gets
           # a filter that `cargo codspeed run` matches against every
           # benchmark's name, e.g.
-          #   core/benches/fts_benchmark.rs::fts_benches::bench_fts_cold_query::FTS Cold Query::cold_query[1000_rows]
+          #   benches/fts_benchmark.rs::fts_benches::bench_fts_cold_query::FTS Cold Query::cold_query[1000_rows]
           # The filters of one target split on a single character using
           # character sets that together cover every character, so each
           # benchmark, including ones added later, runs in exactly one job.

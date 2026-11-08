@@ -2,11 +2,14 @@ use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
+use crate::schema::{RangeOffsets, TypeDef};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::expr_type::{type_of, ExprType};
+use crate::translate::expr::expr_type::{
+    type_of, without_domain, without_wrappers, BuiltinType, ExprType, TypeEnv,
+};
 use crate::translate::expr::{
     custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -963,7 +966,8 @@ fn emit_frame_offset(
     mode: turso_parser::ast::FrameMode,
     pos: FrameBoundPosition,
 ) -> Result<()> {
-    if is_constant_frame_offset(expr, resolver)? {
+    let is_constant = is_constant_frame_offset(expr, resolver)?;
+    if is_constant {
         translate_expr_no_constant_opt(
             program,
             Some(&plan.table_references),
@@ -978,7 +982,18 @@ fn emit_frame_offset(
             dest_end: None,
         });
     }
-    emit_window_check_offset(program, reg, mode, pos);
+    let integer_only = match mode {
+        turso_parser::ast::FrameMode::Range => {
+            let window = plan.window.as_ref().expect("missing window");
+            let [(order_expr, ..)] = window.order_by.as_slice() else {
+                unreachable!("RANGE offsets require exactly one ORDER BY expression");
+            };
+            let context = ExprContext::new(Some(&plan.table_references), resolver);
+            check_range_offset_type(order_expr, is_constant.then_some(expr), &context.type_env())?
+        }
+        turso_parser::ast::FrameMode::Rows | turso_parser::ast::FrameMode::Groups => true,
+    };
+    emit_window_check_offset(program, reg, integer_only, pos);
     Ok(())
 }
 
@@ -1012,20 +1027,19 @@ fn is_constant_frame_offset(expr: &Expr, resolver: &Resolver<'_>) -> Result<bool
 }
 
 /// Emit a runtime check that the frame-offset register holds a
-/// non-negative integer, halting the program with the standard SQLite
-/// error message on failure. Mirrors `windowCheckValue` at
-/// `window.c:1482-1523`.
+/// non-negative integer, or with `integer_only` false a non-negative number,
+/// halting the program with the standard SQLite error message on failure.
+/// Mirrors `windowCheckValue` at `window.c:1482-1523`.
 fn emit_window_check_offset(
     program: &mut ProgramBuilder,
     offset_reg: usize,
-    mode: turso_parser::ast::FrameMode,
+    integer_only: bool,
     pos: FrameBoundPosition,
 ) {
-    use turso_parser::ast::FrameMode;
     let label_halt = program.allocate_label();
     let label_ok = program.allocate_label();
     let reg_zero = program.alloc_register();
-    if mode == FrameMode::Range {
+    if !integer_only {
         // A RANGE offset has to be a number. This checks that indirectly:
         // comparing with NUMERIC affinity turns a number (or numeric-looking
         // text) into a number, and in SQLite's type ordering numbers sort
@@ -1048,10 +1062,10 @@ fn emit_window_check_offset(
             collation: CollationSeq::for_internal_values(),
         });
     } else {
-        // A ROWS / GROUPS offset has to be an integer. MustBeInt converts
-        // it, or jumps to our own Halt if it can't — so the user gets
-        // SQLite's specific frame-offset error rather than a generic
-        // "datatype mismatch".
+        // A ROWS / GROUPS offset, or a RANGE offset over smallint or bigint,
+        // has to be an integer. MustBeInt converts it, or jumps to our own
+        // Halt if it can't — so the user gets SQLite's specific frame-offset
+        // error rather than a generic "datatype mismatch".
         program.emit_insn(Insn::MustBeInt {
             reg: offset_reg,
             target_pc: Some(label_halt),
@@ -1070,15 +1084,11 @@ fn emit_window_check_offset(
         collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(label_halt);
-    let msg = match (mode, pos) {
-        (FrameMode::Range, FrameBoundPosition::Start) => {
-            "frame starting offset must be a non-negative number"
-        }
-        (FrameMode::Range, FrameBoundPosition::End) => {
-            "frame ending offset must be a non-negative number"
-        }
-        (_, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
-        (_, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
+    let msg = match (integer_only, pos) {
+        (false, FrameBoundPosition::Start) => "frame starting offset must be a non-negative number",
+        (false, FrameBoundPosition::End) => "frame ending offset must be a non-negative number",
+        (true, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
+        (true, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
     };
     program.emit_insn(Insn::Halt {
         constraint_info: None,
@@ -2558,10 +2568,12 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
-    // the value's type as in any other arithmetic: numeric adds exactly, and
-    // a date moves by days. None means SQLite's operator runs.
     let offset_expr = frame_offset_expr(&window.frame, offset_bound);
+    let context = ExprContext::new(Some(&plan.table_references), resolver);
+    let env = context.type_env();
+    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
+    // the value's type as in any other arithmetic: numeric adds exactly.
+    // None means SQLite's operator runs.
     let operator = if subtract {
         turso_parser::ast::Operator::Subtract
     } else {
@@ -2572,20 +2584,8 @@ fn emit_window_range_test(
         operator,
         Box::new(offset_expr.clone()),
     );
-    let context = ExprContext::new(Some(&plan.table_references), resolver);
-    let env = context.type_env();
     let type_arithmetic = custom_operator_call(&arithmetic, &env)?;
-    // A type with its own order but no `+` or `-` has no distance to add. A
-    // NULL offset is rejected before any arithmetic, so it needs no call.
     let collation = context.expr_collation(order_expr)?;
-    if let CollationSeq::Type(ordering) = collation {
-        if type_arithmetic.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
-            crate::bail_parse_error!(
-                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
-                ordering.name()
-            )
-        }
-    }
     let big_null = matches!(
         (sort_order, nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
@@ -2688,6 +2688,143 @@ fn emit_window_range_test(
     );
     program.preassign_label_to_next_insn(label_done);
     Ok(())
+}
+
+/// Fails unless a RANGE frame ordered by `order_expr` may have the offset
+/// `offset`. A custom type takes the offsets its RangeOffsets kind takes, as
+/// PostgreSQL's `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works
+/// over a bigint, but not over a date, a uuid or a type made with CREATE
+/// TYPE. Arrays take none, and neither do values whose type nothing declares,
+/// since they may be custom-type values. Other values sort with SQLite's
+/// comparison. They take any offset of a SQLite type, checked when the
+/// statement runs as in SQLite, and smallint and bigint offsets, which are
+/// plain integers. Other custom types are refused there: `x + CAST(1 AS
+/// numeric(5,2))` is a numeric, which doesn't compare with x's numbers.
+///
+/// A domain is checked as the type it is based on, on either side.
+///
+/// A parameter or a string is read as the column's type when the statement
+/// runs, as PostgreSQL does. Returns whether the column takes only integer
+/// offsets: the offset must then be made an integer when the statement runs,
+/// so that '1' is 1 and '1.5' is an error.
+///
+/// `offset` is None when it is not a constant: the frame then reads it as
+/// NULL, as SQLite does.
+fn check_range_offset_type(
+    order_expr: &Expr,
+    offset: Option<&Expr>,
+    env: &TypeEnv,
+) -> Result<bool> {
+    let schema = env.schema();
+    let order_type = without_domain(type_of(order_expr, env), schema);
+    let offset_type = match offset.map(without_wrappers) {
+        // A parameter's type comes from where it is used, as a string's does,
+        // though `type_of` gives it SQLite's ANY.
+        Some(Expr::Variable(variable)) if variable.custom_type.is_none() => ExprType::Untyped,
+        Some(offset) => without_domain(type_of(offset, env), schema),
+        None => ExprType::Null,
+    };
+    let column = range_type(&order_type);
+    match (column, range_type(&offset_type)) {
+        (RangeType::Custom(RangeOffsets::None), _) => crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {order_type}"
+        ),
+        (
+            RangeType::ReadWhenRun | RangeType::Sqlite(_),
+            RangeType::ReadWhenRun
+            | RangeType::Sqlite(_)
+            | RangeType::Custom(RangeOffsets::Integer),
+        ) => {}
+        (
+            RangeType::ReadWhenRun | RangeType::Sqlite(_),
+            RangeType::Custom(RangeOffsets::None | RangeOffsets::Numeric),
+        ) => {
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
+                 {offset_type} over a value without a custom type; cast the offset to \
+                 integer or real"
+            )
+        }
+        (
+            RangeType::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
+            RangeType::ReadWhenRun,
+        ) => {}
+        (
+            RangeType::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
+            RangeType::Sqlite(RangeOffsets::None),
+        ) => {
+            let ExprType::Builtin(builtin) = offset_type else {
+                unreachable!("an offset of a SQLite type has a built-in type")
+            };
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                 {order_type} and an offset of SQLite type {}; cast the offset to integer",
+                builtin.sqlite_name()
+            )
+        }
+        (
+            RangeType::Custom(offsets @ (RangeOffsets::Integer | RangeOffsets::Numeric)),
+            RangeType::Sqlite(kind @ (RangeOffsets::Integer | RangeOffsets::Numeric))
+            | RangeType::Custom(kind),
+        ) => {
+            if !offsets.takes(kind) {
+                crate::bail_parse_error!(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                     {order_type} and offset type {offset_type}; cast the offset to integer"
+                );
+            }
+        }
+    }
+    Ok(column == RangeType::Custom(RangeOffsets::Integer))
+}
+
+/// A type as the RANGE offset check sees it, as the ORDER BY value or as the
+/// offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeType {
+    /// NULL, a string or a parameter. As an offset over a custom type, its value
+    /// is read as that type when the statement runs, as PostgreSQL does, and a
+    /// NULL fails there as any other NULL offset. As the ORDER BY value it sorts
+    /// with SQLite's comparison.
+    ReadWhenRun,
+    /// A SQLite type, which is this kind of number. The ORDER BY value sorts
+    /// with SQLite's comparison, so the frame takes any number, checked when
+    /// the statement runs, as in SQLite.
+    Sqlite(RangeOffsets),
+    /// A custom type, or a value that may be one, which is this kind of number.
+    Custom(RangeOffsets),
+}
+
+/// `ty` is not a domain. An integer written in the statement is an integer
+/// and a decimal such as 1.5 is a numeric, as in PostgreSQL. A real is
+/// inexact, and SQLite's `CAST(x AS numeric)` may give one. SQLite's ANY, such
+/// as a CASE that mixes SQLite types, may hold a real too. An array, or a value
+/// whose type nothing declares or isn't known yet, such as the result of `+`
+/// on an array, may be a custom type's value, so it takes no offsets and is no
+/// offset; neither is a row value such as `(a, b)`.
+fn range_type(ty: &ExprType) -> RangeType {
+    match ty {
+        ExprType::Null | ExprType::Untyped => RangeType::ReadWhenRun,
+        ExprType::Builtin(BuiltinType::Integer) => RangeType::Sqlite(RangeOffsets::Integer),
+        ExprType::Builtin(BuiltinType::Decimal) => RangeType::Sqlite(RangeOffsets::Numeric),
+        ExprType::Builtin(
+            BuiltinType::Real
+            | BuiltinType::Numeric
+            | BuiltinType::Text
+            | BuiltinType::Blob
+            | BuiltinType::Any,
+        ) => RangeType::Sqlite(RangeOffsets::None),
+        ExprType::Custom { type_def, .. } => RangeType::Custom(declared_range_offsets(type_def)),
+        ExprType::Array { .. } | ExprType::Unknown | ExprType::NotKnownYet | ExprType::RowValue => {
+            RangeType::Custom(RangeOffsets::None)
+        }
+    }
+}
+
+fn declared_range_offsets(type_def: &TypeDef) -> RangeOffsets {
+    type_def
+        .range_offsets
+        .expect("a type that is not a domain declares its RANGE offsets")
 }
 
 /// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.
