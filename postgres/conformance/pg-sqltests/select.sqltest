@@ -330,6 +330,36 @@ test select-cast-invalid-text-to-timestamp {
 @sqlstate 22007
 expect error {}
 
+test select-cast-text-to-uuid-writes-it-lowercase-with-hyphens {
+    SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid,
+           CAST('{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}' AS uuid),
+           'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid,
+           CASE WHEN 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid
+                   = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid THEN 't' ELSE 'f' END;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|t
+}
+
+test select-cast-to-uuid-in-subquery-finds-an-indexed-row-once {
+    CREATE TABLE uuid_cast(u uuid);
+    INSERT INTO uuid_cast VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    CREATE INDEX uuid_cast_u ON uuid_cast(u);
+    SELECT count(*) FROM uuid_cast WHERE u IN (
+        SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid
+        UNION ALL SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid
+    );
+    DROP TABLE uuid_cast;
+}
+expect {
+    1
+}
+
+test select-cast-invalid-text-to-uuid {
+    SELECT 'hello'::uuid;
+}
+expect error {}
+
 test select-cast-int8-accepts-its-smallest-and-largest-values {
     SELECT 9223372036854775807::int8, (-9223372036854775808)::bigint, int8(-9223372036854775808);
 }
