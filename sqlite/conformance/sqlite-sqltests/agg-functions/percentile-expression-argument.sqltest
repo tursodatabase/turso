@@ -11,6 +11,10 @@ test percentile-disc-expression-value {
 expect {
     2.0
 }
+# JS Number omits .0 for whole numbers
+expect @js {
+    2
+}
 
 test percentile-disc-function-value {
     CREATE TABLE t(a INTEGER, b TEXT);
@@ -20,6 +24,9 @@ test percentile-disc-function-value {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test percentile-cont-expression-value {
     SELECT percentile_cont('5' + 0, 0.5);
@@ -27,12 +34,18 @@ test percentile-cont-expression-value {
 expect {
     5.0
 }
+expect @js {
+    5
+}
 
 test percentile-disc-function-value-no-rows-read {
     SELECT percentile_disc(abs(''), 1);
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test percentile-cont-expression-value-and-fraction {
@@ -42,4 +55,7 @@ test percentile-cont-expression-value-and-fraction {
 }
 expect {
     25.0
+}
+expect @js {
+    25
 }
