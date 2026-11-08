@@ -2768,6 +2768,14 @@ fn emit_update_insns<'a>(
             }
         }
         Table::Virtual(_) => {
+            // The second VUpdate argument is the new rowid.
+            if let Some(new_rowid_reg) = rowid_set_clause_reg {
+                program.emit_insn(Insn::Copy {
+                    src_reg: new_rowid_reg,
+                    dst_reg: beg + 1,
+                    extra_amount: 0,
+                });
+            }
             let arg_count = col_len + 2;
             program.emit_insn(Insn::VUpdate {
                 cursor_id: target_table_cursor_id,

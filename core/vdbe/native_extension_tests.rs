@@ -1626,6 +1626,27 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
 }
 
 #[test]
+fn native_update_of_rowid_moves_the_row() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let rows = Arc::new(Mutex::new(vec![(1, 13)]));
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+        "native_store",
+        VTabKind::VirtualTable,
+        RowsModule {
+            queue: queue.clone(),
+            rows: rows.clone(),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: true,
+        },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE store USING native_store")
+        .unwrap();
+    let mut stmt = conn.prepare("UPDATE store SET rowid = rowid + 10").unwrap();
+    collect(&mut stmt, &queue);
+    assert_eq!(*rows.lock(), vec![(11, 13)]);
+}
+
+#[test]
 fn abandoned_native_write_does_not_apply_the_pending_update() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
