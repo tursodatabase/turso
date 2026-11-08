@@ -4673,7 +4673,7 @@ impl Schema {
         namespace: NamespaceId,
         child: &Arc<BTreeTable>,
     ) -> Result<Vec<FkCheckItem>> {
-        let mut foreign_keys: Vec<&Arc<ForeignKey>> = child.foreign_keys.iter().collect();
+        let mut foreign_keys: Vec<&Arc<ForeignKey>> = child.foreign_keys.iter().try_collect()?;
         foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
 
         let mut out = Vec::try_with_capacity_ext(foreign_keys.len())?;

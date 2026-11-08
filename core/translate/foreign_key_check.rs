@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::alloc::Arc;
+use crate::alloc::{vec, Arc, TursoIteratorExt, Vec};
 use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, FkCheckItem, FkCheckParent, Schema, Table};
 use crate::translate::emitter::{emit_columns_and_dependencies, Resolver};
@@ -52,15 +52,15 @@ fn children_of_table(
         }
     };
     let Some(table) = table else {
-        return Ok(Vec::new());
+        return Ok(vec![]);
     };
     Ok(child_to_check(schema, namespace_id, table)?
         .into_iter()
-        .collect())
+        .try_collect()?)
 }
 
 fn children_of_all_tables(schema: &Schema) -> Result<Vec<ChildToCheck>> {
-    let mut children = Vec::new();
+    let mut children = vec![];
     for namespace_id in schema.namespace_ids() {
         for table in schema.tables(namespace_id) {
             let Table::BTree(table) = table.as_ref() else {
@@ -115,7 +115,7 @@ fn emit_check_of_child(
                 affinities: build_index_affinity_string(index, parent_tbl),
             },
         })
-        .collect();
+        .try_collect()?;
 
     let result_base = program.alloc_registers(4);
     let rowid_reg = program.alloc_register();
