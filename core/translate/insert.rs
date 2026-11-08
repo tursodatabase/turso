@@ -981,6 +981,9 @@ pub fn translate_insert(
     resolver.register_columns.clear();
 
     let mut insert_flags = InsertFlags::new();
+    if connection.is_mvcc_bootstrap_connection() {
+        insert_flags = insert_flags.skip_last_rowid().skip_all_change_counts();
+    }
 
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not

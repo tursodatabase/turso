@@ -89,10 +89,12 @@ pub fn translate(
     origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
-    let change_cnt_on = matches!(
-        stmt,
-        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
-    );
+    let change_cnt_on = !connection.is_mvcc_bootstrap_connection()
+        && matches!(origin, crate::statement::StatementOrigin::Root)
+        && matches!(
+            stmt,
+            ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
+        );
 
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
         None

@@ -18579,18 +18579,31 @@ impl OpJournalModeState {
 pub struct MvccBootstrapGuard {
     connection: Arc<Connection>,
     completed: bool,
+    saved_changes: i64,
+    saved_total_changes: i64,
+    saved_last_insert_rowid: i64,
 }
 
 impl MvccBootstrapGuard {
     fn new(connection: Arc<Connection>) -> Self {
+        let saved_changes = connection.changes();
+        let saved_total_changes = connection.total_changes();
+        let saved_last_insert_rowid = connection.last_insert_rowid();
         Self {
             connection,
             completed: false,
+            saved_changes,
+            saved_total_changes,
+            saved_last_insert_rowid,
         }
     }
 
     fn complete(&mut self) {
         self.completed = true;
+        self.connection.set_changes(self.saved_changes);
+        self.connection.set_total_changes(self.saved_total_changes);
+        self.connection
+            .update_last_rowid(self.saved_last_insert_rowid);
     }
 }
 
@@ -18599,6 +18612,10 @@ impl Drop for MvccBootstrapGuard {
         if self.completed {
             return;
         }
+        self.connection.set_changes(self.saved_changes);
+        self.connection.set_total_changes(self.saved_total_changes);
+        self.connection
+            .update_last_rowid(self.saved_last_insert_rowid);
         // Bootstrap did not finish: re-promote the connection if it is still
         // demoted (bootstrap promotes itself only at `Recover`) and uninstall
         // the un-bootstrapped store so neither this connection nor others on

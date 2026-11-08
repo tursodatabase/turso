@@ -2920,6 +2920,10 @@ impl Connection {
         self.changes.store(num_changes, Ordering::SeqCst);
     }
 
+    pub fn set_total_changes(&self, total: i64) {
+        self.total_changes.store(total, Ordering::SeqCst);
+    }
+
     pub fn changes(&self) -> i64 {
         self.changes.load(Ordering::SeqCst)
     }
