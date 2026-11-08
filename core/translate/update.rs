@@ -268,6 +268,9 @@ fn prepare_update_plan(
             body.tbl_name.name.as_str()
         );
     }
+    if !body.returning.is_empty() && table.virtual_table().is_some() {
+        bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
+    }
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
