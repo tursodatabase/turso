@@ -325,6 +325,39 @@ fn test_drop_sequence_reuse_name(db: TempDatabase) {
     pg_execute(&conn, "DROP SEQUENCE reuse_seq");
 }
 
+#[turso_macros::test(mvcc)]
+fn test_drop_sequence_fails_when_column_default_depends_on_it(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    // 1. Serial column implicitly creates sequence t_id_seq and uses nextval in default
+    pg_execute(&conn, "CREATE TABLE t (id serial, v int)");
+    let err = pg_execute_err(&conn, "DROP SEQUENCE t_id_seq");
+    assert!(
+        err.contains("cannot drop sequence t_id_seq because other objects depend on it"),
+        "unexpected error: {err}"
+    );
+
+    // After dropping the table, dropping the sequence succeeds
+    pg_execute(&conn, "DROP TABLE t");
+    pg_execute(&conn, "DROP SEQUENCE t_id_seq");
+
+    // 2. Explicit sequence with nextval in column DEFAULT
+    pg_execute(&conn, "CREATE SEQUENCE s");
+    pg_execute(
+        &conn,
+        "CREATE TABLE t2 (id int DEFAULT nextval('s'), v int)",
+    );
+    let err = pg_execute_err(&conn, "DROP SEQUENCE s");
+    assert!(
+        err.contains("cannot drop sequence s because other objects depend on it"),
+        "unexpected error: {err}"
+    );
+
+    // After dropping table t2, sequence s can be dropped
+    pg_execute(&conn, "DROP TABLE t2");
+    pg_execute(&conn, "DROP SEQUENCE s");
+}
+
 // ============================================================
 // nextval — Basic
 // ============================================================

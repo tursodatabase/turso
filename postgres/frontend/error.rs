@@ -287,6 +287,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
+        || msg.starts_with("cannot drop sequence")
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if is_duplicate_object_error(msg) {

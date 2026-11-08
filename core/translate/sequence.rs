@@ -24,7 +24,7 @@ use crate::schema::{
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
-use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
@@ -1218,6 +1218,143 @@ pub(crate) fn emit_drop_sequence_cleanup(
     Ok(true)
 }
 
+/// Check if any active table column DEFAULT expression depends on the sequence being dropped.
+fn check_sequence_dependencies(
+    resolver: &Resolver,
+    target_namespace: NamespaceRef,
+    target_name: &str,
+) -> Result<()> {
+    let database_id = target_namespace.database_id;
+    let has_dependent_column = resolver.with_schema(database_id, |schema| {
+        for namespace_id in schema.namespace_ids() {
+            for table in schema.tables(namespace_id) {
+                for column in table.columns() {
+                    if let Some(default_expr) = &column.default {
+                        if default_expr_references_sequence(
+                            default_expr,
+                            namespace_id,
+                            target_namespace,
+                            target_name,
+                            resolver,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    });
+
+    if has_dependent_column {
+        bail_parse_error!("cannot drop sequence {target_name} because other objects depend on it");
+    }
+    Ok(())
+}
+
+fn default_expr_references_sequence(
+    expr: &ast::Expr,
+    table_namespace: NamespaceId,
+    target_namespace: NamespaceRef,
+    target_name: &str,
+    resolver: &Resolver,
+) -> bool {
+    let mut references = false;
+    let _ = walk_expr(expr, &mut |sub_expr| {
+        if references {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let ast::Expr::FunctionCall { name, args, .. } = sub_expr {
+            if is_sequence_function(name.as_str()) {
+                if let Some(arg) = args.first() {
+                    if sequence_arg_matches(
+                        arg,
+                        table_namespace,
+                        target_namespace,
+                        target_name,
+                        resolver,
+                    ) {
+                        references = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    references
+}
+
+fn unwrap_expr(mut e: &ast::Expr) -> &ast::Expr {
+    loop {
+        match e {
+            ast::Expr::Cast { expr, .. } => e = expr,
+            ast::Expr::Parenthesized(exprs) => {
+                if exprs.len() == 1 {
+                    e = &exprs[0];
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    e
+}
+
+fn sequence_arg_matches(
+    arg: &ast::Expr,
+    table_namespace: NamespaceId,
+    target_namespace: NamespaceRef,
+    target_name: &str,
+    resolver: &Resolver,
+) -> bool {
+    let unwrapped = unwrap_expr(arg);
+    let raw_str = match unwrapped {
+        ast::Expr::Literal(ast::Literal::String(s)) => crate::util::dequote(s),
+        _ => return false,
+    };
+
+    if let Some((resolved_ns, resolved_name)) = resolve_sequence_name(&raw_str, resolver) {
+        if resolved_ns.database_id == target_namespace.database_id
+            && resolved_ns.id == target_namespace.id
+            && resolved_name == target_name
+        {
+            return true;
+        }
+    }
+
+    let normalized_raw = normalize_ident(&raw_str);
+    let mangled = resolver.mangle_name(target_namespace, target_name);
+    if normalized_raw == mangled {
+        return true;
+    }
+
+    if let Some((schema_part, bare_part)) = raw_str.split_once('.') {
+        let bare_part_norm = normalize_ident(bare_part);
+        if bare_part_norm == target_name {
+            if let Some(ns) = resolver.namespace_named(&normalize_ident(schema_part)) {
+                if ns.database_id == target_namespace.database_id && ns.id == target_namespace.id {
+                    return true;
+                }
+            }
+            if let Some(target_schema_name) = resolver.name_of_namespace(target_namespace) {
+                if target_schema_name.eq_ignore_ascii_case(schema_part) {
+                    return true;
+                }
+            }
+        }
+    } else if normalized_raw == target_name
+        && (table_namespace == target_namespace.id
+            || target_namespace.id.is_root()
+            || resolver.name_of_namespace(target_namespace).is_none())
+    {
+        return true;
+    }
+
+    false
+}
+
 /// Translate DROP SEQUENCE into bytecode that removes the definition from sqlite_schema.
 pub fn translate_drop_sequence(
     seq_name: &ast::QualifiedName,
@@ -1233,6 +1370,9 @@ pub fn translate_drop_sequence(
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
     };
+
+    check_sequence_dependencies(resolver, namespace, &normalized_name)?;
+
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
