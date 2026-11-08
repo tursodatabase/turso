@@ -59,3 +59,41 @@ expect {
 expect @js {
     25
 }
+
+# Like SQLite's ext/misc/percentile.c, a non-NULL TEXT or BLOB value is an
+# error, also when the text looks like a number. NULL values are skipped.
+
+test percentile-disc-text-value {
+    SELECT percentile_disc('5', 1);
+}
+expect error {
+    input to percentile_disc\(\) is not numeric
+}
+
+test median-text-value {
+    SELECT median('7');
+}
+expect error {
+    input to median\(\) is not numeric
+}
+
+test percentile-cont-text-value {
+    SELECT percentile_cont('abc', 0.5);
+}
+expect error {
+    input to percentile_cont\(\) is not numeric
+}
+
+test percentile-blob-value {
+    SELECT percentile(x'35', 50);
+}
+expect error {
+    input to percentile\(\) is not numeric
+}
+
+test percentile-disc-null-value {
+    SELECT percentile_disc(NULL, 1) IS NULL;
+}
+expect {
+    1
+}

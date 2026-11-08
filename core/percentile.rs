@@ -1,4 +1,4 @@
-use turso_ext::{AggFunc, AggregateDerive, ExtensionApi, Value};
+use turso_ext::{AggFunc, AggregateDerive, ExtensionApi, Value, ValueType};
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
     unsafe {
@@ -10,27 +10,52 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
     }
 }
 
+/// The value of an aggregated argument: `None` for NULL, `error` for TEXT or BLOB
+/// (as in SQLite's ext/misc/percentile.c), the number otherwise.
+fn numeric_input(value: Option<&Value>, error: &'static str) -> Result<Option<f64>, &'static str> {
+    match value.map(Value::value_type) {
+        Some(ValueType::Text | ValueType::Blob) => Err(error),
+        _ => Ok(value.and_then(Value::to_float)),
+    }
+}
+
+/// Values, fraction, first error about the fraction, first non-numeric input error.
+type PercentileState = (
+    Vec<f64>,
+    Option<f64>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
 #[derive(AggregateDerive)]
 struct Median;
 
 impl AggFunc for Median {
-    type State = Vec<f64>;
+    type State = (Vec<f64>, Option<Self::Error>);
     type Error = &'static str;
     const NAME: &'static str = "median";
     const ARGS: i32 = 1;
 
     fn step(state: &mut Self::State, args: &[Value]) {
-        if let Some(val) = args.first().and_then(Value::to_float) {
-            state.push(val);
+        let (values, input_err) = state;
+        match numeric_input(args.first(), "input to median() is not numeric") {
+            Ok(Some(val)) => values.push(val),
+            Ok(None) => {}
+            Err(err) => {
+                input_err.get_or_insert(err);
+            }
         }
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        if state.is_empty() {
+        let (mut sorted, input_err) = state;
+        if let Some(err) = input_err {
+            return Err(err);
+        }
+        if sorted.is_empty() {
             return Ok(Value::null());
         }
 
-        let mut sorted = state;
         sorted.sort_by(|a, b| a.total_cmp(b));
 
         let len = sorted.len();
@@ -48,17 +73,21 @@ impl AggFunc for Median {
 struct Percentile;
 
 impl AggFunc for Percentile {
-    type State = (Vec<f64>, Option<f64>, Option<Self::Error>);
+    type State = PercentileState;
     type Error = &'static str;
     const NAME: &'static str = "percentile";
     const ARGS: i32 = 2;
 
     fn step(state: &mut Self::State, args: &[Value]) {
-        let (values, p_value, err_value) = state;
-        if let (Some(y), Some(p)) = (
-            args.first().and_then(Value::to_float),
-            args.get(1).and_then(Value::to_float),
-        ) {
+        let (values, p_value, err_value, input_err) = state;
+        let y = match numeric_input(args.first(), "input to percentile() is not numeric") {
+            Ok(y) => y,
+            Err(err) => {
+                input_err.get_or_insert(err);
+                return;
+            }
+        };
+        if let (Some(y), Some(p)) = (y, args.get(1).and_then(Value::to_float)) {
             if !(0.0..=100.0).contains(&p) {
                 err_value.get_or_insert("Invalid percentile value");
                 return;
@@ -77,7 +106,10 @@ impl AggFunc for Percentile {
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        let (mut values, p_value, err_value) = state;
+        let (mut values, p_value, err_value, input_err) = state;
+        if let Some(err) = input_err {
+            return Err(err);
+        }
         if values.is_empty() {
             return Ok(Value::null());
         }
@@ -110,36 +142,20 @@ impl AggFunc for Percentile {
 struct PercentileCont;
 
 impl AggFunc for PercentileCont {
-    type State = (Vec<f64>, Option<f64>, Option<Self::Error>);
+    type State = PercentileState;
     type Error = &'static str;
     const NAME: &'static str = "percentile_cont";
     const ARGS: i32 = 2;
 
     fn step(state: &mut Self::State, args: &[Value]) {
-        let (values, p_value, err_state) = state;
-        if let (Some(y), Some(p)) = (
-            args.first().and_then(Value::to_float),
-            args.get(1).and_then(Value::to_float),
-        ) {
-            if !(0.0..=1.0).contains(&p) {
-                err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
-                return;
-            }
-
-            if let Some(existing_p) = *p_value {
-                if (existing_p - p).abs() >= 0.001 {
-                    err_state.get_or_insert("Inconsistent percentile values across rows");
-                    return;
-                }
-            } else {
-                *p_value = Some(p);
-            }
-            values.push(y);
-        }
+        fraction_step(state, args, "input to percentile_cont() is not numeric");
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        let (mut values, p_value, err_state) = state;
+        let (mut values, p_value, err_state, input_err) = state;
+        if let Some(err) = input_err {
+            return Err(err);
+        }
         if values.is_empty() {
             return Ok(Value::null());
         }
@@ -168,11 +184,39 @@ impl AggFunc for PercentileCont {
     }
 }
 
+/// Step of percentile_cont and percentile_disc: the fraction is in [0, 1].
+fn fraction_step(state: &mut PercentileState, args: &[Value], input_error: &'static str) {
+    let (values, p_value, err_state, input_err) = state;
+    let y = match numeric_input(args.first(), input_error) {
+        Ok(y) => y,
+        Err(err) => {
+            input_err.get_or_insert(err);
+            return;
+        }
+    };
+    if let (Some(y), Some(p)) = (y, args.get(1).and_then(Value::to_float)) {
+        if !(0.0..=1.0).contains(&p) {
+            err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
+            return;
+        }
+
+        if let Some(existing_p) = *p_value {
+            if (existing_p - p).abs() >= 0.001 {
+                err_state.get_or_insert("Inconsistent percentile values across rows");
+                return;
+            }
+        } else {
+            *p_value = Some(p);
+        }
+        values.push(y);
+    }
+}
+
 #[derive(AggregateDerive)]
 struct PercentileDisc;
 
 impl AggFunc for PercentileDisc {
-    type State = (Vec<f64>, Option<f64>, Option<Self::Error>);
+    type State = PercentileState;
     type Error = &'static str;
     const NAME: &'static str = "percentile_disc";
     const ARGS: i32 = 2;
@@ -182,11 +226,14 @@ impl AggFunc for PercentileDisc {
         // in SQLite's ext/misc/percentile.c and PostgreSQL. Using
         // Percentile::step admitted p up to 100 while finalize indexes by
         // fraction, so percentile_disc(x, 100) ran off the end.
-        PercentileCont::step(state, args);
+        fraction_step(state, args, "input to percentile_disc() is not numeric");
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        let (mut values, p_value, err_value) = state;
+        let (mut values, p_value, err_value, input_err) = state;
+        if let Some(err) = input_err {
+            return Err(err);
+        }
         if values.is_empty() {
             return Ok(Value::null());
         }
@@ -254,7 +301,7 @@ mod tests {
     use super::*;
     use turso_ext::ValueType;
 
-    type PctState = (Vec<f64>, Option<f64>, Option<&'static str>);
+    type PctState = PercentileState;
 
     /// Drive an aggregate over explicit `(value, percentile)` rows.
     fn run_rows<A: AggFunc<State = PctState>>(rows: &[(f64, f64)]) -> Result<Value, A::Error> {
