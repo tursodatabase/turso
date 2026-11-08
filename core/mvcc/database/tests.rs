@@ -6394,6 +6394,85 @@ fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
     assert_eq!(&rows[0][1].to_string(), "old_path_352");
 }
 
+/// Issue #7476: a SELECT and an INSERT ran on the connection while its COMMIT
+/// waited at a yield. The SELECT did not see the write of its own
+/// transaction, and the INSERT panicked. Both are now refused.
+#[test]
+fn statements_are_refused_while_the_commit_of_the_connection_yields() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'pending')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+
+    for sql in [
+        "SELECT id, v FROM t ORDER BY id",
+        "INSERT INTO t VALUES (2, 'during-commit')",
+    ] {
+        let err = conn.prepare(sql).unwrap().run_ignore_rows().unwrap_err();
+        assert!(
+            matches!(err, LimboError::StatementsInProgress(_)),
+            "{sql}: {err:?}"
+        );
+    }
+
+    conn.set_yield_injector(None);
+    commit.run_ignore_rows().unwrap();
+    drop(commit);
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![vec![Value::from_i64(1), Value::build_text("pending")]]
+    );
+}
+
+/// Issue #8447: ROLLBACK TO ran on the connection while its COMMIT waited at
+/// a yield. The row was gone in memory, but came back after a restart. The
+/// ROLLBACK TO is now refused, so the committed row stays in both.
+#[test]
+fn rollback_to_is_refused_while_the_commit_of_the_connection_yields() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let expected = vec![vec![
+        Value::from_i64(1),
+        Value::build_text("should_persist"),
+    ]];
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'should_persist')")
+            .unwrap();
+        conn.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+
+        let err = conn.execute("ROLLBACK TO s").unwrap_err();
+        assert!(
+            matches!(err, LimboError::StatementsInProgress(_)),
+            "{err:?}"
+        );
+
+        conn.set_yield_injector(None);
+        commit.run_ignore_rows().unwrap();
+        drop(commit);
+        assert_eq!(get_rows(&conn, "SELECT id, v FROM t"), expected);
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(get_rows(&conn, "SELECT id, v FROM t"), expected);
+}
+
 /// What this test checks: SQL-only recovery must not replay a CREATE TABLE frame already made durable by checkpoint.
 /// Why this matters: a regressed checkpoint boundary can make recovery replay the pre-checkpoint schema row with its negative root page after WAL recovery has already installed the positive root page.
 ///
