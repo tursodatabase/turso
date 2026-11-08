@@ -1,10 +1,11 @@
 use crate::alloc::Arc;
+use crate::namespace::NamespaceRef;
 use crate::schema::Column;
-use crate::translate::expr::emit_table_column;
-use crate::vdbe::affinity::Affinity;
+use crate::translate::collate::CollationSeq;
+use crate::translate::expr::{emit_stored_column, emit_table_column};
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
+    schema::{BTreeTable, Index, Schema, Table},
     translate::{
         emitter::Resolver,
         expr::{
@@ -19,7 +20,8 @@ use crate::{
     },
     HashSet,
 };
-use turso_parser::ast;
+use crate::{types::StrictType, Result};
+use turso_parser::ast::{self, TableInternalId};
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
@@ -27,9 +29,7 @@ pub const MAX_INTEGRITY_CHECK_ERRORS: usize = 100;
 
 enum BoundIndexColumn {
     Column(usize),
-    /// The affiniy is `Some` when the index column refers to a virtual generated column
-    /// (the affinity is the column's declared type).
-    Expr(Box<ast::Expr>, Option<Affinity>),
+    Expr(Box<ast::Expr>),
 }
 
 struct BoundIntegrityIndex {
@@ -124,6 +124,7 @@ fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers
         decrement_by: 1,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: 0,
         on_error: None,
         description_reg: None,
@@ -227,7 +228,7 @@ fn translate_integrity_check_for_schema(
     });
 
     let database_name = resolver
-        .get_database_name_by_index(database_id)
+        .namespace_name(database_id)
         .expect("resolved integrity-check database must still exist");
     program.emit_string8(
         format!("*** in database {database_name} ***\n"),
@@ -246,7 +247,11 @@ fn translate_integrity_check_for_schema(
     //    - CHECK constraints
     //    - index membership/uniqueness (integrity_check only)
     //    - index cardinality cross-checks
-    for table in schema.tables.values() {
+    for (namespace, table) in schema.namespace_ids().flat_map(|namespace| {
+        schema
+            .tables(namespace)
+            .map(move |table| (namespace, table))
+    }) {
         let Table::BTree(btree_table) = table.as_ref() else {
             continue;
         };
@@ -275,12 +280,16 @@ fn translate_integrity_check_for_schema(
                 unmatched_right_rows_plan: None,
                 table: Table::BTree(btree_table.clone()),
                 identifier: btree_table.name.clone(),
+                has_alias: false,
                 internal_id: table_ref_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id,
+                namespace: NamespaceRef {
+                    database_id,
+                    id: namespace,
+                },
                 indexed: None,
                 plan_estimate: None,
             }],
@@ -288,57 +297,50 @@ fn translate_integrity_check_for_schema(
         );
 
         let mut bound_indexes = Vec::new();
-        if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
-            for index in indexes {
-                if index.root_page <= 0 || !connection_root_pages.contains(&index.root_page) {
-                    continue;
-                }
-
-                let cursor_id = program.alloc_cursor_index(None, index)?;
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: index.root_page,
-                    db: database_id,
-                });
-
-                let expected_count_reg = program.alloc_register();
-                program.emit_int(0, expected_count_reg);
-
-                let mut where_expr = None;
-                if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(pred, &mut table_references, resolver)?);
-                }
-
-                let mut columns = Vec::with_capacity(index.columns.len());
-                let mut unique_nullable = Vec::with_capacity(index.columns.len());
-                for col in &index.columns {
-                    if let Some(expr) = col.expr.as_deref() {
-                        let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                            Some(btree_table.columns()[col.pos_in_table].affinity())
-                        } else {
-                            // expression indexes don't apply affinity from the basae table
-                            None
-                        };
-                        columns.push(BoundIndexColumn::Expr(
-                            Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
-                            affinity,
-                        ));
-                        unique_nullable.push(true);
-                    } else {
-                        columns.push(BoundIndexColumn::Column(col.pos_in_table));
-                        unique_nullable.push(!btree_table.columns()[col.pos_in_table].notnull());
-                    }
-                }
-
-                bound_indexes.push(BoundIntegrityIndex {
-                    index: index.clone(),
-                    cursor_id,
-                    expected_count_reg,
-                    where_expr,
-                    columns,
-                    unique_nullable,
-                });
+        for index in schema.get_indices(namespace, btree_table.name.as_str()) {
+            if index.root_page <= 0 || !connection_root_pages.contains(&index.root_page) {
+                continue;
             }
+
+            let cursor_id = program.alloc_cursor_index(None, index)?;
+            program.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page: index.root_page,
+                db: database_id,
+            });
+
+            let expected_count_reg = program.alloc_register();
+            program.emit_int(0, expected_count_reg);
+
+            let mut where_expr = None;
+            if let Some(pred) = index.where_clause.as_deref() {
+                where_expr = Some(bind_expr_for_table(pred, &mut table_references, resolver)?);
+            }
+
+            let mut columns = Vec::with_capacity(index.columns.len());
+            let mut unique_nullable = Vec::with_capacity(index.columns.len());
+            for col in &index.columns {
+                if let Some(expr) = col.expression() {
+                    columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
+                        expr,
+                        &mut table_references,
+                        resolver,
+                    )?)));
+                    unique_nullable.push(true);
+                } else {
+                    columns.push(BoundIndexColumn::Column(col.pos_in_table));
+                    unique_nullable.push(!btree_table.columns()[col.pos_in_table].notnull());
+                }
+            }
+
+            bound_indexes.push(BoundIntegrityIndex {
+                index: index.clone(),
+                cursor_id,
+                expected_count_reg,
+                where_expr,
+                columns,
+                unique_nullable,
+            });
         }
 
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
@@ -375,26 +377,18 @@ fn translate_integrity_check_for_schema(
             .enumerate()
             .filter(|(_, c)| !c.is_rowid_alias()) // nothing to check on IPK cols
             .filter(|(_, c)| c.notnull() || btree_table.is_strict)
-            .map(|(idx, col)| {
-                let col_ref = match col.generated_type() {
-                    GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
-                        Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
-                        Some(col.affinity()),
-                    ),
-                    GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
-                };
+            .map(|(idx, col)| (idx, col, &type_check_table.columns()[idx]))
+            .collect::<Vec<_>>();
 
-                Ok((col_ref, col, &type_check_table.columns()[idx]))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        for (col_ref, col, type_check_col) in &checked_columns {
-            let col_reg = emit_column(
+        for (idx, col, type_check_col) in &checked_columns {
+            let col_reg = emit_checked_column(
                 program,
                 resolver,
                 table_cursor_id,
+                table_ref_id,
                 &table_references,
-                col_ref,
+                col,
+                *idx,
             )?;
 
             let col_name = col.name.as_deref().unwrap_or("");
@@ -406,7 +400,7 @@ fn translate_integrity_check_for_schema(
                     type_check_col,
                     col_name,
                     col_reg,
-                );
+                )?;
             }
             if col.notnull() {
                 emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
@@ -487,7 +481,7 @@ fn translate_integrity_check_for_schema(
                             resolver,
                         )?;
                     }
-                    BoundIndexColumn::Expr(expr, affinity) => {
+                    BoundIndexColumn::Expr(expr) => {
                         let self_table_context =
                             table_references.joined_tables().first().map(|jt| {
                                 SelfTableContext::ForSelect {
@@ -511,9 +505,6 @@ fn translate_integrity_check_for_schema(
                                 Ok(())
                             },
                         )?;
-                        if let Some(aff) = affinity {
-                            program.emit_column_affinity(target, *aff);
-                        }
                     }
                 }
             }
@@ -599,16 +590,6 @@ fn translate_integrity_check_for_schema(
         program.preassign_label_to_next_insn(table_empty_label);
 
         for bound_index in &bound_indexes {
-            // An index method's backing B-tree stores its data in the index
-            // alone; the owning table has zero rows by construction, so the
-            // entry-count comparison below would report every healthy FTS
-            // database as corrupt. Its pages are still visited above.
-            if bound_index.index.is_backing_btree_index() {
-                program.emit_insn(Insn::Close {
-                    cursor_id: bound_index.cursor_id,
-                });
-                continue;
-            }
             if bound_index.where_expr.is_none() {
                 let actual_count_reg = program.alloc_register();
                 program.emit_insn(Insn::Count {
@@ -623,7 +604,7 @@ fn translate_integrity_check_for_schema(
                     rhs: bound_index.expected_count_reg,
                     target_pc: counts_match,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
                 program.emit_string8(
                     format!("wrong # of entries in index {}", bound_index.index.name),
@@ -664,7 +645,7 @@ fn translate_integrity_check_for_schema(
 }
 
 fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Vec<i64> {
-    let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+    let mut root_pages = Vec::new();
 
     // integrity_check verifies the physical file, so a placeholder (negative) root for an
     // object a passive checkpoint has since materialized must be resolved to its real page.
@@ -675,23 +656,42 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
         }
     };
 
-    for table in schema.tables.values() {
+    for (namespace, table) in schema.namespace_ids().flat_map(|namespace| {
+        schema
+            .tables(namespace)
+            .map(move |table| (namespace, table))
+    }) {
         if let Table::BTree(btree_table) = table.as_ref() {
             let table_root = resolve_root(btree_table.root_page);
             if table_root < 0 {
                 continue;
             }
             root_pages.push(table_root);
-            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
-                for index in indexes {
-                    let index_root = resolve_root(index.root_page);
-                    if index_root > 0 {
-                        root_pages.push(index_root);
-                    }
+            for index in schema.indices_including_backing(namespace, btree_table.name.as_str()) {
+                let index_root = resolve_root(index.root_page);
+                if index_root > 0 {
+                    root_pages.push(index_root);
                 }
             }
         }
     }
+
+    // A materialized view created by an incompatible (older) storage version
+    // has no `Table::BTree` entry above: it is deliberately kept out of
+    // `schema.tables` so reads and writes still fail with the "DROP and
+    // recreate" error instead of touching storage this build cannot
+    // interpret. Its btree still owns a real page, though, so it must be
+    // counted here or the structural pass below reports it as orphaned.
+    for root_page in schema
+        .namespace_ids()
+        .flat_map(|namespace| schema.incompatible_materialized_view_roots(namespace))
+    {
+        let view_root = resolve_root(root_page);
+        if view_root > 0 {
+            root_pages.push(view_root);
+        }
+    }
+
     root_pages
 }
 
@@ -728,9 +728,10 @@ fn emit_strict_type_check(
     type_check_col: &Column,
     col_name: &str,
     col_reg: usize,
-) {
-    let Some(value_type) = type_check_col.strict_value_type() else {
-        return;
+) -> Result<()> {
+    let value_type = match type_check_col.strict_type(&btree_table.name)? {
+        StrictType::Stores(storage_class) => storage_class.value_type(),
+        StrictType::Any => return Ok(()),
     };
 
     let type_ok = program.allocate_label();
@@ -750,6 +751,7 @@ fn emit_strict_type_check(
     );
     emit_integrity_result_row(program, registers);
     program.preassign_label_to_next_insn(type_ok);
+    Ok(())
 }
 
 fn emit_notnull_check(
@@ -772,47 +774,37 @@ fn emit_notnull_check(
     program.preassign_label_to_next_insn(not_null_ok);
 }
 
-/// Returns the register containing the column
-fn emit_column(
+/// Reads a column as it is stored. A virtual column is computed and encoded,
+/// so it gets the same checks as a stored column.
+fn emit_checked_column(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_cursor_id: usize,
+    table_ref_id: TableInternalId,
     table_references: &TableReferences,
-    col_ref: &BoundIndexColumn,
+    column: &Column,
+    column_index: usize,
 ) -> crate::Result<usize> {
     let col_value_reg = program.alloc_register();
-    match col_ref {
-        BoundIndexColumn::Column(idx) => {
-            program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
-        }
-        BoundIndexColumn::Expr(expr, affinity) => {
-            let self_table_context =
-                table_references
-                    .joined_tables()
-                    .first()
-                    .map(|jt| SelfTableContext::ForSelect {
-                        table_ref_id: jt.internal_id,
-                        referenced_tables: table_references.clone(),
-                    });
-            resolver.with_self_table_context(
-                program,
-                self_table_context.as_ref(),
-                |program, _| {
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(table_references),
-                        expr,
-                        col_value_reg,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    if let Some(affinity) = affinity {
-                        program.emit_column_affinity(col_value_reg, *affinity);
-                    }
-                    Ok(())
-                },
-            )?;
-        }
+    if column.is_virtual_generated() {
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_ref_id,
+            table_references,
+            column,
+            column_index,
+            col_value_reg,
+            resolver,
+        )?;
+    } else {
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            column_index,
+            col_value_reg,
+            resolver,
+        )?;
     }
     Ok(col_value_reg)
 }

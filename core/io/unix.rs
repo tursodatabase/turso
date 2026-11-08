@@ -596,6 +596,18 @@ mod tests {
     }
 
     #[test]
+    fn hole_operations_return_an_error_on_a_file_without_hole_support() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let io = UnixIO::new().unwrap();
+        let file = io
+            .open_file(temp.path().to_str().unwrap(), OpenFlags::None, false)
+            .unwrap();
+
+        assert!(file.has_hole(0, 4096).is_err());
+        assert!(file.punch_hole(0, 4096).is_err());
+    }
+
+    #[test]
     fn test_shared_wal_map_supports_unaligned_logical_offset() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let backing_len = 128 * 1024;

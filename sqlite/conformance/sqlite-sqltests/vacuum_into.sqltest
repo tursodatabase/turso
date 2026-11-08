@@ -1,11 +1,38 @@
 @database :memory:
 
-@backend rust
-test vacuum-into-empty-path-rejected {
+test vacuum-into-memory-targets {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    VACUUM INTO ':memory:';
+    VACUUM INTO ':memory:';
     VACUUM INTO '';
+    VACUUM INTO '';
+    VACUUM INTO 'file::memory:';
+    VACUUM INTO 'file::memory:';
+    VACUUM INTO 'file::memory:?cache=shared';
+    VACUUM INTO 'file:';
+    VACUUM INTO 'file://';
+    VACUUM INTO 'file://localhost';
+    VACUUM INTO 'file:vacuum_into_memory_mode.db?mode=memory';
+    VACUUM INTO 'file:vacuum_into_memory_mode.db?mode=memory';
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test vacuum-into-uri-root-directory-empty-authority {
+    CREATE TABLE t(a);
+    VACUUM INTO 'file:///';
 }
 expect error {
-    VACUUM INTO path cannot be empty
+}
+
+test vacuum-into-uri-root-directory-localhost {
+    CREATE TABLE t(a);
+    VACUUM INTO 'file://localhost/';
+}
+expect error {
 }
 
 @backend rust
@@ -24,4 +51,86 @@ test vacuum-into-nonexistent-schema {
 }
 expect error {
     no such database: bogus
+}
+
+test vacuum-into-path-expressions {
+    CREATE TABLE t(n TEXT);
+    INSERT INTO t VALUES (':memory:');
+    VACUUM INTO (SELECT n FROM t);
+    VACUUM INTO ':mem' || 'ory:';
+    VACUUM INTO lower(':MEMORY:');
+    SELECT n FROM t;
+}
+expect {
+    :memory:
+}
+
+@skip-if sqlite "the sqlite.org CLI is built with SQLITE_DQS=0, and SQLite checks dqs_ddl for this path"
+test vacuum-into-double-quoted-path {
+    CREATE TABLE t(n TEXT);
+    INSERT INTO t VALUES ('x');
+    VACUUM INTO "";
+    SELECT n FROM t;
+}
+expect {
+    x
+}
+
+test vacuum-into-unknown-identifier {
+    VACUUM INTO vacuum_into_unknown_identifier;
+}
+expect error {
+    no such column: vacuum_into_unknown_identifier
+}
+
+test vacuum-into-integer-path {
+    VACUUM INTO 5;
+}
+expect error {
+    non-text filename
+}
+
+test vacuum-into-null-path {
+    VACUUM INTO NULL;
+}
+expect error {
+    non-text filename
+}
+
+test vacuum-into-blob-path {
+    VACUUM INTO x'3a6d656d6f72793a';
+}
+expect error {
+    non-text filename
+}
+
+test vacuum-into-subquery-without-rows {
+    CREATE TABLE t(n TEXT);
+    VACUUM INTO (SELECT n FROM t);
+}
+expect error {
+    non-text filename
+}
+
+test vacuum-into-row-value-path {
+    VACUUM INTO (':memory:', ':memory:');
+}
+expect error {
+    row value misused
+}
+
+test vacuum-into-multi-column-subquery-path {
+    VACUUM INTO (SELECT ':memory:', ':memory:');
+}
+expect error {
+    sub-select returns 2 columns - expected 1
+}
+
+test vacuum-temp-into-does-not-evaluate-path {
+    VACUUM temp INTO vacuum_temp_into_unknown_identifier;
+    VACUUM temp INTO (SELECT 1, 2);
+    SELECT 1;
+}
+expect {
+    1
 }

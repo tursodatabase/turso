@@ -1,5 +1,6 @@
-use crate::common::TempDatabase;
-use std::time::Duration;
+use crate::common::{limbo_exec_rows, TempDatabase};
+use rusqlite::types::Value;
+use std::time::{Duration, Instant};
 use turso_core::vdbe::StepResult;
 
 fn run_until_terminal(stmt: &mut turso_core::Statement) -> turso_core::Result<StepResult> {
@@ -56,5 +57,113 @@ fn query_timeout_allows_short_running_query(tmp_db: TempDatabase) -> anyhow::Res
         matches!(result, StepResult::Done),
         "expected done, got {result:?}"
     );
+    Ok(())
+}
+
+/// Runs for minutes on 200 rows, so a statement that returns quickly was
+/// stopped inside the trigger rather than after it.
+const SLOW_JOIN: &str = "SELECT count(*) FROM tasks a, tasks b, tasks c, tasks d";
+
+fn run_expecting_prompt_interrupt(stmt: &mut turso_core::Statement) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let result = run_until_terminal(stmt);
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(result, Ok(StepResult::Interrupt)),
+        "expected interrupt, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the trigger body ran for {elapsed:?} before the statement stopped"
+    );
+    Ok(())
+}
+
+fn create_tasks(conn: &std::sync::Arc<turso_core::Connection>) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE tasks(id INTEGER PRIMARY KEY)")?;
+    for i in 0..200 {
+        conn.execute(format!("INSERT INTO tasks VALUES ({i})"))?;
+    }
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn query_timeout_interrupts_trigger_body(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_tasks(&conn)?;
+    conn.execute("CREATE TABLE outbox(id INTEGER PRIMARY KEY, v INTEGER)")?;
+    conn.execute("INSERT INTO outbox VALUES (1, 0)")?;
+    conn.execute(format!(
+        "CREATE TRIGGER slow BEFORE UPDATE ON outbox BEGIN {SLOW_JOIN}; END"
+    ))?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO outbox VALUES (2, 0)")?;
+    conn.set_query_timeout(Duration::from_millis(10));
+
+    let mut stmt = conn.prepare("UPDATE outbox SET v = v + 1")?;
+    run_expecting_prompt_interrupt(&mut stmt)?;
+    drop(stmt);
+
+    conn.set_query_timeout(Duration::ZERO);
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id, v FROM outbox ORDER BY id"),
+        vec![
+            vec![Value::Integer(1), Value::Integer(0)],
+            vec![Value::Integer(2), Value::Integer(0)],
+        ],
+        "the interrupted UPDATE must change no row, and the INSERT before it must commit"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn query_timeout_interrupts_trigger_fired_by_foreign_key_action(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_tasks(&conn)?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )?;
+    conn.execute("INSERT INTO parent VALUES (1)")?;
+    conn.execute("INSERT INTO child VALUES (1, 1)")?;
+    conn.execute(format!(
+        "CREATE TRIGGER slow BEFORE DELETE ON child BEGIN {SLOW_JOIN}; END"
+    ))?;
+    conn.set_query_timeout(Duration::from_millis(10));
+
+    let mut stmt = conn.prepare("DELETE FROM parent WHERE id = 1")?;
+    run_expecting_prompt_interrupt(&mut stmt)?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn connection_interrupt_inside_trigger_returns_interrupt(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_tasks(&conn)?;
+    conn.execute("CREATE TABLE outbox(id INTEGER PRIMARY KEY, v INTEGER)")?;
+    conn.execute("INSERT INTO outbox VALUES (1, 0)")?;
+    conn.execute(format!(
+        "CREATE TRIGGER slow BEFORE UPDATE ON outbox BEGIN {SLOW_JOIN}; END"
+    ))?;
+    // The UPDATE itself runs far fewer than 1000 instructions, so the
+    // handler first runs, and calls interrupt(), inside the trigger.
+    let conn_for_handler = conn.clone();
+    conn.set_progress_handler(
+        1000,
+        Some(Box::new(move || {
+            conn_for_handler.interrupt();
+            false
+        })),
+    );
+
+    let mut stmt = conn.prepare("UPDATE outbox SET v = v + 1 WHERE id = 1")?;
+    run_expecting_prompt_interrupt(&mut stmt)?;
+    conn.set_progress_handler(0, None);
     Ok(())
 }

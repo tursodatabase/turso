@@ -1786,12 +1786,12 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     db: Arc<dyn turso_core::File>,
 ) -> Result<DbSyncInfo> {
     tracing::info!("db_bootstrap");
-    let start_time = std::time::Instant::now();
     let db_info = db_info_http(ctx).await?;
     tracing::info!("db_bootstrap: fetched db_info={db_info:?}");
     let content = db_bootstrap_http(ctx, db_info.current_generation).await?;
     let mut pos = 0;
     loop {
+        let done = content.is_done()?;
         while let Some(chunk) = content.poll_data()? {
             ctx.io.network_stats.read(chunk.data().len());
             let chunk = chunk.data();
@@ -1814,7 +1814,7 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
             }
             pos += content_len as u64;
         }
-        if content.is_done()? {
+        if done {
             break;
         }
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
@@ -1823,8 +1823,7 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     // sync file in the end
     sync_file(ctx.coro, &db).await?;
 
-    let elapsed = std::time::Instant::now().duration_since(start_time);
-    tracing::info!("db_bootstrap: finished: bytes={pos}, elapsed={:?}", elapsed);
+    tracing::info!("db_bootstrap: finished: bytes={pos}");
 
     Ok(db_info)
 }
@@ -2332,6 +2331,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
             WalHttpPullResult::Frames(content) => content,
         };
         loop {
+            let done = data.is_done()?;
             while let Some(chunk) = data.poll_data()? {
                 ctx.io.network_stats.read(chunk.data().len());
                 let mut chunk = chunk.data();
@@ -2368,7 +2368,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
                     }
                 }
             }
-            if data.is_done()? {
+            if done {
                 break;
             }
             ctx.coro.yield_(SyncEngineIoResult::IO).await?;
@@ -3633,7 +3633,7 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
 ) -> Result<DatabasePullRevision> {
     tracing::info!("bootstrap_db_file(path={})", main_db_path);
 
-    let start_time = std::time::Instant::now();
+    let start_time = io.current_time_monotonic();
     // cleanup all files left from previous attempt to bootstrap
     // we shouldn't write any WAL files - but let's truncate them too for safety
     if let Some(file) = io.try_open(main_db_path)? {
@@ -3649,7 +3649,7 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
     let file = io.create(main_db_path)?;
     let db_info = db_bootstrap(ctx, file).await?;
 
-    let elapsed = std::time::Instant::now().duration_since(start_time);
+    let elapsed = io.current_time_monotonic().duration_since(start_time);
     tracing::info!(
         "bootstrap_db_files(path={}): finished: elapsed={:?}",
         main_db_path,
@@ -3931,7 +3931,6 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
     network_stats: &DataStats,
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
-    let start_time = std::time::Instant::now();
     while completion.status()?.is_none() {
         coro.yield_(SyncEngineIoResult::IO).await?;
     }
@@ -3954,10 +3953,11 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
             Some((message_length, prefix_length)) => message_length + prefix_length > bytes.len(),
         };
         if not_enough_bytes {
+            let done = completion.is_done()?;
             if let Some(poll) = completion.poll_data()? {
                 network_stats.read(poll.data().len());
                 bytes.extend_from_slice(poll.data());
-            } else if !completion.is_done()? {
+            } else if !done {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             } else if bytes.is_empty() {
                 return Ok(None);
@@ -3973,10 +3973,7 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
             Error::DatabaseSyncEngineError(format!("unable to deserialize protobuf message: {e}"))
         })?;
         let _ = bytes.split_to(message_length + prefix_length);
-        tracing::trace!(
-            "wait_proto_message: elapsed={:?}",
-            std::time::Instant::now().duration_since(start_time)
-        );
+        tracing::trace!("wait_proto_message: got message");
         return Ok(Some(message));
     }
 }
@@ -3988,11 +3985,12 @@ pub async fn wait_all_results<Ctx, T: Clone>(
 ) -> Result<Vec<T>> {
     let mut results = Vec::new();
     loop {
+        let done = completion.is_done()?;
         while let Some(poll) = completion.poll_data()? {
             stats.inspect(|s| s.read(poll.data().len()));
             results.extend_from_slice(poll.data());
         }
-        if completion.is_done()? {
+        if done {
             break;
         }
         coro.yield_(SyncEngineIoResult::IO).await?;
@@ -4007,7 +4005,7 @@ mod tests {
         collections::BTreeMap,
         sync::{Arc, Mutex},
     };
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;
@@ -5717,9 +5715,11 @@ mod tests {
                 let opts = push_test_opts();
                 let conn = db.connect(&coro).await.unwrap();
 
-                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("CREATE TABLE \"T\"(x)").unwrap();
                 conn.execute("INSERT INTO t VALUES (1)").unwrap();
                 conn.execute("INSERT INTO t VALUES (2), (3)").unwrap();
+                conn.execute("UPDATE t SET x = 4 WHERE x = 1").unwrap();
+                conn.execute("DELETE FROM t WHERE x = 2").unwrap();
                 let after_writes = count_local_changes(&coro, &conn, &opts, 0).await.unwrap();
 
                 update_last_change_id(&coro, &conn, "client-a", 1, 0)
@@ -5771,12 +5771,12 @@ mod tests {
             }
         };
 
-        assert_eq!(after_writes, 4);
+        assert_eq!(after_writes, 6);
         assert_eq!(after_second_high_water_mark, after_first_high_water_mark);
         assert_eq!(
             with_ignored_table,
-            after_second_high_water_mark - 3,
-            "the three rows written to t must drop out"
+            after_second_high_water_mark - 5,
+            "all five changes to t must drop out"
         );
         assert!(cdc_rows > after_second_high_water_mark);
     }
@@ -5997,5 +5997,111 @@ mod tests {
             detect_remote_pull_protocol(&header(99)),
             RemotePullProtocol::Pages
         );
+    }
+
+    mod last_chunk_arrives_between_checks {
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        use bytes::BytesMut;
+        use prost::Message;
+
+        use crate::database_sync_engine::DataStats;
+        use crate::database_sync_engine_io::{DataCompletion, DataPollResult};
+        use crate::database_sync_operations::{wait_all_results, wait_proto_message};
+        use crate::server_proto::PullUpdatesRespProtoBody;
+        use crate::types::Coro;
+        use crate::Result;
+
+        #[test]
+        fn wait_all_results_keeps_the_chunk_that_arrives_with_done() {
+            let completion = LastChunkArrivesBetweenChecks::new(vec![1, 2], vec![3, 4]);
+            let mut gen = genawaiter::sync::Gen::new(|coro| async move {
+                let coro: Coro<()> = coro.into();
+                wait_all_results(&coro, &completion, None).await
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(_) => continue,
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            assert_eq!(result.unwrap(), vec![1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn wait_proto_message_reads_the_rest_of_a_message_that_arrives_with_done() {
+            let message = PullUpdatesRespProtoBody {
+                server_revision: "revision".to_string(),
+                ..Default::default()
+            };
+            let mut encoded = Vec::new();
+            message.encode_length_delimited(&mut encoded).unwrap();
+            let (head, tail) = encoded.split_at(3);
+            let completion = LastChunkArrivesBetweenChecks::new(head.to_vec(), tail.to_vec());
+            let stats = DataStats::new();
+            let mut gen = genawaiter::sync::Gen::new(|coro| async move {
+                let coro: Coro<()> = coro.into();
+                let mut bytes = BytesMut::new();
+                wait_proto_message::<(), PullUpdatesRespProtoBody>(
+                    &coro,
+                    &completion,
+                    &stats,
+                    &mut bytes,
+                )
+                .await
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(_) => continue,
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            assert_eq!(result.unwrap().unwrap().server_revision, "revision");
+        }
+
+        struct LastChunkArrivesBetweenChecks {
+            chunks: Mutex<VecDeque<Vec<u8>>>,
+            last_chunk: Mutex<Option<Vec<u8>>>,
+            done: Mutex<bool>,
+        }
+
+        impl LastChunkArrivesBetweenChecks {
+            fn new(first_chunk: Vec<u8>, last_chunk: Vec<u8>) -> Self {
+                Self {
+                    chunks: Mutex::new(VecDeque::from([first_chunk])),
+                    last_chunk: Mutex::new(Some(last_chunk)),
+                    done: Mutex::new(false),
+                }
+            }
+        }
+
+        impl DataCompletion<u8> for LastChunkArrivesBetweenChecks {
+            type DataPollResult = Chunk;
+
+            fn status(&self) -> Result<Option<u16>> {
+                Ok(Some(200))
+            }
+
+            fn poll_data(&self) -> Result<Option<Chunk>> {
+                Ok(self.chunks.lock().unwrap().pop_front().map(Chunk))
+            }
+
+            fn is_done(&self) -> Result<bool> {
+                if let Some(last_chunk) = self.last_chunk.lock().unwrap().take() {
+                    self.chunks.lock().unwrap().push_back(last_chunk);
+                    *self.done.lock().unwrap() = true;
+                }
+                Ok(*self.done.lock().unwrap())
+            }
+        }
+
+        struct Chunk(Vec<u8>);
+
+        impl DataPollResult<u8> for Chunk {
+            fn data(&self) -> &[u8] {
+                &self.0
+            }
+        }
     }
 }

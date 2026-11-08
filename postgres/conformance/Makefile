@@ -10,14 +10,21 @@ RUNNER_DIR := $(ROOT_DIR)/testing/sqltest
 ifdef CI
     CARGO_PROFILE := --release
     TARGET_DIR := release
+    FUZZER_CARGO_PROFILE := --profile pg-dump-fuzzer
+    FUZZER_TARGET_DIR := pg-dump-fuzzer
 else
     CARGO_PROFILE :=
     TARGET_DIR := debug
+    FUZZER_CARGO_PROFILE :=
+    FUZZER_TARGET_DIR := debug
 endif
 
 # Honor a CARGO_TARGET_DIR override; default to the workspace target dir.
 TARGET_ROOT := $(or $(CARGO_TARGET_DIR),$(ROOT_DIR)/target)
 TURSOPG := $(TARGET_ROOT)/$(TARGET_DIR)/tursopg
+PGDUMP_FUZZER := $(TARGET_ROOT)/$(FUZZER_TARGET_DIR)/pg-dump-fuzzer
+PGDUMP_PROFILE ?= compatible
+FUZZ_ARGS ?= --cases 100
 SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CARGO_PROFILE)
 
 # Test corpora (relative to this directory)
@@ -26,7 +33,7 @@ PG_TESTS := pg-sqltests
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-upstream clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
 
 # Build everything
 all: build
@@ -66,6 +73,25 @@ run-postgres: build-runner
 # make run-one-postgres FILE=pg-sqltests/select.sqltest
 run-one-postgres: build-runner
 	./with-postgres.sh sh -c '$(SQLTEST) run $(FILE) --jobs $(POSTGRES_JOBS) --backend postgres --postgres-dsn "$$PG_DSN"'
+
+# Differential SQLSTATE fuzzer: generates a random schema, data, and
+# statements and compares every outcome's error code against a real
+# PostgreSQL server. Prints its seed; rerun a failure with SEED=<n>, and
+# set GEN_CASES=<n> for more statements.
+run-sqlstate-fuzzer:
+	POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh cargo test -p turso_pg_server --test sqlstate_differential -- --nocapture
+
+build-dump-fuzzer:
+	cd $(ROOT_DIR) && cargo build $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
+
+test-pgdump: build-tursopg build-dump-fuzzer
+	cd $(ROOT_DIR) && cargo test $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
+	@for fixture in $(or $(FILE),$(wildcard pgdump/*.sql)); do \
+		POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
+	done
+
+fuzz-pgdump: build-tursopg build-dump-fuzzer
+	POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;

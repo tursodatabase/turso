@@ -65,6 +65,10 @@ impl SqlBackend for TursopgBackend {
         HashSet::new()
     }
 
+    fn reports_sqlstate(&self) -> bool {
+        true
+    }
+
     async fn create_database(
         &self,
         config: &DatabaseConfig,

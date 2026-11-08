@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO};
+use turso_sqlite::SqliteDialect;
 use turso_sync_engine::Result;
 
 use super::replica::Replica;
@@ -71,6 +70,8 @@ impl Remote {
     }
 }
 
-pub(super) fn database_opts() -> DatabaseOpts {
-    DatabaseOpts::new().with_generated_columns(true)
+/// Options for remotes and replicas. Custom types are on so that a test can
+/// use a schema that a replica opened with `DatabaseOpts::new()` cannot replay.
+pub fn database_opts() -> DatabaseOpts {
+    DatabaseOpts::new().with_custom_types(true)
 }

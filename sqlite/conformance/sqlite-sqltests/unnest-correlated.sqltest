@@ -1551,10 +1551,10 @@ test limit-one-keeps-correlated-in {
 expect {
     1|0|0|SCAN limit_outer AS o
     6|0|0|CORRELATED LIST SUBQUERY 1
-    8|6|0|SCAN limit_inner AS i
+    9|6|0|SCAN limit_inner AS i
     1|0|0|SCAN limit_outer AS o
     6|0|0|CORRELATED LIST SUBQUERY 1
-    8|6|0|SCAN limit_inner AS i
+    9|6|0|SCAN limit_inner AS i
     1|0|0|SCAN limit_outer AS o
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
 }

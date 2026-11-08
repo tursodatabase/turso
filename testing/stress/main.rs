@@ -24,7 +24,7 @@ use turso_stress::sync::Arc;
 use turso_stress::sync::AsyncBarrier as Barrier;
 use turso_stress::sync::AsyncMutex as Mutex;
 
-use crate::conn::StressDb;
+use crate::conn::{StressConn, StressDb};
 use crate::counter::StressCounter;
 use crate::logging::Tracer;
 use crate::progress::ProgressBars;
@@ -277,7 +277,16 @@ fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
     match data_type {
         DataType::Integer => rng.random_range(0..1000).to_string(),
         DataType::Real => format!("{:.2}", rng.random_range(0f32..100f32)),
-        DataType::Text => format!("'{}'", generate_random_identifier(rng)),
+        DataType::Text => {
+            // 10% chance of a text value large enough to spill into overflow
+            // pages, also as a primary key or UNIQUE index key.
+            if rng.random_ratio(1, 10) {
+                let repeat = rng.random_range(20..400);
+                format!("'{}'", generate_random_identifier(rng).repeat(repeat))
+            } else {
+                format!("'{}'", generate_random_identifier(rng))
+            }
+        }
         DataType::Blob => {
             // 20% chance of generating a large blob via zeroblob() to trigger
             // page allocation (the pattern that exposed the savepoint rollback
@@ -399,13 +408,50 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
     format!("DELETE FROM {} WHERE {};", table.name, where_clause)
 }
 
-/// Generate a random SQL statement for a schema
-fn generate_random_statement(rng: &mut ThreadRng, schema: &ArbitrarySchema) -> String {
+/// Run a random write or read against a random table. Errors are ignored
+/// here; `StressConn` fails the run on errors that point to an engine bug.
+async fn run_random_statement(conn: &StressConn, rng: &mut ThreadRng, schema: &ArbitrarySchema) {
     let table = rng.choose(&schema.tables);
-    match rng.random_range(0..=2) {
-        0 => generate_insert(rng, table),
-        1 => generate_update(rng, table),
-        _ => generate_delete(rng, table),
+    let _ = match rng.random_range(0..=3) {
+        0 => conn
+            .execute(&generate_insert(rng, table), ())
+            .await
+            .map(|_| ()),
+        1 => conn
+            .execute(&generate_update(rng, table), ())
+            .await
+            .map(|_| ()),
+        2 => conn
+            .execute(&generate_delete(rng, table), ())
+            .await
+            .map(|_| ()),
+        _ => conn.query_all(&generate_read(rng, table)).await,
+    };
+}
+
+/// Generate a read that scans many rows of a table.
+fn generate_read(rng: &mut ThreadRng, table: &Table) -> String {
+    let column = rng.choose(&table.columns);
+    if rng.random_ratio(1, 2) {
+        format!(
+            "SELECT count(*), sum(length({})) FROM {};",
+            column.name, table.name
+        )
+    } else {
+        let pk_column = table
+            .columns
+            .iter()
+            .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
+            .expect("Table should have a primary key");
+        format!(
+            "SELECT count(*), sum(length({})) FROM (SELECT * FROM {} WHERE {} >= {} ORDER BY {} LIMIT {});",
+            column.name,
+            table.name,
+            pk_column.name,
+            generate_random_value(rng, &pk_column.data_type),
+            pk_column.name,
+            rng.random_range(1..200)
+        )
     }
 }
 
@@ -644,6 +690,11 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         .collect();
 
     let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
+    // The page size can only change while the database is empty.
+    if opts.db_ref.is_none() {
+        let page_size = main_rng.choose(&[512, 1024, 4096, 65536]);
+        conn.pragma_update("page_size", page_size).await?;
+    }
     'stmts: for stmt in &ddl_statements {
         let mut retry_counter = 0;
         while retry_counter < 10 {
@@ -707,12 +758,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             let stress_counter = stress_counter.clone();
 
             let handle = turso_stress::future::spawn(async move {
-                let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
                 let mut rng = ThreadRng::new(
                     global_seed
                         .wrapping_add(thread_idx as u64)
                         .wrapping_add(batch_idx.wrapping_mul(1000)),
                 );
+                let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                conn.apply_random_settings(&mut rng, opts.tx_mode).await?;
                 let mut iteration_count_this_batch = 0;
 
                 all_threads_ready.wait().await;
@@ -721,6 +773,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if rng.random_ratio(1, 50) {
                         // Reconnect to the database
                         conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                        conn.apply_random_settings(&mut rng, opts.tx_mode).await?;
                     }
 
                     let tx = match opts.tx_mode {
@@ -744,10 +797,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         )
                         .await;
                     } else {
-                        let sql = generate_random_statement(&mut rng, &schema_for_task);
-                        if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
-                            turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
-                        }
+                        run_random_statement(&conn, &mut rng, &schema_for_task).await;
                     }
 
                     // When inside a transaction, 30% chance to exercise savepoints.
@@ -772,12 +822,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                                 )
                                 .await;
                             } else {
-                                let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
-                                if let Err(turso::Error::Corrupt(e)) =
-                                    conn.execute(&sp_sql, ()).await
-                                {
-                                    turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
-                                }
+                                run_random_statement(&conn, &mut rng, &schema_for_task).await;
                             }
                         }
 
@@ -826,6 +871,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         match result {
                             Ok(rows) if rows == [Value::Text("ok".into())] => {
                                 sql_logger.log(&thread, sql, "OK");
+                                turso_macros::turso_assert_reachable!("integrity check succeeded", { "thread": thread });
                             }
                             Ok(rows) if rows.is_empty() => {
                                 sql_logger.log(&thread, sql, "ERROR: no rows");

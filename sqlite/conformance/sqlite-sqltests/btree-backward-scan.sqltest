@@ -17,3 +17,23 @@ expect {
     1800
     1|1800
 }
+
+# Regression test for https://github.com/tursodatabase/turso/issues/9295
+# The REPLACE at child 10 cascades a delete into index cb while the SELECT scans
+# cb backward. The scan must not return a leaf page a second time.
+@cross-check-integrity
+test backward-index-scan-after-fk-cascade-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE, b TEXT);
+    CREATE INDEX cb ON c(b);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 20)
+    INSERT INTO c(id, pid, b) SELECT x, NULL, printf('%02d', x) || printf('%.800c', '.') FROM s;
+    INSERT INTO p(id, v) VALUES (-1, NULL);
+    INSERT INTO c(id, pid, b) VALUES (99, -1, 'zz');
+    INSERT OR REPLACE INTO p(id, v) SELECT CASE WHEN id = 10 THEN -1 END, id FROM c ORDER BY b DESC;
+    SELECT group_concat(v, ' ') FROM (SELECT v FROM p WHERE id <> -1 ORDER BY id);
+}
+expect {
+    99 20 19 18 17 16 15 14 13 12 11 9 8 7 6 5 4 3 2 1
+}

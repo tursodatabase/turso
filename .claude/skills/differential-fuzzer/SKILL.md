@@ -121,8 +121,12 @@ Always follow these steps
    tells you immediately whether the edit kept the bug. This loop usually
    ends at a one-line kernel you can hand to `EXPLAIN` on both engines.
 
-6. **Create a regression test** in `.sqltest` (preferred) or `.rs` from the
-   kernel. Always load the [Debugging skill for reference](../debugging/).
+6. **Create a permanent `*.sqltest` regression** from the kernel before the
+   fix is complete. Preserve only the schema, data, statements, and assertions
+   required to expose the bug. The seed and minimized fuzzer artifact are
+   debugging aids, not substitutes for this regression. Use a Rust test only
+   when the behavior cannot be expressed in `.sqltest`, and always load the
+   [Debugging skill for reference](../debugging/).
 
 ## Understanding Failures
 

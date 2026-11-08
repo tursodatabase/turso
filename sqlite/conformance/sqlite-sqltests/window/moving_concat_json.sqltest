@@ -78,6 +78,7 @@ setup empty_concat_values {
 }
 
 @setup empty_concat_values
+@skip-if sqlite "SQLite 3.50.4 loses empty group_concat values when a window frame moves its start; fixed on SQLite trunk"
 @cross-check-integrity
 test moving-group-concat-empty-prefix {
     SELECT id,
@@ -90,8 +91,91 @@ test moving-group-concat-empty-prefix {
 expect {
     1|''|''
     2|'|'|'|'
-    3|'x'|'x'
-    4|'y'|'y'
+    3|'|x'|'|x'
+    4|'x--y'|'x--y'
+}
+
+setup empty_concat_suffix_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT);
+    INSERT INTO t VALUES (1,'a','a'),(2,'',''),(3,NULL,'');
+}
+
+@setup empty_concat_suffix_values
+@cross-check-integrity
+test moving-group-concat-only-empty-strings-left {
+    SELECT id,
+           quote(group_concat(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(string_agg(v, '--') OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(group_concat(w) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING))
+    FROM t ORDER BY id;
+}
+expect {
+    1|'a,'|'a--'|'a,,'
+    2|''|''|','
+    3|NULL|NULL|''
+}
+
+setup empty_concat_middle_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1,'a'),(2,''),(3,'b'),(4,''),(5,'c');
+}
+
+@setup empty_concat_middle_values
+@skip-if sqlite "SQLite 3.50.4 loses empty group_concat values when a window frame moves its start; fixed on SQLite trunk"
+@cross-check-integrity
+test moving-group-concat-step-after-text-emptied {
+    SELECT id,
+           quote(group_concat(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(group_concat(v, '--') OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))
+    FROM t ORDER BY id;
+}
+expect {
+    1|'a,'|'a'
+    2|',b'|'a--'
+    3|'b,'|'--b'
+    4|',c'|'b--'
+    5|'c'|'--c'
+}
+
+setup empty_concat_unicode_values {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1,'a'),(2,''),(3,'éa'),(4,'b');
+}
+
+@setup empty_concat_unicode_values
+@skip-if sqlite "SQLite 3.50.4 loses empty group_concat values when a window frame moves its start; fixed on SQLite trunk"
+@cross-check-integrity
+test moving-group-concat-empty-and-unicode-values {
+    SELECT a,
+           quote(group_concat(b) OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)),
+           quote(string_agg(b, '-') OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING))
+    FROM t ORDER BY a;
+}
+expect {
+    1|'a,'|'a-'
+    2|',éa'|'-éa'
+    3|'éa,b'|'éa-b'
+    4|'b'|'b'
+}
+
+setup empty_separator_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, sep TEXT);
+    INSERT INTO t VALUES (1,'a','--'),(2,'',''),(3,'',''),(4,'b',',');
+}
+
+@setup empty_separator_values
+@skip-if sqlite "SQLite 3.50.4 loses empty group_concat values when a window frame moves its start; fixed on SQLite trunk"
+@cross-check-integrity
+test moving-group-concat-empty-values-empty-separators {
+    SELECT id,
+           quote(group_concat(v, sep) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING))
+    FROM t ORDER BY id;
+}
+expect {
+    1|'a'
+    2|',b'
+    3|',b'
+    4|'b'
 }
 
 setup peer_values {

@@ -1,0 +1,13 @@
+---
+source: nulls-first-last.sqltest
+expression: SELECT x FROM nn ORDER BY x NULLS LAST LIMIT 2;
+info:
+  statement_type: SELECT
+  tables:
+  - nn
+  setup_blocks:
+  - not-null-index-table
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN nn USING COVERING INDEX nn_x

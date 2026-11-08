@@ -219,6 +219,46 @@ test divide-by-zero {
 expect {
 }
 
+test divide-by-float-zero {
+    SELECT 10 / 0.0
+}
+expect {
+}
+
+test divide-float-by-float-zero {
+    SELECT 10.0 / 0.0
+}
+expect {
+}
+
+test divide-float-by-int-zero {
+    SELECT (1.5 / 0) IS NULL
+}
+expect {
+    1
+}
+
+test divide-by-quoted-zero {
+    SELECT (1 / '0') IS NULL
+}
+expect {
+    1
+}
+
+test divide-null-by-zero {
+    SELECT (NULL / 0) IS NULL
+}
+expect {
+    1
+}
+
+test remainder-null-by-zero {
+    SELECT (NULL % 0) IS NULL
+}
+expect {
+    1
+}
+
 test divide-int-null {
     SELECT 10 / null
 }
@@ -1601,6 +1641,41 @@ expect {
 
 test log-int-null {
     SELECT log(5, null)
+}
+expect {
+}
+
+# Only the base of log(B, X) is type-checked: X is read like sqlite3_value_double().
+test log-int-str-numeric-prefix {
+    SELECT log(10, '100abc')
+}
+expect {
+    2.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    2
+}
+
+test log-int-blob {
+    SELECT log(10, x'313030')
+}
+expect {
+    2.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    2
+}
+
+test log-int-str-not-numeric {
+    SELECT log(10, 'abc')
+}
+expect {
+}
+
+test log-str-numeric-prefix-int {
+    SELECT log('10abc', 100)
 }
 expect {
 }

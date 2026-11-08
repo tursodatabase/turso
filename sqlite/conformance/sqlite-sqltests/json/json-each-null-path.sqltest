@@ -1,0 +1,33 @@
+@database :memory:
+
+# A NULL PATH makes json_each and json_tree return no rows, the same as a
+# NULL JSON argument. The JSON is still parsed first, so malformed JSON is
+# an error even with a NULL path.
+
+test json-each-null-path-is-empty {
+    SELECT count(*) FROM json_each('[1,2]', NULL);
+}
+expect {
+    0
+}
+
+test json-tree-null-path-is-empty {
+    SELECT count(*) FROM json_tree('[1,2]', NULL);
+}
+expect {
+    0
+}
+
+test json-each-null-path-from-join {
+    SELECT count(*) FROM (SELECT NULL AS p) JOIN json_each('[1,2]', p);
+}
+expect {
+    0
+}
+
+test json-each-null-path-still-parses-json {
+    SELECT count(*) FROM json_each('not json', NULL);
+}
+expect error {
+    .*malformed JSON.*
+}

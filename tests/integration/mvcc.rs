@@ -7,8 +7,9 @@ use std::sync::Arc;
 use turso_core::{
     mvcc::persistent_storage::logical_log::LogTxFrameInfo, Clock, Completion, ConnectOpts,
     Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, MonotonicInstant, OpenFlags,
-    OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
+    OpenOptions, StepResult, WallClockInstant, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
@@ -54,11 +55,12 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn serialize_row_version(
         &self,
         log_record: &mut turso_core::mvcc::database::LogRecord,
+        row_id: &turso_core::mvcc::database::RowID,
         row_version: &turso_core::mvcc::database::RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> turso_core::Result<()> {
         self.inner
-            .serialize_row_version(log_record, row_version, portable_extension)
+            .serialize_row_version(log_record, row_id, row_version, portable_extension)
     }
 
     fn serialize_database_header(
@@ -407,6 +409,28 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
     let conn2 = tmp_db.connect_limbo();
     conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_open_reports_unsupported() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_open_reports_unsupported.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute("INSERT INTO files VALUES (1, zeroblob(8))")?;
+
+    for read_write in [false, true] {
+        let Err(err) = conn.blob_open("files", "data", 1, read_write) else {
+            panic!("blob_open must fail in MVCC mode");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Internal error: incremental blob I/O is not supported in MVCC mode"
+        );
+    }
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
+    assert_eq!(rows, vec![("0000000000000000".to_string(),)]);
     Ok(())
 }
 
@@ -1504,6 +1528,38 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
     Ok(())
 }
 
+/// Regression test for https://github.com/tursodatabase/turso/issues/8067
+///
+/// Under MVCC, an UPSERT (`ON CONFLICT(v) DO UPDATE SET id = excluded.id`) on a
+/// checkpointed row probes the new `INTEGER PRIMARY KEY` with `NotExists` on the
+/// table cursor before re-seeking to the conflicting rowid and deleting it.
+/// `MvccLazyCursor::exists` moved the underlying B-tree cursor during a miss
+/// without clearing `current_pos`, causing the subsequent `SeekRowid` equality
+/// fast-path to short-circuit and `Delete` to fail with a false corruption error.
+#[turso_macros::test]
+fn test_mvcc_checkpointed_upsert_changing_ipk(db: TempDatabase) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    conn.execute("INSERT INTO t VALUES (3, 'one') ON CONFLICT(v) DO UPDATE SET id = excluded.id")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    let by_pk: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(by_pk, vec![(2, "two".to_string()), (3, "one".to_string())]);
+
+    let by_idx: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, v FROM t INDEXED BY sqlite_autoindex_t_1 ORDER BY v");
+    assert_eq!(by_idx, vec![(3, "one".to_string()), (2, "two".to_string())]);
+
+    Ok(())
+}
+
 /// Regression test for https://github.com/tursodatabase/turso/issues/7578
 ///
 /// An active MVCC index scan must not return a row deleted after the scan
@@ -1943,6 +1999,9 @@ fn test_ddl_in_concurrent_tx_busy_after_other_commit(tmp_db: TempDatabase) -> an
 
     let conn2 = tmp_db.connect_limbo();
     conn2.execute("BEGIN CONCURRENT")?;
+    // BEGIN CONCURRENT is deferred; read to pin the snapshot before the
+    // other connection commits.
+    let _: Vec<(i64,)> = conn2.exec_rows("SELECT count(*) FROM t");
 
     conn.execute("INSERT INTO t VALUES (1)")?;
 
@@ -2043,5 +2102,44 @@ fn test_savepoint_rollback_after_ddl_upgrade_keeps_exclusivity(
         vec![(1,)],
         "writes proceed after the upgraded tx ends"
     );
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/11163:
+/// reopening an MVCC database whose `sqlite_sequence` contains a row with a
+/// NULL name must succeed. A name that is not text names no table, so the
+/// WAL→MVCC autoincrement watermark sync skips the row like WAL mode does.
+/// The seq value is coerced to an integer the way the INSERT path does it.
+#[test]
+fn test_mvcc_open_tolerates_null_sqlite_sequence_name() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_null_sqlite_sequence_name.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+    conn.execute("CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+    conn.execute("CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+    conn.execute("INSERT INTO t1 VALUES(NULL)")?;
+    conn.execute("INSERT INTO t2 VALUES(NULL)")?;
+    conn.execute("INSERT INTO t3 VALUES(NULL)")?;
+    // A NULL name and a non-text name both make a row name no table.
+    conn.execute("UPDATE sqlite_sequence SET name=NULL WHERE name='t1'")?;
+    conn.execute("UPDATE sqlite_sequence SET name=5 WHERE name='t2'")?;
+    // A text seq is coerced to its integer prefix like the INSERT path does.
+    conn.execute("UPDATE sqlite_sequence SET seq='5abc' WHERE name='t3'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    // Drop the cached Database so the reopen below really runs MVCC
+    // bootstrap: opening a still-live path returns the existing instance.
+    let path = tmp_db.path.clone();
+    conn.close()?;
+    drop(conn);
+    drop(tmp_db);
+    let tmp_db = TempDatabase::new_with_existent(&path);
+    let conn = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM sqlite_sequence");
+    assert_eq!(rows, vec![(3,)]);
+    // The coerced text sequence still hands out the next watermark.
+    conn.execute("INSERT INTO t3 VALUES(NULL)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT seq FROM sqlite_sequence WHERE name='t3'");
+    assert_eq!(rows, vec![(6,)]);
     Ok(())
 }

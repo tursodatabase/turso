@@ -304,6 +304,11 @@ fn test_hermitage_otv_observed_transaction_vanishes() {
     conn2.execute("BEGIN CONCURRENT").unwrap();
     conn3.execute("BEGIN CONCURRENT").unwrap();
 
+    // BEGIN CONCURRENT is deferred; pin T3's snapshot before T1 writes so
+    // the observed-transaction-vanishes check below still exercises a
+    // snapshot that predates T1's commit.
+    assert_eq!(read_value(&conn3, 1), 10);
+
     // T1: update test set value = 11 where id = 1
     conn1
         .execute("UPDATE test SET value = 11 WHERE id = 1")

@@ -1,0 +1,624 @@
+# GRANT SELECT on tables through the PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+#
+# The privilege is stored in the relation's access control list, which
+# pg_class.relacl shows in PostgreSQL's aclitem[] form. The owner's default
+# entry lists every table privilege of PostgreSQL 17 and later. A role reads
+# a table only when it owns it or the list gives it SELECT.
+
+@database :memory:
+
+test grant-select-lets-a-role-read-the-table {
+    CREATE ROLE gs_reader;
+    CREATE TABLE gs_docs (id INT);
+    INSERT INTO gs_docs VALUES (1), (2);
+    GRANT SELECT ON gs_docs TO gs_reader;
+    SET ROLE gs_reader;
+    SELECT id FROM gs_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test grant-select-on-table-keyword {
+    CREATE ROLE gs_table_keyword;
+    CREATE TABLE gs_keyword (id INT);
+    INSERT INTO gs_keyword VALUES (1);
+    GRANT SELECT ON TABLE gs_keyword TO gs_table_keyword;
+    SET ROLE gs_table_keyword;
+    SELECT id FROM gs_keyword;
+}
+expect {
+    1
+}
+
+test grant-select-on-table-qualified-with-its-schema {
+    CREATE ROLE gs_qualified;
+    CREATE TABLE gs_public_docs (id INT);
+    INSERT INTO gs_public_docs VALUES (1);
+    GRANT SELECT ON public.gs_public_docs TO gs_qualified;
+    SET ROLE gs_qualified;
+    SELECT id FROM public.gs_public_docs;
+}
+expect {
+    1
+}
+
+test grant-select-on-several-tables-to-several-roles {
+    CREATE ROLE gs_many_a;
+    CREATE ROLE gs_many_b;
+    CREATE TABLE gs_many_x (id INT);
+    CREATE TABLE gs_many_y (id INT);
+    INSERT INTO gs_many_x VALUES (1);
+    INSERT INTO gs_many_y VALUES (2);
+    GRANT SELECT ON gs_many_x, gs_many_y TO gs_many_a, gs_many_b;
+    SET ROLE gs_many_b;
+    SELECT x.id, y.id FROM gs_many_x x, gs_many_y y;
+}
+expect {
+    1|2
+}
+
+test grant-select-to-public-lets-every-role-read {
+    CREATE ROLE gs_public_reader;
+    CREATE TABLE gs_for_everyone (id INT);
+    INSERT INTO gs_for_everyone VALUES (1);
+    GRANT SELECT ON gs_for_everyone TO PUBLIC;
+    SET ROLE gs_public_reader;
+    SELECT id FROM gs_for_everyone;
+}
+expect {
+    1
+}
+
+test grant-select-to-current-user {
+    CREATE TABLE gs_current (id INT);
+    INSERT INTO gs_current VALUES (1);
+    GRANT SELECT ON gs_current TO CURRENT_USER;
+    SELECT id FROM gs_current;
+}
+expect {
+    1
+}
+
+test grant-select-to-quoted-role-name {
+    CREATE ROLE "GsQuoted";
+    CREATE TABLE gs_quoted (id INT);
+    INSERT INTO gs_quoted VALUES (1);
+    GRANT SELECT ON gs_quoted TO "GsQuoted";
+    SET ROLE "GsQuoted";
+    SELECT id FROM gs_quoted;
+}
+expect {
+    1
+}
+
+test grant-select-on-all-tables-in-schema {
+    CREATE ROLE gs_all_tables;
+    CREATE TABLE gs_all_a (id INT);
+    CREATE TABLE gs_all_b (id INT);
+    INSERT INTO gs_all_a VALUES (1);
+    INSERT INTO gs_all_b VALUES (2);
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO gs_all_tables;
+    SET ROLE gs_all_tables;
+    SELECT a.id, b.id FROM gs_all_a a, gs_all_b b;
+}
+expect {
+    1|2
+}
+
+test grant-select-on-view {
+    CREATE ROLE gs_view_reader;
+    CREATE TABLE gs_view_base (id INT);
+    INSERT INTO gs_view_base VALUES (1), (2);
+    CREATE VIEW gs_view AS SELECT id FROM gs_view_base WHERE id > 1;
+    GRANT SELECT ON gs_view TO gs_view_reader;
+    SET ROLE gs_view_reader;
+    SELECT id FROM gs_view;
+}
+expect {
+    2
+}
+
+test grant-select-twice {
+    CREATE ROLE gs_twice;
+    CREATE TABLE gs_twice_docs (id INT);
+    INSERT INTO gs_twice_docs VALUES (1);
+    GRANT SELECT ON gs_twice_docs TO gs_twice;
+    GRANT SELECT ON gs_twice_docs TO gs_twice;
+    SET ROLE gs_twice;
+    SELECT id FROM gs_twice_docs;
+}
+expect {
+    1
+}
+
+test grant-select-in-a-transaction {
+    CREATE ROLE gs_in_tx;
+    CREATE TABLE gs_tx_docs (id INT);
+    INSERT INTO gs_tx_docs VALUES (1);
+    BEGIN;
+    GRANT SELECT ON gs_tx_docs TO gs_in_tx;
+    COMMIT;
+    SET ROLE gs_in_tx;
+    SELECT id FROM gs_tx_docs;
+}
+expect {
+    1
+}
+
+test grant-select-on-missing-table-fails {
+    CREATE ROLE gs_missing_table;
+    GRANT SELECT ON gs_no_such_table TO gs_missing_table;
+}
+@sqlstate 42P01
+expect error {
+    relation "gs_no_such_table" does not exist
+}
+
+test grant-select-on-missing-table-in-schema-fails {
+    CREATE ROLE gs_missing_qualified;
+    GRANT SELECT ON public.gs_no_such_table TO gs_missing_qualified;
+}
+@sqlstate 42P01
+expect error {
+    relation "public.gs_no_such_table" does not exist
+}
+
+test grant-select-on-table-in-missing-schema-fails {
+    CREATE ROLE gs_missing_schema;
+    GRANT SELECT ON gs_no_such_schema.t TO gs_missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    schema "gs_no_such_schema" does not exist
+}
+
+test grant-select-on-all-tables-in-missing-schema-fails {
+    CREATE ROLE gs_all_missing_schema;
+    GRANT SELECT ON ALL TABLES IN SCHEMA gs_no_such_schema TO gs_all_missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    schema "gs_no_such_schema" does not exist
+}
+
+test grant-select-on-all-tables-in-an-empty-schema-checks-the-role {
+    CREATE SCHEMA gs_empty_schema;
+    GRANT SELECT ON ALL TABLES IN SCHEMA gs_empty_schema TO gs_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "gs_no_such_role" does not exist
+}
+
+test grant-select-to-missing-role-fails {
+    CREATE TABLE gs_missing_role_docs (id INT);
+    GRANT SELECT ON gs_missing_role_docs TO gs_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "gs_no_such_role" does not exist
+}
+
+test grant-select-checks-the-table-before-the-role {
+    GRANT SELECT ON gs_no_such_table TO gs_no_such_role;
+}
+@sqlstate 42P01
+expect error {
+    relation "gs_no_such_table" does not exist
+}
+
+test grant-select-to-role-named-in-another-case-fails {
+    CREATE ROLE "GsCased";
+    CREATE TABLE gs_cased (id INT);
+    GRANT SELECT ON gs_cased TO GsCased;
+}
+@sqlstate 42704
+expect error {
+    role "gscased" does not exist
+}
+
+test grant-select-in-a-read-only-transaction-fails {
+    CREATE ROLE gs_read_only;
+    CREATE TABLE gs_read_only_docs (id INT);
+    BEGIN READ ONLY;
+    GRANT SELECT ON gs_read_only_docs TO gs_read_only;
+}
+@sqlstate 25006
+expect error {}
+
+test grant-select-on-catalog-tables {
+    CREATE ROLE gs_catalog_reader;
+    CREATE TABLE gs_catalog_docs (id INT);
+    GRANT SELECT ON pg_catalog.pg_class, pg_namespace, pg_catalog.pg_roles TO gs_catalog_reader;
+    SET ROLE gs_catalog_reader;
+    SELECT relname FROM pg_catalog.pg_class WHERE relname = 'gs_catalog_docs';
+}
+expect {
+    gs_catalog_docs
+}
+
+test grant-select-on-information-schema-table {
+    CREATE ROLE gs_schemata_reader;
+    GRANT SELECT ON information_schema.schemata TO gs_schemata_reader;
+    SET ROLE gs_schemata_reader;
+    SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'public';
+}
+expect {
+    public
+}
+
+test grant-select-on-index-fails {
+    CREATE ROLE gs_index_grantee;
+    CREATE TABLE gs_indexed (id INT);
+    CREATE INDEX gs_indexed_idx ON gs_indexed (id);
+    GRANT SELECT ON gs_indexed_idx TO gs_index_grantee;
+}
+@sqlstate 42809
+expect error {
+    "gs_indexed_idx" is an index
+}
+
+test grant-select-on-table-in-another-database-fails {
+    CREATE ROLE gs_cross_database;
+    GRANT SELECT ON gs_other_db.public.t TO gs_cross_database;
+}
+@sqlstate 0A000
+expect error {}
+
+test grant-select-to-pg-database-owner {
+    CREATE TABLE gs_database_owner (id INT);
+    INSERT INTO gs_database_owner VALUES (1);
+    GRANT SELECT ON gs_database_owner TO pg_database_owner;
+    SELECT id FROM gs_database_owner;
+}
+expect {
+    1
+}
+
+# What GRANT stores: pg_class.relacl.
+
+test grant-select-is-stored-in-relacl {
+    CREATE ROLE gs_acl_reader;
+    CREATE TABLE gs_acl (id INT);
+    GRANT SELECT ON gs_acl TO gs_acl_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_reader=r/postgres}
+}
+
+test relacl-is-null-before-the-first-grant {
+    CREATE TABLE gs_untouched (id INT);
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'gs_untouched';
+}
+expect {
+    null
+}
+
+test grant-select-to-public-is-stored-with-an-empty-grantee {
+    CREATE TABLE gs_acl_public (id INT);
+    GRANT SELECT ON gs_acl_public TO PUBLIC;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_public';
+}
+expect {
+    {postgres=arwdDxtm/postgres,=r/postgres}
+}
+
+test grant-select-to-several-roles-is-stored-in-order {
+    CREATE ROLE gs_acl_first;
+    CREATE ROLE gs_acl_second;
+    CREATE TABLE gs_acl_many (id INT);
+    GRANT SELECT ON gs_acl_many TO gs_acl_first, PUBLIC, gs_acl_second;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_many';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_first=r/postgres,=r/postgres,gs_acl_second=r/postgres}
+}
+
+test grant-select-twice-is-stored-once {
+    CREATE ROLE gs_acl_twice;
+    CREATE TABLE gs_acl_twice_docs (id INT);
+    GRANT SELECT ON gs_acl_twice_docs TO gs_acl_twice;
+    GRANT SELECT ON gs_acl_twice_docs TO gs_acl_twice;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_twice_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_twice=r/postgres}
+}
+
+test grant-select-to-the-owner-stores-the-default-list {
+    CREATE TABLE gs_acl_owner (id INT);
+    GRANT SELECT ON gs_acl_owner TO postgres;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_owner';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test grant-select-to-a-mixed-case-role-is-stored-unquoted {
+    CREATE ROLE "GsAclCased";
+    CREATE TABLE gs_acl_cased (id INT);
+    GRANT SELECT ON gs_acl_cased TO "GsAclCased";
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_cased';
+}
+expect {
+    {postgres=arwdDxtm/postgres,GsAclCased=r/postgres}
+}
+
+test grant-select-on-sequence-is-stored-with-sequence-privileges {
+    CREATE ROLE gs_acl_seq_reader;
+    CREATE SEQUENCE gs_acl_seq;
+    GRANT SELECT ON gs_acl_seq TO gs_acl_seq_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_seq';
+}
+expect {
+    {postgres=rwU/postgres,gs_acl_seq_reader=r/postgres}
+}
+
+# Views are granted on too, which the Rust integration tests cover, because
+# pg_class does not list views yet.
+test grant-select-on-all-tables-in-schema-is-stored-on-each-table-but-not-sequences {
+    CREATE ROLE gs_acl_all;
+    CREATE TABLE gs_acl_all_a (id INT);
+    CREATE TABLE gs_acl_all_b (id INT);
+    CREATE SEQUENCE gs_acl_all_s;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO gs_acl_all;
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+    WHERE relname IN ('gs_acl_all_a', 'gs_acl_all_b', 'gs_acl_all_s') ORDER BY relname;
+}
+expect {
+    gs_acl_all_a|{postgres=arwdDxtm/postgres,gs_acl_all=r/postgres}
+    gs_acl_all_b|{postgres=arwdDxtm/postgres,gs_acl_all=r/postgres}
+    gs_acl_all_s|null
+}
+
+test grant-select-by-the-owner-names-the-owner-as-grantor {
+    CREATE ROLE gs_acl_owner_role;
+    CREATE ROLE gs_acl_owner_reader;
+    CREATE TABLE gs_acl_owned (id INT);
+    ALTER TABLE gs_acl_owned OWNER TO gs_acl_owner_role;
+    SET ROLE gs_acl_owner_role;
+    GRANT SELECT ON gs_acl_owned TO gs_acl_owner_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_owned';
+}
+expect {
+    {gs_acl_owner_role=arwdDxtm/gs_acl_owner_role,gs_acl_owner_reader=r/gs_acl_owner_role}
+}
+
+test grant-select-by-a-superuser-grants-as-the-owner {
+    CREATE ROLE gs_acl_su_owner;
+    CREATE ROLE gs_acl_su_reader;
+    CREATE TABLE gs_acl_su_owned (id INT);
+    ALTER TABLE gs_acl_su_owned OWNER TO gs_acl_su_owner;
+    GRANT SELECT ON gs_acl_su_owned TO gs_acl_su_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_su_owned';
+}
+expect {
+    {gs_acl_su_owner=arwdDxtm/gs_acl_su_owner,gs_acl_su_reader=r/gs_acl_su_owner}
+}
+
+test grant-select-by-a-role-without-privileges-fails {
+    CREATE ROLE gs_acl_stranger;
+    CREATE ROLE gs_acl_stranger_reader;
+    CREATE TABLE gs_acl_not_theirs (id INT);
+    SET ROLE gs_acl_stranger;
+    GRANT SELECT ON gs_acl_not_theirs TO gs_acl_stranger_reader;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_acl_not_theirs
+}
+
+# PostgreSQL warns that no privileges were granted and stores nothing.
+test grant-select-by-a-role-without-grant-option-stores-nothing {
+    CREATE ROLE gs_acl_no_option;
+    CREATE ROLE gs_acl_no_option_reader;
+    CREATE TABLE gs_acl_readable (id INT);
+    GRANT SELECT ON gs_acl_readable TO PUBLIC;
+    SET ROLE gs_acl_no_option;
+    GRANT SELECT ON gs_acl_readable TO gs_acl_no_option_reader;
+    SET ROLE postgres;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_readable';
+}
+expect {
+    {postgres=arwdDxtm/postgres,=r/postgres}
+}
+
+test owner-to-after-grant-puts-the-new-owner-in-the-list {
+    CREATE ROLE gs_acl_new_owner;
+    CREATE ROLE gs_acl_kept_reader;
+    CREATE TABLE gs_acl_handed_over (id INT);
+    GRANT SELECT ON gs_acl_handed_over TO gs_acl_kept_reader;
+    ALTER TABLE gs_acl_handed_over OWNER TO gs_acl_new_owner;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_handed_over';
+}
+expect {
+    {gs_acl_new_owner=arwdDxtm/gs_acl_new_owner,gs_acl_kept_reader=r/gs_acl_new_owner}
+}
+
+test grant-select-in-a-rolled-back-transaction-stores-nothing {
+    CREATE ROLE gs_acl_rolled_back;
+    CREATE TABLE gs_acl_rollback_docs (id INT);
+    BEGIN;
+    GRANT SELECT ON gs_acl_rollback_docs TO gs_acl_rolled_back;
+    ROLLBACK;
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'gs_acl_rollback_docs';
+}
+expect {
+    null
+}
+
+test grant-select-in-a-committed-transaction-is-stored {
+    CREATE ROLE gs_acl_committed;
+    CREATE TABLE gs_acl_commit_docs (id INT);
+    BEGIN;
+    GRANT SELECT ON gs_acl_commit_docs TO gs_acl_committed;
+    COMMIT;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_commit_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_committed=r/postgres}
+}
+
+test rename-after-grant-keeps-the-list {
+    CREATE ROLE gs_acl_renamed_reader;
+    CREATE TABLE gs_acl_before_rename (id INT);
+    GRANT SELECT ON gs_acl_before_rename TO gs_acl_renamed_reader;
+    ALTER TABLE gs_acl_before_rename RENAME TO gs_acl_after_rename;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_after_rename';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_renamed_reader=r/postgres}
+}
+
+# What GRANT allows: reading the table.
+
+test role-without-select-cannot-read-the-table {
+    CREATE ROLE gs_denied;
+    CREATE TABLE gs_closed (id INT);
+    SET ROLE gs_denied;
+    SELECT id FROM gs_closed;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed
+}
+
+test role-without-select-cannot-read-the-table-in-a-join {
+    CREATE ROLE gs_denied_join;
+    CREATE TABLE gs_open_j (id INT);
+    CREATE TABLE gs_closed_j (id INT);
+    GRANT SELECT ON gs_open_j TO gs_denied_join;
+    SET ROLE gs_denied_join;
+    SELECT o.id FROM gs_open_j o JOIN gs_closed_j c ON c.id = o.id;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_j
+}
+
+test role-without-select-cannot-read-the-table-in-a-subquery {
+    CREATE ROLE gs_denied_sub;
+    CREATE TABLE gs_closed_sub (id INT);
+    SET ROLE gs_denied_sub;
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM gs_closed_sub);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_sub
+}
+
+test role-without-select-cannot-read-the-table-in-a-cte {
+    CREATE ROLE gs_denied_cte;
+    CREATE TABLE gs_closed_cte (id INT);
+    SET ROLE gs_denied_cte;
+    WITH c AS (SELECT id FROM gs_closed_cte) SELECT id FROM c;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_cte
+}
+
+test role-without-select-cannot-read-the-view {
+    CREATE ROLE gs_denied_view;
+    CREATE TABLE gs_view_closed_base (id INT);
+    CREATE VIEW gs_closed_view AS SELECT id FROM gs_view_closed_base;
+    SET ROLE gs_denied_view;
+    SELECT id FROM gs_closed_view;
+}
+@sqlstate 42501
+expect error {
+    permission denied for view gs_closed_view
+}
+
+test select-on-the-view-is-enough-when-its-owner-reads-the-table {
+    CREATE ROLE gs_view_only;
+    CREATE TABLE gs_view_only_base (id INT);
+    INSERT INTO gs_view_only_base VALUES (7);
+    CREATE VIEW gs_view_only_view AS SELECT id FROM gs_view_only_base;
+    GRANT SELECT ON gs_view_only_view TO gs_view_only;
+    SET ROLE gs_view_only;
+    SELECT id FROM gs_view_only_view;
+}
+expect {
+    7
+}
+
+test select-on-the-view-is-not-enough-when-its-owner-cannot-read-the-table {
+    CREATE ROLE gs_view_owner;
+    CREATE ROLE gs_view_reader2;
+    CREATE TABLE gs_view_private_base (id INT);
+    CREATE VIEW gs_view_of_private AS SELECT id FROM gs_view_private_base;
+    ALTER VIEW gs_view_of_private OWNER TO gs_view_owner;
+    GRANT SELECT ON gs_view_of_private TO gs_view_reader2;
+    SET ROLE gs_view_reader2;
+    SELECT id FROM gs_view_of_private;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_view_private_base
+}
+
+test the-owner-reads-its-table-without-a-grant {
+    CREATE ROLE gs_owner_reads;
+    CREATE TABLE gs_owned_by_reader (id INT);
+    INSERT INTO gs_owned_by_reader VALUES (3);
+    ALTER TABLE gs_owned_by_reader OWNER TO gs_owner_reads;
+    SET ROLE gs_owner_reads;
+    SELECT id FROM gs_owned_by_reader;
+}
+expect {
+    3
+}
+
+test select-granted-to-public-lets-a-role-made-later-read {
+    CREATE TABLE gs_for_all (id INT);
+    INSERT INTO gs_for_all VALUES (5);
+    GRANT SELECT ON gs_for_all TO PUBLIC;
+    CREATE ROLE gs_latecomer;
+    SET ROLE gs_latecomer;
+    SELECT id FROM gs_for_all;
+}
+expect {
+    5
+}
+
+test select-granted-to-another-role-does-not-let-this-one-read {
+    CREATE ROLE gs_granted_other;
+    CREATE ROLE gs_not_granted;
+    CREATE TABLE gs_for_other (id INT);
+    GRANT SELECT ON gs_for_other TO gs_granted_other;
+    SET ROLE gs_not_granted;
+    SELECT id FROM gs_for_other;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_for_other
+}
+
+test reset-role-reads-again {
+    CREATE ROLE gs_back_to_super;
+    CREATE TABLE gs_after_reset (id INT);
+    INSERT INTO gs_after_reset VALUES (9);
+    SET ROLE gs_back_to_super;
+    RESET ROLE;
+    SELECT id FROM gs_after_reset;
+}
+expect {
+    9
+}
+
+test role-without-select-cannot-count-the-table {
+    CREATE ROLE gs_denied_count;
+    CREATE TABLE gs_closed_count (id INT);
+    SET ROLE gs_denied_count;
+    SELECT count(*) FROM gs_closed_count;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_count
+}

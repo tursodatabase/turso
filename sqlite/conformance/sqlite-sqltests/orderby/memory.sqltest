@@ -379,3 +379,62 @@ expect {
     1
 }
 
+# A join ordered by the rowid of one table scans that table first and needs no sorter.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_rowid_join_scans_ordered_table_first {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b INT);
+    EXPLAIN QUERY PLAN SELECT * FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SEARCH t2 USING INTEGER PRIMARY KEY (rowid=?)
+}
+
+# A rowid seek beats a full scan of another index that gives the order.
+setup seek_or_ordered_scan {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX ta ON t(a);
+    CREATE TABLE u(id INTEGER PRIMARY KEY, c INT);
+}
+
+@setup seek_or_ordered_scan
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_other_index_keeps_rowid_eq_seek {
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE id = 5 ORDER BY a;
+}
+expect {
+    1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+    10|0|0|USE SORTER FOR ORDER BY
+}
+
+@setup seek_or_ordered_scan
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_other_index_keeps_rowid_in_seek {
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE id IN (1, 2, 3) ORDER BY a;
+}
+expect {
+    1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+    26|0|0|USE SORTER FOR ORDER BY
+}
+
+@setup seek_or_ordered_scan
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test groupby_other_index_keeps_rowid_eq_seek {
+    EXPLAIN QUERY PLAN SELECT a, count(*) FROM t WHERE id = 5 GROUP BY a;
+}
+expect {
+    1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+    4|0|0|USE SORTER FOR GROUP BY
+}
+
+@setup seek_or_ordered_scan
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test orderby_other_index_keeps_join_rowid_eq_seek {
+    EXPLAIN QUERY PLAN SELECT * FROM u JOIN t ON t.id = u.id WHERE u.id = 5 ORDER BY t.a;
+}
+expect {
+    1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+    16|0|0|USE SORTER FOR ORDER BY
+}

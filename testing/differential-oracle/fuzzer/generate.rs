@@ -55,6 +55,7 @@ pub enum WeightProfile {
     CorrelatedSubqueries,
     /// SELECT-heavy workload with chained joins of every join type.
     Joins,
+    OrderedAggregates,
 }
 
 impl WeightProfile {
@@ -99,6 +100,7 @@ impl WeightProfile {
             // Keep this profile on reads, inserts, and schema creation. Unrelated
             // UPDATE or DELETE failures must not stop a fixed JOIN campaign.
             // Use fewer inserts because each row can multiply a chained join.
+            WeightProfile::OrderedAggregates => base(80, 15, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),
             WeightProfile::Joins => base(80, 4, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),
         }
     }
@@ -131,6 +133,17 @@ impl WeightProfile {
             policy.expr_config.exists_negation_probability = 0.5;
             policy.literal_config.string_max_len = 20;
             policy.literal_config.blob_max_size = 16;
+        }
+
+        if self == WeightProfile::OrderedAggregates {
+            policy.expr_config.aggregate_order_by_probability = 1.0;
+            policy.expr_config.aggregate_distinct_probability = 0.4;
+            policy.select_config.group_by_probability = 0.8;
+            policy.select_config.subquery_aggregate_probability = 1.0;
+            policy.select_config.cte_probability = 0.0;
+            policy.select_config.compound_probability = 0.0;
+            policy.max_expr_depth = 2;
+            policy.max_subquery_depth = 1;
         }
 
         if self == WeightProfile::Joins {
@@ -211,8 +224,25 @@ impl SqlGenBackend {
         window_function_probability: f64,
         profile: WeightProfile,
     ) -> Self {
+        Self::new_with_options(seed, window_function_probability, profile, false)
+    }
+
+    pub fn new_with_options(
+        seed: u64,
+        window_function_probability: f64,
+        profile: WeightProfile,
+        ivm: bool,
+    ) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
-        let stmt_weights = profile.stmt_weights();
+        let mut stmt_weights = profile.stmt_weights();
+        if ivm {
+            // Schema changes under a table with dependent materialized views
+            // diverge from SQLite by design: Turso rejects ALTER TABLE
+            // outright, and DROP TABLE would orphan the view. Disable both so
+            // IVM runs exercise maintenance, not that asymmetry.
+            stmt_weights.drop_table = 0;
+            stmt_weights.alter_table = 0;
+        }
         tracing::info!("Statement weight profile {profile:?}: {stmt_weights:?}");
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
@@ -318,6 +348,10 @@ pub struct PropTestBackend {
 
 impl PropTestBackend {
     pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
+        Self::new_with_options(seed_bytes, recursive_cte_focus, false)
+    }
+
+    pub fn new_with_options(seed_bytes: [u8; 32], recursive_cte_focus: bool, ivm: bool) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -347,6 +381,12 @@ impl PropTestBackend {
             cte.cte_count_range = 1..=3;
             cte.recursive_weight = 100;
             cte.non_recursive_weight = 0;
+        }
+        if ivm {
+            // See SqlGenBackend::new_with_options: DROP/ALTER TABLE on base tables of
+            // materialized views diverge from SQLite by design.
+            profile.drop_table_weight = 0;
+            profile.alter_table = sql_gen_prop::WeightedProfile::new(0);
         }
         Self {
             test_runner,
@@ -485,6 +525,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordered_json_aggregates_accept_blob_columns() {
+        use crate::shrink::{EnginePair, query_results_differ};
+        use sql_gen::{ColumnDef, DataType, Schema, Table};
+
+        let pair = EnginePair::build_strict(
+            "CREATE TABLE t(x BLOB);\nINSERT INTO t VALUES (x'00'), (x'FF'), (NULL);",
+        )
+        .unwrap();
+        let schema = Schema {
+            tables: vec![Table::new("t", vec![ColumnDef::new("x", DataType::Blob)])],
+            ..Default::default()
+        };
+        for seed in 0..100 {
+            let mut generator =
+                SqlGenBackend::new_with_window_weight(seed, 0.0, WeightProfile::OrderedAggregates);
+            generator.policy.stmt_weights = sql_gen::StmtWeights::select_only();
+            generator
+                .policy
+                .function_config
+                .aggregate_function_weights
+                .retain(|(function, _)| function.name == "JSON_GROUP_ARRAY");
+            generator.policy.expr_config.aggregate_filter_probability = 0.0;
+            generator.policy.select_config.group_by_probability = 1.0;
+            generator.policy.select_config.where_probability = 0.0;
+            generator.policy.select_config.having_probability = 0.0;
+            generator.policy.select_config.join_config.join_probability = 0.0;
+            let statement = generator.generate(&schema).unwrap();
+            let (turso, sqlite) = pair.run_both(&statement.sql);
+            assert!(
+                !turso.is_error() && !sqlite.is_error(),
+                "seed {seed}: {}: {turso:?} / {sqlite:?}",
+                statement.sql
+            );
+            assert!(!query_results_differ(&turso, &sqlite), "{}", statement.sql);
+        }
+    }
+
+    #[test]
+    fn ordered_aggregates_match_sqlite_and_ignore_input_scan_order() {
+        use crate::oracle::QueryResult;
+        use crate::shrink::{EnginePair, query_results_differ};
+        use sql_gen::{ColumnDef, DataType, Schema, Table};
+
+        let rows = [
+            "(1, 1, 'a')",
+            "(1, 1.5, 'a')",
+            "(1, NULL, 'A')",
+            "(2, -2, 'b')",
+            "(2, 3, '')",
+            "(2, 3, '')",
+        ];
+        let state = format!(
+            "CREATE TABLE t(g, v, s);\nINSERT INTO t VALUES {};",
+            rows.join(",")
+        );
+        let forward = EnginePair::build_strict(&state).unwrap();
+        let schema = Schema {
+            tables: vec![Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("g", DataType::Integer),
+                    ColumnDef::new("v", DataType::Real),
+                    ColumnDef::new("s", DataType::Text),
+                ],
+            )],
+            ..Default::default()
+        };
+        let mut outcomes = Vec::new();
+        for seed in 0..200 {
+            let mut generator =
+                SqlGenBackend::new_with_window_weight(seed, 0.0, WeightProfile::OrderedAggregates);
+            generator.policy.stmt_weights = sql_gen::StmtWeights::select_only();
+            generator.policy.select_config.group_by_probability = 1.0;
+            generator.policy.select_config.limit_probability = 0.0;
+            generator.policy.select_config.join_config.join_probability = 0.0;
+            let statement = generator.generate(&schema).unwrap();
+            if statement.is_ddl || statement.mutates_data || statement.has_unordered_limit {
+                continue;
+            }
+            let (turso, sqlite) = forward.run_both(&statement.sql);
+            if matches!(
+                (&turso, &sqlite),
+                (QueryResult::Error(_), QueryResult::Error(_))
+            ) {
+                continue;
+            }
+            assert!(
+                !turso.is_error() && !sqlite.is_error(),
+                "seed {seed}: {}: {turso:?} / {sqlite:?}",
+                statement.sql
+            );
+            assert!(
+                !query_results_differ(&turso, &sqlite),
+                "seed {seed}: {}",
+                statement.sql
+            );
+            outcomes.push((seed, statement.sql, turso, sqlite));
+        }
+        assert!(
+            outcomes.len() > 100,
+            "only {} successful comparisons",
+            outcomes.len()
+        );
+        let (turso, sqlite) = forward.run_both("DELETE FROM t");
+        assert!(!turso.is_error() && !sqlite.is_error());
+        let insert = format!(
+            "INSERT INTO t VALUES {}",
+            rows.into_iter().rev().collect::<Vec<_>>().join(",")
+        );
+        let (turso, sqlite) = forward.run_both(&insert);
+        assert!(!turso.is_error() && !sqlite.is_error());
+        for (seed, sql, turso, sqlite) in outcomes {
+            let (reversed_turso, reversed_sqlite) = forward.run_both(&sql);
+            assert!(
+                !query_results_differ(&turso, &reversed_turso),
+                "seed {seed}: {sql}"
+            );
+            assert!(
+                !query_results_differ(&sqlite, &reversed_sqlite),
+                "seed {seed}: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn updates_that_can_choose_different_rows_are_disabled() {
         let sql_gen = SqlGenBackend::new(1);
         assert_eq!(sql_gen.policy.update_config.or_ignore_probability, 0.0);
@@ -564,6 +729,7 @@ mod tests {
             WeightProfile::Triggers,
             WeightProfile::Writes,
             WeightProfile::CorrelatedSubqueries,
+            WeightProfile::OrderedAggregates,
             WeightProfile::Joins,
         ] {
             let w = profile.stmt_weights();

@@ -66,8 +66,12 @@ jobs:
           cache: true
           cache-dependency-path: bindings/go/go.sum
 
+      - name: Run serverless Go tests
+        working-directory: serverless/go
+        run: go test ./...
+
       - name: Build Rust (debug)
-        run: cargo build --verbose --locked
+        run: cargo build --verbose --locked -p turso_sync_sdk_kit -p turso_cli
 
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir
       - name: Run Go tests (Linux)

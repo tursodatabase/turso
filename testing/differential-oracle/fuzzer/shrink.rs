@@ -16,16 +16,18 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use turso_core::{ConnectOpts, Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database};
 use turso_parser::ast::{
     Cmd, Expr, InsertBody, Literal, OneSelect, ResultColumn, Select, SelectTable, Stmt,
 };
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 use crate::memory::MemorySimIO;
-use crate::oracle::{DifferentialOracle, QueryResult};
+use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};
 
 /// Upper bound on candidate executions per shrink, so a pathological
 /// statement cannot stall a fuzzing loop.
@@ -62,17 +64,38 @@ pub struct EnginePair {
 }
 
 impl EnginePair {
-    /// Build both engines and replay the state script into each. Individual
-    /// statement errors during replay are ignored: the script was produced
-    /// from a live database, so failures here would only come from replay
-    /// artifacts, and the baseline check below decides whether the replayed
-    /// state is good enough to shrink against.
+    /// Build both engines and replay the state script into each, tolerating
+    /// replay errors: used for reduction candidates, which deliberately edit
+    /// or drop statements, so a later statement referencing something a
+    /// dropped line used to define is expected to fail.
     pub fn build(state_sql: &str) -> Result<Self> {
+        Self::build_with(state_sql, false)
+    }
+
+    /// Like `build`, but a statement that errors during replay fails the
+    /// build instead of being silently ignored. Use this for a script known
+    /// to have run successfully when it was produced (a state dump or the
+    /// run's executed-statement history): an error there means replay itself
+    /// is broken relative to the original run (for example, a database
+    /// option the original run had enabled that replay does not), not an
+    /// expected casualty of shrinking.
+    pub fn build_strict(state_sql: &str) -> Result<Self> {
+        Self::build_with(state_sql, true)
+    }
+
+    fn build_with(state_sql: &str, surface_errors: bool) -> Result<Self> {
+        static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(0);
+        let database_id = NEXT_DATABASE_ID.fetch_add(1, Ordering::Relaxed);
         let io = Arc::new(MemorySimIO::new(0));
-        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+        // Views are cheap to enable even for a non-IVM run (no materialized
+        // view statement appears unless the original run created one), and a
+        // replay without them can never reproduce an IVM-mode divergence.
+        let opts = turso_core::DatabaseOpts::new()
+            .with_attach(true)
+            .with_views(true);
         let turso_db = Database::open_file_with_flags(
             io,
-            "shrink.db",
+            &format!("shrink-{database_id}.db"),
             turso_core::OpenFlags::default(),
             opts,
             None,
@@ -85,8 +108,20 @@ impl EnginePair {
             if stmt.is_empty() || stmt.starts_with("--") {
                 continue;
             }
-            let _ = DifferentialOracle::execute_turso(&turso, stmt);
-            let _ = DifferentialOracle::execute_sqlite(&sqlite, stmt);
+            let turso_result = DifferentialOracle::execute_turso(&turso, stmt);
+            let sqlite_result = DifferentialOracle::execute_sqlite(&sqlite, stmt);
+            if surface_errors {
+                if let QueryResult::Error(err) = &turso_result {
+                    anyhow::bail!(
+                        "replay statement {stmt:?} failed on turso though the original run succeeded: {err}"
+                    );
+                }
+                if let QueryResult::Error(err) = &sqlite_result {
+                    anyhow::bail!(
+                        "replay statement {stmt:?} failed on sqlite though the original run succeeded: {err}"
+                    );
+                }
+            }
         }
         Ok(Self {
             turso,
@@ -140,8 +175,8 @@ impl EnginePair {
             let QueryResult::Rows(names) = sqlite_names else {
                 continue;
             };
-            for row in &names {
-                let Some(sql_gen_prop::SqlValue::Text(name)) = row.0.first() else {
+            for row in names.rows() {
+                let Some(QueryValue::Text(name)) = row.0.first() else {
                     continue;
                 };
                 let table_sql = format!("SELECT * FROM {db}.{name} ORDER BY rowid");
@@ -159,7 +194,7 @@ impl EnginePair {
 pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
     match (a, b) {
         (QueryResult::Rows(ra), QueryResult::Rows(rb)) => {
-            !sql_gen_prop::result::diff_results(ra, rb).is_empty()
+            !query_result_oracle::diff_result_sets(ra, rb).is_empty()
         }
         (QueryResult::Ok, QueryResult::Ok) => false,
         (QueryResult::Error(_), QueryResult::Error(_)) => false,
@@ -237,7 +272,17 @@ fn expr_children(e: &mut Expr) -> Vec<&mut Expr> {
         | Expr::NotNull(expr)
         | Expr::Unary(_, expr)
         | Expr::FieldAccess { base: expr, .. } => vec![expr],
-        Expr::FunctionCall { args, .. } => args.iter_mut().map(|a| &mut **a).collect(),
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => args
+            .iter_mut()
+            .map(|a| &mut **a)
+            .chain(order_by.iter_mut().map(|item| &mut *item.expr))
+            .chain(filter_over.filter_clause.as_deref_mut())
+            .collect(),
         Expr::InList { lhs, rhs, .. } => {
             let mut v: Vec<&mut Expr> = vec![lhs];
             v.extend(rhs.iter_mut().map(|a| &mut **a));
@@ -1018,11 +1063,11 @@ pub fn shrink_statement(
 ) -> Result<Option<Minimized>> {
     let mut state_sql = state_sql;
     let mut baseline = {
-        let pair = EnginePair::build(state_sql)?;
+        let pair = EnginePair::build_strict(state_sql)?;
         pair.classify(failing_sql)
     };
     if baseline.is_none() {
-        let pair = EnginePair::build(history_sql)?;
+        let pair = EnginePair::build_strict(history_sql)?;
         baseline = pair.classify(failing_sql);
         if baseline.is_some() {
             tracing::info!(
@@ -1072,6 +1117,33 @@ mod tests {
     /// hand-written spacing.
     fn norm(sql: &str) -> String {
         parse_one(sql).expect("test SQL must parse").to_string()
+    }
+
+    #[test]
+    fn engine_pairs_do_not_share_database_state() {
+        let first = EnginePair::build_strict("CREATE TABLE t(x);").unwrap();
+        let second = EnginePair::build_strict("CREATE TABLE t(x);").unwrap();
+        let (turso, sqlite) = first.run_both("INSERT INTO t VALUES (1)");
+        assert!(!turso.is_error() && !sqlite.is_error());
+        assert!(!second.states_differ());
+    }
+
+    #[test]
+    fn aggregate_ordering_and_filter_expressions_shrink() {
+        let results =
+            candidates("SELECT group_concat(x ORDER BY y + 2, z) FILTER (WHERE x > 3) FROM t");
+        assert!(
+            results.contains(&norm(
+                "SELECT group_concat(x ORDER BY 1, z) FILTER (WHERE x > 3) FROM t"
+            )),
+            "{results:?}"
+        );
+        assert!(
+            results.contains(&norm(
+                "SELECT group_concat(x ORDER BY y + 2, z) FILTER (WHERE 1) FROM t"
+            )),
+            "{results:?}"
+        );
     }
 
     #[test]

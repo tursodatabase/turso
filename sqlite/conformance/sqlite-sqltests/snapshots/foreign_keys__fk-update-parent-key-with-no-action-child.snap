@@ -36,7 +36,7 @@ addr  opcode         p1  p2  p3  p4        p5  comment
   19  Halt         2067   0   0  parent.k   0
   20  Column          0   1  12             0  r[12]=parent.k
   21  Copy            5  13   0             0  r[13]=r[5]
-  22  Eq             12  13  43             0  if r[12]==r[13] goto 43
+  22  Eq             12  13  43  Binary     0  if r[12]==r[13] goto 43
   23  Goto            0  24   0             0
   24  IsNull         12  34   0             0  if (r[12]==NULL) goto 34
   25  OpenRead        2   4   0  k(2,B,B)   0  =child, root=4, iDb=0

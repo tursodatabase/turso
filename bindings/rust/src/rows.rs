@@ -57,7 +57,7 @@ impl Rows {
                 self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Self::Output> {
-                self.stmt.step(Some(self.columns), cx)
+                self.stmt.step(self.columns, cx)
             }
         }
 
