@@ -2005,11 +2005,6 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
         .map(|arg| arg.to_string())
         .collect::<Vec<String>>()
         .join(", ");
-    let if_not_exists = if vtab.if_not_exists {
-        "IF NOT EXISTS "
-    } else {
-        ""
-    };
     let module_args = vtab
         .args
         .iter()
@@ -2026,9 +2021,8 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
         "()"
     };
     format!(
-        "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
+        "CREATE VIRTUAL TABLE {} USING {}{}\n /*{}{}*/",
         vtab.tbl_name.name.as_ident(),
-        if_not_exists,
         vtab.module_name.as_ident(),
         if args.is_empty() {
             String::new()
