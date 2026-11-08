@@ -16052,7 +16052,77 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                add_schema_rows(conn, db, rows, trigger_target_database_id, has_mv_store)?;
+                // The rows are added only after the nested `sqlite_schema` scan
+                // finishes, so the schema is changed in place and copied only when
+                // another owner (the committed schema or a savepoint) still shares it.
+                // The qualifiers are read before `with_database_schema_mut` locks the
+                // schema: reading them takes the main schema lock, which that call may hold.
+                let qualifiers = conn.current_qualifiers();
+                // SetCookie has already run for the current temp DDL, so the temp pager's
+                // header cookie is the new schema version. Without it the cached version
+                // can differ from the header on later temp DDL in the same transaction,
+                // which fails the statement with SchemaUpdated and makes the reprepare
+                // roll back the temp pages it has written.
+                let temp_schema_cookie = if db == crate::TEMP_DB_ID {
+                    conn.temp
+                        .database
+                        .read()
+                        .as_ref()
+                        .and_then(|temp_db| temp_db.pager.get_schema_cookie_cached())
+                } else {
+                    None
+                };
+                let syms = conn.syms.read();
+                let dialect = conn.dialect();
+                conn.with_database_schema_mut(db, |schema| {
+                    let attached_resolver =
+                        |alias: &str| qualifiers.database_id(&crate::util::normalize_ident(alias));
+                    let mut from_sql_indexes = crate::alloc::Vec::new();
+                    let mut automatic_indices = crate::HashMap::default();
+                    let mut dbsp_state_roots = crate::HashMap::default();
+                    let mut dbsp_state_index_roots = crate::HashMap::default();
+                    let mut materialized_view_info = crate::HashMap::default();
+                    for row in &rows {
+                        schema.handle_schema_row(
+                            &row.ty,
+                            &row.name,
+                            &row.tbl_name,
+                            row.root_page,
+                            row.sql.as_deref(),
+                            &syms,
+                            &mut from_sql_indexes,
+                            &mut automatic_indices,
+                            &mut dbsp_state_roots,
+                            &mut dbsp_state_index_roots,
+                            &mut materialized_view_info,
+                            &attached_resolver,
+                            dialect.as_ref(),
+                        )?;
+                        if row.ty == "trigger" {
+                            if let Some(target_database_id) = trigger_target_database_id {
+                                schema.set_trigger_target_database_id(
+                                    NamespaceId::ROOT,
+                                    &row.name,
+                                    target_database_id,
+                                )?;
+                            }
+                        }
+                    }
+                    if let Some(cookie) = temp_schema_cookie {
+                        schema.schema_version = cookie;
+                    }
+                    // The schema already holds every stored type.
+                    schema.populate_types_views_then_indices(
+                        &syms,
+                        &[],
+                        materialized_view_info,
+                        dbsp_state_roots,
+                        dbsp_state_index_roots,
+                        from_sql_indexes,
+                        automatic_indices,
+                        has_mv_store,
+                    )
+                })??;
 
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -16090,87 +16160,6 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
             }
         }
     }
-}
-
-/// Adds the rows read by ParseSchema to the connection's schema of database
-/// `db`. The rows are added only after the nested `sqlite_schema` scan
-/// finishes, so the schema is changed in place and copied only when another
-/// owner (the committed schema or a savepoint) still shares it.
-fn add_schema_rows(
-    conn: &Arc<Connection>,
-    db: usize,
-    rows: crate::alloc::Vec<SchemaRow>,
-    trigger_target_database_id: Option<usize>,
-    has_mv_store: bool,
-) -> Result<()> {
-    // Both are read before `with_database_schema_mut` locks the schema: reading
-    // the qualifiers takes the main schema lock, which that call may hold.
-    let qualifiers = conn.current_qualifiers();
-    // SetCookie has already run for the current temp DDL, so the temp pager's
-    // header cookie is the new schema version. Without it the cached version
-    // can differ from the header on later temp DDL in the same transaction,
-    // which fails the statement with SchemaUpdated and makes the reprepare
-    // roll back the temp pages it has written.
-    let temp_schema_cookie = if db == crate::TEMP_DB_ID {
-        conn.temp
-            .database
-            .read()
-            .as_ref()
-            .and_then(|temp_db| temp_db.pager.get_schema_cookie_cached())
-    } else {
-        None
-    };
-    let syms = conn.syms.read();
-    let dialect = conn.dialect();
-    conn.with_database_schema_mut(db, |schema| {
-        let attached_resolver =
-            |alias: &str| qualifiers.database_id(&crate::util::normalize_ident(alias));
-        let mut from_sql_indexes = crate::alloc::Vec::new();
-        let mut automatic_indices = crate::HashMap::default();
-        let mut dbsp_state_roots = crate::HashMap::default();
-        let mut dbsp_state_index_roots = crate::HashMap::default();
-        let mut materialized_view_info = crate::HashMap::default();
-        for row in &rows {
-            schema.handle_schema_row(
-                &row.ty,
-                &row.name,
-                &row.tbl_name,
-                row.root_page,
-                row.sql.as_deref(),
-                &syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                &attached_resolver,
-                dialect.as_ref(),
-            )?;
-            if row.ty == "trigger" {
-                if let Some(target_database_id) = trigger_target_database_id {
-                    schema.set_trigger_target_database_id(
-                        NamespaceId::ROOT,
-                        &row.name,
-                        target_database_id,
-                    )?;
-                }
-            }
-        }
-        if let Some(cookie) = temp_schema_cookie {
-            schema.schema_version = cookie;
-        }
-        // The schema already holds every stored type.
-        schema.populate_types_views_then_indices(
-            &syms,
-            &[],
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            from_sql_indexes,
-            automatic_indices,
-            has_mv_store,
-        )
-    })?
 }
 
 /// Phases of the multi-statement state machine driven by [`op_init_cdc_version`].
