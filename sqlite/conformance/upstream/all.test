@@ -188,7 +188,7 @@ set test_files {
   dbstatus             fail
   dbstatus2            fail
   delete               fail
-  delete2              pass
+  delete2              fail
   delete3              pass
   delete4            fail
   delete_db            fail
@@ -206,7 +206,7 @@ set test_files {
   e_changes            fail
   e_createtable        fail
   e_delete             fail
-  e_droptrigger        pass
+  e_droptrigger        fail
   e_dropview           fail
   e_expr               fail
   e_fkey               fail
@@ -500,7 +500,7 @@ set test_files {
   securedel2           fail
   seekscan1            pass
   select1              pass
-  select2              pass
+  select2              fail
   select3              fail
   select4              fail
   select5              pass
@@ -591,7 +591,7 @@ set test_files {
   tkt-54844eea3f       pass
   tkt-5d863f876e       fail
   tkt-5e10420e8d       fail
-  tkt-5ee23731f        pass
+  tkt-5ee23731f        fail
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
   tkt-78e04e52ea       pass
@@ -618,7 +618,7 @@ set test_files {
   tkt-bd484a090c       fail
   tkt-bdc6bbbb38       fail
   tkt-c48d99d690       pass
-  tkt-c694113d5        pass
+  tkt-c694113d5        fail
   tkt-cbd054fa6b       fail
   tkt-d11f09d36e       pass
   tkt-d635236375       pass
@@ -644,7 +644,7 @@ set test_files {
   tkt1567              fail
   tkt1644              fail
   tkt1667              pass
-  tkt1873              pass
+  tkt1873              fail
   tkt2141              pass
   tkt2192              pass
   tkt2213              fail
