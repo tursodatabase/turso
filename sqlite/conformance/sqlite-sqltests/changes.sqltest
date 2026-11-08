@@ -484,3 +484,27 @@ expect {
     2|8|8
     t2|8
 }
+
+# Only INSERT, UPDATE and DELETE set changes(). CREATE INDEX writes index
+# entries, but like other DDL it leaves the count of the last change as it is.
+@cross-check-integrity
+test changes-unchanged-by-create-index {
+    create table temp (t1 integer);
+    insert into temp values (1), (2), (3);
+    create index temp_t1 on temp (t1);
+    select changes();
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test changes-unchanged-by-create-unique-index {
+    create table temp (t1 integer);
+    insert into temp values (1), (2), (3);
+    create unique index temp_t1 on temp (t1);
+    select changes();
+}
+expect {
+    3
+}

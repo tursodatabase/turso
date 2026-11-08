@@ -90,10 +90,7 @@ pub fn translate(
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
-        ast::Stmt::CreateIndex { .. }
-            | ast::Stmt::Delete { .. }
-            | ast::Stmt::Insert { .. }
-            | ast::Stmt::Update { .. }
+        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
 
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
