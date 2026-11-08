@@ -1,0 +1,144 @@
+@database :memory:
+@skip-file-if sqlite "the CI SQLite build has no median() or stddev()"
+
+# An aggregate from an extension (median, stddev, percentile_cont, ...) used
+# where no aggregate can be computed must give the same error as a built-in
+# aggregate, not crash the process.
+
+test extension-aggregate-in-select-where {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t WHERE median(a) = 1;
+}
+expect error {
+    misuse of aggregate function median()
+}
+
+test extension-aggregate-in-where-without-table {
+    SELECT 1 WHERE percentile_cont(0.5, 1) = 1;
+}
+expect error {
+    misuse of aggregate function percentile_cont()
+}
+
+test extension-aggregate-in-delete-where {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1);
+    DELETE FROM t WHERE median(a) = 3;
+}
+expect error {
+    misuse of aggregate function median()
+}
+
+test extension-aggregate-in-update-where {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1);
+    UPDATE t SET a = 2 WHERE median(a) = 1;
+}
+expect error {
+    misuse of aggregate function median()
+}
+
+test extension-aggregate-in-update-set {
+    CREATE TABLE t(a REAL);
+    INSERT INTO t VALUES(1);
+    UPDATE t SET a = stddev(1);
+}
+expect error {
+    misuse of aggregate function stddev()
+}
+
+test extension-aggregate-in-insert-values {
+    CREATE TABLE t(a REAL);
+    INSERT INTO t VALUES(stddev(1));
+}
+expect error {
+    misuse of aggregate function stddev()
+}
+
+test extension-aggregate-in-returning {
+    CREATE TABLE t(a REAL);
+    INSERT INTO t VALUES(1) RETURNING stddev(a);
+}
+expect error {
+    misuse of aggregate function stddev()
+}
+
+test extension-aggregate-inside-builtin-aggregate {
+    SELECT count(median(1));
+}
+expect error {
+    misuse of aggregate function median()
+}
+
+test extension-aggregate-inside-extension-aggregate {
+    SELECT median(stddev(1));
+}
+expect error {
+    misuse of aggregate function stddev()
+}
+
+test extension-window-function-in-where {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t WHERE median(a) OVER () = 1;
+}
+expect error {
+    misuse of window function median()
+}
+
+test extension-aggregate-in-check-constraint {
+    CREATE TABLE t(a INTEGER, CHECK(median(a) > 0));
+}
+expect error {
+    misuse of aggregate function median()
+}
+
+# The same aggregates still work where SQLite allows them.
+
+test extension-aggregate-in-select-list-and-having {
+    CREATE TABLE t(g INTEGER, a INTEGER);
+    INSERT INTO t VALUES(1, 1), (1, 3), (2, 10);
+    SELECT g, median(a) FROM t GROUP BY g HAVING median(a) > 1 ORDER BY median(a);
+}
+expect {
+    1|2.0
+    2|10.0
+}
+
+test extension-aggregate-inside-expression {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1), (3);
+    SELECT CASE WHEN median(a) > 0 THEN median(a) + 1 ELSE 0 END FROM t;
+}
+expect {
+    3.0
+}
+
+test extension-aggregate-in-where-of-subquery {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1), (3);
+    SELECT a FROM t WHERE a < (SELECT median(a) FROM t);
+}
+expect {
+    1
+}
+
+test extension-aggregate-of-outer-column-in-subquery {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1), (3);
+    SELECT (SELECT median(t.a)) FROM t;
+}
+expect {
+    2.0
+}
+
+test extension-aggregate-of-outer-column-in-subquery-with-group-by {
+    CREATE TABLE t(g INTEGER, a INTEGER);
+    INSERT INTO t VALUES(1, 1), (1, 3), (2, 10);
+    SELECT g, (SELECT median(t.a)) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|2.0
+    2|10.0
+}
