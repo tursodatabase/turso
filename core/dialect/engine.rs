@@ -15,7 +15,7 @@
 
 use crate::namespace::NamespaceId;
 use crate::pragma::PragmaVirtualTable;
-use crate::schema::{BTreeTable, Schema, Table};
+use crate::schema::{Schema, Table};
 use crate::sync::Arc;
 use crate::vtab::{VirtualTable, VirtualTableType};
 use turso_ext::VTabKind;
@@ -44,46 +44,6 @@ pub(crate) struct EngineDialect;
 impl super::Dialect for EngineDialect {
     fn name(&self) -> &'static str {
         "engine"
-    }
-
-    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-        parse(sql)
-    }
-
-    fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-        reject_postgres_table_sql(sql)?;
-        BTreeTable::from_sql(sql, root_page)
-    }
-
-    fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-        reject_postgres_table_sql(sql)?;
-        parse_table_sql_ast(sql)
-    }
-
-    fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-        reject_postgres_table_sql(sql)?;
-        table_sql_for_replay(sql)
-    }
-
-    fn format_table_sql(
-        &self,
-        _input: &str,
-        tbl_name: &turso_parser::ast::QualifiedName,
-        body: &turso_parser::ast::CreateTableBody,
-    ) -> crate::Result<String> {
-        format_table_sql(tbl_name, body)
-    }
-
-    fn register_catalog(
-        &self,
-        schema: &mut Schema,
-        enable_custom_types: bool,
-    ) -> crate::Result<()> {
-        register_builtin_catalog(schema, enable_custom_types)
-    }
-
-    fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
-        resolve_builtin_function(name, arg_count)
     }
 }
 
