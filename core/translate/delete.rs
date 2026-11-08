@@ -283,6 +283,7 @@ pub fn prepare_delete_plan(
         namespace,
         indexed,
         plan_estimate: None,
+        row_filter: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -315,7 +316,12 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         resolver,
     )?;
-    row_security::filter_rows(command, &table_references, &mut where_predicates, resolver)?;
+    row_security::filter_rows(
+        command,
+        &mut table_references,
+        &mut where_predicates,
+        resolver,
+    )?;
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)

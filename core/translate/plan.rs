@@ -1829,6 +1829,10 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
+    /// The condition that row-level security puts on the rows of the table.
+    /// It is checked as soon as the loop reads a row, before any other
+    /// condition, so no expression of the query sees a row it fails.
+    pub row_filter: Option<ast::Expr>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -3327,6 +3331,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3380,6 +3385,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3418,6 +3424,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 

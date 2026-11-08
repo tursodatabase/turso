@@ -391,6 +391,7 @@ pub fn translate_insert(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );

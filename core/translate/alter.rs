@@ -760,6 +760,7 @@ fn emit_column_constraints_validation(
                 namespace,
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );

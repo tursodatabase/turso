@@ -347,6 +347,7 @@ fn prepare_update_plan(
         namespace,
         indexed,
         plan_estimate: None,
+        row_filter: None,
     };
     let mut table_refs_outside_from = Vec::new();
     for set in &body.sets {
@@ -374,7 +375,12 @@ fn prepare_update_plan(
         &mut from_tables,
         connection,
     )?;
-    row_security::filter_rows(Command::Select, &from_tables, &mut where_clause, resolver)?;
+    row_security::filter_rows(
+        Command::Select,
+        &mut from_tables,
+        &mut where_clause,
+        resolver,
+    )?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
     // a column name that already appears in another FROM-side table without being
@@ -421,7 +427,7 @@ fn prepare_update_plan(
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
     row_security::filter_rows(
         Command::Update,
-        &read_scope_tables,
+        &mut read_scope_tables,
         &mut where_clause,
         resolver,
     )?;

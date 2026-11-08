@@ -34,44 +34,52 @@ use crate::{
 };
 
 /// Limits the rows of the tables in `table_references` that the statement
-/// reads, updates or deletes to the rows the role may access, by adding a
-/// filter to `where_clause` for each table that the role may not access in
-/// full.
+/// reads, updates or deletes to the rows the role may access.
 ///
-/// For the right side of a LEFT JOIN the filter is part of the join
-/// condition, so a hidden row reads as NULLs like a row that does not exist.
-/// The filters go before the statement's own conditions.
+/// Each such table gets the condition its rows must pass as
+/// [`JoinedTable::row_filter`], which the loop over the table checks before
+/// any other condition, so no expression of the statement sees a row the
+/// role may not access. On the right side of a LEFT JOIN a row that fails it
+/// reads as NULLs, like a row that does not exist.
+///
+/// The parts of the condition are also added to `where_clause` so that the
+/// optimizer can use them. Rows that fail them were already skipped.
+///
+/// [`JoinedTable::row_filter`]: crate::translate::plan::JoinedTable::row_filter
 pub(crate) fn filter_rows(
     command: Command,
-    table_references: &TableReferences,
+    table_references: &mut TableReferences,
     where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
-    let mut filters = Vec::new();
-    for table in table_references.joined_tables() {
+    let mut terms = Vec::new();
+    for index in 0..table_references.joined_tables().len() {
+        let table = &table_references.joined_tables()[index];
         let Table::BTree(btree) = &table.table else {
             continue;
         };
-        match policy(resolver, table.namespace, &btree.declared_name, command) {
+        let filter = match policy(resolver, table.namespace, &btree.declared_name, command) {
             Policy::Allow => continue,
-            Policy::Deny => {}
-        }
+            Policy::Deny => no_rows(),
+        };
         reject_joins_that_keep_right_rows(table_references, &btree.declared_name)?;
-        let is_outer = table
+        let origin = if table
             .join_info
             .as_ref()
-            .is_some_and(|join_info| join_info.is_outer());
-        filters.push(WhereTerm {
-            expr: no_rows(),
-            origin: if is_outer {
-                WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
-            } else {
-                WhereTermOrigin::Where
-            },
+            .is_some_and(|join_info| join_info.is_outer())
+        {
+            WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
+        } else {
+            WhereTermOrigin::Where
+        };
+        terms.push(WhereTerm {
+            expr: filter.clone(),
+            origin,
             consumed: false,
         });
+        table_references.joined_tables_mut()[index].row_filter = Some(filter);
     }
-    where_clause.splice(0..0, filters);
+    where_clause.splice(0..0, terms);
     Ok(())
 }
 

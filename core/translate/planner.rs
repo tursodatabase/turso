@@ -2155,6 +2155,7 @@ fn parse_table(
                     namespace: NamespaceRef::root_of(crate::MAIN_DB_ID),
                     indexed: None,
                     plan_estimate: None,
+                    row_filter: None,
                 });
             }
             return Ok(());
@@ -2210,6 +2211,7 @@ fn parse_table(
             namespace,
             indexed,
             plan_estimate: None,
+            row_filter: None,
         });
         return Ok(());
     };
@@ -2340,6 +2342,7 @@ fn parse_table(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         });
         return Ok(());
     }
@@ -2367,6 +2370,7 @@ fn parse_table(
                     namespace,
                     indexed: None,
                     plan_estimate: None,
+                    row_filter: None,
                 });
                 return Ok(());
             }

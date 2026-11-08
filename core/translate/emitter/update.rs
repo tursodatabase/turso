@@ -186,6 +186,7 @@ pub fn emit_program_for_update(
                 namespace: NamespaceRef::root_of(MAIN_DB_ID),
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );

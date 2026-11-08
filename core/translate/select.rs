@@ -363,7 +363,7 @@ fn prepare_one_select_plan(
                 )?;
                 row_security::filter_rows(
                     Command::Select,
-                    &table_references,
+                    &mut table_references,
                     &mut where_predicates,
                     resolver,
                 )?;

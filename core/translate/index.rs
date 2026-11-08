@@ -483,6 +483,7 @@ pub(crate) fn emit_refill_index(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
