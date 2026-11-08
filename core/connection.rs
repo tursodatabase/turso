@@ -378,7 +378,7 @@ pub(crate) struct StatementActivity {
 pub(crate) enum RootStatementKind {
     /// A statement that the application prepared. It cannot start while
     /// another statement is in progress on the connection, unless it starts
-    /// inside a step of that statement.
+    /// inside a step of a statement on the same connection.
     Application,
     /// A statement that the engine runs for its own work, such as a read of
     /// its own tables to load the schema.
