@@ -4976,6 +4976,8 @@ mod tests {
             }
             _ => panic!("Expected row from COUNT query"),
         }
+        // The connection runs one statement at a time.
+        drop(stmt);
 
         // Test 2: Filter by relnamespace = 2200 (public schema)
         let mut stmt = conn
@@ -4990,6 +4992,7 @@ mod tests {
             }
             _ => panic!("Expected row from COUNT query"),
         }
+        drop(stmt);
 
         // Test 3: Combined filters
         let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200 ORDER BY relname").unwrap();

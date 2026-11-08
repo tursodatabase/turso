@@ -200,6 +200,7 @@ fn test_postgres_create_table_as_with_no_data(db: TempDatabase) {
         panic!("expected integer count");
     };
     assert_eq!(*count, 0, "WITH NO DATA must not copy rows");
+    drop(rows);
 
     // The structure must exist and accept inserts.
     conn.execute("INSERT INTO dst VALUES (7, 'New')").unwrap();
