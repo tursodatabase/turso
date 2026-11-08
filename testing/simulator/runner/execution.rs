@@ -576,7 +576,8 @@ mod tests {
     use clap::Parser as _;
     use sql_generation::model::query::pragma::{CheckpointMode, Pragma};
     use std::num::NonZeroUsize;
-    use turso_core::{ConnectOpts, Database, IO, MemoryIO, SqliteDialect};
+    use turso_core::{ConnectOpts, Database, IO, MemoryIO};
+    use turso_sqlite::SqliteDialect;
 
     fn memory_connection() -> Arc<Connection> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

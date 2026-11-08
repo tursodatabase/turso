@@ -1,3 +1,4 @@
+use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
 
@@ -105,6 +106,9 @@ impl From<&LimboError> for ErrorReport {
                 report.detail = constraint_detail(violation);
             }
         }
+        if let LimboError::PermissionDenied(denial) = error {
+            report.message = permission_denied_message(denial);
+        }
         report
     }
 }
@@ -133,7 +137,10 @@ fn constraint_name(violation: &ConstraintViolation, table: &str) -> Option<Strin
             violation.column_names.join("_")
         )),
         ConstraintKind::Check => Some(format!("{table}_check")),
-        ConstraintKind::NotNull | ConstraintKind::Other => None,
+        ConstraintKind::NotNull
+        | ConstraintKind::Trigger
+        | ConstraintKind::Datatype
+        | ConstraintKind::Other => None,
     }
 }
 
@@ -154,7 +161,9 @@ fn constraint_message(violation: &ConstraintViolation, report: &ErrorReport) -> 
         ConstraintKind::Check => {
             format!("new row for relation \"{table}\" violates check constraint \"{constraint}\"")
         }
-        ConstraintKind::Other => violation.message.clone(),
+        ConstraintKind::Trigger | ConstraintKind::Datatype | ConstraintKind::Other => {
+            violation.message.clone()
+        }
     }
 }
 
@@ -215,7 +224,9 @@ fn sqlstate(error: &LimboError) -> &'static str {
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
             ConstraintKind::NotNull => SQLSTATE_NOT_NULL_VIOLATION,
             ConstraintKind::Check => SQLSTATE_CHECK_VIOLATION,
-            ConstraintKind::Other => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
+            ConstraintKind::Trigger | ConstraintKind::Datatype | ConstraintKind::Other => {
+                SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION
+            }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
@@ -257,10 +268,11 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::OutOfMemory => SQLSTATE_OUT_OF_MEMORY,
         LimboError::TableLocked | LimboError::Busy => SQLSTATE_LOCK_NOT_AVAILABLE,
         LimboError::Interrupt => SQLSTATE_QUERY_CANCELED,
-        LimboError::Raise(_, msg) => raise_sqlstate(msg),
+        LimboError::Raise(_, error) => raise_sqlstate(&error.to_string()),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,
+        LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
@@ -302,8 +314,25 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+    } else if (msg.starts_with("sequence \"") || msg.starts_with("relation \""))
+        && msg.ends_with("\" does not exist")
+    {
         SQLSTATE_UNDEFINED_TABLE
+    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.starts_with('"')
+        && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
+    {
+        SQLSTATE_WRONG_OBJECT_TYPE
+    } else if msg.starts_with("cannot change owner of sequence \"") {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg.starts_with("column \"")
+        && msg.contains("\" of relation \"")
+        && msg.ends_with("\" does not exist")
+    {
+        SQLSTATE_UNDEFINED_COLUMN
+    } else if msg == "sequence must have same owner as table it is linked to" {
+        SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
         || msg == "no schema has been selected to create in"
     {
@@ -376,6 +405,40 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
     }
 }
 
+fn permission_denied_message(denial: &PermissionDenied) -> String {
+    if denial.reason == Reason::Owner {
+        return format!("must be owner of {}", object_name(&denial.object));
+    }
+    match (denial.action, &denial.object) {
+        (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),
+        (Action::Create, Object::Role(_)) => "permission denied to create role".into(),
+        (Action::Write, Object::Setting(name)) => {
+            format!("permission denied to set parameter \"{name}\"")
+        }
+        (Action::Read, Object::Setting(name)) => format!("permission denied to examine \"{name}\""),
+        (Action::Analyze, _) => "permission denied to run ANALYZE".into(),
+        (Action::Vacuum, _) => "permission denied to run VACUUM".into(),
+        (Action::Reindex, _) => "permission denied to run REINDEX".into(),
+        (Action::Optimize, _) => "permission denied to run OPTIMIZE".into(),
+        (Action::Attach, _) => "permission denied to attach a database".into(),
+        (Action::Detach, _) => "permission denied to detach a database".into(),
+        (Action::SetRole, Object::Role(name)) => {
+            format!("permission denied to set role \"{name}\"")
+        }
+        (_, Object::File(_)) => "permission denied to COPY from a file".into(),
+        (_, object) => format!("permission denied for {}", object_name(object)),
+    }
+}
+
+/// Names an object the way PostgreSQL does in its errors. Core's main
+/// database is PostgreSQL's `public` schema.
+fn object_name(object: &Object) -> String {
+    match object {
+        Object::Schema(name) if name == "main" => "schema public".to_string(),
+        object => object.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +507,22 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
+            ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            (
+                "cannot change owner of sequence \"s\"",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "column \"c\" of relation \"t\" does not exist",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            (
+                "sequence must have same owner as table it is linked to",
+                SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            ),
             (
                 "table no such table already exists",
                 SQLSTATE_DUPLICATE_TABLE,

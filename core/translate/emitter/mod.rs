@@ -178,6 +178,9 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// The statement is compiled for a role that is not a superuser, which may
+    /// not use a sequence or a PRAGMA anywhere, including inside a view.
+    pub(crate) role_is_not_superuser: bool,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -198,6 +201,15 @@ impl RegisterColumn {
             affinity: column.affinity(),
             collation: crate::translate::collate::column_collation(column),
             column_type: column_type(column, is_strict, schema),
+        }
+    }
+
+    /// A column of the table being written whose register holds the value
+    /// DECODE gave, so comparisons use the affinity of that value's kind.
+    pub fn decoded_table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
+        Self {
+            affinity: column.comparison_affinity(),
+            ..Self::table_column(column, is_strict, schema)
         }
     }
 
@@ -292,16 +304,26 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => {
-                Some(table.columns().iter().map(|c| c.affinity()).collect())
-            }
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.comparison_affinity())
+                    .collect(),
+            ),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.comparison_affinity())
+                        .collect()
+                }),
         };
 
         Self {
@@ -346,7 +368,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::dialect::SqliteDialect),
+            Arc::new(crate::EngineDialect),
             None,
         )
     }
@@ -388,6 +410,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            role_is_not_superuser: false,
         }
     }
 
@@ -422,6 +445,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            role_is_not_superuser: self.role_is_not_superuser,
         }
     }
 
@@ -438,6 +462,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            role_is_not_superuser: self.role_is_not_superuser,
         }
     }
 
@@ -717,13 +742,6 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
     ) -> Result<NamespaceRef> {
         self.catalog.resolve_existing_trigger(qualified_name)
-    }
-
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.catalog.resolve_existing_sequence(seq_name)
     }
 
     /// The namespace and bare name of the sequence whose mangled name is
@@ -2217,6 +2235,14 @@ fn emit_index_column_value_new_image(
                     table,
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::Stored { .. } => {
+                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
             }
             GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {

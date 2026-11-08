@@ -8,10 +8,12 @@ use std::task::Waker;
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::settings::{
-    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
+    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
+    SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -21,13 +23,15 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo,
-    PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgGrantSelectStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
 
@@ -88,15 +92,20 @@ pub fn open_database_with_io(
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open(
+    let db = turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )
-    .map_err(Into::into)
+    )?;
+    // After the open, the classes table exists before the database holds
+    // any relation, and every relation gets its row from its CREATE. A
+    // database with relations but no catalog is from an earlier tursopg and
+    // is refused.
+    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
+    Ok(db)
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -415,10 +424,14 @@ fn prepare_statement_inner(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
-    let translator = PostgreSQLTranslator::new();
+    let conn_for_names = Arc::clone(&pg_conn.conn);
+    let translator = PostgreSQLTranslator::new().with_relation_name_check(move |schema, name| {
+        schema_has_relation(&conn_for_names, schema, name)
+    });
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
@@ -429,7 +442,7 @@ fn prepare_statement_inner(
     let role = tx_role(translated.cmd.stmt());
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
-    if translated.prereqs.is_empty() {
+    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
@@ -443,9 +456,11 @@ fn prepare_statement_inner(
             });
     }
 
-    // Validate prerequisites and the target command during prepare without
-    // executing any writes. Side-effecting prerequisites run atomically with
-    // the command only when the returned Statement is actually executed.
+    // Validate the prerequisites and the target command during prepare
+    // without executing any writes. What follows the command names what the
+    // command creates, so it can only be prepared once the command has run.
+    // Side-effecting prerequisites run atomically with the command only when
+    // the returned Statement is actually executed.
     for prereq in &translated.prereqs {
         let input = prereq.to_string();
         let _ = pg_conn
@@ -465,6 +480,7 @@ fn prepare_statement_inner(
             DeferredOperation::Translated {
                 prereqs: translated.prereqs,
                 cmd: Box::new(cmd),
+                postreqs: translated.postreqs,
                 sql: sql.into_owned(),
             },
         ),
@@ -589,6 +605,9 @@ enum DeferredOperation {
     Translated {
         prereqs: Vec<ast::Stmt>,
         cmd: Box<ast::Cmd>,
+        /// Statements that run after the command, as `ALTER SEQUENCE ...
+        /// OWNED BY` does for a serial column's sequence.
+        postreqs: Vec<ast::Stmt>,
         sql: String,
     },
     Frontend(FrontendStmt),
@@ -596,7 +615,9 @@ enum DeferredOperation {
 
 enum DeferredCommand {
     Translated(ast::Cmd, String),
-    Namespace(ast::Stmt),
+    /// A statement the frontend built as an AST, with no text of its own
+    /// that a dialect parses: CREATE SCHEMA, DROP SCHEMA and GRANT.
+    Ast(ast::Stmt),
     Postgres(String),
     Sqlite(String),
 }
@@ -620,6 +641,9 @@ enum DeferredWork {
 
 struct PrerequisiteState {
     commands: CommandSequence,
+    /// The position of the command itself among the statements, after the
+    /// prerequisites and before what follows it.
+    target_index: usize,
     target_exists: bool,
 }
 
@@ -1013,31 +1037,38 @@ impl DeferredOperation {
         active: &mut Option<crate::Statement>,
     ) -> Result<Option<DeferredWork>> {
         match self {
-            Self::Translated { prereqs, cmd, sql } => {
-                let mut statements: Vec<_> = prereqs
-                    .iter()
-                    .map(|stmt| DeferredStatement {
-                        command: DeferredCommand::Translated(
-                            ast::Cmd::Stmt(stmt.clone()),
-                            stmt.to_string(),
-                        ),
-                        context: CommandContext::Default,
-                    })
-                    .collect();
+            Self::Translated {
+                prereqs,
+                cmd,
+                postreqs,
+                sql,
+            } => {
+                let translated = |stmt: &ast::Stmt| DeferredStatement {
+                    command: DeferredCommand::Translated(
+                        ast::Cmd::Stmt(stmt.clone()),
+                        stmt.to_string(),
+                    ),
+                    context: CommandContext::Default,
+                };
+                let mut statements: Vec<_> = prereqs.iter().map(translated).collect();
+                let target_index = statements.len();
                 statements.push(DeferredStatement {
                     command: DeferredCommand::Translated((**cmd).clone(), sql.clone()),
                     context: CommandContext::Default,
                 });
+                statements.extend(postreqs.iter().map(translated));
                 *active = prepare_create_table_target_check(conn, cmd)?.map(crate::Statement::new);
                 Ok(Some(DeferredWork::Prerequisites(PrerequisiteState {
                     commands: CommandSequence {
                         statements,
                         index: 0,
                     },
+                    target_index,
                     target_exists: false,
                 })))
             }
             Self::Frontend(stmt) => {
+                check_frontend_privileges(conn, stmt)?;
                 let statements = match stmt {
                     FrontendStmt::ResetAll => {
                         reset_all_settings(conn)?;
@@ -1073,11 +1104,17 @@ impl DeferredOperation {
                             index: 0,
                         })));
                     }
-                    FrontendStmt::RefreshMatview | FrontendStmt::CommentOn => {
+                    FrontendStmt::RefreshMatview(_) | FrontendStmt::CommentOn(_) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
                         return Ok(None);
+                    }
+                    FrontendStmt::GrantSelect(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        grant_select_commands(conn, stmt)?
                     }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
@@ -1185,7 +1222,11 @@ impl DeferredWork {
 impl PrerequisiteState {
     fn finish_inspection(&mut self) -> bool {
         if self.target_exists {
-            self.commands.index = self.commands.statements.len() - 1;
+            // Only the command itself runs, which then does nothing, as
+            // CREATE TABLE IF NOT EXISTS does: neither the prerequisites nor
+            // what follows the command.
+            self.commands.statements.truncate(self.target_index + 1);
+            self.commands.index = self.target_index;
         }
         !self.target_exists
     }
@@ -1203,8 +1244,8 @@ impl CommandSequence {
                 conn.prepare_translated_cmd(cmd.clone(), sql)
                     .map_err(schema_error)?,
             ),
-            DeferredCommand::Namespace(stmt) => {
-                crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
+            DeferredCommand::Ast(stmt) => {
+                crate::Statement::new(conn.prepare_ast_stmt(stmt.clone()).map_err(schema_error)?)
             }
             DeferredCommand::Postgres(_) => {
                 prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
@@ -1223,7 +1264,7 @@ impl CommandSequence {
             DeferredCommand::Translated(_, sql)
             | DeferredCommand::Sqlite(sql)
             | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
-            DeferredCommand::Namespace(stmt) => stmt.to_string().into(),
+            DeferredCommand::Ast(stmt) => stmt.to_string().into(),
         }
     }
 
@@ -1431,12 +1472,7 @@ fn relation_name_is_taken(
             let ns = namespace.target.id;
             (
                 schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
-                schema.get_table(ns, name).is_some()
-                    || schema.get_view(ns, name).is_some()
-                    || schema.has_sequence(ns, name)
-                    || schema
-                        .indexes(ns)
-                        .any(|index| index.name.eq_ignore_ascii_case(name)),
+                schema.relation_kind(ns, name).is_some(),
             )
         });
         taken = name_exists;
@@ -1445,6 +1481,61 @@ fn relation_name_is_taken(
         }
     }
     Ok(taken)
+}
+
+/// Whether schema `schema` has a table, index, view or sequence named
+/// `name`, which makes PostgreSQL name a serial column's sequence otherwise.
+fn schema_has_relation(conn: &Arc<Connection>, schema: &str, name: &str) -> bool {
+    relation_lookup_namespaces(conn, Some(schema))
+        .iter()
+        .any(|namespace| {
+            conn.with_schema(namespace.database_id(), |s| {
+                s.relation_kind(namespace.target.id, name).is_some()
+            })
+        })
+}
+
+/// `sql`, a CREATE TABLE statement, with each serial column whose sequence
+/// is not named `<table>_<column>_seq` written out with its sequence. The
+/// table is loaded from its stored text, which otherwise implies that name.
+fn write_out_renamed_serial_columns<'a>(
+    conn: &Arc<Connection>,
+    sql: Cow<'a, str>,
+    sequences: &[SerialSequence],
+) -> Result<Cow<'a, str>> {
+    let mut sql = sql;
+    for sequence in sequences
+        .iter()
+        .filter(|sequence| !sequence.has_default_name)
+    {
+        let stored_name = stored_sequence_name(conn, &sequence.schema, &sequence.name)?;
+        let written_out =
+            turso_pg_parser::write_out_serial_column(&sql, &sequence.column, &stored_name)
+                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        sql = Cow::Owned(written_out);
+    }
+    Ok(sql)
+}
+
+/// The name the stored text of a table calls sequence `name` of schema
+/// `schema` by, which is how the loader resolves it: `public.name` for a
+/// sequence of the public schema, otherwise the mangled name, which is how
+/// the stored text names the table itself.
+fn stored_sequence_name(conn: &Arc<Connection>, schema: &str, name: &str) -> Result<String> {
+    let namespace = relation_lookup_namespaces(conn, Some(schema))
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_SCHEMA_NAME,
+                format!("schema \"{schema}\" does not exist"),
+            )
+        })?;
+    Ok(if namespace.is_database() {
+        format!("public.{name}")
+    } else {
+        namespace.mangle_name(name)
+    })
 }
 
 /// PostgreSQL refuses DROP VIEW and DROP MATERIALIZED VIEW on a relation of
@@ -1620,8 +1711,9 @@ fn try_prepare_special(
         | FrontendStmt::CreateSchema(_)
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::CopyFrom(_)
-        | FrontendStmt::RefreshMatview
-        | FrontendStmt::CommentOn) => crate::Statement::with_deferred(
+        | FrontendStmt::RefreshMatview(_)
+        | FrontendStmt::CommentOn(_)
+        | FrontendStmt::GrantSelect(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1634,16 +1726,11 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
         ParseError::ParseError(message) => LimboError::ParseError(message),
         ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
-        ParseError::SchemaQualifiedName { ref schema, .. }
-            if !catalog::namespace_exists(conn, schema) =>
-        {
-            sqlstate_error(
-                SQLSTATE_INVALID_SCHEMA_NAME,
-                format!("schema \"{schema}\" does not exist"),
-            )
-        }
-        ParseError::SchemaQualifiedName { .. } => {
-            sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
+        ParseError::SchemaQualifiedName { ref schema, .. } => {
+            match check_schema_exists(conn, schema) {
+                Err(missing_schema) => missing_schema,
+                Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+            }
         }
     }
 }
@@ -1669,6 +1756,120 @@ fn prepare_set_transaction(
         Ok(())
     });
     Ok(crate::Statement::new_with_post_run(inner, post_run))
+}
+
+/// Checks that the current role may run a statement that the frontend runs
+/// itself, outside the privilege checks of core. Only a superuser may change
+/// schemas or read files, and a superuser owns every object.
+fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<()> {
+    if conn.current_role_is_superuser() {
+        return Ok(());
+    }
+    let denial = match stmt {
+        // Core checks the statements that these prepare.
+        FrontendStmt::Set(_)
+        | FrontendStmt::SetTransaction
+        | FrontendStmt::Show(_)
+        | FrontendStmt::ResetAll
+        | FrontendStmt::DiscardAll
+        | FrontendStmt::CopyTo(_) => return Ok(()),
+        // Who may grant on each table is decided from its stored privileges
+        // when the engine's GRANT runs.
+        FrontendStmt::GrantSelect(_) => return Ok(()),
+        FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
+            Action::Create,
+            Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+        ),
+        FrontendStmt::DropSchema(stmt) => {
+            PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+        }
+        FrontendStmt::CopyFrom(stmt) => {
+            PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
+        }
+        FrontendStmt::RefreshMatview(stmt) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                format!("permission denied for materialized view {}", stmt.name),
+            ));
+        }
+        FrontendStmt::CommentOn(stmt) => {
+            let message = match &stmt.target {
+                PgCommentTarget::Owned(object) => format!("must be owner of {object}"),
+                PgCommentTarget::Role | PgCommentTarget::Other => "permission denied".to_string(),
+            };
+            return Err(sqlstate_error(SQLSTATE_INSUFFICIENT_PRIVILEGE, message));
+        }
+    };
+    Err(LimboError::PermissionDenied(Box::new(denial)))
+}
+
+/// The engine GRANT that stores a GRANT SELECT. The engine checks the
+/// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
+/// TABLES IN SCHEMA` names the tables, views and materialized views of each
+/// schema, and no statement when there are none.
+fn grant_select_commands(
+    conn: &Arc<Connection>,
+    stmt: &PgGrantSelectStmt,
+) -> Result<Vec<DeferredStatement>> {
+    let relations = match &stmt.tables {
+        PgGrantTables::Named(tables) => tables.clone(),
+        PgGrantTables::AllInSchemas(schemas) => {
+            let mut relations = Vec::new();
+            for schema in schemas {
+                check_schema_exists(conn, schema)?;
+                let schema = schema.to_lowercase();
+                relations.extend(
+                    schema_objects(conn, &schema)
+                        .into_iter()
+                        .filter_map(|object| match object {
+                            SchemaObject::Table(name) | SchemaObject::View(name) => Some(name),
+                            SchemaObject::Sequence(_) => None,
+                        })
+                        .map(|name| {
+                            ast::QualifiedName::fullname(
+                                ast::Name::exact(schema.clone()),
+                                ast::Name::exact(name),
+                            )
+                        }),
+                );
+            }
+            relations
+        }
+    };
+    if relations.is_empty() {
+        // With nothing to grant on, the roles are still checked, as in
+        // PostgreSQL; otherwise the dialect checks them.
+        let roles = conn.role_catalog();
+        for grantee in &stmt.roles {
+            if let PgGrantee::Role(name) = grantee {
+                if catalog::role_oid_by_name(&roles, name).is_none() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_UNDEFINED_OBJECT,
+                        format!("role \"{name}\" does not exist"),
+                    ));
+                }
+            }
+        }
+        return Ok(Vec::new());
+    }
+    Ok(vec![DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            privileges: vec![ast::Privilege::Select],
+            relations,
+            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
+        })),
+        context: CommandContext::Default,
+    }])
+}
+
+fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
+    if catalog::namespace_exists(conn, schema) {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INVALID_SCHEMA_NAME,
+        format!("schema \"{schema}\" does not exist"),
+    ))
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -1774,9 +1975,10 @@ fn reset_all_settings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Resets the session as DISCARD ALL does. tursopg has no temporary
-/// tables, SQL-level prepared statements or cached plans to drop. A server
-/// client's protocol-level prepared statements are not dropped.
+/// Resets the session as DISCARD ALL does, including the current role.
+/// tursopg has no temporary tables, SQL-level prepared statements or cached
+/// plans to drop. A server client's protocol-level prepared statements are
+/// not dropped.
 fn discard_all(conn: &Connection) -> Result<()> {
     if !conn.get_auto_commit() {
         return Err(sqlstate_error(
@@ -1786,6 +1988,7 @@ fn discard_all(conn: &Connection) -> Result<()> {
     }
     reset_all_settings(conn)?;
     conn.clear_sequence_currvals();
+    set_role(conn, None, SettingScope::Session)?;
     Ok(())
 }
 
@@ -1810,6 +2013,42 @@ pub(crate) fn set_search_path(
 /// search_path that lists them finds nothing there, as in PostgreSQL.
 fn is_core_database_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
+}
+
+/// Makes `value` the current role, as SET ROLE does. `none`, or no value,
+/// makes the session's login role current again.
+pub(crate) fn set_role(
+    conn: &Connection,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<String> {
+    let role = match value.filter(|name| *name != "none") {
+        None => None,
+        Some(name) => {
+            let roles = conn.role_catalog();
+            let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    format!("role \"{name}\" does not exist"),
+                ));
+            };
+            if !roles.can_set_role(conn.session_role(), role.id) {
+                return Err(LimboError::PermissionDenied(Box::new(
+                    PermissionDenied::privilege(Action::SetRole, Object::Role(name.to_owned())),
+                )));
+            }
+            Some(SetRole {
+                id: role.id,
+                name: name.to_owned(),
+            })
+        }
+    };
+    let role_id = role
+        .as_ref()
+        .map_or_else(|| conn.session_role(), |role| role.id);
+    session_state(conn)?.mutate(conn, |settings| settings.set_role(role, scope));
+    conn.set_current_role(role_id);
+    Ok(value.unwrap_or("none").to_owned())
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
@@ -1926,7 +2165,7 @@ fn create_schema_commands(
     }
 
     let mut commands = vec![DeferredStatement {
-        command: DeferredCommand::Namespace(ast::Stmt::CreateSchema {
+        command: DeferredCommand::Ast(ast::Stmt::CreateSchema {
             name: ast::Name::exact(name.clone()),
         }),
         context: CommandContext::Default,
@@ -1970,7 +2209,7 @@ fn drop_schema_commands(
         })
         .collect();
     commands.push(DeferredStatement {
-        command: DeferredCommand::Namespace(ast::Stmt::DropSchema {
+        command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name),
         }),
         context: CommandContext::DropSchema,

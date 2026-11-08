@@ -25,7 +25,8 @@
 
 use std::sync::Arc;
 
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_sqlite::SqliteDialect;
 
 use crate::unreliable_io::UnreliableIo;
 

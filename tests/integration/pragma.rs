@@ -4,7 +4,8 @@ use crate::queued_io::QueuedIo;
 use asserting::prelude::*;
 use rusqlite::types::Value as RValue;
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, SqliteDialect, StepResult, Value};
+use turso_core::{ConnectOpts, Database, StepResult, Value};
+use turso_sqlite::SqliteDialect;
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_module_list_returns_list(db: TempDatabase) {

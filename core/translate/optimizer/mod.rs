@@ -4324,7 +4324,7 @@ fn ephemeral_index_build(
         .map(|(i, c)| {
             let expr = match c.generated_type() {
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
-                GeneratedType::NotGenerated => None,
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
             };
             IndexColumn {
                 name: c.name.clone().unwrap(),
@@ -4930,7 +4930,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::dialect::SqliteDialect),
+            crate::sync::Arc::new(crate::EngineDialect),
             None,
         )
     }

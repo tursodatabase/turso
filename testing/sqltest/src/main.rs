@@ -486,13 +486,19 @@ async fn run_tests(
                     return ExitCode::from(2);
                 }
             };
+            let role_cleanup = backend.role_cleanup();
             let runner = TestRunner::new(backend).with_config(config);
-            runner
+            let results = runner
                 .run_loaded_tests(loaded, |result| {
                     output.write_test(result);
                     output.flush();
                 })
-                .await
+                .await;
+            if let Err(e) = role_cleanup.drop_roles_created_by_the_run().await {
+                eprintln!("Error: cannot drop the roles that the tests created: {e}");
+                return ExitCode::from(2);
+            }
+            results
         }
         other => {
             eprintln!(

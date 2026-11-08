@@ -8,7 +8,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -24,7 +24,9 @@ use crate::translate::planner::{
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
+use crate::translate::subquery::{
+    plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -259,7 +261,21 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
-    let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let (mut limit, mut offset) =
+        limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let mut cse_map = Vec::new();
+    let mut same_query_map = Vec::new();
+    plan_limit_offset_subqueries(
+        program,
+        &mut last.non_from_clause_subqueries,
+        &mut last.table_references,
+        resolver,
+        connection,
+        limit.as_deref_mut(),
+        offset.as_deref_mut(),
+        &mut cse_map,
+        &mut same_query_map,
+    )?;
 
     // ORDER BY names can come from any arm of a compound SELECT.
     let all_plans: Vec<&SelectPlan> = left
@@ -630,6 +646,7 @@ fn prepare_one_select_plan(
                             exprs,
                             sort_elided: false,
                             having,
+                            columns_read_by_group_subqueries: Vec::new(),
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
@@ -639,6 +656,7 @@ fn prepare_one_select_plan(
                             sort_elided: false,
                             exprs: vec![],
                             having: having_predicates,
+                            columns_read_by_group_subqueries: Vec::new(),
                         });
                     }
                 }
@@ -733,6 +751,9 @@ fn prepare_one_select_plan(
 
             {
                 trace_stack!("process_order_by");
+                let is_aggregate_query = has_group_by
+                    || agg_count_before_order_by > 0
+                    || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
                 for (expr, _, _) in key.iter() {
                     let had_agg = resolve_window_and_aggregate_functions(
                         expr,
@@ -748,7 +769,7 @@ fn prepare_one_select_plan(
                     // e.g. SELECT f1 FROM t ORDER BY min(f1);
                     // But SELECT 1 ORDER BY sum(1) is allowed (no FROM clause).
                     let has_from = !plan.table_references.joined_tables().is_empty();
-                    if had_agg && has_from && !has_group_by && agg_count_before_order_by == 0 {
+                    if had_agg && has_from && !is_aggregate_query {
                         let agg = &plan.aggregates[agg_count_before_order_by];
                         crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                     }
@@ -765,9 +786,8 @@ fn prepare_one_select_plan(
                         &mut cut_named_windows,
                     )?;
                 }
-                let is_aggregate_query = has_group_by || agg_count_before_order_by > 0;
                 if !cut_windows.is_empty() && !is_aggregate_query {
-                    for (expr, _, _) in terms_cut_after_rowid.iter() {
+                    for (expr, _, _) in key.iter().chain(terms_cut_after_rowid.iter()) {
                         if let Some(name) = first_aggregate_without_over_clause(expr, resolver)? {
                             crate::bail_parse_error!("misuse of aggregate: {}()", name);
                         }
@@ -925,6 +945,20 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+/// Whether a result column calls an aggregate, also one inside a window function
+/// such as the `sum(a)` in `row_number() OVER (ORDER BY sum(a))`.
+fn result_columns_contain_aggregate(
+    result_columns: &[ResultSetColumn],
+    resolver: &Resolver,
+) -> Result<bool> {
+    for result_column in result_columns {
+        if first_aggregate_without_over_clause(&result_column.expr, resolver)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn first_aggregate_without_over_clause<'a>(
@@ -1290,7 +1324,13 @@ fn resolve_compound_order_by_expr(
         ast::Expr::Collate(inner, collation_name) => {
             let (col_idx, _) =
                 resolve_compound_order_by_expr(inner, all_plans, resolver, term_number)?;
-            return Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)));
+            let collation = compound_order_by_collation(
+                all_plans,
+                col_idx,
+                TextCollation::new(collation_name.as_str())?,
+                resolver,
+            )?;
+            return Ok((col_idx, Some(collation)));
         }
         // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
         // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as

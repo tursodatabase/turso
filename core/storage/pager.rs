@@ -6590,7 +6590,7 @@ mod tests {
     fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
         let io = Arc::new(MemoryIO::new());
         let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
             .unwrap();
@@ -6917,7 +6917,7 @@ mod tests {
 
     fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = crate::Database::open_file(io, path, Arc::new(crate::SqliteDialect)).unwrap();
+        let db = crate::Database::open_file(io, path, Arc::new(crate::EngineDialect)).unwrap();
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();
         (db, conn)
     }
@@ -7397,7 +7397,7 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -7432,7 +7432,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         (db, dir)

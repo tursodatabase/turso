@@ -1,5 +1,5 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;

@@ -281,7 +281,9 @@ impl SelectStmt {
     }
 
     /// Returns true if any ORDER BY expression is a bare column reference to
-    /// a primary key or non-nullable unique column of the FROM table.
+    /// a primary key or non-nullable unique column of the FROM table. With
+    /// DISTINCT the column must also be selected, or DISTINCT can merge rows
+    /// with different values of it.
     fn order_by_includes_unique_column(&self, schema: &Schema) -> bool {
         let Some(from) = &self.from else {
             return false;
@@ -302,13 +304,23 @@ impl SelectStmt {
                         return false;
                     }
                 }
-                table.columns.iter().any(|c| {
+                let is_unique = table.columns.iter().any(|c| {
                     c.name == col_ref.column && (c.primary_key || (c.unique && !c.nullable))
-                })
+                });
+                is_unique && (!self.distinct || self.selects_column(&col_ref.column))
             } else {
                 false
             }
         })
+    }
+
+    /// Returns true if the select list is `*` or contains a bare reference to `column`.
+    fn selects_column(&self, column: &str) -> bool {
+        self.columns.is_empty()
+            || self
+                .columns
+                .iter()
+                .any(|c| matches!(&c.expr, Expr::ColumnRef(r) if r.column == column))
     }
 }
 
@@ -1216,6 +1228,9 @@ pub struct ColumnDefStmt {
     pub unique: bool,
     pub default: Option<Expr>,
     pub check: Option<Expr>,
+    /// `GENERATED ALWAYS AS (<expr>) STORED`. `None` means a regular column.
+    /// When this is `Some`, `default`, `not_null`, and `unique` must all be unset.
+    pub generated: Option<Expr>,
 }
 
 impl fmt::Display for ColumnDefStmt {
@@ -1226,20 +1241,26 @@ impl fmt::Display for ColumnDefStmt {
             write!(f, " PRIMARY KEY")?;
         }
 
-        if self.not_null && !self.primary_key {
-            write!(f, " NOT NULL")?;
-        }
+        if self.generated.is_none() {
+            if self.not_null && !self.primary_key {
+                write!(f, " NOT NULL")?;
+            }
 
-        if self.unique && !self.primary_key {
-            write!(f, " UNIQUE")?;
-        }
+            if self.unique && !self.primary_key {
+                write!(f, " UNIQUE")?;
+            }
 
-        if let Some(default) = &self.default {
-            write!(f, " DEFAULT ({default})")?;
+            if let Some(default) = &self.default {
+                write!(f, " DEFAULT ({default})")?;
+            }
         }
 
         if let Some(check) = &self.check {
             write!(f, " CHECK ({check})")?;
+        }
+
+        if let Some(expr) = &self.generated {
+            write!(f, " GENERATED ALWAYS AS ({expr}) STORED")?;
         }
 
         Ok(())
@@ -1283,7 +1304,7 @@ pub enum AlterTableAction {
     /// RENAME TO new_name
     RenameTo(String),
     /// ADD COLUMN column_def
-    AddColumn(ColumnDefStmt),
+    AddColumn(Box<ColumnDefStmt>),
     /// DROP COLUMN column_name
     DropColumn(String),
     /// RENAME COLUMN old_name TO new_name
@@ -3169,6 +3190,66 @@ mod tests {
     }
 
     #[test]
+    fn test_non_unique_order_by_detected_for_pk_not_selected_with_distinct() {
+        use crate::schema::{ColumnDef, Schema, Table};
+
+        let schema = Schema {
+            tables: vec![Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            )],
+            indexes: vec![],
+            triggers: vec![],
+            attached_databases: vec![],
+        };
+        let column = |name: &str| {
+            Expr::ColumnRef(ColumnRef {
+                table: None,
+                column: name.to_string(),
+            })
+        };
+        let select = |columns: Vec<&str>| SelectStmt {
+            with_clause: None,
+            distinct: true,
+            columns: columns
+                .into_iter()
+                .map(|name| SelectColumn {
+                    expr: column(name),
+                    alias: None,
+                })
+                .collect(),
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            compounds: vec![],
+            order_by: vec![OrderByItem {
+                expr: column("id"),
+                direction: OrderDirection::Asc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert_eq!(
+            select(vec!["name"]).non_unique_order_by_reason(&schema),
+            Some("limit_non_unique_order_by")
+        );
+        assert_eq!(
+            select(vec!["name", "id"]).non_unique_order_by_reason(&schema),
+            None
+        );
+        assert_eq!(select(vec![]).non_unique_order_by_reason(&schema), None);
+    }
+
+    #[test]
     fn test_create_temp_table_display() {
         let stmt = CreateTableStmt {
             table: "t".to_string(),
@@ -3180,6 +3261,7 @@ mod tests {
                 unique: false,
                 default: None,
                 check: None,
+                generated: None,
             }],
             if_not_exists: false,
             strict: false,

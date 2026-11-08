@@ -266,6 +266,8 @@ test pg-function-support-catalogs-are-empty {
 expect {}
 
 test pg-init-privs-is-read-only {
+    CREATE ROLE reader_of_init_privs_is_read_only_role;
+    SET ROLE reader_of_init_privs_is_read_only_role;
     DELETE FROM pg_init_privs;
 }
 @sqlstate 42501
@@ -274,6 +276,8 @@ expect error {permission denied for table pg_init_privs}
 expect @tursopg error {cannot delete from pg_catalog table "pg_init_privs"}
 
 test pg-cast-is-read-only {
+    CREATE ROLE reader_of_cast_is_read_only_role;
+    SET ROLE reader_of_cast_is_read_only_role;
     DELETE FROM pg_cast;
 }
 @sqlstate 42501
@@ -282,6 +286,8 @@ expect error {permission denied for table pg_cast}
 expect @tursopg error {cannot delete from pg_catalog table "pg_cast"}
 
 test pg-transform-is-read-only {
+    CREATE ROLE reader_of_transform_is_read_only_role;
+    SET ROLE reader_of_transform_is_read_only_role;
     DELETE FROM pg_transform;
 }
 @sqlstate 42501
@@ -411,6 +417,8 @@ test pg-object-unsupported-catalogs-are-empty {
 expect {}
 
 test pg-object-operator-is-read-only {
+    CREATE ROLE reader_of_object_operator_is_read_only_role;
+    SET ROLE reader_of_object_operator_is_read_only_role;
     DELETE FROM pg_operator;
 }
 @sqlstate 42501
@@ -419,6 +427,8 @@ expect error {permission denied for table pg_operator}
 expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 
 test pg-object-opclass-is-read-only {
+    CREATE ROLE reader_of_object_opclass_is_read_only_role;
+    SET ROLE reader_of_object_opclass_is_read_only_role;
     DELETE FROM pg_opclass;
 }
 @sqlstate 42501
@@ -427,6 +437,8 @@ expect error {permission denied for table pg_opclass}
 expect @tursopg error {cannot delete from pg_catalog table "pg_opclass"}
 
 test pg-object-opfamily-is-read-only {
+    CREATE ROLE reader_of_object_opfamily_is_read_only_role;
+    SET ROLE reader_of_object_opfamily_is_read_only_role;
     DELETE FROM pg_opfamily;
 }
 @sqlstate 42501
@@ -435,6 +447,8 @@ expect error {permission denied for table pg_opfamily}
 expect @tursopg error {cannot delete from pg_catalog table "pg_opfamily"}
 
 test pg-object-ts-parser-is-read-only {
+    CREATE ROLE reader_of_object_ts_parser_is_read_only_role;
+    SET ROLE reader_of_object_ts_parser_is_read_only_role;
     DELETE FROM pg_ts_parser;
 }
 @sqlstate 42501
@@ -443,6 +457,8 @@ expect error {permission denied for table pg_ts_parser}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_parser"}
 
 test pg-object-ts-template-is-read-only {
+    CREATE ROLE reader_of_object_ts_template_is_read_only_role;
+    SET ROLE reader_of_object_ts_template_is_read_only_role;
     DELETE FROM pg_ts_template;
 }
 @sqlstate 42501
@@ -451,6 +467,8 @@ expect error {permission denied for table pg_ts_template}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_template"}
 
 test pg-object-ts-dict-is-read-only {
+    CREATE ROLE reader_of_object_ts_dict_is_read_only_role;
+    SET ROLE reader_of_object_ts_dict_is_read_only_role;
     DELETE FROM pg_ts_dict;
 }
 @sqlstate 42501
@@ -459,6 +477,8 @@ expect error {permission denied for table pg_ts_dict}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_dict"}
 
 test pg-object-ts-config-is-read-only {
+    CREATE ROLE reader_of_object_ts_config_is_read_only_role;
+    SET ROLE reader_of_object_ts_config_is_read_only_role;
     DELETE FROM pg_ts_config;
 }
 @sqlstate 42501
@@ -467,6 +487,8 @@ expect error {permission denied for table pg_ts_config}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_config"}
 
 test pg-object-foreign-data-wrapper-is-read-only {
+    CREATE ROLE reader_of_object_foreign_data_wrapper_is_read_only_role;
+    SET ROLE reader_of_object_foreign_data_wrapper_is_read_only_role;
     DELETE FROM pg_foreign_data_wrapper;
 }
 @sqlstate 42501
@@ -475,6 +497,8 @@ expect error {permission denied for table pg_foreign_data_wrapper}
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
 
 test pg-object-foreign-server-is-read-only {
+    CREATE ROLE reader_of_object_foreign_server_is_read_only_role;
+    SET ROLE reader_of_object_foreign_server_is_read_only_role;
     DELETE FROM pg_foreign_server;
 }
 @sqlstate 42501
@@ -483,6 +507,8 @@ expect error {permission denied for table pg_foreign_server}
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_server"}
 
 test pg-object-default-acl-is-read-only {
+    CREATE ROLE reader_of_object_default_acl_is_read_only_role;
+    SET ROLE reader_of_object_default_acl_is_read_only_role;
     DELETE FROM pg_default_acl;
 }
 @sqlstate 42501
@@ -491,6 +517,8 @@ expect error {permission denied for table pg_default_acl}
 expect @tursopg error {cannot delete from pg_catalog table "pg_default_acl"}
 
 test pg-object-conversion-is-read-only {
+    CREATE ROLE reader_of_object_conversion_is_read_only_role;
+    SET ROLE reader_of_object_conversion_is_read_only_role;
     DELETE FROM pg_conversion;
 }
 @sqlstate 42501
@@ -499,6 +527,8 @@ expect error {permission denied for table pg_conversion}
 expect @tursopg error {cannot delete from pg_catalog table "pg_conversion"}
 
 test pg-object-range-is-read-only {
+    CREATE ROLE reader_of_object_range_is_read_only_role;
+    SET ROLE reader_of_object_range_is_read_only_role;
     DELETE FROM pg_range;
 }
 @sqlstate 42501
@@ -507,6 +537,8 @@ expect error {permission denied for table pg_range}
 expect @tursopg error {cannot delete from pg_catalog table "pg_range"}
 
 test pg-object-event-trigger-is-read-only {
+    CREATE ROLE reader_of_object_event_trigger_is_read_only_role;
+    SET ROLE reader_of_object_event_trigger_is_read_only_role;
     DELETE FROM pg_event_trigger;
 }
 @sqlstate 42501
@@ -515,6 +547,8 @@ expect error {permission denied for table pg_event_trigger}
 expect @tursopg error {cannot delete from pg_catalog table "pg_event_trigger"}
 
 test pg-object-subscription-is-read-only {
+    CREATE ROLE reader_of_object_subscription_is_read_only_role;
+    SET ROLE reader_of_object_subscription_is_read_only_role;
     DELETE FROM pg_subscription;
 }
 @sqlstate 42501
@@ -523,6 +557,8 @@ expect error {permission denied for table pg_subscription}
 expect @tursopg error {cannot delete from pg_catalog table "pg_subscription"}
 
 test pg-object-largeobject-metadata-is-read-only {
+    CREATE ROLE reader_of_object_largeobject_metadata_is_read_only_role;
+    SET ROLE reader_of_object_largeobject_metadata_is_read_only_role;
     DELETE FROM pg_largeobject_metadata;
 }
 @sqlstate 42501
@@ -531,6 +567,8 @@ expect error {permission denied for table pg_largeobject_metadata}
 expect @tursopg error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
 
 test pg-object-amop-is-read-only {
+    CREATE ROLE reader_of_object_amop_is_read_only_role;
+    SET ROLE reader_of_object_amop_is_read_only_role;
     DELETE FROM pg_amop;
 }
 @sqlstate 42501
@@ -539,6 +577,8 @@ expect error {permission denied for table pg_amop}
 expect @tursopg error {cannot delete from pg_catalog table "pg_amop"}
 
 test pg-object-amproc-is-read-only {
+    CREATE ROLE reader_of_object_amproc_is_read_only_role;
+    SET ROLE reader_of_object_amproc_is_read_only_role;
     DELETE FROM pg_amproc;
 }
 @sqlstate 42501
@@ -603,7 +643,6 @@ expect {
     2608
 }
 
-@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test pg-depend-for-dump-table-query {
     CREATE TABLE dump_indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE);
     CREATE TABLE dump_plain (value TEXT);
@@ -646,8 +685,8 @@ test pg-depend-for-dump-table-query {
     ORDER BY relname;
 }
 expect {
-    1259|dump_indexed|1|{owner=arwdDxt/owner}||||heap
-    1259|dump_plain|0|{owner=arwdDxt/owner}||||heap
+    1259|dump_indexed|1|{owner=arwdDxtm/owner}||||heap
+    1259|dump_plain|0|{owner=arwdDxtm/owner}||||heap
 }
 
 test physical-catalog-tableoid {
@@ -1451,4 +1490,142 @@ test pg-dump-descending-index-keys {
 }
 expect {
     CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
+}
+
+# A relation's oid is stable: it comes from a stored catalog row, not from
+# the relation's position among sorted names. Raw oid values differ between
+# engines, so the tests compare through joins.
+
+test pg-class-oid-survives-an-earlier-sorting-table-appearing {
+    CREATE TABLE zz_stable (x int);
+    CREATE TABLE zz_oid_memo (memo oid);
+    INSERT INTO zz_oid_memo SELECT oid FROM pg_class WHERE relname = 'zz_stable';
+    CREATE TABLE aa_sorts_first (x int);
+    SELECT count(*) FROM pg_class c JOIN zz_oid_memo m ON c.oid = m.memo
+    WHERE c.relname = 'zz_stable';
+}
+expect {
+    1
+}
+
+test pg-attribute-keeps-joining-to-pg-class-after-an-earlier-table-appears {
+    CREATE TABLE zz_attrs (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE zz_attrs_memo (memo oid);
+    INSERT INTO zz_attrs_memo SELECT oid FROM pg_class WHERE relname = 'zz_attrs';
+    CREATE TABLE aa_appears (x int);
+    SELECT a.attname FROM pg_attribute a JOIN zz_attrs_memo m ON a.attrelid = m.memo
+    WHERE a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id
+    v
+}
+
+test pg-index-keeps-joining-to-pg-class-after-an-earlier-table-appears {
+    CREATE TABLE zz_indexed (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE zz_indexed_memo (memo oid);
+    INSERT INTO zz_indexed_memo SELECT oid FROM pg_class WHERE relname = 'zz_indexed';
+    CREATE TABLE aa_appears2 (x int);
+    SELECT count(*) FROM pg_index i JOIN zz_indexed_memo m ON i.indrelid = m.memo;
+}
+expect {
+    2
+}
+
+test pg-constraint-keeps-joining-to-pg-class-after-an-earlier-table-appears {
+    CREATE TABLE zz_constrained (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE zz_constrained_memo (memo oid);
+    INSERT INTO zz_constrained_memo SELECT oid FROM pg_class WHERE relname = 'zz_constrained';
+    CREATE TABLE aa_appears3 (x int);
+    SELECT count(*) FROM pg_constraint con JOIN zz_constrained_memo m ON con.conrelid = m.memo
+    WHERE con.contype IN ('p', 'u');
+}
+expect {
+    2
+}
+
+test rename-keeps-the-oid {
+    CREATE TABLE zz_before_rename (x int);
+    CREATE TABLE zz_rename_memo (memo oid);
+    INSERT INTO zz_rename_memo SELECT oid FROM pg_class WHERE relname = 'zz_before_rename';
+    ALTER TABLE zz_before_rename RENAME TO zz_after_rename;
+    SELECT count(*) FROM pg_class c JOIN zz_rename_memo m ON c.oid = m.memo
+    WHERE c.relname = 'zz_after_rename';
+}
+expect {
+    1
+}
+
+test a-table-may-not-share-its-name-with-a-sequence {
+    CREATE SEQUENCE zz_shared_name;
+    CREATE TABLE zz_shared_name (a int);
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_shared_name" already exists
+}
+
+test an-index-may-not-share-its-name-with-its-table {
+    CREATE TABLE zz_named_alike (a int);
+    CREATE INDEX zz_named_alike ON zz_named_alike (a);
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_named_alike" already exists
+}
+
+test create-table-if-not-exists-skips-a-sequence-of-that-name {
+    CREATE SEQUENCE zz_taken_by_seq;
+    CREATE TABLE IF NOT EXISTS zz_taken_by_seq (a int);
+    SELECT relkind FROM pg_class WHERE relname = 'zz_taken_by_seq';
+}
+expect {
+    S
+}
+
+test create-sequence-if-not-exists-skips-a-table-of-that-name {
+    CREATE TABLE zz_taken_by_table (a int);
+    CREATE SEQUENCE IF NOT EXISTS zz_taken_by_table;
+    SELECT relkind FROM pg_class WHERE relname = 'zz_taken_by_table';
+}
+expect {
+    r
+}
+
+test create-index-if-not-exists-skips-its-tables-name {
+    CREATE TABLE zz_taken_by_index (a int);
+    CREATE INDEX IF NOT EXISTS zz_taken_by_index ON zz_taken_by_index (a);
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_taken_by_index';
+}
+expect {
+    1
+}
+
+test rename-onto-a-sequences-name-is-an-error {
+    CREATE TABLE zz_rn_table (a int);
+    CREATE SEQUENCE zz_rn_seq;
+    ALTER TABLE zz_rn_table RENAME TO zz_rn_seq;
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_rn_seq" already exists
+}
+
+test rename-onto-a-views-name-is-an-error {
+    CREATE TABLE zz_rn_table2 (a int);
+    CREATE VIEW zz_rn_view AS SELECT 1 AS a;
+    ALTER TABLE zz_rn_table2 RENAME TO zz_rn_view;
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_rn_view" already exists
+}
+
+test constraint-oids-are-not-relation-oids {
+    CREATE TABLE zz_con_t (a int PRIMARY KEY, b int UNIQUE);
+    CREATE TABLE zz_con_u (a int);
+    SELECT count(*) FROM pg_constraint con JOIN pg_class c ON con.oid = c.oid;
+}
+expect {
+    0
 }

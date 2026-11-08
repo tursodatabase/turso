@@ -291,7 +291,7 @@ def test_crypto():
     # assert no function before extension loads
     turso.run_test_fn(
         "SELECT crypto_blake('a');",
-        lambda res: "Parse error" in res,
+        lambda res: "no such function: crypto_blake" in res,
         "crypto_blake3 returns null when ext not loaded",
     )
     turso.execute_dot(f".load {extension_path}")
@@ -547,7 +547,7 @@ def test_ipaddr():
 
     turso.run_test_fn(
         "SELECT ipfamily('192.168.1.1');",
-        lambda res: "error: no such function: " in res,
+        lambda res: "no such function: ipfamily" in res,
         "ipfamily function returns null when ext not loaded",
     )
     turso.execute_dot(f".load {ext_path}")
@@ -670,7 +670,7 @@ def test_fuzzy():
     ext_path = f"{DEBUG_DIR}/liblimbo_fuzzy"
     turso.run_test_fn(
         "SELECT fuzzy_leven('awesome', 'aewsme');",
-        lambda res: "error: no such function: " in res,
+        lambda res: "no such function: fuzzy_leven" in res,
         "fuzzy levenshtein function returns null when ext not loaded",
     )
     turso.execute_dot(f".load {ext_path}")
@@ -896,7 +896,7 @@ def test_csv():
     turso.run_test_fn("DROP TABLE csv;", null, "Drop CSV table")
     turso.run_test_fn(
         "SELECT * FROM csv;",
-        lambda res: "Parse error: no such table: csv" in res,
+        lambda res: "no such table: csv" in res,
         "Query dropped CSV table should fail",
     )
     turso.run_test_fn(
@@ -913,7 +913,7 @@ def test_csv():
     )
     turso.run_test_fn(
         "SELECT c1 FROM t1;",
-        lambda res: "Parse error: no such column: c1" in res,
+        lambda res: "no such column: c1" in res,
         "Empty CSV table without header should not have columns other than 'c0'",
     )
 
@@ -929,7 +929,7 @@ def test_csv():
     )
     turso.run_test_fn(
         "SELECT c0 FROM t2;",
-        lambda res: "Parse error: no such column: c0" in res,
+        lambda res: "no such column: c0" in res,
         "Empty CSV table with header should not have columns other than '(NULL)'",
     )
 

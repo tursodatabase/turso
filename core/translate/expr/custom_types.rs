@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::ResolvedType;
 
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
@@ -105,27 +106,27 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
-    // Array columns: pass through raw record blob. ArrayDecode is emitted
-    // at display time (ResultRow) so that functions/subscripts see raw blobs.
+    // An array stays a record blob, holding the values its elements read as.
+    // It is turned into text only for output.
     if column.is_array() {
-        return Ok(());
+        return emit_array_decode(program, dest_reg, column, resolver);
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        emit_decode(program, &resolved.chain, dest_reg, resolver)?;
+        emit_decode(program, &resolved, dest_reg, resolver)?;
     }
     Ok(())
 }
 
-/// Emits the DECODE of each of `chain`'s types on the stored value in `reg`,
-/// which turns it into the value a column of the type reads back. NULL is
-/// left as it is.
+/// Emits the DECODE of each of `resolved`'s types on the stored value in
+/// `reg`, which turns it into the value a column of the type reads back. NULL
+/// is left as it is.
 pub(crate) fn emit_decode(
     program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
+    resolved: &ResolvedType,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    if chain.iter().all(|td| td.decode().is_none()) {
+    if !resolved.has_decode() {
         return Ok(());
     }
     let skip_label = program.allocate_label();
@@ -135,7 +136,7 @@ pub(crate) fn emit_decode(
     });
 
     // Apply decode in reverse order (parent/ancestor first, then child)
-    for td in chain.iter().rev() {
+    for td in resolved.chain.iter().rev() {
         if let Some(decode_expr) = td.decode() {
             emit_type_expr(program, decode_expr, reg, reg, resolver)?;
         }
@@ -149,29 +150,24 @@ pub(crate) fn emit_decode(
 /// Validates NOT NULL and CHECK constraints from the domain type chain.
 pub(super) fn emit_domain_cast_constraints(
     program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
+    resolved: &ResolvedType,
     cast_type: &ast::Type,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
 
-    let any_not_null = chain.iter().any(|td| td.not_null);
-
-    if any_not_null {
+    if resolved.not_null() {
         program.emit_insn(Insn::HaltIfNull {
             constraint_info: None,
             target_reg: reg,
             err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: format!(
-                "domain {} does not allow null values",
-                chain.first().map(|td| td.name.as_str()).unwrap_or("?")
-            ),
+            description: format!("domain {} does not allow null values", resolved.leaf().name),
             on_error: None,
         });
     }
 
-    for td in chain {
+    for td in &resolved.chain {
         for (i, dc) in td.domain_checks.iter().enumerate() {
             let constraint_name = dc
                 .name
@@ -233,22 +229,62 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
-/// Emits what storing the value in `reg` as a value of `chain`'s types runs:
-/// each type's ENCODE, then its COERCE with `type_params`, the arguments
-/// written after the type name. A CAST with type arguments runs the same.
+/// Emits what storing the value in `reg` as a value of `resolved` runs: each
+/// type's ENCODE, then its COERCE with `type_params`, the arguments written
+/// after the type name. The result is converted to the kind of the type's
+/// BASE as a STRICT column of the BASE converts it, so a type BASE integer
+/// whose ENCODE gives '5' stores 5, and one whose ENCODE gives 'abc' is an
+/// error. COERCE sees the converted value too. A CAST runs the same.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
+    resolved: &ResolvedType,
     reg: usize,
     type_params: &[Box<ast::Expr>],
+    resolver: &Resolver,
+) -> Result<()> {
+    let convert = Insn::ConvertToType {
+        reg,
+        storage_class: resolved.storage_class()?,
+        description: format!(
+            "as type {} (BASE {})",
+            resolved.leaf().name,
+            resolved.primitive.to_uppercase()
+        ),
+    };
+    for type_def in &resolved.chain {
+        if let Some(encode) = type_def.encode() {
+            emit_type_expr(program, encode, reg, reg, resolver)?;
+        }
+        if let Some(coerce) = coerce_to_run(type_def, type_params) {
+            program.emit_insn(convert.clone());
+            emit_coerce(program, type_def, coerce, reg, type_params, resolver)?;
+        }
+    }
+    program.emit_insn(convert);
+    Ok(())
+}
+
+/// Emits what comparing the value in `reg` with stored values of `chain`'s
+/// types runs: each type's ENCODE, then the affinity of `storage_class`, so
+/// the value has the kind the stored values have. COERCE does not run, and a
+/// value that doesn't convert is kept as it is.
+pub(crate) fn emit_encode_for_comparison(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    storage_class: crate::types::StorageClass,
+    reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     for type_def in chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
         }
-        emit_coerce(program, type_def, reg, type_params, resolver)?;
     }
+    program.emit_insn(Insn::Affinity {
+        start_reg: reg,
+        count: std::num::NonZeroUsize::MIN,
+        affinities: storage_class.affinity().aff_mask().to_string(),
+    });
     Ok(())
 }
 
@@ -264,23 +300,29 @@ pub(crate) fn emit_type_expr(
     emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
 }
 
-/// Emits the type's COERCE on the value in `reg`, with the type's parameters
-/// bound to `type_params` by position. A type with parameters used without
-/// arguments, as a column declared `numeric`, has no limits and nothing is
-/// emitted. NULL is left as it is.
+/// The type's COERCE, unless the type has parameters and is used without
+/// arguments, as a column declared `numeric`: it then has no limits.
+fn coerce_to_run<'a>(
+    type_def: &'a TypeDef,
+    type_params: &[Box<ast::Expr>],
+) -> Option<&'a ast::Expr> {
+    let coerce = type_def.coerce()?;
+    if type_params.is_empty() && type_def.user_params().next().is_some() {
+        return None;
+    }
+    Some(coerce)
+}
+
+/// Emits `coerce`, the type's COERCE, on the value in `reg`, with the type's
+/// parameters bound to `type_params` by position. NULL is left as it is.
 fn emit_coerce(
     program: &mut ProgramBuilder,
     type_def: &TypeDef,
+    coerce: &ast::Expr,
     reg: usize,
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
-    let Some(coerce) = type_def.coerce() else {
-        return Ok(());
-    };
-    if type_params.is_empty() && type_def.user_params().next().is_some() {
-        return Ok(());
-    }
     // A parameter without an argument, as scale in numeric(10), is NULL.
     let null = ast::Expr::Literal(ast::Literal::Null);
     let bindings: Vec<(&str, &ast::Expr)> = type_def
@@ -415,16 +457,8 @@ pub(crate) fn emit_constraint_values_decode(
             table.is_strict,
             resolver,
         )?;
-        // emit_user_facing_column_value leaves arrays encoded, because SELECT
-        // decodes them when it outputs the row.
         if column.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg: decoded_reg,
-                target_pc: skip_label,
-            });
-            emit_array_decode(program, decoded_reg, column, resolver)?;
-            program.preassign_label_to_next_insn(skip_label);
+            program.emit_insn(Insn::ArrayDecode { reg: decoded_reg });
         }
         info.violation_regs[i] = decoded_reg;
     }

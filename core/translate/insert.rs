@@ -8,7 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::turso_debug_assert;
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
         self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
         SQLITE_SEQUENCE_TABLE_NAME,
@@ -66,7 +66,7 @@ use crate::{
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
-use gencol::compute_virtual_columns;
+use gencol::compute_generated_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
@@ -585,7 +585,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns(
+        compute_generated_columns(
             program,
             &ctx.table.columns_topo_sort()?,
             &dml_ctx,
@@ -761,28 +761,30 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    let types_checked_first = has_before_triggers || insertion.has_generated_columns();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
-            !column.is_virtual_generated() && !has_custom_type(column)
+            !column.is_generated() && !has_custom_type(column)
         })?;
     }
     if let Some(type_check_table) = &maybe_type_check_table {
-        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            )?,
-        });
+        if !program.flags.writes_stored_values() {
+            // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+            // to catch things like a TEXT value inserted into an INTEGER-based custom type.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: insertion.num_non_virtual_cols,
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    ctx.table,
+                    resolver.schema(),
+                    None,
+                )?,
+            });
 
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+            // Encode values for columns with custom types.
+            emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+        }
 
         // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
         // We don't check generated columns in this initial pass because their dependencies could
@@ -795,12 +797,12 @@ pub fn translate_insert(
         });
     }
     emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
-        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+        !column.is_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
-    if insertion.has_virtual_columns() {
+    if insertion.has_generated_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
-        compute_virtual_columns(
+        compute_generated_columns(
             program,
             &ctx.table.columns_topo_sort()?,
             &dml_ctx.with_form(DmlRowForm::Stored),
@@ -825,7 +827,7 @@ pub fn translate_insert(
             &insertion,
             resolver,
             true,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 
@@ -1670,10 +1672,15 @@ fn resolve_upserts(
     for (position, (_, label, upsert)) in upsert_actions.iter_mut().enumerate() {
         // Like SQLite, only compile an action that some constraint check can
         // jump to, so its SET clause and UPDATE triggers are never resolved
-        // when the INSERT cannot conflict.
-        let reachable = constraints.constraints_to_check.iter().any(|(_, handler)| {
-            handler.or(constraints.upsert_catch_all_position) == Some(position)
-        });
+        // when the INSERT cannot conflict. A non-unique index never conflicts.
+        let reachable = constraints
+            .constraints_to_check
+            .iter()
+            .any(|(target, handler)| {
+                let can_conflict =
+                    !matches!(target, ResolvedUpsertTarget::Index(index) if !index.unique);
+                can_conflict && handler.or(constraints.upsert_catch_all_position) == Some(position)
+            });
         if !reachable {
             continue;
         }
@@ -1815,63 +1822,13 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         table_name_reg,
         ..
     } = meta;
-
-    program.emit_insn(Insn::Integer {
-        dest: r_seq,
-        value: 0,
-    });
-    program.emit_insn(Insn::Null {
-        dest: r_seq_rowid,
-        dest_end: None,
-    });
-
-    let loop_start_label = program.allocate_label();
-    let loop_end_label = program.allocate_label();
-    let found_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: seq_cursor_id,
-        pc_if_empty: loop_end_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    let name_col_reg = program.alloc_register();
-    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
-        target_pc: found_label,
-        flags: CmpInsFlags::default().jump_if_null(),
-        collation: super::collate::CollationSeq::NOCASE,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: name_col_reg,
-        dst_reg: table_name_reg,
-        extra_amount: 0,
-    });
-
-    program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
-    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
-    program.emit_insn(Insn::AddImm {
-        register: r_seq,
-        value: 0,
-    });
-    program.emit_insn(Insn::RowId {
-        cursor_id: seq_cursor_id,
-        dest: r_seq_rowid,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: loop_end_label,
-    });
-
-    program.preassign_label_to_next_insn(found_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: seq_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(loop_end_label);
+    crate::translate::sequence::emit_sqlite_sequence_row_read(
+        program,
+        seq_cursor_id,
+        table_name_reg,
+        r_seq,
+        r_seq_rowid,
+    );
 }
 
 fn emit_notnulls(
@@ -1948,10 +1905,12 @@ fn emit_notnulls(
         // Determine which register to check: for custom type columns with
         // a DECODE expression, decode the encoded value into a temp register
         // and check the *decoded* value. This prevents "ghost NULLs" where
-        // ENCODE produces a non-NULL value but DECODE returns NULL.
-        let has_decode = resolver
-            .schema()
-            .column_has_decode(column_mapping.column, ctx.table.is_strict);
+        // ENCODE produces a non-NULL value but DECODE returns NULL. An array's
+        // DECODE runs on its elements, so it never makes the array NULL.
+        let has_decode = !column_mapping.column.is_array()
+            && resolver
+                .schema()
+                .column_has_decode(column_mapping.column, ctx.table.is_strict);
         let check_reg = if has_decode {
             let decoded_reg = program.alloc_register();
             crate::translate::expr::emit_user_facing_column_value(
@@ -2070,7 +2029,7 @@ struct BoundInsertResult {
 /// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
@@ -2603,8 +2562,8 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
-    fn has_virtual_columns(&self) -> bool {
-        self.col_mappings.len() - self.num_non_virtual_cols > 0
+    fn has_generated_columns(&self) -> bool {
+        self.col_mappings.iter().any(|m| m.column.is_generated())
     }
 
     /// Returns the column mapping for a given column name.
@@ -2966,8 +2925,7 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.is_virtual_generated() {
-        // virtual columns are computed in a separate pass in compute_virtual_columns
+    } else if column.is_generated() {
     } else if column.hidden() {
         program.emit_insn(Insn::Null {
             dest: column_register,
@@ -2990,9 +2948,7 @@ fn translate_column(
             });
             return Ok(());
         };
-        let has_custom_encode = resolved
-            .as_ref()
-            .is_some_and(|r| r.chain.iter().any(|td| td.has_encode_or_coerce()));
+        let has_custom_encode = resolved.as_ref().is_some_and(|r| r.has_encode_or_coerce());
         if has_custom_encode {
             translate_expr_no_constant_opt(
                 program,
@@ -3318,16 +3274,17 @@ fn emit_unique_index_check(
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
-        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        let raw_desc = format_unique_violation_desc(ctx.table, index);
         let mut constraint_info = ConstraintInfo::unique_index(
-            ctx.table.name.as_str(),
+            ctx.table,
             index,
             (0..num_cols).map(|i| idx_start_reg + i).collect(),
         );
         emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+        let err_code = constraint_info.kind.sqlite_extended_result_code();
         program.emit_insn(Insn::Halt {
             constraint_info: Some(Box::new(constraint_info)),
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            err_code,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
@@ -3365,16 +3322,17 @@ fn emit_unique_index_check(
             });
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let raw_desc = format_unique_violation_desc(ctx.table, index);
             let mut constraint_info = ConstraintInfo::unique_index(
-                ctx.table.name.as_str(),
+                ctx.table,
                 index,
                 (0..num_cols).map(|i| idx_start_reg + i).collect(),
             );
             emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+            let err_code = constraint_info.kind.sqlite_extended_result_code();
             program.emit_insn(Insn::Halt {
                 constraint_info: Some(Box::new(constraint_info)),
-                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                err_code,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
@@ -3564,30 +3522,24 @@ fn translate_virtual_table_insert(
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
-/// single column: `t.c1`
-/// multi-column:  `t.(k, c1)`
-pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
-    if index.columns.len() == 1 {
-        let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
-        s.push_str(table_name);
-        s.push('.');
-        s.push_str(&index.columns[0].name);
-        s
-    } else {
-        let mut s = String::with_capacity(table_name.len() + 3 + 4 * index.columns.len());
-        s.push_str(table_name);
-        s.push_str(".(");
-        s.push_str(
-            &index
-                .columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        s.push(')');
-        s
+/// columns:     `t.c1` or `t.k, t.c1`
+/// expressions: `index 'i'`
+pub fn format_unique_violation_desc(table: &BTreeTable, index: &Index) -> String {
+    if index.columns.iter().any(|c| c.expression().is_some()) {
+        return format!("index '{}'", index.name);
     }
+    index
+        .columns
+        .iter()
+        .map(|c| {
+            let column = table.columns()[c.pos_in_table]
+                .name
+                .as_deref()
+                .expect("index column must name a table column");
+            format!("{}.{column}", table.name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn emit_index_column_value_for_insert(

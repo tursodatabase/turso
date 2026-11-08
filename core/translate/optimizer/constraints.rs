@@ -241,7 +241,7 @@ impl Constraint {
         });
         self.collation
             .is_none_or(|collation| collation == col.collation())
-            && self.satisfies_index_affinity(col.affinity())
+            && self.satisfies_index_affinity(col.comparison_affinity())
     }
 
     /// Whether an index key column can serve this term: a seek compares keys
@@ -330,6 +330,9 @@ pub(super) fn automatic_index_terms(
         let column = &columns[term
             .table_col_pos
             .expect("a term that can drive an index seek has a column")];
+        if schema.column_is_lossy(column, table.table.is_strict()) {
+            return false;
+        }
         !column.index_order_differs_from_value_order(schema, table.table.is_strict())
             || term.operator == ast::Operator::Equals.into()
     };
@@ -1329,7 +1332,7 @@ pub fn constraints_from_where_clause(
                         {
                             continue;
                         }
-                        let idx_col_aff = constrained_column.affinity();
+                        let idx_col_aff = constrained_column.comparison_affinity();
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
@@ -2496,7 +2499,7 @@ fn find_best_index_for_constraint(
         .table
         .columns()
         .get(col_pos)
-        .is_some_and(|column| column.affinity().index_affinity_ok(affinity))
+        .is_some_and(|column| column.comparison_affinity().index_affinity_ok(affinity))
     {
         return (None, vec![]);
     }

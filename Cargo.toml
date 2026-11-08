@@ -9,6 +9,7 @@ members = [
     "bindings/python",
     "bindings/rust",
     "cli",
+    "benches",
     "core",
     "extensions/completion",
     "extensions/core",
@@ -24,6 +25,7 @@ members = [
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
+    "sqlite/frontend",
     "sqlite/parser",
     "postgres/cli",
     "postgres/client",
@@ -66,6 +68,7 @@ default-members = [
     "bindings/python",
     "bindings/rust",
     "cli",
+    "benches",
     "core",
     "extensions/completion",
     "extensions/core",
@@ -81,6 +84,7 @@ default-members = [
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
+    "sqlite/frontend",
     "sqlite/parser",
     "postgres/tests",
     "serverless/rust",
@@ -123,6 +127,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.2" }
 turso_ext = { path = "extensions/core", version = "0.9.0-pre.2" }
 turso_macros = { path = "macros", version = "0.9.0-pre.2" }
 turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.2" }
+turso_sqlite = { path = "sqlite/frontend", version = "0.9.0-pre.2" }
 turso_pg = { path = "postgres/frontend", version = "0.9.0-pre.2" }
 turso_pg_client = { path = "postgres/client", version = "0.9.0-pre.2" }
 turso_pg_parser = { path = "postgres/parser", version = "0.9.0-pre.2" }

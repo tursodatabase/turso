@@ -162,6 +162,14 @@ impl<'a> CatalogContext<'a> {
         self.with_database_scope(namespace, "view", view_name, f)
     }
 
+    /// The view whose query is being planned, innermost first, or None
+    /// outside any view.
+    pub(crate) fn enclosing_view(&self) -> Option<(NamespaceRef, String)> {
+        let scope = self.database_scope.borrow();
+        let scope = scope.as_ref()?;
+        (scope.kind == "view").then(|| (scope.namespace, scope.object_name.clone()))
+    }
+
     pub fn resolve_function(
         &self,
         func_name: &str,
@@ -484,14 +492,6 @@ impl<'a> CatalogContext<'a> {
 
     fn namespace_has_trigger(schema: &Schema, namespace: NamespaceId, trigger_name: &str) -> bool {
         schema.get_trigger(namespace, trigger_name).is_some()
-    }
-
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.find_existing_sequence(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
     }
 
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
