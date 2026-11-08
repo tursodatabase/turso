@@ -3212,7 +3212,15 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
+                let raw_type_name = extract_type_name_from_typename(pg_type_name)?;
+                if is_integer_type_name(&raw_type_name) {
+                    if let Some(text) = string_literal_text(arg) {
+                        if let Some(decimal) = non_decimal_literal_as_decimal(text) {
+                            expr = Box::new(ast::Expr::Literal(ast::Literal::Numeric(decimal)));
+                        }
+                    }
+                }
+                if raw_type_name.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
@@ -4188,6 +4196,13 @@ impl PostgreSQLTranslator {
                     )));
                 }
                 let mut operand = args.into_iter().next().unwrap();
+                if is_integer_type_name(&func_name) {
+                    if let Some(text) = string_literal_text(&func_call.args[0]) {
+                        if let Some(decimal) = non_decimal_literal_as_decimal(text) {
+                            operand = Box::new(ast::Expr::Literal(ast::Literal::Numeric(decimal)));
+                        }
+                    }
+                }
                 if func_name.eq_ignore_ascii_case("int8") {
                     operand = Box::new(int8_cast_operand(&func_call.args[0], *operand));
                 }
@@ -6374,6 +6389,36 @@ fn int8_cast_operand(arg: &pg_query::protobuf::Node, operand: ast::Expr) -> ast:
     }
 }
 
+fn is_integer_type_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "int2" | "smallint" | "int4" | "integer" | "int" | "int8" | "bigint"
+    )
+}
+
+fn string_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst, AExprKind};
+    match arg.node.as_ref()? {
+        Node::AConst(AConst {
+            val: Some(Val::Sval(s)),
+            ..
+        }) => Some(&s.sval),
+        Node::AExpr(a_expr)
+            if a_expr.kind() == AExprKind::AexprOp
+                && a_expr.lexpr.is_none()
+                && matches!(
+                    a_expr.name.as_slice(),
+                    [pg_query::protobuf::Node {
+                        node: Some(Node::String(name)),
+                    }] if name.sval == "+"
+                ) =>
+        {
+            string_literal_text(a_expr.rexpr.as_ref()?)
+        }
+        _ => None,
+    }
+}
+
 /// The text of a non-integer numeric literal, also when written with a unary
 /// plus. PostgreSQL's parser already folds a unary minus into the literal.
 fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
@@ -6383,6 +6428,10 @@ fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
             val: Some(Val::Fval(f)),
             ..
         }) => Some(&f.fval),
+        Node::AConst(AConst {
+            val: Some(Val::Sval(s)),
+            ..
+        }) => Some(&s.sval),
         Node::AExpr(a_expr)
             if a_expr.kind() == AExprKind::AexprOp
                 && a_expr.lexpr.is_none()
@@ -6402,10 +6451,14 @@ fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
 /// Rounds half away from zero before the range check, like PostgreSQL's
 /// numeric to int8 cast.
 fn numeric_literal_exceeds_int8(literal: &str) -> bool {
+    let literal = literal.trim();
     let literal = literal.replace('_', "");
     let (negative, unsigned) = match literal.strip_prefix('-') {
         Some(rest) => (true, rest),
-        None => (false, literal.as_str()),
+        None => match literal.strip_prefix('+') {
+            Some(rest) => (false, rest),
+            None => (false, literal.as_str()),
+        },
     };
     let limit = if negative {
         i64::MIN.unsigned_abs() as u128
@@ -6421,7 +6474,13 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     if let Some(radix) = radix {
         let digits = unsigned[2..].trim_start_matches('0');
         // Too many digits for a u128 is far outside the bigint range.
-        return u128::from_str_radix(digits, radix).map_or(!digits.is_empty(), |m| m > limit);
+        return match u128::from_str_radix(digits, radix) {
+            Ok(m) => m > limit,
+            Err(e) => {
+                matches!(e.kind(), std::num::IntErrorKind::PosOverflow)
+                    && digits.chars().all(|c| c.to_digit(radix).is_some())
+            }
+        };
     }
     let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
         Some((mantissa, exponent)) => match exponent.parse::<i64>() {
@@ -6468,11 +6527,15 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
 /// decimal digits. Turso's numeric literal parser reads only decimal and hex
 /// text, and reads hex the SQLite way, so a value above i64 wraps around.
 /// Returns `None` for a decimal literal.
-fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
+pub fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
+    let literal = literal.trim();
     let literal = literal.replace('_', "");
     let (sign, unsigned) = match literal.strip_prefix('-') {
         Some(rest) => ("-", rest),
-        None => ("", literal.as_str()),
+        None => match literal.strip_prefix('+') {
+            Some(rest) => ("", rest),
+            None => ("", literal.as_str()),
+        },
     };
     let radix = match unsigned.get(..2) {
         Some("0x" | "0X") => 16,
@@ -6480,10 +6543,14 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
         Some("0b" | "0B") => 2,
         _ => return None,
     };
+    let digits_part = &unsigned[2..];
+    if digits_part.is_empty() {
+        return None;
+    }
     // Decimal digits, least significant first. A literal can be longer than
     // any integer type, so the digits are converted one at a time.
     let mut decimal = vec![0u32];
-    for c in unsigned[2..].chars() {
+    for c in digits_part.chars() {
         let mut carry = c.to_digit(radix)?;
         for digit in decimal.iter_mut() {
             let value = *digit * radix + carry;
@@ -6560,6 +6627,10 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
         Some(Node::Integer(i)) => Some(i.ival as i64),
         Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
             .unwrap_or_else(|| f.fval.clone())
+            .parse::<i64>()
+            .ok(),
+        Some(Node::String(s)) => non_decimal_literal_as_decimal(&s.sval)
+            .unwrap_or_else(|| s.sval.clone())
             .parse::<i64>()
             .ok(),
         _ => None,
@@ -11904,6 +11975,26 @@ mod tests {
             .translate(&parsed)
             .unwrap_or_else(|err| panic!("{sql}: {err}"))
             .to_string()
+    }
+
+    #[test]
+    fn translate_cast_text_with_non_decimal_prefix_to_integer() {
+        assert_eq!(
+            translate_to_sql("SELECT '0o20000000000'::int8, '0o17'::int4, '0x10'::int8, '0b101'::int2"),
+            "SELECT CAST (2147483648 AS INTEGER) int8, CAST (15 AS INTEGER) int4, CAST (16 AS INTEGER) int8, CAST (5 AS INTEGER) int2"
+        );
+        assert_eq!(
+            translate_to_sql("SELECT int8('0x10'), int4('0o17'), int2('0b101')"),
+            "SELECT CAST (16 AS INTEGER) int8, CAST (15 AS INTEGER) int4, CAST (5 AS INTEGER) int2"
+        );
+        assert_eq!(
+            translate_to_sql("SELECT CAST(' 0x10 ' AS bigint), CAST('-0x10' AS integer), CAST('+0o17' AS smallint)"),
+            "SELECT CAST (16 AS INTEGER) int8, CAST (-16 AS INTEGER) int4, CAST (15 AS INTEGER) int2"
+        );
+        assert_eq!(
+            translate_to_sql("SELECT '0o1000000000000000000000'::int8"),
+            "SELECT CAST (int8_out_of_range () AS INTEGER) int8"
+        );
     }
 
     #[test]
