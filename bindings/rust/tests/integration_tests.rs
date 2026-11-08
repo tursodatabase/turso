@@ -322,6 +322,8 @@ async fn test_cacheflush() {
         res.next().await.unwrap().unwrap().get_value(0).unwrap(),
         3.into()
     );
+    // The SELECT is in progress until its rows are dropped.
+    drop(res);
 
     // Tests if cache flush doesn't break a committed transaction
     conn.execute("BEGIN", ()).await.unwrap();
@@ -1478,6 +1480,9 @@ async fn test_prepare_cached_multiple_statements() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     drop(rows);
+    // Dropping the rows does not reset the cached statement, and the
+    // connection runs one statement at a time.
+    stmt1.reset().unwrap();
 
     let mut rows = stmt2.query(vec![Value::Text("test".into())]).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
@@ -1510,17 +1515,20 @@ async fn test_prepare_cached_independent_state() {
     let mut rows1 = stmt1.query(()).await.unwrap();
     let row1 = rows1.next().await.unwrap().unwrap();
     assert_eq!(row1.get::<i64>(0).unwrap(), 1);
-
-    // Start iterating with stmt2 - should have its own state
-    let mut rows2 = stmt2.query(()).await.unwrap();
-    let row2 = rows2.next().await.unwrap().unwrap();
-    assert_eq!(row2.get::<i64>(0).unwrap(), 1);
-
-    // Continue with stmt1 - should be at next row
     let row1 = rows1.next().await.unwrap().unwrap();
     assert_eq!(row1.get::<i64>(0).unwrap(), 2);
 
-    // Continue with stmt2 - should also be at next row (independent state)
+    // The connection runs one statement at a time, so stmt2 cannot start
+    // while stmt1 is in progress.
+    let mut rows2 = stmt2.query(()).await.unwrap();
+    assert!(matches!(rows2.next().await, Err(Error::Busy(_))));
+    drop(rows1);
+    stmt1.reset().unwrap();
+
+    // stmt2 has its own state: it starts at the first row.
+    let mut rows2 = stmt2.query(()).await.unwrap();
+    let row2 = rows2.next().await.unwrap().unwrap();
+    assert_eq!(row2.get::<i64>(0).unwrap(), 1);
     let row2 = rows2.next().await.unwrap().unwrap();
     assert_eq!(row2.get::<i64>(0).unwrap(), 2);
 }
@@ -2902,6 +2910,7 @@ async fn test_query_timeout_interrupts_a_runaway_statement() {
     let mut rows = conn.query("SELECT 1", ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    drop(rows);
 
     // Duration::ZERO disables the limit again.
     conn.set_query_timeout(std::time::Duration::ZERO).unwrap();

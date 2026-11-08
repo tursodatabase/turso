@@ -3088,6 +3088,8 @@ mod tests {
                     .unwrap();
                 let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
                 let sql = row.get_value(0).to_text().unwrap().to_string();
+                // The next statement on conn2 can start only after this one ends.
+                drop(stmt);
                 assert!(
                     sql.contains("z"),
                     "schema should contain z column after ALTER TABLE: {sql}"
@@ -3674,6 +3676,8 @@ mod tests {
                     .unwrap();
                 let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
                 let sql = row.get_value(0).to_text().unwrap().to_string();
+                // The next statement on conn2 can start only after this one ends.
+                drop(stmt);
                 assert!(
                     sql.contains("z"),
                     "schema should still contain z column: {sql}"
