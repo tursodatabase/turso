@@ -213,17 +213,12 @@ fn create_index_on_materialized_view_is_rejected(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
-/// Regression test for #9325: a cursor left open on a materialized view must
-/// keep seeing every row even if a write on the same connection, through the
-/// same transaction, causes a page split in the view's btree while the
-/// cursor sits on an older page. The materialized-view cursor's inner btree
-/// cursor was never registered with the pager's cursor registry (unlike an
-/// ordinary table cursor opened via `Cursor::new_btree`/`new_btree_dyn`), so
-/// it never took part in the save/restore dance that ordinary cursors get
-/// when a peer write rebalances the tree, and could silently skip rows that
-/// moved to a new page.
+/// Regression test for #9325: a write on the same connection, while a cursor
+/// over a materialized view was open, split a page of the view's btree and
+/// made the cursor miss rows that moved to a new page. The connection now
+/// refuses the write while the cursor is open.
 #[turso_macros::test(views)]
-fn open_materialized_view_cursor_survives_page_split_from_same_connection_write(
+fn write_is_refused_while_a_materialized_view_cursor_is_open(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     use turso_core::StepResult;
@@ -262,35 +257,30 @@ fn open_materialized_view_cursor_survives_page_split_from_same_connection_write(
         }
     }
 
-    // A write on the same connection, while `stmt`'s cursor over `mv` is
-    // still open, must not cause it to miss rows that move pages.
-    conn.execute("INSERT INTO t SELECT value * 2 - 1, value * 2 - 1 FROM generate_series(1, 400)")?;
+    let insert = "INSERT INTO t SELECT value * 2 - 1, value * 2 - 1 FROM generate_series(1, 400)";
+    assert!(matches!(
+        conn.execute(insert),
+        Err(turso_core::LimboError::StatementsInProgress(_))
+    ));
 
     open.extend(collect_v(&mut stmt)?);
     drop(stmt);
+    conn.execute(insert)?;
 
     let mut fresh_stmt = conn.prepare(sql)?;
     let fresh = collect_v(&mut fresh_stmt)?;
 
-    assert_eq!(
-        open,
-        vec![800, 798, 2],
-        "open cursor must not miss rows across a same-connection page split"
-    );
+    assert_eq!(open, vec![800, 798, 2]);
     assert_eq!(fresh, vec![800, 798, 2]);
 
     Ok(())
 }
 
-/// Regression test for #9326: an open cursor over a materialized view must
-/// not keep returning a row after a DELETE on the same connection commits
-/// and removes it. The cursor held a reference to the per-statement view
-/// change-log state at open time; a later commit cleared the connection-wide
-/// map but the open cursor kept its stale reference, and the subsequent seek
-/// only matched rows by rowid, ignoring that the delta's weight had gone
-/// negative (retracted).
+/// Regression test for #9326: an open cursor over a materialized view kept
+/// returning a row after a DELETE on the same connection removed it. The
+/// connection now refuses the DELETE while the cursor is open.
 #[turso_macros::test(views)]
-fn open_materialized_view_cursor_does_not_return_row_deleted_after_open(
+fn delete_is_refused_while_a_materialized_view_cursor_is_open(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     use turso_core::StepResult;
@@ -333,20 +323,19 @@ fn open_materialized_view_cursor_does_not_return_row_deleted_after_open(
         }
     }
 
-    // This commits on the same connection while `stmt` is still open on `mv`.
-    conn.execute("DELETE FROM t WHERE id = 3")?;
+    assert!(matches!(
+        conn.execute("DELETE FROM t WHERE id = 3"),
+        Err(turso_core::LimboError::StatementsInProgress(_))
+    ));
 
     open.extend(collect_pairs(&mut stmt)?);
     drop(stmt);
+    conn.execute("DELETE FROM t WHERE id = 3")?;
 
     let mut fresh_stmt = conn.prepare(sql)?;
     let fresh = collect_pairs(&mut fresh_stmt)?;
 
-    assert_eq!(
-        open,
-        vec![(1, 10)],
-        "open cursor must not return a row removed by a DELETE that committed after it opened"
-    );
+    assert_eq!(open, vec![(1, 10), (3, 30)]);
     assert_eq!(fresh, vec![(1, 10)]);
 
     Ok(())

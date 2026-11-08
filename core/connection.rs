@@ -372,6 +372,63 @@ pub(crate) struct StatementActivity {
     explicit_checkpoint_active: bool,
 }
 
+/// How a top-level statement takes part in the rule that the application
+/// runs one statement at a time on a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootStatementKind {
+    /// A statement that the application prepared. It cannot start while
+    /// another statement is in progress on the connection, unless it starts
+    /// inside a step of that statement.
+    Application,
+    /// A statement that the engine runs for its own work, such as a read of
+    /// its own tables to load the schema.
+    Engine,
+    /// The parked statement of an incremental blob handle. It stays in
+    /// progress for the life of the handle, so it does not stop other
+    /// statements.
+    BlobHandle,
+}
+
+crate::thread::thread_local! {
+    /// The address of the connection whose statement this thread steps at
+    /// this time, or 0.
+    static STEPPING_CONNECTION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the current thread as inside a step of a statement on a connection,
+/// until the scope is dropped.
+pub(crate) struct StepScope {
+    connection: usize,
+    previous: usize,
+}
+
+impl StepScope {
+    #[inline]
+    pub(crate) fn enter(connection: &Connection) -> Self {
+        let connection = connection as *const Connection as usize;
+        let previous = STEPPING_CONNECTION.with(|stepping| stepping.replace(connection));
+        Self {
+            connection,
+            previous,
+        }
+    }
+
+    /// Whether this step started inside a step of another statement on the
+    /// same connection, on the same thread. This is the case for SQL that the
+    /// engine, a virtual table or a function runs while a statement executes.
+    #[inline]
+    pub(crate) fn is_inside_another_step(&self) -> bool {
+        self.previous == self.connection
+    }
+}
+
+impl Drop for StepScope {
+    #[inline]
+    fn drop(&mut self) {
+        STEPPING_CONNECTION.with(|stepping| stepping.set(self.previous));
+    }
+}
+
 pub(crate) struct ExplicitCheckpointGuard {
     activity: Arc<Mutex<StatementActivity>>,
     pager: Arc<Pager>,
@@ -578,12 +635,14 @@ pub struct Connection {
     /// How many of `n_active_root_statements` are parked incremental blob
     /// handles. A blob handle keeps a Root statement open from `blob_open`
     /// until close, but between blob operations it just sits on its row, so
-    /// explicit checkpoints subtract these instead of treating them as
-    /// statements in progress (SQLite checkpoints fine with open blob
-    /// handles; a handle re-positions on its next blob operation after the
-    /// checkpoint's cache clear).
+    /// explicit checkpoints and new application statements subtract these
+    /// instead of treating them as statements in progress (SQLite
+    /// checkpoints fine with open blob handles; a handle re-positions on its
+    /// next blob operation after the checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
-    /// Prevents root statements and explicit checkpoints from overlapping on this connection.
+    /// Prevents root statements and explicit checkpoints from overlapping on
+    /// this connection. Changes of `n_active_root_statements` and
+    /// `n_active_blob_statements` happen under this lock.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
@@ -4784,15 +4843,57 @@ impl Connection {
         }
     }
 
-    pub(crate) fn start_root_statement(&self) -> Result<()> {
+    /// Counts a top-level statement as in progress from its first step.
+    ///
+    /// An application statement is refused while another statement on the
+    /// connection is in progress, because the engine cannot keep the state
+    /// of a statement correct while another statement changes it between
+    /// its steps. SQLite permits this. The exception is a statement that
+    /// starts inside a step of another statement on the same connection
+    /// (`inside_another_step`): the engine, a virtual table or a function
+    /// runs that SQL as part of the outer statement.
+    pub(crate) fn start_root_statement(
+        &self,
+        kind: RootStatementKind,
+        inside_another_step: bool,
+    ) -> Result<()> {
         let activity = self.statement_activity.lock();
         if activity.explicit_checkpoint_active {
             return Err(LimboError::StatementsInProgress(
                 "cannot start a statement while a checkpoint is active",
             ));
         }
+        if kind == RootStatementKind::Application
+            && !inside_another_step
+            && self.n_active_non_blob_root_statements() > 0
+        {
+            return Err(LimboError::StatementsInProgress("cannot start a statement"));
+        }
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        if kind == RootStatementKind::BlobHandle {
+            self.n_active_blob_statements.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
+    }
+
+    /// Stops counting a top-level statement as in progress. Returns the
+    /// number of top-level statements in progress before this one ended.
+    pub(crate) fn end_root_statement(&self, kind: RootStatementKind) -> i32 {
+        // Under the same lock as `start_root_statement`, so that a check
+        // never sees the two counters from different moments.
+        let _activity = self.statement_activity.lock();
+        if kind == RootStatementKind::BlobHandle {
+            self.n_active_blob_statements.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.n_active_root_statements.fetch_sub(1, Ordering::SeqCst)
+    }
+
+    /// Top-level statements in progress, other than parked incremental blob
+    /// handles. A blob handle keeps a statement open from `blob_open` until
+    /// close, but between blob operations it only sits on its row.
+    fn n_active_non_blob_root_statements(&self) -> i32 {
+        self.n_active_root_statements.load(Ordering::SeqCst)
+            - self.n_active_blob_statements.load(Ordering::SeqCst)
     }
 
     /// `from_statement` is true when the checkpoint runs inside a root
@@ -4806,14 +4907,11 @@ impl Connection {
     ) -> Result<ExplicitCheckpointGuard> {
         let statements_expected = if from_statement { 1 } else { 0 };
         let mut activity = self.statement_activity.lock();
-        // Parked incremental blob handles don't count: they hold a Root
-        // statement open for their whole lifetime, but between blob
-        // operations they just sit on their row and re-position on their
-        // next blob operation after the checkpoint's cache clear. Counting
-        // them would make one open blob handle block every explicit
+        // Parked incremental blob handles don't count: they re-position on
+        // their next blob operation after the checkpoint's cache clear.
+        // Counting them would make one open blob handle block every explicit
         // checkpoint until it is closed.
-        let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
-            - self.n_active_blob_statements.load(Ordering::SeqCst);
+        let active_non_blob = self.n_active_non_blob_root_statements();
         if activity.explicit_checkpoint_active || active_non_blob != statements_expected {
             return Err(LimboError::StatementsInProgress(
                 "cannot checkpoint while another statement is active",

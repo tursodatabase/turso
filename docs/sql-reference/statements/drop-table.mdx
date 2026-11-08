@@ -33,7 +33,7 @@ DROP TABLE [IF EXISTS] [schema-name.]table-name;
 - All triggers associated with the table are removed.
 - The table entry is removed from the `sqlite_schema` system table.
 - If foreign key constraints reference the dropped table, those references become invalid. Turso does not prevent dropping a table that is referenced by foreign keys in other tables.
-- `DROP TABLE` is not allowed while the table is being read or written by another statement in the same connection.
+- `DROP TABLE` is not allowed while another statement on the same connection is in progress, as for every statement. See [Transactions](/docs/sql-reference/statements/transactions#transaction-lifecycle).
 
 ## Examples
 

@@ -10749,28 +10749,30 @@ pub mod test {
             .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
 
-        fn start_reader(conn: &Arc<Connection>) -> (u64, crate::Statement) {
+        fn start_reader(conn: &Arc<Connection>) -> u64 {
             conn.execute("BEGIN").unwrap();
+            // The first read takes the read lock of the transaction. The lock
+            // stays until COMMIT, also after the SELECT is dropped.
             let mut stmt = conn.prepare("SELECT * FROM test").unwrap();
             stmt.step().unwrap();
-            let frame = conn.pager.load().wal.as_ref().unwrap().get_max_frame();
-            (frame, stmt)
+            drop(stmt);
+            conn.pager.load().wal.as_ref().unwrap().get_max_frame()
         }
 
         bulk_inserts(&conn_writer, 3, 5);
 
         let conn1 = &db.connect(ConnectOpts::new()).unwrap();
-        let (r1_frame, _stmt) = start_reader(conn1); // reader 1
+        let r1_frame = start_reader(conn1); // reader 1
 
         bulk_inserts(&conn_writer, 3, 5);
 
         let conn_r2 = db.connect(ConnectOpts::new()).unwrap();
-        let (r2_frame, _stmt2) = start_reader(&conn_r2); // reader 2
+        let r2_frame = start_reader(&conn_r2); // reader 2
 
         bulk_inserts(&conn_writer, 3, 5);
 
         let conn_r3 = db.connect(ConnectOpts::new()).unwrap();
-        let (r3_frame, _stmt3) = start_reader(&conn_r3); // reader 3
+        let r3_frame = start_reader(&conn_r3); // reader 3
 
         assert!(r1_frame < r2_frame && r2_frame < r3_frame);
 

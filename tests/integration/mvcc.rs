@@ -1562,14 +1562,12 @@ fn test_mvcc_checkpointed_upsert_changing_ipk(db: TempDatabase) -> anyhow::Resul
 
 /// Regression test for https://github.com/tursodatabase/turso/issues/7578
 ///
-/// An active MVCC index scan must not return a row deleted after the scan
-/// cursor was opened. Pre-fix, the scan panicked with
-/// `index shadow scan diverged from query_btree_version_is_valid` in
-/// core/mvcc/cursor.rs (or, without the assertion, returned the deleted row).
+/// A DELETE on the connection of an active MVCC index scan used to make the
+/// scan panic with `index shadow scan diverged from
+/// query_btree_version_is_valid` in core/mvcc/cursor.rs (or, without the
+/// assertion, return the deleted row). The connection now refuses the DELETE.
 #[turso_macros::test]
-fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(
-    db: TempDatabase,
-) -> anyhow::Result<()> {
+fn test_mvcc_delete_is_refused_while_an_index_scan_is_open(db: TempDatabase) -> anyhow::Result<()> {
     fn next_pair(stmt: &mut turso_core::Statement) -> anyhow::Result<Option<(i64, i64)>> {
         loop {
             match stmt.step()? {
@@ -1605,14 +1603,17 @@ fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(
     assert_eq!(next_pair(&mut scan)?, Some((2, 2)));
 
     // Delete a later durable index key while the original index cursor is still open.
-    conn.execute("DELETE FROM t WHERE id=4")?;
+    assert!(matches!(
+        conn.execute("DELETE FROM t WHERE id=4"),
+        Err(turso_core::LimboError::StatementsInProgress(_))
+    ));
 
     let mut rest = Vec::new();
     while let Some(row) = next_pair(&mut scan)? {
         rest.push(row);
     }
 
-    assert_eq!(rest, vec![(3, 4)]);
+    assert_eq!(rest, vec![(3, 4), (4, 5)]);
     Ok(())
 }
 

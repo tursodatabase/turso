@@ -315,8 +315,10 @@ fn returning_delete_drop_after_partial_read_commits(tmp_db: TempDatabase) -> any
     Ok(())
 }
 
+/// A statement that would fail at run time is refused while a RETURNING
+/// statement is open, so it cannot roll back that statement.
 #[turso_macros::test]
-fn unrelated_runtime_error_does_not_rollback_open_returning_statement(
+fn unrelated_statement_is_refused_while_a_returning_statement_is_open(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -335,8 +337,11 @@ fn unrelated_runtime_error_does_not_rollback_open_returning_statement(
 
         let err = conn
             .execute("SELECT sum(x) FROM overflow")
-            .expect_err("sum overflow should fail");
-        assert!(matches!(err, LimboError::IntegerOverflow), "{err:?}");
+            .expect_err("the SELECT must be refused");
+        assert!(
+            matches!(err, LimboError::StatementsInProgress(_)),
+            "{err:?}"
+        );
     }
 
     assert_that!(limbo_exec_rows(&conn, "SELECT id FROM pending ORDER BY id"))

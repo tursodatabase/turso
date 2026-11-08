@@ -11,6 +11,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
+use crate::connection::{RootStatementKind, StepScope};
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -221,8 +222,8 @@ pub struct Statement {
     analyze_refresh: Option<RefreshAnalyzeStatsState>,
     /// True for the parked statement backing an incremental blob handle.
     /// Counted separately in `Connection::n_active_blob_statements` so
-    /// explicit checkpoints can subtract it — an open blob handle must not
-    /// block checkpointing for its whole lifetime.
+    /// explicit checkpoints and new statements can subtract it — an open
+    /// blob handle must not block them for its whole lifetime.
     is_blob_handle: bool,
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
@@ -456,23 +457,9 @@ impl Statement {
             if let Some(hooks) = conn.hooks() {
                 hooks.root_statement_ended(conn, statement_failed);
             }
-            // Blob count drops before the root count so a concurrent
-            // checkpoint-guard read never sees fewer non-blob statements
-            // than are really active (a stale-high read only causes a
-            // spurious StatementsInProgress, never a missed one).
-            if self.is_blob_handle {
-                self.program
-                    .connection
-                    .n_active_blob_statements
-                    .fetch_sub(1, Ordering::SeqCst);
-            }
-            let previous = self
-                .program
-                .connection
-                .n_active_root_statements
-                .fetch_sub(1, Ordering::SeqCst);
+            let previous = conn.end_root_statement(self.root_statement_kind());
             if previous == 1 {
-                self.program.connection.clear_interrupt_if_idle();
+                conn.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
         }
@@ -483,6 +470,7 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let step_scope = StepScope::enter(&self.program.connection);
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -493,7 +481,7 @@ impl Statement {
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
         {
-            if let Some(result) = self.prepare_step(waker)? {
+            if let Some(result) = self.prepare_step(waker, step_scope.is_inside_another_step())? {
                 return Ok(result);
             }
         }
@@ -551,18 +539,16 @@ impl Statement {
     /// First-call and busy-wait work of [`Self::_step`]. Returns the result to
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
-    fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
+    fn prepare_step(
+        &mut self,
+        waker: Option<&Waker>,
+        inside_another_step: bool,
+    ) -> Result<Option<StepResult>> {
         if !self.counted_as_active_root && self.origin.is_top_level() {
-            self.program.connection.start_root_statement()?;
+            self.program
+                .connection
+                .start_root_statement(self.root_statement_kind(), inside_another_step)?;
             self.counted_as_active_root = true;
-            // After the root count, so the checkpoint guard's subtraction
-            // can only read stale-high (see release_active_root_if_counted).
-            if self.is_blob_handle {
-                self.program
-                    .connection
-                    .n_active_blob_statements
-                    .fetch_add(1, Ordering::SeqCst);
-            }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
@@ -601,6 +587,16 @@ impl Statement {
             }
         }
         Ok(None)
+    }
+
+    fn root_statement_kind(&self) -> RootStatementKind {
+        if self.is_blob_handle {
+            RootStatementKind::BlobHandle
+        } else if self.origin == StatementOrigin::Root {
+            RootStatementKind::Application
+        } else {
+            RootStatementKind::Engine
+        }
     }
 
     /// Everything [`Self::_step`] does after the interpreter returned something

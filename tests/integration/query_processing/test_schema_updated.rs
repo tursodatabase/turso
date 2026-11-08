@@ -374,20 +374,23 @@ fn test_strict_generated_any_index_after_reopen() -> Result<()> {
 }
 
 /// A statement that went stale because a connection setting changed is
-/// prepared again before it starts. That must not end the transaction of
-/// another statement that is still returning rows.
+/// refused while another statement is still returning rows, so preparing it
+/// again cannot end the transaction of that statement.
 #[turso_macros::test(mvcc)]
-fn test_stale_statement_keeps_writes_of_a_statement_returning_rows(
+fn test_stale_statement_is_refused_while_a_statement_returns_rows(
     tmp_db: TempDatabase,
 ) -> Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t (x)")?;
     let mut stale = conn.prepare("SELECT 1")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
     let mut insert = conn.prepare("INSERT INTO t VALUES (1), (2) RETURNING x")?;
     assert_eq!(step_to_first_row(&mut insert)?, vec![Value::from_i64(1)]);
 
-    conn.execute("PRAGMA foreign_keys = ON")?;
-    assert_eq!(stale.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
+    assert!(matches!(
+        stale.run_collect_rows(),
+        Err(LimboError::StatementsInProgress(_))
+    ));
     insert.run_ignore_rows()?;
 
     assert_eq!(count_rows(&conn, "t")?, Value::from_i64(2));
@@ -395,25 +398,29 @@ fn test_stale_statement_keeps_writes_of_a_statement_returning_rows(
         count_rows(&tmp_db.connect_limbo(), "t")?,
         Value::from_i64(2)
     );
+    assert_eq!(stale.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
     Ok(())
 }
 
-/// Preparing a stale statement again must not end the read transaction of a
-/// SELECT that is part-way through its rows: the SELECT keeps reading the
-/// snapshot it started with, even after another connection deletes the rows
-/// and checkpoints.
+/// A stale statement is refused while a SELECT is part-way through its rows,
+/// so preparing it again cannot end the read transaction of the SELECT: the
+/// SELECT keeps reading the snapshot it started with, even after another
+/// connection deletes the rows and checkpoints.
 #[turso_macros::test(mvcc)]
-fn test_stale_statement_keeps_the_snapshot_of_a_running_select(tmp_db: TempDatabase) -> Result<()> {
+fn test_stale_statement_is_refused_while_a_select_is_running(tmp_db: TempDatabase) -> Result<()> {
     let conn = tmp_db.connect_limbo();
     let other = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")?;
     conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
     let mut stale = conn.prepare("SELECT 1")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
     let mut select = conn.prepare("SELECT x FROM t ORDER BY x")?;
     assert_eq!(step_to_first_row(&mut select)?, vec![Value::from_i64(1)]);
 
-    conn.execute("PRAGMA foreign_keys = ON")?;
-    assert_eq!(stale.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
+    assert!(matches!(
+        stale.run_collect_rows(),
+        Err(LimboError::StatementsInProgress(_))
+    ));
     other.execute("DELETE FROM t")?;
     match other.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
         Ok(()) | Err(LimboError::Busy) => {}

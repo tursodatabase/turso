@@ -157,37 +157,38 @@ change when they are converted to text.
 | CREATE TRIGGER ... INSTEAD OF | ❌ No  | Triggers on views are not supported. Currently errors with misleading "no such table" message. |
 | CREATE VIEW IF NOT EXISTS | 🚧 Partial | Not idempotent — second create on an existing view errors instead of no-op. |
 
-#### Same-connection write statements
+#### Same-connection statements
 
-SQLite allows more than one active write statement on the same connection. For
-example, an application can step one `INSERT ... RETURNING`, leave it open, and
-then start another write statement on the same connection.
+SQLite allows more than one statement in progress on the same connection. For
+example, an application can step a `SELECT`, and between two rows of the
+`SELECT` run an `INSERT`, a `COMMIT` or a `DROP TABLE` on the same connection.
 
-Turso currently returns `SQLITE_BUSY` for the second write statement. Reads may
-still run while a write statement is active.
+Turso returns `SQLITE_BUSY` ("cannot start a statement - SQL statements in
+progress") for the second statement. A statement is in progress from its first
+step until it returns its last row (`SQLITE_DONE`), fails, or is reset or
+finalized. Finish or reset the open statement first, then run the next
+statement. Statements that must run at the same time need separate connections.
 
-This is a deliberate compatibility gap. SQLite's built-in write opcodes do not
-return control to the application halfway through the mutation. Turso can suspend
-there for async I/O. If a second writer were allowed to start, dropping or
-resetting the first half-finished writer could not always clean up only that
-writer without risking the second writer's state. Returning `SQLITE_BUSY` keeps
-the connection state simple: finish or reset the active writer first, then start
-the next write statement.
+This is a deliberate compatibility gap. Turso can suspend a statement in the
+middle of its work for async I/O. If another statement on the same connection
+changed the database, the schema or the transaction while the first statement
+was suspended, the engine could not keep the state of the first statement
+correct.
 
-`SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` also return `SQLITE_BUSY` while a
-write statement on the connection is active. SQLite rejects `SAVEPOINT` and
-`RELEASE` the same way ("SQL statements in progress"); for `ROLLBACK TO` it
-instead aborts the in-progress statements, which Turso does not support, so
-Turso rejects that too rather than let a suspended writer resume over pages the
-rollback just restored.
+The rule does not apply to:
 
-These same-connection `SQLITE_BUSY` rejections are errors ("... - SQL
-statements in progress") that abort the rejected statement: it must be reset
-or re-executed, not merely stepped again, and the busy handler is never
-invoked for them. No amount of waiting can release the conflict, because only
-the application finishing or resetting its own statement can. This matches
-SQLite, which reports its statements-in-progress rejections as error-class
-`SQLITE_BUSY` and reserves the busy handler for lock contention.
+- Statements on other connections.
+- SQL that runs inside a step of the open statement, on the same thread. For
+  example, SQL that a virtual table or a user-defined function runs.
+- Incremental blob handles. Statements can run while a blob handle is open, and
+  a blob handle can open while a statement is in progress.
+
+The rejected statement did not start: step it again after the other statement
+finished. The busy handler is never invoked for this rejection, because no
+amount of waiting can release the conflict. Only the application can finish or
+reset its own statement. This matches SQLite, which reports its "SQL statements
+in progress" rejections as error-class `SQLITE_BUSY` and reserves the busy
+handler for lock contention.
 
 If a write statement inside `BEGIN` is reset or dropped before it finishes and
 Turso did not open a statement savepoint for it, the transaction becomes
@@ -199,18 +200,6 @@ can observe the abandoned statement's partial changes (they are undone only when
 the transaction ends), and `ROLLBACK TO` a savepoint does not clear the
 rollback-only marker even if it restored every page the abandoned statement
 touched — only `ROLLBACK` recovers the connection.
-
-In experimental MVCC mode there is an additional known gap: all statements on a
-connection share one MVCC transaction, so a write statement that finishes while
-a sibling statement is still active defers its commit until the last sibling
-finishes. SQLite instead commits at the writer's own completion and lets the
-remaining statements continue on a read-only transaction. Until Turso does the
-same, a write that reported success is not durable while sibling statements
-remain active, and it is silently rolled back if the transaction then ends
-abnormally — for example if the last sibling reader is reset or dropped
-mid-scan, or a later write statement on the same connection fails after
-changing rows. Finish or reset sibling statements promptly after writing to
-avoid this window.
 
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
 

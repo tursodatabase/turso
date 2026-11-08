@@ -1263,29 +1263,26 @@ fn test_plain_insert_done_does_not_commit_while_returning_writer_active() {
 }
 
 #[test]
-fn test_same_connection_select_does_not_commit_active_returning_writer() {
+fn test_same_connection_select_is_refused_while_returning_writer_is_active() {
     let env = SameConnectionMvcc::new(":memory:select-does-not-commit-returning");
     env.setup_rows_table();
 
     let mut returning = prepare_insert_returning(&env.conn, 1, "one");
     assert_eq!(step_returning_id(&mut returning), 1);
 
-    assert_eq!(
-        scalar_i64(&env.conn, "SELECT COUNT(*) FROM rows"),
-        1,
-        "the owning connection sees its uncommitted write"
-    );
+    let mut count = env.conn.prepare("SELECT COUNT(*) FROM rows").unwrap();
+    expect_step_busy(&mut count, "SELECT beside an active RETURNING writer");
     assert_eq!(
         env.observer_count(),
         0,
-        "a read statement must not finalize the active implicit write tx"
+        "the refused read must not finalize the active implicit write tx"
     );
     drop(returning);
     assert_eq!(env.observer_ids(), vec![1]);
 }
 
 #[test]
-fn test_suspended_read_does_not_finish_joined_returning_writer() {
+fn test_returning_writer_is_refused_while_a_read_is_suspended() {
     let env = SameConnectionMvcc::new(":memory:suspended-read-joined-writer");
     env.setup_rows_table();
     env.conn
@@ -1296,20 +1293,17 @@ fn test_suspended_read_does_not_finish_joined_returning_writer() {
     let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 10);
     let mut returning = prepare_insert_returning(&env.conn, 1, "one");
-    assert_eq!(step_returning_id(&mut returning), 1);
+    expect_step_busy(&mut returning, "RETURNING writer beside a suspended read");
 
     drop(reader);
-    assert_eq!(
-        env.observer_ids(),
-        vec![10],
-        "dropping the read that opened the transaction must not finish the joined writer"
-    );
+    assert_eq!(env.observer_ids(), vec![10]);
+    assert_eq!(step_returning_id(&mut returning), 1);
     drop(returning);
     assert_eq!(env.observer_ids(), vec![1, 10]);
 }
 
 #[test]
-fn test_completed_writer_waits_for_sibling_mvcc_reader_to_commit() {
+fn test_writer_is_refused_while_an_mvcc_reader_is_open() {
     let env = SameConnectionMvcc::new(":memory:completed-writer-waits-for-reader");
     env.setup_rows_table();
     env.conn
@@ -1319,28 +1313,21 @@ fn test_completed_writer_waits_for_sibling_mvcc_reader_to_commit() {
 
     let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 10);
-
     let mut returning = prepare_insert_returning(&env.conn, 1, "one");
-    assert_eq!(step_returning_id(&mut returning), 1);
-    finish_without_rows(&mut returning);
-    drop(returning);
-
-    assert_eq!(
-        env.observer_ids(),
-        vec![10],
-        "completed writer must not commit while the reader still holds the shared MVCC transaction"
-    );
+    expect_step_busy(&mut returning, "writer beside an MVCC reader");
 
     finish_without_rows(&mut reader);
+    assert_eq!(step_returning_id(&mut returning), 1);
+    finish_without_rows(&mut returning);
     assert_eq!(
         env.observer_ids(),
         vec![1, 10],
-        "the last sibling statement should commit the completed writer's changes"
+        "the writer commits when it finishes"
     );
 }
 
 #[test]
-fn test_suspended_read_does_not_finish_sibling_read_transaction() {
+fn test_second_read_is_refused_while_a_read_is_suspended() {
     let env = SameConnectionMvcc::new(":memory:suspended-read-sibling-read");
     env.setup_rows_table();
     env.conn
@@ -1351,14 +1338,11 @@ fn test_suspended_read_does_not_finish_sibling_read_transaction() {
     let mut first = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut first), 10);
     let mut second = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
-    assert_eq!(step_returning_id(&mut second), 10);
+    expect_step_busy(&mut second, "second read beside a suspended read");
 
     drop(first);
-    assert_eq!(
-        step_returning_id(&mut second),
-        20,
-        "dropping one read must not close the transaction under a sibling read"
-    );
+    assert_eq!(step_returning_id(&mut second), 10);
+    assert_eq!(step_returning_id(&mut second), 20);
     finish_without_rows(&mut second);
     assert_eq!(env.conn.get_mv_tx(), None);
     assert_eq!(
@@ -1368,7 +1352,7 @@ fn test_suspended_read_does_not_finish_sibling_read_transaction() {
 }
 
 #[test]
-fn test_wal_returning_writer_can_commit_while_sibling_reader_is_active() {
+fn test_wal_returning_writer_is_refused_while_a_reader_is_active() {
     let env = SameConnectionWal::new(":memory:wal-reader-active-writer-commit");
     env.setup_rows_table();
     env.conn
@@ -1378,17 +1362,16 @@ fn test_wal_returning_writer_can_commit_while_sibling_reader_is_active() {
 
     let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 10);
-
     let mut returning = prepare_insert_returning(&env.conn, 1, "one");
+    expect_step_busy(&mut returning, "RETURNING writer beside an active reader");
+
+    finish_without_rows(&mut reader);
     assert_eq!(step_returning_id(&mut returning), 1);
     finish_without_rows(&mut returning);
-
     assert_eq!(
         ids_from_query(&env.observer, "SELECT id FROM rows ORDER BY id"),
-        vec![1, 10],
-        "WAL mode follows SQLite's only-active-writer rule: the writer can commit while a reader is still active"
+        vec![1, 10]
     );
-    finish_without_rows(&mut reader);
 }
 
 #[test]
@@ -1418,7 +1401,7 @@ fn test_wal_begin_immediate_does_not_count_as_active_writer() {
 }
 
 #[test]
-fn test_wal_dropping_reader_does_not_rollback_active_returning_writer() {
+fn test_wal_writer_refused_beside_a_reader_runs_after_the_reader_is_dropped() {
     let env = SameConnectionWal::new(":memory:wal-drop-reader-active-writer");
     env.setup_rows_table();
     env.conn
@@ -1429,15 +1412,14 @@ fn test_wal_dropping_reader_does_not_rollback_active_returning_writer() {
     let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 10);
     let mut returning = prepare_insert_returning(&env.conn, 1, "one");
-    assert_eq!(step_returning_id(&mut returning), 1);
+    expect_step_busy(&mut returning, "RETURNING writer beside an open reader");
 
     drop(reader);
     assert_eq!(
         ids_from_query(&env.observer, "SELECT id FROM rows ORDER BY id"),
-        vec![10],
-        "dropping the reader must not commit the active writer"
+        vec![10]
     );
-
+    assert_eq!(step_returning_id(&mut returning), 1);
     finish_without_rows(&mut returning);
     assert_eq!(
         ids_from_query(&env.observer, "SELECT id FROM rows ORDER BY id"),
@@ -1446,7 +1428,7 @@ fn test_wal_dropping_reader_does_not_rollback_active_returning_writer() {
 }
 
 #[test]
-fn test_wal_dropping_one_reader_does_not_close_sibling_reader_transaction() {
+fn test_wal_second_reader_is_refused_while_a_reader_is_open() {
     let env = SameConnectionWal::new(":memory:wal-sibling-readers");
     env.setup_rows_table();
     env.conn
@@ -1457,19 +1439,16 @@ fn test_wal_dropping_one_reader_does_not_close_sibling_reader_transaction() {
     let mut first = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut first), 10);
     let mut second = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
-    assert_eq!(step_returning_id(&mut second), 10);
+    expect_step_busy(&mut second, "second reader beside an open reader");
 
     drop(first);
-    assert_eq!(
-        step_returning_id(&mut second),
-        20,
-        "dropping one reader must not close the transaction under a sibling reader"
-    );
+    assert_eq!(step_returning_id(&mut second), 10);
+    assert_eq!(step_returning_id(&mut second), 20);
     finish_without_rows(&mut second);
 }
 
 #[test]
-fn test_wal_dropping_one_attached_reader_keeps_sibling_reader_locked() {
+fn test_wal_second_attached_reader_is_refused_while_a_reader_is_open() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(
         io,
@@ -1490,27 +1469,18 @@ fn test_wal_dropping_one_attached_reader_keeps_sibling_reader_locked() {
     let mut first = conn.prepare("SELECT id FROM aux.rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut first), 10);
     let mut second = conn.prepare("SELECT id FROM aux.rows ORDER BY id").unwrap();
-    assert_eq!(step_returning_id(&mut second), 10);
+    expect_step_busy(&mut second, "second attached reader beside an open reader");
+    expect_busy(conn.execute("DETACH aux"), "DETACH beside an open reader");
 
     drop(first);
-    let detach_err = conn
-        .execute("DETACH aux")
-        .expect_err("the sibling reader must keep the attached database locked");
-    assert!(
-        matches!(detach_err, LimboError::InvalidArgument(ref message) if message == "database aux is locked"),
-        "expected attached database lock error, got {detach_err:?}"
-    );
-    assert_eq!(
-        step_returning_id(&mut second),
-        20,
-        "dropping one attached reader must not close the transaction under its sibling"
-    );
+    assert_eq!(step_returning_id(&mut second), 10);
+    assert_eq!(step_returning_id(&mut second), 20);
     finish_without_rows(&mut second);
     conn.execute("DETACH aux").unwrap();
 }
 
 #[test]
-fn review_attached_writer_success_is_not_lost_when_sibling_dropped() {
+fn review_attached_writer_is_refused_beside_a_reader() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(
         io,
@@ -1533,14 +1503,19 @@ fn review_attached_writer_success_is_not_lost_when_sibling_dropped() {
 
     let mut reader = conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 1);
-    conn.execute("UPDATE aux.rows SET id = 11").unwrap();
+    expect_busy(
+        conn.execute("UPDATE aux.rows SET id = 11"),
+        "attached writer beside a reader",
+    );
     drop(reader);
 
+    assert_eq!(ids_from_query(&conn, "SELECT id FROM aux.rows"), vec![10]);
+    conn.execute("UPDATE aux.rows SET id = 11").unwrap();
     assert_eq!(ids_from_query(&conn, "SELECT id FROM aux.rows"), vec![11]);
 }
 
 #[test]
-fn review_transactionless_last_sibling_closes_attached_txn() {
+fn review_attached_read_is_refused_beside_a_transactionless_read() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(
         io,
@@ -1562,10 +1537,11 @@ fn review_transactionless_last_sibling_closes_attached_txn() {
     let mut literal = conn.prepare("SELECT 1").unwrap();
     assert_eq!(step_returning_id(&mut literal), 1);
     let mut attached = conn.prepare("SELECT id FROM aux.rows ORDER BY id").unwrap();
-    assert_eq!(step_returning_id(&mut attached), 10);
-    assert_eq!(drain_returning_ids(&mut attached), vec![20]);
+    expect_step_busy(&mut attached, "attached read beside a transactionless read");
     finish_without_rows(&mut literal);
 
+    assert_eq!(step_returning_id(&mut attached), 10);
+    assert_eq!(drain_returning_ids(&mut attached), vec![20]);
     conn.execute("DETACH aux").unwrap();
 }
 
@@ -2113,16 +2089,15 @@ fn test_second_writer_busy_does_not_invoke_busy_handler() {
     assert_eq!(env.observer_ids(), vec![1]);
 }
 
-// The two tests below pin known data-loss gaps in the MVCC deferred-commit
-// model; they document current behavior, not desired behavior. A writer that
-// finishes while a sibling statement holds the shared implicit MVCC
-// transaction open defers its commit to the last sibling, so any path that
-// ends that transaction in a rollback silently discards changes whose caller
-// already observed success. The durable fix is committing at the writer's own
-// halt; see the FIXME in `halt` (core/vdbe/execute.rs).
+// The two tests below come from data-loss gaps of the MVCC deferred-commit
+// model. A writer that finished while a sibling statement held the shared
+// implicit MVCC transaction open deferred its commit to the last sibling, so a
+// rollback of that transaction discarded changes whose caller had seen
+// success. The connection now refuses the writer while another statement is
+// in progress, so the writer commits when it finishes.
 
 #[test]
-fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
+fn test_mvcc_writer_is_refused_beside_a_reader_that_is_abandoned() {
     let env = SameConnectionMvcc::new(":memory:completed-writer-lost-reader-abandoned");
     env.setup_rows_table();
     env.conn
@@ -2132,27 +2107,19 @@ fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
 
     let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 10);
-
     let mut returning = prepare_insert_returning(&env.conn, 1, "one");
+    expect_step_busy(&mut returning, "writer beside an open reader");
+
+    // The reader is abandoned mid-scan instead of finishing.
+    drop(reader);
+    assert_eq!(env.observer_ids(), vec![10]);
     assert_eq!(step_returning_id(&mut returning), 1);
     finish_without_rows(&mut returning);
-    drop(returning);
-
-    // The reader is abandoned mid-scan instead of finishing, so the shared
-    // transaction ends through the rollback path and the completed writer's
-    // row is lost. Compare test_completed_writer_waits_for_sibling_mvcc_reader_to_commit,
-    // where the reader finishes normally and the writer's row commits.
-    drop(reader);
-
-    assert_eq!(
-        env.observer_ids(),
-        vec![10],
-        "pins the deferred-commit gap: an abandoned last reader discards the completed writer's row"
-    );
+    assert_eq!(env.observer_ids(), vec![1, 10]);
 }
 
 #[test]
-fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
+fn test_mvcc_writers_are_refused_beside_a_reader() {
     let env = SameConnectionMvcc::new(":memory:completed-writer-lost-joining-writer-error");
     env.setup_rows_table();
     env.conn
@@ -2165,29 +2132,21 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
 
     let mut reader = env.conn.prepare("SELECT id FROM src ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 1);
-
-    env.conn
-        .execute("INSERT INTO rows VALUES (1, 'one')")
-        .unwrap();
-
-    // The joining writer changes a row (id 2) before hitting the duplicate,
-    // and has no local rollback boundary, so the whole shared transaction is
-    // rolled back — including the earlier INSERT that already reported success.
-    let err = env
-        .conn
-        .execute("INSERT INTO rows SELECT id, v FROM src")
-        .expect_err("second insert should hit duplicate primary key");
-    assert!(
-        matches!(err, LimboError::Constraint(_)),
-        "expected duplicate-key constraint error, got {err:?}"
+    expect_busy(
+        env.conn.execute("INSERT INTO rows VALUES (1, 'one')"),
+        "INSERT beside an open reader",
+    );
+    expect_busy(
+        env.conn.execute("INSERT INTO rows SELECT id, v FROM src"),
+        "INSERT ... SELECT beside an open reader",
     );
 
     drop(reader);
-    assert_eq!(
-        env.observer_ids(),
-        Vec::<i64>::new(),
-        "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
-    );
+    assert_eq!(env.observer_ids(), Vec::<i64>::new());
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(env.observer_ids(), vec![1]);
 }
 
 #[cfg(feature = "fts")]
@@ -2208,17 +2167,12 @@ fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connecti
     (db, conn, observer)
 }
 
-/// A writer that finishes while a sibling statement holds the shared implicit
-/// MVCC transaction open defers its commit to the last sibling (see
-/// test_completed_writer_waits_for_sibling_mvcc_reader_to_commit). Its FTS
-/// writes must be deferred with it: once the base row commits, the document
-/// must be searchable. The deferred halt path must stage the writer's
-/// index-method work or hand its cursor to the connection — otherwise the
-/// pending documents die with the statement and the base row commits without
-/// its index entries.
+/// A writer was refused while a reader of the same connection was open, so it
+/// cannot defer its commit to the reader. When it runs after the reader, its
+/// FTS document commits together with its base row.
 #[cfg(feature = "fts")]
 #[test]
-fn fts_writes_survive_deferred_shared_autocommit() {
+fn fts_writer_refused_beside_a_reader_commits_its_document_after_it() {
     let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-deferred-shared-autocommit");
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -2230,21 +2184,20 @@ fn fts_writes_survive_deferred_shared_autocommit() {
 
     let mut reader = conn.prepare("SELECT id FROM docs ORDER BY id").unwrap();
     assert_eq!(step_returning_id(&mut reader), 10);
-
     let mut writer = conn
         .prepare("INSERT INTO docs VALUES (1, 'deferred needle') RETURNING id")
         .unwrap();
+    expect_step_busy(&mut writer, "FTS writer beside an open reader");
+
+    finish_without_rows(&mut reader);
+    drop(reader);
     assert_eq!(step_returning_id(&mut writer), 1);
     finish_without_rows(&mut writer);
     drop(writer);
 
-    finish_without_rows(&mut reader);
-    drop(reader);
-
     assert_eq!(
         ids_from_query(&observer, "SELECT id FROM docs ORDER BY id"),
-        vec![1, 10],
-        "the last sibling statement commits the completed writer's base row"
+        vec![1, 10]
     );
     assert_eq!(
         ids_from_query(

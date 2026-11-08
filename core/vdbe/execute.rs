@@ -3843,8 +3843,11 @@ pub fn halt(
             // shared transaction then ends in a rollback — the last sibling
             // reader is reset or dropped mid-scan, or a later joining writer
             // errors or is abandoned after changing rows — the finished
-            // writer's changes are silently discarded
-            // (see test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned).
+            // writer's changes are silently discarded. The connection refuses
+            // a second application statement while one is in progress (see
+            // test_mvcc_writer_is_refused_beside_a_reader_that_is_abandoned),
+            // so only SQL that runs inside the step of another statement, such
+            // as SQL of a virtual table or a function, can get here.
             // SQLite never has this window: it commits at the writer's own
             // halt and downgrades the transaction to read-only for the
             // remaining statements (btreeEndTransaction). The MVCC equivalent

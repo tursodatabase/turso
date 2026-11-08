@@ -148,7 +148,7 @@ VACUUM;
 | `VACUUM is only supported for the main database; schema '<name>' is not supported yet` | In-place `VACUUM schema-name` with a schema other than `main`. |
 | `Cannot execute VACUUM in query_only mode` | `VACUUM` or `VACUUM INTO` run on a connection where `PRAGMA query_only` is set. |
 | `cannot VACUUM from within a transaction` / `cannot VACUUM INTO from within a transaction` | Run inside an explicit `BEGIN`. |
-| `cannot VACUUM - SQL statements in progress` | Another statement is still active on the same connection. |
+| `cannot start a statement - SQL statements in progress` | Another statement is still active on the same connection. |
 | `Incremental auto-vacuum is not supported` | The source database has `auto_vacuum = incremental`. Applies to both `VACUUM` and `VACUUM INTO`. |
 | `VACUUM requires a WAL-mode database` | In-place `VACUUM` on a non-WAL database. |
 | `cannot VACUUM an in-memory database` | In-place `VACUUM` on an in-memory database. |

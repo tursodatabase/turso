@@ -122,6 +122,8 @@ ROLLBACK;
 
 Each connection can have at most one active top-level transaction at a time. For finer-grained rollback within a transaction, use savepoints.
 
+Each connection also runs one statement at a time. While a statement is in progress (it returned a row or waits for I/O, and it is not done or reset), every other statement on the same connection, including `BEGIN`, `COMMIT` and `ROLLBACK`, fails with `SQLITE_BUSY` ("cannot start a statement - SQL statements in progress"). Finish or reset the open statement first. SQLite allows such statements; see [SQLite Compatibility](/docs/sql-reference/compatibility) for the details.
+
 ## Savepoints
 
 Savepoints are named markers within a transaction that let you roll back part of the work without aborting the whole transaction. They can be nested.
@@ -148,7 +150,7 @@ COMMIT;
 ```
 
 <Info>
-While a write statement on the same connection is still in progress, `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` may return `SQLITE_BUSY`.
+While another statement on the same connection is still in progress, `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` return `SQLITE_BUSY`.
 </Info>
 
 ## BEGIN CONCURRENT

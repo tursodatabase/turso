@@ -1079,33 +1079,30 @@ pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
 }
 
 #[turso_macros::test]
-pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
+pub fn second_read_is_refused_while_a_read_is_open_on_the_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
     let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
     conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
 
     let mut stmt1 = conn1.prepare("SELECT * FROM t").unwrap();
+    let mut rows = 0;
     loop {
         match stmt1.step().unwrap() {
             StepResult::Row => {
+                rows += 1;
                 let mut stmt2 = conn1.prepare("SELECT * FROM t").unwrap();
-                let mut rows = 0;
-                loop {
-                    match stmt2.step().unwrap() {
-                        StepResult::Row => rows += 1,
-                        StepResult::Done => break,
-                        StepResult::IO => stmt2._io().step().unwrap(),
-                        r => panic!("unexpected step result: {r:?}"),
-                    }
-                }
-                assert_eq!(rows, 3);
+                assert!(matches!(
+                    stmt2.step(),
+                    Err(LimboError::StatementsInProgress(_))
+                ));
             }
             StepResult::Done => break,
             StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
+    assert_eq!(rows, 3);
 }
 
 #[turso_macros::test]
@@ -2326,7 +2323,7 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 }
 
 #[turso_macros::test]
-fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
+fn test_insert_is_refused_between_steps_of_a_backward_index_scan(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -2344,7 +2341,10 @@ fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
                 let b = stmt.row().unwrap().get::<i64>(0)?;
                 seen.push(b);
                 if b % 97 == 0 {
-                    conn.execute(format!("INSERT INTO t(b) VALUES ({})", 1_000_000 + b))?;
+                    assert!(matches!(
+                        conn.execute(format!("INSERT INTO t(b) VALUES ({})", 1_000_000 + b)),
+                        Err(LimboError::StatementsInProgress(_))
+                    ));
                 }
             }
             StepResult::IO => stmt._io().step()?,

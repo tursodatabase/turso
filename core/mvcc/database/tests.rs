@@ -11066,16 +11066,22 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     }
     conn.set_yield_injector(None);
 
-    let rows = get_rows(&conn, "SELECT 1");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_string(), "1");
+    // A same-connection SELECT here used to commit the partial sqlite_schema
+    // delete of the interrupted DROP TABLE. It is now refused.
+    let err = conn
+        .prepare("SELECT 1")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap_err();
+    assert!(
+        matches!(err, LimboError::StatementsInProgress(_)),
+        "{err:?}"
+    );
 
     drop(drop_stmt);
     drop(conn);
     drop(db);
 
-    // Reopening used to fail here because the same-connection SELECT could
-    // commit the interrupted DROP TABLE's partial sqlite_schema delete.
     let db = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     let target_schema_rows = get_rows(
@@ -12064,8 +12070,11 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
     assert_eq!(index_slots(), index_slots_before + 100);
 }
 
+/// ROLLBACK of a transaction that created an index is refused while a reader
+/// of the transaction uses the index, so the reader cannot point into the
+/// freed index maps.
 #[test]
-fn rollback_of_created_index_keeps_open_reader_valid() {
+fn rollback_of_created_index_is_refused_while_a_reader_uses_it() {
     let db = MvccTestDb::new();
     let conn = &db.conn;
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -12082,18 +12091,23 @@ fn rollback_of_created_index_keeps_open_reader_valid() {
         .prepare("SELECT id FROM t INDEXED BY idx_v ORDER BY v")
         .unwrap();
     assert!(matches!(read.step().unwrap(), StepResult::Row));
+    assert!(matches!(
+        conn.execute("ROLLBACK"),
+        Err(LimboError::StatementsInProgress(_))
+    ));
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    assert!(matches!(read.step().unwrap(), StepResult::Done));
+    drop(read);
     conn.execute("ROLLBACK").unwrap();
 
-    // Each rolled-back CREATE INDEX frees and reallocates per-index maps, so a
-    // reader pointing into a freed map would see memory reused by a new one.
+    // Each rolled-back CREATE INDEX frees and reallocates per-index maps.
     for i in 0..200 {
         conn.execute("BEGIN").unwrap();
         conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
             .unwrap();
         conn.execute("ROLLBACK").unwrap();
     }
-
-    assert!(matches!(read.step().unwrap(), StepResult::Done));
 }
 
 #[test]
@@ -12128,8 +12142,10 @@ fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
     insert.reset().unwrap();
 }
 
+/// A statement that would end the transaction of an open reader is refused
+/// while the reader is open, so the reader keeps its transaction.
 #[test]
-fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
+fn transaction_end_is_refused_while_a_reader_is_open() {
     for (begin, end_transaction) in [
         (None, "INSERT OR ROLLBACK INTO other VALUES (6)"),
         (Some("BEGIN"), "ROLLBACK"),
@@ -12153,22 +12169,27 @@ fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
         let mut ids = Vec::new();
         assert!(matches!(read.step().unwrap(), StepResult::Row));
         ids.push(read.row().unwrap().get::<i64>(0).unwrap());
-        let _ = conn.execute(end_transaction);
-
-        let err = loop {
-            match read.step() {
-                Ok(StepResult::Row) => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
-                Ok(StepResult::IO) => read.get_pager().io.step().unwrap(),
-                Ok(other) => panic!("{end_transaction}: expected an error, got {other:?}"),
-                Err(err) => break err,
-            }
-        };
         assert!(
-            matches!(err, LimboError::NoSuchTransactionID(_)),
-            "{end_transaction}: expected NoSuchTransactionID, got {err:?}"
+            matches!(
+                conn.execute(end_transaction),
+                Err(LimboError::StatementsInProgress(_))
+            ),
+            "{end_transaction}"
         );
-        assert_eq!(ids, vec![1, 2], "{end_transaction}");
+
+        loop {
+            match read.step().unwrap() {
+                StepResult::Row => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO => read.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("{end_transaction}: unexpected step result {other:?}"),
+            }
+        }
+        assert_eq!(ids, vec![1, 2, 3], "{end_transaction}");
         drop(read);
+        if begin.is_some() {
+            conn.execute("ROLLBACK").unwrap();
+        }
 
         assert_eq!(
             get_rows(conn, "SELECT id, v FROM t"),
@@ -14739,19 +14760,18 @@ fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
     );
 }
 
-/// An index scan must return a row that its own transaction inserts ahead of
-/// the scan position, whether the other index entries are in the B-tree (after
-/// a checkpoint) or in MVCC versions, and in both scan directions. A row that
-/// another connection inserts and commits there must stay hidden.
+/// An insert ahead of the position of an open index scan is refused when it
+/// comes from the connection of the scan. A row that another connection
+/// inserts and commits there stays hidden from the scan, whether the other
+/// index entries are in the B-tree (after a checkpoint) or in MVCC versions,
+/// and in both scan directions.
 #[test]
-fn test_index_scan_sees_its_own_insert_ahead_of_the_scan() {
+fn test_index_scan_does_not_see_an_insert_ahead_of_the_scan() {
     for checkpoint in [true, false] {
         for update in [false, true] {
             for begin in ["BEGIN", "BEGIN CONCURRENT"] {
-                for (insert_from_other_connection, asc, desc) in [
-                    (false, "a,b,c,d,e,f,g,h,i", "i,h,g,f,e,d,c,b,a"),
-                    (true, "a,b,c,d,f,g,h,i", "i,h,g,f,d,c,b,a"),
-                ] {
+                for insert_from_other_connection in [false, true] {
+                    let (asc, desc) = ("a,b,c,d,f,g,h,i", "i,h,g,f,d,c,b,a");
                     let case = format!(
                         "checkpoint={checkpoint} update={update} {begin} \
                          other_connection={insert_from_other_connection}"
@@ -14804,11 +14824,11 @@ fn test_index_scan_sees_its_own_insert_ahead_of_the_scan() {
     }
 }
 
-/// An index scan must not return a row that its own transaction deletes ahead
-/// of the scan position, after a checkpoint, while the scan holds that row as
-/// its next MVCC index entry.
+/// A delete of a row ahead of the position of an open index scan, from the
+/// connection of the scan, is refused. This holds after a checkpoint, while
+/// the scan holds that row as its next MVCC index entry.
 #[test]
-fn test_index_scan_skips_its_own_delete_ahead_of_the_scan() {
+fn test_delete_ahead_of_an_open_index_scan_is_refused() {
     for begin in ["BEGIN", "BEGIN CONCURRENT"] {
         // How the deleted row gets its MVCC versions, if at all.
         for deleted_row_versions in ["none", "update", "insert in transaction"] {
@@ -14816,22 +14836,22 @@ fn test_index_scan_skips_its_own_delete_ahead_of_the_scan() {
                 (
                     "SELECT quote(v), id FROM t WHERE v > ''",
                     (3, "c"),
-                    "'a'|1,'b'|2,'d'|4",
+                    "'a'|1,'b'|2,'c'|3,'d'|4",
                 ),
                 (
                     "SELECT quote(w), id FROM t WHERE v > ''",
                     (3, "c"),
-                    "'aa'|1,'bb'|2,'dd'|4",
+                    "'aa'|1,'bb'|2,'cc'|3,'dd'|4",
                 ),
                 (
                     "SELECT quote(v), id FROM t WHERE v < 'z' ORDER BY v DESC",
                     (2, "b"),
-                    "'d'|4,'c'|3,'a'|1",
+                    "'d'|4,'c'|3,'b'|2,'a'|1",
                 ),
                 (
                     "SELECT quote(w), id FROM t WHERE v < 'z' ORDER BY v DESC",
                     (2, "b"),
-                    "'dd'|4,'cc'|3,'aa'|1",
+                    "'dd'|4,'cc'|3,'bb'|2,'aa'|1",
                 ),
             ] {
                 let db = MvccTestDb::new();
@@ -14878,12 +14898,12 @@ fn test_index_scan_skips_its_own_delete_ahead_of_the_scan() {
     }
 }
 
-/// A table or index scan must not return a B-tree row or index entry that its
-/// own transaction deletes, or changes the indexed value of, ahead of the scan
-/// position while the scan holds it as its next B-tree entry. The same write
-/// made and committed by another connection must stay hidden.
+/// A delete, or a change of the indexed value, of the B-tree row or index entry
+/// that an open table or index scan holds as its next B-tree entry is refused
+/// when it comes from the connection of the scan. The same write made and
+/// committed by another connection stays hidden from the scan.
 #[test]
-fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
+fn test_write_to_the_next_btree_entry_of_an_open_scan_is_refused() {
     for write_from_other_connection in [false, true] {
         for checkpoint in [true, false] {
             for begin in ["BEGIN", "BEGIN CONCURRENT"] {
@@ -14895,8 +14915,8 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
                         1,
                         "a,b,c,d,e",
                         [
-                            ("DELETE FROM t WHERE id = 2", "a,c,d,e"),
-                            ("UPDATE t SET v = 'bb' WHERE id = 2", "a,bb,c,d,e"),
+                            "DELETE FROM t WHERE id = 2",
+                            "UPDATE t SET v = 'bb' WHERE id = 2",
                         ],
                     ),
                     (
@@ -14904,8 +14924,8 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
                         5,
                         "e,d,c,b,a",
                         [
-                            ("DELETE FROM t WHERE id = 4", "e,c,b,a"),
-                            ("UPDATE t SET v = 'dd' WHERE id = 4", "e,dd,c,b,a"),
+                            "DELETE FROM t WHERE id = 4",
+                            "UPDATE t SET v = 'dd' WHERE id = 4",
                         ],
                     ),
                     (
@@ -14913,8 +14933,8 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
                         1,
                         "1,2,3,4,5",
                         [
-                            ("DELETE FROM t WHERE id = 2", "1,3,4,5"),
-                            ("UPDATE t SET v = 'bb' WHERE id = 2", "1,2,3,4,5"),
+                            "DELETE FROM t WHERE id = 2",
+                            "UPDATE t SET v = 'bb' WHERE id = 2",
                         ],
                     ),
                     (
@@ -14922,12 +14942,12 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
                         5,
                         "5,4,3,2,1",
                         [
-                            ("DELETE FROM t WHERE id = 4", "5,3,2,1"),
-                            ("UPDATE t SET v = 'dd' WHERE id = 4", "5,4,3,2,1"),
+                            "DELETE FROM t WHERE id = 4",
+                            "UPDATE t SET v = 'dd' WHERE id = 4",
                         ],
                     ),
                 ] {
-                    for (write, expected) in writes {
+                    for write in writes {
                         let db = MvccTestDb::new();
                         let conn = &db.conn;
                         conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -14945,14 +14965,14 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
                         conn.execute(format!("UPDATE t SET v = v WHERE id = {updated_id}"))
                             .unwrap();
                         conn.execute(begin).unwrap();
-                        let (writer, expected) = if write_from_other_connection {
-                            (db.db.connect(ConnectOpts::new()).unwrap(), all_rows)
+                        let writer = if write_from_other_connection {
+                            db.db.connect(ConnectOpts::new()).unwrap()
                         } else {
-                            (conn.clone(), expected)
+                            conn.clone()
                         };
                         assert_eq!(
                             scan_with_write_after_rows(conn, scan_sql, 1, &writer, write),
-                            expected,
+                            all_rows,
                             "checkpoint={checkpoint} {begin} {write} \
                              other_connection={write_from_other_connection} {scan_sql}"
                         );
@@ -14963,12 +14983,12 @@ fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
     }
 }
 
-/// A table scan must return a row that its own transaction writes between the
-/// scan position and the next MVCC row the scan holds: a new or re-inserted
-/// rowid, or a new version of a B-tree row. It must not return that next MVCC
-/// row once the same transaction deletes it.
+/// A write between the position of an open table scan and the next MVCC row
+/// that the scan holds is refused when it comes from the connection of the
+/// scan: a new or re-inserted rowid, a new version of a B-tree row, or a
+/// delete of that next MVCC row.
 #[test]
-fn test_table_scan_returns_its_own_write_before_the_next_mvcc_row() {
+fn test_write_before_the_next_mvcc_row_of_an_open_scan_is_refused() {
     for checkpoint in [true, false] {
         for begin in ["BEGIN", "BEGIN CONCURRENT"] {
             // After the checkpoint the scan's first row comes from the B-tree,
@@ -14978,43 +14998,43 @@ fn test_table_scan_returns_its_own_write_before_the_next_mvcc_row() {
                     "SELECT id || v FROM t NOT INDEXED",
                     "UPDATE t SET v = v WHERE id = 4",
                     "UPDATE t SET v = 'bb' WHERE id = 2",
-                    "1a,2bb,3c,4d,5e",
+                    "1a,2b,3c,4d,5e",
                 ),
                 (
                     "SELECT id || v FROM t NOT INDEXED",
                     "UPDATE t SET v = v WHERE id = 4",
                     "DELETE FROM t WHERE id = 4",
-                    "1a,2b,3c,5e",
+                    "1a,2b,3c,4d,5e",
                 ),
                 (
                     "SELECT id || v FROM t NOT INDEXED",
                     "DELETE FROM t WHERE id IN (2, 4)",
                     "INSERT INTO t VALUES (2, 'x')",
-                    "1a,2x,3c,5e",
+                    "1a,3c,5e",
                 ),
                 (
                     "SELECT id || v FROM t NOT INDEXED",
                     "DELETE FROM t WHERE id IN (2, 4)",
                     "INSERT INTO t VALUES (6, 'f')",
-                    "1a,3c,5e,6f",
+                    "1a,3c,5e",
                 ),
                 (
                     "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
                     "UPDATE t SET v = v WHERE id = 2",
                     "UPDATE t SET v = 'dd' WHERE id = 4",
-                    "5e,4dd,3c,2b,1a",
+                    "5e,4d,3c,2b,1a",
                 ),
                 (
                     "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
                     "UPDATE t SET v = v WHERE id = 2",
                     "DELETE FROM t WHERE id = 2",
-                    "5e,4d,3c,1a",
+                    "5e,4d,3c,2b,1a",
                 ),
                 (
                     "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
                     "DELETE FROM t WHERE id IN (2, 4)",
                     "INSERT INTO t VALUES (4, 'x')",
-                    "5e,4x,3c,1a",
+                    "5e,3c,1a",
                 ),
             ] {
                 let db = MvccTestDb::new();
@@ -15040,22 +15060,22 @@ fn test_table_scan_returns_its_own_write_before_the_next_mvcc_row() {
     }
 }
 
-/// A table or index scan must follow `ROLLBACK TO` of its own transaction's
-/// writes ahead of the scan position, after a checkpoint: a rolled-back insert
-/// is not returned, and a row whose delete was rolled back is returned.
+/// `ROLLBACK TO` of a savepoint with writes ahead of the position of an open
+/// table or index scan is refused while the scan is open, after a checkpoint.
+/// The scan returns the inserted row, and does not return the deleted row.
 #[test]
-fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
+fn test_rollback_to_savepoint_is_refused_while_a_scan_is_open() {
     for begin in ["BEGIN", "BEGIN CONCURRENT"] {
         for (write_in_savepoint, asc, desc) in [
             (
                 "INSERT INTO t VALUES (3, 'c')",
-                "'a'|1,'b'|2,'d'|4,'e'|5",
-                "'e'|5,'d'|4,'b'|2,'a'|1",
+                "'a'|1,'b'|2,'c'|3,'d'|4,'e'|5",
+                "'e'|5,'d'|4,'c'|3,'b'|2,'a'|1",
             ),
             (
                 "DELETE FROM t WHERE id = 3",
-                "'a'|1,'b'|2,'c'|3,'d'|4,'e'|5",
-                "'e'|5,'d'|4,'c'|3,'b'|2,'a'|1",
+                "'a'|1,'b'|2,'d'|4,'e'|5",
+                "'e'|5,'d'|4,'b'|2,'a'|1",
             ),
         ] {
             // MVCC versions on 'c' and on the row after it in scan order, so the
@@ -15106,7 +15126,8 @@ fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
 }
 
 /// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
-/// returned `rows_before_write` rows. Returns the rows, with columns joined by `|`.
+/// returned `rows_before_write` rows. A write on `conn` itself is refused while
+/// the scan is open. Returns the rows, with columns joined by `|`.
 fn scan_with_write_after_rows(
     conn: &Arc<Connection>,
     scan_sql: &str,
@@ -15119,7 +15140,15 @@ fn scan_with_write_after_rows(
     let mut written = false;
     loop {
         if !written && rows.len() == rows_before_write {
-            writer.execute(write_sql).unwrap();
+            let result = writer.execute(write_sql);
+            if Arc::ptr_eq(conn, writer) {
+                assert!(
+                    matches!(result, Err(LimboError::StatementsInProgress(_))),
+                    "{write_sql}: {result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
             written = true;
         }
         match scan.step().unwrap() {
@@ -19879,8 +19908,9 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
 ///    enabled, making the index schema row durable after the delayed checkpoint's
 ///    schema snapshot.
 /// 3. A later INSERT writes a fresh index row version for that now-durable index.
-/// 4. The background connection observes the new schema through normal SQL, so
-///    the resumed checkpoint no longer fails early as a stale-schema write.
+/// 4. The background connection prepares a statement, which loads the new
+///    schema, so the resumed checkpoint no longer fails early as a stale-schema
+///    write. The statement itself is refused while the INSERT is in progress.
 /// 5. Resuming the delayed checkpoint refreshes its durable watermark, skips the
 ///    durable CREATE INDEX schema row, but still collects the fresh index row.
 ///    The checkpoint-local `index_id_to_index` map must have been refreshed
@@ -19933,11 +19963,14 @@ fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
         .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
         .unwrap();
     conn_a.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
-    let rows = get_rows(
-        &conn_b,
-        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx'",
-    );
-    assert_eq!(rows.len(), 1);
+    let mut schema_query = conn_b
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx'")
+        .unwrap();
+    assert!(matches!(
+        schema_query.step(),
+        Err(LimboError::StatementsInProgress(_))
+    ));
+    drop(schema_query);
 
     delayed_ckpt.run_ignore_rows().unwrap();
 

@@ -1482,12 +1482,11 @@ fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Re
     Ok(())
 }
 
-/// A column read must not use bytes read for an earlier version of the row.
 /// The inner table of the join is scanned once per outer row. After the first
-/// outer row, an UPDATE on the same connection rewrites the large value, and
-/// the next scan reads the row again from the same place on the same page.
+/// outer row, an UPDATE on the same connection that rewrites the large value
+/// is refused, so the next scan reads the value the join started with.
 #[turso_macros::test]
-fn test_overflow_value_read_again_after_row_is_rewritten(
+fn test_rewrite_of_an_overflow_value_is_refused_while_a_join_reads_it(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -1516,14 +1515,13 @@ fn test_overflow_value_read_again_after_row_is_rewritten(
         next_row(&mut stmt)?,
         vec![Value::from_i64(1), Value::Null, Value::Null]
     );
-    conn.execute("UPDATE t SET b = replace(b, 'a', 'z'), tail = 'new tail'")?;
+    assert!(matches!(
+        conn.execute("UPDATE t SET b = replace(b, 'a', 'z'), tail = 'new tail'"),
+        Err(LimboError::StatementsInProgress(_))
+    ));
     assert_eq!(
         next_row(&mut stmt)?,
-        vec![
-            Value::from_i64(2),
-            Value::build_text("zzzzzzEND1"),
-            Value::build_text("new tail"),
-        ]
+        vec![Value::from_i64(2), Value::Null, Value::Null]
     );
     Ok(())
 }

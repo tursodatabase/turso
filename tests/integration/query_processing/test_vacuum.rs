@@ -916,10 +916,10 @@ fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
     Ok(())
 }
 
-/// Statement overlap: a live SELECT on one connection can continue after a
-/// same-connection write, and it keeps reading its original snapshot.
+/// Statement overlap: a write on the connection of a live SELECT is refused.
+/// The SELECT continues, and the write can run after the SELECT is done.
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
-fn test_same_connection_select_then_write_then_continue_select(
+fn test_same_connection_write_is_refused_while_select_is_open(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -935,7 +935,10 @@ fn test_same_connection_select_then_write_then_continue_select(
         Some(&Value::from_i64(1))
     );
 
-    conn.execute("INSERT INTO t VALUES (4)")?;
+    assert!(matches!(
+        conn.execute("INSERT INTO t VALUES (4)"),
+        Err(LimboError::StatementsInProgress(_))
+    ));
 
     let mut seen = vec![1];
     loop {
@@ -956,12 +959,9 @@ fn test_same_connection_select_then_write_then_continue_select(
         }
     }
 
-    assert_eq!(
-        seen,
-        vec![1, 2, 3],
-        "active SELECT should continue reading its original snapshot"
-    );
+    assert_eq!(seen, vec![1, 2, 3]);
 
+    conn.execute("INSERT INTO t VALUES (4)")?;
     let fresh_rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
     assert_eq!(fresh_rows, vec![(1,), (2,), (3,), (4,)]);
     Ok(())
@@ -5356,9 +5356,8 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
 
     // VACUUM should fail while the SELECT is active
     let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "cannot VACUUM - SQL statements in progress",
+    assert!(
+        matches!(err, LimboError::StatementsInProgress(_)),
         "unexpected error: {err}"
     );
 

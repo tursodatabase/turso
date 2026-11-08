@@ -5159,17 +5159,14 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
     }
 }
 
-/// Unordered MATCH cursors stream from Tantivy. UPDATE and DELETE must first
-/// collect their rowids so index maintenance cannot perturb the active scorer.
-/// Regression test: under MVCC, an autocommit write that runs while a sibling
-/// root statement is still open cannot commit at its own halt — it joins the
-/// shared implicit transaction. That halt exit used to release the statement
-/// savepoint without staging the FTS documents or handing the cursor to the
-/// connection, so the base row committed while its index entry was silently
-/// dropped (and the cursor's Drop tripped a debug assert).
+/// Regression test: under MVCC, an autocommit write that ran while another
+/// root statement was still open joined the shared implicit transaction, and
+/// its base row committed while its FTS index entry was dropped. The
+/// connection now refuses the write while the other statement is open, and
+/// the write keeps its index entry when it runs after that statement.
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_deferred_autocommit_write_keeps_index_entries() {
+fn fts_mvcc_write_is_refused_while_a_reader_is_open() {
     let tmp_db = TempDatabase::builder()
         .with_mvcc(true)
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
@@ -5192,12 +5189,12 @@ fn fts_mvcc_deferred_autocommit_write_keeps_index_entries() {
         }
     }
 
-    // Statement B on the same connection: its halt defers the commit to the
-    // shared implicit transaction that statement A still holds open.
-    conn.execute("INSERT INTO docs VALUES (2, 'bravo')")
-        .unwrap();
+    // Statement B on the same connection is refused while A is open.
+    assert!(matches!(
+        conn.execute("INSERT INTO docs VALUES (2, 'bravo')"),
+        Err(turso_core::LimboError::StatementsInProgress(_))
+    ));
 
-    // Finish statement A so the shared transaction commits.
     loop {
         match reader.step().unwrap() {
             turso_core::StepResult::Row => {}
@@ -5207,6 +5204,8 @@ fn fts_mvcc_deferred_autocommit_write_keeps_index_entries() {
         }
     }
     drop(reader);
+    conn.execute("INSERT INTO docs VALUES (2, 'bravo')")
+        .unwrap();
 
     assert_eq!(
         limbo_exec_rows(&conn, "SELECT id FROM docs ORDER BY id"),
@@ -5218,10 +5217,12 @@ fn fts_mvcc_deferred_autocommit_write_keeps_index_entries() {
     assert_eq!(
         limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'bravo')"),
         vec![vec![rusqlite::types::Value::Integer(2)]],
-        "the deferred autocommit write must keep its FTS index entry"
+        "the autocommit write must keep its FTS index entry"
     );
 }
 
+/// Unordered MATCH cursors stream from Tantivy. UPDATE and DELETE must first
+/// collect their rowids so index maintenance cannot perturb the active scorer.
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
 fn fts_streaming_dml_collects_stable_rowids() {
