@@ -1583,6 +1583,9 @@ fn collect_table_refs_outside_from(
             collect_subquery_table_refs_in_expr(expr, &mut table_refs);
         }
     }
+    if let Some(from) = from {
+        collect_subquery_table_refs_in_join_constraints(from, &mut table_refs);
+    }
     if let Some(where_clause) = where_clause {
         collect_subquery_table_refs_in_expr(where_clause, &mut table_refs);
     }
@@ -1605,6 +1608,24 @@ fn collect_table_refs_outside_from(
         }
     }
     table_refs
+}
+
+fn collect_subquery_table_refs_in_join_constraints(
+    from: &ast::FromClause,
+    table_refs: &mut Vec<String>,
+) {
+    let collect_nested = |table: &ast::SelectTable, table_refs: &mut Vec<String>| {
+        if let ast::SelectTable::Sub(inner, _) = table {
+            collect_subquery_table_refs_in_join_constraints(inner, table_refs);
+        }
+    };
+    collect_nested(&from.select, table_refs);
+    for join in &from.joins {
+        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+            collect_subquery_table_refs_in_expr(expr, table_refs);
+        }
+        collect_nested(&join.table, table_refs);
+    }
 }
 
 /// Estimates jump labels needed to emit a query plan.
