@@ -329,6 +329,35 @@ impl<'a> AggArgumentSource<'a> {
             }
         }
     }
+
+    /// Emit bytecode to read all aggregate function arguments into consecutive registers,
+    /// returning the first one.
+    pub fn translate_all(
+        &self,
+        program: &mut ProgramBuilder,
+        referenced_tables: &TableReferences,
+        resolver: &Resolver,
+    ) -> Result<usize> {
+        match self {
+            AggArgumentSource::Register {
+                src_reg_start: start_reg,
+                ..
+            } => Ok(*start_reg),
+            AggArgumentSource::Expression { args, .. } => {
+                let start_reg = program.alloc_registers(args.len());
+                for (i, arg) in args.iter().enumerate() {
+                    translate_expr(
+                        program,
+                        Some(referenced_tables),
+                        arg,
+                        start_reg + i,
+                        resolver,
+                    )?;
+                }
+                Ok(start_reg)
+            }
+        }
+    }
 }
 
 pub fn emit_aggregate_step(
@@ -826,16 +855,11 @@ pub fn translate_aggregation_step(
             let expr_reg = if argc == 0 {
                 0
             } else {
-                agg_arg_source.translate(program, referenced_tables, resolver, 0)?
+                agg_arg_source.translate_all(program, referenced_tables, resolver)?
             };
-            for i in 0..argc {
-                if i != 0 {
-                    let _ = agg_arg_source.translate(program, referenced_tables, resolver, i)?;
-                }
-                // invariant: distinct aggregates are only supported for single-argument functions
-                if argc == 1 {
-                    handle_distinct(program, agg_arg_source.distinctness(), expr_reg + i);
-                }
+            // invariant: distinct aggregates are only supported for single-argument functions
+            if argc == 1 {
+                handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             }
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {

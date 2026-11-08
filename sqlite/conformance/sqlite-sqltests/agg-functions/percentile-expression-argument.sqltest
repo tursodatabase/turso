@@ -1,0 +1,45 @@
+@database :memory:
+
+# The value and the fraction of percentile_disc(Y, P) and percentile_cont(Y, P)
+# must reach the aggregate in their own registers when Y is an expression.
+
+test percentile-disc-expression-value {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    SELECT percentile_disc(a + 0, 1) FROM t;
+}
+expect {
+    2.0
+}
+
+test percentile-disc-function-value {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    SELECT percentile_disc(length(b), 1) FROM t;
+}
+expect {
+    1.0
+}
+
+test percentile-cont-expression-value {
+    SELECT percentile_cont('5' + 0, 0.5);
+}
+expect {
+    5.0
+}
+
+test percentile-disc-function-value-no-rows-read {
+    SELECT percentile_disc(abs(''), 1);
+}
+expect {
+    0.0
+}
+
+test percentile-cont-expression-value-and-fraction {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1), (2), (3), (4);
+    SELECT percentile_cont(a * 10, 0.25 + 0.25) FROM t;
+}
+expect {
+    25.0
+}
