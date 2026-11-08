@@ -1861,6 +1861,10 @@ impl Limbo {
         WHERE type='table' AND sql NOT NULL
         ORDER BY tbl_name = 'sqlite_sequence', rowid
     "#;
+        // Read the whole table list first: the connection runs one statement
+        // at a time, so the statements that dump a table cannot run while
+        // this query is in progress.
+        let mut tables = Vec::new();
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
@@ -1874,11 +1878,14 @@ impl Limbo {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
-                writeln!(out, "{ddl};").map_err(|e| io_error(e, "write"))?;
-                Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
-                progress.on(name);
+                tables.push((name.to_string(), ddl.to_string()));
                 Ok(())
             })?;
+        }
+        for (name, ddl) in tables {
+            writeln!(out, "{ddl};")?;
+            Self::dump_table_from_conn(&conn, out, &name, &mut progress)?;
+            progress.on(&name);
         }
         Self::dump_sqlite_sequence(&conn, out)?;
         Self::dump_schema_objects(&conn, out, &mut progress)?;
