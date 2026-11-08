@@ -2055,9 +2055,15 @@ def test_write_while_endless_select_rows_unread(provider):
     try:
         cur = conn.execute("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c")
         assert cur.fetchone() == (1,)
-        conn.execute("CREATE TABLE t(v INTEGER)")
-        conn.cursor().executemany("INSERT INTO t VALUES (?)", [(1,)])
-        conn.executescript("INSERT INTO t VALUES (2);")
+        if provider == "turso":
+            # Turso runs one statement at a time on a connection, so a write
+            # cannot start while the SELECT has unread rows.
+            with pytest.raises(Exception, match="SQL statements in progress"):
+                conn.execute("CREATE TABLE t(v INTEGER)")
+        else:
+            conn.execute("CREATE TABLE t(v INTEGER)")
+            conn.cursor().executemany("INSERT INTO t VALUES (?)", [(1,)])
+            conn.executescript("INSERT INTO t VALUES (2);")
         assert cur.fetchmany(2) == [(2,), (3,)]
     finally:
         conn.close()
