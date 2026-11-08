@@ -304,6 +304,45 @@ test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
 }
 expect error {}
 
+test select-cast-text-to-boolean {
+    SELECT CASE WHEN 't'::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN 'true'::bool THEN 't' ELSE 'f' END,
+           CASE WHEN CAST('yes' AS boolean) THEN 't' ELSE 'f' END,
+           CASE WHEN 'on'::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN '1'::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN 'TRUE'::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN 'off'::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN 'f'::boolean THEN 't' ELSE 'f' END;
+}
+expect {
+    t|t|t|t|t|t|f|f
+}
+
+test select-cast-integer-to-boolean {
+    SELECT CASE WHEN 5::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN 0::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN (-3)::boolean THEN 't' ELSE 'f' END,
+           CASE WHEN (NULL::integer)::boolean IS NULL THEN 'null' END;
+}
+expect {
+    t|f|t|null
+}
+
+test select-cast-text-that-is-not-a-boolean-to-boolean-errors {
+    SELECT 'maybe'::boolean;
+}
+expect error {}
+
+test select-boolean-column-equals-text-cast-to-boolean {
+    CREATE TABLE bool_text (b boolean);
+    INSERT INTO bool_text VALUES (true), ('no'), ('yes');
+    SELECT count(*) FROM bool_text WHERE b = 't'::boolean;
+    DROP TABLE bool_text;
+}
+expect {
+    2
+}
+
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
