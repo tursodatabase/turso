@@ -496,18 +496,24 @@ class Statement {
     this.stmt.setQueryTimeout(queryOptions);
     bindParams(this.stmt, toBindArgs(params));
 
-    while (true) {
-      const [stepResult] = stepSync(this.stmt);
-      if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
-        ioLoopSync(this.db);
-        continue;
+    try {
+      while (true) {
+        const [stepResult] = stepSync(this.stmt);
+        if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
+          ioLoopSync(this.db);
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          yield this.stmt.row();
+        }
       }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        yield this.stmt.row();
-      }
+    } finally {
+      // A loop that stops early leaves the statement in progress, and the
+      // connection refuses other statements until it is reset.
+      resetStatement(this.stmt);
     }
   }
 

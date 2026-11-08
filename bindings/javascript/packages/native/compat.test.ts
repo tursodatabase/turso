@@ -231,3 +231,33 @@ test('encryption', () => {
         unlinkSync(path);
     }
 })
+
+test('a statement inside an iterate() loop is refused, like in better-sqlite3', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x)');
+    db.exec('INSERT INTO t VALUES (1), (2), (3)');
+    const select = db.prepare('SELECT x FROM t');
+    const update = db.prepare('UPDATE t SET x = x * 10 WHERE x = ?');
+    expect(() => {
+        for (const row of select.iterate()) {
+            update.run(row.x);
+        }
+    }).toThrow(/SQL statements in progress/);
+    // The loop ended with the error, so the SELECT is no longer in progress.
+    expect(db.prepare('SELECT sum(x) AS s FROM t').get()).toEqual({ s: 6 });
+    db.close();
+})
+
+test('a loop that stops early ends the iterate() statement', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x)');
+    db.exec('INSERT INTO t VALUES (1), (2), (3)');
+    const select = db.prepare('SELECT x FROM t');
+    for (const row of select.iterate()) {
+        expect(row).toEqual({ x: 1 });
+        break;
+    }
+    db.exec('INSERT INTO t VALUES (4)');
+    expect(db.prepare('SELECT count(*) AS n FROM t').get()).toEqual({ n: 4 });
+    db.close();
+})
