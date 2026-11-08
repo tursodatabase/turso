@@ -74,6 +74,12 @@ struct Args {
     /// profile.
     #[arg(long, default_value = "balanced", value_enum)]
     profile: WeightProfile,
+
+    /// Enable IVM mode: create materialized views (Turso-only) and verify
+    /// after every statement that each view equals a fresh evaluation of its
+    /// defining query.
+    #[arg(long, conflicts_with = "mvcc")]
+    ivm: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +118,7 @@ struct ConfigRecord {
     mvcc: bool,
     recursive_cte_focus: bool,
     profile: String,
+    ivm: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -132,6 +139,7 @@ impl ConfigRecord {
             mvcc: args.mvcc,
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
+            ivm: args.ivm,
         }
     }
 }
@@ -281,6 +289,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         window_function_probability: args.window_function_probability.clamp(0.0, 1.0),
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
+        ivm: args.ivm,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

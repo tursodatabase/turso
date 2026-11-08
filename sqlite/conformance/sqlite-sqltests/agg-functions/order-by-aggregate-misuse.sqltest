@@ -79,3 +79,180 @@ test order-by-agg-with-select-agg-ok {
 expect {
     2
 }
+
+# With a window function, an aggregate anywhere in the ORDER BY of a
+# non-aggregate query is a misuse, also without a FROM clause and also
+# inside the window definition.
+test order-by-window-with-aggregate-without-from {
+    SELECT 1 ORDER BY row_number() OVER (ORDER BY sum(1));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-window-with-aggregate-from-table {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a FROM t ORDER BY row_number() OVER (ORDER BY sum(a));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-window-partition-by-aggregate {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a FROM t ORDER BY row_number() OVER (PARTITION BY sum(a));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-window-argument-aggregate {
+    SELECT 1 ORDER BY lag(sum(1)) OVER ();
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-aggregate-next-to-window {
+    SELECT 1 ORDER BY row_number() OVER (), sum(1);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-aggregate-with-result-window {
+    SELECT row_number() OVER () ORDER BY sum(1);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+# Without a window function and without FROM, the ORDER BY aggregate is allowed.
+test order-by-aggregate-without-from-ok {
+    SELECT 1 ORDER BY sum(1);
+}
+expect {
+    1
+}
+
+test order-by-window-with-aggregate-in-aggregate-query-ok {
+    SELECT sum(1) ORDER BY row_number() OVER (ORDER BY sum(1));
+}
+expect {
+    1
+}
+
+# An aggregate inside a window function of the result makes the query an
+# aggregate query, so the ORDER BY may use aggregates.
+test order-by-aggregate-with-result-window-over-aggregate-ok {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT row_number() OVER (ORDER BY sum(a)) FROM t ORDER BY sum(a);
+}
+expect {
+    1
+}
+
+test order-by-windows-over-aggregates-ok {
+    SELECT row_number() OVER (ORDER BY sum(1)) ORDER BY row_number() OVER (ORDER BY count(*));
+}
+expect {
+    1
+}
+
+test scalar-aggregate-order-error-names-function {
+    SELECT abs(-1 ORDER BY 1);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test ordered-window-error-names-function {
+    SELECT group_concat(1 ORDER BY 1) OVER ();
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test scalar-order-by-where {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    SELECT 1 FROM t WHERE abs(a ORDER BY b)=1;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-group-by {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    SELECT count(*) FROM t GROUP BY abs(a ORDER BY b);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-update-set {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    UPDATE t SET a=abs(a ORDER BY b);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-update-where {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    UPDATE t SET a=1 WHERE abs(a ORDER BY b)=1;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-delete {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    DELETE FROM t WHERE abs(a ORDER BY b)=1;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-insert {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    INSERT INTO t VALUES(abs(-1 ORDER BY 1),2);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-returning {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    DELETE FROM t RETURNING abs(a ORDER BY b);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-check {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    CREATE TABLE checked(a,b,CHECK(abs(a ORDER BY b)=1));
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-index {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    CREATE INDEX bad ON t(abs(a ORDER BY b));
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}

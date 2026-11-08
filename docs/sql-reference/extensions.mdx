@@ -28,6 +28,8 @@ The UUID extension provides functions for generating and working with UUIDs. UUI
 | `uuid4_str()` | none | TEXT | Generate a random UUID v4 as string. Alias: `gen_random_uuid()` |
 | `uuid7()` | none | BLOB | Generate a time-ordered UUID v7 |
 | `uuid7(seconds)` | INTEGER | BLOB | Generate a UUID v7 with specified seconds since epoch |
+| `uuid7_str()` | none | TEXT | Generate a time-ordered UUID v7 as string |
+| `uuid7_str(seconds)` | INTEGER or TEXT | TEXT | Generate a UUID v7 with specified seconds since epoch, as string; errors with `Invalid timestamp` for arguments outside the representable range |
 | `uuid7_timestamp_ms(uuid)` | BLOB | INTEGER | Extract milliseconds since epoch from a UUID v7 |
 | `uuid_str(uuid)` | BLOB | TEXT | Convert a UUID blob to string representation |
 | `uuid_blob(uuid)` | TEXT | BLOB | Convert a UUID string to blob representation |
@@ -271,7 +273,7 @@ SELECT * FROM csv_data;
 | Parameter | Description |
 |-----------|-------------|
 | `filename` | Path to the CSV file |
-| `header` | `yes` if the first row contains column names |
+| `header` | `yes` if the first row contains column names. A bare `header` means `header=yes`. |
 
 ## Percentile Extension
 
@@ -283,8 +285,8 @@ Statistical aggregate functions for computing percentiles.
 |----------|-----------|-------------|-------------|
 | `median(X)` | column | REAL | Median value (50th percentile) |
 | `percentile(Y, P)` | column, REAL | REAL | P-th percentile of Y (P between 0 and 100) |
-| `percentile_cont(Y, P)` | column, REAL | REAL | Continuous percentile (interpolated) |
-| `percentile_disc(Y, P)` | column, REAL | REAL | Discrete percentile (nearest value) |
+| `percentile_cont(Y, P)` | column, REAL | REAL | Continuous percentile (interpolated). P is a fraction between 0.0 and 1.0 inclusive, like PostgreSQL |
+| `percentile_disc(Y, P)` | column, REAL | REAL | Discrete percentile: the value at the largest rank not exceeding P. P is a fraction between 0.0 and 1.0 inclusive, like `percentile_cont` |
 
 ### Examples
 

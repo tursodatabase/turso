@@ -2,11 +2,77 @@ use thiserror::Error;
 
 use crate::storage::page_cache::CacheError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+    NotNull,
+    Check,
+    /// A trigger's RAISE(ABORT | FAIL | ROLLBACK, ...).
+    Trigger,
+    /// A value whose type does not match a STRICT table's column type.
+    Datatype,
+    Other,
+}
+
+impl ConstraintKind {
+    pub fn sqlite_extended_result_code(self) -> usize {
+        match self {
+            Self::PrimaryKey => SQLITE_CONSTRAINT_PRIMARYKEY,
+            Self::Unique => SQLITE_CONSTRAINT_UNIQUE,
+            Self::ForeignKey => SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::NotNull => SQLITE_CONSTRAINT_NOTNULL,
+            Self::Check => SQLITE_CONSTRAINT_CHECK,
+            Self::Trigger => SQLITE_CONSTRAINT_TRIGGER,
+            Self::Datatype => SQLITE_CONSTRAINT_DATATYPE,
+            Self::Other => SQLITE_CONSTRAINT,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintViolation {
+    pub kind: ConstraintKind,
+    pub message: String,
+    pub table_name: Option<String>,
+    pub constraint_name: Option<String>,
+    pub index_name: Option<String>,
+    pub column_names: Vec<String>,
+    pub values: Vec<crate::Value>,
+    pub row_values: bool,
+    pub parent_table: Option<String>,
+}
+
+impl ConstraintViolation {
+    pub fn new(kind: ConstraintKind, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            table_name: None,
+            constraint_name: None,
+            index_name: None,
+            column_names: Vec::new(),
+            values: Vec::new(),
+            row_values: false,
+            parent_table: None,
+        }
+    }
+}
+
+/// An error that code of a dialect raised, which the engine carries without
+/// change. `code` is an error code that the dialect defines.
+#[derive(Debug, Clone)]
+pub struct DialectError {
+    pub code: &'static str,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
-    #[error("File is not a database")]
+    #[error("file is not a database")]
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -24,7 +90,7 @@ pub enum LimboError {
     DatabaseFull,
     #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
     SequenceExhausted { name: String, ascending: bool },
-    #[error("Parse error: {0}")]
+    #[error("{0}")]
     ParseError(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
     /// `LimboError`'s size, which rides in every hot-path `Result`.
@@ -35,8 +101,12 @@ pub enum LimboError {
     ConversionError(String),
     #[error("Env variable error: {0}")]
     EnvVarError(#[from] std::env::VarError),
-    #[error("Transaction error: {0}")]
+    #[error("{0}")]
     TxError(String),
+    #[error("cannot {op} - no transaction is active")]
+    NoActiveTransaction { op: &'static str },
+    #[error("cannot start a transaction within a transaction")]
+    TransactionAlreadyActive,
     #[error(transparent)]
     CompletionError(#[from] CompletionError),
     #[error("Locking error: {0}")]
@@ -55,20 +125,31 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
+    /// The current role may not do what the statement needs.
+    #[error("{0}")]
+    PermissionDenied(Box<crate::security::permission::PermissionDenied>),
     #[error("{0}")]
     Constraint(String),
+    #[error("{}", .0.message)]
+    ConstraintViolation(Box<ConstraintViolation>),
     #[error("{0}")]
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
+    /// An error that halts the statement with its own resolve type (RAISE, a
+    /// constraint-level ON CONFLICT clause, or a trigger step's OR clause).
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, String),
+    Raise(turso_parser::ast::ResolveType, Box<LimboError>),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
     ExtensionError(String),
     #[error("integer overflow")]
     IntegerOverflow,
+    #[error("division by zero")]
+    DivisionByZero,
+    #[error("invalid input syntax for type numeric: \"{0}\"")]
+    InvalidTextRepresentation(String),
     #[error("string or blob too big")]
     TooBig,
     #[error("database table is locked")]
@@ -129,6 +210,10 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    /// An error that code of a dialect raised, for example one of its
+    /// functions. Boxed, so that it does not make every `LimboError` larger.
+    #[error("{}", .0.message)]
+    Dialect(Box<DialectError>),
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes
@@ -169,19 +254,37 @@ impl LimboError {
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::Constraint(_)
+            | Self::ConstraintViolation(_)
+            | Self::ForeignKeyConstraint(_)
+            | Self::Raise(..) => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
             Self::Corrupt(_) => 11,
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
+            Self::CompletionError(CompletionError::IOError(_, "open")) => 14,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
+            Self::PermissionDenied(_) => 23,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
         }
+    }
+
+    /// The extended SQLite result code for this error, e.g. what
+    /// sqlite3_extended_errcode reports. Only constraint violations of a
+    /// known kind have a code more specific than the primary one.
+    pub fn sqlite_extended_result_code(&self) -> i32 {
+        let code = match self {
+            Self::ConstraintViolation(violation) => violation.kind.sqlite_extended_result_code(),
+            Self::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::Raise(_, error) => return error.sqlite_extended_result_code(),
+            _ => return self.sqlite_result_code(),
+        };
+        code as i32
     }
 }
 
@@ -374,12 +477,13 @@ pub const SQLITE_ERROR: usize = 1;
 pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_CHECK: usize = SQLITE_CONSTRAINT | (1 << 8);
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
-#[allow(dead_code)]
 pub const SQLITE_CONSTRAINT_FOREIGNKEY: usize = SQLITE_CONSTRAINT | (3 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
+pub const SQLITE_CONSTRAINT_DATATYPE: usize = SQLITE_CONSTRAINT | (12 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
 pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
+
 // Standard SQLite error code; kept for documentation and potential
 // reuse. The sequence inner-tx wrap used to emit Insn::Halt with this
 // code, but halt()'s constraint catch-all mis-wrapped it; Busy is now
@@ -387,3 +491,38 @@ pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 // op_sequence_commit_inner_tx.
 #[allow(dead_code)]
 pub const SQLITE_BUSY: usize = 5;
+
+impl LimboError {
+    pub fn into_sqlite_error(self) -> Self {
+        match self {
+            Self::ConstraintViolation(violation) => {
+                if violation.kind == ConstraintKind::ForeignKey {
+                    Self::ForeignKeyConstraint(violation.message)
+                } else {
+                    Self::Constraint(violation.message)
+                }
+            }
+            error => error,
+        }
+    }
+
+    pub(crate) fn into_structured_constraint(self) -> Self {
+        match self {
+            Self::Constraint(message) => Self::ConstraintViolation(Box::new(
+                ConstraintViolation::new(ConstraintKind::Other, message),
+            )),
+            Self::ForeignKeyConstraint(message) => Self::ConstraintViolation(Box::new(
+                ConstraintViolation::new(ConstraintKind::ForeignKey, message),
+            )),
+            error => error,
+        }
+    }
+
+    pub(crate) fn is_foreign_key_constraint(&self) -> bool {
+        match self {
+            Self::ForeignKeyConstraint(_) => true,
+            Self::ConstraintViolation(violation) => violation.kind == ConstraintKind::ForeignKey,
+            _ => false,
+        }
+    }
+}

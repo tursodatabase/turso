@@ -596,10 +596,13 @@ fn generate_aggregate_call<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
-    let func = generator
-        .policy()
-        .function_config
-        .select_aggregate_function(ctx)?;
+    let config = &generator.policy().expr_config;
+    let ordered = ctx.gen_bool_with_prob(config.aggregate_order_by_probability);
+    let mut functions = generator.policy().function_config.clone();
+    if ordered {
+        functions.allow_order_dependent_aggregates = true;
+    }
+    let func = functions.select_aggregate_function(ctx)?;
 
     // Pick a column from scoped tables, with qualifier when multi-table
     let multi = ctx.has_multiple_tables();
@@ -621,20 +624,80 @@ fn generate_aggregate_call<C: Capabilities>(
     }
     let (qualifier, col_name) = ctx.choose(&qualified_cols).unwrap().clone();
 
-    let arg = Expr::column_ref(ctx, qualifier, col_name);
-
-    // Optionally add FILTER clause
-    let prob = generator.policy().expr_config.aggregate_filter_probability;
-    if prob > 0.0 && ctx.gen_bool_with_prob(prob) {
-        let filter = generate_aggregate_filter(generator, ctx)?;
-        Ok(Expr::function_call_with_filter(
-            ctx,
-            func.name.to_string(),
-            vec![arg],
-            filter,
-        ))
+    let mut arg = Expr::column_ref(ctx, qualifier, col_name);
+    let distinct = ordered && ctx.gen_bool_with_prob(config.aggregate_distinct_probability);
+    if func.name == "JSON_GROUP_ARRAY" {
+        let storage_type = Expr::function_call(ctx, "TYPEOF".into(), vec![arg.clone()]);
+        let blob_type = Expr::literal(ctx, Literal::Text("blob".into()));
+        let is_blob = Expr::binary_op(ctx, storage_type, BinOp::Eq, blob_type);
+        let bytes = Expr::function_call(ctx, "HEX".into(), vec![arg.clone()]);
+        arg = Expr::case_expr(ctx, None, vec![(is_blob, bytes)], Some(arg));
+    }
+    if distinct {
+        arg = ctx.scope(Origin::AggregateDistinct, |ctx| {
+            Expr::cast(ctx, arg, DataType::Text)
+        });
+    } else if ordered && func.name == "JSON_GROUP_ARRAY" && ctx.gen_bool() {
+        arg = Expr::function_call(ctx, "JSON_ARRAY".into(), vec![arg]);
+    }
+    let mut args = vec![arg.clone()];
+    if !distinct {
+        for _ in 1..func.arg_count(ctx) {
+            let (qualifier, column) = ctx.choose(&qualified_cols).unwrap().clone();
+            args.push(Expr::column_ref(ctx, qualifier, column));
+        }
+    }
+    let mut order_by = Vec::new();
+    if ordered {
+        let separate_distinct_key = distinct && ctx.gen_bool();
+        let key = if separate_distinct_key {
+            Expr::function_call(ctx, "LENGTH".into(), vec![arg.clone()])
+        } else if distinct || ctx.gen_bool() {
+            arg.clone()
+        } else {
+            let (qualifier, column) = ctx.choose(&qualified_cols).unwrap().clone();
+            Expr::column_ref(ctx, qualifier, column)
+        };
+        order_by.push(aggregate_order_item(ctx, key));
+        if distinct {
+            if separate_distinct_key {
+                order_by.push(aggregate_order_item(ctx, arg.clone()));
+            }
+        } else {
+            for arg in &args {
+                order_by.push(aggregate_order_item(ctx, arg.clone()));
+                let storage_type = Expr::function_call(ctx, "TYPEOF".into(), vec![arg.clone()]);
+                order_by.push(aggregate_order_item(ctx, storage_type));
+                let bytes = Expr::function_call(ctx, "HEX".into(), vec![arg.clone()]);
+                order_by.push(aggregate_order_item(ctx, bytes));
+            }
+        }
+    }
+    let filter = if ctx.gen_bool_with_prob(config.aggregate_filter_probability) {
+        Some(Box::new(generate_aggregate_filter(generator, ctx)?))
     } else {
-        Ok(Expr::function_call(ctx, func.name.to_string(), vec![arg]))
+        None
+    };
+    let Expr::FunctionCall(mut call) = Expr::function_call(ctx, func.name.to_string(), args) else {
+        unreachable!();
+    };
+    call.distinct = distinct;
+    call.order_by = order_by;
+    call.filter = filter;
+    Ok(Expr::FunctionCall(call))
+}
+
+fn aggregate_order_item(ctx: &mut Context, expr: Expr) -> OrderByItem {
+    OrderByItem {
+        expr,
+        direction: if ctx.gen_bool() {
+            OrderDirection::Asc
+        } else {
+            OrderDirection::Desc
+        },
+        nulls: *ctx
+            .choose(&[None, Some(NullsOrder::First), Some(NullsOrder::Last)])
+            .unwrap(),
     }
 }
 
@@ -1987,14 +2050,6 @@ fn generate_derived_table<C: Capabilities>(
     todo!("derived table generation")
 }
 
-#[trace_gen(Origin::AggregateDistinct)]
-fn generate_aggregate_distinct<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<Expr, GenError> {
-    todo!("aggregate DISTINCT generation")
-}
-
 #[trace_gen(Origin::AggregateFilter)]
 fn generate_aggregate_filter<C: Capabilities>(
     generator: &SqlGen<C>,
@@ -2026,6 +2081,34 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_generation_includes_ordering() {
+        let mut policy = Policy::default();
+        policy.expr_config.aggregate_filter_probability = 0.0;
+        let generator: SqlGen<Full> = SqlGen::new(test_generator().schema().clone(), policy);
+        let table = generator.schema().tables[0].clone();
+        let mut ordered = 0;
+        let mut variants = [false; 4];
+        for seed in 0..1000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let expr = ctx.with_table_scope([(table.clone(), None)], |ctx| {
+                generate_aggregate_call(&generator, ctx).unwrap()
+            });
+            let Expr::FunctionCall(call) = expr else {
+                unreachable!()
+            };
+            ordered += usize::from(!call.order_by.is_empty());
+            variants[0] |= call.distinct && call.order_by.len() == 1;
+            variants[1] |= call.distinct && call.order_by.len() > 1;
+            variants[2] |= !call.order_by.is_empty() && call.args.len() == 2;
+            variants[3] |=
+                call.name == "JSON_GROUP_ARRAY" && matches!(&call.args[0], Expr::FunctionCall(_));
+        }
+        assert!(ordered > 0);
+        assert!(ordered < 1000);
+        assert!(variants.into_iter().all(|seen| seen), "{variants:?}");
+    }
+
+    #[test]
     fn aggregate_generation_can_exclude_results_that_depend_on_input_order() {
         let policy = Policy::default()
             .with_function_config(FunctionConfig::default().without_order_dependent_aggregates());
@@ -2039,7 +2122,8 @@ mod tests {
                     unreachable!("aggregate generation must return a function call");
                 };
                 assert!(
-                    !aggregate_result_depends_on_input_order(&call.name),
+                    !call.order_by.is_empty()
+                        || !aggregate_result_depends_on_input_order(&call.name),
                     "seed {seed} generated {}",
                     call.name
                 );

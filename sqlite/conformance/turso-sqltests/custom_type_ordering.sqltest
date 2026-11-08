@@ -24,6 +24,37 @@ expect error {
     cannot create index on column 'val' of type 'noorder2': type does not declare OPERATOR '<'
 }
 
+# --- A type that declares OPERATOR '<' sorts and is indexed by its stored value ---
+
+# cents stores 9 as 900 and 10 as 1000. ORDER BY sorts the stored integers,
+# so 9 comes before 10.
+@requires strict "uses STRICT tables"
+test user-type-sorts-by-stored-value-in-order-by {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val cents) STRICT;
+    INSERT INTO t1 VALUES (1, 10), (2, 9), (3, 2);
+    SELECT val FROM t1 ORDER BY val;
+}
+expect {
+    2
+    9
+    10
+}
+
+test create-type-rejects-less-than-operator-with-function {
+    CREATE TYPE orderable_lt BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+}
+expect error {
+    OPERATOR '<' takes no function: a type that declares it sorts by its stored value
+}
+
+test create-type-rejects-operators-other-than-less-than {
+    CREATE TYPE orderable_eq BASE text ENCODE value DECODE value OPERATOR '=' test_uint_eq;
+}
+expect error {
+    CREATE TYPE does not accept OPERATOR '=': only OPERATOR '<' is supported
+}
+
 @requires strict "uses STRICT tables"
 test expression-index-on-custom-type-decodes-before-eval {
     CREATE TYPE rev BASE text ENCODE upper(value) DECODE lower(value);
@@ -50,11 +81,11 @@ expect {
     HELLO
 }
 
-# --- NAKED OPERATOR '<': sort on encoded (on-disk) values with base type comparison ---
+# --- OPERATOR '<' sorts the encoded (on-disk) values with the base type's comparison ---
 
 # Identity encode/decode: encoded = decoded, so sort order matches alphabetical.
 @requires strict "uses STRICT tables"
-test naked-lt-identity-encoding {
+test sort-by-stored-value-identity-encoding {
     CREATE TYPE orderable BASE text ENCODE value DECODE value OPERATOR '<';
     CREATE TABLE t3(id INTEGER PRIMARY KEY, val orderable) STRICT;
     INSERT INTO t3 VALUES (1, 'banana');
@@ -70,7 +101,7 @@ expect {
 
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
-test naked-lt-identity-encoding-with-index {
+test sort-by-stored-value-identity-encoding-with-index {
     CREATE TYPE orderable2 BASE text ENCODE value DECODE value OPERATOR '<';
     CREATE TABLE t4(id INTEGER PRIMARY KEY, val orderable2) STRICT;
     CREATE INDEX idx4 ON t4(val);
@@ -88,7 +119,7 @@ expect {
 # ENCODE value * 10 is a monotonic transform: 10→100, 20→200, 30→300.
 # Sorting encoded integers preserves numeric order.
 @requires strict "uses STRICT tables"
-test naked-lt-monotonic-integer {
+test sort-by-stored-value-monotonic-integer {
     CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t5(id INTEGER PRIMARY KEY, val myint) STRICT;
     INSERT INTO t5 VALUES (1, 30);
@@ -103,23 +134,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test naked-lt-monotonic-integer-with-index {
-    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
-    CREATE TABLE t5b(id INTEGER PRIMARY KEY, val myint1b) STRICT;
-    CREATE INDEX idx5b ON t5b(val);
-    INSERT INTO t5b VALUES (1, 30);
-    INSERT INTO t5b VALUES (2, 10);
-    INSERT INTO t5b VALUES (3, 20);
-    SELECT val FROM t5b ORDER BY val;
-}
-expect {
-    10
-    20
-    30
-}
-
-@requires strict "uses STRICT tables"
-test naked-lt-desc-order {
+test sort-by-stored-value-desc-order {
     CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t6(id INTEGER PRIMARY KEY, val myint2) STRICT;
     INSERT INTO t6 VALUES (1, 30);
@@ -133,28 +148,12 @@ expect {
     10
 }
 
-@requires strict "uses STRICT tables"
-test naked-lt-desc-order-with-index {
-    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
-    CREATE TABLE t6b(id INTEGER PRIMARY KEY, val myint2b) STRICT;
-    CREATE INDEX idx6b ON t6b(val);
-    INSERT INTO t6b VALUES (1, 30);
-    INSERT INTO t6b VALUES (2, 10);
-    INSERT INTO t6b VALUES (3, 20);
-    SELECT val FROM t6b ORDER BY val DESC;
-}
-expect {
-    30
-    20
-    10
-}
-
 # string_reverse is NOT a monotonic transform: the encoded text sort order
 # differs from the decoded text sort order.
 # Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# Naked '<' sorts encoded text: ananab < elppa < yrrehc → display: banana, apple, cherry.
+# ORDER BY sorts encoded text: ananab < elppa < yrrehc → display: banana, apple, cherry.
 @requires strict "uses STRICT tables"
-test naked-lt-non-monotonic-encoding {
+test sort-by-stored-value-non-monotonic-encoding {
     CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t_rev(id INTEGER PRIMARY KEY, val rev) STRICT;
     INSERT INTO t_rev VALUES (1, 'apple');
@@ -168,27 +167,10 @@ expect {
     cherry
 }
 
-# Same query with an index — must produce identical results.
-@requires strict "uses STRICT tables"
-test naked-lt-non-monotonic-encoding-with-index {
-    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t_rev2(id INTEGER PRIMARY KEY, val rev2) STRICT;
-    CREATE INDEX idx_rev2 ON t_rev2(val);
-    INSERT INTO t_rev2 VALUES (1, 'apple');
-    INSERT INTO t_rev2 VALUES (2, 'banana');
-    INSERT INTO t_rev2 VALUES (3, 'cherry');
-    SELECT val FROM t_rev2 ORDER BY val;
-}
-expect {
-    banana
-    apple
-    cherry
-}
-
 # DESC with non-monotonic encoding.
 # DESC encoded: yrrehc > elppa > ananab → display: cherry, apple, banana.
 @requires strict "uses STRICT tables"
-test naked-lt-non-monotonic-desc {
+test sort-by-stored-value-non-monotonic-desc {
     CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t_rev3(id INTEGER PRIMARY KEY, val rev3) STRICT;
     INSERT INTO t_rev3 VALUES (1, 'apple');
@@ -202,92 +184,7 @@ expect {
     banana
 }
 
-@requires strict "uses STRICT tables"
-test naked-lt-non-monotonic-desc-with-index {
-    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t_rev4(id INTEGER PRIMARY KEY, val rev4) STRICT;
-    CREATE INDEX idx_rev4 ON t_rev4(val);
-    INSERT INTO t_rev4 VALUES (1, 'apple');
-    INSERT INTO t_rev4 VALUES (2, 'banana');
-    INSERT INTO t_rev4 VALUES (3, 'cherry');
-    SELECT val FROM t_rev4 ORDER BY val DESC;
-}
-expect {
-    cherry
-    apple
-    banana
-}
-
-# --- OPERATOR '<' WITH CUSTOM COMPARATOR ---
-# OPERATOR '<' string_reverse: the comparator reverses encoded values before comparing,
-# recovering the original alphabetical order.
-# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# Comparator: string_reverse(elppa)=apple, string_reverse(ananab)=banana, string_reverse(yrrehc)=cherry.
-# Sort: apple < banana < cherry → display: apple, banana, cherry.
-
-@requires strict "uses STRICT tables"
-test custom-comparator-recovers-alphabetical {
-    CREATE TYPE rev_cmp BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
-    CREATE TABLE t_cmp(id INTEGER PRIMARY KEY, val rev_cmp) STRICT;
-    INSERT INTO t_cmp VALUES (1, 'apple');
-    INSERT INTO t_cmp VALUES (2, 'banana');
-    INSERT INTO t_cmp VALUES (3, 'cherry');
-    SELECT val FROM t_cmp ORDER BY val;
-}
-expect {
-    apple
-    banana
-    cherry
-}
-
-@requires strict "uses STRICT tables"
-test custom-comparator-recovers-alphabetical-with-index {
-    CREATE TYPE rev_cmp2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
-    CREATE TABLE t_cmp2(id INTEGER PRIMARY KEY, val rev_cmp2) STRICT;
-    CREATE INDEX idx_cmp2 ON t_cmp2(val);
-    INSERT INTO t_cmp2 VALUES (1, 'apple');
-    INSERT INTO t_cmp2 VALUES (2, 'banana');
-    INSERT INTO t_cmp2 VALUES (3, 'cherry');
-    SELECT val FROM t_cmp2 ORDER BY val;
-}
-expect {
-    apple
-    banana
-    cherry
-}
-
-@requires strict "uses STRICT tables"
-test custom-comparator-desc {
-    CREATE TYPE rev_cmp3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
-    CREATE TABLE t_cmp3(id INTEGER PRIMARY KEY, val rev_cmp3) STRICT;
-    INSERT INTO t_cmp3 VALUES (1, 'apple');
-    INSERT INTO t_cmp3 VALUES (2, 'banana');
-    INSERT INTO t_cmp3 VALUES (3, 'cherry');
-    SELECT val FROM t_cmp3 ORDER BY val DESC;
-}
-expect {
-    cherry
-    banana
-    apple
-}
-
-@requires strict "uses STRICT tables"
-test custom-comparator-desc-with-index {
-    CREATE TYPE rev_cmp4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
-    CREATE TABLE t_cmp4(id INTEGER PRIMARY KEY, val rev_cmp4) STRICT;
-    CREATE INDEX idx_cmp4 ON t_cmp4(val);
-    INSERT INTO t_cmp4 VALUES (1, 'apple');
-    INSERT INTO t_cmp4 VALUES (2, 'banana');
-    INSERT INTO t_cmp4 VALUES (3, 'cherry');
-    SELECT val FROM t_cmp4 ORDER BY val DESC;
-}
-expect {
-    cherry
-    banana
-    apple
-}
-
-# --- BUILT-IN TYPES: all have OPERATOR '<' and sort correctly ---
+# --- BUILT-IN TYPES sort correctly ---
 
 @requires strict "uses STRICT tables"
 test builtin-date-order-by {
@@ -388,37 +285,722 @@ expect {
     3|1
 }
 
+# numeric is stored as text, but sorts as a number: 9 comes before 10.
+@requires strict "uses STRICT tables"
+test builtin-numeric-order-by {
+    CREATE TABLE t13(n numeric(10,0)) STRICT;
+    INSERT INTO t13 VALUES (10), (9), (100);
+    SELECT n FROM t13 ORDER BY n;
+}
+expect {
+    9
+    10
+    100
+}
+
+@requires strict "uses STRICT tables"
+test builtin-numeric-with-index {
+    CREATE TABLE t13b(n numeric(10,0)) STRICT;
+    CREATE INDEX idx13b ON t13b(n);
+    INSERT INTO t13b VALUES (10), (9), (100);
+    SELECT n FROM t13b ORDER BY n;
+    SELECT n FROM t13b WHERE n > 9 ORDER BY n;
+}
+expect {
+    9
+    10
+    100
+    10
+    100
+}
+
 # --- MISC ---
 
 @requires strict "uses STRICT tables"
-test naked-lt-with-other-operators {
-    CREATE TYPE mytype BASE text ENCODE value DECODE value OPERATOR '<' OPERATOR '=' DECODE value;
-    CREATE TABLE t15(id INTEGER PRIMARY KEY, val mytype) STRICT;
-    INSERT INTO t15 VALUES (1, 'b');
-    INSERT INTO t15 VALUES (2, 'a');
-    INSERT INTO t15 VALUES (3, 'c');
-    SELECT val FROM t15 ORDER BY val;
-}
-expect {
-    a
-    b
-    c
-}
-
-@requires strict "uses STRICT tables"
-test naked-lt-roundtrips-through-sql {
-    CREATE TYPE rt_type BASE text ENCODE value DECODE value OPERATOR '<';
+test type-sql-roundtrips {
+    CREATE TYPE rt_type BASE text ENCODE value DECODE value;
     SELECT sql FROM sqlite_turso_types WHERE name = 'rt_type';
 }
 expect {
-    CREATE TYPE rt_type BASE text ENCODE value DECODE value OPERATOR '<'
+    CREATE TYPE rt_type BASE text ENCODE value DECODE value
+}
+
+# --- A sort never fails: values that are not of the type still get a place ---
+
+@requires strict "uses STRICT tables"
+test numeric-order-puts-text-that-is-not-a-number-after-numbers {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (2), (1);
+    SELECT n FROM t UNION ALL SELECT 'x' UNION ALL SELECT '1e100000000' ORDER BY 1;
+}
+expect {
+    1.00
+    2.00
+    1e100000000
+    x
 }
 
 @requires strict "uses STRICT tables"
-test custom-comparator-roundtrips-through-sql {
-    CREATE TYPE rt_type2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
-    SELECT sql FROM sqlite_turso_types WHERE name = 'rt_type2';
+test numeric-order-puts-text-that-is-not-a-number-after-numbers-desc {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (2), (1);
+    SELECT n FROM t UNION ALL SELECT 'x' ORDER BY 1 DESC;
 }
 expect {
-    CREATE TYPE rt_type2 BASE text ENCODE string_reverse (value) DECODE string_reverse (value) OPERATOR '<' string_reverse
+    x
+    2.00
+    1.00
+}
+
+@requires strict "uses STRICT tables"
+test array-order-puts-text-that-is-not-an-array-after-arrays {
+    CREATE TABLE t(a integer[]) STRICT;
+    INSERT INTO t VALUES ('{2}'), ('{1,2}'), (NULL);
+    SELECT a FROM t UNION ALL SELECT 'x' ORDER BY 1;
+}
+expect {
+
+    {1,2}
+    {2}
+    x
+}
+
+# An index keeps the order it was created with, so ALTER COLUMN can't change
+# how an indexed column sorts.
+@requires strict "uses STRICT tables"
+test alter-column-refuses-to-change-the-order-of-an-indexed-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x blob) STRICT;
+    CREATE INDEX ix ON t(x);
+    ALTER TABLE t ALTER COLUMN x TO y numeric(10,2);
+}
+expect error {
+    cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
+}
+
+# A type with its own order doesn't accept a COLLATE, so an index that names
+# one couldn't be read back after the column takes such a type.
+@requires strict "uses STRICT tables"
+test alter-column-refuses-a-type-with-an-order-under-an-index-with-its-own-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text) STRICT;
+    CREATE INDEX ix ON t(x COLLATE NOCASE);
+    ALTER TABLE t ALTER COLUMN x TO y numeric(10,2);
+}
+expect error {
+    cannot ALTER COLUMN "x": index ix names a COLLATE for it, and the new type has its own order
+}
+
+# CREATE INDEX rejects a COLLATE on such a type, and so does every statement
+# that declares a column or a key.
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2) COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-binary-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2) COLLATE BINARY) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-array-column {
+    CREATE TABLE t(x integer[] COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type integer\[\]
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-text-array-column {
+    CREATE TABLE t(x text[] COLLATE RTRIM) STRICT;
+}
+expect error {
+    collations are not supported by type text\[\]
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-domain-over-numeric {
+    CREATE DOMAIN money_amount AS numeric;
+    CREATE TABLE t(x money_amount COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type money_amount
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-in-unique-key-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2), UNIQUE(x COLLATE NOCASE)) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-in-primary-key-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2), PRIMARY KEY(x COLLATE NOCASE)) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test add-column-rejects-collate-on-numeric-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t ADD COLUMN x numeric(10,2) COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-rejects-collate-on-numeric-column {
+    CREATE TABLE t(y text) STRICT;
+    ALTER TABLE t ALTER COLUMN y TO x numeric(10,2) COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+# A column whose type has no order of its own keeps its COLLATE, and outside a
+# STRICT table numeric is only a type name, as in SQLite.
+@requires strict "uses STRICT tables"
+test collate-allowed-on-text-column-and-key-next-to-numeric-column {
+    CREATE TABLE t(n numeric(10,2), a text COLLATE NOCASE, b text, UNIQUE(b COLLATE RTRIM)) STRICT;
+    ALTER TABLE t ADD COLUMN c text COLLATE NOCASE;
+    INSERT INTO t VALUES (1.5, 'A', 'x', 'C');
+    INSERT OR IGNORE INTO t VALUES (2.5, 'B', 'x  ', 'D');
+    SELECT count(*) FROM t WHERE a = 'a' AND c = 'c';
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+    1
+}
+
+test collate-allowed-on-numeric-column-of-non-strict-table {
+    CREATE TABLE t(x numeric(10,2) COLLATE NOCASE, UNIQUE(x COLLATE RTRIM));
+    ALTER TABLE t ADD COLUMN y numeric(10,2) COLLATE NOCASE;
+    INSERT INTO t VALUES ('a', 'b');
+    SELECT count(*) FROM t WHERE x = 'A' AND y = 'B';
+}
+expect {
+    1
+}
+
+# Only text types take a COLLATE, as in PostgreSQL: varchar, a type with a
+# text base and a domain over one of them. date is stored as text but is not a
+# text type, so a COLLATE on a date value fails wherever it appears.
+@requires strict "uses STRICT tables"
+test comparison-rejects-collate-next-to-date-column {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-02');
+    SELECT count(*) FROM t WHERE d = '2024-01-02' COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT d COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test order-by-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT d FROM t ORDER BY d COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test group-by-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t GROUP BY d COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test distinct-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT DISTINCT d COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test compound-order-by-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT d FROM t UNION SELECT d FROM t ORDER BY d COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+# The COLLATE applies to the column of every SELECT, not only the first.
+@requires strict "uses STRICT tables"
+test compound-order-by-rejects-collate-on-date-column-of-second-select {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 'x' UNION SELECT d FROM t ORDER BY 1 COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+# A text collation would sort 10.00 before 9.00.
+@requires strict "uses STRICT tables"
+test compound-order-by-rejects-collate-on-numeric-column {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (9), (10);
+    SELECT n FROM t UNION SELECT n FROM t ORDER BY n COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test compound-order-by-allows-collate-on-varchar-column {
+    CREATE TABLE t(v varchar(10)) STRICT;
+    INSERT INTO t VALUES ('B'), ('a');
+    SELECT v FROM t UNION SELECT v FROM t ORDER BY v COLLATE NOCASE;
+}
+expect {
+    a
+    B
+}
+
+# Arrays compare element by element without a collation, so no array takes
+# a COLLATE, even where nothing compares it.
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-integer-array-column {
+    CREATE TABLE t(a integer[]) STRICT;
+    SELECT a COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type integer\[\]
+}
+
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-date-array-column {
+    CREATE TABLE t(a date[]) STRICT;
+    SELECT a COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type date\[\]
+}
+
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-two-dimensional-array-column {
+    CREATE TABLE t(a integer[][]) STRICT;
+    SELECT a COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type integer\[\]\[\]
+}
+
+# ARRAY[x] over a column without a type has no declared element type.
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-array-of-any-values {
+    CREATE TABLE t(x any) STRICT;
+    SELECT ARRAY[x] COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type anyarray
+}
+
+# A COLLATE is refused even where the query never evaluates it.
+@requires strict "uses STRICT tables"
+test exists-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT EXISTS(SELECT d COLLATE NOCASE FROM t);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test update-false-where-term-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    UPDATE t SET d = d WHERE 0 AND d COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test upsert-rejects-collate-on-date-column {
+    CREATE TABLE t(d date PRIMARY KEY) STRICT;
+    INSERT INTO t VALUES ('2024-01-02') ON CONFLICT DO UPDATE SET d = excluded.d COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+# A comparison that would apply a COLLATE to a date is refused even where the
+# query never evaluates it, wherever the COLLATE is written.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-compared-value {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d = 'x' COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-between {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d BETWEEN 'a' COLLATE NOCASE AND 'z';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-in-list {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d IN ('x' COLLATE NOCASE);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-case-when {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND CASE d WHEN 'x' COLLATE NOCASE THEN 1 END;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-max {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND max(d, 'x' COLLATE NOCASE) IS NULL;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-row-value {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND (d, 1) = ('x' COLLATE NOCASE, 1);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-numeric-compared-with-array {
+    CREATE TABLE t(n numeric(10, 2), a integer[]) STRICT;
+    SELECT 1 FROM t WHERE 0 AND n = a;
+}
+expect error {
+    cannot compare type numeric with type integer\[\]
+}
+
+# An operator that no function of a date runs is refused even where the query
+# never evaluates it, so its result can't reach a COLLATE unchecked.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-missing-operator {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND (d * 2) COLLATE NOCASE = 'x';
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-missing-operator {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d * 2 = 1;
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+# A scalar subquery has no type until it is planned; a COLLATE on its text
+# still applies.
+@requires strict "uses STRICT tables"
+test collate-on-scalar-subquery-applies {
+    CREATE TABLE t(d date) STRICT;
+    SELECT (SELECT 'a') COLLATE NOCASE = 'A';
+}
+expect {
+    1
+}
+
+# A subquery's type is known once it is planned, so a COLLATE on a date it
+# returns fails even where the query never evaluates it.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (SELECT d FROM t) COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-missing-operator-on-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (SELECT d FROM t) * 2 = 1;
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+# SQLite's own types all take a COLLATE: integer, real, a decimal written in
+# the statement, a number of either kind, text, blob, a column without a type,
+# a string literal and NULL.
+@requires strict "uses STRICT tables"
+test collate-allowed-on-sqlite-types {
+    CREATE TABLE t(i integer, r real, s text, b blob, x any) STRICT;
+    INSERT INTO t VALUES (1, 1.5, 'a', x'61', 'X');
+    SELECT i COLLATE NOCASE, r COLLATE NOCASE, 0.5 COLLATE NOCASE, (i + x) COLLATE NOCASE, s COLLATE NOCASE = 'A', b COLLATE NOCASE = 'A', x COLLATE NOCASE = 'x', 'a' COLLATE NOCASE = 'A', NULL COLLATE NOCASE IS NULL FROM t;
+}
+expect {
+    1|1.5|0.5|1|1|0|1|1|1
+}
+
+# Nothing says that an array plus a number is text.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-value-of-unknown-type {
+    CREATE TABLE t(a integer[]) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (a + 1) COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type unknown
+}
+
+# A COLLATE inside a row value applies to one of its values.
+@requires strict "uses STRICT tables"
+test collate-inside-row-value-applies {
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('a');
+    SELECT (1, s COLLATE NOCASE) = (SELECT 1, 'A') FROM t;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-inside-row-value {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (1, d COLLATE NOCASE) = (SELECT 1, 'x');
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-compared-with-date-in-row-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (SELECT d, 1) = ('x' COLLATE NOCASE, 1);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test where-term-or-true-rejects-collate-compared-with-date-in-row-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE (SELECT d, 1) = ('x' COLLATE NOCASE, 1) OR 1;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test collate-compared-with-text-in-row-subquery-applies {
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('A');
+    SELECT (SELECT s, 1) = ('a' COLLATE NOCASE, 1) FROM t;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-in-nested-struct {
+    CREATE TYPE inner_t AS STRUCT(d date, s text);
+    CREATE TYPE outer_t AS STRUCT(i inner_t, n integer);
+    CREATE TABLE t(o outer_t) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND o.i.d COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test collate-on-text-in-nested-struct-applies {
+    CREATE TYPE inner_t AS STRUCT(d date, s text);
+    CREATE TYPE outer_t AS STRUCT(i inner_t, n integer);
+    CREATE TABLE t(o outer_t) STRICT;
+    INSERT INTO t VALUES (struct_pack(struct_pack('2024-01-02', 'A'), 1));
+    SELECT o.i.s COLLATE NOCASE = 'a' FROM t;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test upsert-false-where-term-rejects-collate-on-excluded-date {
+    CREATE TABLE t(id integer PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-02');
+    INSERT INTO t VALUES (1, '2024-01-03') ON CONFLICT(id) DO UPDATE SET d = excluded.d WHERE 0 AND excluded.d COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test upsert-set-rejects-collate-on-date-in-branch-never-taken {
+    CREATE TABLE t(id integer PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-02');
+    INSERT INTO t VALUES (1, '2024-01-03') ON CONFLICT(id) DO UPDATE SET d = CASE WHEN 0 THEN d COLLATE NOCASE ELSE d END;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-default {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND DEFAULT COLLATE NOCASE = 'x';
+}
+expect error {
+    DEFAULT is only valid in INSERT VALUES
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-date-column {
+    CREATE TABLE t(d date COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-in-unique-key-on-date-column {
+    CREATE TABLE t(d date, UNIQUE(d COLLATE NOCASE)) STRICT;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-index-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    CREATE INDEX i ON t(d COLLATE NOCASE);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test add-column-rejects-collate-on-date-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t ADD COLUMN d date COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-domain-over-date {
+    CREATE DOMAIN day AS date;
+    CREATE TABLE t(d day COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type day
+}
+
+@requires strict "uses STRICT tables"
+test comparison-rejects-collate-on-type-with-integer-base {
+    CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(c cents) STRICT;
+    SELECT count(*) FROM t WHERE c COLLATE NOCASE = 1;
+}
+expect error {
+    collations are not supported by type cents
+}
+
+@requires strict "uses STRICT tables"
+test collate-allowed-on-text-types {
+    CREATE TYPE label(value text) BASE text ENCODE value DECODE value;
+    CREATE DOMAIN short_text AS varchar;
+    CREATE DOMAIN plain_text AS text;
+    CREATE TABLE t(v varchar(10) COLLATE NOCASE, l label, s short_text, p plain_text, UNIQUE(l COLLATE NOCASE)) STRICT;
+    CREATE INDEX i ON t(s COLLATE NOCASE);
+    INSERT INTO t VALUES ('ABC', 'ABC', 'ABC', 'ABC');
+    SELECT count(*) FROM t WHERE v = 'abc' AND l = 'abc' COLLATE NOCASE AND s COLLATE NOCASE = 'abc' AND p = 'abc' COLLATE NOCASE;
+}
+expect {
+    1
+}
+
+test collate-allowed-on-date-column-of-non-strict-table {
+    CREATE TABLE t(d date COLLATE NOCASE);
+    INSERT INTO t VALUES ('abc');
+    SELECT count(*) FROM t WHERE d = 'ABC' AND d COLLATE NOCASE = 'ABC';
+}
+expect {
+    1
+}
+
+test create-table-if-not-exists-ignores-collate-when-table-exists {
+    CREATE TABLE t(a);
+    CREATE TABLE IF NOT EXISTS t(x numeric(10,2) COLLATE NOCASE) STRICT;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-to-change-the-order-of-an-indexed-expression {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;
+    CREATE INDEX ix ON t(+x);
+    ALTER TABLE t ALTER COLUMN x TO y blob;
+}
+expect error {
+    cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-changes-the-order-of-a-column-without-an-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text, z int) STRICT;
+    CREATE INDEX iz ON t(z);
+    INSERT INTO t VALUES (1, '10', 1), (2, '9', 2);
+    ALTER TABLE t ALTER COLUMN x TO y numeric(10,2);
+    SELECT y FROM t ORDER BY y;
+}
+expect {
+    9.00
+    10.00
 }

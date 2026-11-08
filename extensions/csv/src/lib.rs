@@ -17,7 +17,8 @@
 //! - `filename` — path to the CSV file (mutually exclusive with `data=`)
 //! - `data` — inline CSV content as a string
 //! - `header` — whether the first row contains column names;
-//!   accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`
+//!   accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`;
+//!   a bare `header` means `header=yes`
 //! - `columns` — number of columns
 //! - `schema` — optional custom SQL `CREATE TABLE` schema
 use std::fs::File;
@@ -44,6 +45,9 @@ impl CsvVTabModule {
                     let name = name.trim();
                     let value = value.trim();
                     return Ok((name, value));
+                }
+                if name.trim() == "header" {
+                    return Ok(("header", "yes"));
                 }
             }
         }
@@ -457,6 +461,34 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_header_argument() {
+        let file = write_csv("id,name\n1,Alice\n2,Bob\n");
+        let filename = format!("filename={}", file.path().to_string_lossy());
+        for args in [
+            vec![filename.as_str(), "header"],
+            vec!["data=id,name\n1,Alice\n2,Bob\n", " header "],
+        ] {
+            let (schema, table) = try_new_table(args).unwrap();
+            assert_eq!(schema, "CREATE TABLE x (\"id\" TEXT, \"name\" TEXT)");
+            let cursor = table.open(None).unwrap();
+            let rows = read_rows(cursor, 2);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![cell!("1"), cell!("Alice")],
+                    vec![cell!("2"), cell!("Bob")]
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_more_than_one_bare_header_argument() {
+        let result = try_new_table(vec!["data=id,name\n1,Alice\n", "header", "header=false"]);
+        assert!(matches!(result, Err(ResultCode::InvalidArgs)));
+    }
+
+    #[test]
     fn test_file_without_header() {
         let file = write_csv("1,Alice\n2,Bob\n");
         let table = new_table(vec![
@@ -708,7 +740,8 @@ mod tests {
     #[test]
     fn test_unparsable_argument() {
         let unparsable_arguments = [
-            "header",
+            "data",
+            "header=",
             "schema='CREATE TABLE x (id INT, name TEXT)",
             "schema=\"CREATE TABLE x (id INT, name TEXT)",
             "schema=\"CREATE TABLE x (id INT, name TEXT)'",

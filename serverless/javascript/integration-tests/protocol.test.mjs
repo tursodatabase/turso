@@ -24,6 +24,15 @@ test('encodeValue sends floats as type float', t => {
   t.is(result.value, 0.5);
 });
 
+test('encodeValue sends a Date as integer epoch milliseconds', t => {
+  t.deepEqual(encodeValue(new Date('2025-02-03T04:05:06.000Z')), { type: 'integer', value: '1738555506000' });
+  t.deepEqual(encodeValue(new Date(-1)), { type: 'integer', value: '-1' });
+});
+
+test('encodeValue rejects an invalid Date', t => {
+  t.throws(() => encodeValue(new Date('not a date')), { message: /Invalid Date/ });
+});
+
 // --- decodeValue ---
 
 test('decodeValue decodes empty base64 blob as empty Buffer', t => {

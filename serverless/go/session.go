@@ -8,14 +8,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
-// EncryptionKeyHeader is the HTTP header that carries the customer-managed
-// encryption key for an encrypted database.
+var ErrSessionLost = errors.New("turso: backend session lost; open a new connection")
+
+// EncryptionKeyHeader carries the customer-managed database encryption key.
 const EncryptionKeyHeader = "x-turso-encryption-key"
 
 // normalizeURL rewrites libsql:// and turso:// URLs to https:// and strips
@@ -30,19 +33,14 @@ func normalizeURL(url string) string {
 	return strings.TrimRight(url, "/")
 }
 
-// stmtOutput is the decoded output of one executed statement.
-type stmtOutput struct {
-	columns      []string
-	decltypes    []string
-	rows         [][]any
-	rowsAffected int64
-}
-
 // session manages one server-side stream: the baton, the base URL, and the
 // server-reported transaction state.
 type session struct {
-	client    *http.Client
-	authToken string
+	requestHeaders http.Header
+	retainSession  bool
+	broken         bool
+	client         *http.Client
+	authToken      string
 	// remoteEncryptionKey is the customer-managed key for an encrypted
 	// database, sent as the EncryptionKeyHeader header on every request
 	// (section 3.1). Empty when the database is not encrypted.
@@ -68,21 +66,36 @@ func newSession(url, authToken, remoteEncryptionKey string) *session {
 	}
 }
 
-// resetStream forgets the stream. Any transaction on it was (or will be)
-// rolled back by the server, so the connection is back in autocommit mode.
-func (s *session) resetStream() {
-	s.baton = nil
-	s.autocommit = true
-}
+// markBroken prevents reuse of a session whose state is unknown.
+func (s *session) markBroken() { s.broken = true }
 
-func (s *session) updateStream(baton *string, baseURL *string) {
+func (s *session) updateStream(baton *string, baseURL *string) error {
+	if baton == nil && (s.retainSession || !s.autocommit) {
+		s.broken = true
+		return ErrSessionLost
+	}
 	s.baton = baton
 	if baseURL != nil && *baseURL != "" {
 		s.baseURL = normalizeURL(*baseURL)
 	}
+	return nil
 }
 
-// httpError builds an error from a non-200 response, surfacing the JSON
+// HTTPError is a non-2xx HTTP response from the server.
+// Message contains the JSON error or message field, if available, never the raw body.
+type HTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("turso: HTTP status %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("turso: HTTP status %d", e.StatusCode)
+}
+
+// httpError builds an error from a non-2xx response, surfacing the JSON
 // error message when the body carries one (section 9.3).
 func httpError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -96,22 +109,19 @@ func httpError(resp *http.Response) error {
 			message = parsed.Message
 		}
 		if message != "" {
-			return fmt.Errorf("turso: HTTP status %d: %s", resp.StatusCode, message)
+			return &HTTPError{StatusCode: resp.StatusCode, Message: message}
 		}
 	}
-	return fmt.Errorf("turso: HTTP status %d", resp.StatusCode)
+	return &HTTPError{StatusCode: resp.StatusCode}
 }
 
-// post sends a request that carries the current baton. Any failure,
-// including a non-200 response, is fatal for the stream (section 9.3): the
-// error surfaces to the caller and the next statement starts a fresh
-// stream. The driver never re-sends a request on its own; whether
-// re-running a failed statement is safe is the application's call.
+// post sends a request carrying the current baton. Failed requests are not retried.
+// Retained sessions and open transactions cannot recover on a new stream.
 func (s *session) post(ctx context.Context, path string, body []byte) (*http.Response, error) {
 	url := s.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		s.resetStream()
+		s.resetAfterRequestFailure()
 		return nil, fmt.Errorf("turso: request to %s failed: %w", url, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -121,17 +131,32 @@ func (s *session) post(ctx context.Context, path string, body []byte) (*http.Res
 	if s.remoteEncryptionKey != "" {
 		req.Header.Set(EncryptionKeyHeader, s.remoteEncryptionKey)
 	}
+	for name, values := range s.requestHeaders {
+		if name == "Host" {
+			req.Host = values[0]
+		} else {
+			req.Header[name] = append([]string(nil), values...)
+		}
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		s.resetStream()
+		s.resetAfterRequestFailure()
 		return nil, fmt.Errorf("turso: request to %s failed: %w", url, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
-		s.resetStream()
+		s.resetAfterRequestFailure()
 		return nil, httpError(resp)
 	}
 	return resp, nil
+}
+
+func (s *session) resetAfterRequestFailure() {
+	if s.retainSession || !s.autocommit {
+		s.markBroken()
+		return
+	}
+	s.baton = nil
 }
 
 // executePipeline executes a pipeline (section 5). When trackAutocommit is
@@ -139,6 +164,9 @@ func (s *session) post(ctx context.Context, path string, body []byte) (*http.Res
 // cached transaction state; the returned results cover only the caller's
 // requests.
 func (s *session) executePipeline(ctx context.Context, requests []streamRequest, trackAutocommit bool) ([]streamResult, error) {
+	if s.broken {
+		return nil, ErrSessionLost
+	}
 	reqs := requests
 	if trackAutocommit {
 		reqs = append(append([]streamRequest{}, requests...), streamRequest{Type: "get_autocommit"})
@@ -154,37 +182,49 @@ func (s *session) executePipeline(ctx context.Context, requests []streamRequest,
 	defer resp.Body.Close()
 	var pr pipelineResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		s.resetStream()
+		s.markBroken()
 		return nil, fmt.Errorf("turso: invalid pipeline response: %w", err)
 	}
-	s.updateStream(pr.Baton, pr.BaseURL)
+
 	results := pr.Results
 	// The protocol guarantees one result per request (section 5.2); a
 	// mismatch would misattribute results to the wrong requests, and
 	// leaves the stream state unknown.
 	if len(results) != len(reqs) {
-		s.resetStream()
+		s.markBroken()
 		return nil, fmt.Errorf("turso: pipeline response has %d results for %d requests", len(results), len(reqs))
+	}
+	for i, result := range results {
+		validError := result.Type == "error" && result.Error != nil && result.Response == nil
+		validResponse := result.Type == "ok" && result.Error == nil && result.Response != nil && result.Response.Type == reqs[i].Type
+		if !validError && !validResponse {
+			s.markBroken()
+			return nil, fmt.Errorf("turso: invalid pipeline result for %s", reqs[i].Type)
+		}
 	}
 	if trackAutocommit {
 		result := results[len(results)-1]
 		results = results[:len(results)-1]
 		if result.Error != nil {
+			s.markBroken()
 			return nil, serverError(result.Error)
 		}
 		if result.Response == nil || result.Response.Type != "get_autocommit" || result.Response.IsAutocommit == nil {
-			s.resetStream()
+			s.markBroken()
 			return nil, fmt.Errorf("turso: expected get_autocommit result in pipeline response")
 		}
 		s.autocommit = *result.Response.IsAutocommit
+	}
+	if err := s.updateStream(pr.Baton, pr.BaseURL); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
 
 // refreshAutocommit refreshes the cached transaction state with a
 // standalone `get_autocommit` request. Failures are swallowed: this runs
-// on error paths where the original failure must not be masked, and a dead
-// stream already reset the state to autocommit.
+// on error paths where the original failure must not be masked. Session recovery
+// follows the same rules as other pipeline requests.
 func (s *session) refreshAutocommit(ctx context.Context) {
 	_, _ = s.executePipeline(ctx, nil, true)
 }
@@ -208,39 +248,51 @@ func autocommitProbeStep() batchStep {
 // statement result, tracking the trailing autocommit probe step separately
 // from the caller's step.
 type cursorDecoder struct {
-	output          stmtOutput
+	output          StatementResult
 	lastInsertRowid *int64
 	stepError       *Error
 	fatal           *Error
 	probeExecuted   bool
 	probeUnreliable bool
+	ended           bool
+	terminated      bool
+	stepOpen        bool
 	inProbe         bool
 }
 
 func (d *cursorDecoder) feed(entry *cursorEntry) error {
+	if d.terminated {
+		return fmt.Errorf("turso: cursor entry after terminator")
+	}
 	switch entry.Type {
+	case "replication_index":
+		if !d.ended || d.stepOpen {
+			return fmt.Errorf("turso: cursor terminated before statement completed")
+		}
+		d.terminated = true
 	case "step_begin":
+		if d.stepOpen || entry.Step == nil || (*entry.Step != 0 && *entry.Step != probeStep) || (*entry.Step == 0 && d.ended) || (*entry.Step == probeStep && !d.ended) {
+			return fmt.Errorf("turso: unexpected cursor step")
+		}
+		d.stepOpen = true
 		if entry.Step != nil && *entry.Step == probeStep {
 			d.inProbe = true
 			d.probeExecuted = true
 		} else {
 			d.inProbe = false
 			for _, col := range entry.Cols {
-				name := ""
-				if col.Name != nil {
-					name = *col.Name
-				}
-				decltype := ""
-				if col.Decltype != nil {
-					decltype = *col.Decltype
-				}
-				d.output.columns = append(d.output.columns, name)
-				d.output.decltypes = append(d.output.decltypes, decltype)
+				d.output.Columns = append(d.output.Columns, Column{Name: col.Name, Decltype: col.Decltype})
 			}
 		}
 	case "row":
+		if !d.stepOpen {
+			return fmt.Errorf("turso: cursor row outside a step")
+		}
 		if d.inProbe || d.stepError != nil {
 			return nil
+		}
+		if len(entry.Row) != len(d.output.Columns) {
+			return fmt.Errorf("turso: cursor row does not match column count")
 		}
 		row := make([]any, len(entry.Row))
 		for i, pv := range entry.Row {
@@ -250,12 +302,17 @@ func (d *cursorDecoder) feed(entry *cursorEntry) error {
 			}
 			row[i] = v
 		}
-		d.output.rows = append(d.output.rows, row)
+		d.output.Rows = append(d.output.Rows, row)
 	case "step_end":
+		if !d.stepOpen {
+			return fmt.Errorf("turso: cursor step_end outside a step")
+		}
+		d.stepOpen = false
 		if d.inProbe {
 			return nil
 		}
-		d.output.rowsAffected = entry.AffectedRowCount
+		d.ended = true
+		d.output.RowsAffected = entry.AffectedRowCount
 		rowid, err := parseRowid(entry.LastInsertRowid)
 		if err != nil {
 			return err
@@ -264,23 +321,27 @@ func (d *cursorDecoder) feed(entry *cursorEntry) error {
 			d.lastInsertRowid = rowid
 		}
 	case "step_error":
+		d.stepOpen = false
 		if entry.Step != nil && *entry.Step == probeStep {
 			d.probeUnreliable = true
 		} else if d.stepError == nil {
+			d.ended = true
 			d.stepError = serverError(entry.Error)
 		}
 		d.inProbe = false
 	case "error":
 		d.fatal = serverError(entry.Error)
 	}
-	// replication_index (section 7.2.6) and unknown entries are ignored;
-	// a cleanly ended body is complete without a terminator.
+	// Unknown extension entries are ignored.
 	return nil
 }
 
 // executeStmt executes a single statement on the cursor endpoint
 // (section 7), decoding the streamed entries into a buffered result.
-func (s *session) executeStmt(ctx context.Context, stmt stmtBody) (*stmtOutput, error) {
+func (s *session) executeStmt(ctx context.Context, stmt stmtBody) (*StatementResult, error) {
+	if s.broken {
+		return nil, ErrSessionLost
+	}
 	steps := []batchStep{{Stmt: stmt}, autocommitProbeStep()}
 	body, err := json.Marshal(cursorRequest{Baton: s.baton, Batch: cursorBatch{Steps: steps}})
 	if err != nil {
@@ -295,26 +356,32 @@ func (s *session) executeStmt(ctx context.Context, stmt stmtBody) (*stmtOutput, 
 	reader := bufio.NewReader(resp.Body)
 	firstLine, err := nextLine(reader)
 	if err != nil {
-		s.resetStream()
+		s.markBroken()
 		return nil, err
 	}
 	if firstLine == nil {
-		s.resetStream()
+		s.markBroken()
 		return nil, fmt.Errorf("turso: cursor response body ended before the cursor response line")
 	}
 	var cr cursorResponse
 	if err := json.Unmarshal(firstLine, &cr); err != nil {
-		s.resetStream()
+		s.markBroken()
 		return nil, fmt.Errorf("turso: invalid cursor response: %w", err)
 	}
-	s.updateStream(cr.Baton, cr.BaseURL)
+	if cr.Baton == nil {
+		s.markBroken()
+		return nil, ErrSessionLost
+	}
+	if err := s.updateStream(cr.Baton, cr.BaseURL); err != nil {
+		return nil, err
+	}
 
 	decoder := &cursorDecoder{}
 	for decoder.fatal == nil {
 		line, err := nextLine(reader)
 		if err != nil {
 			// The body failed mid-stream; the stream is unusable.
-			s.resetStream()
+			s.markBroken()
 			if decoder.stepError != nil {
 				return nil, decoder.stepError
 			}
@@ -325,17 +392,21 @@ func (s *session) executeStmt(ctx context.Context, stmt stmtBody) (*stmtOutput, 
 		}
 		var entry cursorEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
-			s.resetStream()
+			s.markBroken()
 			return nil, fmt.Errorf("turso: invalid cursor entry: %w", err)
 		}
 		if err := decoder.feed(&entry); err != nil {
 			// A malformed value from the server; abandon the stream
 			// rather than resume it in an unknown position.
-			s.resetStream()
+			s.markBroken()
 			return nil, err
 		}
 	}
 
+	if (!decoder.ended || decoder.stepOpen) && decoder.fatal == nil {
+		s.markBroken()
+		return nil, fmt.Errorf("turso: cursor ended before statement completed")
+	}
 	if decoder.fatal != nil {
 		// The cursor died but the stream may survive; ask the server for
 		// the authoritative transaction state.
@@ -348,6 +419,10 @@ func (s *session) executeStmt(ctx context.Context, stmt stmtBody) (*stmtOutput, 
 	if decoder.probeUnreliable {
 		s.refreshAutocommit(ctx)
 	} else {
+		// TODO: If HTTP completion is signaled only by closing the connection and
+		// neither the probe nor a cursor terminator arrived, verify autocommit
+		// with the same baton. EOF may mean truncation rather than a skipped probe;
+		// invalidate the connection if that state check fails.
 		s.autocommit = decoder.probeExecuted
 	}
 	if decoder.stepError != nil {
@@ -381,7 +456,15 @@ func nextLine(reader *bufio.Reader) ([]byte, error) {
 // may already have expired.
 func (s *session) close() {
 	if s.baton != nil {
-		_, _ = s.executePipeline(context.Background(), []streamRequest{{Type: "close"}}, false)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		body, _ := json.Marshal(pipelineRequest{Baton: s.baton, Requests: []streamRequest{{Type: "close"}}})
+		resp, err := s.post(ctx, "/v3/pipeline", body)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+		}
 	}
-	s.resetStream()
+	s.baton = nil
+	s.broken = true
 }

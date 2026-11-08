@@ -16,4 +16,4 @@ Figure 1. Transaction log of three transactions.
 </p>
 
 When MVCC bootstraps or recovers, it simply redos the transaction log.
-If the transaction log grows big, we can checkpoint it it by dropping all entries that are no longer visible after the the latest transaction and create a snapshot.
+If the transaction log grows big, we can checkpoint it by dropping all entries that are no longer visible after the latest transaction and create a snapshot.

@@ -200,7 +200,7 @@ test unterminated_string_document_errors {
     SELECT json('"abc');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 # Even JSON5 numbers need a digit in the mantissa: a bare dot, a bare
@@ -230,11 +230,107 @@ expect {
     0|0|0|0|1|3|4|4|4
 }
 
+# An exponent with no digits is reported at the 'e', or at the sign
+# after it. '0x' with no hex digit after it is just the number 0, so
+# the 'x' is reported as the next token.
+test json_error_position_reports_exponent_and_hex_prefix_without_digits {
+    SELECT json_error_position('1e'), json_error_position('[1e]'),
+           json_error_position('{"a":1e}'), json_error_position('[1e+]'),
+           json_error_position('1ex'), json_error_position('1e-'),
+           json_error_position('[1.e]'), json_error_position('[0x]'),
+           json_error_position('[0xg]'), json_error_position('[-0x]'),
+           json_error_position('[0X1]');
+}
+expect {
+    2|3|7|4|2|3|4|3|3|4|0
+}
+
+# A sign with no digits after it is reported at the sign, even when an
+# exponent follows.
+test json_error_position_reports_sign_without_digits_before_exponent {
+    SELECT json_error_position('[-e]'), json_error_position('-e'),
+           json_error_position('{a:-e}'), json_error_position('+e1'),
+           json_error_position('[-E+]');
+}
+expect {
+    2|1|4|1|2
+}
+
+# A bad escape is reported at the character after the backslash.
+test json_error_position_reports_bad_escape_after_backslash {
+    SELECT json_error_position('"\q"'), json_error_position('"ab\q"'),
+           json_error_position('["a\q",1]'), json_error_position('"\x"'),
+           json_error_position('"\uZZZZ"'), json_error_position('"\u12"'),
+           json_error_position('"\x4g"'), json_error_position('{"\q":1}'),
+           json_error_position('"é\q"');
+}
+expect {
+    3|5|5|3|3|3|3|4|4
+}
+
+# In an unquoted key, a backslash that does not start a complete
+# \uXXXX escape is reported at the backslash.
+test json_error_position_reports_bad_escape_in_unquoted_key_at_backslash {
+    SELECT json_error_position('{a\q:1}'), json_error_position('{ab\q:1}'),
+           json_error_position('{a\u0041\q:1}'), json_error_position('{a\u00:1}'),
+           json_error_position('{\u00:1}'), json_error_position('{a\:1}'),
+           json_error_position(char(123) || 'a\'), json_error_position(char(123) || '\u'),
+           json_error_position('{a\"b":1}'), json_error_position('{\u0041:1}');
+}
+expect {
+    3|4|9|3|2|3|3|2|3|0
+}
+
+# When an object key is not followed by ':', SQLite parses what follows
+# as a value. If that parse fails, its own error position is reported;
+# otherwise the position of the value is reported.
+test json_error_position_reports_bad_character_after_unquoted_key {
+    SELECT json_error_position('{a,:1}'), json_error_position('{a}'),
+           json_error_position('{ab]:1}'), json_error_position('{a b:1}'),
+           json_error_position(char(123) || 'ab'), json_error_position('{a$]:1}'),
+           json_error_position('{a"x":1}'), json_error_position('{a''x'':1}'),
+           json_error_position('{a1:2}');
+}
+expect {
+    3|3|4|4|4|4|3|3|0
+}
+
+test json_error_position_reports_value_error_after_object_key {
+    SELECT json_error_position(char(123) || 'a['),
+           json_error_position(char(123) || 'a' || char(123)),
+           json_error_position(char(123) || 'a[1'),
+           json_error_position(char(123) || 'a' || char(123) || '"x":1e' || char(125)),
+           json_error_position(char(123) || '"a"[1'),
+           json_error_position(char(123) || '"a"' || char(123) || '"x":1e' || char(125)),
+           json_error_position('{a tru}'), json_error_position('{a 1:2}'),
+           json_error_position('{a[1]:2}');
+}
+expect {
+    4|4|5|9|7|11|4|4|3
+}
+
+# JSON5 does not allow a digit right after \0.
+test json_error_position_rejects_nul_escape_followed_by_digit {
+    SELECT json_error_position('"\01"'), json_error_position('["\01"]'),
+           json_error_position('"\09"'), json_error_position('"\0a"'),
+           json_error_position('"\0"'), json_valid('"\01"', 6);
+}
+expect {
+    3|4|3|0|0|0
+}
+
+test nul_escape_followed_by_digit_errors {
+    SELECT json('["\01"]');
+}
+expect error {
+    ^(Runtime error: )?malformed JSON$
+}
+
 test digitless_number_document_errors {
     SELECT json('.');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 # The error position counts characters, not bytes: é is one character
@@ -665,7 +761,7 @@ test json5_unquoted_key_slash_is_malformed {
     SELECT json('{ MNO_123/xyz : 789 }');
 }
 expect error {
-    ^(Parse error: )?malformed JSON$
+    ^malformed JSON$
 }
 
 # \uXXXX escapes may appear anywhere in an unquoted key, whatever they
@@ -698,6 +794,19 @@ expect {
     {"x":1}|{"x":1}|0
 }
 
+# JSON5 whitespace directly after an unquoted key ends the key.
+test json5_unquoted_key_ends_at_json5_whitespace {
+    SELECT json('{a' || char(0x2028) || ':1}'), json('{a' || char(0xa0) || ':1}'),
+           json('{a' || char(0xfeff) || ':1}'), json('{a' || char(0x2029) || ':1}'),
+           json('{a' || char(0x3000) || ':1}'), json('{a' || char(0x1680) || ':1}'),
+           json('{a' || char(0x205f) || ':1}'), json('{a' || char(0x2000) || ':1}'),
+           json('{a' || char(0x202f) || ':1}'), json('{a' || char(11) || ':1}'),
+           json('{a' || char(12) || ':1}'), json('{ab' || char(0xa0) || ':1}');
+}
+expect {
+    {"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"ab":1}
+}
+
 # Array locators counting from the end: leading zeros in [#-n] keep the
 # sign, and [#-0] addresses the same one-past-the-end position as [#].
 
@@ -716,6 +825,43 @@ test json_path_minus_zero_is_one_past_the_end {
 }
 expect {
     {"b":[1,2]}|1
+}
+
+# SQLite reads an array index into a 32-bit unsigned integer, so it wraps
+# modulo 2^32. An index from 2^31 to 2^32-1, or a [#-n] past the start of
+# the array, finds nothing: lookups return NULL and edits change nothing.
+
+test json_path_index_near_2_pow_32_finds_nothing {
+    SELECT json_extract('[1,2,3]','$[4294967295]') IS NULL,
+           json_extract('[1,2,3]','$[2147483648]') IS NULL,
+           json_extract('[1,2,3]','$[9223372036854775807]') IS NULL,
+           json_extract('[1,2,3]','$[#-4294967295]') IS NULL,
+           json_extract('[1,2,3]','$[#-2147483648]') IS NULL,
+           json_remove('[1,2,3]','$[4294967295]'),
+           json_set('[1,2,3]','$[4294967295]',9),
+           json_remove('{"a":[1,2,3]}','$.a[#-4294967295]');
+}
+expect {
+    1|1|1|1|1|[1,2,3]|[1,2,3]|{"a":[1,2,3]}
+}
+
+test json_path_index_wraps_modulo_2_pow_32 {
+    SELECT json_extract('[1,2,3]','$[4294967296]'),
+           json_extract('[1,2,3]','$[#-4294967297]'),
+           json_set('[1,2,3]','$[#-4294967296]',9);
+}
+expect {
+    1|3|[1,2,3,9]
+}
+
+test json_arrow_integer_index_near_2_pow_32 {
+    SELECT '[1,2,3]' -> 4294967295 IS NULL,
+           '[1,2,3]' ->> -4294967295 IS NULL,
+           '[1,2,3]' -> 4294967296,
+           '[1,2,3]' ->> -4294967297;
+}
+expect {
+    1|1|1|3
 }
 
 # Appending with [#] or the exact one-past-the-end index works for both
@@ -794,7 +940,7 @@ test json_bad_path_error_message_format {
     SELECT json_extract('{"b":[1]}', '$.b[#-]');
 }
 expect error {
-    ^(Parse error: )?bad JSON path: '\$\.b\[#-\]'$
+    ^bad JSON path: '\$\.b\[#-\]'$
 }
 
 # Apostrophes in the path are doubled in the message, like SQLite's %Q.
@@ -802,7 +948,7 @@ test json_bad_path_message_doubles_apostrophes {
     SELECT json_extract('{}', 'x''y''z');
 }
 expect error {
-    ^(Parse error: )?bad JSON path: 'x''y''z'$
+    ^bad JSON path: 'x''y''z'$
 }
 
 # %Q reads a C string, so the message stops at an embedded NUL.
@@ -810,7 +956,7 @@ test json_bad_path_message_stops_at_nul {
     SELECT json_extract('{}', 'x' || char(0) || 'y');
 }
 expect error {
-    ^(Parse error: )?bad JSON path: 'x'$
+    ^bad JSON path: 'x'$
 }
 
 # subtype() reports 74 ('J') for TEXT a JSON function produced, and 0
@@ -848,7 +994,7 @@ test non_jsonb_blob_arguments_error {
     SELECT json_array(x'313233');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?JSON cannot hold BLOB values$
+    ^(Runtime error: )?JSON cannot hold BLOB values$
 }
 
 # Document arguments accept blobs everywhere: JSONB blobs directly,
@@ -904,14 +1050,14 @@ test patch_validates_target_before_null_patch {
     SELECT json_patch(x'ABCD', 'null');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 test jsonb_patch_validates_target_before_null_patch {
     SELECT jsonb_patch(x'ABCD', 'null');
 }
 expect error {
-    ^(Runtime error: )?(Parse error: )?malformed JSON$
+    ^(Runtime error: )?malformed JSON$
 }
 
 # json_error_position reads a non-JSONB blob as text that stops at the

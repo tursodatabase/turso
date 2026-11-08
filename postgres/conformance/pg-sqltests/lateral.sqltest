@@ -52,6 +52,7 @@ expect {
 test right-join-lateral-cannot-read-the-table-on-its-left {
     SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT t1.a) AS s ON true;
 }
+@sqlstate 42P10
 expect error {
     invalid reference to FROM-clause entry for table "t1"
 }

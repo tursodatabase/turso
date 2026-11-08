@@ -69,6 +69,34 @@ def test_push():
         assert r2 == [["hello"], ["turso"], ["sync"], ["push works"]]
 
 
+def test_callable_remote_url():
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        server.db_sql("INSERT INTO t VALUES ('hello')")
+
+        with CountingProxy(server.db_url(), "/pull-updates") as proxy:
+            conn = turso.sync.connect(":memory:", lambda: proxy.url())
+            assert conn.execute("SELECT * FROM t").fetchall() == [("hello",)]
+
+            server.db_sql("INSERT INTO t VALUES ('pull works')")
+            assert conn.pull()
+            assert conn.execute("SELECT * FROM t").fetchall() == [("hello",), ("pull works",)]
+
+            conn.execute("INSERT INTO t VALUES ('push works')")
+            conn.commit()
+            conn.push()
+            assert server.db_sql("SELECT * FROM t") == [["hello"], ["pull works"], ["push works"]]
+
+            # bootstrap and pull both went through the url returned by the callable
+            assert proxy.count >= 2
+
+
+def test_callable_remote_url_rewrites_turso_schemes():
+    for url in ["libsql://example.com", "turso://example.com"]:
+        ctx = turso.lib_sync._HttpContext(remote_url=lambda: url, auth_token=None, client_name="test")
+        assert ctx.base_url() == "https://example.com"
+
+
 def test_checkpoint():
     # turso.setup_logging(level=logging.DEBUG)
 
@@ -93,6 +121,40 @@ def test_checkpoint():
         conn.push()
 
         assert server.db_sql("SELECT SUM(x) FROM t") == [[f"{1024 * 1023 // 2}"]]
+
+
+def test_sync_operations_from_many_threads():
+    # Sync operations on one connection shared between threads must run one
+    # at a time instead of deadlocking on the sync engine.
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        conn = turso.sync.connect(":memory:", remote_url=server.db_url())
+        conn.execute("INSERT INTO t VALUES ('local')")
+        conn.commit()
+        server.db_sql("INSERT INTO t VALUES ('remote')")
+
+        errors = []
+
+        def sync_all():
+            try:
+                for _ in range(5):
+                    conn.push()
+                    conn.pull()
+                    conn.stats()
+                    conn.checkpoint()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=sync_all) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not any(t.is_alive() for t in threads), "sync operations did not finish"
+        assert not errors, f"concurrent sync operations failed: {errors[0]}"
+
+        assert sorted(conn.execute("SELECT x FROM t").fetchall()) == [("local",), ("remote",)]
+        assert sorted(server.db_sql("SELECT x FROM t")) == [["local"], ["remote"]]
 
 
 def test_partial_sync():

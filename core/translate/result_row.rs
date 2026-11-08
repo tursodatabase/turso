@@ -13,8 +13,8 @@ use turso_parser::ast;
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, NoConstantOptReason, WalkControl,
+        expr_type::{type_of, TypeEnv},
+        translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
     },
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
 };
@@ -64,13 +64,16 @@ pub fn emit_select_result(
     // and CTE materialization. This is slightly over-broad (e.g., simple INSERT INTO ...
     // SELECT with no UNION doesn't need this), but we lack context here to distinguish
     // compound vs non-compound cases.
-    let disable_constant_opt = matches!(
-        plan.query_destination,
-        QueryDestination::EphemeralIndex { .. }
-            | QueryDestination::CoroutineYield { .. }
-            | QueryDestination::EphemeralTable { .. }
-            | QueryDestination::RecursiveCteQueue { .. }
-    );
+    // Keep result expressions in the row body when WHERE is constant false.
+    // The no-rows jump must skip expressions that produce no result row.
+    let disable_constant_opt = plan.contains_constant_false_condition
+        || matches!(
+            plan.query_destination,
+            QueryDestination::EphemeralIndex { .. }
+                | QueryDestination::CoroutineYield { .. }
+                | QueryDestination::EphemeralTable { .. }
+                | QueryDestination::RecursiveCteQueue { .. }
+        );
 
     if !skip_column_eval {
         for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
@@ -85,13 +88,18 @@ pub fn emit_select_result(
         }) {
             let reg = start_reg + i;
             if disable_constant_opt {
+                let reason = if plan.contains_constant_false_condition {
+                    NoConstantOptReason::FilteredResultRow
+                } else {
+                    NoConstantOptReason::RegisterReuse
+                };
                 translate_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
                     reg,
                     resolver,
-                    NoConstantOptReason::RegisterReuse,
+                    reason,
                 )?;
             } else {
                 translate_expr(
@@ -102,17 +110,6 @@ pub fn emit_select_result(
                     resolver,
                 )?;
             }
-        }
-    } else {
-        // EXISTS optimization skips column evaluation, but parameters in those
-        // expressions must still be registered for bind validation to succeed.
-        for rc in plan.result_columns.iter() {
-            let _ = walk_expr(&rc.expr, &mut |e| {
-                if let ast::Expr::Variable(variable) = e {
-                    program.register_variable(variable);
-                }
-                Ok(WalkControl::Continue)
-            });
         }
     }
 
@@ -515,36 +512,13 @@ pub(crate) fn emit_array_decode_for_results(
     start_reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    if program.flags.reads_stored_values() {
+        return Ok(());
+    }
+    let env = TypeEnv::new(Some(table_references), resolver);
     for (i, rc) in result_columns.iter().enumerate() {
-        // Check if this is a column reference to an array column
-        let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
-            table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, t)| t)
-                .and_then(|t| t.get_column_at(*column))
-                .filter(|col| col.is_array())
-        } else {
-            None
-        };
-
-        // Check if this expression produces an array (function call, || operator, etc.)
-        let is_array_expr = array_col.is_none() && expr_is_array(&rc.expr, Some(table_references));
-
-        if array_col.is_some() || is_array_expr {
-            let reg = start_reg + i;
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip,
-            });
-
-            if let Some(col) = array_col {
-                emit_array_decode(program, reg, col, resolver)?;
-            } else {
-                program.emit_insn(Insn::ArrayDecode { reg });
-            }
-
-            program.preassign_label_to_next_insn(skip);
+        if type_of(&rc.expr, &env).is_array() {
+            program.emit_insn(Insn::ArrayDecode { reg: start_reg + i });
         }
     }
     Ok(())

@@ -1,34 +1,39 @@
 use std::sync::Arc;
 
 use crate::alloc::TursoSliceExt;
+use crate::translate::expr_context::ExprContext;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    emitter::{OperationMode, Resolver, TranslateCtx},
+    emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::expr_type::{type_of, TypeEnv};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::in_subquery_collation,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
-            emit_materialized_build_inputs, emit_program_for_select,
-            emit_program_for_select_with_resolver, emit_query,
+            emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
         },
         eqp::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
-        expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
+        },
+        insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
@@ -42,7 +47,7 @@ use crate::{
     types::Value,
     util::parse_signed_number,
     vdbe::{
-        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
+        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder, Subroutine},
         insn::Insn,
         CursorID,
     },
@@ -372,34 +377,17 @@ pub fn plan_subqueries_from_select_plan(
         )?;
     }
 
-    // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
-    {
-        let mut subquery_parser = get_subquery_parser(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            connection,
-            get_outer_query_refs,
-            SubqueryPosition::LimitOffset,
-            SubqueryOrigin::SelectLimitOffset,
-            false,
-            &mut cse_map,
-            &mut same_query_map,
-            &[],
-        );
-        // Limit
-        if let Some(limit) = &mut plan.limit {
-            crate::stack::trace_stack!("select_limit");
-            walk_expr_mut(limit, &mut subquery_parser)?;
-        }
-        // Offset
-        if let Some(offset) = &mut plan.offset {
-            crate::stack::trace_stack!("select_offset");
-            walk_expr_mut(offset, &mut subquery_parser)?;
-        }
-    }
+    plan_limit_offset_subqueries(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        &mut plan.table_references,
+        resolver,
+        connection,
+        plan.limit.as_deref_mut(),
+        plan.offset.as_deref_mut(),
+        &mut cse_map,
+        &mut same_query_map,
+    )?;
 
     // Recollect aggregates after all subquery planning.
     // This is necessary because:
@@ -413,7 +401,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -423,6 +411,53 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     )?;
+    Ok(())
+}
+
+/// Compute query plans for subqueries in a LIMIT/OFFSET pair.
+///
+/// A compound SELECT's LIMIT/OFFSET applies to the compound as a whole instead of to any single
+/// arm, so it is planned by [crate::translate::select::prepare_select_plan_from_arms] rather than
+/// by [plan_subqueries_from_select_plan].
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
+pub(crate) fn plan_limit_offset_subqueries(
+    program: &mut ProgramBuilder,
+    out_subqueries: &mut Vec<NonFromClauseSubquery>,
+    referenced_tables: &mut TableReferences,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    limit: Option<&mut ast::Expr>,
+    offset: Option<&mut ast::Expr>,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
+) -> Result<()> {
+    // LIMIT and OFFSET cannot reference columns from the outer query
+    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
+    let mut subquery_parser = get_subquery_parser(
+        program,
+        out_subqueries,
+        referenced_tables,
+        resolver,
+        connection,
+        &get_outer_query_refs,
+        SubqueryPosition::LimitOffset,
+        SubqueryOrigin::SelectLimitOffset,
+        false,
+        cse_map,
+        same_query_map,
+        &[],
+    );
+    // Limit
+    if let Some(limit) = limit {
+        crate::stack::trace_stack!("select_limit");
+        walk_expr_mut(limit, &mut subquery_parser)?;
+    }
+    // Offset
+    if let Some(offset) = offset {
+        crate::stack::trace_stack!("select_offset");
+        walk_expr_mut(offset, &mut subquery_parser)?;
+    }
     Ok(())
 }
 
@@ -556,11 +591,11 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
-/// Plan subqueries in a trigger WHEN clause expression.
-/// The WHEN clause has no FROM clause, so there are no outer query references.
-/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+/// Plan subqueries in an expression that has no FROM clause, such as a trigger
+/// WHEN clause or a VACUUM INTO path, so there are no outer query references.
+/// Trigger NEW/OLD references should already be rewritten to Expr::Register.
 #[turso_macros::trace_stack]
-pub fn plan_subqueries_from_trigger_when_clause(
+pub fn plan_subqueries_in_expr_without_from_clause(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     expr: &mut ast::Expr,
@@ -576,7 +611,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         std::iter::once(expr),
         connection,
         SubqueryPosition::Where,
-        SubqueryOrigin::TriggerWhen,
+        SubqueryOrigin::ExprWithoutFromClause,
         false,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -601,24 +636,40 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    let mut subquery_parser = get_subquery_parser(
-        program,
-        out_subqueries,
-        referenced_tables,
-        resolver,
-        connection,
-        outer_query_refs_for_correlated_subquery,
-        position,
-        origin,
-        allow_correlated,
-        cse_map,
-        same_query_map,
-        shared,
-    );
-    for expr in exprs {
-        walk_expr_mut(expr, &mut subquery_parser)?;
+    // Only custom types and arrays fail the checks below, and without custom
+    // types enabled there are neither.
+    let custom_types_enabled = !resolver.schema().type_registry.is_empty();
+    let mut with_subqueries = Vec::new();
+    {
+        let mut subquery_parser = get_subquery_parser(
+            program,
+            out_subqueries,
+            referenced_tables,
+            resolver,
+            connection,
+            &outer_query_refs_for_correlated_subquery,
+            position,
+            origin,
+            allow_correlated,
+            cse_map,
+            same_query_map,
+            shared,
+        );
+        for expr in exprs {
+            let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
+            walk_expr_mut(expr, &mut subquery_parser)?;
+            if has_subquery {
+                let expr: &ast::Expr = expr;
+                with_subqueries.push(expr);
+            }
+        }
     }
-
+    // Binding checked these with the types of their subqueries not known yet.
+    // Check them again with those types, as compiling them would, in case
+    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
+    for expr in with_subqueries {
+        check_custom_types(expr, Some(referenced_tables), resolver)?;
+    }
     Ok(())
 }
 
@@ -639,7 +690,9 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
             };
             let outer_ref = OuterQueryReference {
                 table: t.table.clone(),
+                namespace: t.namespace,
                 identifier: t.identifier.clone(),
+                has_alias: t.has_alias,
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
                 col_used_mask: ColumnUsedMask::default(),
@@ -657,7 +710,9 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
         .chain(referenced_tables.outer_query_refs().iter().map(|t| {
             Ok(OuterQueryReference {
                 table: t.table.clone(),
+                namespace: t.namespace,
                 identifier: t.identifier.clone(),
+                has_alias: t.has_alias,
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
                 col_used_mask: ColumnUsedMask::default(),
@@ -692,6 +747,8 @@ fn collect_scalar_subqueries<'a>(
     Ok(found)
 }
 
+type SubqueryParser<'a> = Box<dyn FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a>;
+
 /// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
 #[allow(clippy::too_many_arguments)]
 fn get_subquery_parser<'a>(
@@ -700,15 +757,16 @@ fn get_subquery_parser<'a>(
     referenced_tables: &'a mut TableReferences,
     resolver: &'a Resolver,
     connection: &'a Arc<Connection>,
-    get_outer_query_refs: impl Fn(&TableReferences) -> Result<crate::alloc::Vec<OuterQueryReference>>
-        + 'a,
+    get_outer_query_refs: &'a dyn Fn(
+        &TableReferences,
+    ) -> Result<crate::alloc::Vec<OuterQueryReference>>,
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
     cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
     same_query_map: &'a mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &'a [ast::Expr],
-) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
+) -> SubqueryParser<'a> {
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
             if correlated && !allow_correlated {
@@ -720,7 +778,7 @@ fn get_subquery_parser<'a>(
             Ok(())
         };
 
-    move |expr: &mut ast::Expr| -> Result<WalkControl> {
+    Box::new(move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Exists(_) => {
                 let subquery_id = program.table_reference_counter.next();
@@ -857,16 +915,28 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                if reg_count == 1 {
-                    if let Some(result_col) = plan.result_columns.first() {
-                        let affinity =
-                            get_expr_affinity(&result_col.expr, Some(&plan.table_references), None);
-                        resolver
-                            .subquery_affinities
-                            .borrow_mut()
-                            .insert(subquery_id, affinity);
-                    }
+                let env = TypeEnv::new(Some(&plan.table_references), resolver);
+                let columns: Vec<_> = plan
+                    .result_columns
+                    .iter()
+                    .map(|result_col| RowValueSubqueryColumn {
+                        affinity: get_expr_affinity(
+                            &result_col.expr,
+                            &ExprContext::new(Some(&plan.table_references), resolver),
+                        ),
+                        expr_type: type_of(&result_col.expr, &env),
+                    })
+                    .collect();
+                if let [column] = columns.as_slice() {
+                    referenced_tables.add_scalar_subquery_affinity(subquery_id, column.affinity);
                 }
+                resolver.row_value_subqueries.insert(
+                    subquery_id,
+                    RowValueSubquery {
+                        result_reg_start: reg_start,
+                        columns,
+                    },
+                );
 
                 plan.query_destination = QueryDestination::RowValueSubqueryResult {
                     result_reg_start: reg_start,
@@ -945,12 +1015,31 @@ fn get_subquery_parser<'a>(
                     get_outer_query_refs(referenced_tables)
                 }?;
 
-                let ast::Expr::InSelect { lhs, not, rhs } = ({
+                let ast::Expr::InSelect { mut lhs, not, rhs } = ({
                     crate::stack::trace_stack!("take_in_select_expr");
                     std::mem::take(expr)
                 }) else {
                     unreachable!();
                 };
+                // The walk reaches an IN before its left side, but the comparison
+                // needs the affinity of a scalar subquery there, so plan it first.
+                walk_expr_mut(
+                    &mut lhs,
+                    &mut get_subquery_parser(
+                        &mut *program,
+                        &mut *out_subqueries,
+                        &mut *referenced_tables,
+                        resolver,
+                        connection,
+                        get_outer_query_refs,
+                        position,
+                        origin,
+                        allow_correlated,
+                        &mut *cse_map,
+                        &mut *same_query_map,
+                        shared,
+                    ),
+                )?;
                 let plan = prepare_select_plan(
                     *rhs,
                     resolver,
@@ -995,25 +1084,25 @@ fn get_subquery_parser<'a>(
                         result_columns.len()
                     );
                 }
-                // Collect affinity and LHS collation in a single pass over lhs_columns.
-                // "x IN (SELECT y ...)" uses the collation of x
-                // (https://www.sqlite.org/datatype3.html#collation §7.1),
-                // so the ephemeral index must use the LHS collation for correct
-                // NotFound/Found probe comparisons.
+                // "x IN (SELECT y ...)" compares x and y like "x = y" does, so
+                // the ephemeral index uses the collation of that comparison
+                // for its NotFound/Found probes.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
-                let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
-                    let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
+                    let lhs_affinity = get_expr_affinity(
+                        lhs_expr,
+                        &ExprContext::new(Some(referenced_tables), resolver),
+                    );
                     affinity_chars.push(
                         comparison_affinity(
                             &result_columns[i].expr,
                             lhs_affinity,
-                            Some(table_references),
-                            None,
+                            &ExprContext::new(Some(table_references), resolver),
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                    lhs_exprs.push(lhs_expr);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -1021,13 +1110,20 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
+                        let collation = in_subquery_collation(
+                            lhs_exprs[i],
+                            Some(referenced_tables),
+                            &plan,
+                            i,
+                            resolver,
+                        )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
-                            collation: lhs_collations[i].or(rhs_collation),
+                            collation,
+                            explicit_collation: None,
                             default: None,
                             expr: None,
                         })
@@ -1045,6 +1141,7 @@ fn get_subquery_parser<'a>(
                     where_clause: None,
                     index_method: None,
                     on_conflict: None,
+                    constraint_name: None,
                 });
 
                 let cursor_id =
@@ -1085,7 +1182,7 @@ fn get_subquery_parser<'a>(
             }
             _ => Ok(WalkControl::Continue),
         }
-    }
+    })
 }
 
 /// Recollect all aggregates after subquery planning.
@@ -1181,6 +1278,7 @@ fn update_column_used_masks(
                 outer_query_ref
                     .col_used_mask
                     .union_with(&child_outer_query_ref.col_used_mask)?;
+                outer_query_ref.rowid_referenced |= child_outer_query_ref.rowid_referenced;
             }
         }
 
@@ -1337,13 +1435,14 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                     && plan_has_outer_scope_dependency(&from_clause_subquery.plan);
                 if from_clause_subquery.requires_table_materialization()
                     && !reads_a_row_of_an_outer_query
+                    && !plan_is_correlated(&from_clause_subquery.plan)
                 {
                     tracing::trace!(
                         cte_id,
                         identifier = %table_reference.identifier,
                         "pre-materializing shared CTE"
                     );
-                    let (result_columns_start, cte_cursor_id, cte_table) = program
+                    let (result_columns_start, cursor_id, shared_table) = program
                         .with_cte_materialization_eqp(
                             cte_id,
                             &from_clause_subquery.name,
@@ -1356,15 +1455,10 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                                 )
                             },
                         )?;
-                    program.register_materialized_cte(
-                        cte_id,
-                        MaterializedCteInfo {
-                            cursor_id: cte_cursor_id,
-                            table: cte_table,
-                            num_columns: from_clause_subquery.columns.len(),
-                        },
-                    );
-                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
+                    let cte_info =
+                        shared_table.expect("an uncorrelated CTE is filled by a subroutine");
+                    from_clause_subquery.materialized_cursor_id = Some(cursor_id);
+                    program.register_materialized_cte(cte_id, cte_info);
                     from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                     program
                         .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -1576,6 +1670,10 @@ pub fn emit_from_clause_subqueries(
             // Check if this is a CTE that's already materialized
             if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
+                    program.emit_insn(Insn::Gosub {
+                        target_pc: cte_info.fill_subroutine.label,
+                        return_reg: cte_info.fill_subroutine.return_reg,
+                    });
                     if from_clause_subquery.materialized_cursor_id.is_some() {
                         tracing::trace!(
                             cte_id,
@@ -1632,23 +1730,18 @@ pub fn emit_from_clause_subqueries(
                     t_ctx,
                 )?),
                 FromClauseSubqueryExecutionMode::MaterializedTable => {
-                    let (result_columns_start, cte_cursor_id, cte_table) =
+                    let (result_columns_start, cursor_id, shared_table) =
                         emit_materialized_subquery_table(
                             program,
                             from_clause_subquery.plan.as_mut(),
                             t_ctx,
                             &from_clause_subquery.columns,
                         )?;
-                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
-                    if let Some(cte_id) = from_clause_subquery.cte_id() {
-                        program.register_materialized_cte(
-                            cte_id,
-                            MaterializedCteInfo {
-                                cursor_id: cte_cursor_id,
-                                table: cte_table,
-                                num_columns: from_clause_subquery.columns.len(),
-                            },
-                        );
+                    from_clause_subquery.materialized_cursor_id = Some(cursor_id);
+                    if let (Some(cte_id), Some(cte_info)) =
+                        (from_clause_subquery.cte_id(), shared_table)
+                    {
+                        program.register_materialized_cte(cte_id, cte_info);
                     }
                     Some(result_columns_start)
                 }
@@ -1725,7 +1818,7 @@ fn allocate_cursors_read_by_lateral_subquery(
             ),
             "a LATERAL subquery must come after the tables it reads in the join order"
         );
-        read_table.open_cursors(program, OperationMode::SELECT, t_ctx.resolver.schema())?;
+        read_table.open_cursors(program, OperationMode::SELECT, &t_ctx.resolver)?;
     }
     Ok(())
 }
@@ -1805,7 +1898,7 @@ pub fn emit_from_clause_subquery(
                     limit_ctx: None,
                     reg_offset: None,
                     reg_limit_offset_sum: None,
-                    resolver: t_ctx.resolver.fork(),
+                    resolver: t_ctx.resolver.fork_with_expr_cache(),
                     non_aggregate_expressions: Vec::new(),
                     agg_leaf_columns: Vec::new(),
                     cdc_cursor_id: None,
@@ -1822,7 +1915,7 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                let resolver = t_ctx.resolver.fork();
+                let resolver = t_ctx.resolver.fork_with_expr_cache();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
                 emit_program_for_compound_select(program, &resolver, plan)?
@@ -1905,7 +1998,7 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_expr_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -1922,7 +2015,7 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_expr_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(_) => {
@@ -1945,7 +2038,7 @@ fn emit_materialized_subquery_table(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
     columns: &[Column],
-) -> Result<(usize, CursorID, Arc<BTreeTable>)> {
+) -> Result<(usize, CursorID, Option<MaterializedCteInfo>)> {
     use super::plan::EphemeralRowidMode;
 
     // EphemeralTable (not EphemeralIndex) is required because it preserves
@@ -1969,16 +2062,30 @@ fn emit_materialized_subquery_table(
     // Allocate registers for reading result columns
     let result_columns_start_reg = program.alloc_registers(columns.len());
 
-    let build_end = if plan_is_correlated(plan) {
+    // A correlated parent query can reach this code more than once.
+    // SQLite keeps an uncorrelated FROM source for the full statement, and
+    // fills it in a subroutine that later references of a CTE call too.
+    let fill_subroutine = if plan_is_correlated(plan) {
         None
     } else {
-        let label = program.allocate_label();
-        // A correlated parent query can reach this code more than once.
-        // SQLite keeps an uncorrelated FROM source for the full statement.
-        program.emit_insn(Insn::Once {
-            target_pc_when_reentered: label,
+        let fill_subroutine = Subroutine {
+            label: program.allocate_label(),
+            return_reg: program.alloc_register(),
+        };
+        let fill_end = program.allocate_label();
+        let after_subroutine = program.allocate_label();
+        program.emit_insn(Insn::Gosub {
+            target_pc: fill_subroutine.label,
+            return_reg: fill_subroutine.return_reg,
         });
-        Some(label)
+        program.emit_insn(Insn::Goto {
+            target_pc: after_subroutine,
+        });
+        program.preassign_label_to_next_insn(fill_subroutine.label);
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: fill_end,
+        });
+        Some((fill_subroutine, fill_end, after_subroutine))
     };
 
     // Open the ephemeral table
@@ -2021,7 +2128,7 @@ fn emit_materialized_subquery_table(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_expr_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -2038,7 +2145,7 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_expr_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
@@ -2049,11 +2156,22 @@ fn emit_materialized_subquery_table(
         }
     }
 
-    if let Some(build_end) = build_end {
-        program.preassign_label_to_next_insn(build_end);
+    if let Some((fill_subroutine, fill_end, after_subroutine)) = fill_subroutine {
+        program.preassign_label_to_next_insn(fill_end);
+        program.emit_insn(Insn::Return {
+            return_reg: fill_subroutine.return_reg,
+            can_fallthrough: false,
+        });
+        program.preassign_label_to_next_insn(after_subroutine);
     }
 
-    Ok((result_columns_start_reg, cursor_id, ephemeral_table))
+    let shared_table = fill_subroutine.map(|(fill_subroutine, _, _)| MaterializedCteInfo {
+        cursor_id,
+        table: ephemeral_table,
+        num_columns: columns.len(),
+        fill_subroutine,
+    });
+    Ok((result_columns_start_reg, cursor_id, shared_table))
 }
 
 /// Translate a subquery that is not part of the FROM clause.
@@ -2068,14 +2186,16 @@ fn emit_materialized_subquery_table(
 /// - a single register for EXISTS subqueries,
 /// - a range of registers for RowValue subqueries,
 /// - an ephemeral index for IN subqueries.
+///
+/// A correlated subquery is emitted as a subroutine, which is returned so
+/// that a `Gosub` can run the subquery again.
 pub fn emit_non_from_clause_subquery(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: Plan,
     query_type: &SubqueryType,
     is_correlated: bool,
-    preserve_outer_expr_cache: bool,
-) -> Result<()> {
+) -> Result<Option<Subroutine>> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {
@@ -2116,23 +2236,16 @@ pub fn emit_non_from_clause_subquery(
         };
 
         // Helper closure to emit a select plan (simple or compound). The
-        // closure captures `resolver`, `plan`, and `preserve_outer_expr_cache`
-        // from the enclosing scope; only `program` is passed explicitly so
+        // closure captures `resolver` and `plan` from the enclosing scope; only `program` is passed explicitly so
         // that the outer scope can keep emitting instructions in between.
         // Called at most once, hence `FnOnce`.
         let emit_plan = move |program: &mut ProgramBuilder| -> Result<()> {
             match plan {
-                Plan::Select(select_plan) => {
-                    if preserve_outer_expr_cache {
-                        emit_program_for_select_with_resolver(
-                            program,
-                            resolver.fork_with_expr_cache(),
-                            *select_plan,
-                        )
-                    } else {
-                        emit_program_for_select(program, resolver, *select_plan)
-                    }
-                }
+                Plan::Select(select_plan) => emit_program_for_select_with_resolver(
+                    program,
+                    resolver.fork_with_expr_cache(),
+                    *select_plan,
+                ),
                 mut compound @ Plan::CompoundSelect { .. } => {
                     emit_program_for_compound_select(program, resolver, &mut compound)?;
                     Ok(())
@@ -2141,21 +2254,25 @@ pub fn emit_non_from_clause_subquery(
             }
         };
 
+        let subroutine = if is_correlated || !matches!(query_type, SubqueryType::In { .. }) {
+            let subroutine = Subroutine {
+                label: program.allocate_label(),
+                return_reg: program.alloc_register(),
+            };
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine.return_reg,
+                dest_end: None,
+            });
+            program.preassign_label_to_next_insn(subroutine.label);
+            Some(subroutine)
+        } else {
+            None
+        };
         match query_type {
             SubqueryType::Exists { result_reg, .. } => {
-                let subroutine_reg = program.alloc_register();
-                program.emit_insn(Insn::BeginSubrtn {
-                    dest: subroutine_reg,
-                    dest_end: None,
-                });
                 program.emit_insn(Insn::Integer {
                     value: 0,
                     dest: *result_reg,
-                });
-                emit_plan(program)?;
-                program.emit_insn(Insn::Return {
-                    return_reg: subroutine_reg,
-                    can_fallthrough: true,
                 });
             }
             SubqueryType::In { cursor_id, .. } => {
@@ -2163,29 +2280,25 @@ pub fn emit_non_from_clause_subquery(
                     cursor_id: *cursor_id,
                     is_table: false,
                 });
-                emit_plan(program)?;
             }
             SubqueryType::RowValue {
                 result_reg_start,
                 num_regs,
             } => {
-                let subroutine_reg = program.alloc_register();
-                program.emit_insn(Insn::BeginSubrtn {
-                    dest: subroutine_reg,
-                    dest_end: None,
-                });
                 for result_reg in *result_reg_start..*result_reg_start + *num_regs {
                     program.emit_insn(Insn::Null {
                         dest: result_reg,
                         dest_end: None,
                     });
                 }
-                emit_plan(program)?;
-                program.emit_insn(Insn::Return {
-                    return_reg: subroutine_reg,
-                    can_fallthrough: true,
-                });
             }
+        }
+        emit_plan(program)?;
+        if let Some(subroutine) = subroutine {
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine.return_reg,
+                can_fallthrough: true,
+            });
         }
         // Pop the parent explain for LIST/SCALAR SUBQUERY annotations.
         if !matches!(query_type, SubqueryType::Exists { .. }) {
@@ -2194,7 +2307,7 @@ pub fn emit_non_from_clause_subquery(
         if let Some(label) = label_skip_after_first_run {
             program.preassign_label_to_next_insn(label);
         }
-        Ok(())
+        Ok(subroutine)
     })
 }
 
@@ -2237,17 +2350,14 @@ pub fn emit_non_from_clause_subqueries_for_phase(
         };
 
         let subquery_plan = subquery.consume_plan(evaluated_at);
-        emit_non_from_clause_subquery(
+        let subroutine = emit_non_from_clause_subquery(
             program,
             resolver,
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            !matches!(
-                phase,
-                SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)
-            ),
         )?;
+        subquery.set_subroutine(subroutine);
     }
 
     Ok(())
@@ -2276,7 +2386,7 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
@@ -2292,7 +2402,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
     // first use, so they must keep their phase floor (issue #6807).
     let mut aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for agg in &plan.aggregates {
-        for expr in agg.args.iter().chain(agg.filter_expr.iter()) {
+        for expr in agg.input_exprs() {
             walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
                 if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
                     aggregate_subquery_ids.push(*subquery_id);
@@ -2309,7 +2419,12 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if subquery_reads_outer_aggregate(subquery) {
+        if let Some(func) = outer_aggregate_read_by_subquery(subquery) {
+            // An aggregate's arguments are evaluated for each input row, before
+            // this query has computed the aggregate the subquery reads.
+            if aggregate_subquery_ids.contains(&subquery.internal_id) {
+                crate::bail_parse_error!("misuse of aggregate: {}()", func);
+            }
             subquery.eval_phase = if has_grouped_output {
                 SubqueryEvalPhase::GroupedOutput
             } else {
@@ -2357,6 +2472,54 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             rc.contains_aggregates = true;
         }
     }
+
+    let columns_read_by_group_subqueries = columns_read_by_group_subqueries(plan);
+    if let Some(group_by) = plan.group_by.as_mut() {
+        group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
+    }
+    Ok(())
+}
+
+/// The columns of `plan`'s own tables that are read by its subqueries that run
+/// once per group.
+fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
+    let mut columns = Vec::new();
+    for subquery in &plan.non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        if subquery.eval_phase != SubqueryEvalPhase::GroupedOutput {
+            continue;
+        }
+        for outer_ref in subquery_plan.used_outer_query_refs() {
+            let table = outer_ref.internal_id;
+            if plan
+                .table_references
+                .find_joined_table_by_internal_id(table)
+                .is_none()
+            {
+                continue;
+            }
+            for column in outer_ref.col_used_mask.iter() {
+                columns.push(ast::Expr::Column {
+                    database: None,
+                    table,
+                    column,
+                    is_rowid_alias: outer_ref.columns()[column].is_rowid_alias(),
+                });
+            }
+            if outer_ref.rowid_referenced {
+                columns.push(ast::Expr::RowId {
+                    database: None,
+                    table,
+                });
+            }
+        }
+    }
+    columns
 }
 
 /// True when `expr` reads one of the given subqueries.
@@ -2374,8 +2537,8 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
     found
 }
 
-/// True when a result column of the subquery contains an aggregate whose value
-/// the outer query computes: a plain aggregate call that is not one of the
+/// The name of an aggregate in a result column of the subquery whose value the
+/// outer query computes: a plain aggregate call that is not one of the
 /// subquery's own aggregates, because its argument referenced an outer column
 /// and it was moved to the outer query during resolution. The subquery reads
 /// that aggregate back from the register the outer query finalizes it into.
@@ -2383,14 +2546,19 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
+fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<String> {
+    // EXISTS only checks whether a row comes out and never evaluates its
+    // result columns, as in SQLite.
+    if matches!(subquery.query_type, SubqueryType::Exists { .. }) {
+        return None;
+    }
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
-        return false;
+        return None;
     };
     let Plan::Select(select) = plan.as_ref() else {
-        return false;
+        return None;
     };
-    let mut found = false;
+    let mut found = None;
     for rc in &select.result_columns {
         let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
             if let ast::Expr::FunctionCall {
@@ -2406,13 +2574,13 @@ fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
                         Ok(Some(crate::function::Func::Agg(_)))
                     );
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
-                    found = true;
+                    found = Some(name.as_str().to_string());
                     return Ok(WalkControl::SkipChildren);
                 }
             }
             Ok(WalkControl::Continue)
         });
-        if found {
+        if found.is_some() {
             break;
         }
     }

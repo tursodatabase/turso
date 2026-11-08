@@ -1,7 +1,8 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, Statement};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, IO, OpenFlags, Statement};
+use turso_sqlite::SqliteDialect;
 use turso_whopper::{IOFaultConfig, SimulatorIO};
 
 fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
@@ -497,4 +498,43 @@ fn parse_edn_read(slice: &str) -> Option<(String, bool, &str)> {
         return Some((key.to_string(), true, rest));
     }
     Some((key.to_string(), false, rest))
+}
+
+/// Regression test for #8067 under Whopper's MVCC checkpoint + integrity-check loop.
+#[test]
+fn test_mvcc_checkpointed_upsert_changing_ipk() {
+    use turso_whopper::properties::IntegrityCheckProperty;
+    use turso_whopper::workloads::{
+        BeginWorkload, CommitWorkload, IntegrityCheckWorkload, RollbackWorkload,
+        TruncateCheckpointWorkload, UpsertRowidWorkload, Workload, upsert_sim_schema,
+    };
+    use turso_whopper::{StepResult, Whopper, WhopperOpts};
+
+    let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+        (35, Box::new(UpsertRowidWorkload)),
+        (10, Box::new(TruncateCheckpointWorkload)),
+        (10, Box::new(IntegrityCheckWorkload)),
+        (20, Box::new(BeginWorkload)),
+        (15, Box::new(CommitWorkload)),
+        (5, Box::new(RollbackWorkload)),
+    ];
+    let opts = WhopperOpts::fast()
+        .with_seed(8067)
+        .with_max_steps(2_500)
+        .with_max_connections(3)
+        .with_enable_mvcc(true)
+        .with_allocation_fault_probability(0.0)
+        .with_elle_tables(upsert_sim_schema())
+        .with_workloads(workloads)
+        .with_properties(vec![Box::new(IntegrityCheckProperty)]);
+
+    let mut whopper = Whopper::new(opts).expect("create whopper");
+    while !whopper.is_done() {
+        match whopper.step() {
+            Ok(StepResult::Ok) => {}
+            Ok(StepResult::WalSizeLimitExceeded) => break,
+            Err(e) => panic!("mvcc upsert changing ipk simulation failed: {e}"),
+        }
+    }
+    whopper.finalize_properties().expect("finalize properties");
 }

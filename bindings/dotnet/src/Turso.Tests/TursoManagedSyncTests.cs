@@ -366,15 +366,15 @@ public sealed class TursoManagedSyncTests
                 BootstrapIfEmpty = false,
                 HttpClient = httpClient,
             });
-        var gate = database.EnterConnectionOperation();
+        await using var existingConnection = await database.ConnectAsync();
+        using var gate = database.EnterConnectionOperation();
         var connecting = database.ConnectAsync();
-        await Task.Delay(20);
-        var disposing = Task.Run(database.Dispose);
+        connecting.IsCompleted.Should().BeFalse();
+        database.Dispose();
 
         gate.Dispose();
         var connectAction = async () => await connecting;
         await connectAction.Should().ThrowAsync<ObjectDisposedException>();
-        await disposing;
     }
 
     private sealed class FailingSyncHandler : HttpMessageHandler

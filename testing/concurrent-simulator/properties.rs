@@ -1,6 +1,6 @@
 //! Property-based validation for simulation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail};
@@ -2634,6 +2634,271 @@ impl Property for AutoincWatermarkMonotonicity {
             .unwrap_or(0);
         self.pending_per_tx.clear();
         self.snapshot_at_init.clear();
+        Ok(())
+    }
+}
+
+type TableKeyReadMap = HashMap<(String, String), Vec<Vec<Value>>>;
+
+/// Checks that within an explicit transaction, repeated reads of the same key
+/// return identical results even after non-fatal intermediate errors. This
+/// verifies snapshot isolation: the read horizon must not advance between
+/// statements within a single transaction, regardless of failures in between.
+pub struct SnapshotStabilityProperty {
+    /// Per txn_id: (table_name, key) pairs written via SimpleInsert in this tx.
+    written_keys: HashMap<u64, HashSet<(String, String)>>,
+    /// Per txn_id: flag set when an unstructured write (Delete/Update/Insert sql)
+    /// occurred. We cannot tell which keys those affected, so we skip snapshot
+    /// assertions for the whole tx to avoid false positives.
+    has_unstructured_writes: HashSet<u64>,
+    /// Per txn_id: first result seen for each (table_name, key).
+    first_reads: HashMap<u64, TableKeyReadMap>,
+}
+
+impl Default for SnapshotStabilityProperty {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SnapshotStabilityProperty {
+    pub fn new() -> Self {
+        Self {
+            written_keys: HashMap::new(),
+            has_unstructured_writes: HashSet::new(),
+            first_reads: HashMap::new(),
+        }
+    }
+
+    fn clear_txn(&mut self, txn_id: u64) {
+        self.written_keys.remove(&txn_id);
+        self.has_unstructured_writes.remove(&txn_id);
+        self.first_reads.remove(&txn_id);
+    }
+}
+
+impl Property for SnapshotStabilityProperty {
+    fn finish_op(
+        &mut self,
+        _step: usize,
+        _fiber_id: usize,
+        txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let Some(txn_id) = txn_id else {
+            return Ok(()); // autocommit — no snapshot to track
+        };
+
+        match op {
+            Operation::Commit | Operation::Rollback => {
+                self.clear_txn(txn_id);
+                return Ok(());
+            }
+            Operation::RollbackToSavepoint { .. } => {
+                // Conservatively drop first_reads: written_keys before the
+                // savepoint are unknown from here, so we cannot tell whether a
+                // subsequent read is seeing the pre- or post-rollback state.
+                self.first_reads.remove(&txn_id);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let Ok(rows) = result else {
+            return Ok(()); // failed op — no rows to record or check
+        };
+
+        match op {
+            Operation::SimpleInsert {
+                table_name, key, ..
+            } => {
+                self.written_keys
+                    .entry(txn_id)
+                    .or_default()
+                    .insert((table_name.clone(), key.clone()));
+            }
+            Operation::Delete { .. } | Operation::Update { .. } | Operation::Insert { .. } => {
+                self.has_unstructured_writes.insert(txn_id);
+            }
+            Operation::SimpleSelect { table_name, key } => {
+                if self.has_unstructured_writes.contains(&txn_id) {
+                    return Ok(());
+                }
+                let key_pair = (table_name.clone(), key.clone());
+                if self
+                    .written_keys
+                    .get(&txn_id)
+                    .is_some_and(|s| s.contains(&key_pair))
+                {
+                    return Ok(());
+                }
+
+                match self.first_reads.entry(txn_id).or_default().entry(key_pair) {
+                    hash_map::Entry::Vacant(e) => {
+                        e.insert(rows.clone());
+                    }
+                    hash_map::Entry::Occupied(e) => {
+                        let first = e.get();
+                        if first != rows {
+                            return Err(anyhow!(
+                                "snapshot violation: table={table_name}, key={key}: \
+                                 first read returned {first:?} but subsequent read \
+                                 in the same transaction returned {rows:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn abort_fiber(&mut self, _fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
+        if let Some(t) = txn_id {
+            self.clear_txn(t);
+        }
+        Ok(())
+    }
+}
+
+/// Checks that writes from rolled-back transactions are never visible to any
+/// subsequent read. This tests the Isolation guarantee from ACID: uncommitted
+/// writes from one transaction must not contaminate the view of any other
+/// connection or of the same connection after rollback.
+///
+/// Tracks (table, key) pairs through their lifecycle:
+/// - In-flight: inserted by an active explicit transaction.
+/// - Committed: promoted from in-flight on Commit, or inserted by an autocommit op.
+/// - Rolled-back: moved from in-flight on Rollback, only if never committed by any txn.
+///
+/// A SimpleSelect returning rows for a rolled-back key is a violation.
+pub struct RolledBackInsertsNotVisible {
+    /// Per txn_id: keys inserted by SimpleInsert in that explicit tx.
+    in_flight: HashMap<u64, HashSet<(String, String)>>,
+    /// Keys that have been committed at any point by any connection.
+    committed: HashSet<(String, String)>,
+    /// Keys from rolled-back txns that have never been committed — must not be
+    /// visible to any subsequent SimpleSelect.
+    rolled_back: HashSet<(String, String)>,
+}
+
+impl Default for RolledBackInsertsNotVisible {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RolledBackInsertsNotVisible {
+    pub fn new() -> Self {
+        Self {
+            in_flight: HashMap::new(),
+            committed: HashSet::new(),
+            rolled_back: HashSet::new(),
+        }
+    }
+}
+
+impl Property for RolledBackInsertsNotVisible {
+    fn finish_op(
+        &mut self,
+        _step: usize,
+        _fiber_id: usize,
+        txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let Ok(_) = result else {
+            return Ok(());
+        };
+
+        match op {
+            Operation::SimpleInsert {
+                table_name, key, ..
+            } => {
+                let pair = (table_name.clone(), key.clone());
+                match txn_id {
+                    Some(t) => {
+                        self.in_flight.entry(t).or_default().insert(pair);
+                    }
+                    None => {
+                        // Autocommit insert: committed immediately.
+                        self.rolled_back.remove(&pair);
+                        self.committed.insert(pair);
+                    }
+                }
+            }
+            Operation::Commit => {
+                let t = txn_id.expect("Commit must have a txn_id");
+                for pair in self.in_flight.remove(&t).unwrap_or_default() {
+                    self.rolled_back.remove(&pair);
+                    self.committed.insert(pair);
+                }
+            }
+            Operation::Rollback => {
+                let t = txn_id.expect("Rollback must have a txn_id");
+                for pair in self.in_flight.remove(&t).unwrap_or_default() {
+                    if !self.committed.contains(&pair) {
+                        self.rolled_back.insert(pair);
+                    }
+                }
+            }
+            Operation::Delete { .. } | Operation::Update { .. } | Operation::Insert { .. } => {
+                // Unstructured SQL might delete or overwrite any committed key.
+                // We can't track what it removed, so clear rolled_back to avoid
+                // false positives: a rolled-back key that was then legitimately
+                // deleted would otherwise trigger an incorrect violation report
+                // when a subsequent SELECT returns empty (correctly).
+                self.rolled_back.clear();
+            }
+            Operation::SimpleSelect { table_name, key } => {
+                let rows = result.as_ref().unwrap();
+                let pair = (table_name.clone(), key.clone());
+                if !rows.is_empty() && self.rolled_back.contains(&pair) {
+                    return Err(anyhow!(
+                        "isolation violation: table={table_name}, key={key} \
+                         was written by a rolled-back transaction but is still visible"
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn abort_fiber(&mut self, _fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
+        // An aborted fiber's in-flight writes are effectively rolled back.
+        if let Some(t) = txn_id {
+            for pair in self.in_flight.remove(&t).unwrap_or_default() {
+                if !self.committed.contains(&pair) {
+                    self.rolled_back.insert(pair);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_restart(
+        &mut self,
+        _persisted_sequences: &HashMap<String, PersistedSequenceState>,
+    ) -> anyhow::Result<()> {
+        // After a full restart, all in-flight writes are gone (rolled back by the
+        // engine). Promote any in-flight state to rolled-back, then carry
+        // committed forward — committed data must survive a reopen.
+        for (_, keys) in self.in_flight.drain() {
+            for pair in keys {
+                if !self.committed.contains(&pair) {
+                    self.rolled_back.insert(pair);
+                }
+            }
+        }
         Ok(())
     }
 }

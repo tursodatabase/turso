@@ -302,6 +302,8 @@ SELECT datetime('now');
 -- '2025-06-15 14:30:00'
 ```
 
+As in SQLite, `'now'` does not change while a statement computes one result row: every use of it returns the same time. A call whose arguments are all constant, such as `datetime('now')` or `CURRENT_TIMESTAMP`, is computed once and returns the same time for every row of the statement.
+
 ## Modifiers
 
 Modifiers transform the time value. Multiple modifiers are applied left to right. If any modifier is invalid, the function returns NULL.

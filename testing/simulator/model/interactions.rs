@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -961,8 +961,7 @@ fn reopen_database(env: &mut SimulatorEnv, power_loss: bool) -> Result<()> {
                 turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new()
                     .with_autovacuum(true)
-                    .with_attach(true)
-                    .with_generated_columns(true),
+                    .with_attach(true),
                 None,
                 Arc::new(SqliteDialect),
             ) {

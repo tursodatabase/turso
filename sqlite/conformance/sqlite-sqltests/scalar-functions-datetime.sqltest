@@ -1539,6 +1539,20 @@ expect {
     2460699.048964896
 }
 
+test strftime-julianday-sixteen-significant-digits {
+    SELECT strftime('%J', 10.609676180555555), strftime('%J', 123456.123456789);
+}
+expect {
+    10.60967618055555|123456.123456794
+}
+
+test strftime-real-format-argument {
+    SELECT strftime(2460324.8751736111, 0), CAST(2460324.8751736111 AS TEXT), strftime(1.0, 0);
+}
+expect {
+    2460324.87517361|2460324.87517361|1.0
+}
+
 test strftime-hour-without-leading-zero-1 {
     SELECT strftime('%k', '2025-01-23T13:10:30.567');
 }
@@ -2206,6 +2220,71 @@ test time_date-overflow-issue-5251 {
 expect {
 }
 
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_date-day-overflow-issue-11398 {
+    SELECT make_date(1, 4, 1453556443);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_timestamp-day-overflow-issue-11398 {
+    SELECT make_timestamp(2024, 1, 1453556443, 0, 0, 0);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_date-year-wider-than-i32 {
+    SELECT make_date(4294969297, 1, 1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_date-month-wider-than-i32 {
+    SELECT make_date(2024, 4294967297, 1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_date-offset-overflow {
+    SELECT time_date(2000, 1, 1, 0, 0, -9223372036854775808, 0, 1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_date-offset-overflow-negative {
+    SELECT time_date(2024, 1, 1, 0, 0, 9223372036854775807, 0, -1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_add-overflow {
+    SELECT time_add(time_date(-262143, 1, 1), -9223372036854775807);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_add_date-day-overflow {
+    SELECT time_add_date(make_date(2024, 1, 1), 0, 0, 1453556443);
+}
+expect error {
+    time creation error
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_add_date-year-overflow {
+    SELECT time_add_date(make_date(2024, 1, 1), 2147483647);
+}
+expect error {
+    time creation error
+}
+
 # Invalid date and time
 test invalid-date {
     SELECT date('2024-07-21 24:00:00');
@@ -2758,4 +2837,47 @@ test datetime-accepts-vertical-tab-whitespace {
 }
 expect {
     '2024-01-01'|'2000-01-01 12:00:00'|'2023-02-25'|'-4713-11-24 12:00:00'|'2024-01-01'|'2024-01-01 12:00:00'|'2024-01-01 11:00:00'
+}
+
+test datetime-modifier-rejects-text-after-unit-or-date {
+    SELECT quote(date('2024-01-01', '+1 day ')), quote(date('2024-01-01', '+1 day x')), quote(date('2024-01-01', '+1 month ')), quote(date('2024-01-01', '+0001-00-01 ')), quote(date(0, '+1 day ')), quote(date('2024-01-01', '+1 day' || char(9))), quote(date('2024-01-01', '+1 day' || char(10))), quote(date('2024-01-01', '+0001-00-01' || char(9))), quote(datetime('2024-01-01', '+0001-00-01  12:00'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL
+}
+
+test datetime-modifier-allows-whitespace-inside {
+    SELECT quote(date('2024-01-01', '+1  day')), quote(date('2024-01-01', '+1' || char(9) || 'days')), quote(datetime('2024-01-01', '+0001-00-01 12:00 ')), quote(datetime('2024-01-01', '+0001-00-01' || char(9) || '12:00'));
+}
+expect {
+    '2024-01-02'|'2024-01-02'|'2025-01-02 12:00:00'|'2025-01-02 12:00:00'
+}
+
+test datetime-modifier-date-offset-requires-sign {
+    SELECT quote(datetime('2024-03-15 10:20:30', '0001-00-01')), quote(datetime('2024-03-15 10:20:30', '0001-00-01 12:00')), quote(datetime('2024-03-15 10:20:30', '0001-00-01' || char(9) || '12:00')), quote(datetime('2024-03-15 10:20:30', '0001-00-01' || char(10) || '12:00'));
+}
+expect {
+    NULL|NULL|NULL|NULL
+}
+
+test datetime-modifier-date-offset-five-digit-year {
+    SELECT quote(datetime('2024-03-15 10:20:30', '+00001-00-01')), quote(datetime('2024-03-15 10:20:30', '-00001-02-03 01:00')), quote(datetime('2024-03-15 10:20:30', '+000001-00-01'));
+}
+expect {
+    '2025-03-16 10:20:30'|'2023-01-12 09:20:30'|NULL
+}
+
+test current-time-same-for-whole-statement {
+    SELECT count(DISTINCT d), count(DISTINCT s), count(DISTINCT j), count(DISTINCT u), count(DISTINCT t)
+    FROM (SELECT datetime('subsecond') AS d, strftime('%Y-%m-%d %H:%M:%f', 'now') AS s, julianday('now') AS j, unixepoch('subsec') AS u, time('subsec') AS t FROM generate_series(1, 100000));
+}
+expect {
+    1|1|1|1|1
+}
+
+test current-time-same-for-streamed-rows {
+    SELECT count(*) FROM (SELECT DISTINCT datetime('subsecond') FROM generate_series(1, 100000));
+}
+expect {
+    1
 }

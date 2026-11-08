@@ -15,7 +15,7 @@ name = "turso_pg_parser"
 path = "lib.rs"
 
 [dependencies]
-pg_query = "6.1"
+pg_query = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 turso_parser = { workspace = true }

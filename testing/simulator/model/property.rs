@@ -57,6 +57,15 @@ pub enum Property {
         select_before: Select,
         select_after: Select,
     },
+    /// ReadYourUpdatesBackDeferred is the same as ReadYourUpdatesBack but wraps
+    /// the UPDATE in BEGIN DEFERRED instead of BEGIN IMMEDIATE. This exercises
+    /// the deferred-transaction path where the database snapshot is established
+    /// at the first read/write rather than at BEGIN time.
+    ReadYourUpdatesBackDeferred {
+        update: Update,
+        select_before: Select,
+        select_after: Select,
+    },
     /// TableHasExpectedContent is a property in which the table
     /// must have the expected content, i.e. all the insertions and
     /// updates and deletions should have been persisted in the way
@@ -291,6 +300,7 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::LateralMatchesJsonEach { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ReadYourUpdatesBackDeferred { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }

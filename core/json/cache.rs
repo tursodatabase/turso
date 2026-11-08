@@ -69,7 +69,7 @@ impl JsonCache {
         let key = key.as_value_ref();
         for i in (0..self.used).rev() {
             if let Some((stored_key, value)) = &self.entries[i] {
-                if key == *stored_key {
+                if key.value_type() == stored_key.value_type() && key == *stored_key {
                     let json = value.try_clone()?;
                     self.age[i] = self.counter;
                     self.counter += 1;

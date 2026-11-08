@@ -281,7 +281,9 @@ impl SelectStmt {
     }
 
     /// Returns true if any ORDER BY expression is a bare column reference to
-    /// a primary key or non-nullable unique column of the FROM table.
+    /// a primary key or non-nullable unique column of the FROM table. With
+    /// DISTINCT the column must also be selected, or DISTINCT can merge rows
+    /// with different values of it.
     fn order_by_includes_unique_column(&self, schema: &Schema) -> bool {
         let Some(from) = &self.from else {
             return false;
@@ -302,13 +304,23 @@ impl SelectStmt {
                         return false;
                     }
                 }
-                table.columns.iter().any(|c| {
+                let is_unique = table.columns.iter().any(|c| {
                     c.name == col_ref.column && (c.primary_key || (c.unique && !c.nullable))
-                })
+                });
+                is_unique && (!self.distinct || self.selects_column(&col_ref.column))
             } else {
                 false
             }
         })
+    }
+
+    /// Returns true if the select list is `*` or contains a bare reference to `column`.
+    fn selects_column(&self, column: &str) -> bool {
+        self.columns.is_empty()
+            || self
+                .columns
+                .iter()
+                .any(|c| matches!(&c.expr, Expr::ColumnRef(r) if r.column == column))
     }
 }
 
@@ -333,7 +345,7 @@ impl Expr {
                 .unordered_limit_reason()
                 .or_else(|| b.right.unordered_limit_reason()),
             Expr::UnaryOp(u) => u.operand.unordered_limit_reason(),
-            Expr::FunctionCall(fc) => fc.args.iter().find_map(|a| a.unordered_limit_reason()),
+            Expr::FunctionCall(fc) => fc.inputs().find_map(|a| a.unordered_limit_reason()),
             Expr::Case(c) => c
                 .operand
                 .as_ref()
@@ -388,8 +400,7 @@ impl Expr {
                 .or_else(|| b.right.non_unique_order_by_reason(schema)),
             Expr::UnaryOp(u) => u.operand.non_unique_order_by_reason(schema),
             Expr::FunctionCall(fc) => fc
-                .args
-                .iter()
+                .inputs()
                 .find_map(|a| a.non_unique_order_by_reason(schema)),
             Expr::Case(c) => c
                 .operand
@@ -447,7 +458,7 @@ impl Expr {
                 {
                     return true;
                 }
-                fc.args.iter().any(|a| a.contains_aggregate())
+                fc.inputs().any(|a| a.contains_aggregate())
             }
             Expr::BinaryOp(b) => b.left.contains_aggregate() || b.right.contains_aggregate(),
             Expr::UnaryOp(u) => u.operand.contains_aggregate(),
@@ -487,7 +498,7 @@ impl Expr {
     pub fn contains_column_ref(&self) -> bool {
         match self {
             Expr::ColumnRef(_) => true,
-            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_column_ref()),
+            Expr::FunctionCall(fc) => fc.inputs().any(|a| a.contains_column_ref()),
             Expr::BinaryOp(b) => b.left.contains_column_ref() || b.right.contains_column_ref(),
             Expr::UnaryOp(u) => u.operand.contains_column_ref(),
             Expr::Cast(c) => c.expr.contains_column_ref(),
@@ -527,7 +538,7 @@ impl Expr {
     pub fn contains_scalar_subquery(&self) -> bool {
         match self {
             Expr::Subquery(_) => true,
-            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_scalar_subquery()),
+            Expr::FunctionCall(fc) => fc.inputs().any(|a| a.contains_scalar_subquery()),
             Expr::BinaryOp(b) => {
                 b.left.contains_scalar_subquery() || b.right.contains_scalar_subquery()
             }
@@ -1217,6 +1228,9 @@ pub struct ColumnDefStmt {
     pub unique: bool,
     pub default: Option<Expr>,
     pub check: Option<Expr>,
+    /// `GENERATED ALWAYS AS (<expr>) STORED`. `None` means a regular column.
+    /// When this is `Some`, `default`, `not_null`, and `unique` must all be unset.
+    pub generated: Option<Expr>,
 }
 
 impl fmt::Display for ColumnDefStmt {
@@ -1227,20 +1241,26 @@ impl fmt::Display for ColumnDefStmt {
             write!(f, " PRIMARY KEY")?;
         }
 
-        if self.not_null && !self.primary_key {
-            write!(f, " NOT NULL")?;
-        }
+        if self.generated.is_none() {
+            if self.not_null && !self.primary_key {
+                write!(f, " NOT NULL")?;
+            }
 
-        if self.unique && !self.primary_key {
-            write!(f, " UNIQUE")?;
-        }
+            if self.unique && !self.primary_key {
+                write!(f, " UNIQUE")?;
+            }
 
-        if let Some(default) = &self.default {
-            write!(f, " DEFAULT ({default})")?;
+            if let Some(default) = &self.default {
+                write!(f, " DEFAULT ({default})")?;
+            }
         }
 
         if let Some(check) = &self.check {
             write!(f, " CHECK ({check})")?;
+        }
+
+        if let Some(expr) = &self.generated {
+            write!(f, " GENERATED ALWAYS AS ({expr}) STORED")?;
         }
 
         Ok(())
@@ -1284,7 +1304,7 @@ pub enum AlterTableAction {
     /// RENAME TO new_name
     RenameTo(String),
     /// ADD COLUMN column_def
-    AddColumn(ColumnDefStmt),
+    AddColumn(Box<ColumnDefStmt>),
     /// DROP COLUMN column_name
     DropColumn(String),
     /// RENAME COLUMN old_name TO new_name
@@ -1613,6 +1633,8 @@ impl Expr {
         Expr::FunctionCall(FunctionCallExpr {
             name,
             args,
+            distinct: false,
+            order_by: Vec::new(),
             filter: None,
         })
     }
@@ -1628,6 +1650,8 @@ impl Expr {
         Expr::FunctionCall(FunctionCallExpr {
             name,
             args,
+            distinct: false,
+            order_by: Vec::new(),
             filter: Some(Box::new(filter)),
         })
     }
@@ -1786,7 +1810,12 @@ impl fmt::Display for Literal {
                 if r.is_infinite() || r.is_nan() {
                     write!(f, "NULL")
                 } else {
-                    write!(f, "{r}")
+                    let value = r.to_string();
+                    write!(f, "{value}")?;
+                    if !value.contains(['.', 'e', 'E']) {
+                        write!(f, ".0")?;
+                    }
+                    Ok(())
                 }
             }
             Literal::Text(s) => {
@@ -1815,7 +1844,17 @@ pub struct BinaryOpExpr {
 
 impl fmt::Display for BinaryOpExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}", self.left, self.op, self.right)
+        if matches!(self.left, Expr::BinaryOp(_)) {
+            write!(f, "({})", self.left)?;
+        } else {
+            write!(f, "{}", self.left)?;
+        }
+        write!(f, " {} ", self.op)?;
+        if matches!(self.right, Expr::BinaryOp(_)) {
+            write!(f, "({})", self.right)
+        } else {
+            write!(f, "{}", self.right)
+        }
     }
 }
 
@@ -1994,23 +2033,46 @@ pub enum UnaryOp {
 pub struct FunctionCallExpr {
     pub name: String,
     pub args: Vec<Expr>,
+    pub distinct: bool,
+    pub order_by: Vec<OrderByItem>,
     pub filter: Option<Box<Expr>>,
 }
 
 impl fmt::Display for FunctionCallExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}(", self.name)?;
+        if self.distinct {
+            write!(f, "DISTINCT ")?;
+        }
         for (i, arg) in self.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(f, "{arg}")?;
         }
+        if !self.order_by.is_empty() {
+            write!(f, " ORDER BY ")?;
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{item}")?;
+            }
+        }
         write!(f, ")")?;
         if let Some(filter_expr) = &self.filter {
             write!(f, " FILTER (WHERE {filter_expr})")?;
         }
         Ok(())
+    }
+}
+
+impl FunctionCallExpr {
+    fn inputs(&self) -> impl Iterator<Item = &Expr> {
+        self.args
+            .iter()
+            .chain(self.order_by.iter().map(|item| &item.expr))
+            .chain(self.filter.as_deref())
     }
 }
 
@@ -2339,6 +2401,56 @@ mod tests {
         assert_eq!(Literal::Text("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(Literal::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
+    }
+
+    #[test]
+    fn real_literal_display_preserves_type_and_value() {
+        for value in [
+            0.0,
+            -0.0,
+            1.0,
+            -42.0,
+            3.5,
+            1e20,
+            1e-20,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            let sql = Literal::Real(value).to_string();
+            assert!(sql.contains(['.', 'e', 'E']), "{sql} is an integer literal");
+            assert_eq!(sql.parse::<f64>().unwrap().to_bits(), value.to_bits());
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(Literal::Real(value).to_string(), "NULL");
+        }
+    }
+
+    #[test]
+    fn binary_op_display_preserves_left_operand_grouping() {
+        let expr = BinaryOpExpr {
+            left: Expr::BinaryOp(Box::new(BinaryOpExpr {
+                left: Expr::Literal(Literal::Integer(1)),
+                op: BinOp::Add,
+                right: Expr::Literal(Literal::Integer(2)),
+            })),
+            op: BinOp::Mul,
+            right: Expr::Literal(Literal::Integer(3)),
+        };
+        assert_eq!(expr.to_string(), "(1 + 2) * 3");
+    }
+
+    #[test]
+    fn binary_op_display_preserves_right_operand_grouping() {
+        let expr = BinaryOpExpr {
+            left: Expr::Literal(Literal::Integer(9)),
+            op: BinOp::Sub,
+            right: Expr::BinaryOp(Box::new(BinaryOpExpr {
+                left: Expr::Literal(Literal::Integer(3)),
+                op: BinOp::Sub,
+                right: Expr::Literal(Literal::Integer(1)),
+            })),
+        };
+        assert_eq!(expr.to_string(), "9 - (3 - 1)");
     }
 
     #[test]
@@ -3078,6 +3190,66 @@ mod tests {
     }
 
     #[test]
+    fn test_non_unique_order_by_detected_for_pk_not_selected_with_distinct() {
+        use crate::schema::{ColumnDef, Schema, Table};
+
+        let schema = Schema {
+            tables: vec![Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            )],
+            indexes: vec![],
+            triggers: vec![],
+            attached_databases: vec![],
+        };
+        let column = |name: &str| {
+            Expr::ColumnRef(ColumnRef {
+                table: None,
+                column: name.to_string(),
+            })
+        };
+        let select = |columns: Vec<&str>| SelectStmt {
+            with_clause: None,
+            distinct: true,
+            columns: columns
+                .into_iter()
+                .map(|name| SelectColumn {
+                    expr: column(name),
+                    alias: None,
+                })
+                .collect(),
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            compounds: vec![],
+            order_by: vec![OrderByItem {
+                expr: column("id"),
+                direction: OrderDirection::Asc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert_eq!(
+            select(vec!["name"]).non_unique_order_by_reason(&schema),
+            Some("limit_non_unique_order_by")
+        );
+        assert_eq!(
+            select(vec!["name", "id"]).non_unique_order_by_reason(&schema),
+            None
+        );
+        assert_eq!(select(vec![]).non_unique_order_by_reason(&schema), None);
+    }
+
+    #[test]
     fn test_create_temp_table_display() {
         let stmt = CreateTableStmt {
             table: "t".to_string(),
@@ -3089,6 +3261,7 @@ mod tests {
                 unique: false,
                 default: None,
                 check: None,
+                generated: None,
             }],
             if_not_exists: false,
             strict: false,

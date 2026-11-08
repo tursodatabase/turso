@@ -144,6 +144,7 @@ func (s *stubServer) handleCursor(w http.ResponseWriter, r *http.Request) {
 			},
 		)
 	}
+	lines = append(lines, map[string]any{"type": "replication_index", "replication_index": nil})
 	enc := json.NewEncoder(w)
 	for _, line := range lines {
 		if err := enc.Encode(line); err != nil {

@@ -104,3 +104,22 @@ test without-rowid-foreign-keys-rejected {
 expect error {
     foreign keys on WITHOUT ROWID tables are not supported
 }
+
+test without-rowid-add-column-check-reads-columns-in-declared-order {
+    CREATE TABLE t(c, d, a, PRIMARY KEY(a, d)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t ADD COLUMN b INT DEFAULT 4 CHECK (c = 1 AND d = 2 AND a = 3 AND b = 4);
+    SELECT * FROM t;
+}
+expect {
+    1|2|3|4
+}
+
+test without-rowid-add-column-check-rejects-primary-key-value {
+    CREATE TABLE t(c, a PRIMARY KEY) WITHOUT ROWID;
+    INSERT INTO t VALUES (5, 2);
+    ALTER TABLE t ADD COLUMN b INT CHECK (a = 5);
+}
+expect error {
+    CHECK constraint failed: a = 5
+}

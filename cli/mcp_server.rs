@@ -1,3 +1,4 @@
+use crate::app::quote_ident;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,11 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect,
-    Value as DbValue,
+    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -81,14 +82,19 @@ impl StmtClass {
             | Stmt::CreateVirtualTable(_)
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
+            | Stmt::CreateRole { .. }
+            | Stmt::Grant(_)
             | Stmt::CreateSequence { .. }
+            | Stmt::CreateSchema { .. }
+            | Stmt::DropSchema { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
             | Stmt::DropTrigger { .. }
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::DropSequence { .. } => Some(Self::Schema),
+            | Stmt::DropSequence { .. }
+            | Stmt::AlterSequenceOwnedBy { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
@@ -161,6 +167,35 @@ fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, 
     Ok(sql)
 }
 
+fn jsonrpc_error(id: Option<Value>, code: i32, message: &str) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        }),
+    }
+}
+
+const PARSE_ERROR: i32 = -32700;
+const INVALID_REQUEST: i32 = -32600;
+
+/// Turn one input line into a JSON-RPC request.
+///
+/// Malformed JSON is a Parse error (`-32700`). Well-formed JSON that does not
+/// describe a request is an Invalid Request (`-32600`) that echoes the id when
+/// the client supplied one, so it can pair the error with its call.
+fn parse_request_line(line: &str) -> Result<JsonRpcRequest, Box<JsonRpcResponse>> {
+    let value: Value = serde_json::from_str(line)
+        .map_err(|_| Box::new(jsonrpc_error(None, PARSE_ERROR, "Parse error")))?;
+    let id = value.get("id").cloned();
+    serde_json::from_value(value)
+        .map_err(|_| Box::new(jsonrpc_error(id, INVALID_REQUEST, "Invalid Request")))
+}
+
 pub struct TursoMcpServer {
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
@@ -174,6 +209,23 @@ impl TursoMcpServer {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
             current_db_path: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Turn one input line into the response that must be written to stdout.
+    ///
+    /// Blank lines and notifications (requests without an id) produce nothing.
+    fn process_line(&self, line: &str) -> Option<JsonRpcResponse> {
+        if line.trim().is_empty() {
+            return None;
+        }
+        match parse_request_line(line) {
+            Ok(request) => {
+                let response = self.handle_request(request);
+                // Don't send a response for notifications (when id is None)
+                (response.id.is_some() || response.error.is_some()).then_some(response)
+            }
+            Err(response) => Some(*response),
         }
     }
 
@@ -214,21 +266,7 @@ impl TursoMcpServer {
             // Try to receive a line with a timeout so we can check for interruption
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(line)) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-
-                    let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                        Ok(req) => req,
-                        Err(e) => {
-                            eprintln!("Failed to parse JSON-RPC request: {e}");
-                            continue;
-                        }
-                    };
-
-                    let response = self.handle_request(request);
-                    // Don't send a response for notifications (when id is None)
-                    if response.id.is_some() || response.error.is_some() {
+                    if let Some(response) = self.process_line(&line) {
                         let response_json = serde_json::to_string(&response)?;
                         writeln!(stdout_lock, "{response_json}")?;
                         stdout_lock.flush()?;
@@ -267,6 +305,12 @@ impl TursoMcpServer {
 
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request),
+            "ping" => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({})),
+                error: None,
+            },
             "tools/list" => self.handle_list_tools(request),
             "tools/call" => self.handle_call_tool(request),
             _ => JsonRpcResponse {
@@ -483,26 +527,33 @@ impl TursoMcpServer {
             }
         };
 
+        // A failed tool call is a normal result with isError set, so the
+        // client can show the error text to the model.
+        let (text, is_error) = match result {
+            Ok(text) => (text, false),
+            Err(text) => (text, true),
+        };
         JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: request.id,
             result: Some(json!({
                 "content": [{
                     "type": "text",
-                    "text": result
-                }]
+                    "text": text
+                }],
+                "isError": is_error
             })),
             error: None,
         }
     }
 
-    fn open_database(&self, arguments: &Option<Value>) -> String {
+    fn open_database(&self, arguments: &Option<Value>) -> Result<String, String> {
         let path = match arguments {
             Some(args) => match args.get("path") {
                 Some(Value::String(p)) => p.clone(),
-                _ => return "Missing or invalid path parameter".to_string(),
+                _ => return Err("Missing or invalid path parameter".to_string()),
             },
-            None => return "Missing path parameter".to_string(),
+            None => return Err("Missing path parameter".to_string()),
         };
 
         // Create parent directories if needed
@@ -511,7 +562,7 @@ impl TursoMcpServer {
             if let Some(parent) = db_path.parent() {
                 if !parent.exists() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
-                        return format!("Failed to create parent directories: {e}");
+                        return Err(format!("Failed to create parent directories: {e}"));
                     }
                 }
             }
@@ -521,7 +572,7 @@ impl TursoMcpServer {
         let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
             match Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect)) {
                 Ok((_io, c)) => c,
-                Err(e) => return format!("Failed to open database '{path}': {e}"),
+                Err(e) => return Err(format!("Failed to open database '{path}': {e}")),
             }
         } else {
             match Database::open_new(
@@ -534,9 +585,9 @@ impl TursoMcpServer {
             ) {
                 Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
                     Ok(c) => c,
-                    Err(e) => return format!("Failed to connect to database '{path}': {e}"),
+                    Err(e) => return Err(format!("Failed to connect to database '{path}': {e}")),
                 },
-                Err(e) => return format!("Failed to open database '{path}': {e}"),
+                Err(e) => return Err(format!("Failed to open database '{path}': {e}")),
             }
         };
 
@@ -544,17 +595,17 @@ impl TursoMcpServer {
         *self.conn.lock().unwrap() = conn;
         *self.current_db_path.lock().unwrap() = Some(path.clone());
 
-        format!("Successfully opened database: {path}")
+        Ok(format!("Successfully opened database: {path}"))
     }
 
-    fn current_database(&self) -> String {
-        match &*self.current_db_path.lock().unwrap() {
+    fn current_database(&self) -> Result<String, String> {
+        Ok(match &*self.current_db_path.lock().unwrap() {
             Some(path) => format!("Current database: {path}"),
             None => "Current database: :memory: (default)".to_string(),
-        }
+        })
     }
 
-    fn list_tables(&self) -> String {
+    fn list_tables(&self) -> Result<String, String> {
         let query = "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1";
 
         let conn = self.conn.lock().unwrap().clone();
@@ -569,31 +620,31 @@ impl TursoMcpServer {
                     Ok(())
                 });
                 if let Err(err) = res {
-                    return err.to_string();
+                    return Err(err.to_string());
                 }
 
                 if tables.is_empty() {
-                    "No tables found in the database".to_string()
+                    Ok("No tables found in the database".to_string())
                 } else {
-                    tables.join(", ")
+                    Ok(tables.join(", "))
                 }
             }
-            Ok(None) => "No results returned from the query".to_string(),
-            Err(e) => format!("Error querying database: {e}"),
+            Ok(None) => Ok("No results returned from the query".to_string()),
+            Err(e) => Err(format!("Error querying database: {e}")),
         }
     }
 
-    fn describe_table(&self, arguments: &Option<Value>) -> String {
+    fn describe_table(&self, arguments: &Option<Value>) -> Result<String, String> {
         let table_name = match arguments {
             Some(args) => match args.get("table_name") {
                 Some(Value::String(name)) => name,
-                _ => return "Missing or invalid table_name parameter".to_string(),
+                _ => return Err("Missing or invalid table_name parameter".to_string()),
             },
-            None => return "Missing table_name parameter".to_string(),
+            None => return Err("Missing table_name parameter".to_string()),
         };
 
         // Use table_xinfo to include generated columns (table_info hides them)
-        let query = format!("PRAGMA table_xinfo({table_name})");
+        let query = format!("PRAGMA table_xinfo({})", quote_ident(table_name));
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(&query) {
@@ -652,24 +703,24 @@ impl TursoMcpServer {
                 });
 
                 if let Err(err) = res {
-                    return err.to_string();
+                    return Err(err.to_string());
                 }
                 if columns.is_empty() {
-                    format!("Table '{table_name}' not found")
+                    Err(format!("Table '{table_name}' not found"))
                 } else {
-                    format!("Table '{table_name}' columns:\n{}", columns.join("\n"))
+                    Ok(format!(
+                        "Table '{table_name}' columns:\n{}",
+                        columns.join("\n")
+                    ))
                 }
             }
-            Ok(None) => format!("Table '{table_name}' not found"),
-            Err(e) => format!("Error querying database: {e}"),
+            Ok(None) => Err(format!("Table '{table_name}' not found")),
+            Err(e) => Err(format!("Error querying database: {e}")),
         }
     }
 
-    fn execute_query(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Select) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn execute_query(&self, arguments: &Option<Value>) -> Result<String, String> {
+        let query = validated_query(arguments, StmtClass::Select)?;
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(query) {
@@ -694,7 +745,7 @@ impl TursoMcpServer {
                 });
 
                 if let Err(err) = res {
-                    return err.to_string();
+                    return Err(err.to_string());
                 }
 
                 // Format results as text table
@@ -712,65 +763,53 @@ impl TursoMcpServer {
                 }
 
                 if output.is_empty() {
-                    "No results returned from the query".to_string()
+                    Ok("No results returned from the query".to_string())
                 } else {
-                    output
+                    Ok(output)
                 }
             }
-            Ok(None) => "No results returned from the query".to_string(),
-            Err(e) => format!("Error executing query: {e}"),
+            Ok(None) => Ok("No results returned from the query".to_string()),
+            Err(e) => Err(format!("Error executing query: {e}")),
         }
     }
 
-    fn insert_data(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Insert) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn insert_data(&self, arguments: &Option<Value>) -> Result<String, String> {
+        let query = validated_query(arguments, StmtClass::Insert)?;
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
-            Ok(()) => "INSERT successful.".to_string(),
-            Err(e) => format!("Error executing INSERT: {e}"),
+            Ok(()) => Ok("INSERT successful.".to_string()),
+            Err(e) => Err(format!("Error executing INSERT: {e}")),
         }
     }
 
-    fn update_data(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Update) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn update_data(&self, arguments: &Option<Value>) -> Result<String, String> {
+        let query = validated_query(arguments, StmtClass::Update)?;
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
-            Ok(()) => "UPDATE successful.".to_string(),
-            Err(e) => format!("Error executing UPDATE: {e}"),
+            Ok(()) => Ok("UPDATE successful.".to_string()),
+            Err(e) => Err(format!("Error executing UPDATE: {e}")),
         }
     }
 
-    fn delete_data(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Delete) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn delete_data(&self, arguments: &Option<Value>) -> Result<String, String> {
+        let query = validated_query(arguments, StmtClass::Delete)?;
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
-            Ok(()) => "DELETE successful.".to_string(),
-            Err(e) => format!("Error executing DELETE: {e}"),
+            Ok(()) => Ok("DELETE successful.".to_string()),
+            Err(e) => Err(format!("Error executing DELETE: {e}")),
         }
     }
 
-    fn schema_change(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Schema) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn schema_change(&self, arguments: &Option<Value>) -> Result<String, String> {
+        let query = validated_query(arguments, StmtClass::Schema)?;
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
-            Ok(()) => "Schema change successful.".to_string(),
-            Err(e) => format!("Error executing schema change: {e}"),
+            Ok(()) => Ok("Schema change successful.".to_string()),
+            Err(e) => Err(format!("Error executing schema change: {e}")),
         }
     }
 }
@@ -790,6 +829,15 @@ mod tests {
         Some(json!({ "query": sql }))
     }
 
+    fn call_tool(server: &TursoMcpServer, name: &str, arguments: Value) -> JsonRpcResponse {
+        server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(json!({ "name": name, "arguments": arguments })),
+        })
+    }
+
     fn seed_bench_orders(server: &TursoMcpServer) {
         let conn = server.conn.lock().unwrap().clone();
         conn.execute(
@@ -805,9 +853,76 @@ mod tests {
     }
 
     fn orders_dump(server: &TursoMcpServer) -> String {
-        server.execute_query(&query_arg(
-            "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
-        ))
+        server
+            .execute_query(&query_arg(
+                "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn ping_returns_empty_result() {
+        let server = memory_server();
+        let request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+
+        let response = serde_json::to_value(server.handle_request(request)).unwrap();
+
+        assert_eq!(response, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+    }
+
+    fn reply_json(reply: Option<JsonRpcResponse>) -> Value {
+        serde_json::to_value(reply.expect("a JSON-RPC reply must be written to stdout")).unwrap()
+    }
+
+    #[test]
+    fn malformed_json_gets_parse_error() {
+        let server = memory_server();
+
+        let reply = reply_json(server.process_line("{bad json"));
+
+        assert_eq!(
+            reply,
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": "Parse error" }
+            })
+        );
+    }
+
+    #[test]
+    fn request_without_method_gets_invalid_request_with_id() {
+        let server = memory_server();
+
+        let reply = reply_json(server.process_line(r#"{"jsonrpc":"2.0","id":5}"#));
+
+        assert_eq!(
+            reply,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "error": { "code": -32600, "message": "Invalid Request" }
+            })
+        );
+    }
+
+    #[test]
+    fn valid_request_still_dispatches() {
+        let server = memory_server();
+
+        let reply = reply_json(server.process_line(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#));
+
+        assert_eq!(reply, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+    }
+
+    #[test]
+    fn notification_produces_no_reply() {
+        let server = memory_server();
+
+        assert!(server
+            .process_line(r#"{"jsonrpc":"2.0","method":"ping"}"#)
+            .is_none());
     }
 
     #[test]
@@ -820,7 +935,9 @@ mod tests {
         .expect("open memory database");
         let server = TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)));
 
-        let result = server.execute_query(&query_arg("SELECT load_extension('nonexistent')"));
+        let result = server
+            .execute_query(&query_arg("SELECT load_extension('nonexistent')"))
+            .unwrap_err();
 
         assert!(
             result.contains("runtime extension loading is disabled"),
@@ -835,7 +952,7 @@ mod tests {
 
         let result = server.update_data(&query_arg(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
-        ));
+        )).unwrap_err();
 
         assert!(
             result.contains("Only a single UPDATE statement is allowed"),
@@ -861,7 +978,7 @@ mod tests {
         let result = server.update_data(&query_arg(
             "UPDATE bench_orders SET status='DONE; DELETE' WHERE order_id=1",
         ));
-        assert_eq!(result, "UPDATE successful.");
+        assert_eq!(result, Ok("UPDATE successful.".to_string()));
 
         let dump = orders_dump(&server);
         assert!(dump.contains("1 | DONE; DELETE | 1"), "{dump}");
@@ -875,7 +992,7 @@ mod tests {
 
         let result = server.insert_data(&query_arg(
             "INSERT INTO bench_orders VALUES (3, 'NEW', 3); DELETE FROM bench_orders WHERE order_id=2",
-        ));
+        )).unwrap_err();
 
         assert!(
             result.contains("Only a single INSERT statement is allowed"),
@@ -890,9 +1007,11 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.delete_data(&query_arg(
-            "DELETE FROM bench_orders WHERE order_id=1; DROP TABLE bench_orders",
-        ));
+        let result = server
+            .delete_data(&query_arg(
+                "DELETE FROM bench_orders WHERE order_id=1; DROP TABLE bench_orders",
+            ))
+            .unwrap_err();
 
         assert!(
             result.contains("Only a single DELETE statement is allowed"),
@@ -908,9 +1027,11 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.schema_change(&query_arg(
-            "CREATE TABLE extra (id INTEGER); DELETE FROM bench_orders",
-        ));
+        let result = server
+            .schema_change(&query_arg(
+                "CREATE TABLE extra (id INTEGER); DELETE FROM bench_orders",
+            ))
+            .unwrap_err();
 
         assert!(
             result.contains("Only a single schema modification statement is allowed"),
@@ -927,7 +1048,7 @@ mod tests {
 
         let result = server.execute_query(&query_arg(
             "SELECT order_id FROM bench_orders WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
-        ));
+        )).unwrap_err();
 
         assert!(
             result.contains("Only a single SELECT query is allowed"),
@@ -944,8 +1065,80 @@ mod tests {
         let result = server.update_data(&query_arg(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1",
         ));
-        assert_eq!(result, "UPDATE successful.");
+        assert_eq!(result, Ok("UPDATE successful.".to_string()));
         assert!(orders_dump(&server).contains("1 | DONE | 1"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
+    }
+
+    #[test]
+    fn call_tool_sets_is_error_on_failure() {
+        let server = memory_server();
+
+        let rejected = call_tool(
+            &server,
+            "execute_query",
+            json!({ "query": "UPDATE missing SET value = 1" }),
+        );
+        let result = rejected.result.expect("tool failure must be a result");
+        assert!(rejected.error.is_none());
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            json!("Only SELECT queries are allowed")
+        );
+
+        let failed = call_tool(
+            &server,
+            "execute_query",
+            json!({ "query": "SELECT * FROM missing" }),
+        );
+        let result = failed.result.expect("tool failure must be a result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+
+        let missing_query = call_tool(&server, "insert_data", json!({}));
+        let result = missing_query.result.expect("tool failure must be a result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+    }
+
+    #[test]
+    fn call_tool_clears_is_error_on_success() {
+        let server = memory_server();
+
+        let response = call_tool(&server, "execute_query", json!({ "query": "SELECT 1" }));
+        let result = response.result.expect("tool success must be a result");
+        assert_eq!(result["isError"], json!(false), "{result}");
+        assert_eq!(result["content"][0]["text"], json!("1\n-\n1\n"));
+    }
+
+    #[test]
+    fn call_tool_unknown_tool_is_protocol_error() {
+        let server = memory_server();
+
+        let response = call_tool(&server, "no_such_tool", json!({}));
+        assert!(response.result.is_none());
+        assert_eq!(response.error.expect("JSON-RPC error").code, -32601);
+    }
+
+    #[test]
+    fn describe_table_accepts_names_that_need_quoting() {
+        let server = memory_server();
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute(r#"CREATE TABLE "order items" (id INTEGER, label TEXT)"#)
+            .unwrap();
+        conn.execute(r#"CREATE TABLE "a""b" (x INTEGER)"#).unwrap();
+        conn.execute("CREATE TABLE plain (y TEXT)").unwrap();
+
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "order items" }))),
+            Ok("Table 'order items' columns:\nid INTEGER NULL\nlabel TEXT NULL".to_string())
+        );
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "a\"b" }))),
+            Ok("Table 'a\"b' columns:\nx INTEGER NULL".to_string())
+        );
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "plain" }))),
+            Ok("Table 'plain' columns:\ny TEXT NULL".to_string())
+        );
     }
 }

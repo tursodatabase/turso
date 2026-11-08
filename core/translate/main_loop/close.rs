@@ -401,13 +401,13 @@ fn emit_unmatched_right_rows(
             program.emit_insn(Insn::OpenRead {
                 cursor_id: table_cursor_id,
                 root_page: btree.root_page,
-                db: table.database_id,
+                db: table.namespace.database_id,
             });
             for (index, index_cursor_id) in &unmatched_index_cursors {
                 program.emit_insn(Insn::OpenRead {
                     cursor_id: *index_cursor_id,
                     root_page: index.root_page,
-                    db: table.database_id,
+                    db: table.namespace.database_id,
                 });
             }
         }
@@ -1008,9 +1008,9 @@ fn emit_unmatched_rows_subquery(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            false,
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(super) struct AutoIndexResult {
@@ -1118,7 +1118,7 @@ pub(super) fn emit_autoindex(
                 }
             }
         }
-        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+        emit_stored_column(program, table_cursor_id, col.pos_in_table, reg, resolver)?;
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {
@@ -1139,10 +1139,12 @@ pub(super) fn emit_autoindex(
     // the probe treats a NULL key as "definitely absent", which would skip rows
     // whose key IS NULL, so such a seek never probes — and then building the
     // filter would be wasted work on every row.
-    let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {
-        col.collation
-            .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
-    }) && seek_def.start.op.eq_only()
+    let use_bloom_filter = index
+        .columns
+        .iter()
+        .take(num_seek_keys)
+        .all(|col| col.collation == CollationSeq::BINARY)
+        && seek_def.start.op.eq_only()
         && (0..num_seek_keys).all(|i| !seek_def.is_null_matching_key_component(i));
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {

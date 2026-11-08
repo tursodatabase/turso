@@ -1,0 +1,312 @@
+@database :memory:
+
+setup ordered_inputs {
+    CREATE TABLE t(g INTEGER, v TEXT, k INTEGER);
+    INSERT INTO t VALUES (1,'b',2),(2,'y',2),(1,'a',1),(2,'x',1),(1,'c',3);
+}
+
+@setup ordered_inputs
+test aggregate-order-directions {
+    SELECT group_concat(v ORDER BY k, g), group_concat(v ORDER BY k DESC, g DESC), count(*) FROM t;
+}
+expect {
+    a,x,b,y,c|c,y,b,x,a|5
+}
+
+@setup ordered_inputs
+test aggregate-order-grouped {
+    SELECT g, group_concat(v ORDER BY k DESC), sum(k) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|c,b,a|6
+    2|y,x|3
+}
+
+@setup ordered_inputs
+test aggregate-order-indexed-group {
+    CREATE INDEX t_g ON t(g);
+    SELECT g, group_concat(v ORDER BY k DESC), group_concat(v ORDER BY k) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|c,b,a|a,b,c
+    2|y,x|x,y
+}
+
+@setup ordered_inputs
+test aggregate-order-filter {
+    SELECT group_concat(v ORDER BY k DESC, g) FILTER (WHERE k < 3),
+           group_concat(v ORDER BY k) FILTER (WHERE 0), count(v ORDER BY k) FILTER (WHERE 0) FROM t;
+}
+expect {
+    b,y,a,x||0
+}
+
+@setup ordered_inputs
+test aggregate-order-empty {
+    SELECT group_concat(v ORDER BY k), count(v ORDER BY k) FROM t WHERE 0;
+}
+expect {
+    |0
+}
+
+@setup ordered_inputs
+test aggregate-order-correlated {
+    SELECT g, (SELECT group_concat(v ORDER BY k DESC) FROM t WHERE g=o.g) FROM (SELECT 1 AS g UNION ALL SELECT 2 UNION ALL SELECT 1 UNION ALL SELECT 3) o;
+}
+expect {
+    1|c,b,a
+    2|y,x
+    1|c,b,a
+    3|
+}
+
+test aggregate-order-distinct-first-row {
+    CREATE TABLE t(v TEXT, k INTEGER);
+    INSERT INTO t VALUES ('a',3),('b',2),('a',1),('c',4),('b',5);
+    SELECT group_concat(DISTINCT v ORDER BY k), group_concat(DISTINCT v ORDER BY k DESC) FROM t;
+}
+expect {
+    b,a,c|c,a,b
+}
+
+test aggregate-order-null-and-collation {
+    CREATE TABLE t(v TEXT, k TEXT);
+    INSERT INTO t VALUES ('one','b'),('two',NULL),('three','A'),('four','a');
+    SELECT group_concat(v ORDER BY k COLLATE nocase NULLS LAST),
+           group_concat(v ORDER BY k COLLATE nocase DESC NULLS FIRST) FROM t;
+}
+expect {
+    three,four,one,two|two,one,three,four
+}
+
+@setup ordered_inputs
+test aggregate-order-subquery-key {
+    SELECT g, group_concat(v ORDER BY (SELECT -k)) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|c,b,a
+    2|y,x
+}
+
+test aggregate-order-row-dependent-delimiter {
+    CREATE TABLE t(v TEXT, sep TEXT, k INTEGER);
+    INSERT INTO t VALUES ('b','/',2),('c',';',3),('a',':',1);
+    SELECT group_concat(v, sep ORDER BY k) FROM t;
+}
+expect {
+    a/b;c
+}
+
+test aggregate-order-json-subtypes {
+    CREATE TABLE t(v INTEGER, k INTEGER);
+    INSERT INTO t VALUES (2,2),(1,1);
+    SELECT json_group_array(json_array(v) ORDER BY k),
+           json_group_array('[1]' ORDER BY k),
+           json_group_object(v,json_array(v) ORDER BY k) FROM t;
+}
+expect {
+    [[1],[2]]|["[1]","[1]"]|{"1":[1],"2":[2]}
+}
+
+@setup ordered_inputs
+test aggregate-order-distinct-groups {
+    INSERT INTO t VALUES (1,'b',4),(2,'y',4);
+    SELECT g, group_concat(DISTINCT v ORDER BY k DESC) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|c,b,a
+    2|y,x
+}
+
+@setup ordered_inputs
+test aggregate-order-group-filter-empty {
+    SELECT g, group_concat(v ORDER BY k DESC) FILTER (WHERE g=2) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|
+    2|y,x
+}
+
+test aggregate-order-spill-and-group-reset {
+    PRAGMA temp_store=FILE;
+    PRAGMA cache_size=1;
+    CREATE TABLE t(g INTEGER, v INTEGER);
+    WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+    INSERT INTO t SELECT x%2,x FROM n;
+    SELECT g, substr(group_concat(v ORDER BY v DESC),1,14), length(group_concat(v ORDER BY v DESC)), json_extract(json_group_array(json_array(v) ORDER BY v DESC),'$[0][0]') FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    0|2000,1998,1996|4447|2000
+    1|1999,1997,1995|4444|1999
+}
+
+@setup ordered_inputs
+test aggregate-order-filter-before-arguments {
+    CREATE INDEX t_g ON t(g);
+    SELECT g, group_concat(json_extract('bad json', '$') ORDER BY k) FILTER (WHERE 0) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|
+    2|
+}
+
+@setup ordered_inputs
+test aggregate-order-filter-before-keys {
+    SELECT coalesce(group_concat(v ORDER BY json_extract('bad json', '$')) FILTER (WHERE 0), 'empty') FROM t;
+}
+expect {
+    empty
+}
+
+test aggregate-order-reject-scalar {
+    SELECT abs(1 ORDER BY 1);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate
+}
+
+test aggregate-order-reject-window {
+    SELECT group_concat(1 ORDER BY 1) OVER ();
+}
+expect error {
+    ORDER BY may not be used with non-aggregate
+}
+
+@setup ordered_inputs
+test aggregate-order-having {
+    SELECT g FROM t GROUP BY g HAVING group_concat(v ORDER BY k)='a,b,c';
+}
+expect {
+    1
+}
+
+@setup ordered_inputs
+test aggregate-order-min-max {
+    SELECT max(k ORDER BY json_extract('bad json', '$')) FROM t;
+}
+expect {
+    3
+}
+
+test aggregate-order-integer-overflow {
+    CREATE TABLE t(v INTEGER, k INTEGER);
+    INSERT INTO t VALUES (9223372036854775807,2),(1,3),(-1,1);
+    SELECT sum(v ORDER BY k) FROM t;
+}
+expect {
+    9223372036854775807
+}
+
+test aggregate-order-distinct-collation {
+    CREATE TABLE t(v TEXT, k INTEGER);
+    INSERT INTO t VALUES ('b',3),('A',2),('a',1),('B',4);
+    SELECT group_concat(DISTINCT v COLLATE nocase ORDER BY k),
+           group_concat(DISTINCT v ORDER BY v COLLATE nocase,k) FROM t;
+}
+expect {
+    A,b|a,A,b,B
+}
+
+test aggregate-order-single-row-no-from {
+    SELECT group_concat('a' ORDER BY 10 DESC), count(1 ORDER BY 2);
+}
+expect {
+    a|1
+}
+
+test aggregate-order-empty-table {
+    CREATE TABLE t(v INTEGER);
+    SELECT count(v ORDER BY v), coalesce(group_concat(v ORDER BY v),'empty') FROM t;
+}
+expect {
+    0|empty
+}
+
+test aggregate-order-distinct-shared-key {
+    CREATE TABLE t(v TEXT);
+    INSERT INTO t VALUES ('a'),('A'),('b'),('B');
+    SELECT group_concat(DISTINCT v COLLATE nocase ORDER BY v COLLATE nocase),
+           group_concat(DISTINCT v COLLATE nocase ORDER BY v COLLATE nocase DESC),
+           group_concat(DISTINCT v COLLATE nocase ORDER BY v) FROM t;
+}
+expect {
+    A,B|B,A|a,b
+}
+
+test aggregate-order-key-evaluated-before-distinct {
+    CREATE TABLE t(v TEXT, k INTEGER);
+    INSERT INTO t VALUES ('a',1),('a',2);
+    SELECT group_concat(DISTINCT v ORDER BY CASE WHEN k=2 THEN json_extract('bad','$') ELSE k END) FROM t;
+}
+expect error {
+    malformed JSON
+}
+
+test aggregate-order-distinct-shared-key-reset {
+    CREATE TABLE t(g INTEGER,v TEXT);
+    INSERT INTO t VALUES (1,'a'),(1,'A'),(1,'b'),(1,'B'),(2,'A'),(2,'a'),(2,'B'),(2,'b');
+    SELECT g,group_concat(DISTINCT v COLLATE nocase ORDER BY v COLLATE nocase) FROM t GROUP BY g ORDER BY g;
+    SELECT g,(SELECT group_concat(DISTINCT v COLLATE nocase ORDER BY v COLLATE nocase) FROM t WHERE g=o.g)
+    FROM (SELECT 1 AS g UNION ALL SELECT 2 UNION ALL SELECT 1) o;
+}
+expect {
+    1|A,B
+    2|a,b
+    1|A,B
+    2|a,b
+    1|A,B
+}
+
+test aggregate-order-ties-preserve-input-order-after-spill {
+    PRAGMA temp_store=FILE;
+    PRAGMA cache_size=10000;
+    CREATE TABLE tied_inputs(v INTEGER);
+    WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+    INSERT INTO tied_inputs SELECT x FROM n;
+    SELECT substr(group_concat(v ORDER BY zeroblob(1024)),1,20),
+           json_extract(json_group_array(v ORDER BY zeroblob(1024)),'$[#-1]') FROM tied_inputs;
+    PRAGMA cache_size=1;
+    SELECT substr(group_concat(v ORDER BY zeroblob(1024)),1,20),
+           json_extract(json_group_array(v ORDER BY zeroblob(1024)),'$[#-1]') FROM tied_inputs;
+}
+expect {
+    1,2,3,4,5,6,7,8,9,10|2000
+    1,2,3,4,5,6,7,8,9,10|2000
+}
+
+@setup ordered_inputs
+test aggregate-order-limit-zero {
+    SELECT group_concat(1 ORDER BY 1) LIMIT 0;
+    SELECT group_concat(v ORDER BY k) FROM t LIMIT 0;
+    SELECT group_concat(v ORDER BY k) FROM t LIMIT (SELECT 0);
+    SELECT g, group_concat(v ORDER BY k) FROM t GROUP BY g LIMIT 0;
+    SELECT group_concat(v ORDER BY k) FROM t ORDER BY 1 LIMIT 0;
+    SELECT * FROM (SELECT group_concat(v ORDER BY k) FROM t LIMIT 0);
+    SELECT 'done';
+}
+expect {
+    done
+}
+
+@setup ordered_inputs
+test aggregate-order-scalar-limit-zero {
+    SELECT coalesce((SELECT group_concat(v ORDER BY k) FROM t LIMIT 0), 'empty');
+    SELECT coalesce((SELECT group_concat(v ORDER BY k) FROM t LIMIT (SELECT 0)), 'empty');
+}
+expect {
+    empty
+    empty
+}
+
+@setup ordered_inputs
+test aggregate-order-limit-nonzero {
+    SELECT group_concat(v ORDER BY k) FROM t LIMIT 1;
+    SELECT group_concat(v ORDER BY k) FROM t LIMIT -1;
+    SELECT group_concat(v ORDER BY k) FROM t LIMIT 1 OFFSET 1;
+    SELECT 'done';
+}
+expect {
+    a,x,b,y,c
+    a,x,b,y,c
+    done
+}

@@ -1,0 +1,95 @@
+@database :memory:
+
+# Like sqlite3Atoi, integer PRAGMAs read a float literal from its leading digits
+# (8.192e3 is 8) and read a value outside the 32-bit range as 0.
+
+test pragma-user-version-float-reads-leading-digits {
+    PRAGMA user_version=8.192e3;
+    PRAGMA user_version;
+}
+expect {
+    8
+}
+
+test pragma-user-version-negative-float-reads-leading-digits {
+    PRAGMA user_version=-1.5e3;
+    PRAGMA user_version;
+}
+expect {
+    -1
+}
+
+test pragma-user-version-out-of-range-is-zero {
+    PRAGMA user_version=4294967297;
+    PRAGMA user_version;
+}
+expect {
+    0
+}
+
+test pragma-user-version-just-above-i32-max-is-zero {
+    PRAGMA user_version=2147483648;
+    PRAGMA user_version;
+}
+expect {
+    0
+}
+
+test pragma-user-version-i32-min {
+    PRAGMA user_version=-2147483648;
+    PRAGMA user_version;
+}
+expect {
+    -2147483648
+}
+
+test pragma-application-id-float-reads-leading-digits {
+    PRAGMA application_id=8.192e3;
+    PRAGMA application_id;
+}
+expect {
+    8
+}
+
+test pragma-application-id-out-of-range-is-zero {
+    PRAGMA application_id=4294967297;
+    PRAGMA application_id;
+}
+expect {
+    0
+}
+
+test pragma-busy-timeout-float-reads-leading-digits {
+    PRAGMA busy_timeout=1.5e3;
+    PRAGMA busy_timeout;
+}
+expect {
+    1
+    1
+}
+
+test pragma-busy-timeout-out-of-range-is-zero {
+    PRAGMA busy_timeout=4294967297;
+    PRAGMA busy_timeout;
+}
+expect {
+    0
+    0
+}
+
+test pragma-wal-autocheckpoint-float-reads-leading-digits {
+    PRAGMA wal_autocheckpoint=2e3;
+    PRAGMA wal_autocheckpoint;
+}
+expect {
+    2
+    2
+}
+
+test pragma-cache-size-float-reads-leading-digits {
+    PRAGMA cache_size=1000.5e3;
+    PRAGMA cache_size;
+}
+expect {
+    1000
+}

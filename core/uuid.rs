@@ -1,17 +1,26 @@
+use std::ffi::CStr;
+
 use crate::ext::register_scalar_function;
-use turso_ext::{scalar, ExtensionApi, ResultCode, Value, ValueType};
+use crate::function::ReturnType;
+use turso_ext::{scalar, ExtensionApi, ResultCode, ScalarFunction, Value, ValueType};
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
     // FIXME: Add macro magic to register functions automatically.
-    unsafe {
-        register_scalar_function(ext_api.ctx, c"uuid4_str".as_ptr(), uuid4_str);
-        register_scalar_function(ext_api.ctx, c"gen_random_uuid".as_ptr(), uuid4_str);
-        register_scalar_function(ext_api.ctx, c"uuid4".as_ptr(), uuid4_blob);
-        register_scalar_function(ext_api.ctx, c"uuid7_str".as_ptr(), uuid7_str);
-        register_scalar_function(ext_api.ctx, c"uuid7".as_ptr(), uuid7);
-        register_scalar_function(ext_api.ctx, c"uuid7_timestamp_ms".as_ptr(), uuid7_ts);
-        register_scalar_function(ext_api.ctx, c"uuid_str".as_ptr(), uuid_str);
-        register_scalar_function(ext_api.ctx, c"uuid_blob".as_ptr(), uuid_blob);
+    use ReturnType::{Blob, Integer, Text};
+    let functions: [(&CStr, ScalarFunction, ReturnType); 8] = [
+        (c"uuid4_str", uuid4_str, Text),
+        (c"gen_random_uuid", uuid4_str, Text),
+        (c"uuid4", uuid4_blob, Blob),
+        (c"uuid7_str", uuid7_str, Text),
+        (c"uuid7", uuid7, Blob),
+        (c"uuid7_timestamp_ms", uuid7_ts, Integer),
+        (c"uuid_str", uuid_str, Text),
+        (c"uuid_blob", uuid_blob, Blob),
+    ];
+    for (name, function, return_type) in functions {
+        unsafe {
+            register_scalar_function(ext_api.ctx, name.as_ptr(), function, Some(return_type));
+        }
     }
 }
 

@@ -355,15 +355,25 @@ fn find_git_dir(start_path: impl AsRef<Path>) -> Option<PathBuf> {
 }
 
 fn resolve_head(git_dir: impl AsRef<Path>) -> anyhow::Result<String> {
-    // HACK ignores stuff like packed-refs
-    let head_path = git_dir.as_ref().join("HEAD");
-    let head_contents = read_to_string(&head_path)?;
-    if let Some(ref_path) = head_contents.strip_prefix("ref: ") {
-        let ref_file = git_dir.as_ref().join(ref_path);
-        read_to_string(&ref_file)
-    } else {
-        Ok(head_contents)
+    let git_dir = git_dir.as_ref();
+    let head_contents = read_to_string(git_dir.join("HEAD"))?;
+    let Some(ref_path) = head_contents.strip_prefix("ref: ") else {
+        return Ok(head_contents);
+    };
+    let common_dir = match read_to_string(git_dir.join("commondir")) {
+        Ok(common_dir) => git_dir.join(common_dir),
+        Err(_) => git_dir.to_path_buf(),
+    };
+    if let Ok(hash) = read_to_string(common_dir.join(ref_path)) {
+        return Ok(hash);
     }
+    read_to_string(common_dir.join("packed-refs"))?
+        .lines()
+        .find_map(|line| match line.split_once(' ') {
+            Some((hash, name)) if name == ref_path => Some(hash.to_string()),
+            _ => None,
+        })
+        .with_context(|| format!("ref {ref_path} not found"))
 }
 
 fn read_to_string(path: impl AsRef<Path>) -> anyhow::Result<String> {
@@ -371,4 +381,46 @@ fn read_to_string(path: impl AsRef<Path>) -> anyhow::Result<String> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
     Ok(contents.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::resolve_head;
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn resolve_head_reads_branch_from_packed_refs() {
+        let git_dir = tempfile::tempdir().unwrap();
+        fs::write(git_dir.path().join("HEAD"), "ref: refs/heads/x\n").unwrap();
+        fs::write(
+            git_dir.path().join("packed-refs"),
+            format!(
+                "# pack-refs with: peeled fully-peeled sorted\n\
+                 {}1 refs/heads/xy\n\
+                 {HASH} refs/heads/x\n",
+                &HASH[..39]
+            ),
+        )
+        .unwrap();
+        assert_eq!(resolve_head(git_dir.path()).unwrap(), HASH);
+    }
+
+    #[test]
+    fn resolve_head_reads_worktree_branch_from_common_dir() {
+        let common_dir = tempfile::tempdir().unwrap();
+        let worktree_git_dir = common_dir.path().join("worktrees/wt");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::create_dir_all(common_dir.path().join("refs/heads/feature")).unwrap();
+        fs::write(worktree_git_dir.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            common_dir.path().join("refs/heads/feature/x"),
+            format!("{HASH}\n"),
+        )
+        .unwrap();
+        assert_eq!(resolve_head(&worktree_git_dir).unwrap(), HASH);
+    }
 }

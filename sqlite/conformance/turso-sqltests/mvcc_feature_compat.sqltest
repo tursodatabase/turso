@@ -84,6 +84,20 @@ expect {
     0
 }
 
+test mvcc-analyze-in-begin-concurrent {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t24(x);
+    INSERT INTO t24 VALUES (1);
+    BEGIN CONCURRENT;
+    ANALYZE;
+    COMMIT;
+    SELECT count(*) FROM sqlite_stat1 WHERE tbl = 't24';
+}
+expect {
+    mvcc
+    1
+}
+
 test mvcc-ddl-works-in-exclusive-transaction {
     PRAGMA journal_mode = 'mvcc';
     BEGIN;
@@ -96,10 +110,6 @@ expect {
     mvcc
     42
 }
-
-# SAVEPOINT / ROLLBACK TO straddling the DDL upgrade: the rollback must undo
-# the DDL (schema row and data) while keeping the transaction open, and the
-# same name must be creatable again in the same transaction.
 
 test mvcc-savepoint-rollback-undoes-ddl-upgrade {
     PRAGMA journal_mode = 'mvcc';
@@ -165,4 +175,36 @@ test mvcc-savepoint-rollback-undoes-index-ddl {
 expect {
     mvcc
     0|6
+}
+
+# BEGIN CONCURRENT is deferred: BEGIN itself opens nothing, an empty
+# transaction commits cleanly, and a nested BEGIN gets the standard error.
+
+test mvcc-begin-concurrent-idle-commit {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN CONCURRENT;
+    COMMIT;
+    SELECT 1;
+}
+expect {
+    mvcc
+    1
+}
+
+test mvcc-begin-concurrent-after-begin-errors {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN;
+    BEGIN CONCURRENT;
+}
+expect error {
+    cannot start a transaction within a transaction
+}
+
+test mvcc-begin-after-begin-concurrent-errors {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN CONCURRENT;
+    BEGIN;
+}
+expect error {
+    cannot start a transaction within a transaction
 }
