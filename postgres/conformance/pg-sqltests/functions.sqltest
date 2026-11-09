@@ -351,6 +351,35 @@ expect {
     invalid
 }
 
+test pg-input-is-valid-reads-date-and-time-as-the-types-do {
+    SELECT CASE WHEN pg_input_is_valid('Jan 5 2024', 'date') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('2024-02-30', 'date') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('9:30', 'time') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('2024-01-05T10:00+02', 'timestamptz') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('zzz', 'timestamp') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    invalid
+    valid
+    valid
+    invalid
+}
+
+test pg-input-error-info-date-out-of-range {
+    SELECT message, sql_error_code FROM pg_input_error_info('2024-02-30', 'date');
+}
+expect {
+    date/time field value out of range: "2024-02-30"|22008
+}
+
+test pg-input-error-info-date-bad-syntax {
+    SELECT message, sql_error_code FROM pg_input_error_info('zzz', 'date');
+}
+expect {
+    invalid input syntax for type date: "zzz"|22007
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }

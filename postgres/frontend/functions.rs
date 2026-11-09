@@ -8,14 +8,15 @@ use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFuncti
 use turso_core::security::roles::{RoleCatalog, RoleId};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
+    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
+    Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -1347,69 +1348,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => {
-            // Accept YYYY-MM-DD
-            let parts: Vec<&str> = trimmed.split('-').collect();
-            if parts.len() == 3
-                && parts[0].parse::<i32>().is_ok()
-                && parts[1].parse::<u32>().is_ok_and(|m| (1..=12).contains(&m))
-                && parts[2].parse::<u32>().is_ok_and(|d| (1..=31).contains(&d))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type date: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "timestamp" | "timestamp without time zone" => {
-            // Accept YYYY-MM-DD HH:MM:SS[.fff]
-            if parse_timestamp_prefix(trimmed).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type timestamp: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "timestamptz" | "timestamp with time zone" => {
-            // Accept YYYY-MM-DD HH:MM:SS[.fff][+/-HH[:MM]]
-            let (base, _tz) = match trimmed.rfind('+') {
-                Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
-                _ => match trimmed.rfind('-') {
-                    Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
-                    _ => (trimmed, None),
-                },
-            };
-            if parse_timestamp_prefix(base).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type timestamp with time zone: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "time" | "time without time zone" => {
-            // Accept HH:MM:SS[.fff]
-            let time_part = trimmed.split('.').next().unwrap_or(trimmed);
-            let parts: Vec<&str> = time_part.split(':').collect();
-            if parts.len() >= 2
-                && parts.len() <= 3
-                && parts[0].parse::<u32>().is_ok_and(|h| (0..=23).contains(&h))
-                && parts[1].parse::<u32>().is_ok_and(|m| (0..=59).contains(&m))
-                && (parts.len() < 3 || parts[2].parse::<u32>().is_ok_and(|s| (0..=59).contains(&s)))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type time: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
+        "date" => check_temporal_input(input, "date"),
+        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
+        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
+        "time" | "time without time zone" => check_temporal_input(input, "time"),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1513,47 +1455,22 @@ pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Parse a YYYY-MM-DD HH:MM:SS[.fff] prefix, returning Some(()) if valid.
-fn parse_timestamp_prefix(s: &str) -> Option<()> {
-    let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
-    if parts.len() != 2 {
-        return None;
+/// Reads `input` as the date or time type `type_name` does when it stores a
+/// value, so `pg_input_is_valid` and the type agree on what is valid.
+fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, String)> {
+    match exec_temporal_encode(
+        &Value::build_text(input.to_string()),
+        &Value::build_text(type_name),
+    ) {
+        Ok(_) => None,
+        Err(LimboError::InvalidDate(message)) => {
+            Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
+        }
+        Err(LimboError::DatetimeFieldOverflow(message)) => {
+            Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
+        }
+        Err(other) => unreachable!("temporal_encode of text failed with {other}"),
     }
-    // Validate date part
-    let date_parts: Vec<&str> = parts[0].split('-').collect();
-    if date_parts.len() != 3
-        || date_parts[0].parse::<i32>().is_err()
-        || !date_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (1..=12).contains(&m))
-        || !date_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|d| (1..=31).contains(&d))
-    {
-        return None;
-    }
-    // Validate time part (strip fractional seconds)
-    let time_str = parts[1].split('.').next().unwrap_or(parts[1]);
-    let time_parts: Vec<&str> = time_str.split(':').collect();
-    if time_parts.len() < 2
-        || time_parts.len() > 3
-        || !time_parts[0]
-            .parse::<u32>()
-            .is_ok_and(|h| (0..=23).contains(&h))
-        || !time_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (0..=59).contains(&m))
-    {
-        return None;
-    }
-    if time_parts.len() == 3
-        && !time_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|s| (0..=59).contains(&s))
-    {
-        return None;
-    }
-    Some(())
 }
 
 /// Minimal JSON validation without requiring serde_json.

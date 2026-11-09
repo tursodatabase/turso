@@ -65,7 +65,8 @@ pub fn exec_temporal_encode(value: &Value, type_name: &Value) -> Result<Value> {
     Ok(Value::build_text(fields.format(input, ty)?))
 }
 
-/// PostgreSQL's frontend reports these as `invalid_datetime_format`.
+/// PostgreSQL's frontend reports these as `invalid_datetime_format`. Values
+/// out of range are `DatetimeFieldOverflow` instead.
 fn error(message: String) -> LimboError {
     LimboError::InvalidDate(message)
 }
@@ -78,7 +79,7 @@ fn syntax_error(input: &str, ty: TemporalType) -> LimboError {
 }
 
 fn range_error(input: &str) -> LimboError {
-    error(format!("date/time field value out of range: \"{input}\""))
+    LimboError::DatetimeFieldOverflow(format!("date/time field value out of range: \"{input}\""))
 }
 
 /// A piece of the input, split as PostgreSQL's `ParseDateTime` splits it.
@@ -362,7 +363,7 @@ fn year(text: &str, input: &str, ty: TemporalType) -> Result<i32> {
 fn check_year(year: i32, input: &str, ty: TemporalType) -> Result<()> {
     match year {
         1..=9999 => Ok(()),
-        _ => Err(error(format!(
+        _ => Err(LimboError::DatetimeFieldOverflow(format!(
             "{} values must be between years 0001 and 9999: \"{input}\"",
             ty.name()
         ))),
@@ -411,7 +412,7 @@ fn read_offset(text: &str, input: &str, ty: TemporalType) -> Result<i64> {
     let hours: i64 = two_digits(hours, input, ty)?;
     let minutes: i64 = two_digits(minutes, input, ty)?;
     if hours > 15 || minutes > 59 {
-        return Err(error(format!(
+        return Err(LimboError::DatetimeFieldOverflow(format!(
             "time zone displacement out of range: \"{input}\""
         )));
     }
