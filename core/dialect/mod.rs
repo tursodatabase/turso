@@ -68,6 +68,13 @@ pub enum RelationChange {
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
+    /// `enabled` is false.
+    SetRowSecurity {
+        namespace: NamespaceId,
+        name: String,
+        enabled: bool,
+    },
 }
 
 /// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
@@ -298,8 +305,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership or privileges and refuses `ALTER ... OWNER TO`,
-    /// `ALTER SEQUENCE ... OWNED BY` and `GRANT`.
+    /// has no ownership, privileges or row-level security and refuses
+    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT` and
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`.
     fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -328,6 +336,11 @@ pub trait Dialect: Send + Sync + 'static {
                 }
                 RelationChange::Grant { .. } => {
                     return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                }
+                RelationChange::SetRowSecurity { .. } => {
+                    return Err(LimboError::ParseError(
+                        "row-level security is not supported".to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -382,6 +395,13 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> bool {
         let _ = (schema, namespace, name, role);
         true
+    }
+
+    /// Whether table `name` of `namespace` has row-level security enabled.
+    /// A dialect without row-level security never has it enabled.
+    fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        let _ = (schema, namespace, name);
+        false
     }
 
     /// Whether `PRAGMA capture_data_changes_conn` may create its change
