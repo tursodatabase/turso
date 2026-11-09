@@ -92,7 +92,7 @@ impl SyncEngineIo for InProcessServer {
         }
     }
 
-    fn full_write(&self, path: &str, content: Vec<u8>) -> Result<Response> {
+    fn full_write(&self, path: &str, mut content: Vec<u8>) -> Result<Response> {
         let failure = if path.ends_with("-info") {
             self.metadata_write_failure.swap(0, Ordering::SeqCst)
         } else {
@@ -103,12 +103,15 @@ impl SyncEngineIo for InProcessServer {
                 "injected before metadata publication".into(),
             ));
         }
+        if failure == 3 {
+            content.truncate(content.len() / 2);
+        }
         if let Some(files) = &self.host_files {
             files.lock().unwrap().insert(path.into(), content);
         } else {
             std::fs::write(path, content)?;
         }
-        if failure == 2 {
+        if failure == 2 || failure == 3 {
             return Err(Error::DatabaseSyncEngineError(
                 "injected after metadata publication".into(),
             ));
