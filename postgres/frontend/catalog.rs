@@ -305,6 +305,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn sum_counts_infinite_inputs(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
