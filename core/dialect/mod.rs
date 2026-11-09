@@ -481,14 +481,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// The error for a name that is not a column but is the name of a table
-    /// in the FROM clause of the query or of an enclosing query, as `t` is
-    /// in `SELECT count(t) FROM t`.
+    /// The error for a reference to the whole row of a table in the FROM
+    /// clause of the query or of an enclosing query: a table name that is
+    /// not a column, as `t` is in `SELECT count(t) FROM t`, or `t.*` inside
+    /// an expression. The statement compiles on, and gets this error only
+    /// when it has no other error.
     ///
-    /// SQLite reports a missing column. PostgreSQL reads the name as the
-    /// whole row of the table.
-    fn table_name_as_value_error(&self, name: &str) -> LimboError {
-        LimboError::ParseError(format!("no such column: {name}"))
+    /// None for SQLite, which reports the name as a missing column.
+    /// PostgreSQL reads it as the whole row of the table.
+    fn whole_row_reference_error(&self, _table: &str) -> Option<LimboError> {
+        None
     }
 }
 

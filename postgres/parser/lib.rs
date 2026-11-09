@@ -9,7 +9,7 @@ pub mod routine;
 pub mod sqlstate;
 pub mod translator;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ParseError {
     #[error("{0}")]
     ParseError(String),

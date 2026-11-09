@@ -85,6 +85,11 @@ Some function calls are also rejected with the SQLSTATE `0A000`:
 - Column notation on an expression, as in `(now()).epoch`
 - A table name used as a value, as in `SELECT count(t) FROM t`, and `t.*` in a function call.
 
+The rest of the statement is checked first. So a statement that PostgreSQL
+rejects gets the SQLSTATE of PostgreSQL, for example `42883` for a call of a
+function that does not exist in named notation, or `42703` for a missing
+column elsewhere in the statement.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features

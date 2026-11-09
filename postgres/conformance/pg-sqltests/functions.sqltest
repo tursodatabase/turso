@@ -1768,10 +1768,6 @@ test column-notation-on-a-function-result-is-rejected {
 expect error {
     ^column notation \.epoch applied to type timestamp with time zone, which is not a composite type$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^column notation \.epoch on a function result is not supported$
-}
 
 test column-notation-on-a-constant-is-rejected {
     SELECT (false).is_true;
@@ -1779,10 +1775,6 @@ test column-notation-on-a-constant-is-rejected {
 @sqlstate 42809
 expect error {
     ^column notation \.is_true applied to type boolean, which is not a composite type$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^column notation \.is_true on an expression is not supported$
 }
 
 test column-notation-on-a-table-name-reads-the-column {
@@ -1891,7 +1883,138 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    ^table\.\* inside an expression is not supported$
+    ^a reference to the whole row of "emp" is not supported$
+}
+
+# Function calls that PostgreSQL rejects. tursopg gives the same SQLSTATE,
+# also for a call that it cannot run: it checks the rest of the statement
+# first, as PostgreSQL does.
+
+test function-call-with-named-notation-of-a-missing-function-is-rejected {
+    SELECT missing_function(a => 1);
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(a => integer\) does not exist$
+}
+
+test function-call-with-named-notation-and-a-missing-parameter-name-is-rejected {
+    SELECT make_date(year => 2024, month => 1, days => 2);
+}
+@sqlstate 42883
+expect error {
+    ^function make_date\(year => integer, month => integer, days => integer\) does not exist$
+}
+
+test function-call-with-a-positional-argument-after-a-named-argument-is-rejected {
+    SELECT make_date(year => 2024, 1, 2);
+}
+@sqlstate 42601
+expect error {
+    ^positional argument cannot follow named argument$
+}
+
+test function-call-with-an-argument-name-used-twice-is-rejected {
+    SELECT make_date(year => 2024, year => 1, day => 2);
+}
+@sqlstate 42601
+expect error {
+    ^argument name "year" used more than once$
+}
+
+test function-call-with-named-notation-and-a-missing-column-is-rejected {
+    SELECT make_date(year => missing_column, month => 1, day => 2);
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: missing_column$
+}
+
+test function-call-with-named-notation-and-a-missing-table-is-rejected {
+    SELECT make_date(year => 2024, month => 1, day => 2) FROM missing_table;
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing_table" does not exist$
+}
+@sqlstate 42P01
+expect @tursopg error {
+    ^no such table: missing_table$
+}
+
+test function-call-with-a-variadic-argument-of-a-function-that-is-not-variadic-is-rejected {
+    SELECT lower(VARIADIC ARRAY['a']);
+}
+@sqlstate 42883
+expect error {
+    ^function lower\(text\[\]\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^function lower\(unknown\) does not exist$
+}
+
+test set-returning-function-with-arguments-of-other-types-is-rejected {
+    SELECT generate_series(1);
+}
+@sqlstate 42883
+expect error {
+    ^function generate_series\(integer\) does not exist$
+}
+
+test set-returning-function-in-the-select-list-with-a-missing-column-is-rejected {
+    SELECT generate_series(1, 2), missing_column;
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: missing_column$
+}
+
+test whole-row-reference-with-a-missing-column-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    SELECT count(emp), missing_column FROM emp;
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: missing_column$
+}
+
+test whole-row-reference-with-star-to-a-missing-table-is-rejected {
+    CREATE TABLE emp (name text, salary numeric);
+    SELECT count(missing_table.*) FROM emp;
+}
+@sqlstate 42P01
+expect error {
+    ^missing FROM-clause entry for table "missing_table"$
+}
+@sqlstate 42P01
+expect @tursopg error {
+    ^no such table: missing_table$
+}
+
+# Column notation on a value of a type that is not composite calls the
+# function of that name.
+test column-notation-that-calls-a-function-is-rejected {
+    SELECT ('abc'::text).upper;
+}
+expect {
+    ABC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^column notation \.upper on an expression is not supported$
 }
 
 test function-call-with-a-wrong-number-of-arguments-is-rejected {

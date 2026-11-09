@@ -624,6 +624,10 @@ fn translate_statement(
         return Err(crate::LimboError::ReadOnly);
     }
 
+    if let Some(error) = resolver.take_deferred_error() {
+        return Err(error);
+    }
+
     Ok(())
 }
 

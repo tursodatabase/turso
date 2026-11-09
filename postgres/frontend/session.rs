@@ -442,9 +442,16 @@ fn prepare_statement_inner(
     let translator = PostgreSQLTranslator::new().with_relation_name_check(move |schema, name| {
         schema_has_relation(&conn_for_names, schema, name)
     });
-    let translated = translator
+    let mut translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    // The statement prepares first, so that its other errors come first, as
+    // in PostgreSQL.
+    let unsupported = translated.unsupported.take();
+    let report_unsupported = || match &unsupported {
+        Some(error) => Err(translation_error(&pg_conn.conn, error.clone())),
+        None => Ok(()),
+    };
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
@@ -457,17 +464,16 @@ fn prepare_statement_inner(
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
     if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
-        return pg_conn
+        let inner = pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
-            .map_err(schema_error)
-            .map(|s| {
-                crate::Statement::new(s)
-                    .with_result_kind(result_kind)
-                    .with_tx_tracking(conn, tx, role)
-                    .with_query_start_marking(marks_query_start)
-                    .with_post_run(post_run)
-            });
+            .map_err(schema_error)?;
+        report_unsupported()?;
+        return Ok(crate::Statement::new(inner)
+            .with_result_kind(result_kind)
+            .with_tx_tracking(conn, tx, role)
+            .with_query_start_marking(marks_query_start)
+            .with_post_run(post_run));
     }
 
     // Validate the prerequisites and the target command during prepare
@@ -487,6 +493,7 @@ fn prepare_statement_inner(
         .conn
         .prepare_translated_cmd(cmd.clone(), &sql)
         .map_err(schema_error)?;
+    report_unsupported()?;
     Ok(crate::Statement::with_deferred(
         inner,
         DeferredExecution::new(

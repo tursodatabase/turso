@@ -7,8 +7,8 @@ use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_UNDEFINED_FUNCTION,
-    SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -31,6 +31,12 @@ pub struct TranslateResult {
     pub postreqs: Vec<ast::Stmt>,
     /// The sequences of the serial columns of a CREATE TABLE statement.
     pub serial_sequences: Vec<SerialSequence>,
+    /// The error for the first feature of the command that tursopg does not
+    /// support, where PostgreSQL accepts the feature or rejects it only
+    /// after it checks the rest of the statement. `cmd` has a placeholder
+    /// for the feature. Prepare `cmd` to find its other errors first, and
+    /// then report this error.
+    pub unsupported: Option<ParseError>,
 }
 
 /// The sequence of a serial column of a CREATE TABLE statement.
@@ -56,6 +62,7 @@ pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    unsupported: std::cell::RefCell<Option<ParseError>>,
 }
 
 impl PostgreSQLTranslator {
@@ -157,6 +164,9 @@ impl PostgreSQLTranslator {
     /// use `translate_with_prereqs` instead.
     pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
         let translated = self.translate_with_prereqs(parse_result)?;
+        if let Some(error) = translated.unsupported {
+            return Err(error);
+        }
         let ast::Cmd::Stmt(stmt) = translated.cmd else {
             return Err(ParseError::ParseError(
                 "expected a PostgreSQL statement".to_string(),
@@ -171,6 +181,12 @@ impl PostgreSQLTranslator {
         &self,
         parse_result: &ParseResult,
     ) -> Result<TranslateResult, ParseError> {
+        let mut translated = self.translate_command(parse_result)?;
+        translated.unsupported = self.unsupported.take();
+        Ok(translated)
+    }
+
+    fn translate_command(&self, parse_result: &ParseResult) -> Result<TranslateResult, ParseError> {
         if parse_result.protobuf.nodes().is_empty() {
             return Err(ParseError::ParseError("No statements found".to_string()));
         }
@@ -185,6 +201,7 @@ impl PostgreSQLTranslator {
                 cmd: translated.cmd,
                 postreqs: translated.postreqs,
                 serial_sequences: translated.serial_sequences,
+                unsupported: None,
             });
         }
 
@@ -198,6 +215,7 @@ impl PostgreSQLTranslator {
             cmd,
             postreqs: vec![],
             serial_sequences: vec![],
+            unsupported: None,
         })
     }
 
@@ -562,6 +580,7 @@ impl PostgreSQLTranslator {
             cmd: ast::Cmd::Stmt(stmt),
             postreqs,
             serial_sequences,
+            unsupported: None,
         })
     }
 
@@ -2535,9 +2554,13 @@ impl PostgreSQLTranslator {
 
         let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
-        reject_named_arguments(&func_call.args)?;
-        if func_call.func_variadic
-            || func_call.agg_star
+        if let Some(error) = named_call_error(func_call, func_name) {
+            return Err(error);
+        }
+        if func_call.func_variadic {
+            return Err(variadic_call_error(func_call, func_name));
+        }
+        if func_call.agg_star
             || func_call.agg_distinct
             || func_call.agg_filter.is_some()
             || !func_call.agg_order.is_empty()
@@ -2545,7 +2568,7 @@ impl PostgreSQLTranslator {
             || func_call.over.is_some()
         {
             return Err(not_supported(
-                "VARIADIC, *, DISTINCT, ORDER BY, FILTER or OVER on a function in FROM",
+                "*, DISTINCT, ORDER BY, FILTER or OVER on a function in FROM",
             ));
         }
 
@@ -3136,12 +3159,23 @@ impl PostgreSQLTranslator {
                                 // Qualified column reference (table.column)
                                 let mut parts = vec![];
                                 for field in &col_ref.fields {
-                                    let Some(pg_query::protobuf::node::Node::String(s)) =
-                                        &field.node
-                                    else {
-                                        return Err(not_supported("table.* inside an expression"));
-                                    };
-                                    parts.push(s.sval.clone());
+                                    match &field.node {
+                                        Some(pg_query::protobuf::node::Node::String(s)) => {
+                                            parts.push(s.sval.clone())
+                                        }
+                                        // `t.*` is the whole row of t, which core
+                                        // reports after the other errors.
+                                        Some(pg_query::protobuf::node::Node::AStar(_))
+                                            if col_ref.fields.len() == 2 =>
+                                        {
+                                            parts.push("*".to_string())
+                                        }
+                                        _ => {
+                                            return Err(not_supported(
+                                                "table.* inside an expression",
+                                            ))
+                                        }
+                                    }
                                 }
                                 match parts.len() {
                                     3 => {
@@ -3419,7 +3453,11 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("AIndirection missing arg".into()))?;
-                reject_column_notation_on_expression(arg, &indirection.indirection)?;
+                if let Some(error) = column_notation_error(arg, &indirection.indirection) {
+                    let expr = self.translate_expr(arg)?;
+                    self.defer(error);
+                    return Ok(expr);
+                }
                 let mut expr = self.translate_expr(arg)?;
                 // Each indirection step is either an index (AIndices) or a field name (String)
                 for step in &indirection.indirection {
@@ -4082,22 +4120,71 @@ impl PostgreSQLTranslator {
         })
     }
 
+    /// Keeps the error for the first feature of the statement that tursopg
+    /// does not support, where PostgreSQL accepts the feature or rejects it
+    /// only after it checks the rest of the statement.
+    fn defer(&self, error: ParseError) {
+        self.unsupported.borrow_mut().get_or_insert(error);
+    }
+
+    /// A call that tursopg cannot run: named or mixed notation, a VARIADIC
+    /// argument, or a set-returning function outside FROM. The call becomes
+    /// `coalesce(<arguments>, NULL, NULL)`, so that core finds the errors of
+    /// the arguments and of the rest of the statement first. None for other
+    /// calls.
+    fn deferred_call(
+        &self,
+        func_call: &pg_query::protobuf::FuncCall,
+        func_name: &str,
+    ) -> Result<Option<ast::Expr>, ParseError> {
+        let error = match named_call_error(func_call, func_name) {
+            Some(error) => error,
+            None if func_call.func_variadic => variadic_call_error(func_call, func_name),
+            None => match set_returning_call_error(func_call, func_name) {
+                Some(error) => error,
+                None => return Ok(None),
+            },
+        };
+        let mut args = Vec::new();
+        for arg in &func_call.args {
+            let value = match &arg.node {
+                Some(pg_query::protobuf::node::Node::NamedArgExpr(named)) => named.arg.as_deref(),
+                _ => Some(arg),
+            };
+            if let Some(value) = value {
+                args.push(Box::new(self.translate_expr(value)?));
+            }
+        }
+        self.defer(error);
+        args.push(Box::new(ast::Expr::Literal(ast::Literal::Null)));
+        args.push(Box::new(ast::Expr::Literal(ast::Literal::Null)));
+        Ok(Some(ast::Expr::FunctionCall {
+            name: exact_name("coalesce"),
+            distinctness: None,
+            args,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }))
+    }
+
     fn translate_func_call(
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
-        reject_named_arguments(&func_call.args)?;
-        reject_set_returning_function(&func_name)?;
+        if let Some(placeholder) = self.deferred_call(func_call, &func_name)? {
+            return Ok(placeholder);
+        }
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
             return Err(not_supported(
                 "substring() with a regular expression or SIMILAR pattern",
             ));
-        }
-        if func_call.func_variadic {
-            return Err(not_supported("a VARIADIC function argument"));
         }
 
         // Translate FILTER clause
@@ -8074,38 +8161,136 @@ pub(crate) fn not_supported(what: impl std::fmt::Display) -> ParseError {
     }
 }
 
-/// Rejects named notation, `f(a => 1)`, and mixed notation, `f(1, b => 2)`,
-/// in the arguments of a function call.
-fn reject_named_arguments(args: &[pg_query::protobuf::Node]) -> Result<(), ParseError> {
-    let is_named = |arg: &pg_query::protobuf::Node| {
-        matches!(
-            arg.node,
-            Some(pg_query::protobuf::node::Node::NamedArgExpr(_))
-        )
-    };
-    if !args.iter().any(is_named) {
-        Ok(())
-    } else if args.iter().all(is_named) {
-        Err(not_supported("named notation in a function call"))
+/// The error of a call in named notation, `f(a => 1)`, or mixed notation,
+/// `f(1, b => 2)`, as PostgreSQL finds it: a missing function, or a feature
+/// that tursopg does not support. None for a call without named arguments.
+fn named_call_error(func_call: &pg_query::protobuf::FuncCall, name: &str) -> Option<ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let names: Vec<&str> = func_call
+        .args
+        .iter()
+        .filter_map(|arg| match &arg.node {
+            Some(Node::NamedArgExpr(named)) => Some(named.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let first_named = func_call
+        .args
+        .iter()
+        .position(|arg| matches!(arg.node, Some(Node::NamedArgExpr(_))))?;
+    if func_call.args.len() - first_named != names.len() {
+        return Some(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_SYNTAX_ERROR,
+            message: "positional argument cannot follow named argument".to_string(),
+        });
+    }
+    if let Some(duplicate) = names
+        .iter()
+        .enumerate()
+        .find_map(|(index, name)| names[..index].contains(name).then_some(*name))
+    {
+        return Some(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_SYNTAX_ERROR,
+            message: format!("argument name \"{duplicate}\" used more than once"),
+        });
+    }
+    let types = argument_types(&func_call.args);
+    let names: Vec<String> = names.into_iter().map(str::to_string).collect();
+    if crate::builtins::matching_functions(name, &types, &names)
+        .next()
+        .is_none()
+    {
+        return Some(missing_function_error(name, &types, &names));
+    }
+    Some(if names.len() == func_call.args.len() {
+        not_supported("named notation in a function call")
     } else {
-        Err(not_supported(
-            "mixed positional and named notation in a function call",
-        ))
+        not_supported("mixed positional and named notation in a function call")
+    })
+}
+
+/// The error of a call with a VARIADIC argument, as in
+/// `concat(VARIADIC ARRAY['a', 'b'])`: a missing function, or a feature that
+/// tursopg does not support.
+fn variadic_call_error(func_call: &pg_query::protobuf::FuncCall, name: &str) -> ParseError {
+    let has_variadic_function = crate::builtins::functions(name).iter().any(|function| {
+        function.parameters.len() == func_call.args.len()
+            && function
+                .parameters
+                .last()
+                .is_some_and(|parameter| parameter.variadic)
+    });
+    if has_variadic_function {
+        not_supported("a VARIADIC function argument")
+    } else {
+        missing_function_error(name, &argument_types(&func_call.args), &[])
     }
 }
 
-/// Rejects a call of a set-returning function in an expression, such as
-/// `SELECT generate_series(1, 3)`, which gives one row for each value in
-/// PostgreSQL.
-fn reject_set_returning_function(name: &str) -> Result<(), ParseError> {
-    if SET_RETURNING_FUNCTIONS_IN_FROM.contains(&name) {
-        Err(not_supported(format!(
-            "set-returning function {name}() outside FROM"
-        )))
+/// The error of a call of a set-returning function in an expression, such
+/// as `SELECT generate_series(1, 3)`, which gives one row for each value in
+/// PostgreSQL. None for another function.
+fn set_returning_call_error(
+    func_call: &pg_query::protobuf::FuncCall,
+    name: &str,
+) -> Option<ParseError> {
+    let message = if SET_RETURNING_FUNCTIONS_IN_FROM.contains(&name) {
+        format!("set-returning function {name}() outside FROM")
     } else if OTHER_SET_RETURNING_FUNCTIONS.contains(&name) {
-        Err(not_supported(format!("set-returning function {name}()")))
+        format!("set-returning function {name}()")
     } else {
-        Ok(())
+        return None;
+    };
+    let types = argument_types(&func_call.args);
+    let exists =
+        crate::builtins::matching_functions(name, &types, &[]).any(|function| function.returns_set);
+    Some(if exists {
+        not_supported(message)
+    } else {
+        missing_function_error(name, &types, &[])
+    })
+}
+
+/// The types of the arguments of a call, by their names in pg_type, as far
+/// as they are known without the catalog: `unknown` for the others.
+fn argument_types(args: &[pg_query::protobuf::Node]) -> Vec<String> {
+    use pg_query::protobuf::node::Node;
+
+    args.iter()
+        .map(|arg| {
+            let value = match &arg.node {
+                Some(Node::NamedArgExpr(named)) => named.arg.as_deref().unwrap_or(arg),
+                _ => arg,
+            };
+            crate::routine::expr::expression_type(value)
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .collect()
+}
+
+/// PostgreSQL's error for a call that no function accepts, such as
+/// `function f(a => integer) does not exist`.
+fn missing_function_error(name: &str, types: &[String], names: &[String]) -> ParseError {
+    let positional = types.len() - names.len();
+    let arguments: Vec<String> = types
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| {
+            let ty = crate::builtins::type_display_name(ty);
+            match index.checked_sub(positional) {
+                Some(named) => format!("{} => {ty}", names[named]),
+                None => ty,
+            }
+        })
+        .collect();
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+        message: format!("function {name}({}) does not exist", arguments.join(", ")),
     }
 }
 
@@ -8147,14 +8332,16 @@ const OTHER_SET_RETURNING_FUNCTIONS: &[&str] = &[
     "txid_snapshot_xip",
 ];
 
-/// Rejects column notation, `(arg).name`, except `(t).name` with a single
-/// name `t`, which reads the column `name` of the table `t`. PostgreSQL
-/// reads other column notation as a field of a composite value or as a call
-/// of the function `name`, and tursopg supports neither.
-fn reject_column_notation_on_expression(
+/// The error of column notation, `(arg).name`, except `(t).name` with a
+/// single name `t`, which reads the column `name` of the table `t`.
+/// PostgreSQL reads other column notation as a field of a composite value
+/// or as a call of the function `name`, and tursopg supports neither. When
+/// the value has a type that is not composite and no function `name` takes
+/// it, PostgreSQL rejects the notation.
+fn column_notation_error(
     arg: &pg_query::protobuf::Node,
     steps: &[pg_query::protobuf::Node],
-) -> Result<(), ParseError> {
+) -> Option<ParseError> {
     use pg_query::protobuf::node::Node;
 
     let is_table_name = matches!(
@@ -8168,15 +8355,39 @@ fn reject_column_notation_on_expression(
         if index == 0 && is_table_name {
             continue;
         }
-        return Err(match &arg.node {
-            Some(Node::FuncCall(_)) if index == 0 => not_supported(format!(
-                "column notation .{} on a function result",
-                field.sval
-            )),
-            _ => not_supported(format!("column notation .{} on an expression", field.sval)),
+        let field = field.sval.as_str();
+        let value_type = (index == 0)
+            .then(|| crate::routine::expr::expression_type(arg))
+            .flatten();
+        if let Some(value_type) = value_type {
+            let is_composite = value_type == "record"
+                || crate::builtins::find_type(value_type).is_some_and(|ty| ty.kind == 'c');
+            let is_function_call = crate::builtins::functions(field).iter().any(|function| {
+                function.parameters.len() == 1
+                    && crate::builtins::can_coerce(
+                        value_type,
+                        function.parameters[0].type_name,
+                        crate::builtins::Coercion::Implicit,
+                    )
+            });
+            if !is_composite && !is_function_call {
+                return Some(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_WRONG_OBJECT_TYPE,
+                    message: format!(
+                        "column notation .{field} applied to type {}, which is not a composite type",
+                        crate::builtins::type_display_name(value_type)
+                    ),
+                });
+            }
+        }
+        return Some(match &arg.node {
+            Some(Node::FuncCall(_)) if index == 0 => {
+                not_supported(format!("column notation .{field} on a function result"))
+            }
+            _ => not_supported(format!("column notation .{field} on an expression")),
         });
     }
-    Ok(())
+    None
 }
 
 fn reject_constraint_attributes(
@@ -11390,6 +11601,25 @@ mod tests {
         );
     }
 
+    /// Checks that `sql` translates, with the error for a feature that
+    /// tursopg does not support kept for after the prepare.
+    fn assert_deferred_error(sql: &str, sqlstate: &str, needle: &str) {
+        let parsed = crate::parse(sql).unwrap();
+        let translated = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        match translated.unsupported {
+            Some(ParseError::Sqlstate {
+                sqlstate: actual,
+                message,
+            }) => assert!(
+                actual == sqlstate && message.contains(needle),
+                "{sql}: expected {sqlstate} mentioning {needle:?}, got {actual}: {message}"
+            ),
+            other => panic!("{sql}: expected a kept error, got {other:?}"),
+        }
+    }
+
     fn assert_translates(sql: &str) {
         let parsed = crate::parse(sql).unwrap();
         if let Err(err) = PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
@@ -12249,13 +12479,39 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_variadic() {
-        assert_not_supported("SELECT concat(VARIADIC ARRAY['a', 'b'])", "VARIADIC");
+    fn variadic_argument_is_kept_for_after_the_prepare() {
+        assert_deferred_error(
+            "SELECT concat(VARIADIC ARRAY['a', 'b'])",
+            "0A000",
+            "VARIADIC",
+        );
+        assert_deferred_error(
+            "SELECT lower(VARIADIC ARRAY['a'])",
+            "42883",
+            "function lower(unknown) does not exist",
+        );
+    }
+
+    #[test]
+    fn named_notation_is_kept_for_after_the_prepare() {
+        assert_deferred_error(
+            "SELECT make_date(year => 2024, month => 1, day => 2)",
+            "0A000",
+            "named notation",
+        );
+        assert_deferred_error(
+            "SELECT missing_function(a => 1)",
+            "42883",
+            "function missing_function(a => integer) does not exist",
+        );
     }
 
     #[test]
     fn fail_closed_from_function_call_clauses() {
-        assert_not_supported("SELECT * FROM f(VARIADIC ARRAY[1])", "function in FROM");
+        assert_not_supported(
+            "SELECT * FROM concat(VARIADIC ARRAY['a'])",
+            "a VARIADIC function argument",
+        );
         assert_not_supported(
             "SELECT * FROM generate_series(DISTINCT 1, 3)",
             "function in FROM",
@@ -12334,7 +12590,8 @@ mod tests {
 
     #[test]
     fn fail_closed_column_references() {
-        assert_not_supported("SELECT count(t.*) FROM t", "table.* inside an expression");
+        // Core reports the whole row of t after the other errors.
+        assert_translates("SELECT count(t.*) FROM t");
         assert_not_supported(
             "SELECT row_to_json(s.t.*) FROM s.t",
             "table.* inside an expression",

@@ -75,7 +75,10 @@ impl Dialect for PostgresDialect {
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate_with_prereqs(&parse_result) {
-            Ok(translated) => Ok((Some(translated.cmd), consumed)),
+            Ok(translated) => match translated.unsupported {
+                Some(error) => Err(LimboError::ParseError(error.to_string())),
+                None => Ok((Some(translated.cmd), consumed)),
+            },
             Err(_) => turso_core::dialect::engine::parse(sql),
         }
     }
@@ -303,11 +306,11 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn table_name_as_value_error(&self, name: &str) -> LimboError {
-        sqlstate_error(
+    fn whole_row_reference_error(&self, table: &str) -> Option<LimboError> {
+        Some(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
-            format!("a reference to the whole row of \"{name}\" is not supported"),
-        )
+            format!("a reference to the whole row of \"{table}\" is not supported"),
+        ))
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

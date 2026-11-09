@@ -184,6 +184,10 @@ pub struct Resolver<'a> {
     /// The statement is compiled for a role that is not a superuser, which may
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
+    /// The error for the first feature of the statement that the dialect
+    /// does not support and that the statement reports only when it has no
+    /// other error. Forked resolvers share it.
+    deferred_error: Rc<RefCell<Option<crate::LimboError>>>,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -423,6 +427,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
             role_is_not_superuser: false,
+            deferred_error: Rc::default(),
         }
     }
 
@@ -459,6 +464,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            deferred_error: Rc::clone(&self.deferred_error),
         }
     }
 
@@ -477,7 +483,19 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            deferred_error: Rc::clone(&self.deferred_error),
         }
+    }
+
+    /// Keeps `error` for a feature of the statement that the dialect does
+    /// not support. The statement compiles on to find its other errors, and
+    /// fails with the first kept error only when it has none.
+    pub(crate) fn defer_error(&self, error: crate::LimboError) {
+        self.deferred_error.borrow_mut().get_or_insert(error);
+    }
+
+    pub(crate) fn take_deferred_error(&self) -> Option<crate::LimboError> {
+        self.deferred_error.borrow_mut().take()
     }
 
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
