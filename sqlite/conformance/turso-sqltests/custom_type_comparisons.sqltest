@@ -1525,3 +1525,124 @@ expect {
     1|0|0|SEARCH t USING INDEX i (CAST (x AS tcents)=?)
     eq|1
 }
+
+@requires strict "uses STRICT tables"
+test cmp-text-compared-with-type-skips-coerce {
+    -- As in PostgreSQL, a column's COERCE (its limits, such as the scale of
+    -- numeric(10,1)) applies to what it stores, not to the text it is
+    -- compared with: '1.24' is not rounded to 1.2, and a text over the limit
+    -- equals no row instead of raising an error. Each query runs before and
+    -- after the indexes exist.
+    CREATE TYPE r1(value real) BASE real ENCODE value DECODE value COERCE round(value, 1) OPERATOR '<';
+    CREATE TYPE short5(value text) BASE text ENCODE lower(value) DECODE value COERCE CASE WHEN length(value) <= 5 THEN value ELSE RAISE(ABORT, 'value too long for short5') END OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, r r1, c short5) STRICT;
+    INSERT INTO t VALUES (1, 1.24, 'ABC');
+    SELECT 'stored', r, c FROM t;
+    SELECT 'r-eq-unrounded', count(*) FROM t WHERE r = '1.24';
+    SELECT 'r-eq', count(*) FROM t WHERE r = '1.2';
+    SELECT 'r-gt-unrounded', count(*) FROM t WHERE r > '1.16';
+    SELECT 'c-eq-long', count(*) FROM t WHERE c = 'ABCDEF';
+    SELECT 'c-lt-long', count(*) FROM t WHERE c < 'ABCDEF';
+    SELECT 'c-eq', count(*) FROM t WHERE c = 'ABC';
+    CREATE INDEX t_r ON t(r);
+    CREATE INDEX t_c ON t(c);
+    SELECT 'r-eq-unrounded', count(*) FROM t WHERE r = '1.24';
+    SELECT 'r-eq', count(*) FROM t WHERE r = '1.2';
+    SELECT 'r-gt-unrounded', count(*) FROM t WHERE r > '1.16';
+    SELECT 'c-eq-long', count(*) FROM t WHERE c = 'ABCDEF';
+    SELECT 'c-lt-long', count(*) FROM t WHERE c < 'ABCDEF';
+    SELECT 'c-eq', count(*) FROM t WHERE c = 'ABC';
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE r = '1.24';
+}
+expect {
+    stored|1.2|abc
+    r-eq-unrounded|0
+    r-eq|1
+    r-gt-unrounded|1
+    c-eq-long|0
+    c-lt-long|1
+    c-eq|1
+    r-eq-unrounded|0
+    r-eq|1
+    r-gt-unrounded|1
+    c-eq-long|0
+    c-lt-long|1
+    c-eq|1
+    1|0|0|SEARCH t USING COVERING INDEX t_r (r=?)
+}
+
+@requires strict "uses STRICT tables"
+test cmp-time-row-value-with-text {
+    -- As in PostgreSQL, each text element of a row value compared with a row
+    -- holding a time is converted to a time first: ('10:00', 2) equals
+    -- (10:00:00, 2). Each query runs before and after the index exists.
+    CREATE TABLE t(id INTEGER, tm time, x text) STRICT;
+    INSERT INTO t VALUES (1, '09:30:00', 'a'), (2, '10:00:00', 'b'), (3, '11:00:00', 'c');
+    SELECT 'eq', x FROM t WHERE (tm, id) = ('10:00', 2) ORDER BY x;
+    SELECT 'eq-reversed', x FROM t WHERE ('10:00', 2) = (tm, id) ORDER BY x;
+    SELECT 'ne', x FROM t WHERE (tm, id) <> ('10:00', 2) ORDER BY x;
+    SELECT 'lt', x FROM t WHERE (tm, id) < ('10:00', 2) ORDER BY x;
+    SELECT 'gt', x FROM t WHERE (tm, id) > ('10:00', 2) ORDER BY x;
+    SELECT 'ge', x FROM t WHERE (tm, id) >= ('10:00', 2) ORDER BY x;
+    SELECT 'is', x FROM t WHERE (tm, id) IS ('10:00', 2) ORDER BY x;
+    SELECT 'is-not', x FROM t WHERE (tm, id) IS NOT ('10:00', 2) ORDER BY x;
+    SELECT 'in', x FROM t WHERE (tm, id) IN (('10:00', 2), ('11:00', 3)) ORDER BY x;
+    SELECT 'not-in', x FROM t WHERE (tm, id) NOT IN (('10:00', 2), ('11:00', 3)) ORDER BY x;
+    SELECT 'between', x FROM t WHERE (tm, id) BETWEEN ('09:30', 1) AND ('10:00', 2) ORDER BY x;
+    CREATE INDEX t_tm_id ON t(tm, id);
+    SELECT 'eq', x FROM t WHERE (tm, id) = ('10:00', 2) ORDER BY x;
+    SELECT 'eq-reversed', x FROM t WHERE ('10:00', 2) = (tm, id) ORDER BY x;
+    SELECT 'ne', x FROM t WHERE (tm, id) <> ('10:00', 2) ORDER BY x;
+    SELECT 'lt', x FROM t WHERE (tm, id) < ('10:00', 2) ORDER BY x;
+    SELECT 'gt', x FROM t WHERE (tm, id) > ('10:00', 2) ORDER BY x;
+    SELECT 'ge', x FROM t WHERE (tm, id) >= ('10:00', 2) ORDER BY x;
+    SELECT 'is', x FROM t WHERE (tm, id) IS ('10:00', 2) ORDER BY x;
+    SELECT 'is-not', x FROM t WHERE (tm, id) IS NOT ('10:00', 2) ORDER BY x;
+    SELECT 'in', x FROM t WHERE (tm, id) IN (('10:00', 2), ('11:00', 3)) ORDER BY x;
+    SELECT 'not-in', x FROM t WHERE (tm, id) NOT IN (('10:00', 2), ('11:00', 3)) ORDER BY x;
+    SELECT 'between', x FROM t WHERE (tm, id) BETWEEN ('09:30', 1) AND ('10:00', 2) ORDER BY x;
+}
+expect {
+    eq|b
+    eq-reversed|b
+    ne|a
+    ne|c
+    lt|a
+    gt|c
+    ge|b
+    ge|c
+    is|b
+    is-not|a
+    is-not|c
+    in|b
+    in|c
+    not-in|a
+    between|a
+    between|b
+    eq|b
+    eq-reversed|b
+    ne|a
+    ne|c
+    lt|a
+    gt|c
+    ge|b
+    ge|c
+    is|b
+    is-not|a
+    is-not|c
+    in|b
+    in|c
+    not-in|a
+    between|a
+    between|b
+}
+
+@requires strict "uses STRICT tables"
+test cmp-time-row-value-with-invalid-text-is-an-error {
+    CREATE TABLE t(id INTEGER, tm time) STRICT;
+    INSERT INTO t VALUES (1, '10:00:00');
+    SELECT count(*) FROM t WHERE (tm, id) = ('garbage', 1);
+}
+expect error {
+    invalid time value
+}

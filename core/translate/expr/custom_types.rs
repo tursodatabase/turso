@@ -59,7 +59,8 @@ pub(super) fn emit_custom_type_operator(
 /// value of the type, as PostgreSQL reads it: it is stored as a column of the
 /// type stores it, then read back. So `ts = '2024-01-05T09:31'` compares ts
 /// with '2024-01-05 09:31:00', and a text the type does not accept is an
-/// error.
+/// error. In a row value such as `(tm, id) = ('10:00', 2)`, each element is
+/// compared with the element of `other` at its position.
 pub(crate) fn translate_compared_operand(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -68,6 +69,22 @@ pub(crate) fn translate_compared_operand(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    if let ast::Expr::Parenthesized(elements) = unwrap_parens(operand)? {
+        if elements.len() > 1 && !resolver.schema().type_registry.is_empty() {
+            for (i, element) in elements.iter().enumerate() {
+                let other_element = row_value_component_expr(other, i)?;
+                translate_compared_operand(
+                    program,
+                    referenced_tables,
+                    element,
+                    &other_element,
+                    reg + i,
+                    resolver,
+                )?;
+            }
+            return Ok(reg);
+        }
+    }
     match untyped_operand_type(operand, other, referenced_tables, resolver)? {
         Some(resolved) => translate_untyped_operand_as(
             program,
@@ -191,7 +208,9 @@ fn converts_untyped_operands(resolved: &ResolvedType) -> bool {
 }
 
 /// Stores the string literal or parameter in `reg` as a value of `resolved`,
-/// as INSERT stores it in a column of the type. NULL is left as it is.
+/// as INSERT stores it in a column of the type, but without COERCE: as in
+/// PostgreSQL, a column's limits, such as the scale of `numeric(10,1)`, do not
+/// apply to the value it is compared with. NULL is left as it is.
 pub(crate) fn emit_untyped_operand_store(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
@@ -203,7 +222,12 @@ pub(crate) fn emit_untyped_operand_store(
         reg,
         target_pc: skip_null,
     });
-    emit_store_value(program, resolved, reg, &[], resolver)?;
+    for type_def in &resolved.chain {
+        if let Some(encode) = type_def.encode() {
+            emit_type_expr(program, encode, reg, reg, resolver)?;
+        }
+    }
+    program.emit_insn(convert_to_base(resolved, reg)?);
     program.preassign_label_to_next_insn(skip_null);
     Ok(())
 }
@@ -396,15 +420,7 @@ pub(crate) fn emit_store_value(
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
-    let convert = Insn::ConvertToType {
-        reg,
-        storage_class: resolved.storage_class()?,
-        description: format!(
-            "as type {} (BASE {})",
-            resolved.leaf().name,
-            resolved.primitive.to_uppercase()
-        ),
-    };
+    let convert = convert_to_base(resolved, reg)?;
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
@@ -416,6 +432,20 @@ pub(crate) fn emit_store_value(
     }
     program.emit_insn(convert);
     Ok(())
+}
+
+/// Converts the value in `reg` to the kind of `resolved`'s BASE, as a STRICT
+/// column of the BASE converts it.
+fn convert_to_base(resolved: &ResolvedType, reg: usize) -> Result<Insn> {
+    Ok(Insn::ConvertToType {
+        reg,
+        storage_class: resolved.storage_class()?,
+        description: format!(
+            "as type {} (BASE {})",
+            resolved.leaf().name,
+            resolved.primitive.to_uppercase()
+        ),
+    })
 }
 
 /// Emits what comparing the value in `reg` with stored values of `chain`'s

@@ -68,8 +68,15 @@ fn emit_row_valued_binary_expr(
 
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_compared_pair(
+        program,
+        referenced_tables,
+        e1,
+        e2,
+        lhs_reg,
+        rhs_reg,
+        resolver,
+    )?;
 
     emit_binary_expr_row_valued(
         program,
