@@ -2335,12 +2335,17 @@ impl Schema {
     }
 
     /// Returns whether a domain in the column's type chain has NOT NULL, and the
-    /// domain CHECK constraints with `value` rewritten to the column name.
+    /// domain CHECK constraints with `value` rewritten to the column name. An
+    /// array column has none: its elements are checked one by one as they are
+    /// stored.
     pub fn column_domain_constraints(
         &self,
         column: &Column,
     ) -> Result<(bool, Vec<CheckConstraint>)> {
         let mut checks = vec![];
+        if column.is_array() {
+            return Ok((false, checks));
+        }
         let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
             return Ok((false, checks));
         };

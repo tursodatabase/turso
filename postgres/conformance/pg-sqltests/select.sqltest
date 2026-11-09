@@ -266,7 +266,195 @@ test select-cast-to-enum-rejects-unknown-label {
 }
 @sqlstate 22P02
 expect error {
-    invalid input value for enum mood
+    invalid input value for enum mood: "xyz"
+}
+
+test select-insert-rejects-unknown-enum-label {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (m mood);
+    INSERT INTO t VALUES ('nope');
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum mood: "nope"
+}
+
+test select-cast-null-to-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (m mood[]);
+    INSERT INTO t VALUES ('{sad,NULL}');
+    SELECT CASE WHEN NULL::mood IS NULL THEN 'null' END, m FROM t;
+}
+expect {
+    null|{sad,NULL}
+}
+
+test select-enum-label-with-quote {
+    CREATE TYPE q AS ENUM ('it''s', 'b');
+    SELECT 'it''s'::q;
+}
+expect {
+    it's
+}
+
+test select-create-enum-rejects-duplicate-label {
+    CREATE TYPE mood AS ENUM ('x', 'y', 'x');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint "pg_enum_typid_label_index"
+}
+
+# PostgreSQL creates the type before its labels, so a taken name is reported
+# before a repeated or too long label.
+test select-create-enum-with-taken-name-and-duplicate-label {
+    CREATE TYPE mood AS ENUM ('x');
+    CREATE TYPE mood AS ENUM ('x', 'x');
+}
+expect error {
+    type "?mood"? already exists
+}
+
+test select-create-enum-with-taken-name-and-long-label {
+    CREATE TYPE mood AS ENUM ('x');
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+expect error {
+    type "?mood"? already exists
+}
+
+# EnumValuesCreate checks every label's length before pg_enum's unique index
+# sees a repeated label.
+test select-create-enum-checks-label-length-before-duplicates {
+    CREATE TYPE mood AS ENUM ('x', 'x', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+@sqlstate 42602
+expect error {
+    invalid enum label "a{64}"
+}
+
+test select-create-enum-rejects-label-over-63-bytes {
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+@sqlstate 42602
+expect error {
+    invalid enum label "a{64}"
+}
+
+test select-create-enum-accepts-63-byte-label {
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::mood::text);
+}
+expect {
+    63
+}
+
+test select-empty-enum-rejects-every-value {
+    CREATE TYPE e AS ENUM ();
+    SELECT 'a'::e;
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum e: "a"
+}
+
+test select-cast-null-to-empty-enum {
+    CREATE TYPE e AS ENUM ();
+    SELECT CASE WHEN NULL::e IS NULL THEN 'null' END;
+}
+expect {
+    null
+}
+
+test select-cast-null-to-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    SELECT CAST(NULL AS dm);
+}
+expect error {
+    domain dm does not allow null values
+}
+
+# Each element of a column of type dm[] is a value of domain dm; the array
+# itself is not, so it may be NULL.
+test select-insert-null-element-into-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (a dm[]);
+    INSERT INTO t VALUES ('{sad,NULL}');
+}
+expect error {
+    domain dm does not allow null values
+}
+
+test select-update-null-element-into-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (a dm[]);
+    INSERT INTO t VALUES ('{ok}');
+    UPDATE t SET a = '{NULL}';
+}
+expect error {
+    domain dm does not allow null values
+}
+
+test select-insert-null-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (id int, a dm[]);
+    INSERT INTO t VALUES (1, NULL), (2, '{sad,ok}');
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|
+    2|{sad,ok}
+}
+
+test select-insert-array-of-domain-checks-each-element {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t (a pos[]);
+    INSERT INTO t VALUES ('{1,2}');
+    INSERT INTO t VALUES ('{3,-1}');
+}
+expect error {
+    value for domain pos violates check constraint "pos_(0|check)"
+}
+
+test select-insert-array-of-domain-keeps-valid-elements {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t (a pos[]);
+    INSERT INTO t VALUES ('{1,2}');
+    SELECT a FROM t;
+}
+expect {
+    {1,2}
+}
+
+test select-cast-to-enum-quotes-mixed-case-type-name {
+    CREATE TYPE "Up" AS ENUM ('a');
+    SELECT 'b'::"Up";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "Up": "b"
+}
+
+test select-cast-to-enum-quotes-keyword-type-name {
+    CREATE TYPE "select" AS ENUM ('a');
+    SELECT 'b'::"select";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "select": "b"
+}
+
+test select-cast-to-enum-quotes-type-name-with-quotes {
+    CREATE TYPE "it's ""x""" AS ENUM ('a');
+    SELECT 'b'::"it's ""x""";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "it's ""x""": "b"
 }
 
 test select-cast-to-domain {
