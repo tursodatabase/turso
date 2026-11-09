@@ -567,6 +567,7 @@ impl PostgreSQLTranslator {
                 min_value: sequence.options.min_value,
                 max_value: sequence.options.max_value,
                 cycle: sequence.options.cycle,
+                conflicting_options: false,
             })
             .collect();
         // PostgreSQL links a serial column's sequence to the column once the
@@ -5618,6 +5619,28 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
+        // PostgreSQL checks for a repeated option name before looking at
+        // any option's value, but only once it knows the sequence gets
+        // created: IF NOT EXISTS on a taken name skips the statement
+        // entirely. The conflict is therefore deferred onto the statement
+        // and enforced after the existence check; without IF NOT EXISTS
+        // nothing skips it, so it fails right here.
+        if reject_repeated_options(&seq.options) {
+            if seq.if_not_exists {
+                return Ok(ast::Stmt::CreateSequence {
+                    if_not_exists: true,
+                    seq_name,
+                    start: None,
+                    increment: None,
+                    min_value: None,
+                    max_value: None,
+                    cycle: false,
+                    conflicting_options: true,
+                });
+            }
+            return Err(conflicting_options());
+        }
+
         let options = SequenceOptions::new(&seq.options, None)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
@@ -5627,6 +5650,7 @@ impl PostgreSQLTranslator {
             min_value: options.min_value,
             max_value: options.max_value,
             cycle: options.cycle,
+            conflicting_options: false,
         })
     }
 
@@ -9390,9 +9414,9 @@ pub fn try_extract_copy_from(
     }))
 }
 
-/// Whether the option list names an option twice. PostgreSQL scans the option
-/// names before looking at any value and reports a repeat; pg_query emits an
-/// option and its NO form under the same defname.
+/// PostgreSQL scans option names before looking at any option's value and
+/// reports "conflicting or redundant options" on a repeat; pg_query emits
+/// an option and its NO form under the same defname.
 pub(crate) fn reject_repeated_options(options: &[pg_query::protobuf::Node]) -> bool {
     let mut seen = std::collections::HashSet::new();
     options.iter().any(|option| {
@@ -14349,6 +14373,26 @@ mod tests {
             assert_eq!(message, "conflicting or redundant options", "{sql}");
         }
         assert_translates("CREATE SEQUENCE s NO MINVALUE NO MAXVALUE START 1 INCREMENT 2");
+    }
+
+    #[test]
+    fn create_sequence_if_not_exists_defers_repeated_options() {
+        // Under IF NOT EXISTS the conflict is a flag on the statement: the
+        // executor checks whether the name is taken before reporting it.
+        let parsed = crate::parse("CREATE SEQUENCE IF NOT EXISTS s START 1 START 2").unwrap();
+        let result = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .unwrap();
+        let ast::Cmd::Stmt(ast::Stmt::CreateSequence {
+            if_not_exists,
+            conflicting_options,
+            ..
+        }) = result.cmd
+        else {
+            panic!("expected CREATE SEQUENCE, got {:?}", result.cmd)
+        };
+        assert!(if_not_exists);
+        assert!(conflicting_options);
     }
 
     #[test]

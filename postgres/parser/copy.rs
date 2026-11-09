@@ -1,5 +1,7 @@
 use pg_query::protobuf::{node::Node, Token};
 
+use crate::sqlstate::SQLSTATE_SYNTAX_ERROR;
+use crate::translator::reject_repeated_options;
 use crate::ParseError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +66,12 @@ pub(crate) fn try_extract_copy_to_stdout(
             "COPY cannot name another database".to_owned(),
         ));
     }
-    let mut format_seen = false;
+    if reject_repeated_options(&copy.options) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_SYNTAX_ERROR,
+            message: "conflicting or redundant options".into(),
+        });
+    }
     for option in &copy.options {
         let Some(Node::DefElem(option)) = &option.node else {
             unreachable!("COPY options are DefElem nodes");
@@ -75,12 +82,6 @@ pub(crate) fn try_extract_copy_to_stdout(
                 option.defname
             )));
         }
-        if format_seen {
-            return Err(ParseError::ParseError(
-                "COPY format was specified more than once".to_owned(),
-            ));
-        }
-        format_seen = true;
         match option.arg.as_ref().and_then(|arg| arg.node.as_ref()) {
             Some(Node::String(format)) if format.sval == "text" => {}
             _ => {
@@ -155,7 +156,7 @@ mod tests {
             ("COPY users TO STDOUT (NULL '')", "null"),
             (
                 "COPY users TO STDOUT (FORMAT text, FORMAT text)",
-                "more than once",
+                "conflicting or redundant options",
             ),
             ("COPY users TO STDOUT; SELECT 1", "one statement"),
         ] {
