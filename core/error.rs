@@ -250,6 +250,72 @@ impl From<turso_parser::error::Error> for LimboError {
 }
 
 impl LimboError {
+    /// The error message without the engine category used by Display.
+    pub fn bare_message(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+
+        match self {
+            Self::Corrupt(message)
+            | Self::InternalError(message)
+            | Self::IoBackendUnavailable(message)
+            | Self::SqlError(message)
+            | Self::ParseError(message)
+            | Self::ConversionError(message)
+            | Self::TxError(message)
+            | Self::LockingError(message)
+            | Self::InvalidDate(message)
+            | Self::InvalidTime(message)
+            | Self::InvalidModifier(message)
+            | Self::InvalidArgument(message)
+            | Self::Constraint(message)
+            | Self::ForeignKeyConstraint(message)
+            | Self::ExtensionError(message)
+            | Self::PlanningError(message) => Cow::Borrowed(message),
+            Self::ConstraintViolation(violation) => Cow::Borrowed(&violation.message),
+            Self::Dialect(error) => Cow::Borrowed(&error.message),
+            Self::Raise(_, error) => error.bare_message(),
+            Self::EnvVarError(error) => Cow::Owned(error.to_string()),
+            Self::ParseIntError(error) => Cow::Owned(error.to_string()),
+            Self::ParseFloatError(error) => Cow::Owned(error.to_string()),
+            Self::NotADB
+            | Self::CacheError(_)
+            | Self::DatabaseFull
+            | Self::SequenceExhausted { .. }
+            | Self::LexerError(_)
+            | Self::NoActiveTransaction { .. }
+            | Self::TransactionAlreadyActive
+            | Self::CompletionError(_)
+            | Self::InvalidFormatter(_)
+            | Self::PermissionDenied(_)
+            | Self::RaiseIgnore
+            | Self::IntegerOverflow
+            | Self::DivisionByZero
+            | Self::InvalidTextRepresentation(_)
+            | Self::TooBig
+            | Self::TableLocked
+            | Self::ReadOnly
+            | Self::Busy
+            | Self::StatementsInProgress(_)
+            | Self::Interrupt
+            | Self::BusySnapshot
+            | Self::Conflict(_)
+            | Self::SchemaUpdated
+            | Self::SchemaConflict
+            | Self::Page1NotAlloc
+            | Self::TxTerminated
+            | Self::WriteWriteConflict
+            | Self::CommitDependencyAborted
+            | Self::NoSuchTransactionID(_)
+            | Self::NullValue
+            | Self::InvalidColumnType
+            | Self::InvalidBlobSize(_)
+            | Self::BlobHandleExpired
+            | Self::CheckpointFailed(_)
+            | Self::UnsupportedEncoding(_)
+            | Self::OutOfMemory => Cow::Owned(self.to_string()),
+        }
+    }
+
     /// The primary SQLite result code for this error, e.g. what the sqlite3
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
