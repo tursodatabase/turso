@@ -1,3 +1,4 @@
+pub mod builtins;
 pub mod cmdtag;
 pub mod copy;
 use pg_query::NodeEnum;

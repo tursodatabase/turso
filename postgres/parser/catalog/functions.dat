@@ -1,0 +1,3319 @@
+f-vi RI_FKey_cascade_del() trigger
+f-vi RI_FKey_cascade_upd() trigger
+f-vi RI_FKey_check_ins() trigger
+f-vi RI_FKey_check_upd() trigger
+f-vi RI_FKey_noaction_del() trigger
+f-vi RI_FKey_noaction_upd() trigger
+f-vi RI_FKey_restrict_del() trigger
+f-vi RI_FKey_restrict_upd() trigger
+f-vi RI_FKey_setdefault_del() trigger
+f-vi RI_FKey_setdefault_upd() trigger
+f-vi RI_FKey_setnull_del() trigger
+f-vi RI_FKey_setnull_upd() trigger
+f-ii abbrev(cidr) text =cidr_abbrev
+f-ii abbrev(inet) text =inet_abbrev
+f-ii abs(float4) float4 =float4abs
+f-ii abs(float8) float8 =float8abs
+f-ii abs(int2) int2 =int2abs
+f-ii abs(int4) int4 =int4abs
+f-ii abs(int8) int8 =int8abs
+f-ii abs(numeric) numeric =numeric_abs
+f-ii aclcontains(_aclitem, aclitem) bool
+f-ii acldefault(char, oid) _aclitem =acldefault_sql
+fssi aclexplode(acl _aclitem) record
+f-ii aclinsert(_aclitem, aclitem) _aclitem
+f-ii aclitemeq(aclitem, aclitem) bool =aclitem_eq
+f-si aclitemin(cstring) aclitem
+f-si aclitemout(aclitem) cstring
+f-ii aclremove(_aclitem, aclitem) _aclitem
+f-ii acos(float8) float8 =dacos
+f-ii acosd(float8) float8 =dacosd
+f-ii acosh(float8) float8 =dacosh
+f-ss age(timestamp) interval
+f-ii age(timestamp, timestamp) interval =timestamp_age
+f-ss age(timestamptz) interval
+f-ii age(timestamptz, timestamptz) interval =timestamptz_age
+f-si age(xid) int4 =xid_age
+f-vi amvalidate(oid) bool
+f-ii any_in(cstring) any
+f-ii any_out(any) cstring
+a-ii any_value(anyelement) anyelement =aggregate_dummy
+f-ii any_value_transfn(anyelement, anyelement) anyelement
+f-ii anyarray_in(cstring) anyarray
+f-si anyarray_out(anyarray) cstring
+f-si anyarray_recv(internal) anyarray
+f-si anyarray_send(anyarray) bytea
+f-ii anycompatible_in(cstring) anycompatible
+f-ii anycompatible_out(anycompatible) cstring
+f-ii anycompatiblearray_in(cstring) anycompatiblearray
+f-si anycompatiblearray_out(anycompatiblearray) cstring
+f-si anycompatiblearray_recv(internal) anycompatiblearray
+f-si anycompatiblearray_send(anycompatiblearray) bytea
+f-si anycompatiblemultirange_in(cstring, oid, int4) anycompatiblemultirange
+f-si anycompatiblemultirange_out(anycompatiblemultirange) cstring
+f-ii anycompatiblenonarray_in(cstring) anycompatiblenonarray
+f-ii anycompatiblenonarray_out(anycompatiblenonarray) cstring
+f-si anycompatiblerange_in(cstring, oid, int4) anycompatiblerange
+f-si anycompatiblerange_out(anycompatiblerange) cstring
+f-ii anyelement_in(cstring) anyelement
+f-ii anyelement_out(anyelement) cstring
+f-ii anyenum_in(cstring) anyenum
+f-si anyenum_out(anyenum) cstring
+f-si anymultirange_in(cstring, oid, int4) anymultirange
+f-si anymultirange_out(anymultirange) cstring
+f-ii anynonarray_in(cstring) anynonarray
+f-ii anynonarray_out(anynonarray) cstring
+f-si anyrange_in(cstring, oid, int4) anyrange
+f-si anyrange_out(anyrange) cstring
+f-ss anytextcat(anynonarray, text) text
+f-ii area(box) float8 =box_area
+f-ii area(circle) float8 =circle_area
+f-ii area(path) float8 =path_area
+f-si areajoinsel(internal, oid, internal, int2, internal) float8
+f-si areasel(internal, oid, internal, int4) float8
+a-ii array_agg(anyarray) anyarray =aggregate_dummy
+a-ii array_agg(anynonarray) anyarray =aggregate_dummy
+f-ii array_agg_array_combine(internal, internal) internal
+f-ii array_agg_array_deserialize(bytea, internal) internal
+f-ii array_agg_array_finalfn(internal, anyarray) anyarray
+f-ii array_agg_array_serialize(internal) bytea
+f-ii array_agg_array_transfn(internal, anyarray) internal
+f-ii array_agg_combine(internal, internal) internal
+f-ii array_agg_deserialize(bytea, internal) internal
+f-ii array_agg_finalfn(internal, anynonarray) anyarray
+f-ii array_agg_serialize(internal) bytea
+f-ii array_agg_transfn(internal, anynonarray) internal
+f-ii array_append(anycompatiblearray, anycompatible) anycompatiblearray
+f-ii array_cat(anycompatiblearray, anycompatiblearray) anycompatiblearray
+f-ii array_dims(anyarray) text
+f-ii array_eq(anyarray, anyarray) bool
+f-ii array_fill(anyelement, _int4) anyarray
+f-ii array_fill(anyelement, _int4, _int4) anyarray =array_fill_with_lower_bounds
+f-ii array_ge(anyarray, anyarray) bool
+f-ii array_gt(anyarray, anyarray) bool
+f-si array_in(cstring, oid, int4) anyarray
+f-ii array_larger(anyarray, anyarray) anyarray
+f-ii array_le(anyarray, anyarray) bool
+f-ii array_length(anyarray, int4) int4
+f-ii array_lower(anyarray, int4) int4
+f-ii array_lt(anyarray, anyarray) bool
+f-ii array_ndims(anyarray) int4
+f-ii array_ne(anyarray, anyarray) bool
+f-si array_out(anyarray) cstring
+f-ii array_position(anycompatiblearray, anycompatible) int4
+f-ii array_position(anycompatiblearray, anycompatible, int4) int4 =array_position_start
+f-ii array_positions(anycompatiblearray, anycompatible) _int4
+f-ii array_prepend(anycompatible, anycompatiblearray) anycompatiblearray
+f-si array_recv(internal, oid, int4) anyarray
+f-ii array_remove(anycompatiblearray, anycompatible) anycompatiblearray
+f-ii array_replace(anycompatiblearray, anycompatible, anycompatible) anycompatiblearray
+f-vi array_sample(anyarray, int4) anyarray
+f-si array_send(anyarray) bytea
+f-vi array_shuffle(anyarray) anyarray
+f-ii array_smaller(anyarray, anyarray) anyarray
+f-ii array_subscript_handler(internal) internal
+f-si array_to_json(anyarray) json
+f-si array_to_json(anyarray, bool) json =array_to_json_pretty
+f-si array_to_string(anyarray, text) text =array_to_text
+f-si array_to_string(anyarray, text, text) text =array_to_text_null
+f-ii array_to_tsvector(_text) tsvector
+f-si array_typanalyze(internal) bool
+f-ii array_unnest_support(internal) internal
+f-ii array_upper(anyarray, int4) int4
+f-ii arraycontained(anyarray, anyarray) bool
+f-ii arraycontains(anyarray, anyarray) bool
+f-si arraycontjoinsel(internal, oid, internal, int2, internal) float8
+f-si arraycontsel(internal, oid, internal, int4) float8
+f-ii arrayoverlap(anyarray, anyarray) bool
+f-ii ascii(text) int4
+f-ii asin(float8) float8 =dasin
+f-ii asind(float8) float8 =dasind
+f-ii asinh(float8) float8 =dasinh
+f-ii atan(float8) float8 =datan
+f-ii atan2(float8, float8) float8 =datan2
+f-ii atan2d(float8, float8) float8 =datan2d
+f-ii atand(float8) float8 =datand
+f-ii atanh(float8) float8 =datanh
+a-ii avg(float4) float8 =aggregate_dummy
+a-ii avg(float8) float8 =aggregate_dummy
+a-ii avg(int2) numeric =aggregate_dummy
+a-ii avg(int4) numeric =aggregate_dummy
+a-ii avg(int8) numeric =aggregate_dummy
+a-ii avg(interval) interval =aggregate_dummy
+a-ii avg(numeric) numeric =aggregate_dummy
+f-vi bernoulli(internal) tsm_handler =tsm_bernoulli_handler
+f-ic big5_to_euc_tw(int4, int4, cstring, internal, int4, bool) int4
+f-ic big5_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic big5_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-vi binary_upgrade_add_sub_rel_state(text, oid, char, pg_lsn) void
+f-vi binary_upgrade_create_empty_extension(text, text, bool, text, _oid, _text, _text) void
+f-vi binary_upgrade_logical_slot_has_caught_up(name) bool
+f-vi binary_upgrade_replorigin_advance(text, pg_lsn) void
+f-vi binary_upgrade_set_missing_value(oid, text, text) void
+f-vi binary_upgrade_set_next_array_pg_type_oid(oid) void
+f-vi binary_upgrade_set_next_heap_pg_class_oid(oid) void
+f-vi binary_upgrade_set_next_heap_relfilenode(oid) void
+f-vi binary_upgrade_set_next_index_pg_class_oid(oid) void
+f-vi binary_upgrade_set_next_index_relfilenode(oid) void
+f-vi binary_upgrade_set_next_multirange_array_pg_type_oid(oid) void
+f-vi binary_upgrade_set_next_multirange_pg_type_oid(oid) void
+f-vi binary_upgrade_set_next_pg_authid_oid(oid) void
+f-vi binary_upgrade_set_next_pg_enum_oid(oid) void
+f-vi binary_upgrade_set_next_pg_tablespace_oid(oid) void
+f-vi binary_upgrade_set_next_pg_type_oid(oid) void
+f-vi binary_upgrade_set_next_toast_pg_class_oid(oid) void
+f-vi binary_upgrade_set_next_toast_relfilenode(oid) void
+f-vi binary_upgrade_set_record_init_privs(bool) void
+f-ii bit(bit, int4, bool) bit
+f-ii bit(int4, int4) bit =bitfromint4
+f-ii bit(int8, int4) bit =bitfromint8
+a-ii bit_and(bit) bit =aggregate_dummy
+a-ii bit_and(int2) int2 =aggregate_dummy
+a-ii bit_and(int4) int4 =aggregate_dummy
+a-ii bit_and(int8) int8 =aggregate_dummy
+f-ii bit_count(bit) int8 =bit_bit_count
+f-ii bit_count(bytea) int8 =bytea_bit_count
+f-ii bit_in(cstring, oid, int4) bit
+f-is bit_length(bit) int4
+f-is bit_length(bytea) int4
+f-is bit_length(text) int4
+a-ii bit_or(bit) bit =aggregate_dummy
+a-ii bit_or(int2) int2 =aggregate_dummy
+a-ii bit_or(int4) int4 =aggregate_dummy
+a-ii bit_or(int8) int8 =aggregate_dummy
+f-ii bit_out(bit) cstring
+f-ii bit_recv(internal, oid, int4) bit
+f-ii bit_send(bit) bytea
+a-ii bit_xor(bit) bit =aggregate_dummy
+a-ii bit_xor(int2) int2 =aggregate_dummy
+a-ii bit_xor(int4) int4 =aggregate_dummy
+a-ii bit_xor(int8) int8 =aggregate_dummy
+f-ii bitand(bit, bit) bit =bit_and
+f-ii bitcat(varbit, varbit) varbit
+f-ii bitcmp(bit, bit) int4
+f-ii biteq(bit, bit) bool
+f-ii bitge(bit, bit) bool
+f-ii bitgt(bit, bit) bool
+f-ii bitle(bit, bit) bool
+f-ii bitlt(bit, bit) bool
+f-ii bitne(bit, bit) bool
+f-ii bitnot(bit) bit
+f-ii bitor(bit, bit) bit =bit_or
+f-ii bitshiftleft(bit, int4) bit
+f-ii bitshiftright(bit, int4) bit
+f-ii bittypmodin(_cstring) int4
+f-ii bittypmodout(int4) cstring
+f-ii bitxor(bit, bit) bit
+f-ii bool(int4) bool =int4_bool
+f-ii bool(jsonb) bool =jsonb_bool
+f-ii bool_accum(internal, bool) internal
+f-ii bool_accum_inv(internal, bool) internal
+f-ii bool_alltrue(internal) bool
+a-ii bool_and(bool) bool =aggregate_dummy
+f-ii bool_anytrue(internal) bool
+a-ii bool_or(bool) bool =aggregate_dummy
+f-ii booland_statefunc(bool, bool) bool
+f-ii booleq(bool, bool) bool
+f-ii boolge(bool, bool) bool
+f-ii boolgt(bool, bool) bool
+f-ii boolin(cstring) bool
+f-ii boolle(bool, bool) bool
+f-ii boollt(bool, bool) bool
+f-ii boolne(bool, bool) bool
+f-ii boolor_statefunc(bool, bool) bool
+f-ii boolout(bool) cstring
+f-ii boolrecv(internal) bool
+f-ii boolsend(bool) bytea
+f-ii bound_box(box, box) box =boxes_bound_box
+f-ii box(circle) box =circle_box
+f-ii box(point) box =point_box
+f-ii box(point, point) box =points_box
+f-ii box(polygon) box =poly_box
+f-ii box_above(box, box) bool
+f-ii box_above_eq(box, box) bool
+f-ii box_add(box, point) box
+f-ii box_below(box, box) bool
+f-ii box_below_eq(box, box) bool
+f-ii box_center(box) point
+f-ii box_contain(box, box) bool
+f-ii box_contain_pt(box, point) bool
+f-ii box_contained(box, box) bool
+f-ii box_distance(box, box) float8
+f-ii box_div(box, point) box
+f-ii box_eq(box, box) bool
+f-ii box_ge(box, box) bool
+f-ii box_gt(box, box) bool
+f-ii box_in(cstring) box
+f-ii box_intersect(box, box) box
+f-ii box_le(box, box) bool
+f-ii box_left(box, box) bool
+f-ii box_lt(box, box) bool
+f-ii box_mul(box, point) box
+f-ii box_out(box) cstring
+f-ii box_overabove(box, box) bool
+f-ii box_overbelow(box, box) bool
+f-ii box_overlap(box, box) bool
+f-ii box_overleft(box, box) bool
+f-ii box_overright(box, box) bool
+f-ii box_recv(internal) box
+f-ii box_right(box, box) bool
+f-ii box_same(box, box) bool
+f-ii box_send(box) bytea
+f-ii box_sub(box, point) box
+f-ii bpchar(bpchar, int4, bool) bpchar
+f-ii bpchar(char) bpchar =char_bpchar
+f-ii bpchar(name) bpchar =name_bpchar
+f-ii bpchar_larger(bpchar, bpchar) bpchar
+f-ii bpchar_pattern_ge(bpchar, bpchar) bool
+f-ii bpchar_pattern_gt(bpchar, bpchar) bool
+f-ii bpchar_pattern_le(bpchar, bpchar) bool
+f-ii bpchar_pattern_lt(bpchar, bpchar) bool
+f-ii bpchar_smaller(bpchar, bpchar) bpchar
+f-ii bpchar_sortsupport(internal) void
+f-ii bpcharcmp(bpchar, bpchar) int4
+f-ii bpchareq(bpchar, bpchar) bool
+f-ii bpcharge(bpchar, bpchar) bool
+f-ii bpchargt(bpchar, bpchar) bool
+f-ii bpchariclike(bpchar, text) bool =texticlike
+f-ii bpcharicnlike(bpchar, text) bool =texticnlike
+f-ii bpcharicregexeq(bpchar, text) bool =texticregexeq
+f-ii bpcharicregexne(bpchar, text) bool =texticregexne
+f-ii bpcharin(cstring, oid, int4) bpchar
+f-ii bpcharle(bpchar, bpchar) bool
+f-ii bpcharlike(bpchar, text) bool =textlike
+f-ii bpcharlt(bpchar, bpchar) bool
+f-ii bpcharne(bpchar, bpchar) bool
+f-ii bpcharnlike(bpchar, text) bool =textnlike
+f-ii bpcharout(bpchar) cstring
+f-si bpcharrecv(internal, oid, int4) bpchar
+f-ii bpcharregexeq(bpchar, text) bool =textregexeq
+f-ii bpcharregexne(bpchar, text) bool =textregexne
+f-si bpcharsend(bpchar) bytea
+f-ii bpchartypmodin(_cstring) int4
+f-ii bpchartypmodout(int4) cstring
+f-ii brin_bloom_add_value(internal, internal, internal, internal) bool
+f-ii brin_bloom_consistent(internal, internal, internal, int4) bool
+f-ii brin_bloom_opcinfo(internal) internal
+f-ii brin_bloom_options(internal) void
+f-ii brin_bloom_summary_in(cstring) pg_brin_bloom_summary
+f-ii brin_bloom_summary_out(pg_brin_bloom_summary) cstring
+f-si brin_bloom_summary_recv(internal) pg_brin_bloom_summary
+f-si brin_bloom_summary_send(pg_brin_bloom_summary) bytea
+f-ii brin_bloom_union(internal, internal, internal) bool
+f-vi brin_desummarize_range(regclass, int8) void
+f-ii brin_inclusion_add_value(internal, internal, internal, internal) bool
+f-ii brin_inclusion_consistent(internal, internal, internal) bool
+f-ii brin_inclusion_opcinfo(internal) internal
+f-ii brin_inclusion_union(internal, internal, internal) bool
+f-ii brin_minmax_add_value(internal, internal, internal, internal) bool
+f-ii brin_minmax_consistent(internal, internal, internal) bool
+f-ii brin_minmax_multi_add_value(internal, internal, internal, internal) bool
+f-ii brin_minmax_multi_consistent(internal, internal, internal, int4) bool
+f-ii brin_minmax_multi_distance_date(internal, internal) float8
+f-ii brin_minmax_multi_distance_float4(internal, internal) float8
+f-ii brin_minmax_multi_distance_float8(internal, internal) float8
+f-ii brin_minmax_multi_distance_inet(internal, internal) float8
+f-ii brin_minmax_multi_distance_int2(internal, internal) float8
+f-ii brin_minmax_multi_distance_int4(internal, internal) float8
+f-ii brin_minmax_multi_distance_int8(internal, internal) float8
+f-ii brin_minmax_multi_distance_interval(internal, internal) float8
+f-ii brin_minmax_multi_distance_macaddr(internal, internal) float8
+f-ii brin_minmax_multi_distance_macaddr8(internal, internal) float8
+f-ii brin_minmax_multi_distance_numeric(internal, internal) float8
+f-ii brin_minmax_multi_distance_pg_lsn(internal, internal) float8
+f-ii brin_minmax_multi_distance_tid(internal, internal) float8
+f-ii brin_minmax_multi_distance_time(internal, internal) float8
+f-ii brin_minmax_multi_distance_timestamp(internal, internal) float8
+f-ii brin_minmax_multi_distance_timetz(internal, internal) float8
+f-ii brin_minmax_multi_distance_uuid(internal, internal) float8
+f-ii brin_minmax_multi_opcinfo(internal) internal
+f-ii brin_minmax_multi_options(internal) void
+f-ii brin_minmax_multi_summary_in(cstring) pg_brin_minmax_multi_summary
+f-ii brin_minmax_multi_summary_out(pg_brin_minmax_multi_summary) cstring
+f-si brin_minmax_multi_summary_recv(internal) pg_brin_minmax_multi_summary
+f-si brin_minmax_multi_summary_send(pg_brin_minmax_multi_summary) bytea
+f-ii brin_minmax_multi_union(internal, internal, internal) bool
+f-ii brin_minmax_opcinfo(internal) internal
+f-ii brin_minmax_union(internal, internal, internal) bool
+f-vi brin_summarize_new_values(regclass) int4
+f-vi brin_summarize_range(regclass, int8) int4
+f-vi brinhandler(internal) index_am_handler
+f-ii broadcast(inet) inet =network_broadcast
+f-ii btarraycmp(anyarray, anyarray) int4
+f-ii btboolcmp(bool, bool) int4
+f-ii btbpchar_pattern_cmp(bpchar, bpchar) int4
+f-ii btbpchar_pattern_sortsupport(internal) void
+f-ii btcharcmp(char, char) int4
+f-ii btequalimage(oid) bool
+f-ii btfloat48cmp(float4, float8) int4
+f-ii btfloat4cmp(float4, float4) int4
+f-ii btfloat4sortsupport(internal) void
+f-ii btfloat84cmp(float8, float4) int4
+f-ii btfloat8cmp(float8, float8) int4
+f-ii btfloat8sortsupport(internal) void
+f-vi bthandler(internal) index_am_handler
+f-ii btint24cmp(int2, int4) int4
+f-ii btint28cmp(int2, int8) int4
+f-ii btint2cmp(int2, int2) int4
+f-ii btint2sortsupport(internal) void
+f-ii btint42cmp(int4, int2) int4
+f-ii btint48cmp(int4, int8) int4
+f-ii btint4cmp(int4, int4) int4
+f-ii btint4sortsupport(internal) void
+f-ii btint82cmp(int8, int2) int4
+f-ii btint84cmp(int8, int4) int4
+f-ii btint8cmp(int8, int8) int4
+f-ii btint8sortsupport(internal) void
+f-ii btnamecmp(name, name) int4
+f-ii btnamesortsupport(internal) void
+f-ii btnametextcmp(name, text) int4
+f-ii btoidcmp(oid, oid) int4
+f-ii btoidsortsupport(internal) void
+f-ii btoidvectorcmp(oidvector, oidvector) int4
+f-ii btrecordcmp(record, record) int4
+f-ii btrecordimagecmp(record, record) int4
+f-ii btrim(bytea, bytea) bytea =byteatrim
+f-ii btrim(text) text =btrim1
+f-ii btrim(text, text) text
+f-ii bttext_pattern_cmp(text, text) int4
+f-ii bttext_pattern_sortsupport(internal) void
+f-ii bttextcmp(text, text) int4
+f-ii bttextnamecmp(text, name) int4
+f-ii bttextsortsupport(internal) void
+f-ii bttidcmp(tid, tid) int4
+f-ii btvarstrequalimage(oid) bool
+f-ii bytea_sortsupport(internal) void
+f-ii bytea_string_agg_finalfn(internal) bytea
+f-ii bytea_string_agg_transfn(internal, bytea, bytea) internal
+f-ii byteacat(bytea, bytea) bytea
+f-ii byteacmp(bytea, bytea) int4
+f-ii byteaeq(bytea, bytea) bool
+f-ii byteage(bytea, bytea) bool
+f-ii byteagt(bytea, bytea) bool
+f-ii byteain(cstring) bytea
+f-ii byteale(bytea, bytea) bool
+f-ii bytealike(bytea, bytea) bool
+f-ii bytealt(bytea, bytea) bool
+f-ii byteane(bytea, bytea) bool
+f-ii byteanlike(bytea, bytea) bool
+f-ii byteaout(bytea) cstring
+f-ii bytearecv(internal) bytea
+f-ii byteasend(bytea) bytea
+f-ii cardinality(anyarray) int4 =array_cardinality
+f-ii cash_cmp(money, money) int4
+f-ii cash_div_cash(money, money) float8
+f-ii cash_div_flt4(money, float4) money
+f-ii cash_div_flt8(money, float8) money
+f-ii cash_div_int2(money, int2) money
+f-ii cash_div_int4(money, int4) money
+f-ii cash_div_int8(money, int8) money
+f-ii cash_eq(money, money) bool
+f-ii cash_ge(money, money) bool
+f-ii cash_gt(money, money) bool
+f-si cash_in(cstring) money
+f-ii cash_le(money, money) bool
+f-ii cash_lt(money, money) bool
+f-ii cash_mi(money, money) money
+f-ii cash_mul_flt4(money, float4) money
+f-ii cash_mul_flt8(money, float8) money
+f-ii cash_mul_int2(money, int2) money
+f-ii cash_mul_int4(money, int4) money
+f-ii cash_mul_int8(money, int8) money
+f-ii cash_ne(money, money) bool
+f-si cash_out(money) cstring
+f-ii cash_pl(money, money) money
+f-ii cash_recv(internal) money
+f-ii cash_send(money) bytea
+f-ii cash_words(money) text
+f-ii cashlarger(money, money) money
+f-ii cashsmaller(money, money) money
+f-ii cbrt(float8) float8 =dcbrt
+f-ii ceil(float8) float8 =dceil
+f-ii ceil(numeric) numeric =numeric_ceil
+f-ii ceiling(float8) float8 =dceil
+f-ii ceiling(numeric) numeric =numeric_ceil
+f-ii center(box) point =box_center
+f-ii center(circle) point =circle_center
+f-ii char(int4) char =i4tochar
+f-ii char(text) char =text_char
+f-ii char_length(bpchar) int4 =bpcharlen
+f-ii char_length(text) int4 =textlen
+f-ii character_length(bpchar) int4 =bpcharlen
+f-ii character_length(text) int4 =textlen
+f-ii chareq(char, char) bool
+f-ii charge(char, char) bool
+f-ii chargt(char, char) bool
+f-ii charin(cstring) char
+f-ii charle(char, char) bool
+f-ii charlt(char, char) bool
+f-ii charne(char, char) bool
+f-ii charout(char) cstring
+f-ii charrecv(internal) char
+f-ii charsend(char) bytea
+f-ii chr(int4) text
+f-ii cideq(cid, cid) bool
+f-ii cidin(cstring) cid
+f-ii cidout(cid) cstring
+f-ii cidr(inet) cidr =inet_to_cidr
+f-ii cidr_in(cstring) cidr
+f-ii cidr_out(cidr) cstring
+f-ii cidr_recv(internal) cidr
+f-ii cidr_send(cidr) bytea
+f-ii cidrecv(internal) cid
+f-ii cidsend(cid) bytea
+f-ii circle(box) circle =box_circle
+f-ii circle(point, float8) circle =cr_circle
+f-ii circle(polygon) circle =poly_circle
+f-ii circle_above(circle, circle) bool
+f-ii circle_add_pt(circle, point) circle
+f-ii circle_below(circle, circle) bool
+f-ii circle_center(circle) point
+f-ii circle_contain(circle, circle) bool
+f-ii circle_contain_pt(circle, point) bool
+f-ii circle_contained(circle, circle) bool
+f-ii circle_distance(circle, circle) float8
+f-ii circle_div_pt(circle, point) circle
+f-ii circle_eq(circle, circle) bool
+f-ii circle_ge(circle, circle) bool
+f-ii circle_gt(circle, circle) bool
+f-ii circle_in(cstring) circle
+f-ii circle_le(circle, circle) bool
+f-ii circle_left(circle, circle) bool
+f-ii circle_lt(circle, circle) bool
+f-ii circle_mul_pt(circle, point) circle
+f-ii circle_ne(circle, circle) bool
+f-ii circle_out(circle) cstring
+f-ii circle_overabove(circle, circle) bool
+f-ii circle_overbelow(circle, circle) bool
+f-ii circle_overlap(circle, circle) bool
+f-ii circle_overleft(circle, circle) bool
+f-ii circle_overright(circle, circle) bool
+f-ii circle_recv(internal) circle
+f-ii circle_right(circle, circle) bool
+f-ii circle_same(circle, circle) bool
+f-ii circle_send(circle) bytea
+f-ii circle_sub_pt(circle, point) circle
+f-vi clock_timestamp() timestamptz
+f-ii close_ls(line, lseg) point
+f-ii close_lseg(lseg, lseg) point
+f-ii close_pb(point, box) point
+f-ii close_pl(point, line) point
+f-ii close_ps(point, lseg) point
+f-ii close_sb(lseg, box) point
+f-ss col_description(oid, int4) text
+f-si concat(variadic any) text =text_concat
+f-si concat_ws(text, variadic any) text =text_concat_ws
+f-si contjoinsel(internal, oid, internal, int2, internal) float8
+f-si contsel(internal, oid, internal, int4) float8
+f-si convert(bytea, name, name) bytea =pg_convert
+f-si convert_from(bytea, name) text =pg_convert_from
+f-si convert_to(text, name) bytea =pg_convert_to
+a-ii corr(float8, float8) float8 =aggregate_dummy
+f-ii cos(float8) float8 =dcos
+f-ii cosd(float8) float8 =dcosd
+f-ii cosh(float8) float8 =dcosh
+f-ii cot(float8) float8 =dcot
+f-ii cotd(float8) float8 =dcotd
+a-ii count() int8 =aggregate_dummy
+a-ii count(any) int8 =aggregate_dummy
+a-ii covar_pop(float8, float8) float8 =aggregate_dummy
+a-ii covar_samp(float8, float8) float8 =aggregate_dummy
+f-ii cstring_in(cstring) cstring
+f-ii cstring_out(cstring) cstring
+f-si cstring_recv(internal) cstring
+f-si cstring_send(cstring) bytea
+w-ii cume_dist() float8 =window_cume_dist
+a-ii cume_dist(variadic any) float8 =aggregate_dummy
+f-ii cume_dist_final(internal, variadic any) float8 =hypothetical_cume_dist_final
+f-si current_database() name
+f-vi current_query() text
+f-si current_schema() name
+f-si current_schemas(bool) _name
+f-si current_setting(text) text =show_config_by_name
+f-si current_setting(text, bool) text =show_config_by_name_missing_ok
+f-si current_user() name
+f-vi currtid2(text, tid) tid =currtid_byrelname
+f-vi currval(regclass) int8 =currval_oid
+f-vi cursor_to_xml(cursor refcursor, count int4, nulls bool, tableforest bool, targetns text) xml
+f-vi cursor_to_xmlschema(cursor refcursor, nulls bool, tableforest bool, targetns text) xml
+f-si database_to_xml(nulls bool, tableforest bool, targetns text) xml
+f-si database_to_xml_and_xmlschema(nulls bool, tableforest bool, targetns text) xml
+f-si database_to_xmlschema(nulls bool, tableforest bool, targetns text) xml
+f-ii date(timestamp) date =timestamp_date
+f-si date(timestamptz) date =timestamptz_date
+f-si date_add(timestamptz, interval) timestamptz =timestamptz_pl_interval
+f-ii date_add(timestamptz, interval, text) timestamptz =timestamptz_pl_interval_at_zone
+f-ii date_bin(interval, timestamp, timestamp) timestamp =timestamp_bin
+f-ii date_bin(interval, timestamptz, timestamptz) timestamptz =timestamptz_bin
+f-ii date_cmp(date, date) int4
+f-ii date_cmp_timestamp(date, timestamp) int4
+f-si date_cmp_timestamptz(date, timestamptz) int4
+f-ii date_eq(date, date) bool
+f-ii date_eq_timestamp(date, timestamp) bool
+f-si date_eq_timestamptz(date, timestamptz) bool
+f-ii date_ge(date, date) bool
+f-ii date_ge_timestamp(date, timestamp) bool
+f-si date_ge_timestamptz(date, timestamptz) bool
+f-ii date_gt(date, date) bool
+f-ii date_gt_timestamp(date, timestamp) bool
+f-si date_gt_timestamptz(date, timestamptz) bool
+f-si date_in(cstring) date
+f-ii date_larger(date, date) date
+f-ii date_le(date, date) bool
+f-ii date_le_timestamp(date, timestamp) bool
+f-si date_le_timestamptz(date, timestamptz) bool
+f-ii date_lt(date, date) bool
+f-ii date_lt_timestamp(date, timestamp) bool
+f-si date_lt_timestamptz(date, timestamptz) bool
+f-ii date_mi(date, date) int4
+f-ii date_mi_interval(date, interval) timestamp
+f-ii date_mii(date, int4) date
+f-ii date_ne(date, date) bool
+f-ii date_ne_timestamp(date, timestamp) bool
+f-si date_ne_timestamptz(date, timestamptz) bool
+f-si date_out(date) cstring
+f-is date_part(text, date) float8
+f-ii date_part(text, interval) float8 =interval_part
+f-ii date_part(text, time) float8 =time_part
+f-ii date_part(text, timestamp) float8 =timestamp_part
+f-si date_part(text, timestamptz) float8 =timestamptz_part
+f-ii date_part(text, timetz) float8 =timetz_part
+f-ii date_pl_interval(date, interval) timestamp
+f-ii date_pli(date, int4) date
+f-ii date_recv(internal) date
+f-ii date_send(date) bytea
+f-ii date_smaller(date, date) date
+f-ii date_sortsupport(internal) void
+f-si date_subtract(timestamptz, interval) timestamptz =timestamptz_mi_interval
+f-ii date_subtract(timestamptz, interval, text) timestamptz =timestamptz_mi_interval_at_zone
+f-ii date_trunc(text, interval) interval =interval_trunc
+f-ii date_trunc(text, timestamp) timestamp =timestamp_trunc
+f-si date_trunc(text, timestamptz) timestamptz =timestamptz_trunc
+f-ii date_trunc(text, timestamptz, text) timestamptz =timestamptz_trunc_zone
+f-ii datemultirange() datemultirange =multirange_constructor0
+f-ii datemultirange(daterange) datemultirange =multirange_constructor1
+f-ii datemultirange(variadic _daterange) datemultirange =multirange_constructor2
+f-ii daterange(date, date) daterange =range_constructor2
+f-ii daterange(date, date, text) daterange =range_constructor3
+f-ii daterange_canonical(daterange) daterange
+f-ii daterange_subdiff(date, date) float8
+f-ii datetime_pl(date, time) timestamp =datetime_timestamp
+f-ii datetimetz_pl(date, timetz) timestamptz =datetimetz_timestamptz
+f-ii dcbrt(float8) float8
+f-ii decode(text, text) bytea =binary_decode
+f-ii degrees(float8) float8
+w-ii dense_rank() int8 =window_dense_rank
+a-ii dense_rank(variadic any) int8 =aggregate_dummy
+f-ii dense_rank_final(internal, variadic any) int8 =hypothetical_dense_rank_final
+f-ii dexp(float8) float8
+f-ii diagonal(box) lseg =box_diagonal
+f-ii diameter(circle) float8 =circle_diameter
+f-ii dispell_init(internal) internal
+f-ii dispell_lexize(internal, internal, internal, internal) internal
+f-ii dist_bp(box, point) float8
+f-ii dist_bs(box, lseg) float8
+f-ii dist_cpoint(circle, point) float8
+f-ii dist_cpoly(circle, polygon) float8
+f-ii dist_lp(line, point) float8
+f-ii dist_ls(line, lseg) float8
+f-ii dist_pathp(path, point) float8
+f-ii dist_pb(point, box) float8
+f-ii dist_pc(point, circle) float8
+f-ii dist_pl(point, line) float8
+f-ii dist_polyc(polygon, circle) float8
+f-ii dist_polyp(polygon, point) float8
+f-ii dist_ppath(point, path) float8
+f-ii dist_ppoly(point, polygon) float8
+f-ii dist_ps(point, lseg) float8
+f-ii dist_sb(lseg, box) float8
+f-ii dist_sl(lseg, line) float8
+f-ii dist_sp(lseg, point) float8
+f-ii div(numeric, numeric) numeric =numeric_div_trunc
+f-ii dlog1(float8) float8
+f-ii dlog10(float8) float8
+f-si domain_in(cstring, oid, int4) any
+f-si domain_recv(internal, oid, int4) any
+f-ii dpow(float8, float8) float8
+f-ii dround(float8) float8
+f-ii dsimple_init(internal) internal
+f-ii dsimple_lexize(internal, internal, internal, internal) internal
+f-vc dsnowball_init(internal) internal
+f-vc dsnowball_lexize(internal, internal, internal, internal) internal
+f-ii dsqrt(float8) float8
+f-ii dsynonym_init(internal) internal
+f-ii dsynonym_lexize(internal, internal, internal, internal) internal
+f-ii dtrunc(float8) float8
+f-ii elem_contained_by_multirange(anyelement, anymultirange) bool
+f-ii elem_contained_by_range(anyelement, anyrange) bool
+f-ii elem_contained_by_range_support(internal) internal
+f-ii encode(bytea, text) text =binary_encode
+f-ii enum_cmp(anyenum, anyenum) int4
+f-ii enum_eq(anyenum, anyenum) bool
+f-si enum_first(anyenum) anyenum
+f-ii enum_ge(anyenum, anyenum) bool
+f-ii enum_gt(anyenum, anyenum) bool
+f-si enum_in(cstring, oid) anyenum
+f-ii enum_larger(anyenum, anyenum) anyenum
+f-si enum_last(anyenum) anyenum
+f-ii enum_le(anyenum, anyenum) bool
+f-ii enum_lt(anyenum, anyenum) bool
+f-ii enum_ne(anyenum, anyenum) bool
+f-si enum_out(anyenum) cstring
+f-si enum_range(anyenum) anyarray =enum_range_all
+f-si enum_range(anyenum, anyenum) anyarray =enum_range_bounds
+f-si enum_recv(internal, oid) anyenum
+f-si enum_send(anyenum) bytea
+f-ii enum_smaller(anyenum, anyenum) anyenum
+f-si eqjoinsel(internal, oid, internal, int2, internal) float8
+f-si eqsel(internal, oid, internal, int4) float8
+f-ii erf(float8) float8 =derf
+f-ii erfc(float8) float8 =derfc
+f-ic euc_cn_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_cn_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_jis_2004_to_shift_jis_2004(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_jis_2004_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_jp_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_jp_to_sjis(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_jp_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_kr_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_kr_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_tw_to_big5(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_tw_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic euc_tw_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ii event_trigger_in(cstring) event_trigger
+f-ii event_trigger_out(event_trigger) cstring
+a-ii every(bool) bool =aggregate_dummy
+f-ii exp(float8) float8 =dexp
+f-ii exp(numeric) numeric =numeric_exp
+f-ii extract(text, date) numeric =extract_date
+f-ii extract(text, interval) numeric =extract_interval
+f-ii extract(text, time) numeric =extract_time
+f-ii extract(text, timestamp) numeric =extract_timestamp
+f-si extract(text, timestamptz) numeric =extract_timestamptz
+f-ii extract(text, timetz) numeric =extract_timetz
+f-ii factorial(int8) numeric =numeric_fac
+f-ii family(inet) int4 =network_family
+f-ii fdw_handler_in(cstring) fdw_handler
+f-ii fdw_handler_out(fdw_handler) cstring
+w-ii first_value(anyelement) anyelement =window_first_value
+f-ii float4(float8) float4 =dtof
+f-ii float4(int2) float4 =i2tof
+f-ii float4(int4) float4 =i4tof
+f-ii float4(int8) float4 =i8tof
+f-ii float4(jsonb) float4 =jsonb_float4
+f-ii float4(numeric) float4 =numeric_float4
+f-ii float48div(float4, float8) float8
+f-ii float48eq(float4, float8) bool
+f-ii float48ge(float4, float8) bool
+f-ii float48gt(float4, float8) bool
+f-ii float48le(float4, float8) bool
+f-ii float48lt(float4, float8) bool
+f-ii float48mi(float4, float8) float8
+f-ii float48mul(float4, float8) float8
+f-ii float48ne(float4, float8) bool
+f-ii float48pl(float4, float8) float8
+f-ii float4_accum(_float8, float4) _float8
+f-ii float4abs(float4) float4
+f-ii float4div(float4, float4) float4
+f-ii float4eq(float4, float4) bool
+f-ii float4ge(float4, float4) bool
+f-ii float4gt(float4, float4) bool
+f-ii float4in(cstring) float4
+f-ii float4larger(float4, float4) float4
+f-ii float4le(float4, float4) bool
+f-ii float4lt(float4, float4) bool
+f-ii float4mi(float4, float4) float4
+f-ii float4mul(float4, float4) float4
+f-ii float4ne(float4, float4) bool
+f-ii float4out(float4) cstring
+f-ii float4pl(float4, float4) float4
+f-ii float4recv(internal) float4
+f-ii float4send(float4) bytea
+f-ii float4smaller(float4, float4) float4
+f-ii float4um(float4) float4
+f-ii float4up(float4) float4
+f-ii float8(float4) float8 =ftod
+f-ii float8(int2) float8 =i2tod
+f-ii float8(int4) float8 =i4tod
+f-ii float8(int8) float8 =i8tod
+f-ii float8(jsonb) float8 =jsonb_float8
+f-ii float8(numeric) float8 =numeric_float8
+f-ii float84div(float8, float4) float8
+f-ii float84eq(float8, float4) bool
+f-ii float84ge(float8, float4) bool
+f-ii float84gt(float8, float4) bool
+f-ii float84le(float8, float4) bool
+f-ii float84lt(float8, float4) bool
+f-ii float84mi(float8, float4) float8
+f-ii float84mul(float8, float4) float8
+f-ii float84ne(float8, float4) bool
+f-ii float84pl(float8, float4) float8
+f-ii float8_accum(_float8, float8) _float8
+f-ii float8_avg(_float8) float8
+f-ii float8_combine(_float8, _float8) _float8
+f-ii float8_corr(_float8) float8
+f-ii float8_covar_pop(_float8) float8
+f-ii float8_covar_samp(_float8) float8
+f-ii float8_regr_accum(_float8, float8, float8) _float8
+f-ii float8_regr_avgx(_float8) float8
+f-ii float8_regr_avgy(_float8) float8
+f-ii float8_regr_combine(_float8, _float8) _float8
+f-ii float8_regr_intercept(_float8) float8
+f-ii float8_regr_r2(_float8) float8
+f-ii float8_regr_slope(_float8) float8
+f-ii float8_regr_sxx(_float8) float8
+f-ii float8_regr_sxy(_float8) float8
+f-ii float8_regr_syy(_float8) float8
+f-ii float8_stddev_pop(_float8) float8
+f-ii float8_stddev_samp(_float8) float8
+f-ii float8_var_pop(_float8) float8
+f-ii float8_var_samp(_float8) float8
+f-ii float8abs(float8) float8
+f-ii float8div(float8, float8) float8
+f-ii float8eq(float8, float8) bool
+f-ii float8ge(float8, float8) bool
+f-ii float8gt(float8, float8) bool
+f-ii float8in(cstring) float8
+f-ii float8larger(float8, float8) float8
+f-ii float8le(float8, float8) bool
+f-ii float8lt(float8, float8) bool
+f-ii float8mi(float8, float8) float8
+f-ii float8mul(float8, float8) float8
+f-ii float8ne(float8, float8) bool
+f-ii float8out(float8) cstring
+f-ii float8pl(float8, float8) float8
+f-ii float8recv(internal) float8
+f-ii float8send(float8) bytea
+f-ii float8smaller(float8, float8) float8
+f-ii float8um(float8) float8
+f-ii float8up(float8) float8
+f-ii floor(float8) float8 =dfloor
+f-ii floor(numeric) numeric =numeric_floor
+f-ii flt4_mul_cash(float4, money) money
+f-ii flt8_mul_cash(float8, money) money
+f-si fmgr_c_validator(oid) void
+f-si fmgr_internal_validator(oid) void
+f-si fmgr_sql_validator(oid) void
+f-si format(text) text =text_format_nv
+f-si format(text, variadic any) text =text_format
+f-si format_type(oid, int4) text
+f-ic gb18030_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic gbk_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ii gcd(int4, int4) int4 =int4gcd
+f-ii gcd(int8, int8) int8 =int8gcd
+f-ii gcd(numeric, numeric) numeric =numeric_gcd
+f-vi gen_random_uuid() uuid
+fsii generate_series(int4, int4) int4 =generate_series_int4
+fsii generate_series(int4, int4, int4) int4 =generate_series_step_int4
+fsii generate_series(int8, int8) int8 =generate_series_int8
+fsii generate_series(int8, int8, int8) int8 =generate_series_step_int8
+fsii generate_series(numeric, numeric) numeric =generate_series_numeric
+fsii generate_series(numeric, numeric, numeric) numeric =generate_series_step_numeric
+fsii generate_series(timestamp, timestamp, interval) timestamp =generate_series_timestamp
+fssi generate_series(timestamptz, timestamptz, interval) timestamptz =generate_series_timestamptz
+fsii generate_series(timestamptz, timestamptz, interval, text) timestamptz =generate_series_timestamptz_at_zone
+f-ii generate_series_int4_support(internal) internal
+f-ii generate_series_int8_support(internal) internal
+fsii generate_subscripts(anyarray, int4) int4 =generate_subscripts_nodir
+fsii generate_subscripts(anyarray, int4, bool) int4
+f-ii get_bit(bit, int4) int4 =bitgetbit
+f-ii get_bit(bytea, int8) int4 =byteaGetBit
+f-ii get_byte(bytea, int4) int4 =byteaGetByte
+f-si get_current_ts_config() regconfig
+f-si getdatabaseencoding() name
+f-si getpgusername() name =current_user
+f-vi gin_clean_pending_list(regclass) int8
+f-ii gin_cmp_prefix(text, text, int2, internal) int4
+f-ii gin_cmp_tslexeme(text, text) int4
+f-ii gin_compare_jsonb(text, text) int4
+f-ii gin_consistent_jsonb(internal, int2, jsonb, int4, internal, internal, internal, internal) bool
+f-ii gin_consistent_jsonb_path(internal, int2, jsonb, int4, internal, internal, internal, internal) bool
+f-ii gin_extract_jsonb(jsonb, internal, internal) internal
+f-ii gin_extract_jsonb_path(jsonb, internal, internal) internal
+f-ii gin_extract_jsonb_query(jsonb, internal, int2, internal, internal, internal, internal) internal
+f-ii gin_extract_jsonb_query_path(jsonb, internal, int2, internal, internal, internal, internal) internal
+f-ii gin_extract_tsquery(tsquery, internal, int2, internal, internal) internal =gin_extract_tsquery_5args
+f-ii gin_extract_tsquery(tsquery, internal, int2, internal, internal, internal, internal) internal =gin_extract_tsquery_oldsig
+f-ii gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal) internal
+f-ii gin_extract_tsvector(tsvector, internal) internal =gin_extract_tsvector_2args
+f-ii gin_extract_tsvector(tsvector, internal, internal) internal
+f-ii gin_triconsistent_jsonb(internal, int2, jsonb, int4, internal, internal, internal) char
+f-ii gin_triconsistent_jsonb_path(internal, int2, jsonb, int4, internal, internal, internal) char
+f-ii gin_tsquery_consistent(internal, int2, tsquery, int4, internal, internal) bool =gin_tsquery_consistent_6args
+f-ii gin_tsquery_consistent(internal, int2, tsquery, int4, internal, internal, internal, internal) bool =gin_tsquery_consistent_oldsig
+f-ii gin_tsquery_consistent(internal, int2, tsvector, int4, internal, internal, internal, internal) bool
+f-ii gin_tsquery_triconsistent(internal, int2, tsvector, int4, internal, internal, internal) char
+f-ii ginarrayconsistent(internal, int2, anyarray, int4, internal, internal, internal, internal) bool
+f-ii ginarrayextract(anyarray, internal) internal =ginarrayextract_2args
+f-ii ginarrayextract(anyarray, internal, internal) internal
+f-ii ginarraytriconsistent(internal, int2, anyarray, int4, internal, internal, internal) char
+f-vi ginhandler(internal) index_am_handler
+f-ii ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal) internal
+f-ii gist_box_consistent(internal, box, int2, oid, internal) bool
+f-ii gist_box_distance(internal, box, int2, oid, internal) float8
+f-ii gist_box_penalty(internal, internal, internal) internal
+f-ii gist_box_picksplit(internal, internal) internal
+f-ii gist_box_same(box, box, internal) internal
+f-ii gist_box_union(internal, internal) box
+f-ii gist_circle_compress(internal) internal
+f-ii gist_circle_consistent(internal, circle, int2, oid, internal) bool
+f-ii gist_circle_distance(internal, circle, int2, oid, internal) float8
+f-ii gist_point_compress(internal) internal
+f-ii gist_point_consistent(internal, point, int2, oid, internal) bool
+f-ii gist_point_distance(internal, point, int2, oid, internal) float8
+f-ii gist_point_fetch(internal) internal
+f-ii gist_point_sortsupport(internal) void
+f-ii gist_poly_compress(internal) internal
+f-ii gist_poly_consistent(internal, polygon, int2, oid, internal) bool
+f-ii gist_poly_distance(internal, polygon, int2, oid, internal) float8
+f-vi gisthandler(internal) index_am_handler
+f-ii gtsquery_compress(internal) internal
+f-ii gtsquery_consistent(internal, internal, int4, oid, internal) bool =gtsquery_consistent_oldsig
+f-ii gtsquery_consistent(internal, tsquery, int2, oid, internal) bool
+f-ii gtsquery_penalty(internal, internal, internal) internal
+f-ii gtsquery_picksplit(internal, internal) internal
+f-ii gtsquery_same(int8, int8, internal) internal
+f-ii gtsquery_union(internal, internal) int8
+f-ii gtsvector_compress(internal) internal
+f-ii gtsvector_consistent(internal, gtsvector, int4, oid, internal) bool =gtsvector_consistent_oldsig
+f-ii gtsvector_consistent(internal, tsvector, int2, oid, internal) bool
+f-ii gtsvector_decompress(internal) internal
+f-ii gtsvector_options(internal) void
+f-ii gtsvector_penalty(internal, internal, internal) internal
+f-ii gtsvector_picksplit(internal, internal) internal
+f-ii gtsvector_same(gtsvector, gtsvector, internal) internal
+f-ii gtsvector_union(internal, internal) gtsvector
+f-ii gtsvectorin(cstring) gtsvector
+f-ii gtsvectorout(gtsvector) cstring
+f-si has_any_column_privilege(name, oid, text) bool =has_any_column_privilege_name_id
+f-si has_any_column_privilege(name, text, text) bool =has_any_column_privilege_name_name
+f-si has_any_column_privilege(oid, oid, text) bool =has_any_column_privilege_id_id
+f-si has_any_column_privilege(oid, text) bool =has_any_column_privilege_id
+f-si has_any_column_privilege(oid, text, text) bool =has_any_column_privilege_id_name
+f-si has_any_column_privilege(text, text) bool =has_any_column_privilege_name
+f-si has_column_privilege(name, oid, int2, text) bool =has_column_privilege_name_id_attnum
+f-si has_column_privilege(name, oid, text, text) bool =has_column_privilege_name_id_name
+f-si has_column_privilege(name, text, int2, text) bool =has_column_privilege_name_name_attnum
+f-si has_column_privilege(name, text, text, text) bool =has_column_privilege_name_name_name
+f-si has_column_privilege(oid, int2, text) bool =has_column_privilege_id_attnum
+f-si has_column_privilege(oid, oid, int2, text) bool =has_column_privilege_id_id_attnum
+f-si has_column_privilege(oid, oid, text, text) bool =has_column_privilege_id_id_name
+f-si has_column_privilege(oid, text, int2, text) bool =has_column_privilege_id_name_attnum
+f-si has_column_privilege(oid, text, text) bool =has_column_privilege_id_name
+f-si has_column_privilege(oid, text, text, text) bool =has_column_privilege_id_name_name
+f-si has_column_privilege(text, int2, text) bool =has_column_privilege_name_attnum
+f-si has_column_privilege(text, text, text) bool =has_column_privilege_name_name
+f-si has_database_privilege(name, oid, text) bool =has_database_privilege_name_id
+f-si has_database_privilege(name, text, text) bool =has_database_privilege_name_name
+f-si has_database_privilege(oid, oid, text) bool =has_database_privilege_id_id
+f-si has_database_privilege(oid, text) bool =has_database_privilege_id
+f-si has_database_privilege(oid, text, text) bool =has_database_privilege_id_name
+f-si has_database_privilege(text, text) bool =has_database_privilege_name
+f-si has_foreign_data_wrapper_privilege(name, oid, text) bool =has_foreign_data_wrapper_privilege_name_id
+f-si has_foreign_data_wrapper_privilege(name, text, text) bool =has_foreign_data_wrapper_privilege_name_name
+f-si has_foreign_data_wrapper_privilege(oid, oid, text) bool =has_foreign_data_wrapper_privilege_id_id
+f-si has_foreign_data_wrapper_privilege(oid, text) bool =has_foreign_data_wrapper_privilege_id
+f-si has_foreign_data_wrapper_privilege(oid, text, text) bool =has_foreign_data_wrapper_privilege_id_name
+f-si has_foreign_data_wrapper_privilege(text, text) bool =has_foreign_data_wrapper_privilege_name
+f-si has_function_privilege(name, oid, text) bool =has_function_privilege_name_id
+f-si has_function_privilege(name, text, text) bool =has_function_privilege_name_name
+f-si has_function_privilege(oid, oid, text) bool =has_function_privilege_id_id
+f-si has_function_privilege(oid, text) bool =has_function_privilege_id
+f-si has_function_privilege(oid, text, text) bool =has_function_privilege_id_name
+f-si has_function_privilege(text, text) bool =has_function_privilege_name
+f-si has_language_privilege(name, oid, text) bool =has_language_privilege_name_id
+f-si has_language_privilege(name, text, text) bool =has_language_privilege_name_name
+f-si has_language_privilege(oid, oid, text) bool =has_language_privilege_id_id
+f-si has_language_privilege(oid, text) bool =has_language_privilege_id
+f-si has_language_privilege(oid, text, text) bool =has_language_privilege_id_name
+f-si has_language_privilege(text, text) bool =has_language_privilege_name
+f-si has_parameter_privilege(name, text, text) bool =has_parameter_privilege_name_name
+f-si has_parameter_privilege(oid, text, text) bool =has_parameter_privilege_id_name
+f-si has_parameter_privilege(text, text) bool =has_parameter_privilege_name
+f-si has_schema_privilege(name, oid, text) bool =has_schema_privilege_name_id
+f-si has_schema_privilege(name, text, text) bool =has_schema_privilege_name_name
+f-si has_schema_privilege(oid, oid, text) bool =has_schema_privilege_id_id
+f-si has_schema_privilege(oid, text) bool =has_schema_privilege_id
+f-si has_schema_privilege(oid, text, text) bool =has_schema_privilege_id_name
+f-si has_schema_privilege(text, text) bool =has_schema_privilege_name
+f-si has_sequence_privilege(name, oid, text) bool =has_sequence_privilege_name_id
+f-si has_sequence_privilege(name, text, text) bool =has_sequence_privilege_name_name
+f-si has_sequence_privilege(oid, oid, text) bool =has_sequence_privilege_id_id
+f-si has_sequence_privilege(oid, text) bool =has_sequence_privilege_id
+f-si has_sequence_privilege(oid, text, text) bool =has_sequence_privilege_id_name
+f-si has_sequence_privilege(text, text) bool =has_sequence_privilege_name
+f-si has_server_privilege(name, oid, text) bool =has_server_privilege_name_id
+f-si has_server_privilege(name, text, text) bool =has_server_privilege_name_name
+f-si has_server_privilege(oid, oid, text) bool =has_server_privilege_id_id
+f-si has_server_privilege(oid, text) bool =has_server_privilege_id
+f-si has_server_privilege(oid, text, text) bool =has_server_privilege_id_name
+f-si has_server_privilege(text, text) bool =has_server_privilege_name
+f-si has_table_privilege(name, oid, text) bool =has_table_privilege_name_id
+f-si has_table_privilege(name, text, text) bool =has_table_privilege_name_name
+f-si has_table_privilege(oid, oid, text) bool =has_table_privilege_id_id
+f-si has_table_privilege(oid, text) bool =has_table_privilege_id
+f-si has_table_privilege(oid, text, text) bool =has_table_privilege_id_name
+f-si has_table_privilege(text, text) bool =has_table_privilege_name
+f-si has_tablespace_privilege(name, oid, text) bool =has_tablespace_privilege_name_id
+f-si has_tablespace_privilege(name, text, text) bool =has_tablespace_privilege_name_name
+f-si has_tablespace_privilege(oid, oid, text) bool =has_tablespace_privilege_id_id
+f-si has_tablespace_privilege(oid, text) bool =has_tablespace_privilege_id
+f-si has_tablespace_privilege(oid, text, text) bool =has_tablespace_privilege_id_name
+f-si has_tablespace_privilege(text, text) bool =has_tablespace_privilege_name
+f-si has_type_privilege(name, oid, text) bool =has_type_privilege_name_id
+f-si has_type_privilege(name, text, text) bool =has_type_privilege_name_name
+f-si has_type_privilege(oid, oid, text) bool =has_type_privilege_id_id
+f-si has_type_privilege(oid, text) bool =has_type_privilege_id
+f-si has_type_privilege(oid, text, text) bool =has_type_privilege_id_name
+f-si has_type_privilege(text, text) bool =has_type_privilege_name
+f-ii hash_aclitem(aclitem) int4
+f-ii hash_aclitem_extended(aclitem, int8) int8
+f-ii hash_array(anyarray) int4
+f-ii hash_array_extended(anyarray, int8) int8
+f-ii hash_multirange(anymultirange) int4
+f-ii hash_multirange_extended(anymultirange, int8) int8
+f-ii hash_numeric(numeric) int4
+f-ii hash_numeric_extended(numeric, int8) int8
+f-ii hash_range(anyrange) int4
+f-ii hash_range_extended(anyrange, int8) int8
+f-ii hash_record(record) int4
+f-ii hash_record_extended(record, int8) int8
+f-ii hashbpchar(bpchar) int4
+f-ii hashbpcharextended(bpchar, int8) int8
+f-ii hashchar(char) int4
+f-ii hashcharextended(char, int8) int8
+f-ii hashenum(anyenum) int4
+f-ii hashenumextended(anyenum, int8) int8
+f-ii hashfloat4(float4) int4
+f-ii hashfloat4extended(float4, int8) int8
+f-ii hashfloat8(float8) int4
+f-ii hashfloat8extended(float8, int8) int8
+f-vi hashhandler(internal) index_am_handler
+f-ii hashinet(inet) int4
+f-ii hashinetextended(inet, int8) int8
+f-ii hashint2(int2) int4
+f-ii hashint2extended(int2, int8) int8
+f-ii hashint4(int4) int4
+f-ii hashint4extended(int4, int8) int8
+f-ii hashint8(int8) int4
+f-ii hashint8extended(int8, int8) int8
+f-ii hashmacaddr(macaddr) int4
+f-ii hashmacaddr8(macaddr8) int4
+f-ii hashmacaddr8extended(macaddr8, int8) int8
+f-ii hashmacaddrextended(macaddr, int8) int8
+f-ii hashname(name) int4
+f-ii hashnameextended(name, int8) int8
+f-ii hashoid(oid) int4
+f-ii hashoidextended(oid, int8) int8
+f-ii hashoidvector(oidvector) int4
+f-ii hashoidvectorextended(oidvector, int8) int8
+f-ii hashtext(text) int4
+f-ii hashtextextended(text, int8) int8
+f-ii hashtid(tid) int4
+f-ii hashtidextended(tid, int8) int8
+f-ii hashvarlena(internal) int4
+f-ii hashvarlenaextended(internal, int8) int8
+f-vi heap_tableam_handler(internal) table_am_handler
+f-ii height(box) float8 =box_height
+f-ii host(inet) text =network_host
+f-ii hostmask(inet) inet =network_hostmask
+f-si iclikejoinsel(internal, oid, internal, int2, internal) float8
+f-si iclikesel(internal, oid, internal, int4) float8
+f-si icnlikejoinsel(internal, oid, internal, int2, internal) float8
+f-si icnlikesel(internal, oid, internal, int4) float8
+f-si icregexeqjoinsel(internal, oid, internal, int2, internal) float8
+f-si icregexeqsel(internal, oid, internal, int4) float8
+f-si icregexnejoinsel(internal, oid, internal, int2, internal) float8
+f-si icregexnesel(internal, oid, internal, int4) float8
+f-ii icu_unicode_version() text
+f-ii in_range(date, date, interval, bool, bool) bool =in_range_date_interval
+f-ii in_range(float4, float4, float8, bool, bool) bool =in_range_float4_float8
+f-ii in_range(float8, float8, float8, bool, bool) bool =in_range_float8_float8
+f-ii in_range(int2, int2, int2, bool, bool) bool =in_range_int2_int2
+f-ii in_range(int2, int2, int4, bool, bool) bool =in_range_int2_int4
+f-ii in_range(int2, int2, int8, bool, bool) bool =in_range_int2_int8
+f-ii in_range(int4, int4, int2, bool, bool) bool =in_range_int4_int2
+f-ii in_range(int4, int4, int4, bool, bool) bool =in_range_int4_int4
+f-ii in_range(int4, int4, int8, bool, bool) bool =in_range_int4_int8
+f-ii in_range(int8, int8, int8, bool, bool) bool =in_range_int8_int8
+f-ii in_range(interval, interval, interval, bool, bool) bool =in_range_interval_interval
+f-ii in_range(numeric, numeric, numeric, bool, bool) bool =in_range_numeric_numeric
+f-ii in_range(time, time, interval, bool, bool) bool =in_range_time_interval
+f-ii in_range(timestamp, timestamp, interval, bool, bool) bool =in_range_timestamp_interval
+f-si in_range(timestamptz, timestamptz, interval, bool, bool) bool =in_range_timestamptz_interval
+f-ii in_range(timetz, timetz, interval, bool, bool) bool =in_range_timetz_interval
+f-ii index_am_handler_in(cstring) index_am_handler
+f-ii index_am_handler_out(index_am_handler) cstring
+f-si inet_client_addr() inet
+f-si inet_client_port() int4
+f-ii inet_gist_compress(internal) internal
+f-ii inet_gist_consistent(internal, inet, int2, oid, internal) bool
+f-ii inet_gist_fetch(internal) internal
+f-ii inet_gist_penalty(internal, internal, internal) internal
+f-ii inet_gist_picksplit(internal, internal) internal
+f-ii inet_gist_same(inet, inet, internal) internal
+f-ii inet_gist_union(internal, internal) inet
+f-ii inet_in(cstring) inet
+f-ii inet_merge(inet, inet) cidr
+f-ii inet_out(inet) cstring
+f-ii inet_recv(internal) inet
+f-ii inet_same_family(inet, inet) bool
+f-ii inet_send(inet) bytea
+f-si inet_server_addr() inet
+f-si inet_server_port() int4
+f-ii inet_spg_choose(internal, internal) void
+f-ii inet_spg_config(internal, internal) void
+f-ii inet_spg_inner_consistent(internal, internal) void
+f-ii inet_spg_leaf_consistent(internal, internal) bool
+f-ii inet_spg_picksplit(internal, internal) void
+f-ii inetand(inet, inet) inet
+f-ii inetmi(inet, inet) int8
+f-ii inetmi_int8(inet, int8) inet
+f-ii inetnot(inet) inet
+f-ii inetor(inet, inet) inet
+f-ii inetpl(inet, int8) inet
+f-ii initcap(text) text
+f-ii int2(float4) int2 =ftoi2
+f-ii int2(float8) int2 =dtoi2
+f-ii int2(int4) int2 =i4toi2
+f-ii int2(int8) int2 =int82
+f-ii int2(jsonb) int2 =jsonb_int2
+f-ii int2(numeric) int2 =numeric_int2
+f-ii int24div(int2, int4) int4
+f-ii int24eq(int2, int4) bool
+f-ii int24ge(int2, int4) bool
+f-ii int24gt(int2, int4) bool
+f-ii int24le(int2, int4) bool
+f-ii int24lt(int2, int4) bool
+f-ii int24mi(int2, int4) int4
+f-ii int24mul(int2, int4) int4
+f-ii int24ne(int2, int4) bool
+f-ii int24pl(int2, int4) int4
+f-ii int28div(int2, int8) int8
+f-ii int28eq(int2, int8) bool
+f-ii int28ge(int2, int8) bool
+f-ii int28gt(int2, int8) bool
+f-ii int28le(int2, int8) bool
+f-ii int28lt(int2, int8) bool
+f-ii int28mi(int2, int8) int8
+f-ii int28mul(int2, int8) int8
+f-ii int28ne(int2, int8) bool
+f-ii int28pl(int2, int8) int8
+f-ii int2_accum(internal, int2) internal
+f-ii int2_accum_inv(internal, int2) internal
+f-ii int2_avg_accum(_int8, int2) _int8
+f-ii int2_avg_accum_inv(_int8, int2) _int8
+f-ii int2_mul_cash(int2, money) money
+f-ii int2_sum(int8, int2) int8
+f-ii int2abs(int2) int2
+f-ii int2and(int2, int2) int2
+f-ii int2div(int2, int2) int2
+f-ii int2eq(int2, int2) bool
+f-ii int2ge(int2, int2) bool
+f-ii int2gt(int2, int2) bool
+f-ii int2in(cstring) int2
+f-ii int2int4_sum(_int8) int8
+f-ii int2larger(int2, int2) int2
+f-ii int2le(int2, int2) bool
+f-ii int2lt(int2, int2) bool
+f-ii int2mi(int2, int2) int2
+f-ii int2mod(int2, int2) int2
+f-ii int2mul(int2, int2) int2
+f-ii int2ne(int2, int2) bool
+f-ii int2not(int2) int2
+f-ii int2or(int2, int2) int2
+f-ii int2out(int2) cstring
+f-ii int2pl(int2, int2) int2
+f-ii int2recv(internal) int2
+f-ii int2send(int2) bytea
+f-ii int2shl(int2, int4) int2
+f-ii int2shr(int2, int4) int2
+f-ii int2smaller(int2, int2) int2
+f-ii int2um(int2) int2
+f-ii int2up(int2) int2
+f-ii int2vectorin(cstring) int2vector
+f-ii int2vectorout(int2vector) cstring
+f-ii int2vectorrecv(internal) int2vector
+f-ii int2vectorsend(int2vector) bytea
+f-ii int2xor(int2, int2) int2
+f-ii int4(bit) int4 =bittoint4
+f-ii int4(bool) int4 =bool_int4
+f-ii int4(char) int4 =chartoi4
+f-ii int4(float4) int4 =ftoi4
+f-ii int4(float8) int4 =dtoi4
+f-ii int4(int2) int4 =i2toi4
+f-ii int4(int8) int4 =int84
+f-ii int4(jsonb) int4 =jsonb_int4
+f-ii int4(numeric) int4 =numeric_int4
+f-ii int42div(int4, int2) int4
+f-ii int42eq(int4, int2) bool
+f-ii int42ge(int4, int2) bool
+f-ii int42gt(int4, int2) bool
+f-ii int42le(int4, int2) bool
+f-ii int42lt(int4, int2) bool
+f-ii int42mi(int4, int2) int4
+f-ii int42mul(int4, int2) int4
+f-ii int42ne(int4, int2) bool
+f-ii int42pl(int4, int2) int4
+f-ii int48div(int4, int8) int8
+f-ii int48eq(int4, int8) bool
+f-ii int48ge(int4, int8) bool
+f-ii int48gt(int4, int8) bool
+f-ii int48le(int4, int8) bool
+f-ii int48lt(int4, int8) bool
+f-ii int48mi(int4, int8) int8
+f-ii int48mul(int4, int8) int8
+f-ii int48ne(int4, int8) bool
+f-ii int48pl(int4, int8) int8
+f-ii int4_accum(internal, int4) internal
+f-ii int4_accum_inv(internal, int4) internal
+f-ii int4_avg_accum(_int8, int4) _int8
+f-ii int4_avg_accum_inv(_int8, int4) _int8
+f-ii int4_avg_combine(_int8, _int8) _int8
+f-ii int4_mul_cash(int4, money) money
+f-ii int4_sum(int8, int4) int8
+f-ii int4abs(int4) int4
+f-ii int4and(int4, int4) int4
+f-ii int4div(int4, int4) int4
+f-ii int4eq(int4, int4) bool
+f-ii int4ge(int4, int4) bool
+f-ii int4gt(int4, int4) bool
+f-ii int4in(cstring) int4
+f-ii int4inc(int4) int4
+f-ii int4larger(int4, int4) int4
+f-ii int4le(int4, int4) bool
+f-ii int4lt(int4, int4) bool
+f-ii int4mi(int4, int4) int4
+f-ii int4mod(int4, int4) int4
+f-ii int4mul(int4, int4) int4
+f-ii int4multirange() int4multirange =multirange_constructor0
+f-ii int4multirange(int4range) int4multirange =multirange_constructor1
+f-ii int4multirange(variadic _int4range) int4multirange =multirange_constructor2
+f-ii int4ne(int4, int4) bool
+f-ii int4not(int4) int4
+f-ii int4or(int4, int4) int4
+f-ii int4out(int4) cstring
+f-ii int4pl(int4, int4) int4
+f-ii int4range(int4, int4) int4range =range_constructor2
+f-ii int4range(int4, int4, text) int4range =range_constructor3
+f-ii int4range_canonical(int4range) int4range
+f-ii int4range_subdiff(int4, int4) float8
+f-ii int4recv(internal) int4
+f-ii int4send(int4) bytea
+f-ii int4shl(int4, int4) int4
+f-ii int4shr(int4, int4) int4
+f-ii int4smaller(int4, int4) int4
+f-ii int4um(int4) int4
+f-ii int4up(int4) int4
+f-ii int4xor(int4, int4) int4
+f-ii int8(bit) int8 =bittoint8
+f-ii int8(float4) int8 =ftoi8
+f-ii int8(float8) int8 =dtoi8
+f-ii int8(int2) int8 =int28
+f-ii int8(int4) int8 =int48
+f-ii int8(jsonb) int8 =jsonb_int8
+f-ii int8(numeric) int8 =numeric_int8
+f-ii int8(oid) int8 =oidtoi8
+f-ii int82div(int8, int2) int8
+f-ii int82eq(int8, int2) bool
+f-ii int82ge(int8, int2) bool
+f-ii int82gt(int8, int2) bool
+f-ii int82le(int8, int2) bool
+f-ii int82lt(int8, int2) bool
+f-ii int82mi(int8, int2) int8
+f-ii int82mul(int8, int2) int8
+f-ii int82ne(int8, int2) bool
+f-ii int82pl(int8, int2) int8
+f-ii int84div(int8, int4) int8
+f-ii int84eq(int8, int4) bool
+f-ii int84ge(int8, int4) bool
+f-ii int84gt(int8, int4) bool
+f-ii int84le(int8, int4) bool
+f-ii int84lt(int8, int4) bool
+f-ii int84mi(int8, int4) int8
+f-ii int84mul(int8, int4) int8
+f-ii int84ne(int8, int4) bool
+f-ii int84pl(int8, int4) int8
+f-ii int8_accum(internal, int8) internal
+f-ii int8_accum_inv(internal, int8) internal
+f-ii int8_avg(_int8) numeric
+f-ii int8_avg_accum(internal, int8) internal
+f-ii int8_avg_accum_inv(internal, int8) internal
+f-ii int8_avg_combine(internal, internal) internal
+f-ii int8_avg_deserialize(bytea, internal) internal
+f-ii int8_avg_serialize(internal) bytea
+f-ii int8_mul_cash(int8, money) money
+f-ii int8_sum(numeric, int8) numeric
+f-ii int8abs(int8) int8
+f-ii int8and(int8, int8) int8
+f-ii int8dec(int8) int8
+f-ii int8dec_any(int8, any) int8
+f-ii int8div(int8, int8) int8
+f-ii int8eq(int8, int8) bool
+f-ii int8ge(int8, int8) bool
+f-ii int8gt(int8, int8) bool
+f-ii int8in(cstring) int8
+f-ii int8inc(int8) int8
+f-ii int8inc_any(int8, any) int8
+f-ii int8inc_float8_float8(int8, float8, float8) int8
+f-ii int8inc_support(internal) internal
+f-ii int8larger(int8, int8) int8
+f-ii int8le(int8, int8) bool
+f-ii int8lt(int8, int8) bool
+f-ii int8mi(int8, int8) int8
+f-ii int8mod(int8, int8) int8
+f-ii int8mul(int8, int8) int8
+f-ii int8multirange() int8multirange =multirange_constructor0
+f-ii int8multirange(int8range) int8multirange =multirange_constructor1
+f-ii int8multirange(variadic _int8range) int8multirange =multirange_constructor2
+f-ii int8ne(int8, int8) bool
+f-ii int8not(int8) int8
+f-ii int8or(int8, int8) int8
+f-ii int8out(int8) cstring
+f-ii int8pl(int8, int8) int8
+f-is int8pl_inet(int8, inet) inet
+f-ii int8range(int8, int8) int8range =range_constructor2
+f-ii int8range(int8, int8, text) int8range =range_constructor3
+f-ii int8range_canonical(int8range) int8range
+f-ii int8range_subdiff(int8, int8) float8
+f-ii int8recv(internal) int8
+f-ii int8send(int8) bytea
+f-ii int8shl(int8, int4) int8
+f-ii int8shr(int8, int4) int8
+f-ii int8smaller(int8, int8) int8
+f-ii int8um(int8) int8
+f-ii int8up(int8) int8
+f-ii int8xor(int8, int8) int8
+f-is integer_pl_date(int4, date) date
+f-ii inter_lb(line, box) bool
+f-ii inter_sb(lseg, box) bool
+f-ii inter_sl(lseg, line) bool
+f-ii internal_in(cstring) internal
+f-ii internal_out(internal) cstring
+f-ii interval(interval, int4) interval =interval_scale
+f-ii interval(time) interval =time_interval
+f-ii interval_avg(internal) interval
+f-ii interval_avg_accum(internal, interval) internal
+f-ii interval_avg_accum_inv(internal, interval) internal
+f-ii interval_avg_combine(internal, internal) internal
+f-ii interval_avg_deserialize(bytea, internal) internal
+f-ii interval_avg_serialize(internal) bytea
+f-ii interval_cmp(interval, interval) int4
+f-ii interval_div(interval, float8) interval
+f-ii interval_eq(interval, interval) bool
+f-ii interval_ge(interval, interval) bool
+f-ii interval_gt(interval, interval) bool
+f-ii interval_hash(interval) int4
+f-ii interval_hash_extended(interval, int8) int8
+f-si interval_in(cstring, oid, int4) interval
+f-ii interval_larger(interval, interval) interval
+f-ii interval_le(interval, interval) bool
+f-ii interval_lt(interval, interval) bool
+f-ii interval_mi(interval, interval) interval
+f-ii interval_mul(interval, float8) interval
+f-ii interval_ne(interval, interval) bool
+f-si interval_out(interval) cstring
+f-ii interval_pl(interval, interval) interval
+f-is interval_pl_date(interval, date) timestamp
+f-is interval_pl_time(interval, time) time
+f-is interval_pl_timestamp(interval, timestamp) timestamp
+f-ss interval_pl_timestamptz(interval, timestamptz) timestamptz
+f-is interval_pl_timetz(interval, timetz) timetz
+f-ii interval_recv(internal, oid, int4) interval
+f-ii interval_send(interval) bytea
+f-ii interval_smaller(interval, interval) interval
+f-ii interval_sum(internal) interval
+f-ii interval_support(internal) internal
+f-ii interval_um(interval) interval
+f-ii intervaltypmodin(_cstring) int4
+f-ii intervaltypmodout(int4) cstring
+f-ii is_normalized(text, text default) bool =unicode_is_normalized
+f-ii isclosed(path) bool =path_isclosed
+f-ii isempty(anymultirange) bool =multirange_empty
+f-ii isempty(anyrange) bool =range_empty
+f-ii isfinite(date) bool =date_finite
+f-ii isfinite(interval) bool =interval_finite
+f-ii isfinite(timestamp) bool =timestamp_finite
+f-ii isfinite(timestamptz) bool =timestamp_finite
+f-ii ishorizontal(line) bool =line_horizontal
+f-ii ishorizontal(lseg) bool =lseg_horizontal
+f-ii ishorizontal(point, point) bool =point_horiz
+f-ic iso8859_1_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic iso8859_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic iso_to_koi8r(int4, int4, cstring, internal, int4, bool) int4
+f-ic iso_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic iso_to_win1251(int4, int4, cstring, internal, int4, bool) int4
+f-ic iso_to_win866(int4, int4, cstring, internal, int4, bool) int4
+f-ii isopen(path) bool =path_isopen
+f-ii isparallel(line, line) bool =line_parallel
+f-ii isparallel(lseg, lseg) bool =lseg_parallel
+f-ii isperp(line, line) bool =line_perp
+f-ii isperp(lseg, lseg) bool =lseg_perp
+f-ii isvertical(line) bool =line_vertical
+f-ii isvertical(lseg) bool =lseg_vertical
+f-ii isvertical(point, point) bool =point_vert
+f-ic johab_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+a-si json_agg(anyelement) json =aggregate_dummy
+f-ii json_agg_finalfn(internal) json
+a-si json_agg_strict(anyelement) json =aggregate_dummy
+f-si json_agg_strict_transfn(internal, anyelement) internal
+f-si json_agg_transfn(internal, anyelement) internal
+f-ii json_array_element(from_json json, element_index int4) json
+f-ii json_array_element_text(from_json json, element_index int4) text
+fsii json_array_elements(from_json json) json
+fsii json_array_elements_text(from_json json) text
+f-ii json_array_length(json) int4
+f-si json_build_array() json =json_build_array_noargs
+f-si json_build_array(variadic any) json
+f-si json_build_object() json =json_build_object_noargs
+f-si json_build_object(variadic any) json
+fsii json_each(from_json json) record
+fsii json_each_text(from_json json) record
+f-ii json_extract_path(from_json json, variadic path_elems _text) json
+f-ii json_extract_path_text(from_json json, variadic path_elems _text) text
+f-ii json_in(cstring) json
+f-ii json_object(_text) json
+f-ii json_object(_text, _text) json =json_object_two_arg
+a-si json_object_agg(key any, value any) json =aggregate_dummy
+f-ii json_object_agg_finalfn(internal) json
+a-si json_object_agg_strict(key any, value any) json =aggregate_dummy
+f-si json_object_agg_strict_transfn(internal, any, any) internal
+f-si json_object_agg_transfn(internal, any, any) internal
+a-si json_object_agg_unique(key any, value any) json =aggregate_dummy
+a-si json_object_agg_unique_strict(key any, value any) json =aggregate_dummy
+f-si json_object_agg_unique_strict_transfn(internal, any, any) internal
+f-si json_object_agg_unique_transfn(internal, any, any) internal
+f-ii json_object_field(from_json json, field_name text) json
+f-ii json_object_field_text(from_json json, field_name text) text
+fsii json_object_keys(json) text
+f-ii json_out(json) cstring
+f-si json_populate_record(base anyelement, from_json json, use_json_as_text bool default) anyelement
+fssi json_populate_recordset(base anyelement, from_json json, use_json_as_text bool default) anyelement
+f-ii json_recv(internal) json
+f-ii json_send(json) bytea
+f-ii json_strip_nulls(json) json
+f-si json_to_record(json) record
+fssi json_to_recordset(json) record
+f-si json_to_tsvector(json, jsonb) tsvector
+f-ii json_to_tsvector(regconfig, json, jsonb) tsvector =json_to_tsvector_byid
+f-ii json_typeof(json) text
+a-si jsonb_agg(anyelement) jsonb =aggregate_dummy
+f-si jsonb_agg_finalfn(internal) jsonb
+a-si jsonb_agg_strict(anyelement) jsonb =aggregate_dummy
+f-si jsonb_agg_strict_transfn(internal, anyelement) internal
+f-si jsonb_agg_transfn(internal, anyelement) internal
+f-ii jsonb_array_element(from_json jsonb, element_index int4) jsonb
+f-ii jsonb_array_element_text(from_json jsonb, element_index int4) text
+fsii jsonb_array_elements(from_json jsonb) jsonb
+fsii jsonb_array_elements_text(from_json jsonb) text
+f-ii jsonb_array_length(jsonb) int4
+f-si jsonb_build_array() jsonb =jsonb_build_array_noargs
+f-si jsonb_build_array(variadic any) jsonb
+f-si jsonb_build_object() jsonb =jsonb_build_object_noargs
+f-si jsonb_build_object(variadic any) jsonb
+f-ii jsonb_cmp(jsonb, jsonb) int4
+f-ii jsonb_concat(jsonb, jsonb) jsonb
+f-ii jsonb_contained(jsonb, jsonb) bool
+f-ii jsonb_contains(jsonb, jsonb) bool
+f-ii jsonb_delete(from_json jsonb, variadic path_elems _text) jsonb =jsonb_delete_array
+f-ii jsonb_delete(jsonb, int4) jsonb =jsonb_delete_idx
+f-ii jsonb_delete(jsonb, text) jsonb
+f-ii jsonb_delete_path(jsonb, _text) jsonb
+fsii jsonb_each(from_json jsonb) record
+fsii jsonb_each_text(from_json jsonb) record
+f-ii jsonb_eq(jsonb, jsonb) bool
+f-ii jsonb_exists(jsonb, text) bool
+f-ii jsonb_exists_all(jsonb, _text) bool
+f-ii jsonb_exists_any(jsonb, _text) bool
+f-ii jsonb_extract_path(from_json jsonb, variadic path_elems _text) jsonb
+f-ii jsonb_extract_path_text(from_json jsonb, variadic path_elems _text) text
+f-ii jsonb_ge(jsonb, jsonb) bool
+f-ii jsonb_gt(jsonb, jsonb) bool
+f-ii jsonb_hash(jsonb) int4
+f-ii jsonb_hash_extended(jsonb, int8) int8
+f-ii jsonb_in(cstring) jsonb
+f-ii jsonb_insert(jsonb_in jsonb, path _text, replacement jsonb, insert_after bool default) jsonb
+f-ii jsonb_le(jsonb, jsonb) bool
+f-ii jsonb_lt(jsonb, jsonb) bool
+f-ii jsonb_ne(jsonb, jsonb) bool
+f-ii jsonb_object(_text) jsonb
+f-ii jsonb_object(_text, _text) jsonb =jsonb_object_two_arg
+a-ii jsonb_object_agg(key any, value any) jsonb =aggregate_dummy
+f-si jsonb_object_agg_finalfn(internal) jsonb
+a-ii jsonb_object_agg_strict(key any, value any) jsonb =aggregate_dummy
+f-si jsonb_object_agg_strict_transfn(internal, any, any) internal
+f-si jsonb_object_agg_transfn(internal, any, any) internal
+a-ii jsonb_object_agg_unique(key any, value any) jsonb =aggregate_dummy
+a-ii jsonb_object_agg_unique_strict(key any, value any) jsonb =aggregate_dummy
+f-si jsonb_object_agg_unique_strict_transfn(internal, any, any) internal
+f-si jsonb_object_agg_unique_transfn(internal, any, any) internal
+f-ii jsonb_object_field(from_json jsonb, field_name text) jsonb
+f-ii jsonb_object_field_text(from_json jsonb, field_name text) text
+fsii jsonb_object_keys(jsonb) text
+f-ii jsonb_out(jsonb) cstring
+f-ii jsonb_path_exists(target jsonb, path jsonpath, vars jsonb default, silent bool default) bool
+f-ii jsonb_path_exists_opr(jsonb, jsonpath) bool
+f-si jsonb_path_exists_tz(target jsonb, path jsonpath, vars jsonb default, silent bool default) bool
+f-ii jsonb_path_match(target jsonb, path jsonpath, vars jsonb default, silent bool default) bool
+f-ii jsonb_path_match_opr(jsonb, jsonpath) bool
+f-si jsonb_path_match_tz(target jsonb, path jsonpath, vars jsonb default, silent bool default) bool
+fsii jsonb_path_query(target jsonb, path jsonpath, vars jsonb default, silent bool default) jsonb
+f-ii jsonb_path_query_array(target jsonb, path jsonpath, vars jsonb default, silent bool default) jsonb
+f-si jsonb_path_query_array_tz(target jsonb, path jsonpath, vars jsonb default, silent bool default) jsonb
+f-ii jsonb_path_query_first(target jsonb, path jsonpath, vars jsonb default, silent bool default) jsonb
+f-si jsonb_path_query_first_tz(target jsonb, path jsonpath, vars jsonb default, silent bool default) jsonb
+fssi jsonb_path_query_tz(target jsonb, path jsonpath, vars jsonb default, silent bool default) jsonb
+f-si jsonb_populate_record(anyelement, jsonb) anyelement
+f-si jsonb_populate_record_valid(anyelement, jsonb) bool
+fssi jsonb_populate_recordset(anyelement, jsonb) anyelement
+f-ii jsonb_pretty(jsonb) text
+f-ii jsonb_recv(internal) jsonb
+f-ii jsonb_send(jsonb) bytea
+f-ii jsonb_set(jsonb_in jsonb, path _text, replacement jsonb, create_if_missing bool default) jsonb
+f-ii jsonb_set_lax(jsonb_in jsonb, path _text, replacement jsonb, create_if_missing bool default, null_value_treatment text default) jsonb
+f-ii jsonb_strip_nulls(jsonb) jsonb
+f-ii jsonb_subscript_handler(internal) internal
+f-si jsonb_to_record(jsonb) record
+fssi jsonb_to_recordset(jsonb) record
+f-si jsonb_to_tsvector(jsonb, jsonb) tsvector
+f-ii jsonb_to_tsvector(regconfig, jsonb, jsonb) tsvector =jsonb_to_tsvector_byid
+f-ii jsonb_typeof(jsonb) text
+f-ii jsonpath_in(cstring) jsonpath
+f-ii jsonpath_out(jsonpath) cstring
+f-ii jsonpath_recv(internal) jsonpath
+f-ii jsonpath_send(jsonpath) bytea
+f-ii justify_days(interval) interval =interval_justify_days
+f-ii justify_hours(interval) interval =interval_justify_hours
+f-ii justify_interval(interval) interval =interval_justify_interval
+f-ic koi8r_to_iso(int4, int4, cstring, internal, int4, bool) int4
+f-ic koi8r_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic koi8r_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ic koi8r_to_win1251(int4, int4, cstring, internal, int4, bool) int4
+f-ic koi8r_to_win866(int4, int4, cstring, internal, int4, bool) int4
+f-ic koi8u_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+w-ii lag(anycompatible, int4, anycompatible) anycompatible =window_lag_with_offset_and_default
+w-ii lag(anyelement) anyelement =window_lag
+w-ii lag(anyelement, int4) anyelement =window_lag_with_offset
+f-ii language_handler_in(cstring) language_handler
+f-ii language_handler_out(language_handler) cstring
+w-ii last_value(anyelement) anyelement =window_last_value
+f-vi lastval() int8
+f-ic latin1_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic latin2_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic latin2_to_win1250(int4, int4, cstring, internal, int4, bool) int4
+f-ic latin3_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic latin4_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ii lcm(int4, int4) int4 =int4lcm
+f-ii lcm(int8, int8) int8 =int8lcm
+f-ii lcm(numeric, numeric) numeric =numeric_lcm
+w-ii lead(anycompatible, int4, anycompatible) anycompatible =window_lead_with_offset_and_default
+w-ii lead(anyelement) anyelement =window_lead
+w-ii lead(anyelement, int4) anyelement =window_lead_with_offset
+f-ii left(text, int4) text =text_left
+f-ii length(bit) int4 =bitlength
+f-ii length(bpchar) int4 =bpcharlen
+f-ii length(bytea) int4 =byteaoctetlen
+f-si length(bytea, name) int4 =length_in_encoding
+f-ii length(lseg) float8 =lseg_length
+f-ii length(path) float8 =path_length
+f-ii length(text) int4 =textlen
+f-ii length(tsvector) int4 =tsvector_length
+f-ii like(bytea, bytea) bool =bytealike
+f-ii like(name, text) bool =namelike
+f-ii like(text, text) bool =textlike
+f-ii like_escape(bytea, bytea) bytea =like_escape_bytea
+f-ii like_escape(text, text) text
+f-si likejoinsel(internal, oid, internal, int2, internal) float8
+f-si likesel(internal, oid, internal, int4) float8
+f-ii line(point, point) line =line_construct_pp
+f-ii line_distance(line, line) float8
+f-ii line_eq(line, line) bool
+f-ii line_horizontal(line) bool
+f-ii line_in(cstring) line
+f-ii line_interpt(line, line) point
+f-ii line_intersect(line, line) bool
+f-ii line_out(line) cstring
+f-ii line_parallel(line, line) bool
+f-ii line_perp(line, line) bool
+f-ii line_recv(internal) line
+f-ii line_send(line) bytea
+f-ii line_vertical(line) bool
+f-ii ln(float8) float8 =dlog1
+f-ii ln(numeric) numeric =numeric_ln
+f-vi lo_close(int4) int4 =be_lo_close
+f-vi lo_creat(int4) oid =be_lo_creat
+f-vi lo_create(oid) oid =be_lo_create
+f-vi lo_export(oid, text) int4 =be_lo_export
+f-vi lo_from_bytea(oid, bytea) oid =be_lo_from_bytea
+f-vi lo_get(oid) bytea =be_lo_get
+f-vi lo_get(oid, int8, int4) bytea =be_lo_get_fragment
+f-vi lo_import(text) oid =be_lo_import
+f-vi lo_import(text, oid) oid =be_lo_import_with_oid
+f-vi lo_lseek(int4, int4, int4) int4 =be_lo_lseek
+f-vi lo_lseek64(int4, int8, int4) int8 =be_lo_lseek64
+f-vi lo_open(oid, int4) int4 =be_lo_open
+f-vi lo_put(oid, int8, bytea) void =be_lo_put
+f-vi lo_tell(int4) int4 =be_lo_tell
+f-vi lo_tell64(int4) int8 =be_lo_tell64
+f-vi lo_truncate(int4, int4) int4 =be_lo_truncate
+f-vi lo_truncate64(int4, int8) int4 =be_lo_truncate64
+f-vi lo_unlink(oid) int4 =be_lo_unlink
+f-ii log(float8) float8 =dlog10
+f-is log(numeric) numeric
+f-ii log(numeric, numeric) numeric =numeric_log
+f-ii log10(float8) float8 =dlog10
+f-is log10(numeric) numeric
+f-vi loread(int4, int4) bytea =be_loread
+f-ii lower(anymultirange) anyelement =multirange_lower
+f-ii lower(anyrange) anyelement =range_lower
+f-ii lower(text) text
+f-ii lower_inc(anymultirange) bool =multirange_lower_inc
+f-ii lower_inc(anyrange) bool =range_lower_inc
+f-ii lower_inf(anymultirange) bool =multirange_lower_inf
+f-ii lower_inf(anyrange) bool =range_lower_inf
+f-vi lowrite(int4, bytea) int4 =be_lowrite
+f-is lpad(text, int4) text
+f-ii lpad(text, int4, text) text
+f-ii lseg(box) lseg =box_diagonal
+f-ii lseg(point, point) lseg =lseg_construct
+f-ii lseg_center(lseg) point
+f-ii lseg_distance(lseg, lseg) float8
+f-ii lseg_eq(lseg, lseg) bool
+f-ii lseg_ge(lseg, lseg) bool
+f-ii lseg_gt(lseg, lseg) bool
+f-ii lseg_horizontal(lseg) bool
+f-ii lseg_in(cstring) lseg
+f-ii lseg_interpt(lseg, lseg) point
+f-ii lseg_intersect(lseg, lseg) bool
+f-ii lseg_le(lseg, lseg) bool
+f-ii lseg_length(lseg) float8
+f-ii lseg_lt(lseg, lseg) bool
+f-ii lseg_ne(lseg, lseg) bool
+f-ii lseg_out(lseg) cstring
+f-ii lseg_parallel(lseg, lseg) bool
+f-ii lseg_perp(lseg, lseg) bool
+f-ii lseg_recv(internal) lseg
+f-ii lseg_send(lseg) bytea
+f-ii lseg_vertical(lseg) bool
+f-ii ltrim(bytea, bytea) bytea =bytealtrim
+f-ii ltrim(text) text =ltrim1
+f-ii ltrim(text, text) text
+f-ii macaddr(macaddr8) macaddr =macaddr8tomacaddr
+f-ii macaddr8(macaddr) macaddr8 =macaddrtomacaddr8
+f-ii macaddr8_and(macaddr8, macaddr8) macaddr8
+f-ii macaddr8_cmp(macaddr8, macaddr8) int4
+f-ii macaddr8_eq(macaddr8, macaddr8) bool
+f-ii macaddr8_ge(macaddr8, macaddr8) bool
+f-ii macaddr8_gt(macaddr8, macaddr8) bool
+f-ii macaddr8_in(cstring) macaddr8
+f-ii macaddr8_le(macaddr8, macaddr8) bool
+f-ii macaddr8_lt(macaddr8, macaddr8) bool
+f-ii macaddr8_ne(macaddr8, macaddr8) bool
+f-ii macaddr8_not(macaddr8) macaddr8
+f-ii macaddr8_or(macaddr8, macaddr8) macaddr8
+f-ii macaddr8_out(macaddr8) cstring
+f-ii macaddr8_recv(internal) macaddr8
+f-ii macaddr8_send(macaddr8) bytea
+f-ii macaddr8_set7bit(macaddr8) macaddr8
+f-ii macaddr_and(macaddr, macaddr) macaddr
+f-ii macaddr_cmp(macaddr, macaddr) int4
+f-ii macaddr_eq(macaddr, macaddr) bool
+f-ii macaddr_ge(macaddr, macaddr) bool
+f-ii macaddr_gt(macaddr, macaddr) bool
+f-ii macaddr_in(cstring) macaddr
+f-ii macaddr_le(macaddr, macaddr) bool
+f-ii macaddr_lt(macaddr, macaddr) bool
+f-ii macaddr_ne(macaddr, macaddr) bool
+f-ii macaddr_not(macaddr) macaddr
+f-ii macaddr_or(macaddr, macaddr) macaddr
+f-ii macaddr_out(macaddr) cstring
+f-ii macaddr_recv(internal) macaddr
+f-ii macaddr_send(macaddr) bytea
+f-ii macaddr_sortsupport(internal) void
+f-ii make_date(year int4, month int4, day int4) date
+f-ii make_interval(years int4 default, months int4 default, weeks int4 default, days int4 default, hours int4 default, mins int4 default, secs float8 default) interval
+f-ii make_time(hour int4, min int4, sec float8) time
+f-ii make_timestamp(year int4, month int4, mday int4, hour int4, min int4, sec float8) timestamp
+f-si make_timestamptz(year int4, month int4, mday int4, hour int4, min int4, sec float8) timestamptz
+f-si make_timestamptz(year int4, month int4, mday int4, hour int4, min int4, sec float8, timezone text) timestamptz =make_timestamptz_at_timezone
+f-ii makeaclitem(oid, oid, text, bool) aclitem
+f-ii masklen(inet) int4 =network_masklen
+f-si matchingjoinsel(internal, oid, internal, int2, internal) float8
+f-si matchingsel(internal, oid, internal, int4) float8
+a-ii max(anyarray) anyarray =aggregate_dummy
+a-ii max(anyenum) anyenum =aggregate_dummy
+a-ii max(bpchar) bpchar =aggregate_dummy
+a-ii max(date) date =aggregate_dummy
+a-ii max(float4) float4 =aggregate_dummy
+a-ii max(float8) float8 =aggregate_dummy
+a-ii max(inet) inet =aggregate_dummy
+a-ii max(int2) int2 =aggregate_dummy
+a-ii max(int4) int4 =aggregate_dummy
+a-ii max(int8) int8 =aggregate_dummy
+a-ii max(interval) interval =aggregate_dummy
+a-ii max(money) money =aggregate_dummy
+a-ii max(numeric) numeric =aggregate_dummy
+a-ii max(oid) oid =aggregate_dummy
+a-ii max(pg_lsn) pg_lsn =aggregate_dummy
+a-ii max(text) text =aggregate_dummy
+a-ii max(tid) tid =aggregate_dummy
+a-ii max(time) time =aggregate_dummy
+a-ii max(timestamp) timestamp =aggregate_dummy
+a-ii max(timestamptz) timestamptz =aggregate_dummy
+a-ii max(timetz) timetz =aggregate_dummy
+a-ii max(xid8) xid8 =aggregate_dummy
+f-ii md5(bytea) text =md5_bytea
+f-ii md5(text) text =md5_text
+f-ic mic_to_big5(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_euc_cn(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_euc_jp(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_euc_kr(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_euc_tw(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_iso(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_koi8r(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_latin1(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_latin2(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_latin3(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_latin4(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_sjis(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_win1250(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_win1251(int4, int4, cstring, internal, int4, bool) int4
+f-ic mic_to_win866(int4, int4, cstring, internal, int4, bool) int4
+a-ii min(anyarray) anyarray =aggregate_dummy
+a-ii min(anyenum) anyenum =aggregate_dummy
+a-ii min(bpchar) bpchar =aggregate_dummy
+a-ii min(date) date =aggregate_dummy
+a-ii min(float4) float4 =aggregate_dummy
+a-ii min(float8) float8 =aggregate_dummy
+a-ii min(inet) inet =aggregate_dummy
+a-ii min(int2) int2 =aggregate_dummy
+a-ii min(int4) int4 =aggregate_dummy
+a-ii min(int8) int8 =aggregate_dummy
+a-ii min(interval) interval =aggregate_dummy
+a-ii min(money) money =aggregate_dummy
+a-ii min(numeric) numeric =aggregate_dummy
+a-ii min(oid) oid =aggregate_dummy
+a-ii min(pg_lsn) pg_lsn =aggregate_dummy
+a-ii min(text) text =aggregate_dummy
+a-ii min(tid) tid =aggregate_dummy
+a-ii min(time) time =aggregate_dummy
+a-ii min(timestamp) timestamp =aggregate_dummy
+a-ii min(timestamptz) timestamptz =aggregate_dummy
+a-ii min(timetz) timetz =aggregate_dummy
+a-ii min(xid8) xid8 =aggregate_dummy
+f-ii min_scale(numeric) int4 =numeric_min_scale
+f-ii mod(int2, int2) int2 =int2mod
+f-ii mod(int4, int4) int4 =int4mod
+f-ii mod(int8, int8) int8 =int8mod
+f-ii mod(numeric, numeric) numeric =numeric_mod
+a-ii mode(anyelement) anyelement =aggregate_dummy
+f-ii mode_final(internal, anyelement) anyelement
+f-si money(int4) money =int4_cash
+f-si money(int8) money =int8_cash
+f-si money(numeric) money =numeric_cash
+f-ii mul_d_interval(float8, interval) interval
+f-ii multirange(anyrange) anymultirange =multirange_constructor1
+f-ii multirange_adjacent_multirange(anymultirange, anymultirange) bool
+f-ii multirange_adjacent_range(anymultirange, anyrange) bool
+f-ii multirange_after_multirange(anymultirange, anymultirange) bool
+f-ii multirange_after_range(anymultirange, anyrange) bool
+f-ii multirange_agg_finalfn(internal, anymultirange) anymultirange =range_agg_finalfn
+f-ii multirange_agg_transfn(internal, anymultirange) internal
+f-ii multirange_before_multirange(anymultirange, anymultirange) bool
+f-ii multirange_before_range(anymultirange, anyrange) bool
+f-ii multirange_cmp(anymultirange, anymultirange) int4
+f-ii multirange_contained_by_multirange(anymultirange, anymultirange) bool
+f-ii multirange_contained_by_range(anymultirange, anyrange) bool
+f-ii multirange_contains_elem(anymultirange, anyelement) bool
+f-ii multirange_contains_multirange(anymultirange, anymultirange) bool
+f-ii multirange_contains_range(anymultirange, anyrange) bool
+f-ii multirange_eq(anymultirange, anymultirange) bool
+f-ii multirange_ge(anymultirange, anymultirange) bool
+f-ii multirange_gist_compress(internal) internal
+f-ii multirange_gist_consistent(internal, anymultirange, int2, oid, internal) bool
+f-ii multirange_gt(anymultirange, anymultirange) bool
+f-si multirange_in(cstring, oid, int4) anymultirange
+f-ii multirange_intersect(anymultirange, anymultirange) anymultirange
+f-ii multirange_intersect_agg_transfn(anymultirange, anymultirange) anymultirange
+f-ii multirange_le(anymultirange, anymultirange) bool
+f-ii multirange_lt(anymultirange, anymultirange) bool
+f-ii multirange_minus(anymultirange, anymultirange) anymultirange
+f-ii multirange_ne(anymultirange, anymultirange) bool
+f-si multirange_out(anymultirange) cstring
+f-ii multirange_overlaps_multirange(anymultirange, anymultirange) bool
+f-ii multirange_overlaps_range(anymultirange, anyrange) bool
+f-ii multirange_overleft_multirange(anymultirange, anymultirange) bool
+f-ii multirange_overleft_range(anymultirange, anyrange) bool
+f-ii multirange_overright_multirange(anymultirange, anymultirange) bool
+f-ii multirange_overright_range(anymultirange, anyrange) bool
+f-si multirange_recv(internal, oid, int4) anymultirange
+f-si multirange_send(anymultirange) bytea
+f-si multirange_typanalyze(internal) bool
+f-ii multirange_union(anymultirange, anymultirange) anymultirange
+f-si multirangesel(internal, oid, internal, int4) float8
+f-si mxid_age(xid) int4
+f-ii name(bpchar) name =bpchar_name
+f-ii name(text) name =text_name
+f-ii name(varchar) name =text_name
+f-ii nameconcatoid(name, oid) name
+f-ii nameeq(name, name) bool
+f-ii nameeqtext(name, text) bool
+f-ii namege(name, name) bool
+f-ii namegetext(name, text) bool
+f-ii namegt(name, name) bool
+f-ii namegttext(name, text) bool
+f-ii nameiclike(name, text) bool
+f-ii nameicnlike(name, text) bool
+f-ii nameicregexeq(name, text) bool
+f-ii nameicregexne(name, text) bool
+f-ii namein(cstring) name
+f-ii namele(name, name) bool
+f-ii nameletext(name, text) bool
+f-ii namelike(name, text) bool
+f-ii namelt(name, name) bool
+f-ii namelttext(name, text) bool
+f-ii namene(name, name) bool
+f-ii namenetext(name, text) bool
+f-ii namenlike(name, text) bool
+f-ii nameout(name) cstring
+f-si namerecv(internal) name
+f-ii nameregexeq(name, text) bool
+f-ii nameregexne(name, text) bool
+f-si namesend(name) bytea
+f-si neqjoinsel(internal, oid, internal, int2, internal) float8
+f-si neqsel(internal, oid, internal, int4) float8
+f-ii netmask(inet) inet =network_netmask
+f-ii network(inet) cidr =network_network
+f-ii network_cmp(inet, inet) int4
+f-ii network_eq(inet, inet) bool
+f-ii network_ge(inet, inet) bool
+f-ii network_gt(inet, inet) bool
+f-ii network_larger(inet, inet) inet
+f-ii network_le(inet, inet) bool
+f-ii network_lt(inet, inet) bool
+f-ii network_ne(inet, inet) bool
+f-ii network_overlap(inet, inet) bool
+f-ii network_smaller(inet, inet) inet
+f-ii network_sortsupport(internal) void
+f-ii network_sub(inet, inet) bool
+f-ii network_subeq(inet, inet) bool
+f-ii network_subset_support(internal) internal
+f-ii network_sup(inet, inet) bool
+f-ii network_supeq(inet, inet) bool
+f-si networkjoinsel(internal, oid, internal, int2, internal) float8
+f-si networksel(internal, oid, internal, int4) float8
+f-vi nextval(regclass) int8 =nextval_oid
+f-si nlikejoinsel(internal, oid, internal, int2, internal) float8
+f-si nlikesel(internal, oid, internal, int4) float8
+f-ii normalize(text, text default) text =unicode_normalize_func
+f-ii notlike(bytea, bytea) bool =byteanlike
+f-ii notlike(name, text) bool =namenlike
+f-ii notlike(text, text) bool =textnlike
+f-si now() timestamptz
+f-ii npoints(path) int4 =path_npoints
+f-ii npoints(polygon) int4 =poly_npoints
+w-ii nth_value(anyelement, int4) anyelement =window_nth_value
+w-ii ntile(int4) int4 =window_ntile
+f-ii num_nonnulls(variadic any) int4 =pg_num_nonnulls
+f-ii num_nulls(variadic any) int4 =pg_num_nulls
+f-ii numeric(float4) numeric =float4_numeric
+f-ii numeric(float8) numeric =float8_numeric
+f-ii numeric(int2) numeric =int2_numeric
+f-ii numeric(int4) numeric =int4_numeric
+f-ii numeric(int8) numeric =int8_numeric
+f-ii numeric(jsonb) numeric =jsonb_numeric
+f-si numeric(money) numeric =cash_numeric
+f-ii numeric(numeric, int4) numeric
+f-ii numeric_abs(numeric) numeric
+f-ii numeric_accum(internal, numeric) internal
+f-ii numeric_accum_inv(internal, numeric) internal
+f-ii numeric_add(numeric, numeric) numeric
+f-ii numeric_avg(internal) numeric
+f-ii numeric_avg_accum(internal, numeric) internal
+f-ii numeric_avg_combine(internal, internal) internal
+f-ii numeric_avg_deserialize(bytea, internal) internal
+f-ii numeric_avg_serialize(internal) bytea
+f-ii numeric_cmp(numeric, numeric) int4
+f-ii numeric_combine(internal, internal) internal
+f-ii numeric_deserialize(bytea, internal) internal
+f-ii numeric_div(numeric, numeric) numeric
+f-ii numeric_div_trunc(numeric, numeric) numeric
+f-ii numeric_eq(numeric, numeric) bool
+f-ii numeric_exp(numeric) numeric
+f-ii numeric_ge(numeric, numeric) bool
+f-ii numeric_gt(numeric, numeric) bool
+f-ii numeric_in(cstring, oid, int4) numeric
+f-ii numeric_inc(numeric) numeric
+f-ii numeric_larger(numeric, numeric) numeric
+f-ii numeric_le(numeric, numeric) bool
+f-ii numeric_ln(numeric) numeric
+f-ii numeric_log(numeric, numeric) numeric
+f-ii numeric_lt(numeric, numeric) bool
+f-ii numeric_mod(numeric, numeric) numeric
+f-ii numeric_mul(numeric, numeric) numeric
+f-ii numeric_ne(numeric, numeric) bool
+f-ii numeric_out(numeric) cstring
+f-is numeric_pl_pg_lsn(numeric, pg_lsn) pg_lsn
+f-ii numeric_poly_avg(internal) numeric
+f-ii numeric_poly_combine(internal, internal) internal
+f-ii numeric_poly_deserialize(bytea, internal) internal
+f-ii numeric_poly_serialize(internal) bytea
+f-ii numeric_poly_stddev_pop(internal) numeric
+f-ii numeric_poly_stddev_samp(internal) numeric
+f-ii numeric_poly_sum(internal) numeric
+f-ii numeric_poly_var_pop(internal) numeric
+f-ii numeric_poly_var_samp(internal) numeric
+f-ii numeric_power(numeric, numeric) numeric
+f-ii numeric_recv(internal, oid, int4) numeric
+f-ii numeric_send(numeric) bytea
+f-ii numeric_serialize(internal) bytea
+f-ii numeric_smaller(numeric, numeric) numeric
+f-ii numeric_sortsupport(internal) void
+f-ii numeric_sqrt(numeric) numeric
+f-ii numeric_stddev_pop(internal) numeric
+f-ii numeric_stddev_samp(internal) numeric
+f-ii numeric_sub(numeric, numeric) numeric
+f-ii numeric_sum(internal) numeric
+f-ii numeric_support(internal) internal
+f-ii numeric_uminus(numeric) numeric
+f-ii numeric_uplus(numeric) numeric
+f-ii numeric_var_pop(internal) numeric
+f-ii numeric_var_samp(internal) numeric
+f-ii numerictypmodin(_cstring) int4
+f-ii numerictypmodout(int4) cstring
+f-ii nummultirange() nummultirange =multirange_constructor0
+f-ii nummultirange(numrange) nummultirange =multirange_constructor1
+f-ii nummultirange(variadic _numrange) nummultirange =multirange_constructor2
+f-ii numnode(tsquery) int4 =tsquery_numnode
+f-ii numrange(numeric, numeric) numrange =range_constructor2
+f-ii numrange(numeric, numeric, text) numrange =range_constructor3
+f-ii numrange_subdiff(numeric, numeric) float8
+f-ss obj_description(oid) text
+f-ss obj_description(oid, name) text
+f-ii octet_length(bit) int4 =bitoctetlength
+f-ii octet_length(bpchar) int4 =bpcharoctetlen
+f-ii octet_length(bytea) int4 =byteaoctetlen
+f-ii octet_length(text) int4 =textoctetlen
+f-ii oid(int8) oid =i8tooid
+f-ii oideq(oid, oid) bool
+f-ii oidge(oid, oid) bool
+f-ii oidgt(oid, oid) bool
+f-ii oidin(cstring) oid
+f-ii oidlarger(oid, oid) oid
+f-ii oidle(oid, oid) bool
+f-ii oidlt(oid, oid) bool
+f-ii oidne(oid, oid) bool
+f-ii oidout(oid) cstring
+f-ii oidrecv(internal) oid
+f-ii oidsend(oid) bytea
+f-ii oidsmaller(oid, oid) oid
+f-ii oidvectoreq(oidvector, oidvector) bool
+f-ii oidvectorge(oidvector, oidvector) bool
+f-ii oidvectorgt(oidvector, oidvector) bool
+f-ii oidvectorin(cstring) oidvector
+f-ii oidvectorle(oidvector, oidvector) bool
+f-ii oidvectorlt(oidvector, oidvector) bool
+f-ii oidvectorne(oidvector, oidvector) bool
+f-ii oidvectorout(oidvector) cstring
+f-ii oidvectorrecv(internal) oidvector
+f-ii oidvectorsend(oidvector) bytea
+f-si oidvectortypes(oidvector) text
+f-ii on_pb(point, box) bool
+f-ii on_pl(point, line) bool
+f-ii on_ppath(point, path) bool
+f-ii on_ps(point, lseg) bool
+f-ii on_sb(lseg, box) bool
+f-ii on_sl(lseg, line) bool
+f-ii ordered_set_transition(internal, any) internal
+f-ii ordered_set_transition_multi(internal, variadic any) internal
+f-is overlaps(time, interval, time, interval) bool
+f-is overlaps(time, interval, time, time) bool
+f-is overlaps(time, time, time, interval) bool
+f-ii overlaps(time, time, time, time) bool =overlaps_time
+f-is overlaps(timestamp, interval, timestamp, interval) bool
+f-is overlaps(timestamp, interval, timestamp, timestamp) bool
+f-is overlaps(timestamp, timestamp, timestamp, interval) bool
+f-ii overlaps(timestamp, timestamp, timestamp, timestamp) bool =overlaps_timestamp
+f-ss overlaps(timestamptz, interval, timestamptz, interval) bool
+f-ss overlaps(timestamptz, interval, timestamptz, timestamptz) bool
+f-ss overlaps(timestamptz, timestamptz, timestamptz, interval) bool
+f-ii overlaps(timestamptz, timestamptz, timestamptz, timestamptz) bool =overlaps_timestamp
+f-ii overlaps(timetz, timetz, timetz, timetz) bool =overlaps_timetz
+f-ii overlay(bit, bit, int4) bit =bitoverlay_no_len
+f-ii overlay(bit, bit, int4, int4) bit =bitoverlay
+f-ii overlay(bytea, bytea, int4) bytea =byteaoverlay_no_len
+f-ii overlay(bytea, bytea, int4, int4) bytea =byteaoverlay
+f-ii overlay(text, text, int4) text =textoverlay_no_len
+f-ii overlay(text, text, int4, int4) text =textoverlay
+f-ii parse_ident(str text, strict bool default) _text
+f-ii path(polygon) path =poly_path
+f-ii path_add(path, path) path
+f-ii path_add_pt(path, point) path
+f-is path_contain_pt(path, point) bool
+f-ii path_distance(path, path) float8
+f-ii path_div_pt(path, point) path
+f-ii path_in(cstring) path
+f-ii path_inter(path, path) bool
+f-ii path_length(path) float8
+f-ii path_mul_pt(path, point) path
+f-ii path_n_eq(path, path) bool
+f-ii path_n_ge(path, path) bool
+f-ii path_n_gt(path, path) bool
+f-ii path_n_le(path, path) bool
+f-ii path_n_lt(path, path) bool
+f-ii path_npoints(path) int4
+f-ii path_out(path) cstring
+f-ii path_recv(internal) path
+f-ii path_send(path) bytea
+f-ii path_sub_pt(path, point) path
+f-ii pclose(path) path =path_close
+w-ii percent_rank() float8 =window_percent_rank
+a-ii percent_rank(variadic any) float8 =aggregate_dummy
+f-ii percent_rank_final(internal, variadic any) float8 =hypothetical_percent_rank_final
+a-ii percentile_cont(_float8, float8) _float8 =aggregate_dummy
+a-ii percentile_cont(_float8, interval) _interval =aggregate_dummy
+a-ii percentile_cont(float8, float8) float8 =aggregate_dummy
+a-ii percentile_cont(float8, interval) interval =aggregate_dummy
+f-ii percentile_cont_float8_final(internal, float8) float8
+f-ii percentile_cont_float8_multi_final(internal, _float8) _float8
+f-ii percentile_cont_interval_final(internal, float8) interval
+f-ii percentile_cont_interval_multi_final(internal, _float8) _interval
+a-ii percentile_disc(_float8, anyelement) anyarray =aggregate_dummy
+a-ii percentile_disc(float8, anyelement) anyelement =aggregate_dummy
+f-ii percentile_disc_final(internal, float8, anyelement) anyelement
+f-ii percentile_disc_multi_final(internal, _float8, anyelement) anyarray
+f-vi pg_advisory_lock(int4, int4) void =pg_advisory_lock_int4
+f-vi pg_advisory_lock(int8) void =pg_advisory_lock_int8
+f-vi pg_advisory_lock_shared(int4, int4) void =pg_advisory_lock_shared_int4
+f-vi pg_advisory_lock_shared(int8) void =pg_advisory_lock_shared_int8
+f-vi pg_advisory_unlock(int4, int4) bool =pg_advisory_unlock_int4
+f-vi pg_advisory_unlock(int8) bool =pg_advisory_unlock_int8
+f-vi pg_advisory_unlock_all() void
+f-vi pg_advisory_unlock_shared(int4, int4) bool =pg_advisory_unlock_shared_int4
+f-vi pg_advisory_unlock_shared(int8) bool =pg_advisory_unlock_shared_int8
+f-vi pg_advisory_xact_lock(int4, int4) void =pg_advisory_xact_lock_int4
+f-vi pg_advisory_xact_lock(int8) void =pg_advisory_xact_lock_int8
+f-vi pg_advisory_xact_lock_shared(int4, int4) void =pg_advisory_xact_lock_shared_int4
+f-vi pg_advisory_xact_lock_shared(int8) void =pg_advisory_xact_lock_shared_int8
+fssi pg_available_extension_versions() record
+fssi pg_available_extensions() record
+fsvi pg_available_wal_summaries() record
+f-si pg_backend_pid() int4
+f-vi pg_backup_start(label text, fast bool default) pg_lsn
+f-vi pg_backup_stop(wait_for_archive bool default) record
+f-si pg_basetype(regtype) regtype
+f-vi pg_blocking_pids(int4) _int4
+f-vi pg_cancel_backend(int4) bool
+f-si pg_char_to_encoding(name) int4 =PG_char_to_encoding
+f-si pg_client_encoding() name
+f-vi pg_collation_actual_version(oid) text
+f-si pg_collation_for(any) text
+f-si pg_collation_is_visible(oid) bool
+f-si pg_column_compression(any) text
+f-si pg_column_is_updatable(regclass, int2, bool) bool
+f-si pg_column_size(any) int4
+f-si pg_column_toast_chunk_id(any) oid
+f-si pg_conf_load_time() timestamptz
+fssi pg_config() record
+f-vi pg_control_checkpoint() record
+f-vi pg_control_init() record
+f-vi pg_control_recovery() record
+f-vi pg_control_system() record
+f-si pg_conversion_is_visible(oid) bool
+f-vi pg_copy_logical_replication_slot(src_slot_name name, dst_slot_name name) record =pg_copy_logical_replication_slot_c
+f-vi pg_copy_logical_replication_slot(src_slot_name name, dst_slot_name name, temporary bool) record =pg_copy_logical_replication_slot_b
+f-vi pg_copy_logical_replication_slot(src_slot_name name, dst_slot_name name, temporary bool, plugin name) record =pg_copy_logical_replication_slot_a
+f-vi pg_copy_physical_replication_slot(src_slot_name name, dst_slot_name name) record =pg_copy_physical_replication_slot_b
+f-vi pg_copy_physical_replication_slot(src_slot_name name, dst_slot_name name, temporary bool) record =pg_copy_physical_replication_slot_a
+f-vi pg_create_logical_replication_slot(slot_name name, plugin name, temporary bool default, twophase bool default, failover bool default) record
+f-vi pg_create_physical_replication_slot(slot_name name, immediately_reserve bool default, temporary bool default) record
+f-vi pg_create_restore_point(text) pg_lsn
+f-vi pg_current_logfile() text
+f-vi pg_current_logfile(text) text =pg_current_logfile_1arg
+f-si pg_current_snapshot() pg_snapshot
+f-vi pg_current_wal_flush_lsn() pg_lsn
+f-vi pg_current_wal_insert_lsn() pg_lsn
+f-vi pg_current_wal_lsn() pg_lsn
+f-si pg_current_xact_id() xid8
+f-si pg_current_xact_id_if_assigned() xid8
+fssi pg_cursor() record
+f-vi pg_database_collation_actual_version(oid) text
+f-vi pg_database_size(name) int8 =pg_database_size_name
+f-vi pg_database_size(oid) int8 =pg_database_size_oid
+f-ii pg_ddl_command_in(cstring) pg_ddl_command
+f-ii pg_ddl_command_out(pg_ddl_command) cstring
+f-ii pg_ddl_command_recv(internal) pg_ddl_command
+f-ii pg_ddl_command_send(pg_ddl_command) bytea
+f-ii pg_dependencies_in(cstring) pg_dependencies
+f-ii pg_dependencies_out(pg_dependencies) cstring
+f-si pg_dependencies_recv(internal) pg_dependencies
+f-si pg_dependencies_send(pg_dependencies) bytea
+f-si pg_describe_object(oid, oid, int4) text
+f-vi pg_drop_replication_slot(name) void
+f-ii pg_encoding_max_length(int4) int4 =pg_encoding_max_length_sql
+f-si pg_encoding_to_char(int4) name =PG_encoding_to_char
+fssi pg_event_trigger_ddl_commands() record
+fssi pg_event_trigger_dropped_objects() record
+f-si pg_event_trigger_table_rewrite_oid() oid
+f-si pg_event_trigger_table_rewrite_reason() int4
+f-vi pg_export_snapshot() text
+f-vi pg_extension_config_dump(regclass, text) void
+fssi pg_extension_update_paths(name name) record
+f-si pg_filenode_relation(oid, oid) regclass
+f-si pg_function_is_visible(oid) bool
+fsvi pg_get_backend_memory_contexts() record
+fssi pg_get_catalog_foreign_keys() record
+f-si pg_get_constraintdef(oid) text
+f-si pg_get_constraintdef(oid, bool) text =pg_get_constraintdef_ext
+f-si pg_get_expr(pg_node_tree, oid) text
+f-si pg_get_expr(pg_node_tree, oid, bool) text =pg_get_expr_ext
+f-si pg_get_function_arg_default(oid, int4) text
+f-si pg_get_function_arguments(oid) text
+f-si pg_get_function_identity_arguments(oid) text
+f-si pg_get_function_result(oid) text
+f-si pg_get_function_sqlbody(oid) text
+f-si pg_get_functiondef(oid) text
+f-si pg_get_indexdef(oid) text
+f-si pg_get_indexdef(oid, int4, bool) text =pg_get_indexdef_ext
+fssi pg_get_keywords() record
+fsvi pg_get_multixact_members(multixid xid) record
+f-si pg_get_object_address(type text, object_names _text, object_args _text) record
+f-si pg_get_partition_constraintdef(oid) text
+f-si pg_get_partkeydef(oid) text
+fssi pg_get_publication_tables(variadic pubname _text) record
+f-si pg_get_replica_identity_index(regclass) regclass
+fssi pg_get_replication_slots() record
+f-si pg_get_ruledef(oid) text
+f-si pg_get_ruledef(oid, bool) text =pg_get_ruledef_ext
+f-si pg_get_serial_sequence(text, text) text
+fsvi pg_get_shmem_allocations() record
+f-si pg_get_statisticsobjdef(oid) text
+f-si pg_get_statisticsobjdef_columns(oid) text
+f-si pg_get_statisticsobjdef_expressions(oid) _text
+f-si pg_get_triggerdef(oid) text
+f-si pg_get_triggerdef(oid, bool) text =pg_get_triggerdef_ext
+f-si pg_get_userbyid(oid) name
+f-si pg_get_viewdef(oid) text
+f-si pg_get_viewdef(oid, bool) text =pg_get_viewdef_ext
+f-si pg_get_viewdef(oid, int4) text =pg_get_viewdef_wrap
+f-si pg_get_viewdef(text) text =pg_get_viewdef_name
+f-si pg_get_viewdef(text, bool) text =pg_get_viewdef_name_ext
+fsvi pg_get_wait_events() record
+f-vi pg_get_wal_replay_pause_state() text
+fsvi pg_get_wal_resource_managers() record
+f-vi pg_get_wal_summarizer_state() record
+f-si pg_has_role(name, name, text) bool =pg_has_role_name_name
+f-si pg_has_role(name, oid, text) bool =pg_has_role_name_id
+f-si pg_has_role(name, text) bool =pg_has_role_name
+f-si pg_has_role(oid, name, text) bool =pg_has_role_id_name
+f-si pg_has_role(oid, oid, text) bool =pg_has_role_id_id
+f-si pg_has_role(oid, text) bool =pg_has_role_id
+fsvi pg_hba_file_rules() record
+fsvi pg_ident_file_mappings() record
+f-si pg_identify_object(classid oid, objid oid, objsubid int4) record
+f-si pg_identify_object_as_address(classid oid, objid oid, objsubid int4) record
+f-vi pg_import_system_collations(regnamespace) int4
+f-si pg_index_column_has_property(regclass, int4, text) bool
+f-si pg_index_has_property(regclass, text) bool
+f-si pg_indexam_has_property(oid, text) bool
+f-ii pg_indexam_progress_phasename(oid, int8) text
+f-vi pg_indexes_size(regclass) int8
+f-si pg_input_error_info(value text, type_name text) record
+f-si pg_input_is_valid(text, text) bool
+f-vi pg_is_in_recovery() bool
+f-si pg_is_other_temp_schema(oid) bool
+f-vi pg_is_wal_replay_paused() bool
+f-vi pg_isolation_test_session_is_blocked(int4, _int4) bool
+f-vi pg_jit_available() bool
+f-vi pg_last_committed_xact() record
+f-vi pg_last_wal_receive_lsn() pg_lsn
+f-vi pg_last_wal_replay_lsn() pg_lsn
+f-vi pg_last_xact_replay_timestamp() timestamptz
+fssi pg_listening_channels() text
+fsvi pg_lock_status() record
+f-vi pg_log_backend_memory_contexts(int4) bool
+f-vi pg_log_standby_snapshot() pg_lsn
+f-vi pg_logical_emit_message(transactional bool, prefix text, message bytea, flush bool default) pg_lsn =pg_logical_emit_message_bytea
+f-vi pg_logical_emit_message(transactional bool, prefix text, message text, flush bool default) pg_lsn =pg_logical_emit_message_text
+fsvi pg_logical_slot_get_binary_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges int4, variadic options _text default) record
+fsvi pg_logical_slot_get_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges int4, variadic options _text default) record
+fsvi pg_logical_slot_peek_binary_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges int4, variadic options _text default) record
+fsvi pg_logical_slot_peek_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges int4, variadic options _text default) record
+fsvi pg_ls_archive_statusdir() record
+fsvi pg_ls_dir(text) text =pg_ls_dir_1arg
+fsvi pg_ls_dir(text, bool, bool) text
+fsvi pg_ls_logdir() record
+fsvi pg_ls_logicalmapdir() record
+fsvi pg_ls_logicalsnapdir() record
+fsvi pg_ls_replslotdir(slot_name text) record
+fsvi pg_ls_tmpdir() record =pg_ls_tmpdir_noargs
+fsvi pg_ls_tmpdir(tablespace oid) record =pg_ls_tmpdir_1arg
+fsvi pg_ls_waldir() record
+f-ii pg_lsn(numeric) pg_lsn =numeric_pg_lsn
+f-ii pg_lsn_cmp(pg_lsn, pg_lsn) int4
+f-ii pg_lsn_eq(pg_lsn, pg_lsn) bool
+f-ii pg_lsn_ge(pg_lsn, pg_lsn) bool
+f-ii pg_lsn_gt(pg_lsn, pg_lsn) bool
+f-ii pg_lsn_hash(pg_lsn) int4
+f-ii pg_lsn_hash_extended(pg_lsn, int8) int8
+f-ii pg_lsn_in(cstring) pg_lsn
+f-ii pg_lsn_larger(pg_lsn, pg_lsn) pg_lsn
+f-ii pg_lsn_le(pg_lsn, pg_lsn) bool
+f-ii pg_lsn_lt(pg_lsn, pg_lsn) bool
+f-ii pg_lsn_mi(pg_lsn, pg_lsn) numeric
+f-ii pg_lsn_mii(pg_lsn, numeric) pg_lsn
+f-ii pg_lsn_ne(pg_lsn, pg_lsn) bool
+f-ii pg_lsn_out(pg_lsn) cstring
+f-ii pg_lsn_pli(pg_lsn, numeric) pg_lsn
+f-ii pg_lsn_recv(internal) pg_lsn
+f-ii pg_lsn_send(pg_lsn) bytea
+f-ii pg_lsn_smaller(pg_lsn, pg_lsn) pg_lsn
+f-ii pg_mcv_list_in(cstring) pg_mcv_list
+fssi pg_mcv_list_items(mcv_list pg_mcv_list) record =pg_stats_ext_mcvlist_items
+f-ii pg_mcv_list_out(pg_mcv_list) cstring
+f-si pg_mcv_list_recv(internal) pg_mcv_list
+f-si pg_mcv_list_send(pg_mcv_list) bytea
+f-si pg_my_temp_schema() oid
+f-ii pg_ndistinct_in(cstring) pg_ndistinct
+f-ii pg_ndistinct_out(pg_ndistinct) cstring
+f-si pg_ndistinct_recv(internal) pg_ndistinct
+f-si pg_ndistinct_send(pg_ndistinct) bytea
+f-vi pg_nextoid(regclass, name, regclass) oid
+f-ii pg_node_tree_in(cstring) pg_node_tree
+f-ii pg_node_tree_out(pg_node_tree) cstring
+f-si pg_node_tree_recv(internal) pg_node_tree
+f-si pg_node_tree_send(pg_node_tree) bytea
+f-vi pg_notification_queue_usage() float8
+f-vi pg_notify(text, text) void
+f-si pg_opclass_is_visible(oid) bool
+f-si pg_operator_is_visible(oid) bool
+f-si pg_opfamily_is_visible(oid) bool
+fssi pg_options_to_table(options_array _text) record
+fsvi pg_partition_ancestors(partitionid regclass) regclass
+f-ii pg_partition_root(regclass) regclass
+fsvi pg_partition_tree(rootrelid regclass) record
+f-si pg_postmaster_start_time() timestamptz
+fssi pg_prepared_statement() record
+fsvi pg_prepared_xact() record
+f-vi pg_promote(wait bool default, wait_seconds int4 default) bool
+f-vi pg_read_binary_file(text) bytea =pg_read_binary_file_all
+f-vi pg_read_binary_file(text, bool) bytea =pg_read_binary_file_all_missing
+f-vi pg_read_binary_file(text, int8, int8) bytea =pg_read_binary_file_off_len
+f-vi pg_read_binary_file(text, int8, int8, bool) bytea =pg_read_binary_file_off_len_missing
+f-vi pg_read_file(text) text =pg_read_file_all
+f-vi pg_read_file(text, bool) text =pg_read_file_all_missing
+f-vi pg_read_file(text, int8, int8) text =pg_read_file_off_len
+f-vi pg_read_file(text, int8, int8, bool) text =pg_read_file_off_len_missing
+f-si pg_relation_filenode(regclass) oid
+f-si pg_relation_filepath(regclass) text
+f-si pg_relation_is_publishable(regclass) bool
+f-si pg_relation_is_updatable(regclass, bool) int4
+f-vs pg_relation_size(regclass) int8
+f-vi pg_relation_size(regclass, text) int8
+f-vi pg_reload_conf() bool
+f-vi pg_replication_origin_advance(text, pg_lsn) void
+f-vi pg_replication_origin_create(text) oid
+f-vi pg_replication_origin_drop(text) void
+f-si pg_replication_origin_oid(text) oid
+f-vi pg_replication_origin_progress(text, bool) pg_lsn
+f-vi pg_replication_origin_session_is_setup() bool
+f-vi pg_replication_origin_session_progress(bool) pg_lsn
+f-vi pg_replication_origin_session_reset() void
+f-vi pg_replication_origin_session_setup(text) void
+f-vi pg_replication_origin_xact_reset() void
+f-vi pg_replication_origin_xact_setup(pg_lsn, timestamptz) void
+f-vi pg_replication_slot_advance(slot_name name, upto_lsn pg_lsn) record
+f-vi pg_rotate_logfile() bool
+f-vi pg_safe_snapshot_blocking_pids(int4) _int4
+f-vi pg_sequence_last_value(regclass) int8
+f-si pg_sequence_parameters(sequence_oid oid) record
+f-si pg_settings_get_flags(text) _text
+fsvi pg_show_all_file_settings() record =show_all_file_settings
+fssi pg_show_all_settings() record =show_all_settings
+fsvi pg_show_replication_origin_status() record
+f-ii pg_size_bytes(text) int8
+f-ii pg_size_pretty(int8) text
+f-ii pg_size_pretty(numeric) text =pg_size_pretty_numeric
+f-vi pg_sleep(float8) void
+f-vs pg_sleep_for(interval) void
+f-vs pg_sleep_until(timestamptz) void
+f-ii pg_snapshot_in(cstring) pg_snapshot
+f-ii pg_snapshot_out(pg_snapshot) cstring
+f-ii pg_snapshot_recv(internal) pg_snapshot
+f-ii pg_snapshot_send(pg_snapshot) bytea
+fsii pg_snapshot_xip(pg_snapshot) xid8
+f-ii pg_snapshot_xmax(pg_snapshot) xid8
+f-ii pg_snapshot_xmin(pg_snapshot) xid8
+f-si pg_split_walfile_name(file_name text) record
+f-vi pg_stat_clear_snapshot() void
+f-vi pg_stat_file(filename text) record =pg_stat_file_1arg
+f-vi pg_stat_file(filename text, missing_ok bool) record
+f-vi pg_stat_force_next_flush() void
+fssi pg_stat_get_activity(pid int4) record
+f-si pg_stat_get_analyze_count(oid) int8
+f-si pg_stat_get_archiver() record
+f-si pg_stat_get_autoanalyze_count(oid) int8
+f-si pg_stat_get_autovacuum_count(oid) int8
+f-si pg_stat_get_backend_activity(int4) text
+f-si pg_stat_get_backend_activity_start(int4) timestamptz
+f-si pg_stat_get_backend_client_addr(int4) inet
+f-si pg_stat_get_backend_client_port(int4) int4
+f-si pg_stat_get_backend_dbid(int4) oid
+fssi pg_stat_get_backend_idset() int4
+f-si pg_stat_get_backend_pid(int4) int4
+f-si pg_stat_get_backend_start(int4) timestamptz
+f-si pg_stat_get_backend_subxact(bid int4) record
+f-si pg_stat_get_backend_userid(int4) oid
+f-si pg_stat_get_backend_wait_event(int4) text
+f-si pg_stat_get_backend_wait_event_type(int4) text
+f-si pg_stat_get_backend_xact_start(int4) timestamptz
+f-si pg_stat_get_bgwriter_buf_written_clean() int8
+f-si pg_stat_get_bgwriter_maxwritten_clean() int8
+f-si pg_stat_get_bgwriter_stat_reset_time() timestamptz
+f-si pg_stat_get_blocks_fetched(oid) int8
+f-si pg_stat_get_blocks_hit(oid) int8
+f-si pg_stat_get_buf_alloc() int8
+f-si pg_stat_get_checkpointer_buffers_written() int8
+f-si pg_stat_get_checkpointer_num_requested() int8
+f-si pg_stat_get_checkpointer_num_timed() int8
+f-si pg_stat_get_checkpointer_restartpoints_performed() int8
+f-si pg_stat_get_checkpointer_restartpoints_requested() int8
+f-si pg_stat_get_checkpointer_restartpoints_timed() int8
+f-si pg_stat_get_checkpointer_stat_reset_time() timestamptz
+f-si pg_stat_get_checkpointer_sync_time() float8
+f-si pg_stat_get_checkpointer_write_time() float8
+f-si pg_stat_get_db_active_time(oid) float8
+f-si pg_stat_get_db_blk_read_time(oid) float8
+f-si pg_stat_get_db_blk_write_time(oid) float8
+f-si pg_stat_get_db_blocks_fetched(oid) int8
+f-si pg_stat_get_db_blocks_hit(oid) int8
+f-si pg_stat_get_db_checksum_failures(oid) int8
+f-si pg_stat_get_db_checksum_last_failure(oid) timestamptz
+f-si pg_stat_get_db_conflict_all(oid) int8
+f-si pg_stat_get_db_conflict_bufferpin(oid) int8
+f-si pg_stat_get_db_conflict_lock(oid) int8
+f-si pg_stat_get_db_conflict_logicalslot(oid) int8
+f-si pg_stat_get_db_conflict_snapshot(oid) int8
+f-si pg_stat_get_db_conflict_startup_deadlock(oid) int8
+f-si pg_stat_get_db_conflict_tablespace(oid) int8
+f-si pg_stat_get_db_deadlocks(oid) int8
+f-si pg_stat_get_db_idle_in_transaction_time(oid) float8
+f-si pg_stat_get_db_numbackends(oid) int4
+f-si pg_stat_get_db_session_time(oid) float8
+f-si pg_stat_get_db_sessions(oid) int8
+f-si pg_stat_get_db_sessions_abandoned(oid) int8
+f-si pg_stat_get_db_sessions_fatal(oid) int8
+f-si pg_stat_get_db_sessions_killed(oid) int8
+f-si pg_stat_get_db_stat_reset_time(oid) timestamptz
+f-si pg_stat_get_db_temp_bytes(oid) int8
+f-si pg_stat_get_db_temp_files(oid) int8
+f-si pg_stat_get_db_tuples_deleted(oid) int8
+f-si pg_stat_get_db_tuples_fetched(oid) int8
+f-si pg_stat_get_db_tuples_inserted(oid) int8
+f-si pg_stat_get_db_tuples_returned(oid) int8
+f-si pg_stat_get_db_tuples_updated(oid) int8
+f-si pg_stat_get_db_xact_commit(oid) int8
+f-si pg_stat_get_db_xact_rollback(oid) int8
+f-si pg_stat_get_dead_tuples(oid) int8
+f-si pg_stat_get_function_calls(oid) int8
+f-si pg_stat_get_function_self_time(oid) float8
+f-si pg_stat_get_function_total_time(oid) float8
+f-si pg_stat_get_ins_since_vacuum(oid) int8
+fsvi pg_stat_get_io() record
+f-si pg_stat_get_last_analyze_time(oid) timestamptz
+f-si pg_stat_get_last_autoanalyze_time(oid) timestamptz
+f-si pg_stat_get_last_autovacuum_time(oid) timestamptz
+f-si pg_stat_get_last_vacuum_time(oid) timestamptz
+f-si pg_stat_get_lastscan(oid) timestamptz
+f-si pg_stat_get_live_tuples(oid) int8
+f-si pg_stat_get_mod_since_analyze(oid) int8
+f-si pg_stat_get_numscans(oid) int8
+fssi pg_stat_get_progress_info(cmdtype text) record
+fsvi pg_stat_get_recovery_prefetch() record
+f-si pg_stat_get_replication_slot(slot_name text) record
+fssi pg_stat_get_slru() record
+f-si pg_stat_get_snapshot_timestamp() timestamptz
+fssi pg_stat_get_subscription(subid oid) record
+f-si pg_stat_get_subscription_stats(subid oid) record
+f-si pg_stat_get_tuples_deleted(oid) int8
+f-si pg_stat_get_tuples_fetched(oid) int8
+f-si pg_stat_get_tuples_hot_updated(oid) int8
+f-si pg_stat_get_tuples_inserted(oid) int8
+f-si pg_stat_get_tuples_newpage_updated(oid) int8
+f-si pg_stat_get_tuples_returned(oid) int8
+f-si pg_stat_get_tuples_updated(oid) int8
+f-si pg_stat_get_vacuum_count(oid) int8
+f-si pg_stat_get_wal() record
+f-si pg_stat_get_wal_receiver() record
+fssi pg_stat_get_wal_senders() record
+f-vi pg_stat_get_xact_blocks_fetched(oid) int8
+f-vi pg_stat_get_xact_blocks_hit(oid) int8
+f-vi pg_stat_get_xact_function_calls(oid) int8
+f-vi pg_stat_get_xact_function_self_time(oid) float8
+f-vi pg_stat_get_xact_function_total_time(oid) float8
+f-vi pg_stat_get_xact_numscans(oid) int8
+f-vi pg_stat_get_xact_tuples_deleted(oid) int8
+f-vi pg_stat_get_xact_tuples_fetched(oid) int8
+f-vi pg_stat_get_xact_tuples_hot_updated(oid) int8
+f-vi pg_stat_get_xact_tuples_inserted(oid) int8
+f-vi pg_stat_get_xact_tuples_newpage_updated(oid) int8
+f-vi pg_stat_get_xact_tuples_returned(oid) int8
+f-vi pg_stat_get_xact_tuples_updated(oid) int8
+f-vi pg_stat_have_stats(text, oid, oid) bool
+f-vi pg_stat_reset() void
+f-vi pg_stat_reset_replication_slot(text) void
+f-vi pg_stat_reset_shared(target text default) void
+f-vi pg_stat_reset_single_function_counters(oid) void
+f-vi pg_stat_reset_single_table_counters(oid) void
+f-vi pg_stat_reset_slru(target text default) void
+f-vi pg_stat_reset_subscription_stats(oid) void
+f-si pg_statistics_obj_is_visible(oid) bool
+f-vi pg_stop_making_pinned_objects() void
+f-vi pg_switch_wal() pg_lsn
+f-vi pg_sync_replication_slots() void
+f-si pg_table_is_visible(oid) bool
+f-vi pg_table_size(regclass) int8
+fssi pg_tablespace_databases(oid) oid
+f-si pg_tablespace_location(oid) text
+f-vi pg_tablespace_size(name) int8 =pg_tablespace_size_name
+f-vi pg_tablespace_size(oid) int8 =pg_tablespace_size_oid
+f-vi pg_terminate_backend(pid int4, timeout int8 default) bool
+fssi pg_timezone_abbrevs() record
+fssi pg_timezone_names() record
+f-vi pg_total_relation_size(regclass) int8
+f-si pg_trigger_depth() int4
+f-vi pg_try_advisory_lock(int4, int4) bool =pg_try_advisory_lock_int4
+f-vi pg_try_advisory_lock(int8) bool =pg_try_advisory_lock_int8
+f-vi pg_try_advisory_lock_shared(int4, int4) bool =pg_try_advisory_lock_shared_int4
+f-vi pg_try_advisory_lock_shared(int8) bool =pg_try_advisory_lock_shared_int8
+f-vi pg_try_advisory_xact_lock(int4, int4) bool =pg_try_advisory_xact_lock_int4
+f-vi pg_try_advisory_xact_lock(int8) bool =pg_try_advisory_xact_lock_int8
+f-vi pg_try_advisory_xact_lock_shared(int4, int4) bool =pg_try_advisory_xact_lock_shared_int4
+f-vi pg_try_advisory_xact_lock_shared(int8) bool =pg_try_advisory_xact_lock_shared_int8
+f-si pg_ts_config_is_visible(oid) bool
+f-si pg_ts_dict_is_visible(oid) bool
+f-si pg_ts_parser_is_visible(oid) bool
+f-si pg_ts_template_is_visible(oid) bool
+f-si pg_type_is_visible(oid) bool
+f-si pg_typeof(any) regtype
+f-ii pg_visible_in_snapshot(xid8, pg_snapshot) bool
+f-ii pg_wal_lsn_diff(pg_lsn, pg_lsn) numeric
+f-vi pg_wal_replay_pause() void
+f-vi pg_wal_replay_resume() void
+fsvi pg_wal_summary_contents(tli int8, start_lsn pg_lsn, end_lsn pg_lsn) record
+f-ii pg_walfile_name(pg_lsn) text
+f-ii pg_walfile_name_offset(lsn pg_lsn) record
+f-vi pg_xact_commit_timestamp(xid) timestamptz
+f-vi pg_xact_commit_timestamp_origin(xid xid) record
+f-vi pg_xact_status(xid8) text
+f-ii phraseto_tsquery(regconfig, text) tsquery =phraseto_tsquery_byid
+f-si phraseto_tsquery(text) tsquery
+f-ii pi() float8 =dpi
+f-ii plainto_tsquery(regconfig, text) tsquery =plainto_tsquery_byid
+f-si plainto_tsquery(text) tsquery
+f-vc plpgsql_call_handler() language_handler
+f-vc plpgsql_inline_handler(internal) void
+f-vc plpgsql_validator(oid) void
+f-ii point(box) point =box_center
+f-ii point(circle) point =circle_center
+f-ii point(float8, float8) point =construct_point
+f-ii point(lseg) point =lseg_center
+f-ii point(polygon) point =poly_center
+f-ii point_above(point, point) bool
+f-ii point_add(point, point) point
+f-ii point_below(point, point) bool
+f-ii point_distance(point, point) float8
+f-ii point_div(point, point) point
+f-ii point_eq(point, point) bool
+f-ii point_horiz(point, point) bool
+f-ii point_in(cstring) point
+f-ii point_left(point, point) bool
+f-ii point_mul(point, point) point
+f-ii point_ne(point, point) bool
+f-ii point_out(point) cstring
+f-ii point_recv(internal) point
+f-ii point_right(point, point) bool
+f-ii point_send(point) bytea
+f-ii point_sub(point, point) point
+f-ii point_vert(point, point) bool
+f-ii poly_above(polygon, polygon) bool
+f-ii poly_below(polygon, polygon) bool
+f-ii poly_center(polygon) point
+f-ii poly_contain(polygon, polygon) bool
+f-ii poly_contain_pt(polygon, point) bool
+f-ii poly_contained(polygon, polygon) bool
+f-ii poly_distance(polygon, polygon) float8
+f-ii poly_in(cstring) polygon
+f-ii poly_left(polygon, polygon) bool
+f-ii poly_npoints(polygon) int4
+f-ii poly_out(polygon) cstring
+f-ii poly_overabove(polygon, polygon) bool
+f-ii poly_overbelow(polygon, polygon) bool
+f-ii poly_overlap(polygon, polygon) bool
+f-ii poly_overleft(polygon, polygon) bool
+f-ii poly_overright(polygon, polygon) bool
+f-ii poly_recv(internal) polygon
+f-ii poly_right(polygon, polygon) bool
+f-ii poly_same(polygon, polygon) bool
+f-ii poly_send(polygon) bytea
+f-ii polygon(box) polygon =box_poly
+f-is polygon(circle) polygon
+f-ii polygon(int4, circle) polygon =circle_poly
+f-ii polygon(path) polygon =path_poly
+f-ii popen(path) path =path_open
+f-ii position(bit, bit) int4 =bitposition
+f-ii position(bytea, bytea) int4 =byteapos
+f-ii position(text, text) int4 =textpos
+f-si positionjoinsel(internal, oid, internal, int2, internal) float8
+f-si positionsel(internal, oid, internal, int4) float8
+f-ii postgresql_fdw_validator(_text, oid) bool
+f-ii pow(float8, float8) float8 =dpow
+f-ii pow(numeric, numeric) numeric =numeric_power
+f-ii power(float8, float8) float8 =dpow
+f-ii power(numeric, numeric) numeric =numeric_power
+f-si prefixjoinsel(internal, oid, internal, int2, internal) float8
+f-si prefixsel(internal, oid, internal, int4) float8
+f-ii prsd_end(internal) void
+f-ii prsd_headline(internal, internal, tsquery) internal
+f-ii prsd_lextype(internal) internal
+f-ii prsd_nexttoken(internal, internal, internal) internal
+f-ii prsd_start(internal, int4) internal
+f-ii pt_contained_circle(point, circle) bool
+f-ii pt_contained_poly(point, polygon) bool
+f-vi query_to_xml(query text, nulls bool, tableforest bool, targetns text) xml
+f-vi query_to_xml_and_xmlschema(query text, nulls bool, tableforest bool, targetns text) xml
+f-vi query_to_xmlschema(query text, nulls bool, tableforest bool, targetns text) xml
+f-ii querytree(tsquery) text =tsquerytree
+f-ii quote_ident(text) text
+f-ss quote_literal(anyelement) text
+f-ii quote_literal(text) text
+f-ss quote_nullable(anyelement) text
+f-ii quote_nullable(text) text
+f-ii radians(float8) float8
+f-ii radius(circle) float8 =circle_radius
+f-vi random() float8 =drandom
+f-vi random(min int4, max int4) int4 =int4random
+f-vi random(min int8, max int8) int8 =int8random
+f-vi random(min numeric, max numeric) numeric =numeric_random
+f-vi random_normal(mean float8 default, stddev float8 default) float8 =drandom_normal
+f-ii range_adjacent(anyrange, anyrange) bool
+f-ii range_adjacent_multirange(anyrange, anymultirange) bool
+f-ii range_after(anyrange, anyrange) bool
+f-ii range_after_multirange(anyrange, anymultirange) bool
+a-ii range_agg(anymultirange) anymultirange =aggregate_dummy
+a-ii range_agg(anyrange) anymultirange =aggregate_dummy
+f-ii range_agg_finalfn(internal, anyrange) anymultirange
+f-ii range_agg_transfn(internal, anyrange) internal
+f-ii range_before(anyrange, anyrange) bool
+f-ii range_before_multirange(anyrange, anymultirange) bool
+f-ii range_cmp(anyrange, anyrange) int4
+f-ii range_contained_by(anyrange, anyrange) bool
+f-ii range_contained_by_multirange(anyrange, anymultirange) bool
+f-ii range_contains(anyrange, anyrange) bool
+f-ii range_contains_elem(anyrange, anyelement) bool
+f-ii range_contains_elem_support(internal) internal
+f-ii range_contains_multirange(anyrange, anymultirange) bool
+f-ii range_eq(anyrange, anyrange) bool
+f-ii range_ge(anyrange, anyrange) bool
+f-ii range_gist_consistent(internal, anyrange, int2, oid, internal) bool
+f-ii range_gist_penalty(internal, internal, internal) internal
+f-ii range_gist_picksplit(internal, internal) internal
+f-ii range_gist_same(anyrange, anyrange, internal) internal
+f-ii range_gist_union(internal, internal) anyrange
+f-ii range_gt(anyrange, anyrange) bool
+f-si range_in(cstring, oid, int4) anyrange
+f-ii range_intersect(anyrange, anyrange) anyrange
+a-ii range_intersect_agg(anymultirange) anymultirange =aggregate_dummy
+a-ii range_intersect_agg(anyrange) anyrange =aggregate_dummy
+f-ii range_intersect_agg_transfn(anyrange, anyrange) anyrange
+f-ii range_le(anyrange, anyrange) bool
+f-ii range_lt(anyrange, anyrange) bool
+f-ii range_merge(anymultirange) anyrange =range_merge_from_multirange
+f-ii range_merge(anyrange, anyrange) anyrange
+f-ii range_minus(anyrange, anyrange) anyrange
+f-ii range_ne(anyrange, anyrange) bool
+f-si range_out(anyrange) cstring
+f-ii range_overlaps(anyrange, anyrange) bool
+f-ii range_overlaps_multirange(anyrange, anymultirange) bool
+f-ii range_overleft(anyrange, anyrange) bool
+f-ii range_overleft_multirange(anyrange, anymultirange) bool
+f-ii range_overright(anyrange, anyrange) bool
+f-ii range_overright_multirange(anyrange, anymultirange) bool
+f-si range_recv(internal, oid, int4) anyrange
+f-si range_send(anyrange) bytea
+f-si range_typanalyze(internal) bool
+f-ii range_union(anyrange, anyrange) anyrange
+f-si rangesel(internal, oid, internal, int4) float8
+w-ii rank() int8 =window_rank
+a-ii rank(variadic any) int8 =aggregate_dummy
+f-ii rank_final(internal, variadic any) int8 =hypothetical_rank_final
+f-ii raw_array_subscript_handler(internal) internal
+f-ii record_eq(record, record) bool
+f-ii record_ge(record, record) bool
+f-ii record_gt(record, record) bool
+f-ii record_image_eq(record, record) bool
+f-ii record_image_ge(record, record) bool
+f-ii record_image_gt(record, record) bool
+f-ii record_image_le(record, record) bool
+f-ii record_image_lt(record, record) bool
+f-ii record_image_ne(record, record) bool
+f-si record_in(cstring, oid, int4) record
+f-ii record_le(record, record) bool
+f-ii record_lt(record, record) bool
+f-ii record_ne(record, record) bool
+f-si record_out(record) cstring
+f-si record_recv(internal, oid, int4) record
+f-si record_send(record) bytea
+f-si regclass(text) regclass =text_regclass
+f-si regclassin(cstring) regclass
+f-si regclassout(regclass) cstring
+f-ii regclassrecv(internal) regclass
+f-ii regclasssend(regclass) bytea
+f-si regcollationin(cstring) regcollation
+f-si regcollationout(regcollation) cstring
+f-ii regcollationrecv(internal) regcollation
+f-ii regcollationsend(regcollation) bytea
+f-si regconfigin(cstring) regconfig
+f-si regconfigout(regconfig) cstring
+f-ii regconfigrecv(internal) regconfig
+f-ii regconfigsend(regconfig) bytea
+f-si regdictionaryin(cstring) regdictionary
+f-si regdictionaryout(regdictionary) cstring
+f-ii regdictionaryrecv(internal) regdictionary
+f-ii regdictionarysend(regdictionary) bytea
+f-si regexeqjoinsel(internal, oid, internal, int2, internal) float8
+f-si regexeqsel(internal, oid, internal, int4) float8
+f-si regexnejoinsel(internal, oid, internal, int2, internal) float8
+f-si regexnesel(internal, oid, internal, int4) float8
+f-ii regexp_count(text, text) int4 =regexp_count_no_start
+f-ii regexp_count(text, text, int4) int4 =regexp_count_no_flags
+f-ii regexp_count(text, text, int4, text) int4
+f-ii regexp_instr(text, text) int4 =regexp_instr_no_start
+f-ii regexp_instr(text, text, int4) int4 =regexp_instr_no_n
+f-ii regexp_instr(text, text, int4, int4) int4 =regexp_instr_no_endoption
+f-ii regexp_instr(text, text, int4, int4, int4) int4 =regexp_instr_no_flags
+f-ii regexp_instr(text, text, int4, int4, int4, text) int4 =regexp_instr_no_subexpr
+f-ii regexp_instr(text, text, int4, int4, int4, text, int4) int4
+f-ii regexp_like(text, text) bool =regexp_like_no_flags
+f-ii regexp_like(text, text, text) bool
+f-ii regexp_match(text, text) _text =regexp_match_no_flags
+f-ii regexp_match(text, text, text) _text
+fsii regexp_matches(text, text) _text =regexp_matches_no_flags
+fsii regexp_matches(text, text, text) _text
+f-ii regexp_replace(text, text, text) text =textregexreplace_noopt
+f-ii regexp_replace(text, text, text, int4) text =textregexreplace_extended_no_n
+f-ii regexp_replace(text, text, text, int4, int4) text =textregexreplace_extended_no_flags
+f-ii regexp_replace(text, text, text, int4, int4, text) text =textregexreplace_extended
+f-ii regexp_replace(text, text, text, text) text =textregexreplace
+f-ii regexp_split_to_array(text, text) _text =regexp_split_to_array_no_flags
+f-ii regexp_split_to_array(text, text, text) _text
+fsii regexp_split_to_table(text, text) text =regexp_split_to_table_no_flags
+fsii regexp_split_to_table(text, text, text) text
+f-ii regexp_substr(text, text) text =regexp_substr_no_start
+f-ii regexp_substr(text, text, int4) text =regexp_substr_no_n
+f-ii regexp_substr(text, text, int4, int4) text =regexp_substr_no_flags
+f-ii regexp_substr(text, text, int4, int4, text) text =regexp_substr_no_subexpr
+f-ii regexp_substr(text, text, int4, int4, text, int4) text
+f-si regnamespacein(cstring) regnamespace
+f-si regnamespaceout(regnamespace) cstring
+f-ii regnamespacerecv(internal) regnamespace
+f-ii regnamespacesend(regnamespace) bytea
+f-si regoperatorin(cstring) regoperator
+f-si regoperatorout(regoperator) cstring
+f-ii regoperatorrecv(internal) regoperator
+f-ii regoperatorsend(regoperator) bytea
+f-si regoperin(cstring) regoper
+f-si regoperout(regoper) cstring
+f-ii regoperrecv(internal) regoper
+f-ii regopersend(regoper) bytea
+f-si regprocedurein(cstring) regprocedure
+f-si regprocedureout(regprocedure) cstring
+f-ii regprocedurerecv(internal) regprocedure
+f-ii regproceduresend(regprocedure) bytea
+f-si regprocin(cstring) regproc
+f-si regprocout(regproc) cstring
+f-ii regprocrecv(internal) regproc
+f-ii regprocsend(regproc) bytea
+a-ii regr_avgx(float8, float8) float8 =aggregate_dummy
+a-ii regr_avgy(float8, float8) float8 =aggregate_dummy
+a-ii regr_count(float8, float8) int8 =aggregate_dummy
+a-ii regr_intercept(float8, float8) float8 =aggregate_dummy
+a-ii regr_r2(float8, float8) float8 =aggregate_dummy
+a-ii regr_slope(float8, float8) float8 =aggregate_dummy
+a-ii regr_sxx(float8, float8) float8 =aggregate_dummy
+a-ii regr_sxy(float8, float8) float8 =aggregate_dummy
+a-ii regr_syy(float8, float8) float8 =aggregate_dummy
+f-si regrolein(cstring) regrole
+f-si regroleout(regrole) cstring
+f-ii regrolerecv(internal) regrole
+f-ii regrolesend(regrole) bytea
+f-si regtypein(cstring) regtype
+f-si regtypeout(regtype) cstring
+f-ii regtyperecv(internal) regtype
+f-ii regtypesend(regtype) bytea
+f-ii repeat(text, int4) text
+f-ii replace(text, text, text) text =replace_text
+f-ii reverse(text) text =text_reverse
+f-ii right(text, int4) text =text_right
+f-ii round(float8) float8 =dround
+f-is round(numeric) numeric
+f-ii round(numeric, int4) numeric =numeric_round
+w-ii row_number() int8 =window_row_number
+f-si row_security_active(oid) bool
+f-si row_security_active(text) bool =row_security_active_name
+f-si row_to_json(record) json
+f-si row_to_json(record, bool) json =row_to_json_pretty
+f-is rpad(text, int4) text
+f-ii rpad(text, int4, text) text
+f-ii rtrim(bytea, bytea) bytea =byteartrim
+f-ii rtrim(text) text =rtrim1
+f-ii rtrim(text, text) text
+f-ii satisfies_hash_partition(oid, int4, int4, variadic any) bool
+f-si scalargejoinsel(internal, oid, internal, int2, internal) float8
+f-si scalargesel(internal, oid, internal, int4) float8
+f-si scalargtjoinsel(internal, oid, internal, int2, internal) float8
+f-si scalargtsel(internal, oid, internal, int4) float8
+f-si scalarlejoinsel(internal, oid, internal, int2, internal) float8
+f-si scalarlesel(internal, oid, internal, int4) float8
+f-si scalarltjoinsel(internal, oid, internal, int2, internal) float8
+f-si scalarltsel(internal, oid, internal, int4) float8
+f-ii scale(numeric) int4 =numeric_scale
+f-si schema_to_xml(schema name, nulls bool, tableforest bool, targetns text) xml
+f-si schema_to_xml_and_xmlschema(schema name, nulls bool, tableforest bool, targetns text) xml
+f-si schema_to_xmlschema(schema name, nulls bool, tableforest bool, targetns text) xml
+f-si session_user() name
+f-ii set_bit(bit, int4, int4) bit =bitsetbit
+f-ii set_bit(bytea, int8, int4) bytea =byteaSetBit
+f-ii set_byte(bytea, int4, int4) bytea =byteaSetByte
+f-vi set_config(text, text, bool) text =set_config_by_name
+f-ii set_masklen(cidr, int4) cidr =cidr_set_masklen
+f-ii set_masklen(inet, int4) inet =inet_set_masklen
+f-vi setseed(float8) void
+f-vi setval(regclass, int8) int8 =setval_oid
+f-vi setval(regclass, int8, bool) int8 =setval3_oid
+f-ii setweight(tsvector, char) tsvector =tsvector_setweight
+f-ii setweight(tsvector, char, _text) tsvector =tsvector_setweight_by_filter
+f-ii sha224(bytea) bytea =sha224_bytea
+f-ii sha256(bytea) bytea =sha256_bytea
+f-ii sha384(bytea) bytea =sha384_bytea
+f-ii sha512(bytea) bytea =sha512_bytea
+f-ii shell_in(cstring) void
+f-ii shell_out(void) cstring
+f-ic shift_jis_2004_to_euc_jis_2004(int4, int4, cstring, internal, int4, bool) int4
+f-ic shift_jis_2004_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ss shobj_description(oid, name) text
+f-ii sign(float8) float8 =dsign
+f-ii sign(numeric) numeric =numeric_sign
+f-ii similar_escape(text, text) text
+f-ii similar_to_escape(text) text =similar_to_escape_1
+f-ii similar_to_escape(text, text) text =similar_to_escape_2
+f-ii sin(float8) float8 =dsin
+f-ii sind(float8) float8 =dsind
+f-ii sinh(float8) float8 =dsinh
+f-ic sjis_to_euc_jp(int4, int4, cstring, internal, int4, bool) int4
+f-ic sjis_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic sjis_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ii slope(point, point) float8 =point_slope
+f-ii spg_bbox_quad_config(internal, internal) void
+f-ii spg_box_quad_choose(internal, internal) void
+f-ii spg_box_quad_config(internal, internal) void
+f-ii spg_box_quad_inner_consistent(internal, internal) void
+f-ii spg_box_quad_leaf_consistent(internal, internal) bool
+f-ii spg_box_quad_picksplit(internal, internal) void
+f-ii spg_kd_choose(internal, internal) void
+f-ii spg_kd_config(internal, internal) void
+f-ii spg_kd_inner_consistent(internal, internal) void
+f-ii spg_kd_picksplit(internal, internal) void
+f-ii spg_poly_quad_compress(polygon) box
+f-ii spg_quad_choose(internal, internal) void
+f-ii spg_quad_config(internal, internal) void
+f-ii spg_quad_inner_consistent(internal, internal) void
+f-ii spg_quad_leaf_consistent(internal, internal) bool
+f-ii spg_quad_picksplit(internal, internal) void
+f-ii spg_range_quad_choose(internal, internal) void
+f-ii spg_range_quad_config(internal, internal) void
+f-ii spg_range_quad_inner_consistent(internal, internal) void
+f-ii spg_range_quad_leaf_consistent(internal, internal) bool
+f-ii spg_range_quad_picksplit(internal, internal) void
+f-ii spg_text_choose(internal, internal) void
+f-ii spg_text_config(internal, internal) void
+f-ii spg_text_inner_consistent(internal, internal) void
+f-ii spg_text_leaf_consistent(internal, internal) bool
+f-ii spg_text_picksplit(internal, internal) void
+f-vi spghandler(internal) index_am_handler
+f-ii split_part(text, text, int4) text
+f-ii sqrt(float8) float8 =dsqrt
+f-ii sqrt(numeric) numeric =numeric_sqrt
+f-ii starts_with(text, text) bool =text_starts_with
+f-si statement_timestamp() timestamptz
+a-ii stddev(float4) float8 =aggregate_dummy
+a-ii stddev(float8) float8 =aggregate_dummy
+a-ii stddev(int2) numeric =aggregate_dummy
+a-ii stddev(int4) numeric =aggregate_dummy
+a-ii stddev(int8) numeric =aggregate_dummy
+a-ii stddev(numeric) numeric =aggregate_dummy
+a-ii stddev_pop(float4) float8 =aggregate_dummy
+a-ii stddev_pop(float8) float8 =aggregate_dummy
+a-ii stddev_pop(int2) numeric =aggregate_dummy
+a-ii stddev_pop(int4) numeric =aggregate_dummy
+a-ii stddev_pop(int8) numeric =aggregate_dummy
+a-ii stddev_pop(numeric) numeric =aggregate_dummy
+a-ii stddev_samp(float4) float8 =aggregate_dummy
+a-ii stddev_samp(float8) float8 =aggregate_dummy
+a-ii stddev_samp(int2) numeric =aggregate_dummy
+a-ii stddev_samp(int4) numeric =aggregate_dummy
+a-ii stddev_samp(int8) numeric =aggregate_dummy
+a-ii stddev_samp(numeric) numeric =aggregate_dummy
+a-ii string_agg(value bytea, delimiter bytea) bytea =aggregate_dummy
+a-ii string_agg(value text, delimiter text) text =aggregate_dummy
+f-ii string_agg_combine(internal, internal) internal
+f-ii string_agg_deserialize(bytea, internal) internal
+f-ii string_agg_finalfn(internal) text
+f-ii string_agg_serialize(internal) bytea
+f-ii string_agg_transfn(internal, text, text) internal
+f-ii string_to_array(text, text) _text =text_to_array
+f-ii string_to_array(text, text, text) _text =text_to_array_null
+fsii string_to_table(text, text) text =text_to_table
+fsii string_to_table(text, text, text) text =text_to_table_null
+f-ii strip(tsvector) tsvector =tsvector_strip
+f-ii strpos(text, text) int4 =textpos
+f-ii substr(bytea, int4) bytea =bytea_substr_no_len
+f-ii substr(bytea, int4, int4) bytea =bytea_substr
+f-ii substr(text, int4) text =text_substr_no_len
+f-ii substr(text, int4, int4) text =text_substr
+f-ii substring(bit, int4) bit =bitsubstr_no_len
+f-ii substring(bit, int4, int4) bit =bitsubstr
+f-ii substring(bytea, int4) bytea =bytea_substr_no_len
+f-ii substring(bytea, int4, int4) bytea =bytea_substr
+f-ii substring(text, int4) text =text_substr_no_len
+f-ii substring(text, int4, int4) text =text_substr
+f-ii substring(text, text) text =textregexsubstr
+f-is substring(text, text, text) text
+a-ii sum(float4) float4 =aggregate_dummy
+a-ii sum(float8) float8 =aggregate_dummy
+a-ii sum(int2) int8 =aggregate_dummy
+a-ii sum(int4) int8 =aggregate_dummy
+a-ii sum(int8) numeric =aggregate_dummy
+a-ii sum(interval) interval =aggregate_dummy
+a-ii sum(money) money =aggregate_dummy
+a-ii sum(numeric) numeric =aggregate_dummy
+f-vi suppress_redundant_updates_trigger() trigger
+f-vi system(internal) tsm_handler =tsm_system_handler
+f-si system_user() text
+f-ii table_am_handler_in(cstring) table_am_handler
+f-ii table_am_handler_out(table_am_handler) cstring
+f-si table_to_xml(tbl regclass, nulls bool, tableforest bool, targetns text) xml
+f-si table_to_xml_and_xmlschema(tbl regclass, nulls bool, tableforest bool, targetns text) xml
+f-si table_to_xmlschema(tbl regclass, nulls bool, tableforest bool, targetns text) xml
+f-ii tan(float8) float8 =dtan
+f-ii tand(float8) float8 =dtand
+f-ii tanh(float8) float8 =dtanh
+f-ii text(bool) text =booltext
+f-ii text(bpchar) text =rtrim1
+f-ii text(char) text =char_text
+f-ii text(inet) text =network_show
+f-ii text(name) text =name_text
+f-ii text(xml) text =xmltotext
+f-ii text_ge(text, text) bool
+f-ii text_gt(text, text) bool
+f-ii text_larger(text, text) text
+f-ii text_le(text, text) bool
+f-ii text_lt(text, text) bool
+f-ii text_pattern_ge(text, text) bool
+f-ii text_pattern_gt(text, text) bool
+f-ii text_pattern_le(text, text) bool
+f-ii text_pattern_lt(text, text) bool
+f-ii text_smaller(text, text) text
+f-ii text_starts_with_support(internal) internal
+f-ss textanycat(text, anynonarray) text
+f-ii textcat(text, text) text
+f-ii texteq(text, text) bool
+f-ii texteqname(text, name) bool
+f-ii textgename(text, name) bool
+f-ii textgtname(text, name) bool
+f-ii texticlike(text, text) bool
+f-ii texticlike_support(internal) internal
+f-ii texticnlike(text, text) bool
+f-ii texticregexeq(text, text) bool
+f-ii texticregexeq_support(internal) internal
+f-ii texticregexne(text, text) bool
+f-ii textin(cstring) text
+f-ii textlen(text) int4
+f-ii textlename(text, name) bool
+f-ii textlike(text, text) bool
+f-ii textlike_support(internal) internal
+f-ii textltname(text, name) bool
+f-ii textne(text, text) bool
+f-ii textnename(text, name) bool
+f-ii textnlike(text, text) bool
+f-ii textout(text) cstring
+f-si textrecv(internal) text
+f-ii textregexeq(text, text) bool
+f-ii textregexeq_support(internal) internal
+f-ii textregexne(text, text) bool
+f-si textsend(text) bytea
+f-ii thesaurus_init(internal) internal
+f-ii thesaurus_lexize(internal, internal, internal, internal) internal
+f-ii tideq(tid, tid) bool
+f-ii tidge(tid, tid) bool
+f-ii tidgt(tid, tid) bool
+f-ii tidin(cstring) tid
+f-ii tidlarger(tid, tid) tid
+f-ii tidle(tid, tid) bool
+f-ii tidlt(tid, tid) bool
+f-ii tidne(tid, tid) bool
+f-ii tidout(tid) cstring
+f-ii tidrecv(internal) tid
+f-ii tidsend(tid) bytea
+f-ii tidsmaller(tid, tid) tid
+f-ii time(interval) time =interval_time
+f-ii time(time, int4) time =time_scale
+f-ii time(timestamp) time =timestamp_time
+f-si time(timestamptz) time =timestamptz_time
+f-ii time(timetz) time =timetz_time
+f-ii time_cmp(time, time) int4
+f-ii time_eq(time, time) bool
+f-ii time_ge(time, time) bool
+f-ii time_gt(time, time) bool
+f-ii time_hash(time) int4
+f-ii time_hash_extended(time, int8) int8
+f-si time_in(cstring, oid, int4) time
+f-ii time_larger(time, time) time
+f-ii time_le(time, time) bool
+f-ii time_lt(time, time) bool
+f-ii time_mi_interval(time, interval) time
+f-ii time_mi_time(time, time) interval
+f-ii time_ne(time, time) bool
+f-ii time_out(time) cstring
+f-ii time_pl_interval(time, interval) time
+f-ii time_recv(internal, oid, int4) time
+f-ii time_send(time) bytea
+f-ii time_smaller(time, time) time
+f-ii time_support(internal) internal
+f-is timedate_pl(time, date) timestamp
+f-vi timeofday() text
+f-ii timestamp(date) timestamp =date_timestamp
+f-ii timestamp(date, time) timestamp =datetime_timestamp
+f-ii timestamp(timestamp, int4) timestamp =timestamp_scale
+f-si timestamp(timestamptz) timestamp =timestamptz_timestamp
+f-ii timestamp_cmp(timestamp, timestamp) int4
+f-ii timestamp_cmp_date(timestamp, date) int4
+f-si timestamp_cmp_timestamptz(timestamp, timestamptz) int4
+f-ii timestamp_eq(timestamp, timestamp) bool
+f-ii timestamp_eq_date(timestamp, date) bool
+f-si timestamp_eq_timestamptz(timestamp, timestamptz) bool
+f-ii timestamp_ge(timestamp, timestamp) bool
+f-ii timestamp_ge_date(timestamp, date) bool
+f-si timestamp_ge_timestamptz(timestamp, timestamptz) bool
+f-ii timestamp_gt(timestamp, timestamp) bool
+f-ii timestamp_gt_date(timestamp, date) bool
+f-si timestamp_gt_timestamptz(timestamp, timestamptz) bool
+f-ii timestamp_hash(timestamp) int4
+f-ii timestamp_hash_extended(timestamp, int8) int8
+f-si timestamp_in(cstring, oid, int4) timestamp
+f-ii timestamp_larger(timestamp, timestamp) timestamp
+f-ii timestamp_le(timestamp, timestamp) bool
+f-ii timestamp_le_date(timestamp, date) bool
+f-si timestamp_le_timestamptz(timestamp, timestamptz) bool
+f-ii timestamp_lt(timestamp, timestamp) bool
+f-ii timestamp_lt_date(timestamp, date) bool
+f-si timestamp_lt_timestamptz(timestamp, timestamptz) bool
+f-ii timestamp_mi(timestamp, timestamp) interval
+f-ii timestamp_mi_interval(timestamp, interval) timestamp
+f-ii timestamp_ne(timestamp, timestamp) bool
+f-ii timestamp_ne_date(timestamp, date) bool
+f-si timestamp_ne_timestamptz(timestamp, timestamptz) bool
+f-si timestamp_out(timestamp) cstring
+f-ii timestamp_pl_interval(timestamp, interval) timestamp
+f-ii timestamp_recv(internal, oid, int4) timestamp
+f-ii timestamp_send(timestamp) bytea
+f-ii timestamp_smaller(timestamp, timestamp) timestamp
+f-ii timestamp_sortsupport(internal) void
+f-ii timestamp_support(internal) internal
+f-ii timestamptypmodin(_cstring) int4
+f-ii timestamptypmodout(int4) cstring
+f-si timestamptz(date) timestamptz =date_timestamptz
+f-ss timestamptz(date, time) timestamptz
+f-ii timestamptz(date, timetz) timestamptz =datetimetz_timestamptz
+f-si timestamptz(timestamp) timestamptz =timestamp_timestamptz
+f-ii timestamptz(timestamptz, int4) timestamptz =timestamptz_scale
+f-ii timestamptz_cmp(timestamptz, timestamptz) int4 =timestamp_cmp
+f-si timestamptz_cmp_date(timestamptz, date) int4
+f-si timestamptz_cmp_timestamp(timestamptz, timestamp) int4
+f-ii timestamptz_eq(timestamptz, timestamptz) bool =timestamp_eq
+f-si timestamptz_eq_date(timestamptz, date) bool
+f-si timestamptz_eq_timestamp(timestamptz, timestamp) bool
+f-ii timestamptz_ge(timestamptz, timestamptz) bool =timestamp_ge
+f-si timestamptz_ge_date(timestamptz, date) bool
+f-si timestamptz_ge_timestamp(timestamptz, timestamp) bool
+f-ii timestamptz_gt(timestamptz, timestamptz) bool =timestamp_gt
+f-si timestamptz_gt_date(timestamptz, date) bool
+f-si timestamptz_gt_timestamp(timestamptz, timestamp) bool
+f-si timestamptz_in(cstring, oid, int4) timestamptz
+f-ii timestamptz_larger(timestamptz, timestamptz) timestamptz =timestamp_larger
+f-ii timestamptz_le(timestamptz, timestamptz) bool =timestamp_le
+f-si timestamptz_le_date(timestamptz, date) bool
+f-si timestamptz_le_timestamp(timestamptz, timestamp) bool
+f-ii timestamptz_lt(timestamptz, timestamptz) bool =timestamp_lt
+f-si timestamptz_lt_date(timestamptz, date) bool
+f-si timestamptz_lt_timestamp(timestamptz, timestamp) bool
+f-ii timestamptz_mi(timestamptz, timestamptz) interval =timestamp_mi
+f-si timestamptz_mi_interval(timestamptz, interval) timestamptz
+f-ii timestamptz_ne(timestamptz, timestamptz) bool =timestamp_ne
+f-si timestamptz_ne_date(timestamptz, date) bool
+f-si timestamptz_ne_timestamp(timestamptz, timestamp) bool
+f-si timestamptz_out(timestamptz) cstring
+f-si timestamptz_pl_interval(timestamptz, interval) timestamptz
+f-ii timestamptz_recv(internal, oid, int4) timestamptz
+f-ii timestamptz_send(timestamptz) bytea
+f-ii timestamptz_smaller(timestamptz, timestamptz) timestamptz =timestamp_smaller
+f-ii timestamptztypmodin(_cstring) int4
+f-ii timestamptztypmodout(int4) cstring
+f-ii timetypmodin(_cstring) int4
+f-ii timetypmodout(int4) cstring
+f-si timetz(time) timetz =time_timetz
+f-si timetz(timestamptz) timetz =timestamptz_timetz
+f-ii timetz(timetz, int4) timetz =timetz_scale
+f-ii timetz_cmp(timetz, timetz) int4
+f-ii timetz_eq(timetz, timetz) bool
+f-ii timetz_ge(timetz, timetz) bool
+f-ii timetz_gt(timetz, timetz) bool
+f-ii timetz_hash(timetz) int4
+f-ii timetz_hash_extended(timetz, int8) int8
+f-si timetz_in(cstring, oid, int4) timetz
+f-ii timetz_larger(timetz, timetz) timetz
+f-ii timetz_le(timetz, timetz) bool
+f-ii timetz_lt(timetz, timetz) bool
+f-ii timetz_mi_interval(timetz, interval) timetz
+f-ii timetz_ne(timetz, timetz) bool
+f-ii timetz_out(timetz) cstring
+f-ii timetz_pl_interval(timetz, interval) timetz
+f-ii timetz_recv(internal, oid, int4) timetz
+f-ii timetz_send(timetz) bytea
+f-ii timetz_smaller(timetz, timetz) timetz
+f-is timetzdate_pl(timetz, date) timestamptz
+f-ii timetztypmodin(_cstring) int4
+f-ii timetztypmodout(int4) cstring
+f-ii timezone(interval, timestamp) timestamptz =timestamp_izone
+f-ii timezone(interval, timestamptz) timestamp =timestamptz_izone
+f-ii timezone(interval, timetz) timetz =timetz_izone
+f-ii timezone(text, timestamp) timestamptz =timestamp_zone
+f-ii timezone(text, timestamptz) timestamp =timestamptz_zone
+f-si timezone(text, timetz) timetz =timetz_zone
+f-si timezone(timestamp) timestamptz =timestamp_at_local
+f-si timezone(timestamptz) timestamp =timestamptz_at_local
+f-si timezone(timetz) timetz =timetz_at_local
+f-ii to_ascii(text) text =to_ascii_default
+f-ii to_ascii(text, int4) text =to_ascii_enc
+f-ii to_ascii(text, name) text =to_ascii_encname
+f-ii to_bin(int4) text =to_bin32
+f-ii to_bin(int8) text =to_bin64
+f-si to_char(float4, text) text =float4_to_char
+f-si to_char(float8, text) text =float8_to_char
+f-si to_char(int4, text) text =int4_to_char
+f-si to_char(int8, text) text =int8_to_char
+f-si to_char(interval, text) text =interval_to_char
+f-si to_char(numeric, text) text =numeric_to_char
+f-si to_char(timestamp, text) text =timestamp_to_char
+f-si to_char(timestamptz, text) text =timestamptz_to_char
+f-si to_date(text, text) date
+f-ii to_hex(int4) text =to_hex32
+f-ii to_hex(int8) text =to_hex64
+f-si to_json(anyelement) json
+f-si to_jsonb(anyelement) jsonb
+f-si to_number(text, text) numeric =numeric_to_number
+f-ii to_oct(int4) text =to_oct32
+f-ii to_oct(int8) text =to_oct64
+f-si to_regclass(text) regclass
+f-si to_regcollation(text) regcollation
+f-si to_regnamespace(text) regnamespace
+f-si to_regoper(text) regoper
+f-si to_regoperator(text) regoperator
+f-si to_regproc(text) regproc
+f-si to_regprocedure(text) regprocedure
+f-si to_regrole(text) regrole
+f-si to_regtype(text) regtype
+f-si to_regtypemod(text) int4
+f-ii to_timestamp(float8) timestamptz =float8_timestamptz
+f-si to_timestamp(text, text) timestamptz
+f-ii to_tsquery(regconfig, text) tsquery =to_tsquery_byid
+f-si to_tsquery(text) tsquery
+f-si to_tsvector(json) tsvector =json_string_to_tsvector
+f-si to_tsvector(jsonb) tsvector =jsonb_string_to_tsvector
+f-ii to_tsvector(regconfig, json) tsvector =json_string_to_tsvector_byid
+f-ii to_tsvector(regconfig, jsonb) tsvector =jsonb_string_to_tsvector_byid
+f-ii to_tsvector(regconfig, text) tsvector =to_tsvector_byid
+f-si to_tsvector(text) tsvector
+f-si transaction_timestamp() timestamptz =now
+f-ii translate(text, text, text) text
+f-ii trigger_in(cstring) trigger
+f-ii trigger_out(trigger) cstring
+f-ii trim_array(anyarray, int4) anyarray
+f-ii trim_scale(numeric) numeric =numeric_trim_scale
+f-ii trunc(float8) float8 =dtrunc
+f-ii trunc(macaddr) macaddr =macaddr_trunc
+f-ii trunc(macaddr8) macaddr8 =macaddr8_trunc
+f-is trunc(numeric) numeric
+f-ii trunc(numeric, int4) numeric =numeric_trunc
+fsss ts_debug(config regconfig, document text) record
+fsss ts_debug(document text) record
+f-ii ts_delete(tsvector, _text) tsvector =tsvector_delete_arr
+f-ii ts_delete(tsvector, text) tsvector =tsvector_delete_str
+f-ii ts_filter(tsvector, _char) tsvector =tsvector_filter
+f-si ts_headline(json, tsquery) json =ts_headline_json
+f-si ts_headline(json, tsquery, text) json =ts_headline_json_opt
+f-si ts_headline(jsonb, tsquery) jsonb =ts_headline_jsonb
+f-si ts_headline(jsonb, tsquery, text) jsonb =ts_headline_jsonb_opt
+f-ii ts_headline(regconfig, json, tsquery) json =ts_headline_json_byid
+f-ii ts_headline(regconfig, json, tsquery, text) json =ts_headline_json_byid_opt
+f-ii ts_headline(regconfig, jsonb, tsquery) jsonb =ts_headline_jsonb_byid
+f-ii ts_headline(regconfig, jsonb, tsquery, text) jsonb =ts_headline_jsonb_byid_opt
+f-ii ts_headline(regconfig, text, tsquery) text =ts_headline_byid
+f-ii ts_headline(regconfig, text, tsquery, text) text =ts_headline_byid_opt
+f-si ts_headline(text, tsquery) text
+f-si ts_headline(text, tsquery, text) text =ts_headline_opt
+f-ii ts_lexize(regdictionary, text) _text
+f-ii ts_match_qv(tsquery, tsvector) bool
+f-si ts_match_tq(text, tsquery) bool
+f-si ts_match_tt(text, text) bool
+f-ii ts_match_vq(tsvector, tsquery) bool
+fssi ts_parse(parser_name text, txt text) record =ts_parse_byname
+fsii ts_parse(parser_oid oid, txt text) record =ts_parse_byid
+f-ii ts_rank(_float4, tsvector, tsquery) float4 =ts_rank_wtt
+f-ii ts_rank(_float4, tsvector, tsquery, int4) float4 =ts_rank_wttf
+f-ii ts_rank(tsvector, tsquery) float4 =ts_rank_tt
+f-ii ts_rank(tsvector, tsquery, int4) float4 =ts_rank_ttf
+f-ii ts_rank_cd(_float4, tsvector, tsquery) float4 =ts_rankcd_wtt
+f-ii ts_rank_cd(_float4, tsvector, tsquery, int4) float4 =ts_rankcd_wttf
+f-ii ts_rank_cd(tsvector, tsquery) float4 =ts_rankcd_tt
+f-ii ts_rank_cd(tsvector, tsquery, int4) float4 =ts_rankcd_ttf
+f-vi ts_rewrite(tsquery, text) tsquery =tsquery_rewrite_query
+f-ii ts_rewrite(tsquery, tsquery, tsquery) tsquery =tsquery_rewrite
+fsvi ts_stat(query text) record =ts_stat1
+fsvi ts_stat(query text, weights text) record =ts_stat2
+fssi ts_token_type(parser_name text) record =ts_token_type_byname
+fsii ts_token_type(parser_oid oid) record =ts_token_type_byid
+f-si ts_typanalyze(internal) bool
+f-ii tsm_handler_in(cstring) tsm_handler
+f-ii tsm_handler_out(tsm_handler) cstring
+f-si tsmatchjoinsel(internal, oid, internal, int2, internal) float8
+f-si tsmatchsel(internal, oid, internal, int4) float8
+f-ii tsmultirange() tsmultirange =multirange_constructor0
+f-ii tsmultirange(tsrange) tsmultirange =multirange_constructor1
+f-ii tsmultirange(variadic _tsrange) tsmultirange =multirange_constructor2
+f-ii tsq_mcontained(tsquery, tsquery) bool
+f-ii tsq_mcontains(tsquery, tsquery) bool
+f-ii tsquery_and(tsquery, tsquery) tsquery
+f-ii tsquery_cmp(tsquery, tsquery) int4
+f-ii tsquery_eq(tsquery, tsquery) bool
+f-ii tsquery_ge(tsquery, tsquery) bool
+f-ii tsquery_gt(tsquery, tsquery) bool
+f-ii tsquery_le(tsquery, tsquery) bool
+f-ii tsquery_lt(tsquery, tsquery) bool
+f-ii tsquery_ne(tsquery, tsquery) bool
+f-ii tsquery_not(tsquery) tsquery
+f-ii tsquery_or(tsquery, tsquery) tsquery
+f-ii tsquery_phrase(tsquery, tsquery) tsquery
+f-ii tsquery_phrase(tsquery, tsquery, int4) tsquery =tsquery_phrase_distance
+f-ii tsqueryin(cstring) tsquery
+f-ii tsqueryout(tsquery) cstring
+f-ii tsqueryrecv(internal) tsquery
+f-ii tsquerysend(tsquery) bytea
+f-ii tsrange(timestamp, timestamp) tsrange =range_constructor2
+f-ii tsrange(timestamp, timestamp, text) tsrange =range_constructor3
+f-ii tsrange_subdiff(timestamp, timestamp) float8
+f-ii tstzmultirange() tstzmultirange =multirange_constructor0
+f-ii tstzmultirange(tstzrange) tstzmultirange =multirange_constructor1
+f-ii tstzmultirange(variadic _tstzrange) tstzmultirange =multirange_constructor2
+f-ii tstzrange(timestamptz, timestamptz) tstzrange =range_constructor2
+f-ii tstzrange(timestamptz, timestamptz, text) tstzrange =range_constructor3
+f-ii tstzrange_subdiff(timestamptz, timestamptz) float8
+f-ii tsvector_cmp(tsvector, tsvector) int4
+f-ii tsvector_concat(tsvector, tsvector) tsvector
+f-ii tsvector_eq(tsvector, tsvector) bool
+f-ii tsvector_ge(tsvector, tsvector) bool
+f-ii tsvector_gt(tsvector, tsvector) bool
+f-ii tsvector_le(tsvector, tsvector) bool
+f-ii tsvector_lt(tsvector, tsvector) bool
+f-ii tsvector_ne(tsvector, tsvector) bool
+f-ii tsvector_to_array(tsvector) _text
+f-vi tsvector_update_trigger() trigger =tsvector_update_trigger_byid
+f-vi tsvector_update_trigger_column() trigger =tsvector_update_trigger_bycolumn
+f-ii tsvectorin(cstring) tsvector
+f-ii tsvectorout(tsvector) cstring
+f-ii tsvectorrecv(internal) tsvector
+f-ii tsvectorsend(tsvector) bytea
+f-si txid_current() int8 =pg_current_xact_id
+f-si txid_current_if_assigned() int8 =pg_current_xact_id_if_assigned
+f-si txid_current_snapshot() txid_snapshot =pg_current_snapshot
+f-ii txid_snapshot_in(cstring) txid_snapshot =pg_snapshot_in
+f-ii txid_snapshot_out(txid_snapshot) cstring =pg_snapshot_out
+f-ii txid_snapshot_recv(internal) txid_snapshot =pg_snapshot_recv
+f-ii txid_snapshot_send(txid_snapshot) bytea =pg_snapshot_send
+fsii txid_snapshot_xip(txid_snapshot) int8 =pg_snapshot_xip
+f-ii txid_snapshot_xmax(txid_snapshot) int8 =pg_snapshot_xmax
+f-ii txid_snapshot_xmin(txid_snapshot) int8 =pg_snapshot_xmin
+f-vi txid_status(int8) text =pg_xact_status
+f-ii txid_visible_in_snapshot(int8, txid_snapshot) bool =pg_visible_in_snapshot
+f-ic uhc_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ii unicode_assigned(text) bool
+f-ii unicode_version() text
+f-vi unique_key_recheck() trigger
+f-ii unistr(text) text
+f-ii unknownin(cstring) unknown
+f-ii unknownout(unknown) cstring
+f-ii unknownrecv(internal) unknown
+f-ii unknownsend(unknown) bytea
+fsii unnest(anyarray) anyelement =array_unnest
+fsii unnest(anymultirange) anyrange =multirange_unnest
+fsii unnest(tsvector tsvector) record =tsvector_unnest
+f-ii upper(anymultirange) anyelement =multirange_upper
+f-ii upper(anyrange) anyelement =range_upper
+f-ii upper(text) text
+f-ii upper_inc(anymultirange) bool =multirange_upper_inc
+f-ii upper_inc(anyrange) bool =range_upper_inc
+f-ii upper_inf(anymultirange) bool =multirange_upper_inf
+f-ii upper_inf(anyrange) bool =range_upper_inf
+f-ic utf8_to_big5(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_euc_cn(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_euc_jis_2004(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_euc_jp(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_euc_kr(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_euc_tw(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_gb18030(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_gbk(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_iso8859(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_iso8859_1(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_johab(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_koi8r(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_koi8u(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_shift_jis_2004(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_sjis(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_uhc(int4, int4, cstring, internal, int4, bool) int4
+f-ic utf8_to_win(int4, int4, cstring, internal, int4, bool) int4
+f-ii uuid_cmp(uuid, uuid) int4
+f-ii uuid_eq(uuid, uuid) bool
+f-ii uuid_extract_timestamp(uuid) timestamptz
+f-ii uuid_extract_version(uuid) int2
+f-ii uuid_ge(uuid, uuid) bool
+f-ii uuid_gt(uuid, uuid) bool
+f-ii uuid_hash(uuid) int4
+f-ii uuid_hash_extended(uuid, int8) int8
+f-ii uuid_in(cstring) uuid
+f-ii uuid_le(uuid, uuid) bool
+f-ii uuid_lt(uuid, uuid) bool
+f-ii uuid_ne(uuid, uuid) bool
+f-ii uuid_out(uuid) cstring
+f-ii uuid_recv(internal) uuid
+f-ii uuid_send(uuid) bytea
+f-ii uuid_sortsupport(internal) void
+a-ii var_pop(float4) float8 =aggregate_dummy
+a-ii var_pop(float8) float8 =aggregate_dummy
+a-ii var_pop(int2) numeric =aggregate_dummy
+a-ii var_pop(int4) numeric =aggregate_dummy
+a-ii var_pop(int8) numeric =aggregate_dummy
+a-ii var_pop(numeric) numeric =aggregate_dummy
+a-ii var_samp(float4) float8 =aggregate_dummy
+a-ii var_samp(float8) float8 =aggregate_dummy
+a-ii var_samp(int2) numeric =aggregate_dummy
+a-ii var_samp(int4) numeric =aggregate_dummy
+a-ii var_samp(int8) numeric =aggregate_dummy
+a-ii var_samp(numeric) numeric =aggregate_dummy
+f-ii varbit(varbit, int4, bool) varbit
+f-ii varbit_in(cstring, oid, int4) varbit
+f-ii varbit_out(varbit) cstring
+f-ii varbit_recv(internal, oid, int4) varbit
+f-ii varbit_send(varbit) bytea
+f-ii varbit_support(internal) internal
+f-ii varbitcmp(varbit, varbit) int4 =bitcmp
+f-ii varbiteq(varbit, varbit) bool =biteq
+f-ii varbitge(varbit, varbit) bool =bitge
+f-ii varbitgt(varbit, varbit) bool =bitgt
+f-ii varbitle(varbit, varbit) bool =bitle
+f-ii varbitlt(varbit, varbit) bool =bitlt
+f-ii varbitne(varbit, varbit) bool =bitne
+f-ii varbittypmodin(_cstring) int4
+f-ii varbittypmodout(int4) cstring
+f-ii varchar(name) varchar =name_text
+f-ii varchar(varchar, int4, bool) varchar
+f-ii varchar_support(internal) internal
+f-ii varcharin(cstring, oid, int4) varchar
+f-ii varcharout(varchar) cstring
+f-si varcharrecv(internal, oid, int4) varchar
+f-si varcharsend(varchar) bytea
+f-ii varchartypmodin(_cstring) int4
+f-ii varchartypmodout(int4) cstring
+a-ii variance(float4) float8 =aggregate_dummy
+a-ii variance(float8) float8 =aggregate_dummy
+a-ii variance(int2) numeric =aggregate_dummy
+a-ii variance(int4) numeric =aggregate_dummy
+a-ii variance(int8) numeric =aggregate_dummy
+a-ii variance(numeric) numeric =aggregate_dummy
+f-si version() text =pgsql_version
+f-ii void_in(cstring) void
+f-ii void_out(void) cstring
+f-ii void_recv(internal) void
+f-ii void_send(void) bytea
+f-ii websearch_to_tsquery(regconfig, text) tsquery =websearch_to_tsquery_byid
+f-si websearch_to_tsquery(text) tsquery
+f-ii width(box) float8 =box_width
+f-ii width_bucket(anycompatible, anycompatiblearray) int4 =width_bucket_array
+f-ii width_bucket(float8, float8, float8, int4) int4 =width_bucket_float8
+f-ii width_bucket(numeric, numeric, numeric, int4) int4 =width_bucket_numeric
+f-ic win1250_to_latin2(int4, int4, cstring, internal, int4, bool) int4
+f-ic win1250_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic win1251_to_iso(int4, int4, cstring, internal, int4, bool) int4
+f-ic win1251_to_koi8r(int4, int4, cstring, internal, int4, bool) int4
+f-ic win1251_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic win1251_to_win866(int4, int4, cstring, internal, int4, bool) int4
+f-ic win866_to_iso(int4, int4, cstring, internal, int4, bool) int4
+f-ic win866_to_koi8r(int4, int4, cstring, internal, int4, bool) int4
+f-ic win866_to_mic(int4, int4, cstring, internal, int4, bool) int4
+f-ic win866_to_win1251(int4, int4, cstring, internal, int4, bool) int4
+f-ic win_to_utf8(int4, int4, cstring, internal, int4, bool) int4
+f-ii window_cume_dist_support(internal) internal
+f-ii window_dense_rank_support(internal) internal
+f-ii window_ntile_support(internal) internal
+f-ii window_percent_rank_support(internal) internal
+f-ii window_rank_support(internal) internal
+f-ii window_row_number_support(internal) internal
+f-ii xid(xid8) xid =xid8toxid
+f-ii xid8_larger(xid8, xid8) xid8
+f-ii xid8_smaller(xid8, xid8) xid8
+f-ii xid8cmp(xid8, xid8) int4
+f-ii xid8eq(xid8, xid8) bool
+f-ii xid8ge(xid8, xid8) bool
+f-ii xid8gt(xid8, xid8) bool
+f-ii xid8in(cstring) xid8
+f-ii xid8le(xid8, xid8) bool
+f-ii xid8lt(xid8, xid8) bool
+f-ii xid8ne(xid8, xid8) bool
+f-ii xid8out(xid8) cstring
+f-ii xid8recv(internal) xid8
+f-ii xid8send(xid8) bytea
+f-ii xideq(xid, xid) bool
+f-ii xideqint4(xid, int4) bool =xideq
+f-ii xidin(cstring) xid
+f-ii xidneq(xid, xid) bool
+f-ii xidneqint4(xid, int4) bool =xidneq
+f-ii xidout(xid) cstring
+f-ii xidrecv(internal) xid
+f-ii xidsend(xid) bytea
+f-si xml(text) xml =texttoxml
+f-si xml_in(cstring) xml
+f-si xml_is_well_formed(text) bool
+f-ii xml_is_well_formed_content(text) bool
+f-ii xml_is_well_formed_document(text) bool
+f-ii xml_out(xml) cstring
+f-si xml_recv(internal) xml
+f-si xml_send(xml) bytea
+a-ii xmlagg(xml) xml =aggregate_dummy
+f-ii xmlcomment(text) xml
+f-ii xmlconcat2(xml, xml) xml
+f-ii xmlexists(text, xml) bool
+f-ii xmltext(text) xml
+f-ii xmlvalidate(xml, text) bool
+f-is xpath(text, xml) _xml
+f-ii xpath(text, xml, _text) _xml
+f-is xpath_exists(text, xml) bool
+f-ii xpath_exists(text, xml, _text) bool
