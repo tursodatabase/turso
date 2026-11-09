@@ -1,3 +1,17 @@
+//! Native MVCC frame parsing and body-chunk decryption.
+//!
+//! This codec checks framing and CRCs and verifies the native AEAD tags on
+//! encrypted body chunks. It does not authenticate the complete frame or log.
+//! Native log versions 2 and 3 bind the salt, operation count, commit timestamp,
+//! chunk index, and final total body length. They do not bind the source offset,
+//! previous frame, or full transaction header, including the extension/recovery
+//! split. A writer to storage can drop, replay, or reorder frames and recompute
+//! the unkeyed CRC chain, or move the extension boundary without changing the
+//! combined body length. Successful decoding does not rule out those changes.
+//!
+//! Authenticating frame order and all header fields requires a new native log
+//! version, with explicit compatibility for existing logs and recovery readers.
+
 use super::{
     build_encrypted_chunk_aad, derive_initial_crc, encrypted_payload_blob_size,
     encrypted_payload_chunk_count, EncryptionContext, LogHeader, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
@@ -171,7 +185,9 @@ impl ValidatedFrame<'_> {
     }
 }
 
-/// Validate exactly one stored frame. The caller must bound `stored` to the selected source range.
+/// Check one stored frame's layout, CRC, and encrypted body-chunk tags.
+/// The caller must bound `stored` to the selected source range. `source_start`
+/// checks bounds and determines the returned end offset; it is not authenticated.
 pub fn validate_frame_into<'a>(
     log: &ValidatedLogHeader,
     source_start: u64,

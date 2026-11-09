@@ -59,6 +59,10 @@
 //! ciphertext as AEAD additional data, so tampering with them will cause
 //! decryption to fail. The CRC in the trailer covers the TX header and the body
 //! as written on disk (i.e. the ciphertext when encrypted).
+//! The CRC is not keyed. Frame position/order and the full transaction header,
+//! including the extension/recovery split, are not authenticated. An attacker
+//! able to rewrite storage can rearrange complete frames and recompute CRCs.
+//! Body-chunk tag verification does not provide whole-log tamper detection.
 //!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
