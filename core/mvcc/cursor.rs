@@ -1288,15 +1288,25 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
+                    // An exact rowid seek has at most one B-tree match: once that row is shadowed,
+                    // or the row reached is past it, the B-tree holds no visible match, and
+                    // advancing would walk every shadowed row after it.
+                    let exact_target = match (op.eq_only(), &seek_key) {
+                        (true, SeekKey::TableRowId(target)) => Some(RowKey::Int(*target)),
+                        _ => None,
+                    };
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k)? => {
+                        Some(k)
+                            if exact_target.as_ref().is_none_or(|target| *target == k)
+                                && self.query_btree_version_is_valid(&k)? =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
                             };
                             return Ok(IOResult::Done(()));
                         }
-                        Some(_) => {
+                        Some(_) if exact_target.is_none() => {
                             // shadowed by MVCC, continue to next
                             self.state.replace(MvccLazyCursorState::Seek(
                                 SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
@@ -1304,7 +1314,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             ));
                             inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                         }
-                        None => {
+                        _ => {
                             self.dual_peek.btree_peek = CursorPeek::Exhausted;
                             return Ok(IOResult::Done(()));
                         }

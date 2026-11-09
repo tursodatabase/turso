@@ -37,8 +37,9 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
     io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
-    QueryMode, SqliteDialect, Statement, Value,
+    QueryMode, Statement, Value,
 };
+use turso_sqlite::SqliteDialect;
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -1283,7 +1284,7 @@ impl Limbo {
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_truncation_indicator("…")
-            .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+            .load_preset("││──├─┼┤│    ┬┴┌┐└┘");
 
         if num_columns > 0 {
             let header = column_names
@@ -2233,7 +2234,7 @@ impl Limbo {
     }
 }
 
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {

@@ -143,10 +143,14 @@ public class SqliteParameter : DbParameter
 
     internal bool HasValue => _hasValue;
 
-    internal TursoValue ToTursoValue()
+    // An untyped Guid binds as 36-character TEXT, as in Microsoft.Data.Sqlite, unless the connection
+    // sets BinaryGUID=True. An explicit SqliteType or DbType wins either way.
+    internal TursoValue ToTursoValue(bool binaryGuid = false)
     {
         if (Value is null || Value == DBNull.Value)
             return TursoValue.Null();
+        if (Value is Guid guid && _sqliteType is null && binaryGuid)
+            return TursoValue.Blob(guid.ToByteArray());
 
         return SqliteType switch
         {
@@ -158,9 +162,9 @@ public class SqliteParameter : DbParameter
         };
     }
 
-    internal global::Turso.TursoParameter ToManagedParameter(string parameterName)
+    internal global::Turso.TursoParameter ToManagedParameter(string parameterName, bool binaryGuid = false)
     {
-        var value = ToTursoValue();
+        var value = ToTursoValue(binaryGuid);
         return new global::Turso.TursoParameter(parameterName, value.ValueType switch
         {
             TursoValueType.Null or TursoValueType.Empty => DBNull.Value,

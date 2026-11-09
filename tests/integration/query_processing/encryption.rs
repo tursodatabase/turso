@@ -5,11 +5,11 @@ use crate::common::{
 use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::sync::Arc;
-use turso_core::SqliteDialect;
 use turso_core::{
     CipherMode, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags,
     PlatformIO, Row, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 const ENABLE_ENCRYPTION: bool = true;
 

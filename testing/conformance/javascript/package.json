@@ -22,6 +22,6 @@
     "@libsql/client": "^0.15.15"
   },
   "overrides": {
-    "minimatch": "^11.0.4"
+    "glob@>=10 <14": "^14.0.3"
   }
 }

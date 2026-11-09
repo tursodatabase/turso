@@ -411,10 +411,40 @@ pub struct IvmSumFinalizeData {
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
     pub reg: usize,
-    pub element_affinity: Affinity,
+    /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
-    pub table_name: Arc<str>,
-    pub col_name: Arc<str>,
+    pub element_kind: crate::types::StrictType,
+    /// The number of dimensions of the array: 2 for INTEGER[][].
+    pub dimensions: u32,
+    pub target: ArrayEncodeTarget,
+}
+
+/// Where the array an ArrayEncode builds goes, which its error for a value
+/// that is not an array names.
+#[derive(Debug, Clone)]
+pub enum ArrayEncodeTarget {
+    /// Column `col_name` of table `table_name`.
+    Column {
+        table_name: Arc<str>,
+        col_name: Arc<str>,
+    },
+    /// The result of a CAST to an array type.
+    Cast,
+    /// The key of an index lookup on an array column.
+    IndexKey,
+}
+
+impl std::fmt::Display for ArrayEncodeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column {
+                table_name,
+                col_name,
+            } => write!(f, "column {table_name}.{col_name}"),
+            Self::Cast => write!(f, "a cast"),
+            Self::IndexKey => write!(f, "an index key"),
+        }
+    }
 }
 
 /// Data for HashDistinct instruction (boxed to keep Insn small).
@@ -465,12 +495,17 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+    pub fn unique_index(table: &BTreeTable, index: &Index, regs: Vec<usize>) -> Self {
+        let kind = if table.is_primary_key_index(index) {
+            crate::ConstraintKind::PrimaryKey
+        } else {
+            crate::ConstraintKind::Unique
+        };
         Self {
-            kind: crate::ConstraintKind::Unique,
+            kind,
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
-            table_name: table.to_string(),
+            table_name: table.name.clone(),
             column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
             violation_regs: regs,
             row_col_names: vec![],
@@ -971,6 +1006,15 @@ pub enum Insn {
         table_reference: Arc<BTreeTable>, // P4
     },
 
+    /// Converts the value in `reg` as a STRICT column storing `storage_class`
+    /// does, and fails with "cannot store <kind> value <description>" when it
+    /// can't: '5' becomes 5 for INTEGER, 'abc' is an error. NULL is left as it is.
+    ConvertToType {
+        reg: usize,
+        storage_class: crate::types::StorageClass,
+        description: String,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -1010,14 +1054,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Create an array from contiguous registers (dynamic count).
-    /// Like MakeArray but count is read from count_reg at runtime.
-    MakeArrayDynamic {
-        start_reg: usize,
-        count_reg: usize,
-        dest: usize,
-    },
-
     /// Extract a field from a struct blob by field index.
     /// If src_reg is NULL, dest = NULL.
     StructField {
@@ -1051,16 +1087,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Copy a register value to a dynamically-computed destination.
-    /// ```text
-    /// dest = registers[base + registers[offset_reg]]
-    /// registers[base + registers[offset_reg]] = registers[src]
-    /// ```
-    RegCopyOffset {
-        src: usize,
-        base: usize,
-        offset_reg: usize,
-    },
     /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
     /// of the cursor's current table row into `dest` (as a blob), following overflow
     /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
@@ -1908,6 +1934,23 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
+    /// Add a role to the in-memory role catalog after its row was inserted
+    AddRole {
+        db: usize,
+        /// Register holding the rowid of the role in the roles table
+        id_reg: usize,
+        name: String,
+        superuser: bool,
+    },
+    /// Tell the dialect that a relation of database `db` changed, after the
+    /// statement wrote the dialect's own schema state for it, so the
+    /// in-memory copy follows. `value_regs` name the registers the dialect
+    /// reads back, such as the id its state gave a created relation.
+    RelationChange {
+        db: usize,
+        change: Box<crate::dialect::RelationChange>,
+        value_regs: Vec<usize>,
+    },
 
     /// Close a cursor.
     Close {
@@ -2452,17 +2495,16 @@ impl InsnVariants {
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::ConvertToType => execute::op_convert_to_type,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
-            InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
             InsnVariants::StructField => execute::op_struct_field,
             InsnVariants::UnionPack => execute::op_union_pack,
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
-            InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::BlobRead => execute::op_blob_read,
             InsnVariants::BlobWrite => execute::op_blob_write,
             InsnVariants::BlobLen => execute::op_blob_len,
@@ -2562,6 +2604,8 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::RelationChange => execute::op_relation_change,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2708,6 +2752,8 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
+            | Self::AddRole { .. }
+            | Self::RelationChange { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

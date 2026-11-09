@@ -1,7 +1,11 @@
 use crate::alloc::TursoIteratorExt;
-use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
+use crate::dialect::{NewOwner, RelationChange};
+use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::RelationKind;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::types::StrictType;
+use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -12,8 +16,8 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        validate_check_expr, validate_default_expr, validate_generated_function_calls,
-        SQLITE_TABLEID,
+        self, check_column_type, validate_check_expr, validate_default_expr,
+        validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
@@ -27,8 +31,8 @@ use crate::{
         collate::key_collation,
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{
-            emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-            NoConstantOptReason, WalkControl,
+            emit_stored_column, expr_type::column_type, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, NoConstantOptReason, WalkControl,
         },
         index::expression_type_ordering,
         plan::{
@@ -38,8 +42,8 @@ use crate::{
         trigger::create_trigger_to_sql,
     },
     util::{
-        check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
-        normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        check_expr_references_column, escape_sql_string_literal, normalize_ident,
+        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
         rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -57,9 +61,14 @@ fn validate(
     alter_table: &ast::AlterTableBody,
     table_name: &str,
     supports_namespaces: bool,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    // Check if someone is trying to ALTER a system table
-    if crate::schema::is_system_table(table_name) {
+    // Only the engine's own statements, which run nested, may alter a system
+    // table, as a frontend does to add a column to its catalog table.
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && crate::schema::is_system_table(table_name)
+    {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
@@ -375,51 +384,6 @@ fn emit_rename_sqlite_sequence_entry(
     });
 }
 
-fn emit_delete_sqlite_sequence_entry(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    table_name_norm: &str,
-) {
-    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
-    }) else {
-        return;
-    };
-
-    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
-    let sequence_name_reg = program.alloc_register();
-    let row_name_to_delete_reg = program.emit_string8_new_reg(table_name_norm.to_string());
-    program.mark_last_insn_constant();
-
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: seq_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
-        db: database_id,
-    });
-
-    program.cursor_loop(seq_cursor_id, |program, _rowid| {
-        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
-
-        let continue_loop_label = program.allocate_label();
-        program.emit_insn(Insn::Ne {
-            lhs: sequence_name_reg,
-            rhs: row_name_to_delete_reg,
-            target_pc: continue_loop_label,
-            flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::for_internal_values(),
-        });
-
-        program.emit_insn(Insn::Delete {
-            cursor_id: seq_cursor_id,
-            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-            is_part_of_update: false,
-        });
-
-        program.preassign_label_to_next_insn(continue_loop_label);
-    });
-}
-
 pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
@@ -541,43 +505,85 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
     Ok(!ok)
 }
 
-fn emit_add_column_default_type_validation(
+/// Fails the ALTER with `message` when the table has rows.
+fn emit_halt_if_table_has_rows(
     program: &mut ProgramBuilder,
     original_btree: &Arc<BTreeTable>,
     database_id: usize,
+    message: &str,
 ) -> Result<()> {
-    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    emit_if_table_has_rows(program, original_btree, database_id, |program| {
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: 1,
+            description: message.to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        Ok(())
+    })
+}
+
+/// Existing rows read the DEFAULT of a column added with a custom type as the
+/// type stores it, so when the table has rows, encode the default once here
+/// and discard it: a default the type can't store fails the ALTER instead of
+/// every later read.
+fn emit_add_column_custom_type_default_check(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    database_id: usize,
+    column: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    // Without a DEFAULT existing rows read NULL, which no type encodes; a
+    // plain type's DEFAULT is checked by default_type_mismatch.
+    let custom_type = resolver
+        .schema()
+        .resolve_type(&column.ty_str, original_btree.is_strict)?;
+    if let (Some(default_expr), Some(_)) = (column.default.as_ref(), custom_type) {
+        emit_if_table_has_rows(program, original_btree, database_id, |program| {
+            let default_reg = program.alloc_register();
+            crate::translate::expr::emit_encoded_default(
+                program,
+                column,
+                default_expr,
+                &original_btree.name,
+                default_reg,
+                resolver,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Emits `body` so that it runs only when the table has at least one row.
+fn emit_if_table_has_rows(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    database_id: usize,
+    body: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
-        cursor_id: check_cursor_id,
+        cursor_id,
         root_page: original_btree.root_page,
         db: database_id,
     });
-
-    let skip_check_label = program.allocate_label();
+    let skip_label = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: check_cursor_id,
-        pc_if_empty: skip_check_label,
+        cursor_id,
+        pc_if_empty: skip_label,
     });
-
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: 1,
-        description: "type mismatch on DEFAULT".to_string(),
-        on_error: None,
-        description_reg: None,
-    });
-
-    program.preassign_label_to_next_insn(skip_check_label);
+    body(program)?;
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
 /// Validate NOT NULL and CHECK constraints for a new or altered column by
-/// scanning each existing row of `original_table` as if it had the columns of
-/// `table`, computing virtual generated columns as needed.
+/// scanning each existing row, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
 fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
-    original_table: &BTreeTable,
     table: &BTreeTable,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
@@ -609,13 +615,25 @@ fn emit_column_constraints_validation(
         check_constraints.extend(domain_checks);
     }
 
-    let strict_virtual_type = if table.is_strict && column.is_virtual_generated() {
-        column.strict_value_type()
+    let virtual_column_check = if table.is_strict && column.is_virtual_generated() {
+        let custom_type = resolver.with_schema(database_id, |schema| {
+            schema.resolve_type(&column.ty_str, true)
+        })?;
+        if column.is_array() || custom_type.is_some() {
+            Some(VirtualColumnCheck::Store)
+        } else {
+            match column.strict_type(&table.name)? {
+                StrictType::Stores(storage_class) => {
+                    Some(VirtualColumnCheck::Kind(storage_class.value_type()))
+                }
+                StrictType::Any => None,
+            }
+        }
     } else {
         None
     };
 
-    if !has_notnull && check_constraints.is_empty() && strict_virtual_type.is_none() {
+    if !has_notnull && check_constraints.is_empty() && virtual_column_check.is_none() {
         return Ok(());
     }
 
@@ -660,17 +678,6 @@ fn emit_column_constraints_validation(
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
             continue;
         }
-        // A rowid alias is stored as NULL in the record, also when the new
-        // definition makes the column an ordinary one.
-        if original_table.columns()[idx].is_rowid_alias() {
-            program.emit_insn(Insn::Copy {
-                src_reg: rowid_reg,
-                dst_reg: layout.to_register(base_dest_reg, idx),
-                extra_amount: 0,
-            });
-            continue;
-        }
-
         emit_stored_column(
             program,
             cursor_id,
@@ -696,21 +703,43 @@ fn emit_column_constraints_validation(
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
-    if let Some(value_type) = strict_virtual_type {
-        let type_passed = program.allocate_label();
-        program.emit_insn(Insn::IsType {
-            reg: result_reg,
-            target_pc: type_passed,
-            value_type,
-        });
-        program.emit_insn(Insn::Halt {
-            constraint_info: None,
-            err_code: 1,
-            description: "type mismatch on DEFAULT".to_string(),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(type_passed);
+    match virtual_column_check {
+        Some(VirtualColumnCheck::Kind(value_type)) => {
+            let type_passed = program.allocate_label();
+            program.emit_insn(Insn::IsType {
+                reg: result_reg,
+                target_pc: type_passed,
+                value_type,
+            });
+            program.emit_insn(Insn::Halt {
+                constraint_info: None,
+                err_code: 1,
+                description: "type mismatch on DEFAULT".to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(type_passed);
+        }
+        Some(VirtualColumnCheck::Store) => {
+            // Store a copy, so the CHECK constraints below see the computed
+            // value as reads of the column do.
+            let store_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: store_reg,
+                extra_amount: 0,
+            });
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                std::slice::from_ref(column),
+                store_reg,
+                None,
+                &table.name,
+                &ColumnLayout::Identity { column_count: 1 },
+            )?;
+        }
+        None => {}
     }
 
     if !check_constraints.is_empty() {
@@ -782,6 +811,15 @@ fn emit_column_constraints_validation(
     Ok(())
 }
 
+/// How ADD COLUMN checks a new virtual column of a STRICT table against the
+/// rows already in the table.
+enum VirtualColumnCheck {
+    /// The value must have this kind, as in a STRICT column of a plain type.
+    Kind(crate::types::ValueType),
+    /// The value must store as the column's custom or array type does.
+    Store,
+}
+
 pub fn translate_alter_table(
     alter: ast::AlterTable,
     resolver: &Resolver,
@@ -793,6 +831,22 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
+    if let ast::AlterTableBody::OwnerTo {
+        kind,
+        role,
+        if_exists,
+    } = &alter_table
+    {
+        return translate_alter_owner(
+            &qualified_name,
+            *kind,
+            role,
+            *if_exists,
+            resolver,
+            program,
+            connection,
+        );
+    }
     let namespace = resolver.resolve_existing_table(&qualified_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -808,6 +862,7 @@ pub fn translate_alter_table(
         &alter_table,
         table_name,
         resolver.catalog.dialect.supports_namespaces(),
+        connection,
     )?;
     reject_alter_of_view(&alter_table, table_name, resolver, namespace)?;
 
@@ -856,6 +911,9 @@ pub fn translate_alter_table(
     let mut btree = (*original_btree).clone();
 
     match alter_table {
+        ast::AlterTableBody::OwnerTo { .. } => {
+            unreachable!("OWNER TO is translated before the table is resolved")
+        }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
@@ -1030,11 +1088,11 @@ pub fn translate_alter_table(
                 }
             }
 
-            // Check if any virtual column depends on the dropped column
+            // Check if any generated column depends on the dropped column
             {
                 let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));
@@ -1194,16 +1252,20 @@ pub fn translate_alter_table(
                     }
                 )
             });
-            if is_stored {
-                return Err(LimboError::ParseError(
-                    "cannot add a STORED column".to_string(),
-                ));
-            }
             if is_generated {
                 for c in &col_def.constraints {
-                    if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
-                        validate_generated_function_calls(expr, &resolver.catalog)?;
+                    match &c.constraint {
+                        ast::ColumnConstraint::Generated { expr, .. } => {
+                            crate::schema::validate_generated_expr(expr)?;
+                            validate_generated_function_calls(expr, &resolver.catalog)?;
+                        }
+                        ast::ColumnConstraint::Default(_) => {
+                            return Err(LimboError::ParseError(format!(
+                                "generated column \"{}\" cannot have a DEFAULT value",
+                                col_def.col_name
+                            )));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1237,52 +1299,12 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let default_type_mismatch;
-            {
-                let ty = column.ty_str.as_str();
-                if btree.is_strict && ty.is_empty() {
-                    return Err(LimboError::ParseError(format!(
-                        "missing datatype for {table_name}.{new_column_name}"
-                    )));
-                }
-                let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
-                let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
-                if column.is_array() {
-                    resolver
-                        .schema()
-                        .check_array_element_type(&normalize_ident(ty))?;
-                }
-                // Domain types require STRICT tables because domain constraints
-                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
-                if !is_builtin && !btree.is_strict {
-                    let type_def = resolver
-                        .schema()
-                        .get_type_def_unchecked(&normalize_ident(ty));
-                    if let Some(td) = type_def {
-                        if td.is_domain {
-                            return Err(LimboError::ParseError(format!(
-                                "domain type columns require STRICT tables: {table_name}.{new_column_name}"
-                            )));
-                        }
-                    }
-                }
-
-                if !is_builtin && btree.is_strict {
-                    let type_def = resolver
-                        .schema()
-                        .get_type_def_unchecked(&normalize_ident(ty));
-                    if type_def.is_none() {
-                        return Err(LimboError::ParseError(format!(
-                            "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
-                        )));
-                    }
-                }
-
-                default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
-            }
+            check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
-                column.resolve_custom_type(resolver.schema());
-                key_collation(column.text_collation(), column.type_ordering())?;
+                column.resolve_custom_type(resolver.schema())?;
+                let ty = column_type(&column, true, resolver.schema());
+                key_collation(column.text_collation(), &ty, resolver.schema())?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -1305,76 +1327,13 @@ pub fn translate_alter_table(
             // Add foreign key constraints and CHECK constraints to the btree table
             for constraint in &constraints {
                 match &constraint.constraint {
-                    ast::ColumnConstraint::ForeignKey {
-                        clause,
-                        defer_clause,
-                    } => {
-                        if clause.columns.len() > 1 {
-                            return Err(LimboError::ParseError(format!(
-                                "foreign key on {new_column_name} should reference only one column of table {}",
-                                clause.tbl_name.as_str()
-                            )));
-                        }
-                        let decl_order = btree
-                            .foreign_keys
-                            .iter()
-                            .map(|fk| fk.decl_order)
-                            .max()
-                            .map_or(0, |order| order + 1);
-                        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-                        let (parent_namespace, parent_table) = demangle_name(
+                    ast::ColumnConstraint::ForeignKey { .. } => {
+                        add_column_foreign_key(
+                            &mut btree,
+                            &new_column_name,
+                            constraint,
                             resolver.catalog.dialect.supports_namespaces(),
-                            &mangled_parent_table,
-                        );
-                        let fk = ForeignKey {
-                            constraint_name: constraint
-                                .name
-                                .as_ref()
-                                .map(|n| normalize_ident(n.as_str())),
-                            parent_table: parent_table.to_string(),
-                            parent_namespace,
-                            parent_columns: clause
-                                .columns
-                                .iter()
-                                .map(|c| normalize_ident(c.col_name.as_str()))
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice(),
-                            on_delete: clause
-                                .args
-                                .iter()
-                                .find_map(|arg| {
-                                    if let ast::RefArg::OnDelete(act) = arg {
-                                        Some(*act)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(ast::RefAct::NoAction),
-                            on_update: clause
-                                .args
-                                .iter()
-                                .find_map(|arg| {
-                                    if let ast::RefArg::OnUpdate(act) = arg {
-                                        Some(*act)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: Box::from([new_column_name.to_string()]),
-                            deferred: match defer_clause {
-                                Some(d) => {
-                                    d.deferrable
-                                        && matches!(
-                                            d.init_deferred,
-                                            Some(ast::InitDeferredPred::InitiallyDeferred)
-                                        )
-                                }
-                                None => false,
-                            },
-                            decl_order,
-                        };
-                        btree.foreign_keys.push(Arc::new(fk));
+                        )?;
                     }
                     ast::ColumnConstraint::Check { expr, source } => {
                         let column_names: Vec<&str> = btree
@@ -1394,6 +1353,15 @@ pub fn translate_alter_table(
                         // Other constraints (PRIMARY KEY, NOT NULL, etc.) are handled elsewhere
                     }
                 }
+            }
+            let new_column = btree
+                .columns()
+                .last()
+                .expect("ADD COLUMN appended a column");
+            if btree.is_key_column(new_column) {
+                resolver
+                    .schema()
+                    .check_column_can_be_key(new_column, btree.is_strict)?;
             }
 
             // Propagate domain CHECK and NOT NULL constraints to the newly
@@ -1427,6 +1395,16 @@ pub fn translate_alter_table(
                     "generated UPDATE statement did not parse as expected".to_string(),
                 ));
             };
+
+            if is_stored {
+                btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
+                emit_halt_if_table_has_rows(
+                    program,
+                    &original_btree,
+                    database_id,
+                    "cannot add a STORED column",
+                )?;
+            }
 
             let mut computes_default_for_existing_rows = false;
             if !is_generated {
@@ -1467,33 +1445,30 @@ pub fn translate_alter_table(
                 };
 
                 if needs_empty_table_check {
-                    let check_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
-                    program.emit_insn(Insn::OpenRead {
-                        cursor_id: check_cursor_id,
-                        root_page: original_btree.root_page,
-                        db: database_id,
-                    });
-
-                    let skip_error_label = program.allocate_label();
-                    program.emit_insn(Insn::Rewind {
-                        cursor_id: check_cursor_id,
-                        pc_if_empty: skip_error_label,
-                    });
-
-                    program.emit_insn(Insn::Halt {
-                        constraint_info: None,
-                        err_code: 1,
-                        description: error_message.to_string(),
-                        on_error: None,
-                        description_reg: None,
-                    });
-
-                    program.preassign_label_to_next_insn(skip_error_label);
+                    emit_halt_if_table_has_rows(
+                        program,
+                        &original_btree,
+                        database_id,
+                        error_message,
+                    )?;
                 }
 
                 if default_type_mismatch {
-                    emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                    emit_halt_if_table_has_rows(
+                        program,
+                        &original_btree,
+                        database_id,
+                        "type mismatch on DEFAULT",
+                    )?;
+                }
+                if btree.is_strict && !computes_default_for_existing_rows {
+                    emit_add_column_custom_type_default_check(
+                        program,
+                        &original_btree,
+                        database_id,
+                        &column,
+                        resolver,
+                    )?;
                 }
             }
 
@@ -1522,7 +1497,6 @@ pub fn translate_alter_table(
 
             emit_column_constraints_validation(
                 program,
-                &btree,
                 &btree,
                 &column,
                 &constraints,
@@ -1563,6 +1537,9 @@ pub fn translate_alter_table(
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
 
+            // Under a dialect whose relation names are unique across kinds,
+            // a name any relation has is taken, as for CREATE.
+            schema::relation_name_is_taken(resolver, namespace, &normalized_new_name, false)?;
             // Views whose SQL failed to load are absent from the schema maps
             // but their rows are still in sqlite_schema, so the name is taken.
             let new_name_taken = resolver.with_schema(database_id, |s| {
@@ -1745,6 +1722,36 @@ pub fn translate_alter_table(
                 );
             }
 
+            if schema::dialect_relation_hooks_apply(connection, database_id)? {
+                // Automatic indexes are renamed with the table, because
+                // their names embed it.
+                let mut changes = vec![RelationChange::Rename {
+                    namespace: namespace.id,
+                    old_name: normalized_old_name,
+                    new_name: normalized_new_name,
+                }];
+                for index in &table_indexes {
+                    let Some(new_name) = renamed_automatic_index_name(
+                        &index.name,
+                        &mangled_table_name,
+                        &mangled_new_name,
+                    ) else {
+                        continue;
+                    };
+                    changes.push(RelationChange::Rename {
+                        namespace: namespace.id,
+                        old_name: index.name.clone(),
+                        new_name,
+                    });
+                }
+                resolver.catalog.dialect.translate_relation_changes(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    &changes,
+                )?;
+            }
+
             for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
@@ -1844,7 +1851,7 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            if !col_name.eq_ignore_ascii_case(from) && btree.get_column(col_name).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -1885,15 +1892,12 @@ pub fn translate_alter_table(
                 ));
             }
 
-            // The new definition replaces the old one in the stored CREATE TABLE, so a
-            // PRIMARY KEY or UNIQUE written in the old column would disappear while its
-            // automatic index stays. A rowid alias has no automatic index.
+            // The new definition replaces the old one in the stored CREATE TABLE and
+            // cannot have a PRIMARY KEY or UNIQUE, so one written in the old column,
+            // including an INTEGER PRIMARY KEY, would be lost.
             if !rename {
                 let old_column = &btree.columns()[column_index];
-                if old_column.primary_key()
-                    && btree.primary_key_is_inline
-                    && !old_column.is_rowid_alias()
-                {
+                if old_column.primary_key() && btree.primary_key_is_inline {
                     return Err(LimboError::ParseError(
                         "PRIMARY KEY constraint cannot be altered".to_string(),
                     ));
@@ -1905,10 +1909,29 @@ pub fn translate_alter_table(
                 }
             }
 
+            if !rename {
+                let affected = btree.columns_affected_by_update([column_index])?;
+                if (&affected)
+                    .into_iter()
+                    .any(|idx| btree.columns()[idx].is_stored_generated())
+                {
+                    return Err(LimboError::ParseError(
+                        "cannot alter a STORED column or a column that a STORED column uses"
+                            .to_string(),
+                    ));
+                }
+            }
+
             let (rewrites_physical_layout, virtual_generated_values_may_change, replacement_column) =
                 match rename {
                     true => (false, false, None),
                     false => {
+                        check_column_type(
+                            &definition,
+                            table_name,
+                            btree.is_strict,
+                            resolver.schema(),
+                        )?;
                         let replacement_column =
                             btree.column_for_alter(column_index, &definition)?;
                         let old_column = &btree.columns()[column_index];
@@ -1922,10 +1945,13 @@ pub fn translate_alter_table(
                                 "PRIMARY KEY constraint cannot be altered".to_string(),
                             ));
                         }
-                        // A rowid alias is stored as NULL in the record, so existing rows
-                        // must be rewritten to hold the value once the column is ordinary.
-                        let stops_being_rowid_alias =
-                            old_column.is_rowid_alias() && !replacement_column.is_rowid_alias();
+                        // The column cannot start or stop being the rowid: the new definition
+                        // has no PRIMARY KEY, a column with an inline one was rejected above,
+                        // and a table-level one was checked just now.
+                        turso_assert_eq!(
+                            old_column.is_rowid_alias(),
+                            replacement_column.is_rowid_alias()
+                        );
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();
                         // Toggling the virtual-generated bit changes whether the column
@@ -1954,7 +1980,6 @@ pub fn translate_alter_table(
                                 resolver.schema(),
                             );
                         let rewrites_physical_layout = becomes_generated
-                            || stops_being_rowid_alias
                             || virtuality_changed
                             || affinity_changed
                             || strict_type_changed;
@@ -1966,13 +1991,6 @@ pub fn translate_alter_table(
                         )
                     }
                 };
-            let clears_autoincrement_sequence = !rename
-                && btree.has_autoincrement
-                && btree.columns()[column_index].is_rowid_alias()
-                && replacement_column
-                    .as_ref()
-                    .is_some_and(|column| !column.is_rowid_alias());
-
             let is_making_column_generated = definition
                 .constraints
                 .iter()
@@ -2017,10 +2035,32 @@ pub fn translate_alter_table(
 
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
+                if let (Some(old_name), Some(new_name)) = (
+                    btree.columns()[column_index].name.as_deref(),
+                    replacement_column.name.as_deref(),
+                ) {
+                    table.rename_column_in_keys(old_name, new_name);
+                }
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_types(resolver.schema());
+                // An inline REFERENCES in the new definition is a new FOREIGN KEY
+                // of the table, so the key checks below see it.
+                for constraint in &definition.constraints {
+                    if matches!(
+                        constraint.constraint,
+                        ast::ColumnConstraint::ForeignKey { .. }
+                    ) {
+                        add_column_foreign_key(
+                            &mut table,
+                            col_name,
+                            constraint,
+                            resolver.catalog.dialect.supports_namespaces(),
+                        )?;
+                    }
+                }
+                table.resolve_custom_types(resolver.schema())?;
                 let column = &table.columns()[column_index];
-                key_collation(column.text_collation(), column.type_ordering())?;
+                let ty = column_type(column, table.is_strict, resolver.schema());
+                key_collation(column.text_collation(), &ty, resolver.schema())?;
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
@@ -2038,6 +2078,20 @@ pub fn translate_alter_table(
             };
 
             if let Some(altered_table) = &altered_table {
+                let column = &altered_table.columns()[column_index];
+                let is_index_column =
+                    table_indexes
+                        .iter()
+                        .flat_map(|index| &index.columns)
+                        .any(|index_column| {
+                            index_column.expression().is_none()
+                                && index_column.pos_in_table == column_index
+                        });
+                if is_index_column || altered_table.is_key_column(column) {
+                    resolver
+                        .schema()
+                        .check_column_can_be_key(column, altered_table.is_strict)?;
+                }
                 reject_change_of_indexed_column_order(
                     &original_btree,
                     altered_table,
@@ -2108,7 +2162,6 @@ pub fn translate_alter_table(
                             }
                         }
                         Err(LimboError::ParseError(message)) => {
-                            let message = message.strip_prefix("Parse error: ").unwrap_or(&message);
                             let error =
                                 if let Some(column) = message.strip_prefix("no such column: ") {
                                     format!(
@@ -2366,7 +2419,6 @@ pub fn translate_alter_table(
                 let altered_table = Arc::new(altered_table);
                 emit_column_constraints_validation(
                     program,
-                    &original_btree,
                     &altered_table,
                     &altered_table.columns()[column_index],
                     &definition.constraints,
@@ -2426,15 +2478,6 @@ pub fn translate_alter_table(
                 )?;
             }
 
-            if clears_autoincrement_sequence {
-                emit_delete_sqlite_sequence_entry(
-                    program,
-                    resolver,
-                    database_id,
-                    &mangled_table_name,
-                );
-            }
-
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::SchemaVersion,
@@ -2456,6 +2499,128 @@ pub fn translate_alter_table(
         }
     };
 
+    Ok(())
+}
+
+/// Translates `ALTER TABLE name OWNER TO role`, and the same for the other
+/// relation kinds: the dialect records the new owner in its own schema
+/// state, and moves what the relation owns with it, such as the sequences
+/// of a table's serial columns. As in PostgreSQL, a table's indexes change
+/// owner with the table, because they belong to it, and `ALTER INDEX ...
+/// OWNER TO` changes nothing, because an index is owned by its table.
+/// `ALTER TABLE` accepts every relation kind; the other forms refuse a
+/// relation of another kind.
+///
+/// [`crate::translate::roles::check_statement_privileges`] lets a superuser
+/// run it, and the owner when it names a role it may set, which without
+/// role membership is itself.
+fn translate_alter_owner(
+    qualified_name: &ast::QualifiedName,
+    kind: RelationKind,
+    role: &ast::RoleSpec,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let normalized_name = normalize_ident(qualified_name.name.as_str());
+    let Some((namespace, existing_kind)) =
+        owned_relation(resolver, qualified_name, &normalized_name)
+    else {
+        if if_exists {
+            return Ok(());
+        }
+        crate::bail_parse_error!("relation \"{normalized_name}\" does not exist");
+    };
+    if namespace.database_id != crate::MAIN_DB_ID {
+        crate::bail_parse_error!("permission denied: \"{normalized_name}\" is a system catalog");
+    }
+    // ALTER TABLE accepts every relation kind, as in PostgreSQL; the other
+    // forms want their own.
+    if kind != RelationKind::Table && existing_kind != kind {
+        crate::bail_parse_error!(
+            "\"{normalized_name}\" is not {}",
+            relation_kind_phrase(kind)
+        );
+    }
+    // The dialect decides what goes with the relation, such as a table's
+    // indexes, and whose an index's owner is.
+    let changes = [RelationChange::ChangeOwner {
+        namespace: namespace.id,
+        name: normalized_name,
+        owner: NewOwner::Role(role.clone()),
+    }];
+
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_relation_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    schema::emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// `kind` as an `ALTER ... OWNER TO` error names it.
+fn relation_kind_phrase(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Table => "a table",
+        RelationKind::View => "a view",
+        RelationKind::MaterializedView => "a materialized view",
+        RelationKind::Sequence => "a sequence",
+        RelationKind::Index => "an index",
+    }
+}
+
+/// The namespace and kind of the relation `qualified_name` names: a table,
+/// view, materialized view, sequence or index, whichever exists. None when
+/// none does.
+pub(crate) fn owned_relation(
+    resolver: &Resolver,
+    qualified_name: &ast::QualifiedName,
+    normalized_name: &str,
+) -> Option<(NamespaceRef, RelationKind)> {
+    let namespace = if qualified_name.namespace.is_some() {
+        resolver.resolve_namespace(qualified_name).ok()?
+    } else {
+        resolver
+            .find_existing_table(qualified_name)
+            .ok()
+            .flatten()
+            .or_else(|| resolver.find_existing_index(qualified_name).ok().flatten())
+            .or_else(|| resolver.find_existing_sequence(normalized_name))?
+    };
+    resolver
+        .with_schema(namespace.database_id, |schema| {
+            schema.relation_kind(namespace.id, normalized_name)
+        })
+        .map(|kind| (namespace, kind))
+}
+
+/// Adds the FOREIGN KEY of an inline `REFERENCES` clause on column
+/// `column_name` to `table`. `constraint` must be a
+/// [ast::ColumnConstraint::ForeignKey].
+fn add_column_foreign_key(
+    table: &mut BTreeTable,
+    column_name: &str,
+    constraint: &ast::NamedColumnConstraint,
+    supports_namespaces: bool,
+) -> Result<()> {
+    let decl_order = table
+        .foreign_keys
+        .iter()
+        .map(|fk| fk.decl_order)
+        .max()
+        .map_or(0, |order| order + 1);
+    let fk = ForeignKey::from_column_constraint(
+        column_name,
+        constraint,
+        decl_order,
+        supports_namespaces,
+    )?;
+    table.foreign_keys.push(Arc::new(fk));
     Ok(())
 }
 
@@ -2490,6 +2655,8 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
+        // OWNER TO works on views; it is translated before this check runs.
+        ast::AlterTableBody::OwnerTo { .. } => Ok(()),
     }
 }
 
@@ -2740,10 +2907,16 @@ fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bo
         schema.get_type_def(&old.ty_str, true),
         schema.get_type_def(&new.ty_str, true),
     ) {
-        (None, None) => old.strict_value_type() != new.strict_value_type(),
-        (Some(_), Some(_)) => {
-            !old.ty_str.eq_ignore_ascii_case(&new.ty_str) || old.ty_params != new.ty_params
-        }
+        (None, None) => match (
+            StrictType::named(&old.ty_str),
+            StrictType::named(&new.ty_str),
+        ) {
+            (Some(old_type), Some(new_type)) => old_type != new_type,
+            // Rewriting re-checks every row, so a name that isn't a STRICT
+            // type never skips the check.
+            (None, _) | (_, None) => true,
+        },
+        (Some(_), Some(_)) => !old.has_same_declared_type(new),
         _ => true,
     }
 }
@@ -2911,6 +3084,17 @@ fn emit_strict_column_conversion(
         Some(&column_mask),
         layout,
     )?;
+    // An array converted to a column that is not an array becomes its text,
+    // such as `{1,2}`. A column added by ADD COLUMN is not in the original table.
+    let was_array = original_table
+        .columns()
+        .get(column_index)
+        .is_some_and(|column| column.is_array());
+    if was_array && !rewritten_table.columns()[column_index].is_array() {
+        program.emit_insn(Insn::ArrayDecode {
+            reg: layout.to_register(start_reg, column_index),
+        });
+    }
     program.emit_insn(Insn::TypeCheck {
         start_reg,
         count: layout.num_non_virtual_cols(),

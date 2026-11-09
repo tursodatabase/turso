@@ -481,7 +481,7 @@ mod temp_file_tests {
         let db = crate::Database::open_file(
             io.clone(),
             "ephemeral-temp-file.db",
-            Arc::new(crate::SqliteDialect),
+            Arc::new(crate::EngineDialect),
         )
         .unwrap();
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();

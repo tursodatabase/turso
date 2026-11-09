@@ -29,6 +29,7 @@ name = "leak_tests"
 path = "leak/mod.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 anyhow.workspace = true
 env_logger = { workspace = true }
 turso_core = { workspace = true, features = ["conn_raw_api"] }

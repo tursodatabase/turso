@@ -622,6 +622,61 @@ expect {
     "s"
 }
 
+test table-serial-sequence-takes-the-first-free-name {
+    CREATE TABLE zz_free_id_seq (a int);
+    CREATE SEQUENCE zz_free_id_seq1;
+    CREATE TABLE zz_free (id serial, b int);
+    SELECT relname, relkind FROM pg_class WHERE relname LIKE 'zz_free_id_seq%' ORDER BY relname;
+}
+expect {
+    zz_free_id_seq|r
+    zz_free_id_seq1|S
+    zz_free_id_seq2|S
+}
+
+test table-serial-column-draws-from-its-own-sequence-when-another-has-its-name {
+    CREATE SEQUENCE zz_busy_id_seq START 100;
+    CREATE TABLE zz_busy (id serial, b int);
+    INSERT INTO zz_busy (b) VALUES (10), (20);
+    SELECT id, b FROM zz_busy ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+test table-serial-sequence-of-a-schema-whose-name-has-a-quote-takes-a-free-name {
+    CREATE SCHEMA "zz_o'k";
+    CREATE TABLE "zz_o'k".t_id_seq (a int);
+    CREATE TABLE "zz_o'k".t (id serial, b int);
+    INSERT INTO "zz_o'k".t (b) VALUES (1);
+    SELECT id, b FROM "zz_o'k".t;
+}
+expect {
+    1|1
+}
+
+test table-serial-sequence-of-a-schema-whose-name-has-a-dot-takes-a-free-name {
+    CREATE SCHEMA "zz_a.b";
+    CREATE TABLE "zz_a.b".t_id_seq (a int);
+    CREATE TABLE "zz_a.b".t (id serial, b int);
+    INSERT INTO "zz_a.b".t (b) VALUES (1);
+    SELECT id, b FROM "zz_a.b".t;
+}
+expect {
+    1|1
+}
+
+test table-serial-sequence-of-a-table-whose-name-has-a-quote-takes-a-free-name {
+    CREATE TABLE "zz_q'_id_seq" (a int);
+    CREATE TABLE "zz_q'" (id serial, b int);
+    INSERT INTO "zz_q'" (b) VALUES (1);
+    SELECT id, b FROM "zz_q'";
+}
+expect {
+    1|1
+}
+
 test drop-materialized-view-on-a-view-errors {
     CREATE TABLE t (a int);
     CREATE VIEW v AS SELECT * FROM t;
@@ -727,4 +782,37 @@ test add-column-fills-existing-rows-with-a-function-default {
 expect {
     1|public
     2|public
+}
+
+test array-columns-hold-element-values {
+    -- tursopg prints a boolean result as 1, PostgreSQL as t, so every
+    -- boolean is cast to int.
+    CREATE TABLE array_values (
+        id int PRIMARY KEY,
+        u uuid, us uuid[],
+        d date, ds date[],
+        b boolean, bs boolean[]
+    );
+    INSERT INTO array_values VALUES
+        (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', NULL, '2024-01-02', NULL, true, NULL);
+    UPDATE array_values SET us = ARRAY[u], ds = ARRAY[d], bs = ARRAY[b, false];
+    SELECT (us = ARRAY[u])::int, (ds = ARRAY[d])::int, (bs = ARRAY[b, false])::int,
+        (us[1] = u)::int, (ds[1] = d)::int, (bs[1] = b)::int, bs[1]::int, bs[2]::int
+    FROM array_values;
+    SELECT us, ds FROM array_values;
+}
+expect {
+    1|1|1|1|1|1|1|0
+    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|{2024-01-02}
+}
+
+test array-of-booleans-from-literal-and-aggregate {
+    CREATE TABLE bool_values (id int PRIMARY KEY, b boolean);
+    INSERT INTO bool_values VALUES (1, true), (2, false);
+    SELECT (ARRAY[true, false])[1]::int, (ARRAY[true, false])[2]::int;
+    SELECT (array_agg(b ORDER BY id) = ARRAY[true, false])::int FROM bool_values;
+}
+expect {
+    1|0
+    1
 }

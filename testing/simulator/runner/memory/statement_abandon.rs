@@ -1,6 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use anyhow::Result;
 use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};

@@ -1028,3 +1028,39 @@ fn test_pg_prepare_and_serial_ddl_dst_fuzz() {
         }
     }
 }
+
+#[test]
+fn a_serial_column_keeps_its_sequence_across_a_reopen_when_another_relation_had_the_default_name() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "CREATE TABLE t_id_seq (a int)");
+    pg_execute(&pg, "CREATE TABLE t (id bigserial, b int)");
+    pg_execute(&pg, "INSERT INTO t (b) VALUES (1)");
+    assert_eq!(pg_query_int(&pg, "SELECT id FROM t"), 1);
+
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "INSERT INTO t (b) VALUES (2)");
+    assert_eq!(pg_query_int(&pg, "SELECT max(id) FROM t"), 2);
+    assert_eq!(
+        pg_query_int(&pg, "SELECT count(*) FROM t WHERE id IN (1, 2)"),
+        2
+    );
+}
+
+#[test]
+fn a_serial_column_of_a_schema_whose_name_has_a_quote_keeps_its_sequence_across_a_reopen() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "CREATE SCHEMA \"o'k\"");
+    pg_execute(&pg, "CREATE TABLE \"o'k\".t_id_seq (a int)");
+    pg_execute(&pg, "CREATE TABLE \"o'k\".t (id serial, b int)");
+    pg_execute(&pg, "INSERT INTO \"o'k\".t (b) VALUES (1)");
+
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "INSERT INTO \"o'k\".t (b) VALUES (2)");
+    assert_eq!(pg_query_int(&pg, "SELECT max(id) FROM \"o'k\".t"), 2);
+}

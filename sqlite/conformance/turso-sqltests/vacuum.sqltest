@@ -31,3 +31,24 @@ test vacuum-rejects-query-only {
 expect error {
     Cannot execute VACUUM in query_only mode
 }
+
+# ENCODE value+1 with DECODE value does not undo ENCODE, so VACUUM must copy
+# the stored values: a DECODE then ENCODE round trip adds 1 on every VACUUM.
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test vacuum-keeps-custom-type-values {
+    CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c plus1, a plus1[]) STRICT;
+    INSERT INTO t VALUES (1, 5, ARRAY[1, 2]);
+    SELECT c, a FROM t;
+    VACUUM;
+    SELECT c, a FROM t;
+    VACUUM;
+    SELECT c, a FROM t;
+}
+expect {
+    6|{2,3}
+    6|{2,3}
+    6|{2,3}
+}

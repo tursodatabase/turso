@@ -9,7 +9,26 @@ pub enum ConstraintKind {
     ForeignKey,
     NotNull,
     Check,
+    /// A trigger's RAISE(ABORT | FAIL | ROLLBACK, ...).
+    Trigger,
+    /// A value whose type does not match a STRICT table's column type.
+    Datatype,
     Other,
+}
+
+impl ConstraintKind {
+    pub fn sqlite_extended_result_code(self) -> usize {
+        match self {
+            Self::PrimaryKey => SQLITE_CONSTRAINT_PRIMARYKEY,
+            Self::Unique => SQLITE_CONSTRAINT_UNIQUE,
+            Self::ForeignKey => SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::NotNull => SQLITE_CONSTRAINT_NOTNULL,
+            Self::Check => SQLITE_CONSTRAINT_CHECK,
+            Self::Trigger => SQLITE_CONSTRAINT_TRIGGER,
+            Self::Datatype => SQLITE_CONSTRAINT_DATATYPE,
+            Self::Other => SQLITE_CONSTRAINT,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +72,7 @@ pub struct DialectError {
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
-    #[error("File is not a database")]
+    #[error("file is not a database")]
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -71,7 +90,7 @@ pub enum LimboError {
     DatabaseFull,
     #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
     SequenceExhausted { name: String, ascending: bool },
-    #[error("Parse error: {0}")]
+    #[error("{0}")]
     ParseError(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
     /// `LimboError`'s size, which rides in every hot-path `Result`.
@@ -106,6 +125,9 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
+    /// The current role may not do what the statement needs.
+    #[error("{0}")]
+    PermissionDenied(Box<crate::security::permission::PermissionDenied>),
     #[error("{0}")]
     Constraint(String),
     #[error("{}", .0.message)]
@@ -114,8 +136,10 @@ pub enum LimboError {
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
+    /// An error that halts the statement with its own resolve type (RAISE, a
+    /// constraint-level ON CONFLICT clause, or a trigger step's OR clause).
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, String),
+    Raise(turso_parser::ast::ResolveType, Box<LimboError>),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
@@ -240,12 +264,27 @@ impl LimboError {
             Self::Interrupt => 9,
             Self::Corrupt(_) => 11,
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
+            Self::CompletionError(CompletionError::IOError(_, "open")) => 14,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
+            Self::PermissionDenied(_) => 23,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
         }
+    }
+
+    /// The extended SQLite result code for this error, e.g. what
+    /// sqlite3_extended_errcode reports. Only constraint violations of a
+    /// known kind have a code more specific than the primary one.
+    pub fn sqlite_extended_result_code(&self) -> i32 {
+        let code = match self {
+            Self::ConstraintViolation(violation) => violation.kind.sqlite_extended_result_code(),
+            Self::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::Raise(_, error) => return error.sqlite_extended_result_code(),
+            _ => return self.sqlite_result_code(),
+        };
+        code as i32
     }
 }
 
@@ -438,10 +477,10 @@ pub const SQLITE_ERROR: usize = 1;
 pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_CHECK: usize = SQLITE_CONSTRAINT | (1 << 8);
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
-#[allow(dead_code)]
 pub const SQLITE_CONSTRAINT_FOREIGNKEY: usize = SQLITE_CONSTRAINT | (3 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
+pub const SQLITE_CONSTRAINT_DATATYPE: usize = SQLITE_CONSTRAINT | (12 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
 pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 

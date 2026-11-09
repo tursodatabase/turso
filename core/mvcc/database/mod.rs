@@ -1951,6 +1951,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         mvcc_store.rewrite_live_versions_for_committed_tx(owner_tx, end_ts);
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             mvcc_store.unlock_commit_lock_if_held(tx.value());
+            mvcc_store.publish_committed_tx(tx.value(), end_ts);
         }
         crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx));
         Ok(())
@@ -3673,23 +3674,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                let tx_header = *tx_unlocked.header.read();
-                {
-                    // Hold the header lock across the watermark update and header
-                    // publish so the guard decision and replacement are serialized.
-                    let mut global_header = mvcc_store.global_header.write();
-                    // Since we assign a commit timestamp and then we drive the commit to completion,
-                    // it is totally possible for so an older transaction can finish after a newer one.
-                    // In such case, we should not let older commit to set lower value than previous.
-                    // This value is used in checkpointing as a watermark boundary, and an incorrect
-                    // lower value can cause data loss / corruption.
-                    let last_committed_ts = mvcc_store
-                        .last_committed_tx_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
-                        global_header.replace(tx_header);
-                    }
-                }
+                mvcc_store.publish_committed_tx(tx_unlocked, *end_ts);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
@@ -4921,10 +4906,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
-    /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
-    /// be checkpointed first.
-    pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
-        Ok(self.get_logical_log_file().size()? != 0)
+    /// VACUUM copies the physical DB image, so any transaction frames in the
+    /// MVCC logical log must be checkpointed first.
+    ///
+    /// This reads the log's write offset, not its file size: the offset ends
+    /// after the last frame written or found by recovery. Bytes past it are a
+    /// torn tail that recovery skips and the next commit overwrites.
+    pub(crate) fn has_uncheckpointed_log(&self) -> bool {
+        self.logical_log_offset() > LOG_HDR_SIZE as u64
     }
 
     /// Rebuild MVCC's physical root-page metadata after in-place VACUUM
@@ -7332,6 +7321,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if let Some(tx) = self.txs.get(&tx_id) {
                     self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
+                    self.publish_committed_tx(tx.value(), end_ts);
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
@@ -7348,6 +7338,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.release_exclusive_tx(&tx_id);
                 }
             }
+        }
+    }
+
+    /// Raises `last_committed_tx_ts` to `end_ts` and publishes the transaction's
+    /// header as the global header, unless a newer commit already did.
+    fn publish_committed_tx(&self, tx: &Transaction<A>, end_ts: u64) {
+        let tx_header = *tx.header.read();
+        // Hold the header lock across the watermark update and header
+        // publish so the guard decision and replacement are serialized.
+        let mut global_header = self.global_header.write();
+        // Since we assign a commit timestamp and then we drive the commit to completion,
+        // it is totally possible for so an older transaction can finish after a newer one.
+        // In such case, we should not let older commit to set lower value than previous.
+        // This value is used in checkpointing as a watermark boundary, and an incorrect
+        // lower value can cause data loss / corruption.
+        let last_committed_ts = self
+            .last_committed_tx_ts
+            .fetch_max(end_ts, Ordering::AcqRel);
+        if last_committed_ts <= end_ts {
+            global_header.replace(tx_header);
         }
     }
 
@@ -7682,10 +7692,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             && tx.header.read().schema_cookie.get() != global_schema_cookie
     }
 
-    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
+    /// Whether a transaction other than `tx_id` is `Preparing` (it will eventually
+    /// commit), or is `Committed` after `tx_id`'s begin timestamp but may not have
+    /// raised `last_committed_tx_ts` yet.
+    fn has_committing_tx_other_than(&self, tx_id: TxID) -> bool {
+        let begin_ts = self.txs.get(&tx_id).map(|tx| tx.value().begin_ts);
         self.txs.iter().any(|entry| {
             *entry.key() != tx_id
-                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+                && match entry.value().state.load() {
+                    TransactionState::Preparing(_) => true,
+                    TransactionState::Committed(end_ts) => {
+                        begin_ts.is_some_and(|begin_ts| end_ts > begin_ts)
+                    }
+                    _ => false,
+                }
         })
     }
 
@@ -7701,9 +7721,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
         }
-        // if some other transaction is in preparing state, then we cannot let this tx to
-        // continue, as the preparing txn will eventually commit
-        if self.has_preparing_tx_other_than(*tx_id) {
+        // if some other transaction is preparing, or committed after our begin_ts, then we
+        // cannot let this tx continue
+        if self.has_committing_tx_other_than(*tx_id) {
             return Err(LimboError::Busy);
         }
         // after we acquired begin_ts, we will check if some other txn committed in the meantime.
@@ -7741,7 +7761,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                if self.has_preparing_tx_other_than(*tx_id) {
+                if self.has_committing_tx_other_than(*tx_id) {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
                 }

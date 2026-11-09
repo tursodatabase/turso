@@ -139,7 +139,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
 }
 
@@ -150,7 +150,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
 fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
     let db_file = Arc::new(DatabaseFile::new(file));
-    let options = OpenOptions::new(Arc::new(SqliteDialect))
+    let options = OpenOptions::new(Arc::new(EngineDialect))
         .storage(db_file)
         .db_opts(multiprocess_wal_db_opts());
     let mut state = OpenDbAsyncState::new();
@@ -173,7 +173,7 @@ fn open_multiprocess_db_with_flags(
         flags,
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
 }
 
@@ -262,7 +262,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -282,7 +282,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     let db_path = dir.path().join("coordination-default-locked.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -309,7 +309,7 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .expect_err("multiprocess WAL should reject IO backends without shared coordination");
     assert!(
@@ -344,7 +344,7 @@ fn multiprocess_wal_rejects_opening_mvcc_database() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -369,7 +369,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -414,7 +414,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         .join("coordination-default-parent-multiprocess-child.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -922,7 +922,7 @@ fn default_locked_db_child_process() {
     };
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect))
+    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(EngineDialect))
         .expect_err("default non-multiprocess open should stay DB-file locked across processes");
     assert!(
         matches!(err, LimboError::LockingError(_)),
@@ -1180,7 +1180,7 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         OpenFlags::default(),
         multiprocess_wal_db_opts().with_vacuum(true),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -1443,7 +1443,7 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     );
 
     let input = "insert into child_table(value) values ('parent-schema')";
-    let (cmd, _) = crate::dialect::sqlite::parse(input).unwrap();
+    let (cmd, _) = crate::dialect::engine::parse(input).unwrap();
     let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
         panic!("translated statement input did not parse as a statement");
     };
@@ -2207,7 +2207,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -2220,7 +2220,7 @@ fn memory_database_keeps_in_process_wal_backend() {
 #[test]
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.query("VALUES ('ok')").unwrap();

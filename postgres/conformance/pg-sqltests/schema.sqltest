@@ -465,3 +465,22 @@ test create-index-on-schema-qualified-table-constrains-that-table {
     INSERT INTO idx_s2.t VALUES (1);
 }
 expect error {}
+
+# DROP SCHEMA CASCADE drops the catalog rows of everything it drops, so a
+# recreated schema can reuse the names.
+test drop-schema-cascade-lets-the-names-be-reused {
+    CREATE SCHEMA ds_reuse;
+    CREATE TABLE ds_reuse.t (x int);
+    CREATE SEQUENCE ds_reuse.s;
+    CREATE VIEW ds_reuse.v AS SELECT x FROM ds_reuse.t;
+    DROP SCHEMA ds_reuse CASCADE;
+    CREATE SCHEMA ds_reuse;
+    CREATE TABLE ds_reuse.t (x int);
+    CREATE SEQUENCE ds_reuse.s;
+    CREATE VIEW ds_reuse.v AS SELECT x FROM ds_reuse.t;
+    SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE n.nspname = 'ds_reuse' AND c.relname IN ('t', 's');
+}
+expect {
+    2
+}

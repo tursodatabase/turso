@@ -33,6 +33,7 @@ use crate::{
         Table,
     },
     util::{exprs_are_equivalent, normalize_ident},
+    vtab::VirtualTableType,
     Result,
 };
 use crate::{
@@ -2160,12 +2161,22 @@ fn parse_table(
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
+            if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
+                crate::translate::roles::check_pragma_function(resolver, &pragma.pragma_name)?;
+            }
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
+            crate::translate::roles::check_read_privilege(
+                resolver,
+                connection,
+                namespace,
+                &table.name,
+                crate::security::permission::Object::Table(table.name.clone()),
+            )?;
             Table::BTree(table.clone())
         } else {
             return Err(crate::LimboError::InvalidArgument(
@@ -2194,6 +2205,13 @@ fn parse_table(
         schema.get_view(namespace.id, table_name.as_str())
     });
     if let Some(view) = regular_view {
+        crate::translate::roles::check_read_privilege(
+            resolver,
+            connection,
+            namespace,
+            &view.name,
+            crate::security::permission::Object::View(view.name.clone()),
+        )?;
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias
@@ -2263,6 +2281,14 @@ fn parse_table(
                 "Materialized view has no storage allocated".to_string(),
             ));
         }
+
+        crate::translate::roles::check_read_privilege(
+            resolver,
+            connection,
+            namespace,
+            view_guard.name(),
+            crate::security::permission::Object::View(view_guard.name().to_string()),
+        )?;
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata

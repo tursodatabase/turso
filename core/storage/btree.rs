@@ -9385,7 +9385,11 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
-    contents.overflow_cells.clear();
+    turso_assert!(
+        contents.overflow_cells.is_empty(),
+        "btree_init_page: page still has overflow cells from an earlier insert or balance",
+        { "page_id": page.get().id(), "overflow_count": contents.overflow_cells.len() }
+    );
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
         page.get().id(),
@@ -10885,7 +10889,7 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -11024,7 +11028,7 @@ mod tests {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
             .unwrap();
 
         (db, temp_dir)
@@ -11090,8 +11094,8 @@ mod tests {
             #[allow(clippy::arc_with_non_send_sync)]
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db =
-                Database::open_file(io, "overflow-cell-fault.db", Arc::new(SqliteDialect)).unwrap();
-            let conn = db.connect().unwrap();
+                Database::open_file(io, "overflow-cell-fault.db", Arc::new(EngineDialect)).unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
 
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
                 .unwrap();
@@ -11236,7 +11240,7 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -11359,7 +11363,7 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, "resume-overflow-yield.db", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io, "resume-overflow-yield.db", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -11518,6 +11522,19 @@ mod tests {
     struct Cell {
         pos: usize,
         payload: crate::alloc::Vec<u8>,
+    }
+
+    #[test]
+    #[should_panic(expected = "page still has overflow cells")]
+    fn btree_init_page_rejects_page_with_overflow_cells() {
+        let page = get_page(2);
+        let page_contents = page.get_contents();
+        let payload = [1u8; 3000];
+        insert_into_cell(page_contents, &payload, 0, 4096).unwrap();
+        insert_into_cell(page_contents, &payload, 1, 4096).unwrap();
+        assert_eq!(page_contents.overflow_cells.len(), 1);
+
+        btree_init_page(&page, PageType::TableLeaf, 0, 4096);
     }
 
     #[test]
@@ -11733,7 +11750,7 @@ mod tests {
     fn empty_btree() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let pager = conn.pager.load().clone();
 
@@ -11888,7 +11905,7 @@ mod tests {
     fn btree_with_virtual_page_1() -> Result<()> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let pager = conn.pager.load().clone();
 
