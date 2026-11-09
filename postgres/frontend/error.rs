@@ -406,8 +406,12 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
 }
 
 fn permission_denied_message(denial: &PermissionDenied) -> String {
-    if denial.reason == Reason::Owner {
-        return format!("must be owner of {}", object_name(&denial.object));
+    match (denial.reason, &denial.object) {
+        (Reason::Owner, object) => return format!("must be owner of {}", object_name(object)),
+        (Reason::Policy, Object::Table(name)) => {
+            return format!("new row violates row-level security policy for table \"{name}\"")
+        }
+        _ => {}
     }
     match (denial.action, &denial.object) {
         (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),
