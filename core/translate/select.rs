@@ -1371,15 +1371,16 @@ fn resolve_compound_order_by_expr(
 
         let mut bound_expr = expr.clone();
         let mut table_references = plan.table_references.clone();
-        if bind_and_rewrite_expr(
-            &mut bound_expr,
-            Some(&mut table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .is_err()
-        {
+        let bound = resolver.try_bind(|| {
+            bind_and_rewrite_expr(
+                &mut bound_expr,
+                Some(&mut table_references),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )
+        });
+        if bound.is_err() {
             continue;
         }
         if let Some(index) = plan

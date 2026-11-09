@@ -3228,6 +3228,26 @@ fn test_postgres_compound_order_by(db: TempDatabase) {
     assert_eq!(results, vec![3, 2]);
 }
 
+/// A term of a compound ORDER BY is looked up in the columns of each SELECT.
+/// When a SELECT has a table, but no column, of that name, the term is not a
+/// reference to the whole row of that table, and a later SELECT can have the
+/// column.
+#[turso_macros::test]
+fn test_postgres_compound_order_by_term_names_a_table_of_an_earlier_select(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    conn.execute("CREATE TABLE u (t INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3), (1)").unwrap();
+    conn.execute("INSERT INTO u VALUES (2)").unwrap();
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT x AS y FROM t UNION SELECT t FROM u ORDER BY t"
+        ),
+        ["1", "2", "3"]
+    );
+}
+
 #[turso_macros::test]
 fn test_postgres_insert_default(db: TempDatabase) {
     let conn = db.connect_postgres();

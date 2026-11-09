@@ -498,6 +498,19 @@ impl<'a> Resolver<'a> {
         self.deferred_error.borrow_mut().take()
     }
 
+    /// Runs `bind`, a bind that the caller drops when it fails. An error
+    /// that `bind` defers makes the bind fail, and is not kept for the
+    /// statement.
+    pub(crate) fn try_bind<T>(&self, bind: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
+        let earlier = self.deferred_error.borrow_mut().take();
+        let result = bind();
+        let deferred = std::mem::replace(&mut *self.deferred_error.borrow_mut(), earlier);
+        match (result, deferred) {
+            (Ok(_), Some(error)) => Err(error),
+            (result, _) => result,
+        }
+    }
+
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
         self.catalog.require_custom_types(feature)
     }
