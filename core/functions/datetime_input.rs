@@ -143,8 +143,8 @@ fn split_fields(input: &str) -> Option<Vec<Field<'_>>> {
 struct Fields {
     /// Year, month and day.
     date: Option<(i32, u32, u32)>,
-    /// Microseconds since midnight. Up to `24:00:00` and second 60, which
-    /// PostgreSQL also takes; they carry into the next minute or day.
+    /// Microseconds since midnight, up to `24:00:00`. Second 60 carries into
+    /// the next minute.
     time: Option<i64>,
     /// Seconds east of UTC.
     offset: Option<i64>,
@@ -179,6 +179,10 @@ impl Fields {
         for field in fields {
             match field {
                 Field::Date(text, sep) => {
+                    // `time` takes a date only before the time, as PostgreSQL does.
+                    if ty == TemporalType::Time && time.is_some() {
+                        return Err(syntax_error(input, ty));
+                    }
                     let parts: Vec<&str> = text.split(sep).collect();
                     // A first number of 1 or 2 digits is a month or a day, in
                     // an order that depends on PostgreSQL's DateStyle, which
@@ -196,7 +200,8 @@ impl Fields {
                     );
                     set_once(&mut out.date, date, input, ty)?;
                 }
-                Field::Number(digits) if digits.len() == 8 => {
+                // `time` does not take a date written as `20240105`.
+                Field::Number(digits) if digits.len() == 8 && ty != TemporalType::Time => {
                     let date = (
                         year(&digits[..4], input, ty)?,
                         two_digits(&digits[4..6], input, ty)?,
@@ -210,6 +215,8 @@ impl Fields {
                     "am" => set_once(&mut pm, false, input, ty)?,
                     "pm" => set_once(&mut pm, true, input, ty)?,
                     // ISO 8601's separator of the date and the time.
+                    // `time` does not take it.
+                    "t" if ty == TemporalType::Time => return Err(syntax_error(input, ty)),
                     "t" => {}
                     "z" => set_once(&mut out.offset, 0, input, ty)?,
                     "bc" => {
@@ -218,6 +225,8 @@ impl Fields {
                             ty.name()
                         )))
                     }
+                    // `time` does not take a month name.
+                    _ if ty == TemporalType::Time => return Err(syntax_error(input, ty)),
                     other => {
                         let month = other
                             .parse::<Month>()
@@ -256,14 +265,11 @@ impl Fields {
                 Some(false) if hour == 12 => hour = 0,
                 Some(_) | None => {}
             }
-            if hour > 24
-                || minute > 59
-                || second > 60
-                || (hour == 24 && (minute, second, micros) != (0, 0, 0))
-            {
+            let micros_of_day = ((hour * 60 + minute) * 60 + second) * 1_000_000 + micros;
+            if time_overflows(hour, minute, second, micros_of_day) {
                 return Err(range_error(input));
             }
-            out.time = Some(((hour * 60 + minute) * 60 + second) * 1_000_000 + micros);
+            out.time = Some(micros_of_day);
         } else if pm.is_some() {
             return Err(syntax_error(input, ty));
         }
@@ -287,9 +293,6 @@ impl Fields {
         };
         let (date, ty) = match (date, ty) {
             (_, TemporalType::Time) => {
-                if time > MICROS_PER_DAY {
-                    return Err(range_error(input));
-                }
                 let mut out = String::new();
                 push_time(&mut out, time);
                 return Ok(out);
@@ -309,6 +312,12 @@ impl Fields {
         push_time(&mut out, time);
         Ok(out)
     }
+}
+
+/// PostgreSQL's `time_overflows`: each field is in range and the whole time,
+/// second 60 and fraction included, is at most `24:00:00`.
+fn time_overflows(hour: i64, minute: i64, second: i64, micros_of_day: i64) -> bool {
+    hour > 24 || minute > 59 || second > 60 || micros_of_day > MICROS_PER_DAY
 }
 
 /// `HH:MM:SS`, then the fraction of a second with its trailing zeros dropped.
