@@ -878,7 +878,13 @@ fn emit_custom_type_cast(
         }),
         StrictType::Any => {}
     }
-    emit_store_value(program, &resolved, reg, &ty_params, resolver)?;
+    emit_store_value(
+        program,
+        &resolved,
+        reg,
+        Coerce::WithArgs(&ty_params),
+        resolver,
+    )?;
     emit_decode(program, &resolved, reg, resolver)?;
     // The domain's CHECKs see the value after DECODE, as they do on a
     // column of the domain.
@@ -1766,9 +1772,7 @@ fn translate_function_call_expr(
                         crate::bail_parse_error!("min function with no arguments");
                     }
                     let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
+                    translate_compared_args(program, referenced_tables, args, start_reg, resolver)?;
 
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
@@ -1783,9 +1787,7 @@ fn translate_function_call_expr(
                         crate::bail_parse_error!("min function with no arguments");
                     }
                     let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
+                    translate_compared_args(program, referenced_tables, args, start_reg, resolver)?;
 
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,

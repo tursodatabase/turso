@@ -114,6 +114,81 @@ pub(crate) fn translate_compared_pair(
     Ok(())
 }
 
+/// Translates the arguments of a scalar min or max, which compares them with
+/// each other, into `start_reg..`. A string literal or parameter is read as a
+/// value of the custom type of the other arguments, as PostgreSQL's least and
+/// greatest read it: on a time column, `min(tm, '10:00')` compares with the
+/// time 10:00:00. See [translate_compared_operand].
+pub(crate) fn translate_compared_args(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    args: &[Box<ast::Expr>],
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let typed_arg = custom_typed_arg(args, referenced_tables, resolver)?;
+    for (i, arg) in args.iter().enumerate() {
+        match typed_arg {
+            Some(typed_arg) => translate_compared_operand(
+                program,
+                referenced_tables,
+                arg,
+                typed_arg,
+                start_reg + i,
+                resolver,
+            )?,
+            None => translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?,
+        };
+    }
+    Ok(())
+}
+
+/// The argument of a custom type that the string literals and parameters
+/// among `args` are compared with, or None when `args` has no string literal
+/// or parameter, or no argument of a custom type. Arguments of two custom
+/// types leave no single type to read a string literal as, which is an error.
+fn custom_typed_arg<'a>(
+    args: &'a [Box<ast::Expr>],
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<&'a ast::Expr>> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(None);
+    }
+    let mut has_untyped_arg = false;
+    for arg in args {
+        has_untyped_arg |= is_untyped_operand(arg)?;
+    }
+    if !has_untyped_arg {
+        return Ok(None);
+    }
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let mut typed: Option<(&ast::Expr, Arc<TypeDef>)> = None;
+    for arg in args {
+        let type_def = match type_of(arg, &env) {
+            ExprType::Custom { type_def, .. } => type_def,
+            ExprType::Array { .. }
+            | ExprType::Builtin(_)
+            | ExprType::Untyped
+            | ExprType::Null
+            | ExprType::Unknown
+            | ExprType::RowValue
+            | ExprType::NotKnownYet => continue,
+        };
+        match &typed {
+            None => typed = Some((arg.as_ref(), type_def)),
+            Some((_, seen)) if seen.name == type_def.name => {}
+            Some((_, seen)) => crate::bail_parse_error!(
+                "cannot tell which type to read a string literal or parameter as: \
+                 it is compared with type {} and type {}",
+                seen.name,
+                type_def.name
+            ),
+        }
+    }
+    Ok(typed.map(|(arg, _)| arg))
+}
+
 /// Translates the string literal or parameter `operand` into `reg` as a value
 /// of `resolved`: stored as a column of the type stores it, then read back.
 pub(crate) fn translate_untyped_operand_as(
@@ -156,7 +231,7 @@ pub(crate) fn read_untyped_operand_as(
     schema: &crate::schema::Schema,
     other_type: impl FnOnce() -> Result<ExprType>,
 ) -> Result<Option<ResolvedType>> {
-    if !is_untyped_operand(operand) || schema.type_registry.is_empty() {
+    if schema.type_registry.is_empty() || !is_untyped_operand(operand)? {
         return Ok(None);
     }
     let type_def = match other_type()? {
@@ -183,15 +258,16 @@ pub(crate) fn read_untyped_operand_as(
 /// Whether `expr` takes its type from the value it is compared with: a string
 /// literal, or a parameter. A parameter that stands for a column, such as a
 /// foreign key's parent key, carries the column's type or collation and holds
-/// the column's value.
-fn is_untyped_operand(expr: &ast::Expr) -> bool {
-    match expr {
+/// the column's value. Parentheses don't change this: `('10:00')` is a string
+/// literal too.
+fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
+    Ok(match unwrap_parens(expr)? {
         ast::Expr::Literal(ast::Literal::String(_)) => true,
         ast::Expr::Variable(variable) => {
             variable.custom_type.is_none() && variable.col_collation.is_none()
         }
         _ => false,
-    }
+    })
 }
 
 /// Whether a string literal or parameter compared with a value of `resolved`
@@ -222,12 +298,7 @@ pub(crate) fn emit_untyped_operand_store(
         reg,
         target_pc: skip_null,
     });
-    for type_def in &resolved.chain {
-        if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
-    }
-    program.emit_insn(convert_to_base(resolved, reg)?);
+    emit_store_value(program, resolved, reg, Coerce::Skip, resolver)?;
     program.preassign_label_to_next_insn(skip_null);
     Ok(())
 }
@@ -407,37 +478,30 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
+/// Whether storing a value runs the type's COERCE.
+#[derive(Clone, Copy)]
+pub(crate) enum Coerce<'a> {
+    /// Run COERCE with these arguments, the ones written after the type name,
+    /// such as `10, 2` in `numeric(10, 2)`.
+    WithArgs(&'a [Box<ast::Expr>]),
+    /// Don't run COERCE: the value is only compared with values of the type.
+    Skip,
+}
+
 /// Emits what storing the value in `reg` as a value of `resolved` runs: each
-/// type's ENCODE, then its COERCE with `type_params`, the arguments written
-/// after the type name. The result is converted to the kind of the type's
-/// BASE as a STRICT column of the BASE converts it, so a type BASE integer
-/// whose ENCODE gives '5' stores 5, and one whose ENCODE gives 'abc' is an
-/// error. COERCE sees the converted value too. A CAST runs the same.
+/// type's ENCODE, then its COERCE unless `coerce` is [Coerce::Skip]. The
+/// result is converted to the kind of the type's BASE as a STRICT column of
+/// the BASE converts it, so a type BASE integer whose ENCODE gives '5' stores
+/// 5, and one whose ENCODE gives 'abc' is an error. COERCE sees the converted
+/// value too. A CAST runs the same.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
     reg: usize,
-    type_params: &[Box<ast::Expr>],
+    coerce: Coerce,
     resolver: &Resolver,
 ) -> Result<()> {
-    let convert = convert_to_base(resolved, reg)?;
-    for type_def in &resolved.chain {
-        if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
-        if let Some(coerce) = coerce_to_run(type_def, type_params) {
-            program.emit_insn(convert.clone());
-            emit_coerce(program, type_def, coerce, reg, type_params, resolver)?;
-        }
-    }
-    program.emit_insn(convert);
-    Ok(())
-}
-
-/// Converts the value in `reg` to the kind of `resolved`'s BASE, as a STRICT
-/// column of the BASE converts it.
-fn convert_to_base(resolved: &ResolvedType, reg: usize) -> Result<Insn> {
-    Ok(Insn::ConvertToType {
+    let convert = Insn::ConvertToType {
         reg,
         storage_class: resolved.storage_class()?,
         description: format!(
@@ -445,7 +509,22 @@ fn convert_to_base(resolved: &ResolvedType, reg: usize) -> Result<Insn> {
             resolved.leaf().name,
             resolved.primitive.to_uppercase()
         ),
-    })
+    };
+    for type_def in &resolved.chain {
+        if let Some(encode) = type_def.encode() {
+            emit_type_expr(program, encode, reg, reg, resolver)?;
+        }
+        let type_params = match coerce {
+            Coerce::WithArgs(type_params) => type_params,
+            Coerce::Skip => continue,
+        };
+        if let Some(coerce_expr) = coerce_to_run(type_def, type_params) {
+            program.emit_insn(convert.clone());
+            emit_coerce(program, type_def, coerce_expr, reg, type_params, resolver)?;
+        }
+    }
+    program.emit_insn(convert);
+    Ok(())
 }
 
 /// Emits what comparing the value in `reg` with stored values of `chain`'s

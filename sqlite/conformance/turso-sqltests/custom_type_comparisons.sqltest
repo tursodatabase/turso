@@ -1646,3 +1646,62 @@ test cmp-time-row-value-with-invalid-text-is-an-error {
 expect error {
     invalid time value
 }
+
+@requires strict "uses STRICT tables"
+test cmp-time-with-parenthesized-text {
+    -- As in PostgreSQL, parentheses don't change a literal: ('10:00') is
+    -- read as the time 10:00:00 like '10:00'. Each query runs before and
+    -- after the index exists.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO t VALUES (1, '09:30:00'), (2, '10:00:00'), (3, '11:00:00');
+    SELECT 'eq', id FROM t WHERE tm = ('10:00') ORDER BY id;
+    SELECT 'eq-nested', id FROM t WHERE ((('10:00'))) = tm ORDER BY id;
+    SELECT 'lt', id FROM t WHERE tm < ('10:00') ORDER BY id;
+    SELECT 'in', id FROM t WHERE tm IN (('10:00'), ('11:00')) ORDER BY id;
+    CREATE INDEX t_tm ON t(tm);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE tm = ('10:00');
+    SELECT 'eq', id FROM t WHERE tm = ('10:00') ORDER BY id;
+    SELECT 'eq-nested', id FROM t WHERE ((('10:00'))) = tm ORDER BY id;
+    SELECT 'lt', id FROM t WHERE tm < ('10:00') ORDER BY id;
+    SELECT 'in', id FROM t WHERE tm IN (('10:00'), ('11:00')) ORDER BY id;
+}
+expect {
+    eq|2
+    eq-nested|2
+    lt|1
+    in|2
+    in|3
+    1|0|0|SEARCH t USING COVERING INDEX t_tm (tm=?)
+    eq|2
+    eq-nested|2
+    lt|1
+    in|2
+    in|3
+}
+
+@requires strict "uses STRICT tables"
+test cmp-time-min-max-with-text {
+    -- As PostgreSQL's least and greatest do, a scalar min or max reads a text
+    -- argument as a value of the custom type of its other arguments:
+    -- min(tm, '10:00') is the time 10:00:00 when tm is later.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO t VALUES (1, '09:30:00'), (2, '11:00:00');
+    SELECT id, min(tm, '10:00'), max(tm, '10:00'), min('10:00', tm, '09:45') FROM t ORDER BY id;
+    SELECT id FROM t WHERE max(tm, '10:00') = '10:00' ORDER BY id;
+}
+expect {
+    1|09:30:00|10:00:00|09:30:00
+    2|10:00:00|11:00:00|09:45:00
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-min-with-text-and-two-custom-types-is-an-error {
+    -- A text compared with a time and a date has no single type to be read as.
+    CREATE TABLE t(tm time, d date) STRICT;
+    INSERT INTO t VALUES ('10:00:00', '2024-01-02');
+    SELECT min(tm, d, '10:00') FROM t;
+}
+expect error {
+    cannot tell which type to read a string literal or parameter as
+}
