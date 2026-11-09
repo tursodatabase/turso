@@ -222,3 +222,16 @@ test datetime-compare-date-month-name-index {
 expect {
     1
 }
+
+# With the session time zone UTC, a timestamp equals the timestamptz of the
+# same wall-clock time.
+@requires strict "uses STRICT tables"
+test datetime-timestamp-equals-timestamptz {
+    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
+    SELECT id FROM t WHERE ts = tz;
+}
+expect {
+    1
+}

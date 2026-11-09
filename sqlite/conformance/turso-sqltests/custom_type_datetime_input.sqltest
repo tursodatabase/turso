@@ -14,10 +14,10 @@ test datetime-input-postgresql-forms {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00+00
-    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
-    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00+00
-    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00+00
+    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00
+    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
+    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00
+    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00
 }
 
 @requires custom_types "date and time types are custom types"
@@ -37,9 +37,9 @@ test datetime-input-keeps-microseconds {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456+00
-    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5+00
-    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00+00
+    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456
+    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5
+    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00
 }
 
 @requires strict "uses STRICT tables"
@@ -63,8 +63,8 @@ test datetime-input-offsets {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
-    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00+00
+    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
+    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00
 }
 
 @requires strict "uses STRICT tables"
@@ -265,4 +265,28 @@ expect {
     1
     2
     3
+}
+
+# timestamptz is stored as the UTC instant with no offset, so it equals the
+# same timestamp and SQLite's date functions can read it.
+@requires strict "uses STRICT tables"
+test datetime-timestamp-equals-timestamptz {
+    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
+    SELECT id FROM t WHERE ts = tz;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-sqlite-date-functions {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 10:00:00'), ('2024-01-05 12:00:00+02');
+    SELECT datetime(tz), date(tz), unixepoch(tz) FROM t;
+}
+expect {
+    2024-01-05 10:00:00|2024-01-05|1704448800
+    2024-01-05 10:00:00|2024-01-05|1704448800
 }

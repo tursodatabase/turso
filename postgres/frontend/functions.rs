@@ -1116,19 +1116,13 @@ fn exec_age(args: &[Register]) -> Result<Value> {
 }
 
 /// Reads a timestamp in the form the timestamp type stores, `YYYY-MM-DD
-/// HH:MM:SS[.f]`, the form the timestamptz type stores, the same in UTC
-/// followed by `+00`, or a date in the form the date type stores,
-/// `YYYY-MM-DD`, as midnight of that day, since PostgreSQL casts a date to a
-/// timestamp.
+/// HH:MM:SS[.f]` (the timestamptz type stores the same form, in UTC), or a
+/// date in the form the date type stores, `YYYY-MM-DD`, as midnight of that
+/// day, since PostgreSQL casts a date to a timestamp.
 fn parse_timestamp(text: &str) -> Result<NaiveDateTime> {
-    let text_in_utc = match text.strip_suffix("+00") {
-        Some(timestamp) => timestamp,
-        None => text,
-    };
-    NaiveDateTime::parse_from_str(text_in_utc, "%Y-%m-%d %H:%M:%S%.f")
+    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| {
-            NaiveDate::parse_from_str(text_in_utc, "%Y-%m-%d")
-                .map(|date| date.and_time(NaiveTime::MIN))
+            NaiveDate::parse_from_str(text, "%Y-%m-%d").map(|date| date.and_time(NaiveTime::MIN))
         })
         .map_err(|_| {
             LimboError::InvalidArgument(format!(

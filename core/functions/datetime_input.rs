@@ -2,7 +2,8 @@
 //! `timestamp_in` and `timestamptz_in` do, for the ENCODE of the built-in
 //! types of the same names. Each value is written in one fixed text form, with
 //! a 4-digit year, so the stored texts sort in time order:
-//! `2024-01-05`, `10:00:00.5`, `2024-01-05 10:00:00.5`, `2024-01-05 08:00:00+00`.
+//! `2024-01-05`, `10:00:00.5`, `2024-01-05 10:00:00.5`. A timestamptz is
+//! written as the same form in UTC, without an offset.
 //!
 //! The input is split into fields as PostgreSQL's `ParseDateTime` does and the
 //! fields are read as its `DecodeDateTime` does, for a subset of its forms.
@@ -305,9 +306,6 @@ impl Fields {
             + i64::from(timestamp.nanosecond() / 1000);
         let mut out = timestamp.format("%Y-%m-%d ").to_string();
         push_time(&mut out, time);
-        if ty == TemporalType::Timestamptz {
-            out.push_str("+00");
-        }
         Ok(out)
     }
 }
@@ -448,7 +446,7 @@ mod tests {
             ("2024-01-05 10:00", "time", "10:00:00"),
             ("9:5", "time", "09:05:00"),
             ("12:30 PM", "time", "12:30:00"),
-            ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00+00"),
+            ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00"),
         ];
         for (input, ty, expected) in cases {
             assert_eq!(
