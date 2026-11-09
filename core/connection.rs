@@ -3181,6 +3181,17 @@ impl Connection {
         self.db.dialect()
     }
 
+    /// Whether a statement of this connection finds a function for a call
+    /// of `name` with `arg_count` arguments: a function of the dialect, or a
+    /// function that an extension registers.
+    pub fn has_function(&self, name: &str, arg_count: usize) -> bool {
+        match self.dialect().resolve_function(name, arg_count) {
+            Ok(Some(_)) => true,
+            Ok(None) => self.syms.read().resolve_function(name, arg_count).is_some(),
+            Err(_) => false,
+        }
+    }
+
     pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
     where
         T: crate::vtab::InternalVirtualTable + 'static,

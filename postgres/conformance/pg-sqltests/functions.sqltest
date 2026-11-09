@@ -1956,7 +1956,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    ^function row_to_json\(\) is not supported$
+    ^a reference to the whole row of "x" is not supported$
 }
 
 # Function calls that PostgreSQL rejects. tursopg gives the same SQLSTATE,
@@ -2112,4 +2112,44 @@ expect error {
 @sqlstate 42883
 expect @tursopg error {
     ^no such function: row_to_json$
+}
+
+# Each call is checked on its own: a good call of a function does not make
+# another call of the same function good.
+test call-with-a-wrong-number-of-arguments-next-to-a-good-call-is-rejected {
+    SELECT upper('a'), upper('a', 'b');
+}
+@sqlstate 42883
+expect error {
+    ^function upper\(unknown, unknown\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^wrong number of arguments to function upper\(\)$
+}
+
+test call-of-a-function-that-tursopg-does-not-have-with-an-argument-of-a-wrong-type-is-rejected {
+    SELECT pg_size_pretty(true), pg_size_pretty(1::bigint);
+}
+@sqlstate 42883
+expect error {
+    ^function pg_size_pretty\(boolean\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^no such function: pg_size_pretty$
+}
+
+# A call of a function that tursopg does not have fails after the other
+# checks of the statement.
+test call-of-a-function-that-tursopg-does-not-have-next-to-a-missing-function-is-rejected {
+    SELECT pg_size_pretty(1::bigint), missing_function(1);
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^no such function: missing_function$
 }

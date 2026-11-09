@@ -37,10 +37,6 @@ pub struct TranslateResult {
     /// for the feature. Prepare `cmd` to find its other errors first, and
     /// then report this error.
     pub unsupported: Option<ParseError>,
-    /// The names, as core sees them, of the function calls that a built-in
-    /// function of PostgreSQL accepts. When core has no function for such a
-    /// call, the call is of a function that tursopg does not support.
-    pub postgres_calls: std::collections::HashSet<String>,
 }
 
 /// The sequence of a serial column of a CREATE TABLE statement.
@@ -60,6 +56,9 @@ pub struct SerialSequence {
 /// Whether a schema, by name, has a relation of a name.
 type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
+/// Whether core has a function of a name for a number of arguments.
+type FunctionCheck = Box<dyn Fn(&str, usize) -> bool>;
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
@@ -67,7 +66,8 @@ pub struct PostgreSQLTranslator {
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
     unsupported: std::cell::RefCell<Option<ParseError>>,
-    postgres_calls: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// None when nothing is known about the functions of core, as in tests.
+    function_exists: Option<FunctionCheck>,
 }
 
 impl PostgreSQLTranslator {
@@ -82,6 +82,14 @@ impl PostgreSQLTranslator {
         is_taken: impl Fn(&str, &str) -> bool + 'static,
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
+    }
+
+    /// A translator that asks `exists(name, arg_count)` whether core has the
+    /// function of a call, so that a call of a function that only
+    /// PostgreSQL has fails as not supported.
+    pub fn with_function_check(mut self, exists: impl Fn(&str, usize) -> bool + 'static) -> Self {
+        self.function_exists = Some(Box::new(exists));
         self
     }
 
@@ -188,7 +196,6 @@ impl PostgreSQLTranslator {
     ) -> Result<TranslateResult, ParseError> {
         let mut translated = self.translate_command(parse_result)?;
         translated.unsupported = self.unsupported.take();
-        translated.postgres_calls = self.postgres_calls.take();
         Ok(translated)
     }
 
@@ -208,7 +215,6 @@ impl PostgreSQLTranslator {
                 postreqs: translated.postreqs,
                 serial_sequences: translated.serial_sequences,
                 unsupported: None,
-                postgres_calls: Default::default(),
             });
         }
 
@@ -223,7 +229,6 @@ impl PostgreSQLTranslator {
             postreqs: vec![],
             serial_sequences: vec![],
             unsupported: None,
-            postgres_calls: Default::default(),
         })
     }
 
@@ -589,7 +594,6 @@ impl PostgreSQLTranslator {
             postreqs,
             serial_sequences,
             unsupported: None,
-            postgres_calls: Default::default(),
         })
     }
 
@@ -4168,19 +4172,7 @@ impl PostgreSQLTranslator {
             }
         }
         self.defer(error);
-        args.push(Box::new(ast::Expr::Literal(ast::Literal::Null)));
-        args.push(Box::new(ast::Expr::Literal(ast::Literal::Null)));
-        Ok(Some(ast::Expr::FunctionCall {
-            name: exact_name("coalesce"),
-            distinctness: None,
-            args,
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        }))
+        Ok(Some(placeholder_call(args)))
     }
 
     fn translate_func_call(
@@ -4226,8 +4218,6 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let postgres_accepts = postgres_accepts_call(func_call, &func_name);
-
         // Translate function arguments
         let args = func_call
             .args
@@ -4251,6 +4241,7 @@ impl PostgreSQLTranslator {
         // regular function call with operands already in `(haystack, needle)`
         // order — the same shape SQLite's `instr` and PostgreSQL's `strpos`
         // take — so the rewrite is purely a name change.
+        let postgres_name = func_name.clone();
         let func_name = match func_name.as_str() {
             "position" => "strpos".to_string(),
             _ => func_name,
@@ -4325,8 +4316,19 @@ impl PostgreSQLTranslator {
             (translated_order, vec![])
         };
 
-        if postgres_accepts {
-            self.postgres_calls.borrow_mut().insert(func_name.clone());
+        if self.lacks_function(&func_name, args.len())
+            && postgres_accepts_call(func_call, &postgres_name)
+        {
+            self.defer(not_supported(format!("function {func_name}()")));
+            let mut values = args;
+            values.extend(
+                order_by
+                    .into_iter()
+                    .chain(within_group)
+                    .map(|column| column.expr),
+            );
+            values.extend(filter_over.filter_clause);
+            return Ok(placeholder_call(values));
         }
         Ok(ast::Expr::FunctionCall {
             name: exact_name(func_name),
@@ -4336,6 +4338,15 @@ impl PostgreSQLTranslator {
             within_group,
             filter_over,
         })
+    }
+
+    /// Whether core has no function for a call of `name` with `arg_count`
+    /// arguments. False when the translator knows nothing about the
+    /// functions of core.
+    fn lacks_function(&self, name: &str, arg_count: usize) -> bool {
+        self.function_exists
+            .as_ref()
+            .is_some_and(|exists| !exists(name, arg_count))
     }
 
     /// Translate the WINDOW clause (named window definitions) from a SELECT statement.
@@ -8274,6 +8285,26 @@ fn set_returning_call_error(
     } else {
         missing_function_error(name, &types, &[])
     })
+}
+
+/// The placeholder for a call that tursopg cannot run:
+/// `coalesce(<values>, NULL, NULL)`, so that core finds the errors of the
+/// values and of the rest of the statement first.
+fn placeholder_call(values: impl IntoIterator<Item = Box<ast::Expr>>) -> ast::Expr {
+    let mut args: Vec<_> = values.into_iter().collect();
+    args.push(Box::new(ast::Expr::Literal(ast::Literal::Null)));
+    args.push(Box::new(ast::Expr::Literal(ast::Literal::Null)));
+    ast::Expr::FunctionCall {
+        name: exact_name("coalesce"),
+        distinctness: None,
+        args,
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
 }
 
 /// Whether a built-in function of PostgreSQL accepts the call, as far as
