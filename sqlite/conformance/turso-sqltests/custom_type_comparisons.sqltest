@@ -1705,3 +1705,58 @@ test cmp-min-with-text-and-two-custom-types-is-an-error {
 expect error {
     cannot tell which type to read a string literal or parameter as
 }
+
+@requires strict "uses STRICT tables"
+test cmp-time-returned-text-is-read-as-time {
+    -- As in PostgreSQL, an expression that returns one of its values (COALESCE,
+    -- CASE results) reads a string literal among them as their common type:
+    -- coalesce(tm, '00:00') on a time column is the time 00:00:00, so it
+    -- equals '00:00'. Each query runs before and after the expression indexes
+    -- exist.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO t VALUES (1, '10:00:00'), (2, NULL);
+    SELECT id, coalesce(tm, '00:00'), ifnull(tm, '00:00'), iif(tm IS NULL, '00:00', tm), CASE WHEN tm IS NULL THEN '00:00' ELSE tm END FROM t ORDER BY id;
+    SELECT 'coalesce', id FROM t WHERE coalesce(tm, '00:00') = '00:00';
+    SELECT 'ifnull', id FROM t WHERE ifnull(tm, '00:00') = '00:00';
+    SELECT 'iif', id FROM t WHERE iif(tm IS NULL, '00:00', tm) = '00:00';
+    SELECT 'case', id FROM t WHERE CASE WHEN tm IS NULL THEN '00:00' ELSE tm END = '00:00';
+    CREATE INDEX t_coalesce ON t(coalesce(tm, '00:00'));
+    CREATE INDEX t_ifnull ON t(ifnull(tm, '00:00'));
+    CREATE INDEX t_iif ON t(iif(tm IS NULL, '00:00', tm));
+    CREATE INDEX t_case ON t(CASE WHEN tm IS NULL THEN '00:00' ELSE tm END);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE coalesce(tm, '00:00') = '00:00';
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE ifnull(tm, '00:00') = '00:00';
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE iif(tm IS NULL, '00:00', tm) = '00:00';
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE CASE WHEN tm IS NULL THEN '00:00' ELSE tm END = '00:00';
+    SELECT 'coalesce', id FROM t WHERE coalesce(tm, '00:00') = '00:00';
+    SELECT 'ifnull', id FROM t WHERE ifnull(tm, '00:00') = '00:00';
+    SELECT 'iif', id FROM t WHERE iif(tm IS NULL, '00:00', tm) = '00:00';
+    SELECT 'case', id FROM t WHERE CASE WHEN tm IS NULL THEN '00:00' ELSE tm END = '00:00';
+}
+expect {
+    1|10:00:00|10:00:00|10:00:00|10:00:00
+    2|00:00:00|00:00:00|00:00:00|00:00:00
+    coalesce|2
+    ifnull|2
+    iif|2
+    case|2
+    1|0|0|SEARCH t USING INDEX t_coalesce (coalesce (tm, '00:00')=?)
+    1|0|0|SEARCH t USING INDEX t_ifnull (ifnull (tm, '00:00')=?)
+    1|0|0|SEARCH t USING INDEX t_iif (iif (tm IS NULL, '00:00', tm)=?)
+    1|0|0|SEARCH t USING INDEX t_case (CASE WHEN tm IS NULL THEN '00:00' ELSE tm END=?)
+    coalesce|2
+    ifnull|2
+    iif|2
+    case|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coalesce-with-text-and-two-custom-types-is-an-error {
+    -- A text among a time and a date has no single type to be read as.
+    CREATE TABLE t(tm time, d date) STRICT;
+    INSERT INTO t VALUES (NULL, NULL);
+    SELECT coalesce(tm, d, '10:00') FROM t;
+}
+expect error {
+    cannot tell which type to read a string literal or parameter as
+}

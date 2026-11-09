@@ -57,10 +57,10 @@ expect error {
 test boolean-null {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
     INSERT INTO t1 VALUES (1, NULL);
-    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
+    SELECT id, val IS NULL FROM t1;
 }
 expect {
-    1|IS_NULL
+    1|1
 }
 
 @requires strict "uses STRICT tables"

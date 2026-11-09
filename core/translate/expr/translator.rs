@@ -641,6 +641,14 @@ fn translate_case_expr(
     // case statement we're processing.
     let base_reg = base.as_ref().map(|_| program.alloc_register());
     let expr_reg = program.alloc_register();
+    let values_type = untyped_values_type(
+        when_then_pairs
+            .iter()
+            .map(|(_, then)| then.as_ref())
+            .chain(else_expr.as_deref()),
+        referenced_tables,
+        resolver,
+    )?;
     if let Some(base_expr) = base {
         translate_expr(
             program,
@@ -710,13 +718,13 @@ fn translate_case_expr(
             }),
         };
         // THEN...
-        translate_expr_no_constant_opt(
+        translate_returned_value(
             program,
             referenced_tables,
             then_expr,
+            values_type.as_ref(),
             target_register,
             resolver,
-            NoConstantOptReason::RegisterReuse,
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: return_label,
@@ -728,13 +736,13 @@ fn translate_case_expr(
     }
     match else_expr {
         Some(expr) => {
-            translate_expr_no_constant_opt(
+            translate_returned_value(
                 program,
                 referenced_tables,
                 expr,
+                values_type.as_ref(),
                 target_register,
                 resolver,
-                NoConstantOptReason::RegisterReuse,
             )?;
         }
         // If ELSE isn't specified, it means ELSE null.
@@ -1352,14 +1360,19 @@ fn translate_function_call_expr(
                     // coalesce function is implemented as a series of not null checks
                     // whenever a not null check succeeds, we jump to the end of the series
                     let label_coalesce_end = program.allocate_label();
+                    let values_type = untyped_values_type(
+                        args.iter().map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
                     for (index, arg) in args.iter().enumerate() {
-                        let reg = translate_expr_no_constant_opt(
+                        let reg = translate_returned_value(
                             program,
                             referenced_tables,
                             arg,
+                            values_type.as_ref(),
                             target_register,
                             resolver,
-                            NoConstantOptReason::RegisterReuse,
                         )?;
                         if index < args.len() - 1 {
                             program.emit_insn(Insn::NotNull {
@@ -1443,14 +1456,19 @@ fn translate_function_call_expr(
                         );
                     }
 
+                    let values_type = untyped_values_type(
+                        args.iter().map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
                     let temp_reg = program.alloc_register();
-                    translate_expr_no_constant_opt(
+                    translate_returned_value(
                         program,
                         referenced_tables,
                         &args[0],
+                        values_type.as_ref(),
                         temp_reg,
                         resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
                     let before_copy_label = program.allocate_label();
                     program.emit_insn(Insn::NotNull {
@@ -1458,13 +1476,13 @@ fn translate_function_call_expr(
                         target_pc: before_copy_label,
                     });
 
-                    translate_expr_no_constant_opt(
+                    translate_returned_value(
                         program,
                         referenced_tables,
                         &args[1],
+                        values_type.as_ref(),
                         temp_reg,
                         resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
                     program.preassign_label_to_next_insn(before_copy_label);
                     program.emit_insn(Insn::Copy {
@@ -1480,6 +1498,11 @@ fn translate_function_call_expr(
 
                     let iif_end_label = program.allocate_label();
                     let condition_reg = program.alloc_register();
+                    let values_type = untyped_values_type(
+                        iif_values(args).map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
 
                     for pair in args.chunks_exact(2) {
                         let condition_expr = &pair[0];
@@ -1501,13 +1524,13 @@ fn translate_function_call_expr(
                             jump_if_null: true,
                         });
 
-                        translate_expr_no_constant_opt(
+                        translate_returned_value(
                             program,
                             referenced_tables,
                             value_expr,
+                            values_type.as_ref(),
                             target_register,
                             resolver,
-                            NoConstantOptReason::RegisterReuse,
                         )?;
                         program.emit_insn(Insn::Goto {
                             target_pc: iif_end_label,
@@ -1517,13 +1540,13 @@ fn translate_function_call_expr(
                     }
 
                     if args.len() % 2 != 0 {
-                        translate_expr_no_constant_opt(
+                        translate_returned_value(
                             program,
                             referenced_tables,
                             args.last().unwrap(),
+                            values_type.as_ref(),
                             target_register,
                             resolver,
-                            NoConstantOptReason::RegisterReuse,
                         )?;
                     } else {
                         program.emit_insn(Insn::Null {

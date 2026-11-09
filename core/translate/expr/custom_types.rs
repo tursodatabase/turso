@@ -114,11 +114,9 @@ pub(crate) fn translate_compared_pair(
     Ok(())
 }
 
-/// Translates the arguments of a scalar min or max, which compares them with
-/// each other, into `start_reg..`. A string literal or parameter is read as a
-/// value of the custom type of the other arguments, as PostgreSQL's least and
-/// greatest read it: on a time column, `min(tm, '10:00')` compares with the
-/// time 10:00:00. See [translate_compared_operand].
+/// Translates the arguments of a scalar min or max into `start_reg..`. Their
+/// string literals and parameters are read as described in
+/// [untyped_values_type].
 pub(crate) fn translate_compared_args(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -126,46 +124,77 @@ pub(crate) fn translate_compared_args(
     start_reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let typed_arg = custom_typed_arg(args, referenced_tables, resolver)?;
+    let values_type = untyped_values_type(
+        args.iter().map(|arg| arg.as_ref()),
+        referenced_tables,
+        resolver,
+    )?;
     for (i, arg) in args.iter().enumerate() {
-        match typed_arg {
-            Some(typed_arg) => translate_compared_operand(
-                program,
-                referenced_tables,
-                arg,
-                typed_arg,
-                start_reg + i,
-                resolver,
-            )?,
-            None => translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?,
-        };
+        let reg = start_reg + i;
+        if !translate_untyped_value(
+            program,
+            referenced_tables,
+            arg,
+            values_type.as_ref(),
+            reg,
+            resolver,
+        )? {
+            translate_expr(program, referenced_tables, arg, reg, resolver)?;
+        }
     }
     Ok(())
 }
 
-/// The argument of a custom type that the string literals and parameters
-/// among `args` are compared with, or None when `args` has no string literal
-/// or parameter, or no argument of a custom type. Arguments of two custom
-/// types leave no single type to read a string literal as, which is an error.
-fn custom_typed_arg<'a>(
-    args: &'a [Box<ast::Expr>],
+/// The type the string literals and parameters among `values` are read as,
+/// where `values` are what an expression returns one of or compares with each
+/// other: the arguments of coalesce, ifnull, min and max, the values of iif,
+/// and the results of CASE. As in PostgreSQL, a string literal or parameter
+/// is read as a value of the values' common type when that is a custom type:
+/// in `coalesce(tm, '00:00')` on a time column, '00:00' is the time 00:00:00.
+/// Values of two custom types leave no single type to read a string literal
+/// as, which is an error. None when nothing is read as a custom type.
+pub(crate) fn untyped_values_type<'e>(
+    values: impl Iterator<Item = &'e ast::Expr> + Clone,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
-) -> Result<Option<&'a ast::Expr>> {
-    if resolver.schema().type_registry.is_empty() {
+) -> Result<Option<ResolvedType>> {
+    let schema = resolver.schema();
+    if schema.type_registry.is_empty() {
         return Ok(None);
     }
-    let mut has_untyped_arg = false;
-    for arg in args {
-        has_untyped_arg |= is_untyped_operand(arg)?;
+    let mut has_untyped_value = false;
+    for value in values.clone() {
+        has_untyped_value |= is_untyped_operand(value)?;
     }
-    if !has_untyped_arg {
+    if !has_untyped_value {
         return Ok(None);
     }
     let env = TypeEnv::new(referenced_tables, resolver);
-    let mut typed: Option<(&ast::Expr, Arc<TypeDef>)> = None;
-    for arg in args {
-        let type_def = match type_of(arg, &env) {
+    let common = common_type(values.clone(), &env);
+    match common {
+        ExprType::Custom { .. } => untyped_operands_read_as(schema, common),
+        ExprType::Array { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        | ExprType::NotKnownYet => {
+            refuse_two_custom_types(values, &env)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Fails when `values` have two different custom types. Called when string
+/// literals or parameters among them would be read as their common type.
+fn refuse_two_custom_types<'e>(
+    values: impl Iterator<Item = &'e ast::Expr>,
+    env: &TypeEnv,
+) -> Result<()> {
+    let mut seen: Option<Arc<TypeDef>> = None;
+    for value in values {
+        let type_def = match type_of(value, env) {
             ExprType::Custom { type_def, .. } => type_def,
             ExprType::Array { .. }
             | ExprType::Builtin(_)
@@ -175,10 +204,10 @@ fn custom_typed_arg<'a>(
             | ExprType::RowValue
             | ExprType::NotKnownYet => continue,
         };
-        match &typed {
-            None => typed = Some((arg.as_ref(), type_def)),
-            Some((_, seen)) if seen.name == type_def.name => {}
-            Some((_, seen)) => crate::bail_parse_error!(
+        match &seen {
+            None => seen = Some(type_def),
+            Some(seen) if seen.name == type_def.name => {}
+            Some(seen) => crate::bail_parse_error!(
                 "cannot tell which type to read a string literal or parameter as: \
                  it is compared with type {} and type {}",
                 seen.name,
@@ -186,7 +215,72 @@ fn custom_typed_arg<'a>(
             ),
         }
     }
-    Ok(typed.map(|(arg, _)| arg))
+    Ok(())
+}
+
+/// Translates `value`, one of the values an expression returns one of (see
+/// [untyped_values_type]), into `reg`, which the other values write too.
+pub(crate) fn translate_returned_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value: &ast::Expr,
+    values_type: Option<&ResolvedType>,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if translate_untyped_value(
+        program,
+        referenced_tables,
+        value,
+        values_type,
+        reg,
+        resolver,
+    )? {
+        return Ok(reg);
+    }
+    translate_expr_no_constant_opt(
+        program,
+        referenced_tables,
+        value,
+        reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )
+}
+
+/// Translates `value` into `reg` if it is a string literal or parameter read
+/// as `values_type` (see [untyped_values_type]), and returns whether it did.
+/// The conversion is computed once in a register of its own and copied into
+/// `reg`, so the other values may write `reg` too.
+pub(crate) fn translate_untyped_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value: &ast::Expr,
+    values_type: Option<&ResolvedType>,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let Some(resolved) = values_type else {
+        return Ok(false);
+    };
+    if !is_untyped_operand(value)? {
+        return Ok(false);
+    }
+    let value_reg = program.alloc_register();
+    translate_untyped_operand_as(
+        program,
+        referenced_tables,
+        value,
+        resolved,
+        value_reg,
+        resolver,
+    )?;
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    Ok(true)
 }
 
 /// Translates the string literal or parameter `operand` into `reg` as a value
@@ -234,7 +328,16 @@ pub(crate) fn read_untyped_operand_as(
     if schema.type_registry.is_empty() || !is_untyped_operand(operand)? {
         return Ok(None);
     }
-    let type_def = match other_type()? {
+    untyped_operands_read_as(schema, other_type()?)
+}
+
+/// The type a string literal or parameter compared with a value of
+/// `other_type` is read as, if it is a string literal or parameter.
+fn untyped_operands_read_as(
+    schema: &crate::schema::Schema,
+    other_type: ExprType,
+) -> Result<Option<ResolvedType>> {
+    let type_def = match other_type {
         ExprType::Custom { type_def, .. } => type_def,
         // An array compares in its own order, which converts the other operand.
         ExprType::Array { .. }

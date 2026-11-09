@@ -133,10 +133,10 @@ test cents-accepts-null {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
     INSERT INTO t VALUES (1, NULL);
-    SELECT COALESCE(amount, 'NULL') FROM t;
+    SELECT amount IS NULL FROM t;
 }
 expect {
-    NULL
+    1
 }
 
 # ============================================================================
