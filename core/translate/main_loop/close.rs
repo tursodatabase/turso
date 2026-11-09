@@ -969,9 +969,13 @@ fn replace_subquery_output(
         Operation::Search(Search::Seek { seek_def, .. }) => {
             operation_uses_subquery |= replace_in_seek(seek_def, subquery_id, new_query_type)?;
         }
-        Operation::Search(Search::InSeek { source, .. }) => {
+        Operation::Search(Search::InSeek { source, prefix, .. }) => {
             operation_uses_subquery |=
                 replace_in_source(source, subquery_id, old_query_type, new_query_type)?;
+            for term in prefix {
+                operation_uses_subquery |=
+                    replace_in_expr(&mut term.expr, subquery_id, new_query_type)?;
+            }
         }
         Operation::MultiIndexScan(scan) => {
             for branch in &mut scan.branches {
