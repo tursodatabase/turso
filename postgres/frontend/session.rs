@@ -452,6 +452,8 @@ fn prepare_statement_inner(
         Some(error) => Err(translation_error(&pg_conn.conn, error.clone())),
         None => Ok(()),
     };
+    let postgres_calls = std::mem::take(&mut translated.postgres_calls);
+    let prepare_error = |error| unsupported_call_error(schema_error(error), &postgres_calls);
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
@@ -467,7 +469,7 @@ fn prepare_statement_inner(
         let inner = pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
-            .map_err(schema_error)?;
+            .map_err(prepare_error)?;
         report_unsupported()?;
         return Ok(crate::Statement::new(inner)
             .with_result_kind(result_kind)
@@ -492,7 +494,7 @@ fn prepare_statement_inner(
     let inner = pg_conn
         .conn
         .prepare_translated_cmd(cmd.clone(), &sql)
-        .map_err(schema_error)?;
+        .map_err(prepare_error)?;
     report_unsupported()?;
     Ok(crate::Statement::with_deferred(
         inner,
@@ -510,6 +512,30 @@ fn prepare_statement_inner(
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
     .with_post_run(post_run))
+}
+
+/// Core reports a call of a function that tursopg does not have as a call
+/// of a missing function. When a built-in function of PostgreSQL accepts
+/// the call, the error is that tursopg does not support the function.
+fn unsupported_call_error(
+    error: LimboError,
+    postgres_calls: &std::collections::HashSet<String>,
+) -> LimboError {
+    let LimboError::ParseError(message) = &error else {
+        return error;
+    };
+    let name = message.strip_prefix("no such function: ").or_else(|| {
+        message
+            .strip_prefix("wrong number of arguments to function ")
+            .and_then(|rest| rest.strip_suffix("()"))
+    });
+    match name {
+        Some(name) if postgres_calls.contains(name) => crate::error::sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("function {name}() is not supported"),
+        ),
+        _ => error,
+    }
 }
 
 /// The objects of the session's database that the checks of statements

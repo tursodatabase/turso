@@ -96,7 +96,8 @@ Some function calls are also rejected with the SQLSTATE `0A000`:
 - `VARIADIC` arguments
 - A set-returning function outside `FROM`, as in `SELECT generate_series(1, 3)`
 - Column notation on an expression, as in `(now()).epoch`
-- A table name used as a value, as in `SELECT count(t) FROM t`, and `t.*` in a function call.
+- A table name used as a value, as in `SELECT count(t) FROM t`, and `t.*` in a function call
+- A call of a built-in function of PostgreSQL 17 that the frontend does not have, as in `SELECT pg_size_pretty(1::bigint)`.
 
 The rest of the statement is checked first. So a statement that PostgreSQL
 rejects gets the SQLSTATE of PostgreSQL, for example `42883` for a call of a

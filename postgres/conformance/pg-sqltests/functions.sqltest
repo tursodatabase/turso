@@ -1934,6 +1934,31 @@ expect @tursopg error {
     ^no such column: t\.\*$
 }
 
+# A call of a built-in function of PostgreSQL that tursopg does not have.
+test call-of-a-function-that-tursopg-does-not-have-is-rejected {
+    SELECT pg_size_pretty(1::bigint);
+}
+expect {
+    1 bytes
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^function pg_size_pretty\(\) is not supported$
+}
+
+test whole-row-reference-with-star-in-a-function-that-tursopg-does-not-have-is-rejected {
+    CREATE TABLE tt (a int, b text);
+    INSERT INTO tt VALUES (1, 'x');
+    SELECT row_to_json(x.*) FROM tt x;
+}
+expect {
+    {"a":1,"b":"x"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^function row_to_json\(\) is not supported$
+}
+
 # Function calls that PostgreSQL rejects. tursopg gives the same SQLSTATE,
 # also for a call that it cannot run: it checks the rest of the statement
 # first, as PostgreSQL does.
@@ -2075,4 +2100,16 @@ expect error {
 @sqlstate 42883
 expect @tursopg error {
     ^wrong number of arguments to function lower\(\)$
+}
+
+test call-of-a-function-that-tursopg-does-not-have-with-a-wrong-number-of-arguments-is-rejected {
+    SELECT row_to_json();
+}
+@sqlstate 42883
+expect error {
+    ^function row_to_json\(\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^no such function: row_to_json$
 }

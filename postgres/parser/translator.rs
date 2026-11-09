@@ -37,6 +37,10 @@ pub struct TranslateResult {
     /// for the feature. Prepare `cmd` to find its other errors first, and
     /// then report this error.
     pub unsupported: Option<ParseError>,
+    /// The names, as core sees them, of the function calls that a built-in
+    /// function of PostgreSQL accepts. When core has no function for such a
+    /// call, the call is of a function that tursopg does not support.
+    pub postgres_calls: std::collections::HashSet<String>,
 }
 
 /// The sequence of a serial column of a CREATE TABLE statement.
@@ -63,6 +67,7 @@ pub struct PostgreSQLTranslator {
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
     unsupported: std::cell::RefCell<Option<ParseError>>,
+    postgres_calls: std::cell::RefCell<std::collections::HashSet<String>>,
 }
 
 impl PostgreSQLTranslator {
@@ -183,6 +188,7 @@ impl PostgreSQLTranslator {
     ) -> Result<TranslateResult, ParseError> {
         let mut translated = self.translate_command(parse_result)?;
         translated.unsupported = self.unsupported.take();
+        translated.postgres_calls = self.postgres_calls.take();
         Ok(translated)
     }
 
@@ -202,6 +208,7 @@ impl PostgreSQLTranslator {
                 postreqs: translated.postreqs,
                 serial_sequences: translated.serial_sequences,
                 unsupported: None,
+                postgres_calls: Default::default(),
             });
         }
 
@@ -216,6 +223,7 @@ impl PostgreSQLTranslator {
             postreqs: vec![],
             serial_sequences: vec![],
             unsupported: None,
+            postgres_calls: Default::default(),
         })
     }
 
@@ -581,6 +589,7 @@ impl PostgreSQLTranslator {
             postreqs,
             serial_sequences,
             unsupported: None,
+            postgres_calls: Default::default(),
         })
     }
 
@@ -4217,6 +4226,8 @@ impl PostgreSQLTranslator {
             });
         }
 
+        let postgres_accepts = postgres_accepts_call(func_call, &func_name);
+
         // Translate function arguments
         let args = func_call
             .args
@@ -4314,6 +4325,9 @@ impl PostgreSQLTranslator {
             (translated_order, vec![])
         };
 
+        if postgres_accepts {
+            self.postgres_calls.borrow_mut().insert(func_name.clone());
+        }
         Ok(ast::Expr::FunctionCall {
             name: exact_name(func_name),
             distinctness,
@@ -8260,6 +8274,16 @@ fn set_returning_call_error(
     } else {
         missing_function_error(name, &types, &[])
     })
+}
+
+/// Whether a built-in function of PostgreSQL accepts the call, as far as
+/// the types of its arguments are known.
+fn postgres_accepts_call(func_call: &pg_query::protobuf::FuncCall, name: &str) -> bool {
+    let types = argument_types(&func_call.args);
+    let accepted = crate::builtins::matching_functions(name, &types, &[])
+        .next()
+        .is_some();
+    accepted
 }
 
 /// The types of the arguments of a call, by their names in pg_type, as far
