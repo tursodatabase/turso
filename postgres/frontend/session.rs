@@ -560,36 +560,23 @@ impl RoutineCatalog for SessionCatalog<'_> {
                             })
                             .collect()
                     };
-                    if let Some(table) = catalog.get_table(ns, name) {
-                        let kind = if catalog.is_materialized_view(ns, name) {
-                            RelationKind::MaterializedView
-                        } else {
-                            RelationKind::Table
-                        };
-                        return Some(Relation {
-                            kind,
-                            columns: columns(table.columns()),
-                        });
-                    }
-                    if let Some(view) = catalog.get_view(ns, name) {
-                        return Some(Relation {
-                            kind: RelationKind::View,
-                            columns: columns(&view.columns),
-                        });
-                    }
-                    if catalog.has_sequence(ns, name) {
-                        return Some(Relation {
-                            kind: RelationKind::Sequence,
-                            columns: Vec::new(),
-                        });
-                    }
-                    catalog
-                        .indexes(ns)
-                        .any(|index| index.name.eq_ignore_ascii_case(name))
-                        .then(|| Relation {
-                            kind: RelationKind::Index,
-                            columns: Vec::new(),
-                        })
+                    let relation = |kind, columns| Relation { kind, columns };
+                    Some(match catalog.relation_kind(ns, name)? {
+                        ast::RelationKind::Table => relation(
+                            RelationKind::Table,
+                            columns(catalog.get_table(ns, name)?.columns()),
+                        ),
+                        ast::RelationKind::MaterializedView => relation(
+                            RelationKind::MaterializedView,
+                            columns(catalog.get_table(ns, name)?.columns()),
+                        ),
+                        ast::RelationKind::View => relation(
+                            RelationKind::View,
+                            columns(&catalog.get_view(ns, name)?.columns),
+                        ),
+                        ast::RelationKind::Sequence => relation(RelationKind::Sequence, Vec::new()),
+                        ast::RelationKind::Index => relation(RelationKind::Index, Vec::new()),
+                    })
                 })
             })
     }
