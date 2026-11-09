@@ -406,7 +406,10 @@ impl SchemaIntrospector {
             Some(db_name) => format!("PRAGMA {db_name}.index_list(\"{table_name}\")"),
             None => format!("PRAGMA index_list(\"{table_name}\")"),
         };
-        let mut indexes = Vec::new();
+        // Read the whole index list first: the connection runs one statement
+        // at a time, so PRAGMA index_info cannot run while this query is in
+        // progress.
+        let mut listed = Vec::new();
         let mut rows = conn
             .query(&query)
             .context("Failed to query index info")?
@@ -430,12 +433,16 @@ impl SchemaIntrospector {
             {
                 return Ok(());
             }
+            listed.push((name, unique));
+            Ok(())
+        })
+        .context("Failed to iterate index_list")?;
+        drop(rows);
 
-            let columns = Self::get_index_columns_turso(conn, db_name, &name).map_err(|err| {
-                turso_core::LimboError::InternalError(format!(
-                    "Failed to introspect index columns for {name}: {err}"
-                ))
-            })?;
+        let mut indexes = Vec::new();
+        for (name, unique) in listed {
+            let columns = Self::get_index_columns_turso(conn, db_name, &name)
+                .with_context(|| format!("Failed to introspect index columns for {name}"))?;
             let mut index = Index::new(name, table_name.to_string(), columns);
             if unique {
                 index = index.unique();
@@ -444,9 +451,7 @@ impl SchemaIntrospector {
                 index = index.in_database(db_name.to_string());
             }
             indexes.push(index);
-            Ok(())
-        })
-        .context("Failed to iterate index_list")?;
+        }
 
         Ok(indexes)
     }
