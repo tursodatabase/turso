@@ -1320,8 +1320,9 @@ fn query_pragma(
         }
         PragmaName::ForeignKeyCheck => {
             let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name),
-                _ => None,
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_string()),
+                Some(other) => Some(other.to_string()),
+                None => None,
             };
             let mut check_namespace = namespace;
             if let Some(table_name) = &table_name {
@@ -1329,7 +1330,7 @@ fn query_pragma(
                     resolver,
                     namespace,
                     schema_was_explicit,
-                    table_name.as_str(),
+                    table_name,
                 )?;
             }
             translate_foreign_key_check(
@@ -1337,7 +1338,7 @@ fn query_pragma(
                 resolver,
                 check_namespace.database_id,
                 check_namespace.id,
-                table_name.as_ref().map(|name| name.as_str()),
+                table_name.as_deref(),
             )?;
 
             let pragma_meta = pragma_for(&pragma);

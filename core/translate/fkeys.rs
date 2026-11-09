@@ -350,7 +350,7 @@ fn copy_with_affinity(
 /// Build an unpacked key for opcodes that require adjacent registers; rowid aliases
 /// may resolve outside the compact column block.
 #[inline]
-fn copy_context_columns_with_affinity(
+pub(crate) fn copy_context_columns_with_affinity(
     program: &mut ProgramBuilder,
     dml_ctx: &DmlColumnContext,
     column_positions: &[usize],

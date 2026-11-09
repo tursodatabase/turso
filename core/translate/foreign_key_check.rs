@@ -1,10 +1,10 @@
-use std::num::NonZeroUsize;
-
 use crate::alloc::{vec, Arc, TursoIteratorExt, Vec};
 use crate::namespace::NamespaceId;
-use crate::schema::{BTreeTable, FkCheckItem, FkCheckParent, Schema, Table};
+use crate::schema::{BTreeTable, FkCheckItem, FkCheckParent, Index, Schema, Table};
 use crate::translate::emitter::{emit_columns_and_dependencies, Resolver};
-use crate::translate::fkeys::{build_index_affinity_string, open_read_index, open_read_table};
+use crate::translate::fkeys::{
+    copy_context_columns_with_affinity, open_read_index, open_read_table,
+};
 use crate::vdbe::{builder::ProgramBuilder, insn::Insn};
 use crate::{LimboError, Result};
 
@@ -91,7 +91,8 @@ enum OpenParent {
     },
     Index {
         cursor_id: usize,
-        affinities: String,
+        parent_tbl: Arc<BTreeTable>,
+        index: Arc<Index>,
     },
 }
 
@@ -112,7 +113,8 @@ fn emit_check_of_child(
             },
             FkCheckParent::Index { parent_tbl, index } => OpenParent::Index {
                 cursor_id: open_read_index(program, index, database_id),
-                affinities: build_index_affinity_string(index, parent_tbl),
+                parent_tbl: parent_tbl.clone(),
+                index: index.clone(),
             },
         })
         .try_collect()?;
@@ -177,22 +179,17 @@ fn emit_check_of_child(
             }
             OpenParent::Index {
                 cursor_id,
-                affinities,
+                parent_tbl,
+                index,
             } => {
                 let key_len = item.child_pos.len();
-                let key_start = program.alloc_registers(key_len);
-                for (i, &pos) in item.child_pos.iter().enumerate() {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: columns.to_column_reg(pos),
-                        dst_reg: key_start + i,
-                        extra_amount: 0,
-                    });
-                }
-                program.emit_insn(Insn::Affinity {
-                    start_reg: key_start,
-                    count: NonZeroUsize::new(key_len).expect("a foreign key has columns"),
-                    affinities: affinities.clone(),
-                });
+                let key_start = copy_context_columns_with_affinity(
+                    program,
+                    &columns,
+                    &item.child_pos,
+                    index,
+                    parent_tbl,
+                );
                 program.emit_insn(Insn::Found {
                     cursor_id: *cursor_id,
                     target_pc: next_fk,

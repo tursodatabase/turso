@@ -4680,6 +4680,14 @@ impl Schema {
         for (fkid, fk) in foreign_keys.into_iter().enumerate() {
             let parent_name = normalize_ident(&fk.parent_table);
             let Some(parent_tbl) = self.get_btree_table(fk.parent_namespace, &parent_name) else {
+                if self.get_table(fk.parent_namespace, &parent_name).is_some()
+                    || self.get_view(fk.parent_namespace, &parent_name).is_some()
+                    || self
+                        .get_materialized_view(fk.parent_namespace, &parent_name)
+                        .is_some()
+                {
+                    return Err(fk_mismatch_err(&child.name, &parent_name));
+                }
                 let mut child_pos = Vec::try_with_capacity_ext(fk.child_columns.len())?;
                 for column_name in fk.child_columns.iter() {
                     let (pos, _) = child

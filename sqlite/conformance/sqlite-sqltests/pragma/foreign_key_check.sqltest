@@ -222,3 +222,24 @@ test pragma-foreign-key-check-mismatch-in-other-table-ignored-by-name {
 expect {
     good|1|good_parent|0
 }
+
+test pragma-foreign-key-check-view-as-parent {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE VIEW pv AS SELECT * FROM t;
+    CREATE TABLE child(a REFERENCES pv(id));
+    INSERT INTO child VALUES (1);
+    PRAGMA foreign_key_check;
+}
+expect error {
+    foreign key mismatch - "child" referencing "pv"
+}
+
+test pragma-foreign-key-check-number-argument {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(a REFERENCES parent);
+    INSERT INTO child VALUES (1);
+    PRAGMA foreign_key_check(1);
+}
+expect error {
+    no such table: 1
+}
