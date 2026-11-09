@@ -1,10 +1,12 @@
 # CREATE FUNCTION and the other statements about functions, procedures and
 # function calls.
 #
-# tursopg does not support user-defined functions yet. A test shows what
-# PostgreSQL does, and the error that tursopg gives for the first feature of
-# the statement that tursopg does not support. When tursopg supports a
-# feature, the tursopg error of the tests for that feature goes away.
+# tursopg does not support user-defined functions yet. For a statement that
+# PostgreSQL rejects, tursopg gives the same SQLSTATE. For a statement that
+# PostgreSQL accepts, a test shows what PostgreSQL does, and the error that
+# tursopg gives for the first feature of the statement that tursopg does not
+# support. When tursopg supports a feature, the tursopg error of the tests
+# for that feature goes away.
 
 @database :memory:
 
@@ -29,16 +31,12 @@ expect @tursopg error {
     ^CREATE PROCEDURE is not supported$
 }
 
-test call-is-rejected {
+test call-of-a-missing-procedure-is-rejected {
     CALL missing_procedure();
 }
 @sqlstate 42883
 expect error {
     ^procedure missing_procedure\(\) does not exist$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^CALL is not supported$
 }
 
 test do-is-rejected {
@@ -53,76 +51,52 @@ expect @tursopg error {
     ^DO is not supported$
 }
 
-test alter-function-is-rejected {
+test alter-function-of-a-missing-function-is-rejected {
     ALTER FUNCTION missing_function(int) STABLE;
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(integer\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER FUNCTION is not supported$
-}
 
-test alter-function-rename-is-rejected {
+test alter-function-rename-of-a-missing-function-is-rejected {
     ALTER FUNCTION missing_function(int) RENAME TO other_function;
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(integer\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER FUNCTION is not supported$
-}
 
-test alter-function-owner-is-rejected {
-    ALTER FUNCTION missing_function(int) OWNER TO postgres;
+test alter-function-owner-of-a-missing-function-is-rejected {
+    ALTER FUNCTION missing_function(int) OWNER TO CURRENT_USER;
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(integer\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER FUNCTION is not supported$
-}
 
-test alter-function-set-schema-is-rejected {
+test alter-function-set-schema-of-a-missing-function-is-rejected {
     ALTER FUNCTION missing_function(int) SET SCHEMA public;
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(integer\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER FUNCTION is not supported$
-}
 
-test alter-procedure-is-rejected {
+test alter-procedure-of-a-missing-procedure-is-rejected {
     ALTER PROCEDURE missing_procedure() SECURITY DEFINER;
 }
 @sqlstate 42883
 expect error {
     ^procedure missing_procedure\(\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER PROCEDURE is not supported$
-}
 
-test alter-routine-is-rejected {
+test alter-routine-of-a-missing-function-is-rejected {
     ALTER ROUTINE missing_function(int) STABLE;
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(integer\) does not exist$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER ROUTINE is not supported$
 }
 
 test alter-function-of-a-function-is-rejected {
@@ -138,52 +112,36 @@ expect @tursopg error {
     ^CREATE FUNCTION is not supported$
 }
 
-test drop-function-is-rejected {
+test drop-function-of-a-missing-function-is-rejected {
     DROP FUNCTION missing_function(int);
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(integer\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP FUNCTION is not supported$
-}
 
-test drop-function-if-exists-is-rejected {
+test drop-function-if-exists-does-nothing {
     DROP FUNCTION IF EXISTS missing_function(int);
     SELECT 'dropped';
 }
 expect {
     dropped
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP FUNCTION is not supported$
-}
 
-test drop-procedure-is-rejected {
+test drop-procedure-if-exists-does-nothing {
     DROP PROCEDURE IF EXISTS missing_procedure();
     SELECT 'dropped';
 }
 expect {
     dropped
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP PROCEDURE is not supported$
-}
 
-test drop-routine-is-rejected {
+test drop-routine-if-exists-does-nothing {
     DROP ROUTINE IF EXISTS missing_function(int);
     SELECT 'dropped';
 }
 expect {
     dropped
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP ROUTINE is not supported$
 }
 
 test create-aggregate-is-rejected {
@@ -198,28 +156,20 @@ expect @tursopg error {
     ^CREATE AGGREGATE is not supported$
 }
 
-test drop-aggregate-is-rejected {
+test drop-aggregate-if-exists-does-nothing {
     DROP AGGREGATE IF EXISTS missing_aggregate(int);
     SELECT 'dropped';
 }
 expect {
     dropped
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP AGGREGATE is not supported$
-}
 
-test create-transform-is-rejected {
+test create-transform-with-a-missing-function-is-rejected {
     CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION missing_from_sql(internal), TO SQL WITH FUNCTION missing_to_sql(internal));
 }
 @sqlstate 42883
 expect error {
     ^function missing_from_sql\(internal\) does not exist$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^CREATE TRANSFORM is not supported$
 }
 
 test create-language-is-rejected {
@@ -234,16 +184,12 @@ expect @tursopg error {
     ^CREATE LANGUAGE is not supported$
 }
 
-test drop-language-is-rejected {
+test drop-language-of-a-missing-language-is-rejected {
     DROP LANGUAGE missing_language;
 }
 @sqlstate 42704
 expect error {
     ^language "missing_language" does not exist$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP LANGUAGE is not supported$
 }
 
 # The language and the options of CREATE FUNCTION.
@@ -314,10 +260,6 @@ test create-function-with-a-transform-is-rejected {
 @sqlstate 42704
 expect error {
     ^transform for type integer language "sql" does not exist$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^CREATE FUNCTION \.\.\. TRANSFORM is not supported$
 }
 
 test create-leakproof-function-is-rejected {
@@ -992,10 +934,6 @@ test create-function-with-an-empty-body-is-rejected {
 expect error {
     ^return type mismatch in function declared to return integer$
 }
-@sqlstate 42P13
-expect @tursopg error {
-    ^a function body must end with a SELECT statement$
-}
 
 test create-function-with-a-body-that-does-not-end-with-select-is-rejected {
     CREATE FUNCTION path() RETURNS text LANGUAGE sql STABLE AS $$ SHOW search_path $$;
@@ -1003,10 +941,6 @@ test create-function-with-a-body-that-does-not-end-with-select-is-rejected {
 @sqlstate 42P13
 expect error {
     ^return type mismatch in function declared to return text$
-}
-@sqlstate 42P13
-expect @tursopg error {
-    ^a function body must end with a SELECT statement$
 }
 
 test create-function-with-several-statements-is-rejected {
@@ -1106,17 +1040,12 @@ expect @tursopg error {
     ^CREATE FUNCTION is not supported$
 }
 
-test create-or-replace-function-cannot-change-the-result-type {
-    CREATE FUNCTION answer() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 42 $$;
-    CREATE OR REPLACE FUNCTION answer() RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'forty-two' $$;
+test create-or-replace-function-of-a-built-in-function-cannot-change-the-result-type {
+    CREATE OR REPLACE FUNCTION pg_catalog.lower(text) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
 }
 @sqlstate 42P13
 expect error {
     ^cannot change return type of existing function$
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^CREATE FUNCTION is not supported$
 }
 
 # PostgreSQL runs a function that calls itself. tursopg will reject it.
@@ -1143,19 +1072,6 @@ test create-function-with-the-name-of-another-function-is-rejected {
 }
 expect {
     int|text
-}
-@sqlstate 0A000
-expect @tursopg error {
-    ^CREATE FUNCTION is not supported$
-}
-
-test function-call-with-arguments-of-other-types-is-rejected {
-    CREATE FUNCTION add(int, int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 + $2 $$;
-    SELECT add(1.5, 2);
-}
-@sqlstate 42883
-expect error {
-    ^function add\(numeric, integer\) does not exist$
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -1189,9 +1105,9 @@ test create-function-that-reads-a-missing-table-is-rejected {
 expect error {
     ^relation "missing" does not exist$
 }
-@sqlstate 0A000
+@sqlstate 42P01
 expect @tursopg error {
-    ^CREATE FUNCTION is not supported$
+    ^no such table: missing$
 }
 
 test create-function-without-checking-the-body {
@@ -1211,25 +1127,24 @@ expect @tursopg error {
 test drop-function-drops-a-function {
     CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
     DROP FUNCTION one();
-    SELECT one();
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
 }
-@sqlstate 42883
-expect error {
-    ^function one\(\) does not exist$
+expect {
+    0
 }
 @sqlstate 0A000
 expect @tursopg error {
     ^CREATE FUNCTION is not supported$
 }
 
-test drop-function-used-by-a-view-is-rejected {
+test drop-function-cascade-drops-the-views-that-use-it {
     CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
     CREATE VIEW calls_one AS SELECT one() AS x;
-    DROP FUNCTION one();
+    DROP FUNCTION one() CASCADE;
+    SELECT count(*) FROM pg_views WHERE viewname = 'calls_one';
 }
-@sqlstate 2BP01
-expect error {
-    ^cannot drop function one\(\) because other objects depend on it$
+expect {
+    0
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -1248,4 +1163,862 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     ^CREATE FUNCTION is not supported$
+}
+
+# The checks of PostgreSQL on the definition of a function.
+
+test create-function-in-a-missing-schema-is-rejected {
+    CREATE FUNCTION missing_schema.one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 3F000
+expect error {
+    ^schema "missing_schema" does not exist$
+}
+
+test create-function-with-an-empty-search-path-is-rejected {
+    SET search_path = '';
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 3F000
+expect error {
+    ^no schema has been selected to create in$
+}
+
+test create-function-in-a-missing-language-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE missing_language AS $$ SELECT 1 $$;
+}
+@sqlstate 42704
+expect error {
+    ^language "missing_language" does not exist$
+}
+
+test create-procedure-with-a-volatility-is-rejected {
+    CREATE PROCEDURE p() LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^invalid attribute in procedure definition$
+}
+
+test create-function-with-a-cost-of-zero-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE COST 0 AS $$ SELECT 1 $$;
+}
+@sqlstate 22023
+expect error {
+    ^COST must be positive$
+}
+
+test create-function-with-rows-that-does-not-return-a-set-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE ROWS 10 AS $$ SELECT 1 $$;
+}
+@sqlstate 22023
+expect error {
+    ^ROWS is not applicable when function does not return a set$
+}
+
+test create-function-with-an-invalid-parallel-option-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE PARALLEL sometimes AS $$ SELECT 1 $$;
+}
+@sqlstate 42601
+expect error {
+    ^parameter "parallel" must be SAFE, RESTRICTED, or UNSAFE$
+}
+
+test create-function-with-a-missing-support-function-is-rejected {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE SUPPORT missing_support AS $$ SELECT 1 $$;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_support\(internal\) does not exist$
+}
+
+test create-function-with-a-polymorphic-result-and-no-polymorphic-parameter-is-rejected {
+    CREATE FUNCTION first(int) RETURNS anyelement LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^cannot determine result data type$
+}
+
+test create-function-returning-internal-without-an-internal-parameter-is-rejected {
+    CREATE FUNCTION one(int) RETURNS internal LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^unsafe use of pseudo-type "internal"$
+}
+
+test create-function-with-a-parameter-without-default-after-one-with-default-is-rejected {
+    CREATE FUNCTION add(int DEFAULT 1, int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 + $2 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^input parameters after one with a default value must also have defaults$
+}
+
+test create-function-with-a-default-on-an-out-parameter-is-rejected {
+    CREATE FUNCTION one(OUT int DEFAULT 1) LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^only input parameters can have default values$
+}
+
+test create-procedure-with-an-out-parameter-after-a-default-is-rejected {
+    CREATE PROCEDURE p(INOUT a int DEFAULT 1, OUT b int) LANGUAGE sql AS $$ SELECT 1, 2 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^procedure OUT parameters cannot appear after one with a default value$
+}
+
+test create-function-with-two-parameters-of-the-same-name-is-rejected {
+    CREATE FUNCTION add(a int, a int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 + $2 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^parameter name "a" used more than once$
+}
+
+test create-function-with-a-variadic-parameter-before-another-parameter-is-rejected {
+    CREATE FUNCTION f(VARIADIC int[], int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^VARIADIC parameter must be the last input parameter$
+}
+
+test create-function-with-a-variadic-parameter-that-is-not-an-array-is-rejected {
+    CREATE FUNCTION f(VARIADIC int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^VARIADIC parameter must be an array$
+}
+
+test create-function-with-a-result-type-other-than-its-out-parameter-is-rejected {
+    CREATE FUNCTION one(OUT a int) RETURNS text LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^function result type must be integer because of OUT parameters$
+}
+
+test create-function-with-a-default-that-reads-a-column-is-rejected {
+    CREATE FUNCTION one(int DEFAULT missing_column) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" does not exist$
+}
+
+test create-function-with-a-default-subquery-is-rejected {
+    CREATE FUNCTION one(int DEFAULT (SELECT 1)) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 0A000
+expect error {
+    ^cannot use subquery in DEFAULT expression$
+}
+
+test create-function-with-an-aggregate-default-is-rejected {
+    CREATE FUNCTION one(bigint DEFAULT count(*)) RETURNS bigint LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 42803
+expect error {
+    ^aggregate functions are not allowed in DEFAULT expressions$
+}
+
+test create-function-with-a-default-that-is-not-an-integer-is-rejected {
+    CREATE FUNCTION one(int DEFAULT 'one') RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 22P02
+expect error {
+    ^invalid input syntax for type integer: "one"$
+}
+
+test create-function-with-a-default-of-another-type-is-rejected {
+    CREATE FUNCTION one(int DEFAULT true) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 42804
+expect error {
+    ^argument of DEFAULT must be type integer, not type boolean$
+}
+
+@setup emp
+test create-function-with-the-type-of-a-missing-column-is-rejected {
+    CREATE FUNCTION raise(emp.missing_column%TYPE) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" of relation "emp" does not exist$
+}
+
+test create-function-with-the-type-of-a-column-of-a-missing-table-is-rejected {
+    CREATE FUNCTION raise(missing_table.salary%TYPE) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing_table" does not exist$
+}
+
+test create-function-in-the-internal-language-with-a-missing-c-function-is-rejected {
+    CREATE FUNCTION f(int) RETURNS int LANGUAGE internal STABLE AS 'missing_c_function';
+}
+@sqlstate 42883
+expect error {
+    ^there is no built-in function named "missing_c_function"$
+}
+
+test create-function-in-c-with-a-missing-library-is-rejected {
+    CREATE FUNCTION f(int) RETURNS int LANGUAGE c STABLE AS 'missing_library', 'f';
+}
+@sqlstate 58P01
+expect error {
+    ^could not access file "missing_library": No such file or directory$
+}
+
+test create-function-in-plpgsql-returning-cstring-is-rejected {
+    CREATE FUNCTION f() RETURNS cstring LANGUAGE plpgsql STABLE AS $$ BEGIN RETURN NULL; END $$;
+}
+@sqlstate 0A000
+expect error {
+    ^PL/pgSQL functions cannot return type cstring$
+}
+
+test create-trigger-function-with-arguments-is-rejected {
+    CREATE FUNCTION f(int) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+}
+@sqlstate 42P13
+expect error {
+    ^trigger functions cannot have declared arguments$
+}
+
+test create-function-in-plpgsql-with-a-syntax-error-is-rejected {
+    CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql STABLE AS $$ BEGIN RETRN 1; END $$;
+}
+@sqlstate 42601
+expect error {
+    ^syntax error at or near "RETRN"$
+}
+
+test create-function-in-plpgsql-with-an-unknown-variable-is-rejected {
+    CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql STABLE AS $$ BEGIN x := 1; RETURN 1; END $$;
+}
+@sqlstate 42601
+expect error {
+    ^"x" is not a known variable$
+}
+
+test create-function-in-pg-catalog-with-the-signature-of-a-built-in-function-is-rejected {
+    CREATE FUNCTION pg_catalog.lower(text) RETURNS text LANGUAGE sql STABLE AS $$ SELECT $1 $$;
+}
+@sqlstate 42723
+expect error {
+    ^function "lower" already exists with same argument types$
+}
+
+test create-function-with-an-unquoted-body-and-a-polymorphic-parameter-is-rejected {
+    CREATE FUNCTION f(anyelement) RETURNS int LANGUAGE sql STABLE RETURN 1;
+}
+@sqlstate 42P13
+expect error {
+    ^SQL function with unquoted function body cannot have polymorphic arguments$
+}
+
+test create-function-with-a-return-body-that-reads-a-missing-column-is-rejected {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql STABLE RETURN missing_column;
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: missing_column$
+}
+
+test create-function-with-a-begin-atomic-body-that-reads-a-missing-table-is-rejected {
+    CREATE FUNCTION f() RETURNS bigint LANGUAGE sql STABLE BEGIN ATOMIC SELECT count(*) FROM missing_table; END;
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing_table" does not exist$
+}
+@sqlstate 42P01
+expect @tursopg error {
+    ^no such table: missing_table$
+}
+
+test create-function-with-ddl-in-a-begin-atomic-body-is-rejected {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql STABLE BEGIN ATOMIC CREATE TABLE t (a int); SELECT 1; END;
+}
+@sqlstate 0A000
+expect error {
+    ^CREATE TABLE is not yet supported in unquoted SQL function body$
+}
+
+# The body of a function. PostgreSQL checks it when check_function_bodies is
+# on, which is the default.
+
+test check-function-bodies-is-on-by-default {
+    SHOW check_function_bodies;
+    SET check_function_bodies = off;
+    SHOW check_function_bodies;
+    RESET check_function_bodies;
+    SHOW check_function_bodies;
+}
+expect {
+    on
+    off
+    on
+}
+
+test check-function-bodies-must-be-a-boolean {
+    SET check_function_bodies = sometimes;
+}
+@sqlstate 22023
+expect error {
+    ^parameter "check_function_bodies" requires a Boolean value$
+}
+
+test create-function-with-a-body-with-a-missing-parameter-is-rejected {
+    CREATE FUNCTION f(int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT $2 $$;
+}
+@sqlstate 42P02
+expect error {
+    ^there is no parameter \$2$
+}
+
+test create-function-with-a-body-that-calls-a-missing-function-is-rejected {
+    CREATE FUNCTION f(int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT missing_function($1) $$;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^no such function: missing_function$
+}
+
+test create-function-with-a-body-that-returns-two-columns-is-rejected {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1, 2 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return integer$
+}
+
+test create-function-with-a-body-of-another-type-is-rejected {
+    CREATE FUNCTION f() RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return boolean$
+}
+
+test create-function-with-a-body-that-returns-a-string-literal-is-rejected {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql STABLE AS $$ SELECT '1' $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return integer$
+}
+
+@setup emp
+test create-function-with-a-body-that-returns-a-column-of-another-type-is-rejected {
+    CREATE FUNCTION f() RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT name FROM emp $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return numeric$
+}
+
+test create-function-with-a-body-that-ends-with-an-update-is-rejected {
+    CREATE TABLE counter (n int);
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ UPDATE counter SET n = n + 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return integer$
+}
+
+@setup emp
+test create-function-returning-a-table-row-with-too-few-columns-is-rejected {
+    CREATE FUNCTION f() RETURNS emp LANGUAGE sql STABLE AS $$ SELECT 'Bill'::text $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return emp$
+}
+
+@setup emp
+test create-function-returning-a-table-row-with-too-many-columns-is-rejected {
+    CREATE FUNCTION f() RETURNS emp LANGUAGE sql STABLE AS $$ SELECT 'Bill'::text, 1.0, 3 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return emp$
+}
+
+test create-function-returning-a-table-with-too-few-columns-is-rejected {
+    CREATE FUNCTION f() RETURNS TABLE (a int, b text) LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42P13
+expect error {
+    ^return type mismatch in function declared to return record$
+}
+
+# A conversion on assignment is enough: an integer becomes text, and a
+# numeric becomes an integer.
+test create-function-with-a-body-that-converts-on-assignment {
+    CREATE FUNCTION f() RETURNS text LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+    CREATE FUNCTION g() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1.5 $$;
+    SELECT f(), g();
+}
+expect {
+    1|2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^CREATE FUNCTION is not supported$
+}
+
+@setup emp
+test create-function-returning-the-rows-of-a-table {
+    CREATE FUNCTION all_emps() RETURNS SETOF emp LANGUAGE sql STABLE AS $$ SELECT * FROM emp $$;
+    SELECT name FROM all_emps();
+}
+expect {
+    Bill
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^RETURNS SETOF is not supported$
+}
+
+# A body can name a parameter, and a column takes precedence over a
+# parameter with its name.
+@setup emp
+test create-function-with-a-body-that-names-its-parameters {
+    CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE sql STABLE AS $$ SELECT a + add.b $$;
+    CREATE FUNCTION salary_of(name text) RETURNS numeric LANGUAGE sql STABLE AS $$ SELECT salary FROM emp WHERE emp.name = salary_of.name $$;
+    SELECT add(1, 2), salary_of('Bill');
+}
+expect {
+    3|4200
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a named function parameter is not supported$
+}
+
+# Statements that name a function that PostgreSQL has built in.
+
+test drop-function-of-a-built-in-function-is-rejected {
+    DROP FUNCTION lower(text);
+}
+@sqlstate 2BP01
+expect error {
+    ^cannot drop function lower\(text\) because it is required by the database system$
+}
+
+test drop-function-if-exists-of-a-built-in-function-is-rejected {
+    DROP FUNCTION IF EXISTS missing_function(int), lower(text);
+}
+@sqlstate 2BP01
+expect error {
+    ^cannot drop function lower\(text\) because it is required by the database system$
+}
+
+test drop-function-of-a-built-in-function-with-other-types-is-rejected {
+    DROP FUNCTION lower(int);
+}
+@sqlstate 42883
+expect error {
+    ^function lower\(integer\) does not exist$
+}
+
+test drop-function-without-arguments-of-an-overloaded-function-is-rejected {
+    DROP FUNCTION lower;
+}
+@sqlstate 42725
+expect error {
+    ^function name "lower" is not unique$
+}
+
+test drop-function-without-arguments-of-a-missing-function-is-rejected {
+    DROP FUNCTION missing_function;
+}
+@sqlstate 42883
+expect error {
+    ^could not find a function named "missing_function"$
+}
+
+test drop-function-of-an-aggregate-is-rejected {
+    DROP FUNCTION max(int);
+}
+@sqlstate 42809
+expect error {
+    ^"max" is an aggregate function$
+}
+
+test drop-aggregate-of-a-function-is-rejected {
+    DROP AGGREGATE lower(text);
+}
+@sqlstate 42809
+expect error {
+    ^function lower\(text\) is not an aggregate$
+}
+
+test drop-procedure-of-a-function-is-rejected {
+    DROP PROCEDURE lower(text);
+}
+@sqlstate 42809
+expect error {
+    ^lower\(text\) is not a procedure$
+}
+
+test drop-aggregate-with-a-star-of-a-missing-aggregate-is-rejected {
+    DROP AGGREGATE missing_aggregate(*);
+}
+@sqlstate 42883
+expect error {
+    ^aggregate missing_aggregate\(\*\) does not exist$
+}
+
+test drop-function-with-a-missing-type-is-rejected {
+    DROP FUNCTION missing_function(missing_type);
+}
+@sqlstate 42704
+expect error {
+    ^type "missing_type" does not exist$
+}
+
+test drop-function-in-a-missing-schema-is-rejected {
+    DROP FUNCTION missing_schema.missing_function(int);
+}
+@sqlstate 3F000
+expect error {
+    ^schema "missing_schema" does not exist$
+}
+
+test drop-function-if-exists-with-a-missing-type-or-schema-does-nothing {
+    DROP FUNCTION IF EXISTS missing_function(missing_type);
+    DROP FUNCTION IF EXISTS missing_schema.missing_function();
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+
+test alter-function-of-an-aggregate-is-rejected {
+    ALTER FUNCTION max(int) STABLE;
+}
+@sqlstate 42809
+expect error {
+    ^"max" is an aggregate function$
+}
+
+test alter-function-of-a-built-in-function-is-rejected {
+    ALTER FUNCTION lower(text) IMMUTABLE;
+    SELECT 'altered';
+}
+expect {
+    altered
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^ALTER FUNCTION is not supported$
+}
+
+test alter-function-rows-of-a-function-without-a-set-is-rejected {
+    ALTER FUNCTION lower(text) ROWS 10;
+}
+@sqlstate 22023
+expect error {
+    ^ROWS is not applicable when function does not return a set$
+}
+
+test alter-function-rename-to-the-name-of-another-function-is-rejected {
+    ALTER FUNCTION lower(text) RENAME TO upper;
+}
+@sqlstate 42723
+expect error {
+    ^function upper\(text\) already exists in schema "pg_catalog"$
+}
+
+test alter-function-depends-on-a-missing-extension-is-rejected {
+    ALTER FUNCTION lower(text) DEPENDS ON EXTENSION missing_extension;
+}
+@sqlstate 42704
+expect error {
+    ^extension "missing_extension" does not exist$
+}
+
+test alter-function-set-schema-to-a-missing-schema-is-rejected {
+    ALTER FUNCTION lower(text) SET SCHEMA missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    ^schema "missing_schema" does not exist$
+}
+
+test alter-function-owner-to-a-missing-role-is-rejected {
+    ALTER FUNCTION missing_function(int) OWNER TO missing_role;
+}
+@sqlstate 42704
+expect error {
+    ^role "missing_role" does not exist$
+}
+
+test comment-on-a-missing-function-is-rejected {
+    COMMENT ON FUNCTION missing_function(int) IS 'a function';
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer\) does not exist$
+}
+
+test comment-on-a-missing-procedure-is-rejected {
+    COMMENT ON PROCEDURE missing_procedure() IS 'a procedure';
+}
+@sqlstate 42883
+expect error {
+    ^procedure missing_procedure\(\) does not exist$
+}
+
+# tursopg does not keep comments.
+test comment-on-a-built-in-function {
+    COMMENT ON FUNCTION lower(text) IS 'a function';
+    SELECT 'commented';
+}
+expect {
+    commented
+}
+
+# CALL. tursopg has no procedures, and PostgreSQL has no built-in ones.
+
+test call-of-a-function-is-rejected {
+    CALL lower('a');
+}
+@sqlstate 42809
+expect error {
+    ^lower\(unknown\) is not a procedure$
+}
+
+test call-with-a-missing-column-is-rejected {
+    CALL missing_procedure(a => missing_column);
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" does not exist$
+}
+
+test call-with-a-subquery-is-rejected {
+    CALL missing_procedure((SELECT 1));
+}
+@sqlstate 0A000
+expect error {
+    ^cannot use subquery in CALL argument$
+}
+
+test call-of-a-missing-procedure-with-named-arguments-is-rejected {
+    CALL missing_procedure(a => 1);
+}
+@sqlstate 42883
+expect error {
+    ^procedure missing_procedure\(a => integer\) does not exist$
+}
+
+test call-of-a-procedure-in-a-missing-schema-is-rejected {
+    CALL missing_schema.missing_procedure();
+}
+@sqlstate 3F000
+expect error {
+    ^schema "missing_schema" does not exist$
+}
+
+# Aggregates, languages, transforms and DO.
+
+test create-aggregate-with-a-missing-transition-function-is-rejected {
+    CREATE AGGREGATE my_sum (int) (SFUNC = missing_function, STYPE = int);
+}
+@sqlstate 42883
+expect error {
+    ^function missing_function\(integer, integer\) does not exist$
+}
+
+test create-aggregate-without-a-state-type-is-rejected {
+    CREATE AGGREGATE my_sum (int) (SFUNC = int4pl);
+}
+@sqlstate 42P13
+expect error {
+    ^aggregate stype must be specified$
+}
+
+test create-aggregate-with-a-missing-state-type-is-rejected {
+    CREATE AGGREGATE my_sum (int) (SFUNC = int4pl, STYPE = missing_type);
+}
+@sqlstate 42704
+expect error {
+    ^type "missing_type" does not exist$
+}
+
+test create-aggregate-with-a-transition-function-that-converts-its-arguments-is-rejected {
+    CREATE AGGREGATE my_sum (smallint) (SFUNC = int4pl, STYPE = int);
+}
+@sqlstate 42804
+expect error {
+    ^function int4pl\(integer, integer\) requires run-time type coercion$
+}
+
+test create-language-with-a-missing-handler-is-rejected {
+    CREATE LANGUAGE my_language HANDLER missing_handler;
+}
+@sqlstate 42883
+expect error {
+    ^function missing_handler\(\) does not exist$
+}
+
+test create-language-with-a-handler-that-does-not-return-language-handler-is-rejected {
+    CREATE LANGUAGE my_language HANDLER now;
+}
+@sqlstate 42809
+expect error {
+    ^function now must return type language_handler$
+}
+
+test create-language-that-exists-is-rejected {
+    CREATE LANGUAGE plpgsql HANDLER plpgsql_call_handler;
+}
+@sqlstate 42710
+expect error {
+    ^language "plpgsql" already exists$
+}
+
+test drop-language-of-a-built-in-language-is-rejected {
+    DROP LANGUAGE sql;
+}
+@sqlstate 2BP01
+expect error {
+    ^cannot drop language sql because it is required by the database system$
+}
+
+test drop-language-plpgsql-is-rejected {
+    DROP LANGUAGE plpgsql;
+}
+@sqlstate 2BP01
+expect error {
+    ^cannot drop language plpgsql because extension plpgsql requires it$
+}
+
+test drop-language-if-exists-does-nothing {
+    DROP LANGUAGE IF EXISTS missing_language;
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+
+test alter-language-of-a-missing-language-is-rejected {
+    ALTER LANGUAGE missing_language RENAME TO other_language;
+}
+@sqlstate 42704
+expect error {
+    ^language "missing_language" does not exist$
+}
+
+test comment-on-a-missing-language-is-rejected {
+    COMMENT ON LANGUAGE missing_language IS 'a language';
+}
+@sqlstate 42704
+expect error {
+    ^language "missing_language" does not exist$
+}
+
+test create-transform-for-a-missing-type-is-rejected {
+    CREATE TRANSFORM FOR missing_type LANGUAGE sql (FROM SQL WITH FUNCTION f(internal));
+}
+@sqlstate 42704
+expect error {
+    ^type "missing_type" does not exist$
+}
+
+test create-transform-for-a-pseudo-type-is-rejected {
+    CREATE TRANSFORM FOR record LANGUAGE sql (FROM SQL WITH FUNCTION f(internal));
+}
+@sqlstate 42809
+expect error {
+    ^data type record is a pseudo-type$
+}
+
+test create-transform-for-a-missing-language-is-rejected {
+    CREATE TRANSFORM FOR int LANGUAGE missing_language (FROM SQL WITH FUNCTION f(internal));
+}
+@sqlstate 42704
+expect error {
+    ^language "missing_language" does not exist$
+}
+
+test drop-transform-of-a-missing-transform-is-rejected {
+    DROP TRANSFORM FOR int LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    ^transform for type integer language "sql" does not exist$
+}
+
+test drop-transform-if-exists-does-nothing {
+    DROP TRANSFORM IF EXISTS FOR int LANGUAGE sql;
+    SELECT 'dropped';
+}
+expect {
+    dropped
+}
+
+test do-in-sql-is-rejected {
+    DO LANGUAGE sql $$ SELECT 1 $$;
+}
+@sqlstate 0A000
+expect error {
+    ^language "sql" does not support inline code execution$
+}
+
+test do-in-a-missing-language-is-rejected {
+    DO LANGUAGE missing_language $$ SELECT 1 $$;
+}
+@sqlstate 42704
+expect error {
+    ^language "missing_language" does not exist$
+}
+
+test do-with-a-syntax-error-is-rejected {
+    DO $$ BEGIN RETRN; END $$;
+}
+@sqlstate 42601
+expect error {
+    ^syntax error at or near "RETRN"$
+}
+
+# A role that is not a superuser.
+
+test create-function-as-a-role-that-is-not-a-superuser-is-rejected {
+    CREATE ROLE create_function_role;
+    SET ROLE create_function_role;
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+}
+@sqlstate 42501
+expect error {
+    ^permission denied for schema public$
+}
+
+test drop-function-as-a-role-that-is-not-a-superuser-is-rejected {
+    CREATE ROLE drop_function_role;
+    SET ROLE drop_function_role;
+    DROP FUNCTION lower(text);
+}
+@sqlstate 42501
+expect error {
+    ^must be owner of function lower$
 }

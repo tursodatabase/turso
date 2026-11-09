@@ -226,8 +226,10 @@ fn test_postgres_simple_select_literal(db: TempDatabase) {
 fn test_postgres_comment_on_supported_object_forms_are_noops(db: TempDatabase) {
     let conn = db.connect_postgres();
 
-    // COMMENT ON is intentionally accepted without validating or storing the
-    // referenced object, so cover the distinct PostgreSQL grammar forms here.
+    // COMMENT ON is accepted without storing the comment, so cover the
+    // distinct PostgreSQL grammar forms here. Most forms do not check that
+    // the object exists. The forms for functions, triggers and languages do,
+    // as in PostgreSQL, and tursopg has no triggers.
     for (object_kind, sql) in [
         ("table", "COMMENT ON TABLE comment_docs IS 'documentation'"),
         (
@@ -268,12 +270,8 @@ fn test_postgres_comment_on_supported_object_forms_are_noops(db: TempDatabase) {
             "COMMENT ON SEQUENCE comment_docs_id_seq IS 'sequence documentation'",
         ),
         (
-            "trigger",
-            "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'trigger documentation'",
-        ),
-        (
             "function",
-            "COMMENT ON FUNCTION format_comment(integer) IS 'function documentation'",
+            "COMMENT ON FUNCTION lower(text) IS 'function documentation'",
         ),
         (
             "cast",

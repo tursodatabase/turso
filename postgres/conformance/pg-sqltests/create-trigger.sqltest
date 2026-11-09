@@ -1,9 +1,11 @@
 # CREATE TRIGGER and the other statements about triggers.
 #
-# tursopg does not support triggers yet. A test shows what PostgreSQL does,
-# and the error that tursopg gives for the first feature of the statement
-# that tursopg does not support. Most tests name a trigger function that does
-# not exist, so that tursopg reports the error of the trigger statement.
+# tursopg does not support triggers yet. For a statement that PostgreSQL
+# rejects, tursopg gives the same SQLSTATE. For a statement that PostgreSQL
+# accepts, a test shows what PostgreSQL does, and the error that tursopg
+# gives for the first feature of the statement that tursopg does not
+# support. These tests use suppress_redundant_updates_trigger(), a trigger
+# function that PostgreSQL has built in.
 
 @database :memory:
 
@@ -77,15 +79,15 @@ expect @tursopg error {
     ^LANGUAGE plpgsql is not supported$
 }
 
-# The features of CREATE TRIGGER.
+# The features of CREATE TRIGGER that tursopg does not support.
 
 @setup items
 test create-trigger-is-rejected {
-    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -94,11 +96,11 @@ expect @tursopg error {
 
 @setup items
 test create-statement-level-trigger-is-rejected {
-    CREATE TRIGGER t AFTER INSERT ON items EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t AFTER UPDATE ON items EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -107,11 +109,11 @@ expect @tursopg error {
 
 @setup items
 test create-trigger-for-each-statement-is-rejected {
-    CREATE TRIGGER t AFTER INSERT ON items FOR EACH STATEMENT EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t AFTER UPDATE ON items FOR EACH STATEMENT EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -121,11 +123,11 @@ expect @tursopg error {
 @setup items
 test create-instead-of-trigger-is-rejected {
     CREATE VIEW items_view AS SELECT * FROM items;
-    CREATE TRIGGER t INSTEAD OF INSERT ON items_view FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t INSTEAD OF UPDATE ON items_view FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -134,11 +136,11 @@ expect @tursopg error {
 
 @setup items
 test create-truncate-trigger-is-rejected {
-    CREATE TRIGGER t BEFORE TRUNCATE ON items EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t BEFORE TRUNCATE ON items EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -147,11 +149,11 @@ expect @tursopg error {
 
 @setup items
 test create-trigger-on-update-of-columns-is-rejected {
-    CREATE TRIGGER t BEFORE UPDATE OF name ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t BEFORE UPDATE OF name ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -160,11 +162,11 @@ expect @tursopg error {
 
 @setup items
 test create-trigger-with-when-is-rejected {
-    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW WHEN (NEW.id > OLD.id) EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -173,11 +175,11 @@ expect @tursopg error {
 
 @setup items
 test create-trigger-with-transition-tables-is-rejected {
-    CREATE TRIGGER t AFTER INSERT ON items REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION missing_trigger_function();
+    CREATE TRIGGER t AFTER UPDATE ON items REFERENCING NEW TABLE AS updated FOR EACH STATEMENT EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -186,11 +188,11 @@ expect @tursopg error {
 
 @setup items
 test create-constraint-trigger-is-rejected {
-    CREATE CONSTRAINT TRIGGER t AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+    CREATE CONSTRAINT TRIGGER t AFTER UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -199,11 +201,11 @@ expect @tursopg error {
 
 @setup items
 test create-or-replace-trigger-is-rejected {
-    CREATE OR REPLACE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+    CREATE OR REPLACE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -212,11 +214,11 @@ expect @tursopg error {
 
 @setup items
 test create-trigger-with-function-arguments-is-rejected {
-    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function('a');
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger('a');
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
@@ -224,90 +226,359 @@ expect @tursopg error {
 }
 
 test create-schema-with-a-trigger-is-rejected {
-    CREATE SCHEMA app CREATE TABLE items (id int) CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+    CREATE SCHEMA app CREATE TABLE items (id int) CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+    SELECT tgname FROM pg_trigger;
 }
-@sqlstate 42883
-expect error {
-    ^function missing_trigger_function\(\) does not exist$
+expect {
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {
     ^CREATE TRIGGER is not supported$
 }
 
-# The other statements about triggers.
+# CREATE TRIGGER statements that PostgreSQL rejects.
 
 @setup items
-test drop-trigger-is-rejected {
+test create-trigger-with-a-missing-function-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION missing_trigger_function();
+}
+@sqlstate 42883
+expect error {
+    ^function missing_trigger_function\(\) does not exist$
+}
+
+@setup items
+test create-trigger-with-a-function-of-a-missing-schema-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION missing_schema.f();
+}
+@sqlstate 3F000
+expect error {
+    ^schema "missing_schema" does not exist$
+}
+
+@setup items
+test create-trigger-with-a-function-that-does-not-return-trigger-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION now();
+}
+@sqlstate 42P17
+expect error {
+    ^function now must return type trigger$
+}
+
+test create-trigger-on-a-missing-table-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON missing_table FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing_table" does not exist$
+}
+
+@setup items
+test create-row-trigger-on-a-view-is-rejected {
+    CREATE VIEW items_view AS SELECT * FROM items;
+    CREATE TRIGGER t BEFORE UPDATE ON items_view FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42809
+expect error {
+    ^"items_view" is a view$
+}
+
+@setup items
+test create-instead-of-trigger-on-a-table-is-rejected {
+    CREATE TRIGGER t INSTEAD OF UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42809
+expect error {
+    ^"items" is a table$
+}
+
+test create-trigger-on-a-sequence-is-rejected {
+    CREATE SEQUENCE item_ids;
+    CREATE TRIGGER t BEFORE UPDATE ON item_ids FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42809
+expect error {
+    ^relation "item_ids" cannot have triggers$
+}
+
+@setup items
+test create-row-level-truncate-trigger-is-rejected {
+    CREATE TRIGGER t BEFORE TRUNCATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 0A000
+expect error {
+    ^TRUNCATE FOR EACH ROW triggers are not supported$
+}
+
+@setup items
+test create-statement-level-instead-of-trigger-is-rejected {
+    CREATE VIEW items_view AS SELECT * FROM items;
+    CREATE TRIGGER t INSTEAD OF UPDATE ON items_view EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 0A000
+expect error {
+    ^INSTEAD OF triggers must be FOR EACH ROW$
+}
+
+@setup items
+test create-statement-level-trigger-with-a-column-in-when-is-rejected {
+    CREATE TRIGGER t AFTER UPDATE ON items WHEN (NEW.id > 0) EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42P17
+expect error {
+    ^statement trigger's WHEN condition cannot reference column values$
+}
+
+@setup items
+test create-insert-trigger-with-old-in-when-is-rejected {
+    CREATE TRIGGER t BEFORE INSERT ON items FOR EACH ROW WHEN (OLD.id > 0) EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42P17
+expect error {
+    ^INSERT trigger's WHEN condition cannot reference OLD values$
+}
+
+@setup items
+test create-delete-trigger-with-new-in-when-is-rejected {
+    CREATE TRIGGER t BEFORE DELETE ON items FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42P17
+expect error {
+    ^DELETE trigger's WHEN condition cannot reference NEW values$
+}
+
+@setup items
+test create-trigger-with-a-missing-column-in-when-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW WHEN (NEW.missing_column > 0) EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42703
+expect error {
+    ^column new\.missing_column does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: new\.missing_column$
+}
+
+@setup items
+test create-trigger-with-a-when-condition-that-is-not-boolean-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW WHEN (1) EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42804
+expect error {
+    ^argument of WHEN must be type boolean, not type integer$
+}
+
+@setup items
+test create-before-trigger-with-a-transition-table-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE ON items REFERENCING NEW TABLE AS updated FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42P17
+expect error {
+    ^transition table name can only be specified for an AFTER trigger$
+}
+
+@setup items
+test create-insert-trigger-with-an-old-table-is-rejected {
+    CREATE TRIGGER t AFTER INSERT ON items REFERENCING OLD TABLE AS removed FOR EACH STATEMENT EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42P17
+expect error {
+    ^OLD TABLE can only be specified for a DELETE or UPDATE trigger$
+}
+
+@setup items
+test create-trigger-with-a-transition-table-for-two-events-is-rejected {
+    CREATE TRIGGER t AFTER INSERT OR UPDATE ON items REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 0A000
+expect error {
+    ^transition tables cannot be specified for triggers with more than one event$
+}
+
+@setup items
+test create-trigger-on-update-of-a-missing-column-is-rejected {
+    CREATE TRIGGER t BEFORE UPDATE OF missing_column ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 42703
+expect error {
+    ^column "missing_column" of relation "items" does not exist$
+}
+
+@setup items
+test create-or-replace-constraint-trigger-is-rejected {
+    CREATE OR REPLACE CONSTRAINT TRIGGER t AFTER UPDATE ON items FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+@sqlstate 0A000
+expect error {
+    ^CREATE OR REPLACE CONSTRAINT TRIGGER is not supported$
+}
+
+# The other statements about triggers. tursopg has no triggers.
+
+@setup items
+test drop-trigger-of-a-missing-trigger-is-rejected {
     DROP TRIGGER missing_trigger ON items;
 }
 @sqlstate 42704
 expect error {
     ^trigger "missing_trigger" for table "items" does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP TRIGGER is not supported$
+
+test drop-trigger-on-a-missing-table-is-rejected {
+    DROP TRIGGER missing_trigger ON missing_table;
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing_table" does not exist$
 }
 
 @setup items
-test drop-trigger-if-exists-is-rejected {
+test drop-trigger-if-exists-does-nothing {
     DROP TRIGGER IF EXISTS missing_trigger ON items;
+    DROP TRIGGER IF EXISTS missing_trigger ON missing_table;
     SELECT 'dropped';
 }
 expect {
     dropped
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP TRIGGER is not supported$
-}
 
 @setup items
-test alter-trigger-is-rejected {
+test alter-trigger-of-a-missing-trigger-is-rejected {
     ALTER TRIGGER missing_trigger ON items RENAME TO other_trigger;
 }
 @sqlstate 42704
 expect error {
     ^trigger "missing_trigger" for table "items" does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER TRIGGER is not supported$
+
+test alter-trigger-on-a-missing-table-is-rejected {
+    ALTER TRIGGER missing_trigger ON missing_table RENAME TO other_trigger;
+}
+@sqlstate 42P01
+expect error {
+    ^relation "missing_table" does not exist$
 }
 
-test create-event-trigger-is-rejected {
+@setup items
+test comment-on-a-missing-trigger-is-rejected {
+    COMMENT ON TRIGGER missing_trigger ON items IS 'a trigger';
+}
+@sqlstate 42704
+expect error {
+    ^trigger "missing_trigger" for table "items" does not exist$
+}
+
+@setup items
+test alter-table-enable-trigger-of-a-missing-trigger-is-rejected {
+    ALTER TABLE items ENABLE TRIGGER missing_trigger;
+}
+@sqlstate 42704
+expect error {
+    ^trigger "missing_trigger" for table "items" does not exist$
+}
+
+@setup items
+test alter-table-disable-trigger-all-does-nothing {
+    ALTER TABLE items DISABLE TRIGGER ALL;
+    ALTER TABLE items ENABLE TRIGGER USER;
+    ALTER TABLE IF EXISTS missing_table ENABLE TRIGGER ALL;
+    SELECT 'altered';
+}
+expect {
+    altered
+}
+
+@setup items
+test alter-table-enable-trigger-on-a-view-is-rejected {
+    CREATE VIEW items_view AS SELECT * FROM items;
+    ALTER TABLE items_view ENABLE TRIGGER ALL;
+}
+@sqlstate 42809
+expect error {
+    ^ALTER action ENABLE TRIGGER ALL cannot be performed on relation "items_view"$
+}
+
+# Event triggers. No function that PostgreSQL has built in returns
+# event_trigger, so CREATE EVENT TRIGGER always fails.
+
+test create-event-trigger-with-a-missing-function-is-rejected {
     CREATE EVENT TRIGGER missing_event_trigger ON ddl_command_start EXECUTE FUNCTION missing_function();
 }
 @sqlstate 42883
 expect error {
     ^function missing_function\(\) does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^CREATE EVENT TRIGGER is not supported$
+
+test create-event-trigger-with-a-function-that-does-not-return-event-trigger-is-rejected {
+    CREATE EVENT TRIGGER e ON ddl_command_start EXECUTE FUNCTION now();
+}
+@sqlstate 42P17
+expect error {
+    ^function now must return type event_trigger$
 }
 
-test alter-event-trigger-is-rejected {
+test create-event-trigger-for-a-missing-event-is-rejected {
+    CREATE EVENT TRIGGER e ON missing_event EXECUTE FUNCTION missing_function();
+}
+@sqlstate 42601
+expect error {
+    ^unrecognized event name "missing_event"$
+}
+
+test create-event-trigger-with-a-missing-filter-variable-is-rejected {
+    CREATE EVENT TRIGGER e ON ddl_command_start WHEN missing_variable IN ('x') EXECUTE FUNCTION missing_function();
+}
+@sqlstate 42601
+expect error {
+    ^unrecognized filter variable "missing_variable"$
+}
+
+test create-event-trigger-with-a-missing-command-tag-is-rejected {
+    CREATE EVENT TRIGGER e ON ddl_command_start WHEN TAG IN ('CREATE TABLE', 'MISSING COMMAND') EXECUTE FUNCTION missing_function();
+}
+@sqlstate 42601
+expect error {
+    ^filter value "MISSING COMMAND" not recognized for filter variable "tag"$
+}
+
+test create-event-trigger-for-a-command-without-event-triggers-is-rejected {
+    CREATE EVENT TRIGGER e ON ddl_command_start WHEN TAG IN ('create table', 'SELECT') EXECUTE FUNCTION missing_function();
+}
+@sqlstate 0A000
+expect error {
+    ^event triggers are not supported for SELECT$
+}
+
+test alter-event-trigger-of-a-missing-event-trigger-is-rejected {
     ALTER EVENT TRIGGER missing_event_trigger DISABLE;
 }
 @sqlstate 42704
 expect error {
     ^event trigger "missing_event_trigger" does not exist$
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^ALTER EVENT TRIGGER is not supported$
+
+test drop-event-trigger-of-a-missing-event-trigger-is-rejected {
+    DROP EVENT TRIGGER missing_event_trigger;
+}
+@sqlstate 42704
+expect error {
+    ^event trigger "missing_event_trigger" does not exist$
 }
 
-test drop-event-trigger-is-rejected {
+test drop-event-trigger-if-exists-does-nothing {
     DROP EVENT TRIGGER IF EXISTS missing_event_trigger;
     SELECT 'dropped';
 }
 expect {
     dropped
 }
-@sqlstate 0A000
-expect @tursopg error {
-    ^DROP EVENT TRIGGER is not supported$
+
+test comment-on-a-missing-event-trigger-is-rejected {
+    COMMENT ON EVENT TRIGGER missing_event_trigger IS 'an event trigger';
+}
+@sqlstate 42704
+expect error {
+    ^event trigger "missing_event_trigger" does not exist$
 }

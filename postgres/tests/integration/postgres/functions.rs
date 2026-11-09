@@ -791,7 +791,6 @@ fn test_pg_builtin_settings_validate_all_entry_points(db: TempDatabase) {
         ("transaction_timeout", "0", "0", "1"),
         ("row_security", "false", "off", "on"),
         ("quote_all_identifiers", "false", "off", "on"),
-        ("check_function_bodies", "false", "off", "on"),
         ("synchronize_seqscans", "false", "off", "on"),
         ("default_tablespace", "", "", "other"),
         ("default_tablespace", "", "", "   "),
@@ -831,6 +830,33 @@ fn test_pg_builtin_settings_validate_all_entry_points(db: TempDatabase) {
             [canonical]
         );
     }
+}
+
+/// check_function_bodies is a setting of each session, on by default. With
+/// it off, CREATE FUNCTION does not check the body, as in PostgreSQL.
+#[turso_macros::test(mvcc)]
+fn test_pg_check_function_bodies_is_a_session_setting(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    let create = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql STABLE AS $$ SELECT count(*) FROM missing $$";
+    assert_eq!(query_text(&conn, "SHOW check_function_bodies"), ["on"]);
+    conn.execute("SET check_function_bodies = false").unwrap();
+    assert_eq!(query_text(&conn, "SHOW check_function_bodies"), ["off"]);
+    assert_eq!(query_text(&other, "SHOW check_function_bodies"), ["on"]);
+    let error = conn.execute(create).unwrap_err().to_string();
+    assert!(
+        error.contains("CREATE FUNCTION is not supported"),
+        "{error}"
+    );
+    let error = other.execute(create).unwrap_err().to_string();
+    assert!(error.contains("no such table: missing"), "{error}");
+    conn.execute("RESET check_function_bodies").unwrap();
+    assert_eq!(query_text(&conn, "SHOW check_function_bodies"), ["on"]);
+    let error = conn
+        .execute("SET check_function_bodies = sometimes")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires a Boolean value"), "{error}");
 }
 
 #[turso_macros::test(mvcc)]

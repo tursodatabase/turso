@@ -4724,6 +4724,14 @@ impl PostgreSQLTranslator {
                 .ok_or_else(|| ParseError::ParseError("CTE missing query body".into()))?;
             let select = match &cte_query.node {
                 Some(Node::SelectStmt(select_stmt)) => self.translate_select(select_stmt)?,
+                Some(
+                    Node::InsertStmt(_)
+                    | Node::UpdateStmt(_)
+                    | Node::DeleteStmt(_)
+                    | Node::MergeStmt(_),
+                ) => {
+                    return Err(not_supported("a data-modifying statement in WITH"));
+                }
                 _ => {
                     return Err(ParseError::ParseError(
                         "CTE query is not a SELECT statement".into(),

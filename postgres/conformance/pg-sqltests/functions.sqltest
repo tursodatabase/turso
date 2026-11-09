@@ -1893,3 +1893,15 @@ expect {
 expect @tursopg error {
     ^table\.\* inside an expression is not supported$
 }
+
+test function-call-with-a-wrong-number-of-arguments-is-rejected {
+    SELECT lower('a', 'b');
+}
+@sqlstate 42883
+expect error {
+    ^function lower\(unknown, unknown\) does not exist$
+}
+@sqlstate 42883
+expect @tursopg error {
+    ^wrong number of arguments to function lower\(\)$
+}

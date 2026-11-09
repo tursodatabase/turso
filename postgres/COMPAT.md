@@ -52,7 +52,7 @@ Basics not enumerated by the official feature matrix.
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
-| COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
+| COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description`. COMMENT ON a function, procedure, aggregate, trigger, event trigger, language or transform fails when the object does not exist, as in PostgreSQL |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
 | ALTER SEQUENCE | 🟡 Partial | OWNED BY { table.column \| NONE } works, which is how a serial column's sequence belongs to its table; the other options are rejected |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
@@ -68,7 +68,7 @@ Basics not enumerated by the official feature matrix.
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins, and rejected outside FROM; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW / RESET | 🟡 Partial | Only search_path and custom parameters such as `app.user_id` (`SET [LOCAL]`, `SET ... TO DEFAULT`, `SET ... FROM CURRENT`, `RESET`, `RESET ALL`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
+| SET / SHOW / RESET | 🟡 Partial | Only search_path, application_name, check_function_bodies and custom parameters such as `app.user_id` (`SET [LOCAL]`, `SET ... TO DEFAULT`, `SET ... FROM CURRENT`, `RESET`, `RESET ALL`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
 ## Backend
 
@@ -392,7 +392,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Only search_path and custom parameters; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW / RESET above) |
+| SET / SHOW configuration parameters | 🟡 Partial | Only search_path, application_name, check_function_bodies and custom parameters; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW / RESET above) |
 | Custom configuration parameters (`app.user_id`) | 🟡 Partial | In server mode, all clients share the values |
 | DISCARD | 🟡 Partial | Only `DISCARD ALL`, which resets every parameter and forgets `currval` values. In server mode it does not drop the client's protocol-level prepared statements, and it resets the parameters of all clients |
 | ALTER SYSTEM | ❌ Not supported | |
@@ -487,21 +487,21 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ALTER TABLE ENABLE/DISABLE TRIGGER | ❌ Not supported | |
+| ALTER TABLE ENABLE/DISABLE TRIGGER | 🟡 Partial | There are no triggers: ENABLE and DISABLE TRIGGER ALL and USER do nothing, and a named trigger does not exist |
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | Rejected with an error, as is a `RETURN expression` body |
 | CALL syntax for executing procedures | ❌ Not supported | Rejected with an error |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error that names the first feature of the statement that tursopg does not support, for example LANGUAGE plpgsql, a function that is not STABLE, a type that is not a base type (polymorphic, composite, array, range, enum or domain), RETURNS SETOF/TABLE/record/void, OUT/INOUT/VARIADIC/named parameters, parameter defaults, an option such as SECURITY DEFINER, STRICT, COST or SET, a body that is not dollar-quoted, or a body that is not one SELECT (DDL, data changes, several statements). Definitions that PostgreSQL also rejects get PostgreSQL's error. ALTER FUNCTION/PROCEDURE/ROUTINE, DROP FUNCTION/PROCEDURE/ROUTINE/AGGREGATE and CREATE AGGREGATE are rejected too |
+| CREATE FUNCTION | ❌ Not supported | tursopg first does the checks of PostgreSQL, and a definition that PostgreSQL rejects gets the SQLSTATE of PostgreSQL. With check_function_bodies on, the default, these checks prepare each statement of a SQL body and compare its result with the result type. A definition that PostgreSQL accepts gets SQLSTATE 0A000 and an error that names the first feature that tursopg does not support, for example LANGUAGE plpgsql, a function that is not STABLE, a type that is not a base type (polymorphic, composite, array, range, enum or domain), RETURNS SETOF/TABLE/record/void, OUT/INOUT/VARIADIC/named parameters, parameter defaults, an option such as SECURITY DEFINER, STRICT, COST or SET, a body that is not dollar-quoted, or a body that is not one SELECT (DDL, data changes, several statements). The only functions are the built-in functions of PostgreSQL 17. ALTER, DROP and COMMENT ON FUNCTION/PROCEDURE/ROUTINE/AGGREGATE, CREATE AGGREGATE and CALL fail as they do in PostgreSQL, for example for a function that does not exist or that is built in. DROP ... IF EXISTS of a function that does not exist does nothing |
 | Column level triggers | ❌ Not supported | `UPDATE OF` columns are rejected |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
-| Event triggers | ❌ Not supported | CREATE/ALTER/DROP EVENT TRIGGER are rejected |
+| Event triggers | ❌ Not supported | CREATE/ALTER/DROP EVENT TRIGGER fail as in PostgreSQL, because no event trigger function exists. DROP EVENT TRIGGER IF EXISTS does nothing |
 | FILTER clause for aggregate functions | ✅ Supported | |
 | ORDER BY support within aggregates | ❌ Not supported | Silently dropped |
 | Per function GUC settings | ❌ Not supported | SET and SET ... FROM CURRENT on CREATE FUNCTION are rejected |
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | Rejected |
-| Statement level triggers | ❌ Not supported | CREATE TRIGGER, ALTER TRIGGER and DROP TRIGGER are rejected with an error, for row-level triggers too |
+| Statement level triggers | ❌ Not supported | CREATE TRIGGER is rejected with an error, for row-level triggers too. It fails as in PostgreSQL when PostgreSQL rejects it, for example for a trigger function that does not exist. ALTER TRIGGER and DROP TRIGGER fail, because there are no triggers, and DROP TRIGGER IF EXISTS does nothing |
 | Statement level TRUNCATE triggers | ❌ Not supported | Rejected |
 | Triggers on views | ❌ Not supported | INSTEAD OF triggers are rejected |
 | Variadic functions | ❌ Not supported | VARIADIC arguments and parameters rejected |
@@ -511,7 +511,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION in a language other than SQL, CREATE LANGUAGE, DROP LANGUAGE and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION in a language other than SQL, CREATE LANGUAGE, DROP LANGUAGE and DO are rejected with an error. The languages are sql, plpgsql, c and internal. The body of a PL/pgSQL function or DO block is parsed, so a syntax error gets SQLSTATE 42601, but a DO block does not run |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | CREATE TRANSFORM, DROP TRANSFORM and TRANSFORM on CREATE FUNCTION are rejected |

@@ -315,7 +315,18 @@ pub(crate) enum ConfigParameter {
     SearchPath,
     Role,
     ApplicationName,
+    /// Whether CREATE FUNCTION checks the body of a function. pg_dump turns
+    /// it off.
+    CheckFunctionBodies,
     Fixed(&'static FixedParameter),
+}
+
+const CHECK_FUNCTION_BODIES_DEFAULT: &str = "on";
+
+/// Whether CREATE FUNCTION checks the body of a function in the session of
+/// `conn`.
+pub(crate) fn check_function_bodies(conn: &Connection) -> bool {
+    ConfigParameter::CheckFunctionBodies.get(conn) == "on"
 }
 
 pub(crate) enum Parameter<'a> {
@@ -330,6 +341,8 @@ pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
         ConfigParameter::Role
     } else if name.eq_ignore_ascii_case("application_name") {
         ConfigParameter::ApplicationName
+    } else if name.eq_ignore_ascii_case("check_function_bodies") {
+        ConfigParameter::CheckFunctionBodies
     } else if let Some(parameter) = FIXED_PARAMETERS
         .iter()
         .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
@@ -357,6 +370,23 @@ impl ConfigParameter {
                 });
                 Ok(value.unwrap_or_default().to_owned())
             }
+            Self::CheckFunctionBodies => {
+                let value = match value.map(|value| crate::functions::parse_pg_bool(value.trim())) {
+                    None => None,
+                    Some(Some(true)) => Some("on"),
+                    Some(Some(false)) => Some("off"),
+                    Some(None) => {
+                        return Err(crate::error::sqlstate_error(
+                            turso_pg_parser::sqlstate::SQLSTATE_INVALID_PARAMETER_VALUE,
+                            format!("parameter \"{}\" requires a Boolean value", self.name()),
+                        ))
+                    }
+                };
+                crate::session::session_state(conn)?.mutate(conn, |settings| {
+                    settings.set(self.name(), value.map(str::to_owned), scope);
+                });
+                Ok(value.unwrap_or(CHECK_FUNCTION_BODIES_DEFAULT).to_owned())
+            }
             Self::Fixed(parameter) => {
                 if let Some(value) = value {
                     parameter.validate(value)?;
@@ -378,6 +408,10 @@ impl ConfigParameter {
                 .context::<PgSessionState>()
                 .and_then(|state| state.setting(self.name()))
                 .unwrap_or_default(),
+            Self::CheckFunctionBodies => conn
+                .context::<PgSessionState>()
+                .and_then(|state| state.setting(self.name()))
+                .unwrap_or_else(|| CHECK_FUNCTION_BODIES_DEFAULT.to_owned()),
             Self::Fixed(parameter) => parameter.value.to_owned(),
         }
     }
@@ -387,6 +421,7 @@ impl ConfigParameter {
             Self::SearchPath => "search_path",
             Self::Role => "role",
             Self::ApplicationName => "application_name",
+            Self::CheckFunctionBodies => "check_function_bodies",
             Self::Fixed(parameter) => parameter.name,
         }
     }
@@ -509,11 +544,6 @@ const FIXED_PARAMETERS: &[FixedParameter] = &[
     },
     FixedParameter {
         name: "quote_all_identifiers",
-        value: "off",
-        validation: FixedValidation::Bool(false),
-    },
-    FixedParameter {
-        name: "check_function_bodies",
         value: "off",
         validation: FixedValidation::Bool(false),
     },

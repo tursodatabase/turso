@@ -19,7 +19,9 @@ use turso_core::{
 };
 use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
-use turso_pg_parser::routine::{routine_error, CatalogType};
+use turso_pg_parser::routine::{
+    check_routine_statement, Relation, RelationKind, RoutineCatalog, UserType,
+};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
@@ -377,7 +379,7 @@ fn prepare_statement_inner(
     reject_sqlite_catalog_access(sql)?;
 
     let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::parse(sql).map_err(|error| translation_error(&pg_conn.conn, error))?;
 
     // In an aborted transaction block PostgreSQL accepts only the statements
     // that end it and rejects everything else with 25P02.
@@ -385,10 +387,15 @@ fn prepare_statement_inner(
         return Err(in_failed_sql_transaction_error());
     }
 
-    if let Some(error) = routine_error(sql, &parse_result, |schema, name| {
-        signature_type(&pg_conn.conn, schema, name)
-    }) {
-        return Err(translation_error(&pg_conn.conn, error));
+    if let Some(outcome) = check_routine_statement(sql, &parse_result, &SessionCatalog(pg_conn)) {
+        outcome.map_err(|error| translation_error(&pg_conn.conn, error))?;
+        return Ok(crate::Statement::new(noop_statement(&pg_conn.conn)?)
+            .with_result_kind(StatementResultKind::Command)
+            .with_tx_tracking(
+                Arc::clone(&pg_conn.conn),
+                Arc::clone(&pg_conn.tx),
+                TxRole::Other,
+            ));
     }
 
     // The single definition of what counts as the transaction's first
@@ -498,34 +505,117 @@ fn prepare_statement_inner(
     .with_post_run(post_run))
 }
 
-/// What a type name in a function signature names: the row type of a
-/// table, view or sequence, which is looked up like a relation, or a type
-/// that CREATE TYPE or CREATE DOMAIN made. Such a type is not in a schema,
-/// so only a name without a schema or with `public` can name it.
-fn signature_type(conn: &Arc<Connection>, schema: Option<&str>, name: &str) -> CatalogType {
-    let is_relation = relation_lookup_namespaces(conn, schema)
-        .iter()
-        .any(|namespace| {
-            conn.with_schema(namespace.database_id(), |catalog| {
-                let ns = namespace.target.id;
-                catalog.get_table(ns, name).is_some()
-                    || catalog.get_view(ns, name).is_some()
-                    || catalog.has_sequence(ns, name)
-            })
-        });
-    if is_relation {
-        return CatalogType::RowType;
+/// The objects of the session's database that the checks of statements
+/// about functions, procedures and triggers look up.
+struct SessionCatalog<'a>(&'a Arc<PgConnectionInner>);
+
+impl RoutineCatalog for SessionCatalog<'_> {
+    fn is_superuser(&self) -> bool {
+        self.0.conn.current_role_is_superuser()
     }
-    let is_user_defined = matches!(schema, None | Some("public"))
-        && conn.with_schema(turso_core::MAIN_DB_ID, |catalog| {
-            catalog
-                .get_type_def_unchecked(name)
-                .is_some_and(|type_def| !type_def.is_builtin)
-        });
-    if is_user_defined {
-        CatalogType::UserDefined
-    } else {
-        CatalogType::Missing
+
+    fn check_function_bodies(&self) -> bool {
+        crate::settings::check_function_bodies(&self.0.conn)
+    }
+
+    fn creation_schema(&self) -> Option<String> {
+        current_schema(&self.0.conn)
+    }
+
+    fn schema_exists(&self, name: &str) -> bool {
+        catalog::namespace_exists(&self.0.conn, name)
+    }
+
+    fn role_exists(&self, name: &str) -> bool {
+        let roles = self.0.conn.role_catalog();
+        let exists = catalog::postgres_roles(&roles).any(|role| role.name == name);
+        exists
+    }
+
+    /// tursopg has no extensions, and a new PostgreSQL database has only
+    /// plpgsql.
+    fn extension_exists(&self, name: &str) -> bool {
+        name == "plpgsql"
+    }
+
+    fn relation(&self, schema: Option<&str>, name: &str) -> Option<Relation> {
+        let conn = &self.0.conn;
+        relation_lookup_namespaces(conn, schema)
+            .iter()
+            .find_map(|namespace| {
+                conn.with_schema(namespace.database_id(), |catalog| {
+                    let ns = namespace.target.id;
+                    let columns = |columns: &[turso_core::schema::Column]| {
+                        columns
+                            .iter()
+                            .filter_map(|column| {
+                                Some((column.name.clone()?, column.ty_str.clone()))
+                            })
+                            .collect()
+                    };
+                    if let Some(table) = catalog.get_table(ns, name) {
+                        let kind = if catalog.is_materialized_view(ns, name) {
+                            RelationKind::MaterializedView
+                        } else {
+                            RelationKind::Table
+                        };
+                        return Some(Relation {
+                            kind,
+                            columns: columns(table.columns()),
+                        });
+                    }
+                    if let Some(view) = catalog.get_view(ns, name) {
+                        return Some(Relation {
+                            kind: RelationKind::View,
+                            columns: columns(&view.columns),
+                        });
+                    }
+                    if catalog.has_sequence(ns, name) {
+                        return Some(Relation {
+                            kind: RelationKind::Sequence,
+                            columns: Vec::new(),
+                        });
+                    }
+                    catalog
+                        .indexes(ns)
+                        .any(|index| index.name.eq_ignore_ascii_case(name))
+                        .then(|| Relation {
+                            kind: RelationKind::Index,
+                            columns: Vec::new(),
+                        })
+                })
+            })
+    }
+
+    /// A type made with CREATE TYPE or CREATE DOMAIN is not in a schema, so
+    /// only a name without a schema or with `public` can name it.
+    fn user_type(&self, schema: Option<&str>, name: &str) -> Option<UserType> {
+        if !matches!(schema, None | Some("public")) {
+            return None;
+        }
+        self.0.conn.with_schema(turso_core::MAIN_DB_ID, |catalog| {
+            let type_def = catalog.get_type_def_unchecked(name)?;
+            if type_def.is_builtin {
+                None
+            } else if type_def.is_domain {
+                Some(UserType::Domain)
+            } else {
+                Some(UserType::Other)
+            }
+        })
+    }
+
+    fn prepare(&self, sql: &str) -> std::result::Result<usize, ParseError> {
+        match prepare_statement_inner(self.0, sql) {
+            Ok(statement) => Ok(statement.num_columns()),
+            Err(error) => {
+                let report = crate::error::ErrorReport::from(&error);
+                Err(ParseError::Sqlstate {
+                    sqlstate: report.sqlstate,
+                    message: report.message,
+                })
+            }
+        }
     }
 }
 

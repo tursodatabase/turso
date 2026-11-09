@@ -46,16 +46,21 @@ pub enum CommandTag {
     DiscardPlans,
     DiscardSequences,
     DiscardTemp,
+    DropAggregate,
     DropDomain,
+    DropEventTrigger,
     DropExtension,
     DropFunction,
     DropIndex,
+    DropLanguage,
     DropMaterializedView,
     DropProcedure,
     DropRole,
+    DropRoutine,
     DropSchema,
     DropSequence,
     DropTable,
+    DropTransform,
     DropTrigger,
     DropType,
     DropView,
@@ -216,16 +221,21 @@ impl CommandTag {
             Self::DiscardPlans => "DISCARD PLANS",
             Self::DiscardSequences => "DISCARD SEQUENCES",
             Self::DiscardTemp => "DISCARD TEMP",
+            Self::DropAggregate => "DROP AGGREGATE",
             Self::DropDomain => "DROP DOMAIN",
+            Self::DropEventTrigger => "DROP EVENT TRIGGER",
             Self::DropExtension => "DROP EXTENSION",
             Self::DropFunction => "DROP FUNCTION",
             Self::DropIndex => "DROP INDEX",
+            Self::DropLanguage => "DROP LANGUAGE",
             Self::DropMaterializedView => "DROP MATERIALIZED VIEW",
             Self::DropProcedure => "DROP PROCEDURE",
             Self::DropRole => "DROP ROLE",
+            Self::DropRoutine => "DROP ROUTINE",
             Self::DropSchema => "DROP SCHEMA",
             Self::DropSequence => "DROP SEQUENCE",
             Self::DropTable => "DROP TABLE",
+            Self::DropTransform => "DROP TRANSFORM",
             Self::DropTrigger => "DROP TRIGGER",
             Self::DropType => "DROP TYPE",
             Self::DropView => "DROP VIEW",
@@ -297,6 +307,11 @@ impl CommandTag {
             ObjectType::ObjectTrigger => Self::DropTrigger,
             ObjectType::ObjectFunction => Self::DropFunction,
             ObjectType::ObjectProcedure => Self::DropProcedure,
+            ObjectType::ObjectRoutine => Self::DropRoutine,
+            ObjectType::ObjectAggregate => Self::DropAggregate,
+            ObjectType::ObjectEventTrigger => Self::DropEventTrigger,
+            ObjectType::ObjectLanguage => Self::DropLanguage,
+            ObjectType::ObjectTransform => Self::DropTransform,
             ObjectType::ObjectExtension => Self::DropExtension,
             _ => Self::Unknown,
         }
@@ -309,6 +324,22 @@ mod tests {
 
     fn tag(sql: &str) -> CommandTag {
         CommandTag::of(&crate::parse(sql).unwrap())
+    }
+
+    #[test]
+    fn drop_of_an_object_about_functions_has_its_own_tag() {
+        for (sql, expected) in [
+            ("DROP ROUTINE IF EXISTS r", "DROP ROUTINE"),
+            ("DROP AGGREGATE IF EXISTS a(int)", "DROP AGGREGATE"),
+            ("DROP EVENT TRIGGER IF EXISTS e", "DROP EVENT TRIGGER"),
+            ("DROP LANGUAGE IF EXISTS l", "DROP LANGUAGE"),
+            (
+                "DROP TRANSFORM IF EXISTS FOR int LANGUAGE sql",
+                "DROP TRANSFORM",
+            ),
+        ] {
+            assert_eq!(tag(sql).name(), expected, "{sql}");
+        }
     }
 
     #[test]

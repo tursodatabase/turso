@@ -221,7 +221,16 @@ impl TursoPgHandler {
         // the block.
         let parse_error = |error: turso_pg_parser::ParseError| {
             conn.abort_transaction_block_on_error();
-            pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
+            let error = match error {
+                turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
+                    turso_core::LimboError::Dialect(Box::new(turso_core::DialectError {
+                        code: sqlstate,
+                        message,
+                    }))
+                }
+                error => turso_core::LimboError::ParseError(error.to_string()),
+            };
+            pg_error(error.into())
         };
         turso_pg_parser::parse(&query.query).map_err(parse_error)?;
         let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;

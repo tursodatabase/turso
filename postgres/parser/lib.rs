@@ -28,7 +28,53 @@ pub enum ParseError {
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::parse(sql).map_err(grammar_error)
+}
+
+/// The error of the PostgreSQL grammar for a statement that does not parse.
+/// Most of these errors are syntax errors. The grammar gives some of them
+/// another SQLSTATE.
+fn grammar_error(error: pg_query::Error) -> ParseError {
+    let pg_query::Error::Parse(message) = &error else {
+        return ParseError::ParseError(error.to_string());
+    };
+    let sqlstate = match message.as_str() {
+        "CREATE ASSERTION is not yet implemented"
+        | "CREATE EXTENSION ... FROM is no longer supported"
+        | "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"
+        | "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
+        | "MATCH PARTIAL not yet implemented"
+        | "RECHECK is no longer required"
+        | "UNENCRYPTED PASSWORD is no longer supported"
+        | "UNIQUE predicate is not yet implemented"
+        | "WITH CHECK OPTION not supported on recursive views"
+        | "aggregates cannot have output arguments"
+        | "current database cannot be changed"
+        | "dropping an enum value is not implemented"
+        | "only string constants are supported in JSON_TABLE path specification" => {
+            sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED
+        }
+        message
+            if message.starts_with("an ordered-set aggregate with a VARIADIC direct argument") =>
+        {
+            sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED
+        }
+        message
+            if message.starts_with("frame start cannot be")
+                || message.starts_with("frame end cannot be")
+                || message.starts_with("frame starting from") =>
+        {
+            sqlstate::SQLSTATE_WINDOWING_ERROR
+        }
+        message if message.starts_with("precision for type float must be") => {
+            sqlstate::SQLSTATE_INVALID_PARAMETER_VALUE
+        }
+        _ => return ParseError::ParseError(error.to_string()),
+    };
+    ParseError::Sqlstate {
+        sqlstate,
+        message: message.clone(),
+    }
 }
 
 /// Whether the first statement in `parsed` sends rows to the client.
@@ -79,7 +125,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
 
 /// The text of `stmt` in `sql`, the string that it was parsed from. A
 /// length of 0 means that the statement ends where `sql` ends.
-fn statement_text<'a>(sql: &'a str, stmt: &pg_query::protobuf::RawStmt) -> &'a str {
+pub(crate) fn statement_text<'a>(sql: &'a str, stmt: &pg_query::protobuf::RawStmt) -> &'a str {
     let start = stmt.stmt_location as usize;
     match stmt.stmt_len {
         0 => &sql[start..],
