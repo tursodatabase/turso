@@ -775,9 +775,8 @@ mod raw_pg {
 
 /// PostgreSQL checks the access mode when a command starts executing, so a
 /// write portal suspended mid-INSERT keeps writing after the transaction
-/// becomes READ ONLY, and so does tursopg. The frontend's statement-start
-/// enforcement and the VDBE write backstop's captured-at-start mode exist
-/// to preserve this exact behavior.
+/// becomes READ ONLY. tursopg runs one statement at a time on a connection,
+/// so it refuses the BEGIN READ ONLY instead (see the tursopg half below).
 #[test]
 fn suspended_write_portal_keeps_writing_after_begin_read_only() {
     use raw_pg::{Msg, RawPg};
@@ -861,9 +860,11 @@ fn suspended_write_portal_keeps_writing_after_begin_read_only() {
 }
 
 /// The tursopg half of the suspended-portal behavior, which needs no
-/// PostgreSQL server and so always runs.
+/// PostgreSQL server and so always runs. Unlike PostgreSQL, tursopg runs one
+/// statement at a time on a connection: it refuses BEGIN READ ONLY while the
+/// INSERT is suspended, and the INSERT then finishes on its own.
 #[test]
-fn suspended_write_portal_keeps_writing_after_begin_read_only_in_tursopg() {
+fn suspended_write_portal_refuses_begin_read_only_in_tursopg() {
     let (_io, db) = turso_pg::open_database(
         ":memory:",
         None,
@@ -882,8 +883,13 @@ fn suspended_write_portal_keeps_writing_after_begin_read_only_in_tursopg() {
             .is_some(),
         "INSERT must suspend after one returned row"
     );
-    conn.execute("BEGIN READ ONLY")
-        .expect("BEGIN READ ONLY must be accepted while a write statement is in flight");
+    let err = conn
+        .execute("BEGIN READ ONLY")
+        .expect_err("BEGIN READ ONLY must be refused while a write statement is in flight");
+    assert!(
+        err.to_string().contains("SQL statements in progress"),
+        "unexpected error: {err}"
+    );
     let mut resumed_rows = 0;
     loop {
         match stmt.run_one_step_blocking(|| Ok(()), || Ok(())) {
@@ -897,7 +903,7 @@ fn suspended_write_portal_keeps_writing_after_begin_read_only_in_tursopg() {
     }
     assert_eq!(resumed_rows, 4);
     drop(stmt);
-    conn.execute("COMMIT").unwrap();
+    // No transaction started, so the INSERT committed when it finished.
     let mut count = conn.prepare("SELECT count(*) FROM t9").unwrap();
     assert_eq!(
         count.run_collect_rows().unwrap(),
