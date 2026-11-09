@@ -21,6 +21,14 @@ recovery marker or known replacement backup, including empty files. The error
 identifies the conflicting path and leaves the artifacts untouched. Reopening an
 initialized replica still permits orphaned backups left by interrupted cleanup.
 
+With bootstrap enabled, missing or empty `-info` metadata permits downloading
+again over the main database, matching plaintext bootstrap behavior. No bootstrap
+marker or additional persistent state is written. Nonempty metadata must
+successfully authenticate and parse; failures leave the replica untouched.
+Conflicting nonempty WAL, MVCC log, revert WAL, or staging files still block fresh
+creation. A database whose metadata was deleted cannot be distinguished from an
+interrupted bootstrap, so its main file can also be overwritten in this case.
+
 ## Local sample server
 
 The CLI sample server supports encrypted sync in single-database and directory
@@ -36,8 +44,9 @@ Use `--sync-dir ./databases` instead of `./source.db` to serve databases under
 `http://127.0.0.1:8080/db/{name}` with the same configured key and cipher.
 Configure clients with the base64 encoding of that cloud key and an independent
 local hex key. The sample server validates encryption credentials for both
-pull and SQL push requests. It serves authenticated, decrypted pages and MVCC
-frames over HTTP; keep it on loopback or use an HTTPS proxy for network access.
+pull and SQL push requests. It verifies native page/body-chunk tags and serves
+decrypted pages and MVCC frames over HTTP; keep it on loopback or use an HTTPS
+proxy for network access.
 SQL pipeline requests may send only the cloud key, as JavaScript's
 `remoteWritesExperimental` path does. Any supplied cipher must match the server's
 configuration; pull requests require both the cloud key and cipher headers.
@@ -157,10 +166,12 @@ Omit the local key to use a plaintext local replica of an encrypted source.
 AES-128-GCM, AES-256-GCM, and all six native AEGIS variants are supported. ChaCha20
 remains supported only by the existing legacy remote-encryption path.
 
-Authentication errors are returned to the application. The engine does not
-silently discard the database, regenerate keys, or restart bootstrap. A failed
-response does not publish its revision. A page-apply failure can leave partial
-local changes; applications choose whether to reopen or recreate the replica.
+Authentication errors are returned to the application; they do not trigger
+file deletion, key regeneration, or bootstrap. Retrying creation may restart
+bootstrap when metadata is missing or empty, subject to the artifact checks
+above. A failed response does not publish its revision. A page-apply failure can
+leave partial local changes; applications choose whether to reopen or recreate
+the replica.
 
 The server validates the requested cipher against database metadata and the cloud
 key against stored data. Pull responses carry no encryption capability flag or
@@ -174,6 +185,16 @@ length followed by encrypted message chunks, or fixed-size encrypted page
 records. There is no scratch-file header or footer: a completed batch's identity,
 counts, and size stay in memory. Scratch writes complete before apply, without
 an fsync; abandoned downloads are reset after restart.
+
+The native MVCC codec checks body-chunk AEAD tags and frame CRCs; it does not
+authenticate whole frames or log ordering. Existing native log versions do not
+bind frame offsets, preceding frames, or all header fields, including the split
+between extension and recovery bytes. An attacker who can modify stored logs
+can drop, replay, or reorder complete frames and recompute CRCs without a key.
+The codec can also accept a changed extension boundary with the same total body
+length. Fixing these limitations requires a new native log version and compatible
+recovery readers; the sync codec does not change the existing format. See the
+[native log review](https://github.com/tursodatabase/turso/pull/11515).
 
 ## Validation
 
@@ -189,9 +210,12 @@ cover empty and zero-page bootstrap, incremental pull, plaintext replicas,
 metadata/staging confidentiality, wrong or missing local keys, incompatible bootstrap pages, replacement, failed replacement recovery, checkpoint, and reopen.
 They also inject bootstrap failures before/after database sync and metadata
 publication, exercise pending replacement recovery at startup, and verify that
-a metadata write failure preserves the published revision. A host-storage test
-distinguishes missing metadata from an existing empty file even when core IO
-sees a different file.
+a later create retries with missing or empty metadata, including a subprocess
+that exits after database fsync before metadata publication. Nonempty partial
+metadata, damaged metadata, and wrong-key retries preserve the existing files.
+Tests also verify that a metadata write failure preserves the published revision
+and that metadata in host storage is authoritative when core IO sees a different
+file.
 The server's `scripts/test-sync-encryption-local.sh` additionally runs the
 production retained-fragment stream against this client.
 
