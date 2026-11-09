@@ -703,7 +703,7 @@ export class Session {
       columns,
       columnTypes,
       rows,
-      rowsAffected: columns.length > 0 ? 0 : (stepResult.affected_row_count ?? 0),
+      rowsAffected: stepResult.affected_row_count ?? 0,
       rowsRead: stepResult.rows_read,
       rowsWritten: stepResult.rows_written,
       queryDurationMs: stepResult.query_duration_ms,
