@@ -1,4 +1,4 @@
-import { test, expect, afterAll } from 'vitest';
+import { test, expect, afterAll, vi } from 'vitest';
 import { connect } from './promise-default.js';
 import { MainWorker } from './index-default.js';
 import { BrowserIO, EncryptedBrowserIO } from './browser-io.js';
@@ -51,6 +51,46 @@ test('encrypted OPFS bootstrap, checkpoint, offline reopen, and wrong key', asyn
     await reopened.close();
     await expect(connect({ path, localEncryptionKey: '17'.repeat(32),
         remoteEncryption: { cipher: 'aes256gcm' } })).rejects.toThrow();
+});
+
+test.each(['missing', 'empty', 'partial'] as const)('encrypted OPFS bootstrap handles %s metadata after failure', async (state) => {
+    const path = `interrupted-${crypto.randomUUID()}.db`;
+    let requests = 0;
+    const header = Uint8Array.from([10, 3, 114, 101, 118, 26, 0, 64, 1]);
+    const options = {
+        path, url: 'https://fixture.test', localEncryptionKey: '16'.repeat(32),
+        remoteEncryption: { cipher: 'aes256gcm' as const, key: btoa(String.fromCharCode(...new Uint8Array(32).fill(11))) },
+        fetch: async () => { requests++; return new Response(Uint8Array.from([header.length, ...header]), { status: 200 }); },
+    };
+    const write = EncryptedBrowserIO.write;
+    const interrupted = vi.spyOn(EncryptedBrowserIO, 'write').mockImplementationOnce(async (name, data) => {
+        expect(name).toBe(path + '-info');
+        if (state !== 'missing') {
+            await write(name, data.subarray(0, state === 'empty' ? 0 : Math.floor(data.length / 2)));
+        }
+        throw new Error('injected incomplete metadata write');
+    });
+    try {
+        await expect(connect(options)).rejects.toThrow('injected incomplete metadata write');
+    } finally {
+        interrupted.mockRestore();
+    }
+    if (state === 'partial') {
+        const stored = localStorage.getItem(path + '-info');
+        requests = 0;
+        await expect(connect(options)).rejects.toThrow();
+        expect(requests).toBe(0);
+        expect(localStorage.getItem(path + '-info')).toBe(stored);
+        return;
+    }
+    const db = await connect(options);
+    await db.exec("CREATE TABLE t(value TEXT); INSERT INTO t VALUES ('retried')");
+    await db.checkpoint();
+    await db.close();
+    const reopened = await connect({ ...options, url: () => null,
+        fetch: async () => { throw new Error('offline'); } });
+    expect(await (await reopened.prepare('SELECT value FROM t')).get()).toEqual({ value: 'retried' });
+    await reopened.close();
 });
 
 test('plaintext OPFS metadata stays JSON through checkpoint and reopen', async () => {
