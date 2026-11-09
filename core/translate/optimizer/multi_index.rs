@@ -11,6 +11,7 @@ use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::expr_references_any_subquery;
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
     BranchReadMode, ChosenInSeekCandidate,
@@ -195,9 +196,7 @@ fn get_table_local_constraints_for_branch(
         }
         constraint.constraining_expr = Some(constraint.get_constraining_expr(
             &synthetic_where_terms,
-            Some(table_references),
-            schema,
-            None,
+            &TableMetadata::new(Some(table_references), schema),
         ));
     }
     Ok((synthetic_where_terms, table_constraints))

@@ -3707,9 +3707,7 @@ fn btree_search_operation(
             cmp_expr: constraints[eq.constraint_pos]
                 .get_constraining_expr(
                     where_clause,
-                    Some(table_references),
-                    resolver.schema(),
-                    Some(resolver),
+                    &ExprContext::new(Some(table_references), resolver),
                 )
                 .1,
         }));
@@ -3800,8 +3798,8 @@ fn build_vtab_scan_op(
         {
             where_term.consumed = true;
         }
-        let (_, expr, _) =
-            constraint.get_constraining_expr(where_clause, referenced_tables, schema, None);
+        let (_, expr, _) = constraint
+            .get_constraining_expr(where_clause, &TableMetadata::new(referenced_tables, schema));
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }

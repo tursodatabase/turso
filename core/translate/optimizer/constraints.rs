@@ -150,9 +150,7 @@ impl Constraint {
     pub fn get_constraining_expr(
         &self,
         where_clause: &[WhereTerm],
-        referenced_tables: Option<&TableReferences>,
-        schema: &Schema,
-        resolver: Option<&Resolver>,
+        expr_properties: &impl ExprProperties,
     ) -> (ast::Operator, ast::Expr, Affinity) {
         // For multi-index branches, use the pre-computed constraining expression
         if let Some(constraining) = &self.constraining_expr {
@@ -169,14 +167,7 @@ impl Constraint {
             // `text_col < (SELECT int_col ...)` must use the subquery column's
             // affinity. With the TEXT side's affinity alone, the seek would
             // compare the integer as text.
-            affinity = match resolver {
-                Some(resolver) => {
-                    comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver))
-                }
-                None => {
-                    comparison_affinity(lhs, rhs, &TableMetadata::new(referenced_tables, schema))
-                }
-            };
+            affinity = comparison_affinity(lhs, rhs, expr_properties);
         }
 
         if side == BinaryExprSide::Lhs {
@@ -1513,14 +1504,9 @@ impl RangeConstraintRef {
         referenced_tables: Option<&TableReferences>,
         resolver: &Resolver,
     ) -> SeekRangeConstraint {
-        let constraining_expr = |constraint: &Constraint| {
-            constraint.get_constraining_expr(
-                where_clause,
-                referenced_tables,
-                resolver.schema(),
-                Some(resolver),
-            )
-        };
+        let expr_context = ExprContext::new(referenced_tables, resolver);
+        let constraining_expr =
+            |constraint: &Constraint| constraint.get_constraining_expr(where_clause, &expr_context);
         if let Some(ref eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
