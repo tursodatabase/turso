@@ -173,16 +173,12 @@ jobs:
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Use psql and pg_dump from the PostgreSQL image
-        # These scripts run psql and pg_dump in the image of postgres/version,
-        # so the clients always have the same version as the server.
-        run: |
-          postgres/conformance/docker-clients/pg_dump --version
-          echo "$GITHUB_WORKSPACE/postgres/conformance/docker-clients" >> "$GITHUB_PATH"
       - name: Check fuzzer and comparison logic
         run: cargo test --locked --profile pg-dump-fuzzer -p turso_pg_dump_fuzzer
       - name: Compare generated PostgreSQL and Turso dumps
-        run: make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
+        # psql and pg_dump come from the image of postgres/version, so the
+        # clients always have the same version as the server.
+        run: postgres/conformance/with-postgres-clients.sh make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
       - name: Upload generation report and failure artifacts
         if: always()
         uses: actions/upload-artifact@v4

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs psql from the PostgreSQL image of postgres/version, so that it has the
+# Runs psql in the container of with-postgres-clients.sh, so that it has the
 # same version as the server. See exec_postgres_client in postgres-container.sh.
 set -euo pipefail
 

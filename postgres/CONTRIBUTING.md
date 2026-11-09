@@ -63,10 +63,11 @@ into fresh PostgreSQL and Turso databases, and compare their `pg_dump` output.
 It compares PostgreSQL ASTs and decoded COPY rows rather than dump bytes.
 
 Install PostgreSQL clients that support `pg_dump --restrict-key`, or on Linux
-put `postgres/conformance/docker-clients` first on `PATH` to use the clients of
-the PostgreSQL image. Use Docker, or set `PG_DSN` to a disposable server of the
-PostgreSQL version in `postgres/version`, using a `turso` role with LOGIN and
-CREATEDB. Matching role names avoids default-privilege differences:
+run the commands through `postgres/conformance/with-postgres-clients.sh` to use
+the clients of the PostgreSQL image. Use Docker, or set `PG_DSN` to a
+disposable server of the PostgreSQL version in `postgres/version`, using a
+`turso` role with LOGIN and CREATEDB. Matching role names avoids
+default-privilege differences:
 
 ```bash
 make -C postgres/conformance test-pgdump
