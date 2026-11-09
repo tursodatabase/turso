@@ -792,16 +792,23 @@ fn assign_new_subquery_output(
                 QueryDestination::ExistsSubqueryResult { result_reg },
             )
         }
-        SubqueryType::RowValue { num_regs, .. } => {
+        SubqueryType::RowValue {
+            num_regs,
+            row_count_reg,
+            ..
+        } => {
             let result_reg_start = program.alloc_registers(*num_regs);
+            let row_count_reg = row_count_reg.map(|_| program.alloc_register());
             (
                 SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: *num_regs,
+                    row_count_reg,
                 },
                 QueryDestination::RowValueSubqueryResult {
                     result_reg_start,
                     num_regs: *num_regs,
+                    row_count_reg,
                 },
             )
         }

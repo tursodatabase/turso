@@ -376,7 +376,9 @@ fn invalid_argument_sqlstate(msg: &str) -> &'static str {
 
 /// The SQLSTATE of an error that a statement of the engine raised when it ran.
 fn sql_error_sqlstate(msg: &str) -> &'static str {
-    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time") {
+    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time")
+        || msg.contains("more than one row returned by a subquery used as an expression")
+    {
         SQLSTATE_CARDINALITY_VIOLATION
     } else {
         SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
