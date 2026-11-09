@@ -232,6 +232,7 @@ fn emit_in_seek_multi_index_branch(
         &t_ctx.resolver,
         branch.index.as_ref(),
         source,
+        0,
     )?;
 
     let branch_loop_end = program.allocate_label();
@@ -260,7 +261,8 @@ fn emit_in_seek_multi_index_branch(
     let outer_loop_start = program.allocate_label();
     program.preassign_label_to_next_insn(outer_loop_start);
     let next_value_label = program.allocate_label();
-    let seek_reg = emit_in_seek_key(
+    let seek_reg = program.alloc_register();
+    emit_in_seek_key(
         program,
         table_references,
         &t_ctx.resolver,
@@ -268,6 +270,8 @@ fn emit_in_seek_multi_index_branch(
         source,
         ephemeral_cursor_id,
         next_value_label,
+        seek_reg,
+        0,
     )?;
 
     if let Some(branch_cursor_id) = branch_cursor_id {
