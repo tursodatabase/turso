@@ -37,7 +37,13 @@ up() {
         exit 2
     fi
 
-    if docker container inspect "$PG_CONTAINER" >/dev/null 2>&1; then
+    local image
+    if image=$(docker container inspect --format '{{.Config.Image}}' "$PG_CONTAINER" 2>/dev/null); then
+        if [[ "$image" != "$POSTGRES_IMAGE" ]]; then
+            echo "error: container $PG_CONTAINER runs $image, not $POSTGRES_IMAGE." >&2
+            echo "Remove it with '$0 down', then run '$0 up' again." >&2
+            exit 2
+        fi
         docker start "$PG_CONTAINER" >/dev/null
     else
         start_postgres_container --name "$PG_CONTAINER" --publish "127.0.0.1:${PG_PORT}:5432" >/dev/null
