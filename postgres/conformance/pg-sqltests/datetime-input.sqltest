@@ -125,3 +125,100 @@ test datetime-input-rejects-infinity {
 expect error {
     the timestamp value "infinity" is not supported
 }
+
+# A string compared with a date or time column is read as a value of the
+# column's type, in any input form, whether the query scans the table or
+# seeks an index.
+
+setup datetime-compare-no-index {
+    CREATE TABLE c (id int, d date, ts timestamp, tz timestamptz);
+    INSERT INTO c VALUES (1, '2024-01-05', '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+}
+
+setup datetime-compare-index {
+    CREATE TABLE c (id int, d date, ts timestamp, tz timestamptz);
+    CREATE INDEX c_d ON c (d);
+    CREATE INDEX c_ts ON c (ts);
+    CREATE INDEX c_tz ON c (tz);
+    INSERT INTO c VALUES (1, '2024-01-05', '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+}
+
+@setup datetime-compare-no-index
+test datetime-compare-timestamptz-eq-scan {
+    SELECT id FROM c WHERE tz = '2024-01-05 10:00:00';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-index
+test datetime-compare-timestamptz-eq-index {
+    SELECT id FROM c WHERE tz = '2024-01-05 10:00:00';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-no-index
+test datetime-compare-timestamptz-gt-scan {
+    SELECT count(*) FROM c WHERE tz > '2024-01-05 10:00:00';
+}
+expect {
+    0
+}
+
+@setup datetime-compare-index
+test datetime-compare-timestamptz-gt-index {
+    SELECT count(*) FROM c WHERE tz > '2024-01-05 10:00:00';
+}
+expect {
+    0
+}
+
+@setup datetime-compare-no-index
+test datetime-compare-timestamptz-between-scan {
+    SELECT id FROM c WHERE tz BETWEEN '2024-01-05 09:00:00' AND '2024-01-05 10:00:00';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-index
+test datetime-compare-timestamptz-between-index {
+    SELECT id FROM c WHERE tz BETWEEN '2024-01-05 09:00:00' AND '2024-01-05 10:00:00';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-no-index
+test datetime-compare-timestamp-t-form-scan {
+    SELECT id FROM c WHERE ts > '2024-01-05T09:00';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-index
+test datetime-compare-timestamp-t-form-index {
+    SELECT id FROM c WHERE ts > '2024-01-05T09:00';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-no-index
+test datetime-compare-date-month-name-scan {
+    SELECT id FROM c WHERE d >= 'Jan 5 2024';
+}
+expect {
+    1
+}
+
+@setup datetime-compare-index
+test datetime-compare-date-month-name-index {
+    SELECT id FROM c WHERE d >= 'Jan 5 2024';
+}
+expect {
+    1
+}
