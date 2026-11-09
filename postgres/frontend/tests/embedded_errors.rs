@@ -207,6 +207,35 @@ fn foreign_key_violation_reports_structured_fields() {
     );
 }
 
+/// In PostgreSQL, DISABLE TRIGGER ALL also stops the checks of the foreign
+/// keys of a table, on both tables of each key. tursopg cannot stop them for
+/// one table, so it rejects the statement when the session checks them.
+#[test]
+fn disable_trigger_all_on_a_table_with_foreign_key_checks_is_not_supported() {
+    let (_io, conn) = pg_connection_with_fk();
+    conn.execute("CREATE TABLE t_parent (id INT PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE t_child (pid INT REFERENCES t_parent(id))")
+        .unwrap();
+    conn.execute("CREATE TABLE t_other (id INT)").unwrap();
+    for table in ["t_child", "t_parent"] {
+        let e = exec_err(&conn, &format!("ALTER TABLE {table} DISABLE TRIGGER ALL"));
+        assert_eq!(e.sqlstate, "0A000");
+        assert_eq!(
+            e.message,
+            "ALTER TABLE ... DISABLE TRIGGER ALL on a table with foreign key checks is not supported"
+        );
+        conn.execute(format!("ALTER TABLE {table} DISABLE TRIGGER USER"))
+            .unwrap();
+        conn.execute(format!("ALTER TABLE {table} ENABLE TRIGGER ALL"))
+            .unwrap();
+    }
+    conn.execute("ALTER TABLE t_other DISABLE TRIGGER ALL")
+        .unwrap();
+    let e = exec_err(&conn, "INSERT INTO t_child VALUES (99)");
+    assert_eq!(e.sqlstate, "23503");
+}
+
 #[test]
 fn not_null_violation_reports_column_name() {
     let (_io, conn) = pg_connection();

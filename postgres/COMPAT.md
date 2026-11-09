@@ -487,7 +487,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ALTER TABLE ENABLE/DISABLE TRIGGER | 🟡 Partial | There are no triggers: ENABLE and DISABLE TRIGGER ALL and USER do nothing, and a named trigger does not exist |
+| ALTER TABLE ENABLE/DISABLE TRIGGER | 🟡 Partial | There are no triggers: ENABLE and DISABLE TRIGGER ALL and USER do nothing, and a named trigger does not exist. In PostgreSQL, DISABLE TRIGGER ALL also stops the foreign key checks of the table. tursopg cannot stop them for one table, so it rejects DISABLE TRIGGER ALL when the session checks foreign keys of the table |
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | Rejected with an error, as is a `RETURN expression` body |
 | CALL syntax for executing procedures | ❌ Not supported | Rejected with an error |

@@ -59,6 +59,9 @@ pub struct Relation {
     /// The name of each column, with the type that it was declared with,
     /// such as `integer` or `numeric(10, 2)`.
     pub columns: Vec<(String, String)>,
+    /// Whether the session checks a foreign key of the table: a foreign key
+    /// on the table, or one that references the table.
+    pub foreign_keys_checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

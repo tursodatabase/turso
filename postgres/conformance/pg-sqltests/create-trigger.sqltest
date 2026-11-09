@@ -490,6 +490,23 @@ expect {
     altered
 }
 
+# DISABLE TRIGGER ALL also stops the checks of the foreign keys of a table.
+# A tursopg session does not check foreign keys, so the row without a parent
+# goes in on both.
+test alter-table-disable-trigger-all-on-a-table-with-a-foreign-key {
+    CREATE TABLE parents (id int PRIMARY KEY);
+    CREATE TABLE children (parent_id int REFERENCES parents);
+    ALTER TABLE children DISABLE TRIGGER ALL;
+    ALTER TABLE parents DISABLE TRIGGER ALL;
+    INSERT INTO children VALUES (42);
+    ALTER TABLE children ENABLE TRIGGER ALL;
+    ALTER TABLE parents ENABLE TRIGGER ALL;
+    SELECT parent_id FROM children;
+}
+expect {
+    42
+}
+
 @setup items
 test alter-table-enable-trigger-on-a-view-is-rejected {
     CREATE VIEW items_view AS SELECT * FROM items;

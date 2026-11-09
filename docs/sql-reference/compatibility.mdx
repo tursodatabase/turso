@@ -70,6 +70,13 @@ the first feature of the statement that is not supported, for example
 does not exist does nothing, as in PostgreSQL. `COMMENT ON` an object that
 exists does nothing, because comments are not kept.
 
+`ALTER TABLE ... ENABLE TRIGGER` and `DISABLE TRIGGER` with `ALL` or `USER` do
+nothing, because there are no triggers. In PostgreSQL, `DISABLE TRIGGER ALL`
+also stops the foreign key checks of the table. The frontend cannot stop
+these checks for one table. So when the session checks foreign keys,
+`DISABLE TRIGGER ALL` gets `0A000` for a table that has a foreign key or that
+a foreign key references.
+
 When `check_function_bodies` is on, which is the default, `CREATE FUNCTION`
 prepares each statement of a SQL function body. A missing table, column, or
 function in the body gets the PostgreSQL SQLSTATE. A result that does not

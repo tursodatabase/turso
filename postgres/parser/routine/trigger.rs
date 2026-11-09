@@ -502,6 +502,17 @@ pub(super) fn check_alter_table_triggers(
     if let Some((command, _)) = named {
         return Some(Err(missing_trigger(&command.name, &range.relname)));
     }
+    // PostgreSQL checks a foreign key with system triggers on both of its
+    // tables, and DISABLE TRIGGER ALL turns them off. tursopg cannot stop
+    // the checks of one table.
+    let disables_all = triggers
+        .iter()
+        .any(|(command, _)| command.subtype() == AlterTableType::AtDisableTrigAll);
+    if disables_all && relation.foreign_keys_checked {
+        return Some(Err(not_supported(
+            "ALTER TABLE ... DISABLE TRIGGER ALL on a table with foreign key checks",
+        )));
+    }
     // Without triggers, ENABLE and DISABLE TRIGGER ALL or USER do nothing.
     if triggers.len() == commands.len() {
         return Some(Ok(()));

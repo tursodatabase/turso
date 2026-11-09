@@ -560,12 +560,23 @@ impl RoutineCatalog for SessionCatalog<'_> {
                             })
                             .collect()
                     };
-                    let relation = |kind, columns| Relation { kind, columns };
+                    let relation = |kind, columns| Relation {
+                        kind,
+                        columns,
+                        foreign_keys_checked: false,
+                    };
                     Some(match catalog.relation_kind(ns, name)? {
-                        ast::RelationKind::Table => relation(
-                            RelationKind::Table,
-                            columns(catalog.get_table(ns, name)?.columns()),
-                        ),
+                        ast::RelationKind::Table => {
+                            let table = catalog.get_table(ns, name)?;
+                            let table_name = table.get_name();
+                            Relation {
+                                kind: RelationKind::Table,
+                                columns: columns(table.columns()),
+                                foreign_keys_checked: conn.foreign_keys_enabled()
+                                    && (catalog.has_child_fks(ns, table_name)
+                                        || catalog.any_resolved_fks_referencing(ns, table_name)),
+                            }
+                        }
                         ast::RelationKind::MaterializedView => relation(
                             RelationKind::MaterializedView,
                             columns(catalog.get_table(ns, name)?.columns()),
