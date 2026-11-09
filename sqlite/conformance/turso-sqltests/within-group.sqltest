@@ -765,7 +765,8 @@ expect error {
 test percentile_disc_rejects_percentage {
     SELECT percentile_disc(x, 100) FROM (SELECT 1 AS x UNION ALL SELECT 2);
 }
-expect {
+expect error {
+    the fraction argument to percentile_disc\(\) is not between 0.0 and 1.0
 }
 
 test percentile_disc_accepts_fraction {
