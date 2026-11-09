@@ -25,6 +25,11 @@ TURSOPG := $(TARGET_ROOT)/$(TARGET_DIR)/tursopg
 PGDUMP_FUZZER := $(TARGET_ROOT)/$(FUZZER_TARGET_DIR)/pg-dump-fuzzer
 PGDUMP_PROFILE ?= compatible
 FUZZ_ARGS ?= --cases 100
+# With PGDUMP_IN_IMAGE=1, test-pgdump and fuzz-pgdump run the fuzzer in a
+# container of the PostgreSQL image, with the psql and pg_dump of
+# postgres/version. This works only when Docker runs on Linux. CI sets it.
+PGDUMP_IN_IMAGE ?=
+PGDUMP_RUN := $(if $(PGDUMP_IN_IMAGE),./in-postgres-image.sh)
 SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CARGO_PROFILE)
 
 # Test corpora (relative to this directory)
@@ -99,11 +104,11 @@ build-dump-fuzzer:
 test-pgdump: build-tursopg build-dump-fuzzer
 	cd $(ROOT_DIR) && cargo test $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
 	@for fixture in $(or $(FILE),$(wildcard pgdump/*.sql)); do \
-		./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
+		./with-postgres.sh $(PGDUMP_RUN) "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
 	done
 
 fuzz-pgdump: build-tursopg build-dump-fuzzer
-	./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
+	./with-postgres.sh $(PGDUMP_RUN) "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;

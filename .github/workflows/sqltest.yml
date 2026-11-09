@@ -176,9 +176,9 @@ jobs:
       - name: Check fuzzer and comparison logic
         run: cargo test --locked --profile pg-dump-fuzzer -p turso_pg_dump_fuzzer
       - name: Compare generated PostgreSQL and Turso dumps
-        # psql and pg_dump come from the image of postgres/version, so the
-        # clients always have the same version as the server.
-        run: postgres/conformance/with-postgres-clients.sh make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
+        # The fuzzer runs in the image of postgres/version, so psql and pg_dump
+        # always have the same version as the server.
+        run: make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast' PGDUMP_IN_IMAGE=1
       - name: Upload generation report and failure artifacts
         if: always()
         uses: actions/upload-artifact@v4

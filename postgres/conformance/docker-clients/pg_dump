@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Runs pg_dump in the container of with-postgres-clients.sh, so that it has the
-# same version as the server. See exec_postgres_client in postgres-container.sh.
-set -euo pipefail
-
-source "$(dirname "${BASH_SOURCE[0]}")/../postgres-container.sh"
-exec_postgres_client pg_dump "$@"
