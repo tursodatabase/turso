@@ -3058,7 +3058,11 @@ fn operation_for_unmatched_right_rows(
         } => {
             let source = in_seek_source(&original_where_clause[where_term_idx].expr, affinity)?;
             where_clause_for_unmatched_rows[where_term_idx].consumed = true;
-            Ok(Operation::Search(Search::InSeek { index, source }))
+            Ok(Operation::Search(Search::InSeek {
+                index,
+                source,
+                prefix: Vec::new(),
+            }))
         }
         AccessMethodParams::MultiIndexScan {
             branches,
@@ -3541,6 +3545,7 @@ fn apply_table_access_plan(
                     Operation::Search(Search::InSeek {
                         index: index.clone(),
                         source,
+                        prefix: Vec::new(),
                     });
             }
         }

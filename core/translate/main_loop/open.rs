@@ -620,13 +620,18 @@ pub(super) fn emit_table_read_start(
                         }
                     }
                 }
-                Search::InSeek { index, source } => {
+                Search::InSeek {
+                    index,
+                    source,
+                    prefix,
+                } => {
                     let meta = emit_in_seek_start(
                         program,
                         table_references,
                         &t_ctx.resolver,
                         index.as_ref(),
                         source,
+                        prefix,
                         table_cursor_id,
                         index_cursor_id,
                         loop_start,

@@ -406,6 +406,19 @@ impl Display for EqpDetail {
 
 /// Build the human-readable key constraints for an index seek,
 /// e.g. `["label=?", "fromId>?"]`.
+/// The constrained columns of an IN seek: the equality prefix, then the IN column.
+pub(crate) fn in_seek_constraint_parts(index: Option<&Index>, prefix_len: usize) -> Vec<String> {
+    match index {
+        Some(index) => index
+            .columns
+            .iter()
+            .take(prefix_len + 1)
+            .map(|col| format!("{}=?", col.name))
+            .collect(),
+        None => vec!["rowid=?".to_string()],
+    }
+}
+
 pub(crate) fn seek_constraint_parts(index: Option<&Index>, seek_def: &SeekDef) -> Vec<String> {
     let mut parts = Vec::new();
     // Equality prefix constraints
@@ -524,19 +537,12 @@ pub(crate) fn eqp_detail_for_table_op(
                     seek_constraint_parts(index.as_deref(), seek_def),
                     seek_def.iter_dir == IterationDirection::Backwards,
                 ),
-                Search::InSeek { index, .. } => (
+                Search::InSeek { index, prefix, .. } => (
                     EqpSearchKind::InSeek,
                     index
                         .as_ref()
                         .map(|index| eqp_index(index, table.utilizes_covering_index())),
-                    match index {
-                        Some(index) => index
-                            .columns
-                            .first()
-                            .map(|col| vec![format!("{}=?", col.name)])
-                            .unwrap_or_default(),
-                        None => vec!["rowid=?".to_string()],
-                    },
+                    in_seek_constraint_parts(index.as_deref(), prefix.len()),
                     false,
                 ),
             };
