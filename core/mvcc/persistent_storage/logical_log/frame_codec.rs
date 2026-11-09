@@ -1,3 +1,9 @@
+//! Native MVCC frame decoding and sizing for sync.
+//!
+//! Validates log headers, frame layouts, CRCs, and extension records.
+//! Decrypts encrypted body chunks with AEAD tag verification and produces
+//! plaintext wire parts with a separate checksum chain.
+
 use super::{
     build_encrypted_chunk_aad, derive_initial_crc, encrypted_payload_blob_size,
     encrypted_payload_chunk_count, EncryptionContext, LogHeader, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
@@ -194,7 +200,10 @@ impl ValidatedFrame<'_> {
     }
 }
 
-/// Validate exactly one stored frame. The caller must bound `stored_frame` to the selected source range.
+/// Validate a complete stored frame and write its plaintext body to `output`.
+/// Checks framing, the chained CRC, extension records, and encrypted chunk tags.
+/// `source_start` is the frame's offset in the source log, used to calculate
+/// the returned end offset. The caller must enforce the selected source range.
 pub fn validate_frame_into<'a>(
     log: &ValidatedLogHeader,
     source_start: u64,
