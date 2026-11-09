@@ -5342,6 +5342,7 @@ impl<'a> Parser<'a> {
             min_value,
             max_value,
             cycle,
+            conflicting_options: false,
         })
     }
 
@@ -13628,8 +13629,10 @@ mod tests {
                 min_value,
                 max_value,
                 cycle,
+                conflicting_options,
             }) => {
                 assert!(!if_not_exists);
+                assert!(!conflicting_options);
                 assert_eq!(seq_name.name.to_string(), "foo");
                 assert_eq!(start, None);
                 assert_eq!(increment, None);

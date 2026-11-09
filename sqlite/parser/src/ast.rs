@@ -361,6 +361,9 @@ pub enum Stmt {
         max_value: Option<i64>,
         /// cycle on overflow
         cycle: bool,
+        /// an option name was repeated, deferred so the executor can apply
+        /// `IF NOT EXISTS` before reporting the conflict
+        conflicting_options: bool,
     },
     /// `DROP SEQUENCE`
     DropSequence {

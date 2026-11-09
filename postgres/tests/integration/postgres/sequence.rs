@@ -178,6 +178,23 @@ fn test_create_sequence_duplicate(db: TempDatabase) {
     // With IF NOT EXISTS -> ok
     pg_execute(&conn, "CREATE SEQUENCE IF NOT EXISTS dup_seq");
 
+    // A taken name skips the statement before the option list is checked,
+    // like PostgreSQL: repeated options under IF NOT EXISTS are ignored.
+    pg_execute(
+        &conn,
+        "CREATE SEQUENCE IF NOT EXISTS dup_seq START 1 START 2",
+    );
+
+    // A fresh name still reports the conflict.
+    let err = pg_execute_err(
+        &conn,
+        "CREATE SEQUENCE IF NOT EXISTS dup_seq2 START 1 START 2",
+    );
+    assert!(
+        err.contains("conflicting or redundant options"),
+        "unexpected error: {err}"
+    );
+
     pg_execute(&conn, "DROP SEQUENCE dup_seq");
 }
 

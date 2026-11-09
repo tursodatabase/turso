@@ -835,6 +835,7 @@ impl ToTokens for Stmt {
                 min_value,
                 max_value,
                 cycle,
+                conflicting_options: _,
             } => {
                 s.append(TK_CREATE, None)?;
                 s.append(TK_ID, Some("SEQUENCE"))?;
