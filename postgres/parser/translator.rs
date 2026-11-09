@@ -5,9 +5,10 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -5168,25 +5169,24 @@ impl PostgreSQLTranslator {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    "cache" => {
-                        // Turso's disk-only sequence implementation never
-                        // caches values, so a `CACHE n` clause is otherwise
-                        // a no-op. We still validate the value against the
-                        // PostgreSQL contract (`CACHE` must be >= 1) so
-                        // that `CACHE 0` errors with the same message a
-                        // real PG server would produce. Surfacing the
-                        // requested value through to the runtime would
-                        // require resurrecting per-sequence in-memory
-                        // descriptor state we have intentionally removed
-                        // (see feedback-sequences-disk-only memory).
-                        if let Some(cache) = extract_def_elem_int(elem) {
-                            if cache < 1 {
-                                return Err(ParseError::ParseError(format!(
-                                    "CACHE ({cache}) must be greater than zero"
-                                )));
-                            }
+                    "cache" => match extract_def_elem_int(elem) {
+                        Some(1) => {}
+                        Some(cache) if cache < 1 => {
+                            return Err(ParseError::Sqlstate {
+                                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                                message: format!("CACHE ({cache}) must be greater than zero"),
+                            });
                         }
-                    }
+                        Some(cache) => {
+                            return Err(not_supported(format!(
+                                "CACHE {cache} (Turso sequences do not cache values, \
+                                 so CACHE must be 1)"
+                            )));
+                        }
+                        None => {
+                            return Err(not_supported("this CACHE value in CREATE SEQUENCE"));
+                        }
+                    },
                     "owned_by"
                         if matches!(
                             elem.arg.as_ref().and_then(|n| n.node.as_ref()),
@@ -12289,6 +12289,9 @@ mod tests {
             "CREATE SEQUENCE s MAXVALUE 99999999999999999999",
             "MAXVALUE value",
         );
+        assert_not_supported("CREATE SEQUENCE s CACHE 10", "CACHE 10");
+        assert_not_supported("CREATE SEQUENCE s CACHE 9999999999", "CACHE 9999999999");
+        assert_not_supported("CREATE SEQUENCE s CACHE 1.5", "CACHE value");
         assert_translates("CREATE SEQUENCE s OWNED BY NONE NO MINVALUE NO MAXVALUE CACHE 1");
 
         let parsed = crate::parse("CREATE SEQUENCE s AS integer START WITH 1").unwrap();
