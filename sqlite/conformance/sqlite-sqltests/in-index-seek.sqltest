@@ -1020,3 +1020,422 @@ expect {
     |6|6
     |7|7
 }
+
+# IN on an index column that follows an equality prefix: with an index on
+# (source, item_id), `source = ? AND item_id IN (...)` seeks (source, v) once
+# per distinct non-NULL value v instead of scanning every row of the prefix.
+setup eq_prefix {
+    CREATE TABLE ts (
+        id INTEGER PRIMARY KEY,
+        source TEXT,
+        item_id INTEGER
+    );
+    CREATE INDEX idx_ts ON ts(source, item_id);
+    INSERT INTO ts VALUES(1, 'a', 1);
+    INSERT INTO ts VALUES(2, 'a', 2);
+    INSERT INTO ts VALUES(3, 'a', 3);
+    INSERT INTO ts VALUES(4, 'a', 3);
+    INSERT INTO ts VALUES(5, 'a', NULL);
+    INSERT INTO ts VALUES(6, 'b', 1);
+    INSERT INTO ts VALUES(7, 'b', 2);
+    INSERT INTO ts VALUES(8, NULL, 1);
+    INSERT INTO ts VALUES(9, NULL, NULL);
+    INSERT INTO ts VALUES(10, 'a', 5);
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix {
+    SELECT id FROM ts WHERE source = 'a' AND item_id IN (3, 1, 99) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+# A value spelled several ways, or repeated, reads its rows once.
+@setup eq_prefix
+test in-list-after-eq-prefix-duplicate-values {
+    SELECT id FROM ts WHERE source = 'a' AND item_id IN (3, 3, 3.0, '3', 1) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-null-in-list {
+    SELECT id FROM ts WHERE source = 'a' AND item_id IN (NULL, 2) ORDER BY id;
+}
+expect {
+    2
+}
+
+# A NULL prefix value matches nothing.
+@setup eq_prefix
+test in-list-after-eq-prefix-null-prefix {
+    SELECT count(*) FROM ts WHERE source = NULL AND item_id IN (1, 2);
+}
+expect {
+    0
+}
+
+# IS matches NULL keys, so it is not a prefix equality.
+@setup eq_prefix
+test in-list-after-is-null-prefix {
+    SELECT id FROM ts WHERE source IS NULL AND item_id IN (1, 2) ORDER BY id;
+}
+expect {
+    8
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-expression {
+    SELECT id FROM ts WHERE source = lower('A') AND item_id IN (2, 5) ORDER BY id;
+}
+expect {
+    2
+    10
+}
+
+@setup eq_prefix
+test not-in-list-after-eq-prefix {
+    SELECT id FROM ts WHERE source = 'a' AND item_id NOT IN (1, 2, 3) ORDER BY id;
+}
+expect {
+    10
+}
+
+@setup eq_prefix
+test in-subquery-after-eq-prefix {
+    SELECT id FROM ts
+    WHERE source = 'a' AND item_id IN (SELECT item_id FROM ts WHERE source = 'b')
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# The subquery returns a value several times and NULLs.
+@setup eq_prefix
+test in-subquery-after-eq-prefix-duplicates-and-nulls {
+    SELECT id FROM ts
+    WHERE source = 'a' AND item_id IN (SELECT item_id FROM ts WHERE id IN (1, 3, 4, 5, 9))
+    ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@setup eq_prefix
+test in-subquery-after-eq-prefix-no-rows {
+    SELECT count(*) FROM ts
+    WHERE source = 'a' AND item_id IN (SELECT item_id FROM ts WHERE id < 0);
+}
+expect {
+    0
+}
+
+# The IN values are not read in index order: ORDER BY on the IN column must sort.
+@setup eq_prefix
+test in-list-after-eq-prefix-order-by-in-column {
+    SELECT id, item_id FROM ts WHERE source = 'a' AND item_id IN (5, 3, 1) ORDER BY item_id, id;
+}
+expect {
+    1|1
+    3|3
+    4|3
+    10|5
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-order-by-in-column-desc-limit {
+    SELECT id, item_id FROM ts
+    WHERE source = 'a' AND item_id IN (5, 3, 1)
+    ORDER BY item_id DESC, id
+    LIMIT 2;
+}
+expect {
+    10|5
+    3|3
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-order-by-in-column-limit-one {
+    SELECT id, item_id FROM ts WHERE source = 'a' AND item_id IN (5, 3, 1) ORDER BY item_id LIMIT 1;
+}
+expect {
+    1|1
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-order-by-rowid-desc-limit {
+    SELECT id, item_id FROM ts WHERE source = 'a' AND item_id IN (5, 3, 1) ORDER BY id DESC LIMIT 2;
+}
+expect {
+    10|5
+    4|3
+}
+
+setup eq_prefix_left_join {
+    CREATE TABLE tl (k TEXT, v INTEGER);
+    INSERT INTO tl VALUES('a', 1);
+    INSERT INTO tl VALUES('a', 2);
+    INSERT INTO tl VALUES('b', 3);
+    INSERT INTO tl VALUES('z', 1);
+    INSERT INTO tl VALUES(NULL, 9);
+}
+
+# The prefix value comes from the outer table. A row without a match, or with a
+# NULL prefix value, still produces its NULL-extended row.
+@setup eq_prefix
+@setup eq_prefix_left_join
+test in-list-after-eq-prefix-left-join-on {
+    SELECT tl.k, tl.v, ts.id
+    FROM tl LEFT JOIN ts ON ts.source = tl.k AND ts.item_id IN (1, 3)
+    ORDER BY tl.k, tl.v, ts.id;
+}
+expect {
+    |9|
+    a|1|1
+    a|1|3
+    a|1|4
+    a|2|1
+    a|2|3
+    a|2|4
+    b|3|6
+    z|1|
+}
+
+# A WHERE term on the right table also filters the NULL-extended rows.
+@setup eq_prefix
+@setup eq_prefix_left_join
+test in-list-after-eq-prefix-left-join-where {
+    SELECT tl.k, tl.v, ts.id
+    FROM tl LEFT JOIN ts ON ts.source = tl.k
+    WHERE ts.item_id IN (1, 3)
+    ORDER BY tl.k, tl.v, ts.id;
+}
+expect {
+    a|1|1
+    a|1|3
+    a|1|4
+    a|2|1
+    a|2|3
+    a|2|4
+    b|3|6
+}
+
+@setup eq_prefix
+@setup eq_prefix_left_join
+test in-list-after-eq-prefix-inner-join {
+    SELECT tl.v, ts.id
+    FROM tl JOIN ts ON ts.source = tl.k
+    WHERE ts.item_id IN (2, 5)
+    ORDER BY tl.v, ts.id;
+}
+expect {
+    1|2
+    1|10
+    2|2
+    2|10
+    3|7
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-delete {
+    DELETE FROM ts WHERE source = 'a' AND item_id IN (1, 3, 99);
+    SELECT id FROM ts ORDER BY id;
+}
+expect {
+    2
+    5
+    6
+    7
+    8
+    9
+    10
+}
+
+# The UPDATE moves each row to a value that is also in the IN list. Every row
+# must be updated once.
+@setup eq_prefix
+test in-list-after-eq-prefix-update-in-column {
+    UPDATE ts SET item_id = item_id + 1 WHERE source = 'a' AND item_id IN (1, 2, 3);
+    SELECT id, item_id FROM ts WHERE source = 'a' ORDER BY id;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|4
+    5|
+    10|5
+}
+
+@setup eq_prefix
+test in-list-after-eq-prefix-update-prefix-column {
+    UPDATE ts SET source = 'c' WHERE source = 'a' AND item_id IN (2, 5);
+    SELECT id, source FROM ts WHERE source = 'c' ORDER BY id;
+}
+expect {
+    2|c
+    10|c
+}
+
+setup eq_prefix_desc {
+    CREATE TABLE td2 (
+        id INTEGER PRIMARY KEY,
+        source TEXT,
+        item_id INTEGER
+    );
+    CREATE INDEX idx_td2 ON td2(source, item_id DESC);
+    INSERT INTO td2 VALUES(1, 'a', 1);
+    INSERT INTO td2 VALUES(2, 'a', 2);
+    INSERT INTO td2 VALUES(3, 'a', 3);
+    INSERT INTO td2 VALUES(4, 'b', 2);
+    INSERT INTO td2 VALUES(5, 'a', 3);
+}
+
+@setup eq_prefix_desc
+test in-list-after-eq-prefix-desc-index-column {
+    SELECT id FROM td2 WHERE source = 'a' AND item_id IN (3, 1, 9) ORDER BY id;
+}
+expect {
+    1
+    3
+    5
+}
+
+@setup eq_prefix_desc
+test in-list-after-eq-prefix-desc-index-column-delete {
+    DELETE FROM td2 WHERE source = 'a' AND item_id IN (3, 9);
+    SELECT id FROM td2 ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+setup eq_prefix_nocase {
+    CREATE TABLE tcol (
+        id INTEGER PRIMARY KEY,
+        source TEXT COLLATE NOCASE,
+        name TEXT COLLATE NOCASE
+    );
+    CREATE INDEX idx_tcol ON tcol(source, name);
+    INSERT INTO tcol VALUES(1, 'a', 'x');
+    INSERT INTO tcol VALUES(2, 'A', 'X');
+    INSERT INTO tcol VALUES(3, 'a', 'y');
+    INSERT INTO tcol VALUES(4, 'b', 'x');
+    INSERT INTO tcol VALUES(5, 'A', 'z');
+}
+
+# The prefix and the IN column compare with the NOCASE collation of the index.
+@setup eq_prefix_nocase
+test in-list-after-eq-prefix-nocase {
+    SELECT id FROM tcol WHERE source = 'A' AND name IN ('x', 'X', 'Y') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# A BINARY comparison on the prefix cannot use the NOCASE index column.
+@setup eq_prefix_nocase
+test in-list-after-eq-prefix-collation-mismatch-on-prefix {
+    SELECT id FROM tcol WHERE source = 'A' COLLATE BINARY AND name IN ('x', 'X', 'Y') ORDER BY id;
+}
+expect {
+    2
+}
+
+@setup eq_prefix_nocase
+test in-list-after-eq-prefix-collation-mismatch-on-in-column {
+    SELECT id FROM tcol WHERE source = 'a' AND name COLLATE BINARY IN ('x', 'y') ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+# The prefix gets the affinity of its column: 1 becomes '1' for a TEXT column.
+setup eq_prefix_affinity {
+    CREATE TABLE taf (
+        id INTEGER PRIMARY KEY,
+        src TEXT,
+        item INTEGER
+    );
+    CREATE INDEX idx_taf ON taf(src, item);
+    INSERT INTO taf VALUES(1, '1', 10);
+    INSERT INTO taf VALUES(2, '1', 20);
+    INSERT INTO taf VALUES(3, '2', 10);
+    INSERT INTO taf VALUES(4, '01', 10);
+}
+
+@setup eq_prefix_affinity
+test in-list-after-eq-prefix-prefix-affinity {
+    SELECT id FROM taf WHERE src = 1 AND item IN (10, 30) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup eq_prefix_affinity
+test in-list-after-eq-prefix-in-column-affinity {
+    SELECT id FROM taf WHERE src = '1' AND item IN ('20', 10.0) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# More than two index columns: the IN is on the column after the equalities;
+# a column after the IN stays a filter.
+setup eq_prefix_three_columns {
+    CREATE TABLE t3c (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        c INTEGER
+    );
+    CREATE INDEX idx_t3c ON t3c(a, b, c);
+    INSERT INTO t3c VALUES(1, 1, 1, 5);
+    INSERT INTO t3c VALUES(2, 1, 2, 5);
+    INSERT INTO t3c VALUES(3, 1, 2, 6);
+    INSERT INTO t3c VALUES(4, 1, 2, 7);
+    INSERT INTO t3c VALUES(5, 1, 3, 5);
+    INSERT INTO t3c VALUES(6, 2, 2, 5);
+}
+
+@setup eq_prefix_three_columns
+test in-list-after-two-eq-prefix-columns {
+    SELECT id FROM t3c WHERE a = 1 AND b = 2 AND c IN (5, 6) ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+@setup eq_prefix_three_columns
+test in-list-before-an-eq-column {
+    SELECT id FROM t3c WHERE a = 1 AND b IN (2, 3) AND c = 5 ORDER BY id;
+}
+expect {
+    2
+    5
+}
+
+@setup eq_prefix_three_columns
+test in-list-after-eq-prefix-with-range-on-in-column {
+    SELECT id FROM t3c WHERE a = 1 AND b IN (2, 3) AND b > 2 ORDER BY id;
+}
+expect {
+    5
+}
