@@ -159,7 +159,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
-| macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |
+| macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr: input checked with PostgreSQL's rules and stored as PostgreSQL prints it; network operators and functions are not supported |
 | Multiranges | ❌ Not supported | |
 | NULLs in Array | ✅ Supported | `ARRAY[1, NULL, 3]` round-trips |
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
