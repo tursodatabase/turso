@@ -338,6 +338,7 @@ fn prepare_one_select_plan(
             let table_refs_outside_from = if with.is_some() {
                 collect_table_refs_outside_from(
                     &columns,
+                    from.as_ref(),
                     where_clause.as_deref(),
                     group_by.as_ref(),
                     &window_clause,
@@ -1569,6 +1570,7 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
 /// Collects the table names read by subqueries outside the FROM clause.
 fn collect_table_refs_outside_from(
     columns: &[ResultColumn],
+    from: Option<&ast::FromClause>,
     where_clause: Option<&Expr>,
     group_by: Option<&ast::GroupBy>,
     window_clause: &[ast::WindowDef],
@@ -1580,6 +1582,9 @@ fn collect_table_refs_outside_from(
         if let ResultColumn::Expr(expr, _) = column {
             collect_subquery_table_refs_in_expr(expr, &mut table_refs);
         }
+    }
+    if let Some(from) = from {
+        collect_subquery_table_refs_in_join_constraints(from, &mut table_refs);
     }
     if let Some(where_clause) = where_clause {
         collect_subquery_table_refs_in_expr(where_clause, &mut table_refs);
@@ -1603,6 +1608,24 @@ fn collect_table_refs_outside_from(
         }
     }
     table_refs
+}
+
+fn collect_subquery_table_refs_in_join_constraints(
+    from: &ast::FromClause,
+    table_refs: &mut Vec<String>,
+) {
+    let collect_nested = |table: &ast::SelectTable, table_refs: &mut Vec<String>| {
+        if let ast::SelectTable::Sub(inner, _) = table {
+            collect_subquery_table_refs_in_join_constraints(inner, table_refs);
+        }
+    };
+    collect_nested(&from.select, table_refs);
+    for join in &from.joins {
+        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+            collect_subquery_table_refs_in_expr(expr, table_refs);
+        }
+        collect_nested(&join.table, table_refs);
+    }
 }
 
 /// Estimates jump labels needed to emit a query plan.
