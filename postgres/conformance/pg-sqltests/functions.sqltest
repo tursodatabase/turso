@@ -1886,6 +1886,43 @@ expect @tursopg error {
     ^a reference to the whole row of "emp" is not supported$
 }
 
+# `q.*` is the whole row of q, also when q has a column named "*". The quoted
+# name `q."*"` is that column.
+test whole-row-reference-with-star-to-a-table-with-a-column-named-star-is-rejected {
+    CREATE TABLE q ("*" int, b int);
+    INSERT INTO q VALUES (NULL, 1);
+    SELECT count(q.*) FROM q;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^a reference to the whole row of "q" is not supported$
+}
+
+test column-named-star-is-a-column {
+    CREATE TABLE q ("*" int, b int);
+    INSERT INTO q VALUES (7, 1), (NULL, 2);
+    SELECT count(q."*"), sum(q."*" + 1) FROM q;
+}
+expect {
+    1|8
+}
+
+test missing-column-named-star-is-rejected {
+    CREATE TABLE t (a int);
+    SELECT count(t."*") FROM t;
+}
+@sqlstate 42703
+expect error {
+    ^column t\.\* does not exist$
+}
+@sqlstate 42703
+expect @tursopg error {
+    ^no such column: t\.\*$
+}
+
 # Function calls that PostgreSQL rejects. tursopg gives the same SQLSTATE,
 # also for a call that it cannot run: it checks the rest of the statement
 # first, as PostgreSQL does.

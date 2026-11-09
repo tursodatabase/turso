@@ -3160,15 +3160,22 @@ impl PostgreSQLTranslator {
                                 let mut parts = vec![];
                                 for field in &col_ref.fields {
                                     match &field.node {
+                                        // Core reads an unquoted `*` as the
+                                        // whole row, so a name "*" is quoted.
+                                        Some(pg_query::protobuf::node::Node::String(s))
+                                            if s.sval == "*" =>
+                                        {
+                                            parts.push(ast::Name::from_string("\"*\""))
+                                        }
                                         Some(pg_query::protobuf::node::Node::String(s)) => {
-                                            parts.push(s.sval.clone())
+                                            parts.push(exact_name(s.sval.clone()))
                                         }
                                         // `t.*` is the whole row of t, which core
                                         // reports after the other errors.
                                         Some(pg_query::protobuf::node::Node::AStar(_))
                                             if col_ref.fields.len() == 2 =>
                                         {
-                                            parts.push("*".to_string())
+                                            parts.push(exact_name("*"))
                                         }
                                         _ => {
                                             return Err(not_supported(
@@ -3177,22 +3184,18 @@ impl PostgreSQLTranslator {
                                         }
                                     }
                                 }
-                                match parts.len() {
-                                    3 => {
+                                match parts.as_slice() {
+                                    [schema, table, column] => {
                                         // schema.table.column. The table name is not mapped:
                                         // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            exact_name(schema_qualifier(&parts[0])?),
-                                            exact_name(parts[1].clone()),
-                                            exact_name(parts[2].clone()),
+                                            exact_name(schema_qualifier(schema.as_str())?),
+                                            table.clone(),
+                                            column.clone(),
                                         ))
                                     }
-                                    2 => {
-                                        // table.column
-                                        Ok(ast::Expr::Qualified(
-                                            exact_name(parts[0].clone()),
-                                            exact_name(parts[1].clone()),
-                                        ))
+                                    [table, column] => {
+                                        Ok(ast::Expr::Qualified(table.clone(), column.clone()))
                                     }
                                     _ => Err(not_supported("a cross-database reference")),
                                 }

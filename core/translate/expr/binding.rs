@@ -263,6 +263,16 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
                     let normalized_table_name = normalize_ident(tbl.as_str());
                     let normalized_id = normalize_ident(id.as_str());
+                    // `t.*` inside an expression is the whole row of t, also
+                    // when t has a column named "*", which is quoted.
+                    let whole_row_error = (id.as_str() == "*" && !id.quoted())
+                        .then(|| {
+                            resolver
+                                .catalog
+                                .dialect
+                                .whole_row_reference_error(tbl.as_str())
+                        })
+                        .flatten();
 
                     let qualified_match = resolve_qualified_name(
                         referenced_tables,
@@ -330,6 +340,11 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
+                    if let Some(error) = whole_row_error {
+                        resolver.defer_error(error);
+                        *expr = Expr::Literal(ast::Literal::Null);
+                        return Ok(WalkControl::Continue);
+                    }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {
                             bind_qualified_name(expr, referenced_tables, table_id, column)
@@ -339,26 +354,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             tbl.as_str(),
                             id.as_str()
                         ),
-                        QualifiedNameMatch::NoColumn => {
-                            // `t.*` inside an expression is the whole row of t.
-                            let whole_row_error = (id.as_str() == "*")
-                                .then(|| {
-                                    resolver
-                                        .catalog
-                                        .dialect
-                                        .whole_row_reference_error(tbl.as_str())
-                                })
-                                .flatten();
-                            let Some(error) = whole_row_error else {
-                                crate::bail_parse_error!(
-                                    "no such column: {}.{}",
-                                    tbl.as_str(),
-                                    id.as_str()
-                                );
-                            };
-                            resolver.defer_error(error);
-                            *expr = Expr::Literal(ast::Literal::Null);
-                        }
+                        QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        ),
                         QualifiedNameMatch::NoTable => unreachable!("handled above"),
                     }
                     return Ok(WalkControl::Continue);
