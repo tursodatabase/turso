@@ -1730,6 +1730,8 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let count = row.get::<i64>(0).unwrap();
         assert_eq!(count, 10);
+        // The connection runs one statement at a time.
+        drop(rows);
 
         // Check product count
         let mut rows = conn
