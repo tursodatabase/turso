@@ -3731,6 +3731,22 @@ expect {
 
 @cross-check-integrity
 @skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-with-quote-in-name-updates-views {
+    CREATE TABLE "a""b"(x);
+    INSERT INTO "a""b" VALUES (1);
+    CREATE VIEW v AS SELECT x FROM "a""b";
+    CREATE TEMP VIEW tv AS SELECT x FROM "a""b";
+    ALTER TABLE "a""b" RENAME TO t2;
+    SELECT * FROM v;
+    SELECT * FROM tv;
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-updates-view-with-quote-in-name {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (1);
