@@ -582,6 +582,14 @@ impl PostgreSQLTranslator {
             return Err(not_supported("ALTER SEQUENCE IF EXISTS"));
         }
         let seq_name = self.qualified_name_from_range_var(sequence)?;
+        // PostgreSQL scans the option names before reading any of them, so a
+        // repeated OWNED BY reports even when both values would parse.
+        if reject_repeated_options(&alter.options) {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_SYNTAX_ERROR,
+                message: "conflicting or redundant options".into(),
+            });
+        }
         let mut owner = None;
         for option in &alter.options {
             let Some(Node::DefElem(elem)) = option.node.as_ref() else {
@@ -12416,6 +12424,20 @@ mod tests {
             assert_eq!(message, "conflicting or redundant options", "{sql}");
         }
         assert_translates("CREATE SEQUENCE s NO MINVALUE NO MAXVALUE START 1 INCREMENT 2");
+    }
+
+    #[test]
+    fn alter_sequence_rejects_repeated_options() {
+        let parsed = crate::parse("ALTER SEQUENCE s OWNED BY t.a OWNED BY NONE").unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err("repeated OWNED BY");
+        let ParseError::Sqlstate { sqlstate, message } = &err else {
+            panic!("{err}")
+        };
+        assert_eq!(*sqlstate, SQLSTATE_SYNTAX_ERROR);
+        assert_eq!(message, "conflicting or redundant options");
+        assert_translates("ALTER SEQUENCE s OWNED BY t.a");
     }
 
     #[test]
