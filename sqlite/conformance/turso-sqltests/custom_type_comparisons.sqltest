@@ -1308,3 +1308,23 @@ expect {
     1|0|0|SEARCH t USING COVERING INDEX t_tm (tm=?)
     2
 }
+
+@requires strict "uses STRICT tables"
+test cmp-cast-to-text-type-has-text-affinity {
+    -- SQLite's rule (datatype3 4.2, sqlite3CompareAffinity): when both sides
+    -- have an affinity and neither is numeric, nothing is converted, so the
+    -- integer 10 in a column without affinity differs from the text '10'. A
+    -- CAST to tx (BASE text) has TEXT affinity like CAST(... AS TEXT) and a
+    -- tx column; an INTEGER column still converts it to a number.
+    CREATE TYPE tx(value text) BASE text;
+    CREATE TABLE t(a, i INTEGER);
+    INSERT INTO t VALUES (10, 10);
+    CREATE TABLE s(a any, c tx) STRICT;
+    INSERT INTO s VALUES (10, '10');
+    SELECT a = CAST('10' AS tx), a = CAST('10' AS TEXT), i = CAST('10' AS tx) FROM t;
+    SELECT a = CAST('10' AS tx), a = c FROM s;
+}
+expect {
+    0|0|1
+    0|0
+}
