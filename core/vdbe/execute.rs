@@ -17661,7 +17661,9 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
 }
 
 fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
-    if ident.is_empty() {
+    // A quoted identifier doubles its quote characters, so SQL that names
+    // `a"b` contains `"a""b"` and not `a"b`.
+    if ident.is_empty() || ident.contains(['"', '\'', '`']) {
         return true;
     }
 
