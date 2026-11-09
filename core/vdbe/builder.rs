@@ -2200,6 +2200,10 @@ impl ProgramBuilder {
         Ok(())
     }
 
+    pub fn has_write_database(&self) -> bool {
+        !self.write_databases.is_empty()
+    }
+
     pub fn begin_read_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         // Just override the transaction mode when it is None
         if matches!(self.txn_mode, TransactionMode::None) {

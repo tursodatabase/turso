@@ -213,6 +213,7 @@ pub(crate) enum AttachDatabaseState {
         alias: String,
         db: Arc<Database>,
         pager: Arc<Pager>,
+        readonly: bool,
     },
     Done,
 }
@@ -223,12 +224,14 @@ pub(crate) struct AttachDatabaseInitState {
     reserved_space: Option<u8>,
     db: Arc<Database>,
     attached_is_fresh: bool,
+    readonly: bool,
     encryption_key: Option<EncryptionKey>,
     init_st: crate::InitState,
 }
 
 #[cfg(feature = "fs")]
 pub(crate) struct AttachDatabaseBootstrapState {
+    readonly: bool,
     alias: String,
     db: Arc<Database>,
     pager: Arc<Pager>,
@@ -281,14 +284,19 @@ impl Connection {
         pager.set_initial_journal_version(crate::storage::sqlite3_ondisk::Version::Mvcc)
     }
 
-    fn validate_attach_target(db: &Database, is_fresh: bool, alias: &str) -> Result<()> {
+    fn validate_attach_target(
+        db: &Database,
+        is_fresh: bool,
+        alias: &str,
+        readonly: bool,
+    ) -> Result<()> {
         if is_fresh && Self::database_has_existing_wal_state(db) {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot attach database '{alias}': main database file is uninitialized but WAL state exists"
             )));
         }
 
-        if is_fresh && db.is_readonly() {
+        if is_fresh && (readonly || db.is_readonly()) {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot attach database '{alias}': fresh read-only databases cannot be initialized during attach"
             )));
@@ -472,8 +480,12 @@ impl Connection {
                     } else {
                         self.db.io.clone()
                     };
-                    let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) = Self::from_uri_attached(
+                    let main_db_flags = if self.is_readonly(MAIN_DB_ID) {
+                        self.db.open_flags | crate::OpenFlags::ReadOnly
+                    } else {
+                        self.db.open_flags
+                    };
+                    let (db, encryption_opts, readonly) = Self::from_uri_attached(
                         path,
                         db_opts,
                         main_db_flags,
@@ -482,7 +494,7 @@ impl Connection {
                     )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {
-                        Self::validate_attach_target(&db, attached_is_fresh, alias)?;
+                        Self::validate_attach_target(&db, attached_is_fresh, alias, readonly)?;
                     }
                     self.reject_unsupported_fresh_mvcc_attach_durable_storage(
                         alias,
@@ -501,6 +513,7 @@ impl Connection {
                         reserved_space,
                         db,
                         attached_is_fresh,
+                        readonly,
                         encryption_key,
                         init_st: crate::InitState::default(),
                     }));
@@ -518,6 +531,7 @@ impl Connection {
                             alias: init.alias.clone(),
                             db: init.db.clone(),
                             pager,
+                            readonly: init.readonly,
                         };
                         continue;
                     }
@@ -544,6 +558,7 @@ impl Connection {
                         init.db.mv_store.store(Some(mv_store));
                         *state = AttachDatabaseState::Bootstrap(Box::new(
                             AttachDatabaseBootstrapState {
+                                readonly: init.readonly,
                                 alias: init.alias.clone(),
                                 db: init.db.clone(),
                                 pager,
@@ -557,6 +572,7 @@ impl Connection {
                             alias: init.alias.clone(),
                             db: init.db.clone(),
                             pager,
+                            readonly: init.readonly,
                         };
                     }
                 }
@@ -598,14 +614,21 @@ impl Connection {
                         alias: bootstrap.alias.clone(),
                         db: bootstrap.db.clone(),
                         pager: bootstrap.pager.clone(),
+                        readonly: bootstrap.readonly,
                     };
                 }
-                AttachDatabaseState::Publish { alias, db, pager } => {
+                AttachDatabaseState::Publish {
+                    alias,
+                    db,
+                    pager,
+                    readonly,
+                } => {
                     self.has_non_main_pagers.store(true, Ordering::Release);
-                    let database_id = self
-                        .attached_databases
-                        .write()
-                        .insert(db.clone(), pager.clone());
+                    let database_id = self.attached_databases.write().insert(
+                        db.clone(),
+                        pager.clone(),
+                        *readonly,
+                    );
                     self.add_qualifier(crate::Qualifier::database(alias, database_id));
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));

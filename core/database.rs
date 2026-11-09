@@ -502,6 +502,7 @@ enum StatsRefresh {
 /// [`Database::connect_async`].
 #[derive(Clone)]
 pub struct ConnectOpts {
+    readonly: bool,
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
 }
@@ -515,9 +516,17 @@ impl ConnectOpts {
     /// external page codec.
     pub fn new() -> Self {
         Self {
+            readonly: false,
             encryption_key: None,
             page_codec: None,
         }
+    }
+
+    /// Restricts this connection to read-only access to the main database.
+    /// Setting false cannot make read-only database storage writable.
+    pub fn with_readonly(mut self, readonly: bool) -> Self {
+        self.readonly = readonly;
+        self
     }
 
     /// Sets the key used to open an encrypted database. Use this when the key
@@ -582,6 +591,7 @@ pub struct OpenDbAsyncState {
     /// across yields.
     roles_stmt: Option<Box<Statement>>,
     role_rows: Vec<Vec<Value>>,
+    resolved_options: Option<OpenOptions>,
     /// The dialect schema state scan of `LoadingDialectSchema` and the rows
     /// read so far, held across yields.
     dialect_schema_stmt: Option<Box<Statement>>,
@@ -612,6 +622,7 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             roles_stmt: None,
             role_rows: Vec::new(),
+            resolved_options: None,
             dialect_schema_stmt: None,
             dialect_schema_rows: Vec::new(),
         }
@@ -680,15 +691,26 @@ pub(crate) fn remove_file_from_database_registry(path: &str) {
     DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
 }
 
-/// The `Database` object contains per database file state that is shared
-/// between multiple connections.
-///
-/// Do that `Database` object is cached and can be long lived. DO NOT store anything sensitive like
-/// encryption key here.
+/// A database handle with the access policy requested when it was opened.
+/// Handles share their file, schema, and transaction state across connections.
+/// Cached handles can be long lived; do not store sensitive data such as encryption keys.
 pub struct Database<
     A: alloc::ConcurrentAllocator = alloc::DynAllocator,
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
+    shared: Arc<DatabaseSharedState<A, F>>,
+    // Read-only views keep the registry's canonical owner and its native locks alive.
+    canonical: Option<Arc<Database<A, F>>>,
+    requested_readonly: bool,
+}
+
+#[doc(hidden)]
+pub struct DatabaseSharedState<
+    A: alloc::ConcurrentAllocator = alloc::DynAllocator,
+    F: alloc::ConcurrentAllocator = alloc::DynAllocator,
+> {
+    // A weak cache preserves handle reuse without keeping an unused view alive.
+    readonly_view: Mutex<Weak<Database<A, F>>>,
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
@@ -733,6 +755,14 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+}
+
+impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Deref for Database<A, F> {
+    type Target = DatabaseSharedState<A, F>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -794,6 +824,9 @@ impl fmt::Debug for Database {
 
 impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
     fn drop(&mut self) {
+        if self.canonical.is_some() {
+            return;
+        }
         let Some(key) = self.registry_key.get() else {
             return;
         };
@@ -858,48 +891,53 @@ impl Database {
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
 
         let db = Database {
-            mv_store,
-            allocators,
-            path,
-            wal_path,
-            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                enable_custom_types,
-                dialect.as_ref(),
-            )?))),
-            _shared_page_cache: shared_page_cache,
-            shared_wal,
-            #[cfg(host_shared_wal)]
-            shared_wal_coordination: OnceLock::new(),
-            db_file,
-            builtin_syms: parking_lot::RwLock::new(syms),
-            dialect,
-            io: io.clone(),
-            open_flags: flags,
-            opts,
-            buffer_pool: BufferPool::begin_init(io, arena_size),
-            n_connections: AtomicUsize::new(0),
-            incarnation: {
-                // Deliberately std, not crate::sync: this static outlives a
-                // shuttle test execution, and a shuttle-tracked atomic that
-                // survives into the next execution corrupts shuttle's vector
-                // clocks (task ids restart, the stale clock is longer than
-                // the new task table, and clock bookkeeping underflows).
-                // A plain std atomic is fine here: the counter only mints
-                // process-unique ids and needs no ordering guarantees.
-                static NEXT_DATABASE_INCARNATION: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(1);
-                NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            shared: Arc::new(DatabaseSharedState {
+                readonly_view: Mutex::new(Weak::new()),
+                mv_store,
+                allocators,
+                path,
+                wal_path,
+                schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
+                    enable_custom_types,
+                    dialect.as_ref(),
+                )?))),
+                _shared_page_cache: shared_page_cache,
+                shared_wal,
+                #[cfg(host_shared_wal)]
+                shared_wal_coordination: OnceLock::new(),
+                db_file,
+                builtin_syms: parking_lot::RwLock::new(syms),
+                dialect,
+                io: io.clone(),
+                open_flags: flags,
+                opts,
+                buffer_pool: BufferPool::begin_init(io, arena_size),
+                n_connections: AtomicUsize::new(0),
+                incarnation: {
+                    // Deliberately std, not crate::sync: this static outlives a
+                    // shuttle test execution, and a shuttle-tracked atomic that
+                    // survives into the next execution corrupts shuttle's vector
+                    // clocks (task ids restart, the stale clock is longer than
+                    // the new task table, and clock bookkeeping underflows).
+                    // A plain std atomic is fine here: the counter only mints
+                    // process-unique ids and needs no ordering guarantees.
+                    static NEXT_DATABASE_INCARNATION: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                },
 
-            pager_state: Arc::new(SharedPagerState::new(init_page_1)),
-            registry_key: OnceLock::new(),
+                pager_state: Arc::new(SharedPagerState::new(init_page_1)),
+                registry_key: OnceLock::new(),
 
-            encryption_cipher_mode: AtomicCipherMode::new(
-                encryption_cipher_mode.unwrap_or(CipherMode::None),
-            ),
-            page_codec_id,
+                encryption_cipher_mode: AtomicCipherMode::new(
+                    encryption_cipher_mode.unwrap_or(CipherMode::None),
+                ),
+                page_codec_id,
 
-            durable_storage: None,
+                durable_storage: None,
+            }),
+            canonical: None,
+            requested_readonly: false,
         };
 
         db.register_global_builtin_extensions()
@@ -1130,49 +1168,6 @@ impl Database {
         Ok(())
     }
 
-    /// Look up a database in the process-wide registry by file identity.
-    /// Returns the cached Database if found, with encryption validation.
-    /// This avoids opening a file (and acquiring a file lock) when the
-    /// database is already open in this process.
-    fn lookup_in_registry(
-        path: &str,
-        encryption_opts: &Option<EncryptionOpts>,
-        dialect: &dyn Dialect,
-        page_codec: Option<&dyn PageCodec>,
-    ) -> Result<Option<Arc<Database>>> {
-        if is_memory_like(path) {
-            return Ok(None);
-        }
-        let file_id = match io::get_file_id(path) {
-            Ok(id) => id,
-            Err(_) => return Ok(None), // file doesn't exist yet
-        };
-        let key = DatabaseKey::File(file_id);
-        let registry = DATABASE_MANAGER.lock();
-        let db = match registry.get(&key) {
-            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
-                Some(db) => db,
-                None => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        drop(registry);
-
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
-        }
-        db.validate_page_codec(page_codec)?;
-
-        Self::check_registry_dialect(&db, dialect)?;
-
-        Ok(Some(db))
-    }
-
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
         match (self.page_codec_id, page_codec) {
             (Some(_), None) => Err(LimboError::InvalidArgument(
@@ -1214,38 +1209,13 @@ impl Database {
         )
     }
 
-    /// Resolve `OpenOptions::storage` for a file-backed open when the caller
-    /// did not supply pre-opened storage: optionally consult the registry, run
-    /// the legacy/multiprocess WAL probes, open the file, and fill in
-    /// `options.storage` and the effective flags in place. Returns `Some(db)`
-    /// when a registry hit short-circuits the open (only possible when
-    /// `use_registry` is set).
+    /// Open default file storage after the caller has handled the database registry.
     #[cfg(feature = "fs")]
     fn resolve_default_storage(
         io: &Arc<dyn IO>,
         path: &str,
         options: &mut OpenOptions,
-        use_registry: bool,
-    ) -> Result<Option<Arc<Database>>> {
-        // Check the registry before opening the file to avoid acquiring a file
-        // lock that would conflict with an already-open Database in this process.
-        if use_registry {
-            if let Some(db) = Self::lookup_in_registry(
-                path,
-                &options.encryption,
-                options.dialect.as_ref(),
-                options.page_codec.as_deref(),
-            )? {
-                if options.durable_storage.is_some() && db.durable_storage.is_none() {
-                    return Err(LimboError::InvalidArgument(
-                        "database already open without custom durable storage; \
-                         close the existing instance before reopening with a custom DurableStorage"
-                            .to_string(),
-                    ));
-                }
-                return Ok(Some(db));
-            }
-        }
+    ) -> Result<()> {
         // Mixed legacy/multiprocess opens are incompatible, but the two modes
         // advertise themselves through different lock domains (`.tshm` vs DB
         // file lock). We therefore probe both directions around the actual file
@@ -1280,7 +1250,7 @@ impl Database {
         )?;
         options.flags = effective_flags;
         options.storage = Some(Arc::new(DatabaseFile::new(file)));
-        Ok(None)
+        Ok(())
     }
 
     #[cfg(not(feature = "fs"))]
@@ -1288,8 +1258,7 @@ impl Database {
         _io: &Arc<dyn IO>,
         _path: &str,
         _options: &mut OpenOptions,
-        _use_registry: bool,
-    ) -> Result<Option<Arc<Database>>> {
+    ) -> Result<()> {
         Err(LimboError::InvalidArgument(
             "OpenOptions::storage is required to open a database without the `fs` feature"
                 .to_string(),
@@ -1315,17 +1284,12 @@ impl Database {
     ///
     /// Drives the IO loop internally. When `OpenOptions::storage` is unset,
     /// opens the file at `path` (consulting the process-wide registry first).
-    pub fn open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+    pub fn open(io: Arc<dyn IO>, path: &str, options: OpenOptions) -> Result<Arc<Database>> {
         // Reject before resolving default storage: a registry hit there would
         // otherwise return the cached default-WAL instance and silently ignore
         // the custom wal_path before open_async runs its own check.
         Self::reject_wal_path_for_registry_open(&options)?;
         Self::validate_open_options(&options)?;
-        if options.storage.is_none() {
-            if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
-                return Ok(db);
-            }
-        }
         let mut state = OpenDbAsyncState::new();
         loop {
             match Self::open_async(&mut state, io.clone(), path, &options)? {
@@ -1338,8 +1302,8 @@ impl Database {
     }
 
     /// IOResult-driven twin of [`Database::open`]: the caller drives the IO
-    /// loop and passes `state` between calls. `OpenOptions::storage` must be
-    /// set.
+    /// loop and passes `state` between calls. Default storage is resolved once
+    /// and retained in the state across IO yields.
     ///
     /// This matters for the sync engine, which must yield on IO when the
     /// schema table spans multiple pages (potentially needing network IO to
@@ -1360,12 +1324,10 @@ impl Database {
     ) -> IOResultOr<Arc<Database>> {
         Self::reject_wal_path_for_registry_open(options)?;
         Self::validate_open_options(options)?;
-        let Some(storage) = options.storage.clone() else {
-            return Err(LimboError::InvalidArgument(
-                "OpenOptions::storage is required for Database::open_async".to_string(),
-            )
-            .into());
-        };
+        let mut options = state
+            .resolved_options
+            .clone()
+            .unwrap_or_else(|| options.clone());
         // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
         // Callers may hand us default flags on every poll, so this runs each
@@ -1402,9 +1364,15 @@ impl Database {
                                 )
                                 .into());
                             }
+                            if options.durable_storage.is_some() && db.durable_storage.is_none() {
+                                return Err(LimboError::InvalidArgument(
+                                    "database already open without custom durable storage; close the existing instance before reopening with a custom DurableStorage".into(),
+                                ).into());
+                            }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
-                            return Ok(IOResult::Done(db));
+                            Self::check_registry_access(&db, flags)?;
+                            return Ok(IOResult::Done(db.with_open_access(flags)));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
                         registry.insert(key.clone(), RegistryEntry::Opening);
@@ -1423,26 +1391,42 @@ impl Database {
                 }
                 state.registry_key = Some(key);
             }
+            if state.registry_key.is_none() && options.storage.is_none() {
+                Self::resolve_default_storage(&io, path, &mut options)?;
+                if let Ok(file_id) = io.file_id(path) {
+                    let key = DatabaseKey::File(file_id);
+                    registry.insert(key.clone(), RegistryEntry::Opening);
+                    state.registry_key = Some(key);
+                }
+                state.resolved_options = Some(options.clone());
+            }
             // Lock is dropped here — the Opening sentinel prevents concurrent opens
             // of the same path without holding the mutex across yields.
         }
 
         // Open the database (no registry lock held; never re-consults it).
-        let result = Self::do_open_async_guarded(
-            state,
-            io.clone(),
-            path,
-            None,
-            storage,
-            flags,
-            options.db_opts,
-            options.encryption.clone(),
-            options.durable_storage.clone(),
-            options.page_codec.clone(),
-            options.allocators.clone(),
-            options.dialect.clone(),
-            &options.native_extensions,
-        );
+        let result = (|| {
+            if options.storage.is_none() {
+                Self::resolve_default_storage(&io, path, &mut options)?;
+                state.resolved_options = Some(options.clone());
+            }
+            let storage = options.storage.clone().expect("default storage resolved");
+            Self::do_open_async_guarded(
+                state,
+                io.clone(),
+                path,
+                None,
+                storage,
+                flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.page_codec.clone(),
+                options.allocators.clone(),
+                options.dialect.clone(),
+                &options.native_extensions,
+            )
+        })();
 
         match &result {
             Ok(IOResult::Done(db)) => {
@@ -1464,7 +1448,36 @@ impl Database {
             }
             Ok(IOResult::IO(_)) => {}
         }
-        result
+        result.map(|result| match result {
+            IOResult::Done(db) => IOResult::Done(db.with_open_access(flags)),
+            IOResult::IO(completion) => IOResult::IO(completion),
+        })
+    }
+
+    fn with_open_access(self: &Arc<Self>, flags: OpenFlags) -> Arc<Self> {
+        if !flags.contains(OpenFlags::ReadOnly) || self.is_readonly() {
+            return self.clone();
+        }
+        let mut cached = self.readonly_view.lock();
+        if let Some(view) = cached.upgrade() {
+            return view;
+        }
+        let view = Arc::new(Self {
+            shared: self.shared.clone(),
+            canonical: Some(self.clone()),
+            requested_readonly: true,
+        });
+        *cached = Arc::downgrade(&view);
+        view
+    }
+
+    fn check_registry_access(db: &Database, flags: OpenFlags) -> Result<()> {
+        if db.is_readonly() && !flags.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::InvalidArgument(
+                "database is already open read-only; close all existing connections and database handles, then reopen it writable".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Synchronous [`Database::do_open_async`] that drives the IO loop.
@@ -1476,9 +1489,7 @@ impl Database {
     pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
         Self::validate_open_options(&options)?;
         if options.storage.is_none() {
-            // `use_registry = false`: the raw path never consults the registry,
-            // so this only opens the file and never returns a cached Database.
-            Self::resolve_default_storage(&io, path, &mut options, false)?;
+            Self::resolve_default_storage(&io, path, &mut options)?;
         }
         let mut state = OpenDbAsyncState::new();
         loop {
@@ -1618,7 +1629,10 @@ impl Database {
                         dialect.clone(),
                         native_extensions,
                     )?;
-                    db.durable_storage.clone_from(&durable_storage);
+                    Arc::get_mut(&mut db.shared)
+                        .expect("database state is unique before publication")
+                        .durable_storage
+                        .clone_from(&durable_storage);
 
                     // Header validation + WAL recovery runs as a sub state
                     // machine in the ValidatingHeader phase so it can yield
@@ -1668,8 +1682,11 @@ impl Database {
                     let conn = db._connect(
                         false,
                         Some(pager.clone()),
-                        state.encryption_key.clone(),
-                        page_codec.clone(),
+                        ConnectOpts {
+                            encryption_key: state.encryption_key.clone(),
+                            page_codec: page_codec.clone(),
+                            readonly: false,
+                        },
                         ConnectionContext::default(),
                         StatsRefresh::Blocking,
                     )?;
@@ -1795,8 +1812,11 @@ impl Database {
                             state.mvcc_bootstrap_conn = Some(db._connect(
                                 true,
                                 Some(pager.clone()),
-                                state.encryption_key.clone(),
-                                page_codec.clone(),
+                                ConnectOpts {
+                                    encryption_key: state.encryption_key.clone(),
+                                    page_codec: page_codec.clone(),
+                                    readonly: false,
+                                },
                                 ConnectionContext::default(),
                                 StatsRefresh::Blocking,
                             )?);
@@ -2128,7 +2148,9 @@ impl Database {
                         tracing::warn!(
                             "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
                         );
-                        self.open_flags |= OpenFlags::ReadOnly;
+                        Arc::get_mut(&mut self.shared)
+                            .expect("database state is unique before publication")
+                            .open_flags |= OpenFlags::ReadOnly;
                     }
 
                     let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
@@ -2448,7 +2470,9 @@ impl Database {
                         unreachable!("state is OpenWal");
                     };
 
-                    self.shared_wal = shared_wal;
+                    Arc::get_mut(&mut self.shared)
+                        .expect("database state is unique before publication")
+                        .shared_wal = shared_wal;
                     let last_checksum_and_max_frame =
                         self.shared_wal.read().last_checksum_and_max_frame();
                     let wal =
@@ -2558,8 +2582,7 @@ impl Database {
             let mvcc_bootstrap_conn = self._connect(
                 true,
                 None,
-                None,
-                None,
+                ConnectOpts::new(),
                 ConnectionContext::default(),
                 StatsRefresh::Blocking,
             )?;
@@ -2621,14 +2644,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            opts.encryption_key,
-            opts.page_codec,
-            context,
-            StatsRefresh::Blocking,
-        )
+        self._connect(false, None, opts, context, StatsRefresh::Blocking)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2664,8 +2680,7 @@ impl Database {
                 let conn = self._connect(
                     false,
                     None,
-                    opts.encryption_key,
-                    opts.page_codec,
+                    opts,
                     ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
@@ -2689,11 +2704,15 @@ impl Database {
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
-        encryption_key: Option<EncryptionKey>,
-        page_codec: Option<Arc<dyn PageCodec>>,
+        opts: ConnectOpts,
         context: ConnectionContext,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
+        let ConnectOpts {
+            encryption_key,
+            page_codec,
+            readonly,
+        } = opts;
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
                 "database requires an external page codec".to_string(),
@@ -2726,6 +2745,7 @@ impl Database {
             encryption_key,
             default_cache_size,
             context,
+            readonly,
         )?;
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
@@ -2749,6 +2769,7 @@ impl Database {
             encryption_key,
             default_cache_size,
             ConnectionContext::default(),
+            false,
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2763,9 +2784,11 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
         context: ConnectionContext,
+        readonly: bool,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
+            main_readonly: readonly,
             db: self.clone(),
             context: context.value,
             hooks: context.hooks,
@@ -2868,7 +2891,7 @@ impl Database {
     }
 
     pub fn is_readonly(&self) -> bool {
-        self.open_flags.contains(OpenFlags::ReadOnly)
+        self.requested_readonly || self.open_flags.contains(OpenFlags::ReadOnly)
     }
 
     /// Non-blocking read of the 512-byte database file header (page 1's
@@ -3694,6 +3717,7 @@ impl Database {
 }
 
 pub(crate) struct AttachedDatabase {
+    pub(crate) readonly: bool,
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
     pub(crate) sync_mode: SyncMode,
@@ -3724,11 +3748,12 @@ impl DatabaseCatalog {
         self.index_to_data.get(idx).map(|entry| entry.pager.clone())
     }
 
-    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>) -> usize {
+    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>, readonly: bool) -> usize {
         let idx = self.allocate_index();
         self.index_to_data.insert(
             idx,
             AttachedDatabase {
+                readonly,
                 db,
                 pager,
                 sync_mode: SyncMode::Full,
@@ -3802,6 +3827,10 @@ mod database_tests {
         DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
         OpenFlags, OpenOptions, PlatformIO, IO,
     };
+
+    #[cfg(all(feature = "fs", feature = "io_memory_yield"))]
+    #[path = "async_open_tests.rs"]
+    mod async_open_tests;
 
     #[test]
     fn memory_path_classifies_named_memory_databases() {
@@ -4496,6 +4525,432 @@ mod database_tests {
         let second = open_with_page_codec(io, path, second_codec);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn readonly_registry_rejects_writable_sync_and_async_joins_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-first.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        {
+            let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            writer
+                .execute("CREATE TABLE test(id INTEGER PRIMARY KEY); INSERT INTO test VALUES(1)")
+                .unwrap();
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let readonly = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        let reader = readonly
+            .connect(ConnectOpts::new().with_readonly(false))
+            .unwrap();
+        assert!(reader.is_readonly(crate::MAIN_DB_ID));
+        let snapshot = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        for flags in [OpenFlags::None, OpenFlags::Create] {
+            let error = Database::open(
+                io.clone(),
+                path,
+                OpenOptions::new(Arc::new(EngineDialect)).flags(flags),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, LimboError::InvalidArgument(ref message)
+                if message.contains("read-only") && message.contains("close") && message.contains("reopen")),
+                "{error}"
+            );
+            let options = OpenOptions::new(Arc::new(EngineDialect))
+                .flags(flags)
+                .storage(readonly.db_file.clone());
+            let mut state = OpenDbAsyncState::new();
+            let error = Database::open_async(&mut state, io.clone(), path, &options).unwrap_err();
+            assert!(matches!(*error, LimboError::InvalidArgument(ref message)
+                if message.contains("read-only") && message.contains("reopen")));
+            assert_eq!(snapshot(), before);
+        }
+        assert_eq!(count_test_rows(&reader), 1);
+        drop(reader);
+        drop(readonly);
+        let writable = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        writable
+            .connect(ConnectOpts::new())
+            .unwrap()
+            .execute("INSERT INTO test VALUES(2)")
+            .unwrap();
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn readonly_connection_restriction_survives_writable_registry_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("writable-first.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
+            .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id INTEGER PRIMARY KEY); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let reused = Database::open(
+            io,
+            path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        let reader = reused.connect(ConnectOpts::new()).unwrap();
+        assert!(!writer.is_readonly(crate::MAIN_DB_ID));
+        reader.execute("PRAGMA query_only=OFF").unwrap();
+        assert!(matches!(
+            reader.execute("INSERT INTO test VALUES(2)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert!(reader.is_readonly(crate::MAIN_DB_ID));
+        assert!(reused.is_readonly());
+        assert!(!Arc::ptr_eq(&db, &reused));
+        assert!(Arc::ptr_eq(&db.db_file, &reused.db_file));
+        let explicit_false = reused
+            .connect(ConnectOpts::new().with_readonly(false))
+            .unwrap();
+        assert!(explicit_false.is_readonly(crate::MAIN_DB_ID));
+        reader.execute("CREATE TEMP TABLE scratch(value)").unwrap();
+        reader.execute("INSERT INTO scratch VALUES(7)").unwrap();
+        reader.execute("CREATE TEMP TRIGGER temp_trigger AFTER INSERT ON main.test BEGIN SELECT 1; END; DROP TRIGGER temp_trigger; ALTER TABLE temp.scratch RENAME COLUMN value TO renamed; ALTER TABLE temp.scratch ADD COLUMN extra; ALTER TABLE temp.scratch RENAME TO renamed_scratch; ANALYZE temp; PRAGMA temp.user_version=7").unwrap();
+        writer.execute("INSERT INTO test VALUES(3)").unwrap();
+        assert_eq!(count_test_rows(&reader), 2);
+        writer
+            .execute("CREATE TABLE later(value); INSERT INTO later VALUES(9)")
+            .unwrap();
+        reader.execute("SELECT value FROM later").unwrap();
+        assert!(matches!(
+            reader.execute("INSERT INTO later VALUES(10)"),
+            Err(LimboError::ReadOnly)
+        ));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn readonly_open_async_retains_canonical_storage_after_writer_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-view.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+        let canonical = Arc::downgrade(&db);
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let mut state = OpenDbAsyncState::new();
+        let options = OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly);
+        let readonly = loop {
+            match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+                IOResult::Done(db) => break db,
+                IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+            }
+        };
+        let same_readonly = Database::open(io.clone(), path, options).unwrap();
+        assert!(Arc::ptr_eq(&readonly, &same_readonly));
+        drop(same_readonly);
+        let reader = readonly
+            .connect(ConnectOpts::new().with_readonly(false))
+            .unwrap();
+        assert!(matches!(
+            reader.execute("INSERT INTO test VALUES(2)"),
+            Err(LimboError::ReadOnly)
+        ));
+        drop(writer);
+        drop(db);
+        assert!(canonical.upgrade().is_some());
+        assert_eq!(count_test_rows(&reader), 1);
+        let reopened = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+        assert!(Arc::ptr_eq(&reopened, &canonical.upgrade().unwrap()));
+        assert!(Arc::ptr_eq(&readonly.db_file, &reopened.db_file));
+        reopened
+            .connect(ConnectOpts::new())
+            .unwrap()
+            .execute("INSERT INTO test VALUES(3)")
+            .unwrap();
+        assert_eq!(count_test_rows(&reader), 2);
+        drop(reopened);
+        drop(reader);
+        drop(readonly);
+        assert!(canonical.upgrade().is_none());
+        let final_db = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        assert_eq!(
+            count_test_rows(&final_db.connect(ConnectOpts::new()).unwrap()),
+            2
+        );
+    }
+
+    #[test]
+    fn readonly_attachment_reuses_storage_without_losing_access_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attached.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
+            .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let main = Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_attach(true)),
+        )
+        .unwrap();
+        let connection = main.connect(ConnectOpts::new()).unwrap();
+        connection
+            .execute(format!("ATTACH 'file:{}?mode=ro' AS aux", path.display()))
+            .unwrap();
+        connection.execute("PRAGMA query_only=OFF").unwrap();
+        let snapshot = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        assert!(matches!(
+            connection.execute("INSERT INTO aux.test VALUES(2)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        assert!(matches!(
+            connection.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        connection.execute("CREATE TABLE writable(id); INSERT INTO writable VALUES(1); CREATE TEMP TABLE scratch(id); INSERT INTO scratch VALUES(1)").unwrap();
+        writer.execute("INSERT INTO test VALUES(3)").unwrap();
+        let restricted = main
+            .connect(ConnectOpts::new().with_readonly(true))
+            .unwrap();
+        restricted
+            .execute(format!("ATTACH '{}' AS inherited", path.display()))
+            .unwrap();
+        restricted.execute("PRAGMA query_only=OFF").unwrap();
+        assert!(matches!(
+            restricted.execute("INSERT INTO inherited.test VALUES(4)"),
+            Err(LimboError::ReadOnly)
+        ));
+        restricted
+            .execute("CREATE TEMP TABLE scratch(id); INSERT INTO scratch VALUES(1)")
+            .unwrap();
+    }
+
+    #[test]
+    fn readonly_connection_allows_reserved_transactions_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-reservation.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
+            .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let verify = |reader: &Arc<Connection>, expected| {
+            reader.execute("PRAGMA query_only=OFF").unwrap();
+            for begin in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+                for read_first in [None, Some(true), Some(false)] {
+                    reader.execute(begin).unwrap();
+                    if let Some(read_first) = read_first {
+                        if read_first {
+                            assert_eq!(count_test_rows(reader), expected);
+                        }
+                        assert!(matches!(
+                            reader.execute("INSERT INTO test VALUES(2)"),
+                            Err(LimboError::ReadOnly)
+                        ));
+                        if !read_first {
+                            assert_eq!(count_test_rows(reader), expected);
+                        }
+                    }
+                    reader.execute("COMMIT").unwrap();
+                }
+            }
+        };
+        let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+        verify(&reader, 1);
+        writer.execute("INSERT INTO test VALUES(3)").unwrap();
+        assert_eq!(count_test_rows(&reader), 2);
+        drop(reader);
+        writer.close().unwrap();
+        drop(writer);
+        drop(db);
+        let wal_path = format!("{}-wal", path.display());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        let main_before = std::fs::read(&path).unwrap();
+        let readonly = Database::open(
+            io,
+            path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        verify(&readonly.connect(ConnectOpts::new()).unwrap(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn readonly_connection_cannot_checkpoint_shared_writable_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(EngineDialect)).unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id); INSERT INTO test VALUES(1)")
+            .unwrap();
+        let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+        let snapshot = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        assert!(matches!(
+            reader.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        assert!(matches!(
+            reader.checkpoint(crate::CheckpointMode::Truncate {
+                upper_bound_inclusive: None
+            }),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(snapshot(), before);
+        writer
+            .checkpoint(crate::CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn readonly_connection_restriction_is_applied_by_async_connect() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE test(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let mut state = super::ConnectAsyncState::default();
+        let reader = loop {
+            match db
+                .connect_async(ConnectOpts::new().with_readonly(true), &mut state)
+                .unwrap()
+            {
+                IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+                IOResult::Done(connection) => break connection,
+            }
+        };
+        assert!(reader.is_readonly(crate::MAIN_DB_ID));
+        assert!(matches!(
+            reader.execute("INSERT INTO test VALUES(1)"),
+            Err(LimboError::ReadOnly)
+        ));
+        writer.execute("INSERT INTO test VALUES(2)").unwrap();
+        assert_eq!(count_test_rows(&reader), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn schema_writes_to_temp_do_not_require_writable_main() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-main.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        {
+            let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+            let connection = db.connect(ConnectOpts::new()).unwrap();
+            connection
+                .execute("CREATE TABLE test(id INTEGER); INSERT INTO test VALUES(1)")
+                .unwrap();
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        let db = Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        let connection = db.connect(ConnectOpts::new()).unwrap();
+        let before = std::fs::read(path).unwrap();
+        connection.execute("CREATE TEMP TABLE scratch(value); INSERT INTO scratch VALUES(7); DROP TABLE scratch").unwrap();
+        assert_eq!(count_test_rows(&connection), 1);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn schema_writes_to_attached_database_keep_main_transaction_readonly() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open(
+            io,
+            ":memory:",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_attach(true)),
+        )
+        .unwrap();
+        let connection = db.connect(ConnectOpts::new()).unwrap();
+        connection.execute("ATTACH ':memory:' AS aux").unwrap();
+        let mut transactions = Vec::new();
+        connection
+            .prepare("EXPLAIN CREATE TABLE aux.only_aux(value)")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                if row.get::<&str>(1)? == "Transaction" {
+                    transactions.push((row.get::<i64>(2)?, row.get::<i64>(3)?));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            transactions.contains(&(
+                crate::MAIN_DB_ID as i64,
+                crate::TransactionMode::Read as i64
+            )),
+            "{transactions:?}"
+        );
+        assert!(transactions
+            .iter()
+            .any(|(db, mode)| *db >= 2 && *mode == crate::TransactionMode::Write as i64));
+        connection
+            .execute("CREATE TABLE aux.only_aux(value); INSERT INTO aux.only_aux VALUES(1)")
+            .unwrap();
     }
 
     #[cfg(feature = "fs")]
