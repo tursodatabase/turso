@@ -22,7 +22,11 @@ name to be `turso` (the table profile accepts other names). Each case creates a
 uniquely named database and drops only that database. The provided database
 is used only as an administrative connection. Use a disposable server.
 PostgreSQL clients must support `pg_dump --restrict-key` and be at least as new
-as the server: `pg_dump` refuses to dump a newer server.
+as the server: `pg_dump` refuses to dump a newer server. On Linux, the `psql`
+and `pg_dump` scripts in `postgres/conformance/docker-clients` run these
+programs in the image of `postgres/version`, so they have the same version as
+the server. Put that directory first on `PATH` to use them. They use the host
+network and can only read and write files below the current directory.
 
 ```sh
 # Replay saved SQL against both servers (PG_DSN required).
@@ -54,7 +58,8 @@ panic and cannot run the `fuzz` subcommand. Debug builds also support unwinding.
 The SQL Tests workflow runs the `PostgreSQL dump differential fuzzer` job on
 pull requests, pushes to main, and manual workflow dispatches. It checks the
 fuzzer and comparator, then runs 100 cases with an automatic seed, the compatible profile,
-and `--fail-fast` against the PostgreSQL version in `postgres/version`. Known
+and `--fail-fast` against the PostgreSQL version in `postgres/version`, with
+`psql` and `pg_dump` from `postgres/conformance/docker-clients`. Known
 failing opt-in features remain disabled. CI builds and checks the fuzzer with
 the `pg-dump-fuzzer` Cargo profile; the database server still uses the release
 profile.

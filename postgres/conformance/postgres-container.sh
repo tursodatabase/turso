@@ -1,5 +1,6 @@
-# Shared by with-postgres.sh and pg-docker.sh: the PostgreSQL image and how to
-# start it in Docker. Source this file; do not run it.
+# Shared by with-postgres.sh, pg-docker.sh and the scripts in docker-clients/:
+# the PostgreSQL image and how to use it in Docker. Source this file; do not
+# run it.
 
 POSTGRES_VERSION="${POSTGRES_VERSION:-$(cat "$(dirname "${BASH_SOURCE[0]}")/../version")}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:$POSTGRES_VERSION}"
@@ -37,4 +38,25 @@ wait_until_ready() {
     echo "error: PostgreSQL in container $container did not start:" >&2
     docker logs "$container" >&2
     exit 1
+}
+
+# Replaces the shell with a client program of the image, such as psql or
+# pg_dump. The arguments are the program and its arguments. The program uses
+# the network of the host, so it can connect to servers on 127.0.0.1. It can
+# read and write only the files below the current directory, and it gets the
+# PG* environment variables, such as PGCONNECT_TIMEOUT. This works only when
+# Docker runs on Linux.
+exec_postgres_client() {
+    local env_args=()
+    local name
+    for name in $(compgen -e); do
+        if [[ "$name" == PG* ]]; then
+            env_args+=(--env "$name")
+        fi
+    done
+    exec docker run --rm --interactive --network host \
+        --user "$(id -u):$(id -g)" \
+        --volume "$PWD:$PWD" --workdir "$PWD" \
+        "${env_args[@]}" \
+        "$POSTGRES_IMAGE" "$@"
 }

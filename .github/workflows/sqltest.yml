@@ -173,21 +173,12 @@ jobs:
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install PostgreSQL clients
+      - name: Use psql and pg_dump from the PostgreSQL image
+        # These scripts run psql and pg_dump in the image of postgres/version,
+        # so the clients always have the same version as the server.
         run: |
-          # postgres/version is a tag of the postgres Docker image, like 19 or
-          # 19rc1. The packages use the major version only. PGDG puts beta and
-          # rc packages in a component with the major version as its name.
-          pg_version=$(cat postgres/version)
-          pg_major=${pg_version%%[!0-9]*}
-          sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl --fail --silent --show-error --location \
-            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main $pg_major" | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update
-          sudo apt-get install -y "postgresql-client-$pg_major"
-          echo "/usr/lib/postgresql/$pg_major/bin" >> "$GITHUB_PATH"
+          postgres/conformance/docker-clients/pg_dump --version
+          echo "$GITHUB_WORKSPACE/postgres/conformance/docker-clients" >> "$GITHUB_PATH"
       - name: Check fuzzer and comparison logic
         run: cargo test --locked --profile pg-dump-fuzzer -p turso_pg_dump_fuzzer
       - name: Compare generated PostgreSQL and Turso dumps
