@@ -1749,6 +1749,17 @@ expect @tursopg error {
     ^set-returning function regexp_matches\(\) is not supported$
 }
 
+# A new session listens on no channel, so PostgreSQL gives no rows.
+test set-returning-system-function-is-rejected {
+    SELECT pg_listening_channels();
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ^set-returning function pg_listening_channels\(\) is not supported$
+}
+
 test set-returning-function-in-where-is-rejected {
     SELECT 1 WHERE generate_series(1, 2) > 0;
 }

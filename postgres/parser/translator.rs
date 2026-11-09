@@ -8241,12 +8241,16 @@ fn set_returning_call_error(
     func_call: &pg_query::protobuf::FuncCall,
     name: &str,
 ) -> Option<ParseError> {
+    if !crate::builtins::functions(name)
+        .iter()
+        .any(|function| function.returns_set)
+    {
+        return None;
+    }
     let message = if SET_RETURNING_FUNCTIONS_IN_FROM.contains(&name) {
         format!("set-returning function {name}() outside FROM")
-    } else if OTHER_SET_RETURNING_FUNCTIONS.contains(&name) {
-        format!("set-returning function {name}()")
     } else {
-        return None;
+        format!("set-returning function {name}()")
     };
     let types = argument_types(&func_call.args);
     let exists =
@@ -8305,34 +8309,6 @@ const SET_RETURNING_FUNCTIONS_IN_FROM: &[&str] = &[
     "jsonb_to_recordset",
     "pg_options_to_table",
     "unnest",
-];
-
-/// The set-returning functions of PostgreSQL that tursopg does not have.
-const OTHER_SET_RETURNING_FUNCTIONS: &[&str] = &[
-    "aclexplode",
-    "generate_subscripts",
-    "json_array_elements",
-    "json_array_elements_text",
-    "json_each_text",
-    "json_object_keys",
-    "json_populate_recordset",
-    "jsonb_array_elements",
-    "jsonb_array_elements_text",
-    "jsonb_each",
-    "jsonb_each_text",
-    "jsonb_object_keys",
-    "jsonb_path_query",
-    "jsonb_path_query_tz",
-    "jsonb_populate_recordset",
-    "pg_get_keywords",
-    "regexp_matches",
-    "regexp_split_to_table",
-    "string_to_table",
-    "ts_debug",
-    "ts_parse",
-    "ts_stat",
-    "ts_token_type",
-    "txid_snapshot_xip",
 ];
 
 /// The error of column notation, `(arg).name`, except `(t).name` with a
