@@ -117,6 +117,10 @@ enum QualifiedNameMatch {
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones
+///
+/// A reference to the whole row of a table does not fail the bind when the dialect defers its
+/// error: the resolver keeps the error for the end of the statement. So a caller that drops a
+/// failed bind binds through `Resolver::try_bind`.
 #[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
