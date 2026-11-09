@@ -11,7 +11,7 @@
 # `up` from your own shell and then give the agent the printed PG_DSN.
 #
 # Settings (environment variables):
-#   POSTGRES_VERSION  server version, default in postgres/version
+#   POSTGRES_VERSION  tag of the postgres Docker image, default in postgres/version
 #   PG_CONTAINER      container name, default turso-pg
 #   PG_PORT           port on 127.0.0.1, default 54329
 set -euo pipefail

@@ -7,9 +7,9 @@
 # script starts a throwaway PostgreSQL container with Docker, runs the
 # command, and removes the container.
 #
-# To test against another PostgreSQL version, set POSTGRES_VERSION, for
-# example POSTGRES_VERSION=17. To change the version for everyone, change
-# postgres/version.
+# To test against another PostgreSQL version, set POSTGRES_VERSION to a tag
+# of the postgres Docker image, for example POSTGRES_VERSION=18. To change the
+# version for everyone, change postgres/version.
 set -euo pipefail
 
 VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/../version"
