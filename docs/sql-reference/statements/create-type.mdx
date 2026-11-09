@@ -87,6 +87,10 @@ The ENCODE expression is evaluated whenever a value is written to a column of th
 - **Kind of value**: CREATE TYPE works out the kind of value DECODE returns (integer, real, numeric, text or blob), and a column of the type compares like a plain column of that kind. With `BASE text ENCODE CAST(value AS text) DECODE CAST(value AS real)`, `WHERE c < 9.6` compares numbers, so a stored `'10.0'` is not less than `9.6`. When the kind can't be worked out, CREATE TYPE fails with `cannot tell what kind of value DECODE of type t returns; wrap it in CAST(... AS <type>)`. This happens with a function that can return different kinds, such as `json_extract` or a function from a loaded extension, with a CASE or `coalesce` whose branches give different kinds, with `round` or `mod` of an integer (an exact number in PostgreSQL), and with `NULL`. A RAISE branch adds no kind, so `coalesce(CAST(value AS integer), RAISE(ABORT, 'bad'))` is an integer. `->` gives text; `->>` can give any kind. Comparisons, BETWEEN, IN, LIKE, GLOB and `NOT NULL` give integers. Write `DECODE CAST(json_extract(value, '$') AS real)` instead. A DECODE that returns a type with its own order, such as `CAST(value AS numeric(10,2))`, fails the same way.
 - **Casting to a type that doesn't exist yet**: before type `b` exists, `CAST(value AS b)` converts to NUMERIC, as SQLite does for an unknown type name. So `CREATE TYPE b` fails with `cannot create type b: type a already casts to it; create b before a` while another type's expression casts to `b`, and with `cannot create type b: index t_c already casts to it` while an index, CHECK constraint, generated column, column default, view or trigger does. Creating `b` would change what those CASTs give. Create `b` first. A type whose own ENCODE, COERCE, DECODE or DEFAULT casts to it fails with `cannot create type a: it casts to itself`, since reading it would run its DECODE again without end.
 
+For arrays of a custom type, NULL elements also bypass ENCODE and DECODE and remain NULL when stored and read.
+
+When `INSERT OR REPLACE` or a column's `NOT NULL ON CONFLICT REPLACE` rule substitutes a default for NULL, that default is type-checked, encoded, and coerced like an ordinary input. The resulting value must still satisfy NOT NULL.
+
 ```sql
 -- Store text in reversed form
 CREATE TYPE reversed_text BASE text
@@ -257,6 +261,8 @@ SELECT CAST(42 AS cents);
 SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 -- -1.50|2.50
 ```
+
+A NULL input bypasses ENCODE, COERCE, and DECODE. Domain constraints still apply: a NOT NULL domain rejects a NULL cast. After upgrading, run `REINDEX` on expression or partial indexes that depend on a CAST whose ENCODE previously changed NULL into another value.
 
 A CAST first converts the value to the type's `value` type as SQLite's CAST does, then runs ENCODE and COERCE. `CAST(5.5 AS smallint)` and `CAST(5.5 AS bigint)` are `5`, `CAST('ab' AS bytea)` is a blob, and `CAST(40000.5 AS smallint)` fails smallint's range check. A type without a `value` type takes its BASE as input type; `value any` converts nothing. A `value` of another custom type converts to that type's own `value` type, so `value date` converts to text. A `value` type must be INTEGER, REAL, TEXT, BLOB, ANY or a custom type whose own `value` types don't lead back to the new type, so CREATE TYPE refuses `(value float)`.
 

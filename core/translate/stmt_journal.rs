@@ -207,6 +207,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
         || has_materialized_views
         || has_index_method
         || has_fks
+        || has_not_null_array_domain(table, resolver)
         || autoinc_may_abort_multi_row
         || has_upsert_do_update
         || constraint_may_abort(
@@ -322,6 +323,7 @@ pub(crate) fn set_update_stmt_journal_flags(
         || has_materialized_views
         || has_index_method
         || has_fks
+        || has_not_null_array_domain(&btree_table, resolver)
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -335,6 +337,17 @@ pub(crate) fn set_update_stmt_journal_flags(
         );
     program.set_may_abort(may_abort);
     Ok(())
+}
+
+fn has_not_null_array_domain(table: &crate::schema::BTreeTable, resolver: &Resolver) -> bool {
+    table.columns().iter().any(|column| {
+        column.is_array()
+            && resolver
+                .schema()
+                .resolve_type_unchecked(&column.ty_str)
+                .expect("array element type must resolve")
+                .is_some_and(|resolved| resolved.chain.iter().any(|td| td.not_null))
+    })
 }
 
 /// Set multi_write / may_abort for DELETE statements.

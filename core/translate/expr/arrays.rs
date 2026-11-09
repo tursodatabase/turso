@@ -143,6 +143,7 @@ pub(crate) fn emit_array_leaf_loop(
                 reg,
                 element_type: "ANY".into(),
                 element_kind: StrictType::Any,
+                not_null_domain: None,
                 dimensions,
                 target,
             }),
@@ -242,11 +243,19 @@ pub(super) fn emit_array_encode_as(
             "array elements of {target} have type {element_type}, which is not INTEGER, REAL, TEXT, BLOB or ANY"
         ))
     })?;
+    let not_null_domain = resolved.and_then(|resolved| {
+        resolved
+            .chain
+            .iter()
+            .find(|td| td.not_null)
+            .map(|td| td.name.as_str().into())
+    });
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
             reg,
             element_type,
             element_kind,
+            not_null_domain,
             dimensions: col.array_dimensions(),
             target,
         }),
@@ -336,23 +345,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             continue;
         };
 
-        let skip_label = if !resolved.not_null() {
-            // Skip NULL values: jump over encode if NULL
-            let label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label,
-            });
-            Some(label)
-        } else {
-            None
-        };
-
         emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
-
-        if let Some(label) = skip_label {
-            program.preassign_label_to_next_insn(label);
-        }
     }
     Ok(())
 }

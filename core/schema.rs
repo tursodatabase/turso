@@ -2363,7 +2363,7 @@ impl Schema {
                 })?;
             }
         }
-        Ok((resolved.not_null(), checks))
+        Ok((resolved.not_null() && !column.is_array(), checks))
     }
 
     pub fn remove_type(&mut self, type_name: &str) {

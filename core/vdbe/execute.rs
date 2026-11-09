@@ -2680,6 +2680,7 @@ pub fn op_array_encode(
         reg,
         element_type,
         element_kind,
+        not_null_domain,
         dimensions,
         target,
     } = data.as_ref();
@@ -2708,6 +2709,9 @@ pub fn op_array_encode(
                     non_array_value_error(element_type, target).into()
                 ));
             }
+            if let Some(domain) = not_null_domain {
+                check_array_domain_not_null(b, *dimensions, domain)?;
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -2734,10 +2738,37 @@ pub fn op_array_encode(
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
+    if let Some(domain) = not_null_domain {
+        check_array_domain_not_null(record.get_payload(), *dimensions, domain)?;
+    }
     state.registers[*reg].set_blob(record.into_payload())?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn check_array_domain_not_null(blob: &[u8], dimensions: u32, domain: &str) -> Result<()> {
+    assert!(dimensions > 0);
+    let mut arrays = vec![(blob, dimensions)];
+    while let Some((blob, dimensions)) = arrays.pop() {
+        for value in ValueIterator::new(blob)? {
+            match value? {
+                ValueRef::Null if dimensions == 1 => {
+                    return Err(LimboError::ConstraintViolation(Box::new(
+                        crate::ConstraintViolation::new(
+                            crate::ConstraintKind::NotNull,
+                            format!("domain {domain} does not allow null values"),
+                        ),
+                    )));
+                }
+                ValueRef::Blob(inner) if dimensions > 1 => {
+                    arrays.push((inner, dimensions - 1));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The error for a value that is not an array, going to `target`.
