@@ -82,8 +82,8 @@ pub enum UserType {
 }
 
 /// Checks the first statement of `parse_result` when it is about functions,
-/// procedures or triggers. `sql` is the text that was parsed into
-/// `parse_result`.
+/// procedures, triggers, languages or extensions. `sql` is the text that was
+/// parsed into `parse_result`.
 ///
 /// None for any other statement. Ok for a statement that does nothing, and
 /// the error for a statement that fails.
@@ -106,6 +106,7 @@ pub fn check_routine_statement(
         Node::AlterTableStmt(stmt) => trigger::check_alter_table_triggers(stmt, catalog)?,
         Node::DoStmt(stmt) => language::check_do(sql, stmt, catalog),
         Node::CreatePlangStmt(stmt) => language::check_create_language(stmt, catalog),
+        Node::CreateExtensionStmt(stmt) => language::check_create_extension(stmt, catalog),
         Node::CreateTransformStmt(stmt) => language::check_create_transform(stmt, catalog),
         Node::DropStmt(stmt) => check_drop(stmt, catalog)?,
         Node::CommentStmt(stmt) => check_comment(stmt, catalog)?,

@@ -541,7 +541,7 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | CREATE EXTENSION .. CASCADE | ❌ Not supported | |
-| Extension installation | ❌ Not supported | CREATE EXTENSION not translated |
+| Extension installation | ❌ Not supported | The only extension is plpgsql, as in a new PostgreSQL database. CREATE EXTENSION plpgsql fails because it exists, and CREATE EXTENSION IF NOT EXISTS plpgsql does nothing. Every other extension is not available, as in PostgreSQL when the extension is not installed. CREATE LANGUAGE without HANDLER is CREATE EXTENSION, as in PostgreSQL |
 | Trusted extensions | ❌ Not supported | |
 
 ## Internationalisation

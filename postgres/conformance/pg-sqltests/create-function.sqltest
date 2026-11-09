@@ -1897,6 +1897,49 @@ expect error {
     ^language "plpgsql" already exists$
 }
 
+# Without HANDLER, CREATE LANGUAGE is CREATE EXTENSION, and OR REPLACE is IF
+# NOT EXISTS. A new database has the extension plpgsql.
+test create-language-without-a-handler-of-plpgsql-is-rejected {
+    CREATE LANGUAGE plpgsql;
+}
+@sqlstate 42710
+expect error {
+    ^extension "plpgsql" already exists$
+}
+
+test create-or-replace-procedural-language-plpgsql-does-nothing {
+    CREATE OR REPLACE PROCEDURAL LANGUAGE plpgsql;
+    CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog;
+    SELECT 'created';
+}
+expect {
+    created
+}
+
+test create-language-without-a-handler-of-a-missing-extension-is-rejected {
+    CREATE OR REPLACE LANGUAGE missing_language;
+}
+@sqlstate 0A000
+expect error {
+    ^extension "missing_language" is not available$
+}
+
+test create-extension-with-an-invalid-name-is-rejected {
+    CREATE EXTENSION "missing--extension";
+}
+@sqlstate 22023
+expect error {
+    ^invalid extension name: "missing--extension"$
+}
+
+test create-extension-with-an-option-given-twice-is-rejected {
+    CREATE EXTENSION missing_extension WITH SCHEMA public SCHEMA public;
+}
+@sqlstate 42601
+expect error {
+    ^conflicting or redundant options$
+}
+
 test drop-language-of-a-built-in-language-is-rejected {
     DROP LANGUAGE sql;
 }

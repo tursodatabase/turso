@@ -1,15 +1,18 @@
-//! DO, and CREATE, ALTER, DROP and COMMENT ON LANGUAGE and TRANSFORM.
+//! DO, CREATE EXTENSION, and CREATE, ALTER, DROP and COMMENT ON LANGUAGE and
+//! TRANSFORM.
 //!
 //! The languages of tursopg are the languages of a new PostgreSQL database:
-//! sql, plpgsql, c and internal. tursopg has no transforms.
+//! sql, plpgsql, c and internal. Its only extension is plpgsql, as in a new
+//! PostgreSQL database. tursopg has no transforms.
 
 use super::lookup::find_function;
 use super::types::{find_type, type_name_text, TypeRef, UserKind};
 use super::{error, permission_denied, strings, RoutineCatalog, RoutineObject};
 use crate::builtins::{self, FunctionKind, Volatility};
 use crate::sqlstate::{
-    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::translator::not_supported;
 use crate::ParseError;
@@ -111,6 +114,60 @@ pub(super) fn check_create_language(
         ));
     }
     Err(not_supported("CREATE LANGUAGE"))
+}
+
+/// Checks CREATE EXTENSION as PostgreSQL's CreateExtension() does. The
+/// grammar makes CREATE LANGUAGE without HANDLER into CREATE EXTENSION, and
+/// OR REPLACE into IF NOT EXISTS.
+pub(super) fn check_create_extension(
+    stmt: &pb::CreateExtensionStmt,
+    catalog: &dyn RoutineCatalog,
+) -> Result<(), ParseError> {
+    let name = stmt.extname.as_str();
+    check_extension_name(name)?;
+    if catalog.extension_exists(name) {
+        if stmt.if_not_exists {
+            return Ok(());
+        }
+        return Err(error(
+            SQLSTATE_DUPLICATE_OBJECT,
+            format!("extension \"{name}\" already exists"),
+        ));
+    }
+    let mut options = Vec::new();
+    for option in &stmt.options {
+        let Some(Node::DefElem(option)) = &option.node else {
+            continue;
+        };
+        if options.contains(&option.defname.as_str()) {
+            return Err(error(
+                SQLSTATE_SYNTAX_ERROR,
+                "conflicting or redundant options",
+            ));
+        }
+        options.push(option.defname.as_str());
+    }
+    Err(error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("extension \"{name}\" is not available"),
+    ))
+}
+
+/// Checks the name of an extension as PostgreSQL's
+/// check_valid_extension_name() does.
+fn check_extension_name(name: &str) -> Result<(), ParseError> {
+    if name.is_empty()
+        || name.contains("--")
+        || name.starts_with('-')
+        || name.ends_with('-')
+        || name.contains('/')
+    {
+        return Err(error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            format!("invalid extension name: \"{name}\""),
+        ));
+    }
+    Ok(())
 }
 
 /// The function with the name `names` and the parameter types `types`, as

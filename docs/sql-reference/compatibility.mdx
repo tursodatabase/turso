@@ -77,6 +77,12 @@ these checks for one table. So when the session checks foreign keys,
 `DISABLE TRIGGER ALL` gets `0A000` for a table that has a foreign key or that
 a foreign key references.
 
+The only extension is `plpgsql`, as in a new PostgreSQL database. So
+`CREATE EXTENSION IF NOT EXISTS plpgsql` does nothing, and `CREATE EXTENSION`
+of another extension gets `0A000`, as in PostgreSQL when the extension is not
+installed. `CREATE LANGUAGE` without `HANDLER` is `CREATE EXTENSION`, as in
+PostgreSQL.
+
 When `check_function_bodies` is on, which is the default, `CREATE FUNCTION`
 prepares each statement of a SQL function body. A missing table, column, or
 function in the body gets the PostgreSQL SQLSTATE. A result that does not
