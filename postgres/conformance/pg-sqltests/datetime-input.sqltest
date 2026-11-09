@@ -339,3 +339,134 @@ test datetime-timestamp-equals-timestamptz {
 expect {
     1
 }
+
+# The order of the fields matters: `T` needs a date before it and a time after it,
+# it and a time after it, a date cannot follow a time, and the order of a
+# date's numbers and month name is limited.
+test datetime-input-field-order-accepted {
+    CREATE TABLE t(id int, ts timestamp);
+    INSERT INTO t VALUES (1, '2024-01-05T10:00');
+    INSERT INTO t VALUES (2, '2024-01-05 T10:00');
+    INSERT INTO t VALUES (3, '2024-01-05 T 10:00');
+    INSERT INTO t VALUES (4, '2024-01-05 10:00 PM');
+    INSERT INTO t VALUES (5, '5 Jan 2024');
+    INSERT INTO t VALUES (6, '2024 Jan 5');
+    INSERT INTO t VALUES (7, 'Jan 2024 5');
+    INSERT INTO t VALUES (8, '2024 5 Jan');
+    INSERT INTO t VALUES (9, '10:00 Jan 5 2024');
+    INSERT INTO t VALUES (10, '2024-01-05 PM');
+    INSERT INTO t VALUES (11, '2024-01-05 T PM 10:00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00
+    2|2024-01-05 10:00:00
+    3|2024-01-05 10:00:00
+    4|2024-01-05 22:00:00
+    5|2024-01-05 00:00:00
+    6|2024-01-05 00:00:00
+    7|2024-01-05 00:00:00
+    8|2024-01-05 00:00:00
+    9|2024-01-05 10:00:00
+    10|2024-01-05 12:00:00
+    11|2024-01-05 22:00:00
+}
+
+test datetime-input-time-with-t {
+    CREATE TABLE t(id int, tm time);
+    INSERT INTO t VALUES (1, 'T 10:00'), (2, 'T10:00 PM'), (3, '2024-01-05 10:00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10:00:00
+    2|22:00:00
+    3|10:00:00
+}
+
+test datetime-input-rejects-order-2024-01-05t {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('2024-01-05T');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05T"
+}
+
+test datetime-input-rejects-order-2024-01-05-10-00-t {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('2024-01-05 10:00 T');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 10:00 T"
+}
+
+test datetime-input-rejects-order-t-2024-01-05-10-00 {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('T 2024-01-05 10:00');
+}
+expect error {
+    invalid input syntax for type timestamp: "T 2024-01-05 10:00"
+}
+
+test datetime-input-rejects-order-t-2024-01-05 {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('t 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "t 2024-01-05"
+}
+
+test datetime-input-rejects-order-pm-10-00-2024-01-05 {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('PM 10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "PM 10:00 2024-01-05"
+}
+
+test datetime-input-rejects-order-10-00-pm-2024-01-05 {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('10:00 PM 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "10:00 PM 2024-01-05"
+}
+
+test datetime-input-rejects-order-5-2024-jan {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('5 2024 Jan');
+}
+expect error {
+    invalid input syntax for type timestamp: "5 2024 Jan"
+}
+
+test datetime-input-rejects-order-10-00-2024-01-05 {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "10:00 2024-01-05"
+}
+
+test datetime-input-rejects-order-2024-01-05-t-t10-00 {
+    CREATE TABLE t(ts timestamp);
+    INSERT INTO t VALUES ('2024-01-05 T T10:00');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 T T10:00"
+}
+
+test datetime-input-rejects-order-date-after-time {
+    CREATE TABLE t(d date);
+    INSERT INTO t VALUES ('10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type date: "10:00 2024-01-05"
+}
+
+test datetime-input-rejects-order-time-after-am-pm-and-date {
+    CREATE TABLE t(tm time);
+    INSERT INTO t VALUES ('2024-01-05 PM 10:00');
+}
+expect error {
+    invalid input syntax for type time: "2024-01-05 PM 10:00"
+}

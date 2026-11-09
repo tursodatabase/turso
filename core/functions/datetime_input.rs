@@ -127,7 +127,20 @@ fn split_fields(input: &str) -> Option<Vec<Field<'_>>> {
             }
         } else if c.is_ascii_alphabetic() {
             i = skip(i, &|c| c.is_ascii_alphabetic());
-            fields.push(Field::Word(&input[start..i]));
+            let word = &input[start..i];
+            // As in PostgreSQL, letters followed by `-`, `/` or `.` are a
+            // date with a month name, and letters followed by a digit or `+`
+            // are one too unless they are a keyword, such as `Jan5` or
+            // `T10:00`. Those dates are not supported.
+            let glued_to_date = match bytes.get(i) {
+                Some(b'-' | b'/' | b'.') => true,
+                Some(c) if c.is_ascii_digit() || *c == b'+' => !is_keyword(word),
+                Some(_) | None => false,
+            };
+            if glued_to_date {
+                return None;
+            }
+            fields.push(Field::Word(word));
         } else if c == b'+' || c == b'-' {
             i = skip(i + 1, &|c| c.is_ascii_digit() || c == b':');
             fields.push(Field::Offset(&input[start..i]));
@@ -136,6 +149,12 @@ fn split_fields(input: &str) -> Option<Vec<Field<'_>>> {
         }
     }
     Some(fields)
+}
+
+/// The words of PostgreSQL's keyword table that this parser reads.
+fn is_keyword(word: &str) -> bool {
+    let word = word.to_ascii_lowercase();
+    matches!(word.as_str(), "am" | "pm" | "t" | "bc") || word.parse::<Month>().is_ok()
 }
 
 /// What the input says, before it is checked and put together.
@@ -169,111 +188,26 @@ impl Fields {
             _ => {}
         }
         let fields = split_fields(input).ok_or_else(|| syntax_error(input, ty))?;
-        let mut out = Self::default();
-        // The month, day and year of a date written with a month name, such
-        // as `Jan 5 2024` or `5 January 2024`.
-        let mut month_name = None;
-        let mut numbers = Vec::new();
-        let mut pm = None;
-        let mut time = None;
-        for field in fields {
-            match field {
-                Field::Date(text, sep) => {
-                    // `time` takes a date only before the time, as PostgreSQL does.
-                    if ty == TemporalType::Time && time.is_some() {
-                        return Err(syntax_error(input, ty));
-                    }
-                    let parts: Vec<&str> = text.split(sep).collect();
-                    // A first number of 1 or 2 digits is a month or a day, in
-                    // an order that depends on PostgreSQL's DateStyle, which
-                    // is not supported.
-                    let [year_text, month, day] = parts[..] else {
-                        return Err(syntax_error(input, ty));
-                    };
-                    if year_text.len() <= 2 {
-                        return Err(syntax_error(input, ty));
-                    }
-                    let date = (
-                        year(year_text, input, ty)?,
-                        two_digits(month, input, ty)?,
-                        two_digits(day, input, ty)?,
-                    );
-                    set_once(&mut out.date, date, input, ty)?;
-                }
-                // `time` does not take a date written as `20240105`.
-                Field::Number(digits) if digits.len() == 8 && ty != TemporalType::Time => {
-                    let date = (
-                        year(&digits[..4], input, ty)?,
-                        two_digits(&digits[4..6], input, ty)?,
-                        two_digits(&digits[6..], input, ty)?,
-                    );
-                    set_once(&mut out.date, date, input, ty)?;
-                }
-                Field::Number(digits) => numbers.push(digits),
-                Field::Time(text) => set_once(&mut time, read_time(text, input, ty)?, input, ty)?,
-                Field::Word(word) => match word.to_ascii_lowercase().as_str() {
-                    "am" => set_once(&mut pm, false, input, ty)?,
-                    "pm" => set_once(&mut pm, true, input, ty)?,
-                    // ISO 8601's separator of the date and the time.
-                    // `time` does not take it.
-                    "t" if ty == TemporalType::Time => return Err(syntax_error(input, ty)),
-                    "t" => {}
-                    "z" => set_once(&mut out.offset, 0, input, ty)?,
-                    "bc" => {
-                        return Err(error(format!(
-                            "BC dates are not supported for type {}: \"{input}\"",
-                            ty.name()
-                        )))
-                    }
-                    // `time` does not take a month name.
-                    _ if ty == TemporalType::Time => return Err(syntax_error(input, ty)),
-                    other => {
-                        let month = other
-                            .parse::<Month>()
-                            .map_err(|_| syntax_error(input, ty))?;
-                        set_once(&mut month_name, month.number_from_month(), input, ty)?;
-                    }
-                },
-                Field::Offset(text) => {
-                    set_once(&mut out.offset, read_offset(text, input, ty)?, input, ty)?
-                }
-            }
+        let mut reader = Reader {
+            input,
+            ty,
+            seen: 0,
+            iso_time_pending: false,
+            have_text_month: false,
+            year: None,
+            month: None,
+            day: None,
+            time: None,
+            pm: None,
+            offset: None,
+        };
+        for (i, field) in fields.iter().enumerate() {
+            // `time` takes a date only as the first field, right before the time.
+            let date_may_come = ty != TemporalType::Time
+                || (i == 0 && matches!(fields.get(1), Some(Field::Time(_))));
+            reader.read_field(field, date_may_come)?;
         }
-        if let Some(month) = month_name {
-            // One number is the day and one, with 4 digits, the year.
-            let [first, second] = numbers[..] else {
-                return Err(syntax_error(input, ty));
-            };
-            let (day, year_text) = if first.len() <= 2 {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            let date = (
-                year(year_text, input, ty)?,
-                month,
-                two_digits(day, input, ty)?,
-            );
-            set_once(&mut out.date, date, input, ty)?;
-        } else if !numbers.is_empty() {
-            return Err(syntax_error(input, ty));
-        }
-        if let Some((mut hour, minute, second, micros)) = time {
-            match pm {
-                Some(_) if hour > 12 => return Err(range_error(input)),
-                Some(true) if hour < 12 => hour += 12,
-                Some(false) if hour == 12 => hour = 0,
-                Some(_) | None => {}
-            }
-            let micros_of_day = ((hour * 60 + minute) * 60 + second) * 1_000_000 + micros;
-            if time_overflows(hour, minute, second, micros_of_day) {
-                return Err(range_error(input));
-            }
-            out.time = Some(micros_of_day);
-        } else if pm.is_some() {
-            return Err(syntax_error(input, ty));
-        }
-        Ok(out)
+        reader.finish()
     }
 
     /// The value in `ty`'s fixed text form.
@@ -314,6 +248,236 @@ impl Fields {
     }
 }
 
+/// What a field of the input says about the date and time. A field can be
+/// read once, as PostgreSQL's `fmask` enforces.
+const YEAR: u8 = 1;
+const MONTH: u8 = 2;
+const DAY: u8 = 4;
+const TIME: u8 = 8;
+const TIME_ZONE: u8 = 16;
+const AM_PM: u8 = 32;
+const DATE: u8 = YEAR | MONTH | DAY;
+
+/// Reads the fields one at a time as PostgreSQL's `DecodeDateTime` does
+/// (`DecodeTimeOnly` for `time`). What a field means depends on the fields
+/// before it: in `Jan 5 2024` the 5 is the day and 2024 the year, in
+/// `5 2024 Jan` PostgreSQL rejects the same numbers.
+struct Reader<'a> {
+    input: &'a str,
+    ty: TemporalType,
+    /// The kinds of field read so far.
+    seen: u8,
+    /// A `T` was read and the time it announces has not come yet.
+    iso_time_pending: bool,
+    have_text_month: bool,
+    year: Option<i32>,
+    month: Option<u32>,
+    day: Option<u32>,
+    time: Option<(i64, i64, i64, i64)>,
+    pm: Option<bool>,
+    offset: Option<i64>,
+}
+
+impl Reader<'_> {
+    fn read_field(&mut self, field: &Field<'_>, date_may_come: bool) -> Result<()> {
+        let (input, ty) = (self.input, self.ty);
+        let mask = match field {
+            Field::Date(text, sep) => self.read_date(text, *sep, date_may_come)?,
+            Field::Number(digits) => self.read_number(digits)?,
+            Field::Time(text) => {
+                self.iso_time_pending = false;
+                self.time = Some(read_time(text, input, ty)?);
+                TIME
+            }
+            Field::Word(word) => self.read_word(word)?,
+            Field::Offset(text) => {
+                self.offset = Some(read_offset(text, input, ty)?);
+                TIME_ZONE
+            }
+        };
+        if mask & self.seen != 0 {
+            return Err(syntax_error(input, ty));
+        }
+        self.seen |= mask;
+        Ok(())
+    }
+
+    /// `2024-01-05`
+    fn read_date(&mut self, text: &str, sep: char, date_may_come: bool) -> Result<u8> {
+        let (input, ty) = (self.input, self.ty);
+        // As in PostgreSQL, a date is not read after anything but a time zone.
+        if !date_may_come || self.seen & !TIME_ZONE != 0 {
+            return Err(syntax_error(input, ty));
+        }
+        let parts: Vec<&str> = text.split(sep).collect();
+        // A first number of 1 or 2 digits is a month or a day, in an order
+        // that depends on PostgreSQL's DateStyle, which is not supported.
+        let [year_text, month, day] = parts[..] else {
+            return Err(syntax_error(input, ty));
+        };
+        if year_text.len() <= 2 {
+            return Err(syntax_error(input, ty));
+        }
+        self.year = Some(year(year_text, input, ty)?);
+        self.month = Some(two_digits(month, input, ty)?);
+        self.day = Some(two_digits(day, input, ty)?);
+        Ok(DATE)
+    }
+
+    /// Digits only: `20240105`, or the `5` and `2024` of `Jan 5 2024`.
+    fn read_number(&mut self, digits: &str) -> Result<u8> {
+        let (input, ty) = (self.input, self.ty);
+        // `time` takes no number. After a `T`, PostgreSQL reads a number as a
+        // time written as `hhmm`, which is not supported.
+        if ty == TemporalType::Time || self.iso_time_pending {
+            return Err(syntax_error(input, ty));
+        }
+        // 6 digits or more, with no date yet, are a date: `20240105`.
+        if digits.len() >= 6 && self.seen & DATE == 0 {
+            if digits.len() != 8 {
+                return Err(syntax_error(input, ty));
+            }
+            self.year = Some(year(&digits[..4], input, ty)?);
+            self.month = Some(two_digits(&digits[4..6], input, ty)?);
+            self.day = Some(two_digits(&digits[6..], input, ty)?);
+            return Ok(DATE);
+        }
+        // The order of the date fields is PostgreSQL's DateStyle `MDY`, with a
+        // number of 3 digits or more as the year.
+        let is_long = digits.len() >= 3;
+        let has = |bit: u8| self.seen & bit != 0;
+        match (has(YEAR), has(MONTH), has(DAY)) {
+            (false, false, false) if is_long => {
+                self.year = Some(year(digits, input, ty)?);
+                Ok(YEAR)
+            }
+            (false, false, false) => {
+                self.month = Some(two_digits(digits, input, ty)?);
+                Ok(MONTH)
+            }
+            // PostgreSQL reads 3 digits after the year as a day of the year.
+            (true, false, false) if is_long => Err(syntax_error(input, ty)),
+            (true, false, false) => {
+                self.month = Some(two_digits(digits, input, ty)?);
+                Ok(MONTH)
+            }
+            // After a month name, a long number is the year: `Jan 2024 5`.
+            (false, true, false) if self.have_text_month && is_long => {
+                self.year = Some(year(digits, input, ty)?);
+                Ok(YEAR)
+            }
+            (false, true, false) | (true, true, false) => {
+                self.day = Some(two_digits(digits, input, ty)?);
+                Ok(DAY)
+            }
+            (false, true, true) => {
+                self.year = Some(year(digits, input, ty)?);
+                Ok(YEAR)
+            }
+            // A day first needs DateStyle `DMY`. A number after a whole date
+            // would be a time written as `hhmm`, which is not supported.
+            (false, false, true) | (true, false, true) | (true, true, true) => {
+                Err(syntax_error(input, ty))
+            }
+        }
+    }
+
+    /// Letters only: `AM`, `PM`, `T`, `Z`, a month name.
+    fn read_word(&mut self, word: &str) -> Result<u8> {
+        let (input, ty) = (self.input, self.ty);
+        match word.to_ascii_lowercase().as_str() {
+            "am" => {
+                self.pm = Some(false);
+                Ok(AM_PM)
+            }
+            "pm" => {
+                self.pm = Some(true);
+                Ok(AM_PM)
+            }
+            // ISO 8601's separator of the date and the time: the next field
+            // must be the time. PostgreSQL wants a whole date before it, but
+            // not for `time`.
+            "t" => {
+                let date_missing = ty != TemporalType::Time && self.seen & DATE != DATE;
+                if date_missing || self.iso_time_pending {
+                    return Err(syntax_error(input, ty));
+                }
+                self.iso_time_pending = true;
+                Ok(0)
+            }
+            "z" => {
+                self.offset = Some(0);
+                Ok(TIME_ZONE)
+            }
+            "bc" => Err(error(format!(
+                "BC dates are not supported for type {}: \"{input}\"",
+                ty.name()
+            ))),
+            // `time` does not take a month name.
+            _ if ty == TemporalType::Time => Err(syntax_error(input, ty)),
+            other => {
+                let month = other
+                    .parse::<Month>()
+                    .map_err(|_| syntax_error(input, ty))?
+                    .number_from_month();
+                let mut mask = MONTH;
+                // A number before the name is the day, not the month:
+                // `5 Jan 2024`.
+                let number_was_month = self.seen & MONTH != 0
+                    && !self.have_text_month
+                    && self.seen & DAY == 0
+                    && matches!(self.month, Some(1..=31));
+                if number_was_month {
+                    self.day = self.month;
+                    mask = DAY;
+                }
+                self.have_text_month = true;
+                self.month = Some(month);
+                Ok(mask)
+            }
+        }
+    }
+
+    /// Puts the fields together and checks what is left over.
+    fn finish(self) -> Result<Fields> {
+        let (input, ty) = (self.input, self.ty);
+        if self.iso_time_pending {
+            return Err(syntax_error(input, ty));
+        }
+        let date = match (self.year, self.month, self.day) {
+            (Some(year), Some(month), Some(day)) => Some((year, month, day)),
+            (None, None, None) => None,
+            (_, _, _) => return Err(syntax_error(input, ty)),
+        };
+        let time = match self.time {
+            Some(time) => Some(time),
+            // As in PostgreSQL, AM or PM with no time is hour 0:
+            // `2024-01-05 PM` is noon.
+            None if self.pm.is_some() && ty != TemporalType::Time => Some((0, 0, 0, 0)),
+            None => None,
+        };
+        let mut out = Fields {
+            date,
+            time: None,
+            offset: self.offset,
+        };
+        if let Some((mut hour, minute, second, micros)) = time {
+            match self.pm {
+                Some(_) if hour > 12 => return Err(range_error(input)),
+                Some(true) if hour < 12 => hour += 12,
+                Some(false) if hour == 12 => hour = 0,
+                Some(_) | None => {}
+            }
+            let micros_of_day = ((hour * 60 + minute) * 60 + second) * 1_000_000 + micros;
+            if time_overflows(hour, minute, second, micros_of_day) {
+                return Err(range_error(input));
+            }
+            out.time = Some(micros_of_day);
+        }
+        Ok(out)
+    }
+}
+
 /// PostgreSQL's `time_overflows`: each field is in range and the whole time,
 /// second 60 and fraction included, is at most `24:00:00`.
 fn time_overflows(hour: i64, minute: i64, second: i64, micros_of_day: i64) -> bool {
@@ -333,13 +497,6 @@ fn push_time(out: &mut String, micros: i64) {
     if fraction != 0 {
         out.push_str(format!(".{fraction:06}").trim_end_matches('0'));
     }
-}
-
-fn set_once<T>(slot: &mut Option<T>, value: T, input: &str, ty: TemporalType) -> Result<()> {
-    if slot.replace(value).is_some() {
-        return Err(syntax_error(input, ty));
-    }
-    Ok(())
 }
 
 fn is_digits(text: &str) -> bool {
@@ -457,6 +614,8 @@ mod tests {
             ("9:5", "time", "09:05:00"),
             ("12:30 PM", "time", "12:30:00"),
             ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00"),
+            ("+02 2024-01-05 10:00", "timestamp", "2024-01-05 10:00:00"),
+            ("Z 2024-01-05", "timestamp", "2024-01-05 00:00:00"),
         ];
         for (input, ty, expected) in cases {
             assert_eq!(
@@ -489,6 +648,9 @@ mod tests {
             ("0001-01-01 00:00:00+01", "timestamptz"),
             ("2024-01-05 2024-01-06", "date"),
             ("2024-01-05", "interval"),
+            ("2024-01-05 Z10:00", "timestamp"),
+            ("2024-01-05 Jan-05", "timestamp"),
+            ("+02 PM 2024-01-05", "timestamp"),
         ];
         for (input, ty) in cases {
             assert!(
