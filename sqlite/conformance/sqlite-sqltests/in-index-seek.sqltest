@@ -1453,3 +1453,41 @@ test in-list-after-eq-prefix-with-range-on-in-column {
 expect {
     5
 }
+
+# IN on the second column of a composite PRIMARY KEY after an equality on the first
+setup composite_pk {
+    CREATE TABLE cpk (a TEXT, b TEXT, v INTEGER, PRIMARY KEY (a, b));
+    INSERT INTO cpk VALUES('x', '1', 10);
+    INSERT INTO cpk VALUES('x', '2', 20);
+    INSERT INTO cpk VALUES('x', '3', 30);
+    INSERT INTO cpk VALUES('x', '4', 40);
+    INSERT INTO cpk VALUES('y', '1', 50);
+    INSERT INTO cpk VALUES('y', '2', 60);
+}
+
+@setup composite_pk
+test composite-pk-eq-then-in {
+    SELECT v FROM cpk WHERE a = 'x' AND b IN ('1', '3', '9') ORDER BY v;
+}
+expect {
+    10
+    30
+}
+
+# Duplicate and NULL values in the IN list return each row once
+@setup composite_pk
+test composite-pk-eq-then-in-duplicates-and-null {
+    SELECT v FROM cpk WHERE a = 'y' AND b IN ('2', NULL, '2', '1', '1') ORDER BY v;
+}
+expect {
+    50
+    60
+}
+
+# A NULL prefix value matches nothing
+@setup composite_pk
+test composite-pk-null-prefix-then-in {
+    SELECT v FROM cpk WHERE a = NULL AND b IN ('1', '2');
+}
+expect {
+}

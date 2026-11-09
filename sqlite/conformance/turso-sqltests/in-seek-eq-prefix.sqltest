@@ -79,3 +79,34 @@ test long-in-list-over-a-small-prefix-keeps-the-prefix-seek {
 expect pattern {
     \d+\|0\|0\|SEARCH spread USING COVERING INDEX idx_spread \(source=\?\)
 }
+
+# A composite PRIMARY KEY (autoindex) plans like the same columns under a
+# UNIQUE or an explicit index: a PK column alone is not unique.
+setup composite_pk {
+    CREATE TABLE cpk (a TEXT, b TEXT, v INTEGER, PRIMARY KEY (a, b));
+    CREATE TABLE cuq (a TEXT, b TEXT, v INTEGER, UNIQUE (a, b));
+}
+
+@setup composite_pk
+test in-list-after-eq-prefix-on-composite-primary-key {
+    EXPLAIN QUERY PLAN SELECT v FROM cpk WHERE a = 'x' AND b IN ('1', '2', '3');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH cpk USING INDEX sqlite_autoindex_cpk_1 \(a=\? AND b=\?\)
+}
+
+@setup composite_pk
+test in-list-after-eq-prefix-on-composite-unique {
+    EXPLAIN QUERY PLAN SELECT v FROM cuq WHERE a = 'x' AND b IN ('1', '2', '3');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH cuq USING INDEX sqlite_autoindex_cuq_1 \(a=\? AND b=\?\)
+}
+
+@setup composite_pk
+test equality-on-all-composite-primary-key-columns-is-one-seek {
+    EXPLAIN QUERY PLAN SELECT v FROM cpk WHERE a = 'x' AND b = '1';
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH cpk USING INDEX sqlite_autoindex_cpk_1 \(a=\? AND b=\?\)
+}
