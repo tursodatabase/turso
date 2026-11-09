@@ -39,7 +39,7 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. They are fixed compatibility coverage, so a Turso behavior change should be fixed in Turso rather than by editing them; edits here are for upstream syncs or harness maintenance.
-- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend. Tests are meant to pass on both tursopg (`run`) and real PostgreSQL (`run-postgres`).
+- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend. Tests are meant to pass on both tursopg (`run`) and real PostgreSQL (`run-postgres`). When both backends give an error, the test expects the same SQLSTATE from both. Only the message can differ.
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
@@ -142,6 +142,7 @@ Before opening a PR, read the "PR Workflow" document linked above.
 10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
 11. **Dialect-specific behavior belongs on the `Dialect` trait.** If a behavior differs between the SQLite and PostgreSQL frontends (error handling, type semantics, name resolution, etc.), add a method to `core/dialect/mod.rs` with a default that matches SQLite and override it in `PostgresDialect`. `DatabaseOpts` is a poor fit because it is client-public API and clients shouldn't control dialect behavior; CLI flags and wire-protocol fields are a poor fit because they don't reach embedded databases.
 12. **Keep PostgreSQL code out of `core/`.** PostgreSQL behavior and state belong in `postgres/`, so `core/` stays a SQLite engine with generic hooks. Unsure where something fits? Ask.
+13. **Match PostgreSQL's SQLSTATE on errors.** When PostgreSQL rejects a statement, tursopg must reject it with the same SQLSTATE. Use `0A000` (feature_not_supported) only for a statement that PostgreSQL accepts and tursopg does not support. So do the checks that PostgreSQL does, such as for missing objects and invalid definitions, before you reject a feature as not supported.
 
 ## Use plain language instead of complex jargon
 
