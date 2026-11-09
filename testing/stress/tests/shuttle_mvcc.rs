@@ -899,16 +899,21 @@ async fn index_scan_after_concurrent_delete_rollback_scenario() {
                 10
             );
             writer_done.wait();
-            assert_eq!(
-                reader
-                    .execute("DELETE FROM t WHERE id = 3", ())
-                    .await
-                    .unwrap(),
-                1
-            );
+            // The connection runs one statement at a time, so a write on the
+            // connection of the open scan is refused.
+            assert!(matches!(
+                reader.execute("DELETE FROM t WHERE id = 3", ()).await,
+                Err(turso::Error::Busy(_))
+            ));
+            // The DELETE and ROLLBACK of the other connection do not change
+            // what the open scan returns.
             assert_eq!(
                 rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
                 20
+            );
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                30
             );
             assert!(rows.next().await.unwrap().is_none());
         })
