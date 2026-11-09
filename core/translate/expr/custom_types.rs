@@ -114,6 +114,74 @@ pub(crate) fn translate_compared_pair(
     Ok(())
 }
 
+/// The registers holding `lhs` as it is compared with `element`, an element of
+/// the list on the right of IN. PostgreSQL reads `x IN (a, b)` as
+/// `x = a OR x = b`, so a string literal or parameter in `lhs` is read as the
+/// type of each element it is compared with. `lhs_reg` holds `lhs` as written
+/// in `lhs_arity` registers; it is returned when nothing in `lhs` is read as a
+/// custom type, and otherwise a copy with those components converted.
+pub(crate) fn translate_in_lhs_for_element(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    lhs_reg: usize,
+    lhs_arity: usize,
+    element: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(lhs_reg);
+    }
+    let mut converted = Vec::new();
+    match unwrap_parens(lhs)? {
+        ast::Expr::Parenthesized(components) if components.len() > 1 => {
+            for (i, component) in components.iter().enumerate() {
+                let other = row_value_component_expr(element, i)?;
+                if let Some(resolved) =
+                    untyped_operand_type(component, &other, referenced_tables, resolver)?
+                {
+                    converted.push((i, component.as_ref(), resolved));
+                }
+            }
+        }
+        _ => {
+            if let Some(resolved) = untyped_operand_type(lhs, element, referenced_tables, resolver)?
+            {
+                converted.push((0, lhs, resolved));
+            }
+        }
+    }
+    if converted.is_empty() {
+        return Ok(lhs_reg);
+    }
+    let reg = program.alloc_registers(lhs_arity);
+    // A converted component is translated from its expression instead of being
+    // copied from `lhs_reg` first: its conversion is a constant, which runs
+    // before the copy would.
+    for i in 0..lhs_arity {
+        match converted.iter().find(|(index, _, _)| *index == i) {
+            Some((_, component, resolved)) => {
+                translate_untyped_operand_as(
+                    program,
+                    referenced_tables,
+                    component,
+                    resolved,
+                    reg + i,
+                    resolver,
+                )?;
+            }
+            None => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs_reg + i,
+                    dst_reg: reg + i,
+                    extra_amount: 0,
+                });
+            }
+        }
+    }
+    Ok(reg)
+}
+
 /// Translates the arguments of a scalar min or max into `start_reg..`. Their
 /// string literals and parameters are read as described in
 /// [untyped_values_type].

@@ -1387,6 +1387,42 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-text-on-the-left-of-in-is-read-as-the-type-it-is-compared-with {
+    -- PostgreSQL reads x IN (a, b) as x = a OR x = b, so a text on the left of
+    -- IN is read as a time when it is compared with a time, as in
+    -- tm IN ('09:45'). That holds for a list, a row value, and a subquery,
+    -- correlated or not, with or without an index.
+    CREATE TABLE ev(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO ev VALUES (1, '09:45:00'), (2, '10:00:00');
+    SELECT 'list', id FROM ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'list-two', id FROM ev WHERE '09:45' IN (tm, '10:00') ORDER BY id;
+    SELECT 'row', id FROM ev WHERE ('09:45', 1) IN ((tm, id)) ORDER BY id;
+    SELECT 'not-in', id FROM ev WHERE '09:45' NOT IN (tm) ORDER BY id;
+    SELECT 'column', id, '09:45' IN (tm) FROM ev ORDER BY id;
+    SELECT 'subquery', id FROM ev WHERE '09:45' IN (SELECT tm FROM ev) ORDER BY id;
+    SELECT 'correlated', id FROM ev WHERE '09:45' IN (SELECT e2.tm FROM ev e2 WHERE e2.id = ev.id) ORDER BY id;
+    SELECT 'plain', 'a' IN ('a');
+    CREATE INDEX ev_tm ON ev(tm);
+    SELECT 'list-index', id FROM ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'subquery-index', id FROM ev WHERE '09:45' IN (SELECT tm FROM ev) ORDER BY id;
+}
+expect {
+    list|1
+    list-two|1
+    row|1
+    not-in|2
+    column|1|1
+    column|2|0
+    subquery|1
+    subquery|2
+    correlated|1
+    plain|1
+    list-index|1
+    subquery-index|1
+    subquery-index|2
+}
+
+@requires strict "uses STRICT tables"
 test cmp-time-with-text-delete-and-update {
     -- DELETE and UPDATE find their rows with the converted text, by a scan
     -- and through an index.

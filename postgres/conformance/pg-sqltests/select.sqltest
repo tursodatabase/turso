@@ -2034,6 +2034,39 @@ expect {
     ts-eq|2
 }
 
+# x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
+# when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
+# holds for a list and a subquery, correlated or not.
+test compare-text-on-the-left-of-in-with-time {
+    CREATE TABLE in_left_ev (id int PRIMARY KEY, tm time);
+    INSERT INTO in_left_ev VALUES (1, '09:45:00'), (2, '10:00:00');
+    SELECT 'list', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'list-two', id FROM in_left_ev WHERE '09:45' IN (tm, '10:00') ORDER BY id;
+    SELECT 'not-in', id FROM in_left_ev WHERE '09:45' NOT IN (tm) ORDER BY id;
+    SELECT 'column', id, ('09:45' IN (tm))::int FROM in_left_ev ORDER BY id;
+    SELECT 'subquery', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    SELECT 'correlated', id FROM in_left_ev WHERE '09:45' IN (SELECT e2.tm FROM in_left_ev e2 WHERE e2.id = in_left_ev.id) ORDER BY id;
+    SELECT 'plain', ('a' IN ('a'))::int;
+    CREATE INDEX in_left_ev_tm ON in_left_ev (tm);
+    SELECT 'list-index', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'subquery-index', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    DROP TABLE in_left_ev;
+}
+expect {
+    list|1
+    list-two|1
+    not-in|2
+    column|1|1
+    column|2|0
+    subquery|1
+    subquery|2
+    correlated|1
+    plain|1
+    list-index|1
+    subquery-index|1
+    subquery-index|2
+}
+
 # DELETE and UPDATE find their rows with the converted text, by a scan and
 # through an index.
 test compare-time-with-text-delete-and-update {

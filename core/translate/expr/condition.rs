@@ -97,6 +97,16 @@ pub(super) fn translate_in_list(
         let last_condition = i == rhs.len() - 1;
         let rhs_reg = program.alloc_registers(lhs_arity);
         translate_compared_operand(program, referenced_tables, expr, lhs, rhs_reg, resolver)?;
+        // The left side as it is compared with this element.
+        let lhs_reg = translate_in_lhs_for_element(
+            program,
+            referenced_tables,
+            lhs,
+            lhs_reg,
+            lhs_arity,
+            expr,
+            resolver,
+        )?;
 
         if lhs_arity == 1 {
             // Scalar comparison path

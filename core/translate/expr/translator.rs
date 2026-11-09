@@ -342,10 +342,10 @@ fn translate_subquery_result_expr(
     resolver: &Resolver,
 ) -> Result<usize> {
     let ast::Expr::SubqueryResult {
+        subquery_id,
         lhs,
         not_in,
         query_type,
-        ..
     } = expr
     else {
         unreachable!("translate_subquery_result_expr expects Expr::SubqueryResult");
@@ -384,13 +384,42 @@ fn translate_subquery_result_expr(
             let lhs_column_count = lhs_columns.len();
             let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
             for (i, lhs_column) in lhs_columns.iter().enumerate() {
-                translate_expr(
-                    program,
-                    referenced_tables,
-                    lhs_column,
-                    lhs_column_regs_start + i,
-                    resolver,
-                )?;
+                let read_as = read_untyped_operand_as(lhs_column, resolver.schema(), || {
+                    let column_types = resolver
+                        .in_subquery_column_types
+                        .get(*subquery_id)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "IN subquery {subquery_id} has no result column types"
+                            ))
+                        })?;
+                    column_types.get(i).cloned().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "IN subquery {subquery_id} has no result column {i}"
+                        ))
+                    })
+                })?;
+                match read_as {
+                    Some(resolved) => {
+                        translate_untyped_operand_as(
+                            program,
+                            referenced_tables,
+                            lhs_column,
+                            &resolved,
+                            lhs_column_regs_start + i,
+                            resolver,
+                        )?;
+                    }
+                    None => {
+                        translate_expr(
+                            program,
+                            referenced_tables,
+                            lhs_column,
+                            lhs_column_regs_start + i,
+                            resolver,
+                        )?;
+                    }
+                }
                 // If LHS is NULL, we need to check if ephemeral is empty first.
                 // - If empty: IN returns FALSE, NOT IN returns TRUE
                 // - If not empty: result is NULL (unknown)
