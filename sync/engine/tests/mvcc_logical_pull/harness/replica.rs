@@ -50,13 +50,24 @@ impl Replica {
         local_key: Option<[u8; 32]>,
         io: Arc<dyn IO>,
     ) -> Result<Self> {
+        let db_path = dir.path().join("replica.db").to_string_lossy().into_owned();
+        Self::open_encrypted_at_path(dir, server, local_key, io, &db_path)
+    }
+
+    pub fn open_encrypted_at_path(
+        dir: &Arc<TempDir>,
+        server: InProcessServer,
+        local_key: Option<[u8; 32]>,
+        io: Arc<dyn IO>,
+        db_path: &str,
+    ) -> Result<Self> {
         let mut opts = replica_opts(database_opts().with_encryption(local_key.is_some()));
         opts.encryption = Some(turso_sync_engine::sync_encryption::SyncEncryption::new(
             turso_core::CipherMode::Aes256Gcm,
             local_key.map(turso_core::EncryptionKey::new_256),
         )?);
         opts.remote_encryption_key = Some(turso_sync_engine::types::Secret::new("cloud-test-key"));
-        Self::open_with_io(dir, server, opts, io)
+        Self::open_with_io_at_path(dir, server, opts, io, db_path)
     }
 
     fn open_with_options(
@@ -74,9 +85,19 @@ impl Replica {
         io: Arc<dyn IO>,
     ) -> Result<Self> {
         let db_path = dir.path().join("replica.db").to_string_lossy().into_owned();
+        Self::open_with_io_at_path(dir, server, opts, io, &db_path)
+    }
+
+    fn open_with_io_at_path(
+        dir: &Arc<TempDir>,
+        server: InProcessServer,
+        opts: DatabaseSyncEngineOpts,
+        io: Arc<dyn IO>,
+        db_path: &str,
+    ) -> Result<Self> {
         let server = SyncEngineIoStats::new(Arc::new(server));
         let engine = drive(&io, async |coro| {
-            DatabaseSyncEngine::create_db(coro, io.clone(), server, &db_path, opts).await
+            DatabaseSyncEngine::create_db(coro, io.clone(), server, db_path, opts).await
         })?;
         Ok(Self {
             io,

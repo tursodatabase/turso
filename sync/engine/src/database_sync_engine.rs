@@ -1005,27 +1005,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 // Hosts can keep metadata outside core's filesystem (localStorage
                 // and OPFS in browsers). Their existence result is authoritative.
                 Some(404) => None,
-                Some(204) if crypto.is_some() => Some(data),
                 _ if !data.is_empty() => Some(data),
-                _ => {
-                    // Older hosts report missing and empty files identically.
-                    if crypto.is_some() {
-                        let io = io.as_ref().ok_or_else(|| {
-                            Error::DatabaseSyncEngineError(
-                                "local IO must be initialized before reading encrypted metadata"
-                                    .into(),
-                            )
-                        })?;
-                        if let Some(file) = io.try_open(&path)? {
-                            if file.size()? == 0 {
-                                return Err(Error::DatabaseSyncEngineError(
-                                    "encrypted sync metadata file is empty".into(),
-                                ));
-                            }
-                        }
-                    }
-                    None
-                }
+                _ => None,
             }
         };
         match meta {
@@ -1082,6 +1063,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
             for path in sync_database_file_paths(main_db_path) {
+                // Bootstrap can leave downloaded pages before metadata is
+                // published. Missing or empty metadata permits retrying over
+                // the main file, just as it does for plaintext replicas.
+                if path == main_db_path {
+                    continue;
+                }
                 if let Some(file) = io.try_open(&path)? {
                     if file.size()? != 0 {
                         return Err(Error::DatabaseSyncEngineError(format!(
@@ -4103,7 +4090,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_metadata_rejects_empty_file_and_missing_key() {
+    fn encrypted_metadata_treats_empty_file_as_missing_and_requires_key_for_nonempty() {
         let dir = tempfile::tempdir().expect("directory");
         let path = dir.path().join("db");
         let path = path.to_str().expect("path");
@@ -4125,10 +4112,7 @@ mod tests {
                 Some(&crypto),
             )
             .await;
-            assert!(result
-                .expect_err("empty metadata is not a fresh replica")
-                .to_string()
-                .contains("empty"));
+            assert!(result.expect("empty metadata is missing").is_none());
         });
         assert!(matches!(
             gen.resume_with(Ok(())),
