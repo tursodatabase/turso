@@ -1,7 +1,6 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::iter;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -39,12 +38,13 @@ use crate::{
 
 use super::{
     constraints::{
-        usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
+        usable_constraints_for_join_order, usable_constraints_for_lhs_mask, ConstraintRef,
+        TableConstraints,
     },
     cost::{
         estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
-        estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
-        AnalyzeCtx, Cost, IndexInfo,
+        estimate_index_cost, estimate_rows_per_in_seek_value, estimate_rows_per_seek,
+        estimate_scan_cost, estimate_sort_cpu_cost, AnalyzeCtx, Cost, IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -159,6 +159,8 @@ pub enum AccessMethodParams {
         index: Option<Arc<Index>>,
         affinity: Affinity,
         where_term_idx: usize,
+        /// Equalities on the index columns before the one the IN constrains.
+        prefix_refs: Vec<RangeConstraintRef>,
     },
 }
 
@@ -177,7 +179,13 @@ pub(super) struct ChosenInSeekCandidate {
     pub(super) index: Option<Arc<Index>>,
     pub(super) affinity: Affinity,
     pub(super) constraint_idx: usize,
+    /// Equalities on the index columns before the one the IN constrains.
+    pub(super) prefix_refs: SmallVec<[RangeConstraintRef; 2]>,
     pub(super) cost: Cost,
+    /// The cost of sorting the rows when the plain btree access it would
+    /// replace returns them in the order `ORDER BY` asks for. The IN values
+    /// are not read in index order, so the sort cannot be skipped.
+    pub(super) sort_penalty: Cost,
     pub(super) estimated_rows_per_outer_row: f64,
 }
 
@@ -526,6 +534,31 @@ fn consume_partial_index_predicate_terms(
     Ok(())
 }
 
+/// The leading equalities of an index that an `IN` seek can hold fixed.
+///
+/// These are the `=` constraints usable under `lhs_mask` on index columns
+/// `0..n`, before the first column without one. An `IS` equality stops the
+/// prefix: it matches NULL keys, which an IN seek does not.
+fn in_seek_eq_prefix(
+    rhs_constraints: &TableConstraints,
+    refs: &[ConstraintRef],
+    lhs_mask: &TableMask,
+    rhs_table_idx: usize,
+) -> SmallVec<[RangeConstraintRef; 2]> {
+    let mut prefix = usable_constraints_for_lhs_mask(
+        &rhs_constraints.constraints,
+        refs,
+        lhs_mask,
+        rhs_table_idx,
+    );
+    let len = prefix
+        .iter()
+        .take_while(|cref| cref.eq.as_ref().is_some_and(|eq| !eq.null_matching))
+        .count();
+    prefix.truncate(len);
+    prefix
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Evaluate whether an `IN (...)` predicate should replace the ordinary btree
 /// access path with repeated equality seeks.
@@ -534,20 +567,28 @@ fn consume_partial_index_predicate_terms(
 /// generic btree chooser reasons about a single continuous scan/seek over one
 /// candidate, while `InSeek` emits a two-level loop that materializes the RHS
 /// into an ephemeral cursor and performs one equality seek per RHS value.
-/// Because of that execution shape, only rowid or the first column of an index
-/// can drive `InSeek`, and the comparison collation must match the chosen
-/// index's first-key collation.
+/// Because of that execution shape, only rowid or an index column that follows
+/// the index's leading equalities can drive `InSeek`, and the comparison
+/// collation must match the chosen index column's collation. With
+/// `allow_eq_prefix` false only the first column of an index qualifies.
+///
+/// `alternative_is_ordered` says that the plain btree access this one would
+/// replace returns rows in the `ORDER BY` order, which `InSeek` does not.
 pub(super) fn choose_best_in_seek_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
+    rhs_table_idx: usize,
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
+    analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
     read_mode: BranchReadMode,
+    allow_eq_prefix: bool,
+    alternative_is_ordered: bool,
 ) -> Result<Option<ChosenInSeekCandidate>> {
     let Table::BTree(btree) = &rhs_table.table else {
         return Err(LimboError::InternalError(
@@ -562,10 +603,22 @@ pub(super) fn choose_best_in_seek_candidate(
     let may_null_extend = table_references.outer_join_may_null_extend(rhs_table.internal_id);
 
     for candidate in rhs_constraints.candidates.iter() {
-        let first_col_pos = candidate
+        // The equalities that fix the leading index columns. The IN constrains
+        // the column after them.
+        let eq_prefix = match (&candidate.index, allow_eq_prefix) {
+            (Some(_), true) => {
+                in_seek_eq_prefix(rhs_constraints, &candidate.refs, lhs_mask, rhs_table_idx)
+            }
+            _ => SmallVec::new(),
+        };
+        let in_col_pos = eq_prefix.len();
+        // An expression column has no position in the table.
+        let in_index_col = candidate
             .index
             .as_ref()
-            .and_then(|idx| idx.columns.first().map(|c| c.pos_in_table));
+            .and_then(|idx| idx.columns.get(in_col_pos))
+            .filter(|col| col.expression().is_none());
+        let in_col_table_pos = in_index_col.map(|col| col.pos_in_table);
 
         let rowid_only = matches!(read_mode, BranchReadMode::RowIdOnly);
         let index_info = match candidate.index.as_ref() {
@@ -587,7 +640,7 @@ pub(super) fn choose_best_in_seek_candidate(
             },
         };
 
-        for constraint in &rhs_constraints.constraints {
+        for (constraint_pos, constraint) in rhs_constraints.constraints.iter().enumerate() {
             let ConstraintOperator::In {
                 not,
                 estimated_values,
@@ -619,7 +672,7 @@ pub(super) fn choose_best_in_seek_candidate(
             } else {
                 !constraint.is_rowid
                     && constraint.table_col_pos.is_some()
-                    && constraint.table_col_pos == first_col_pos
+                    && constraint.table_col_pos == in_col_table_pos
             };
             if !matches {
                 continue;
@@ -629,7 +682,7 @@ pub(super) fn choose_best_in_seek_candidate(
             // removes duplicate IN values with it, so it must be the
             // collation the IN compares with.
             if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
-                if !constraint.index_column_can_serve(&index.columns[0]) {
+                if !constraint.index_column_can_serve(&index.columns[in_col_pos]) {
                     continue;
                 }
                 let constrained_column = &rhs_table.table.columns()[col_pos];
@@ -639,22 +692,33 @@ pub(super) fn choose_best_in_seek_candidate(
                 }
             }
 
-            let rows_per_seek = if (index_info.unique && index_info.column_count == 1)
-                || candidate.index.is_none()
-            {
+            let rows_per_seek = if candidate.index.is_none() {
                 1.0
             } else {
-                (base * params.sel_eq_indexed).sqrt().max(1.0)
+                let analyze_ctx = AnalyzeCtx {
+                    rhs_table,
+                    index: candidate.index.as_ref(),
+                    stats: analyze_stats,
+                };
+                estimate_rows_per_in_seek_value(
+                    index_info,
+                    &rhs_constraints.constraints,
+                    &eq_prefix,
+                    constraint_pos,
+                    base_row_count,
+                    Some(&analyze_ctx),
+                    params,
+                )
             };
-            let in_cost = estimate_index_cost(
-                base,
-                tree_depth,
-                index_info,
-                estimated_values * input_cardinality,
-                rows_per_seek,
-                params,
-            );
-            if in_cost >= best_in_seek_cost {
+            let seeks = estimated_values * input_cardinality;
+            let in_cost =
+                estimate_index_cost(base, tree_depth, index_info, seeks, rows_per_seek, params);
+            let sort_penalty = if alternative_is_ordered {
+                estimate_sort_cpu_cost(seeks * rows_per_seek, params)
+            } else {
+                Cost(0.0)
+            };
+            if in_cost + sort_penalty >= best_in_seek_cost {
                 continue;
             }
 
@@ -664,13 +728,19 @@ pub(super) fn choose_best_in_seek_candidate(
                 Affinity::Integer
             };
             let affinity = do_comparison_affinity(lhs_affinity, Affinity::None);
-            best_in_seek_cost = in_cost;
+            best_in_seek_cost = in_cost + sort_penalty;
             best_in_seek = Some(ChosenInSeekCandidate {
                 index: candidate.index.clone(),
                 affinity,
                 constraint_idx: constraint.where_clause_pos.0,
+                prefix_refs: eq_prefix.clone(),
                 cost: in_cost,
-                estimated_rows_per_outer_row: (constraint.selectivity * base).max(1.0),
+                sort_penalty,
+                estimated_rows_per_outer_row: if eq_prefix.is_empty() {
+                    (constraint.selectivity * base).max(1.0)
+                } else {
+                    (estimated_values * rows_per_seek).max(1.0)
+                },
             });
         }
     }
@@ -683,36 +753,52 @@ fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
+    rhs_table_idx: usize,
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
+    analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
-) -> Result<Option<AccessMethod>> {
+    alternative_is_ordered: bool,
+) -> Result<Option<(AccessMethod, Cost)>> {
     choose_best_in_seek_candidate(
         rhs_table,
         rhs_constraints,
         lhs_mask,
+        rhs_table_idx,
         where_clause,
         table_references,
+        analyze_stats,
         input_cardinality,
         base_row_count,
         params,
         best_cost,
         BranchReadMode::FullRow,
+        true,
+        alternative_is_ordered,
     )?
-    .map(|chosen| -> Result<AccessMethod> {
-        Ok(AccessMethod {
-            cost: chosen.cost,
-            estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-            consumed_where_terms: iter::once(chosen.constraint_idx).try_collect()?,
-            params: AccessMethodParams::InSeek {
-                index: chosen.index,
-                affinity: chosen.affinity,
-                where_term_idx: chosen.constraint_idx,
+    .map(|chosen| -> Result<(AccessMethod, Cost)> {
+        let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
+            &rhs_constraints.constraints,
+            &chosen.prefix_refs,
+        )?;
+        consumed_where_terms.set(chosen.constraint_idx)?;
+        Ok((
+            AccessMethod {
+                cost: chosen.cost,
+                estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+                consumed_where_terms,
+                params: AccessMethodParams::InSeek {
+                    index: chosen.index,
+                    affinity: chosen.affinity,
+                    where_term_idx: chosen.constraint_idx,
+                    prefix_refs: chosen.prefix_refs.into_vec(),
+                },
             },
-        })
+            chosen.sort_penalty,
+        ))
     })
     .transpose()
 }
@@ -881,6 +967,27 @@ fn find_best_access_method_for_btree(
     };
 
     let access_base_row_count = best.base_row_count;
+    // An IN seek does not read rows in index order, so it can only replace a
+    // btree access that does not provide the ORDER BY order, or that is
+    // cheap enough to pay for the sort.
+    let best_is_ordered = maybe_order_target.is_some_and(|order_target| {
+        [IterationDirection::Forwards, IterationDirection::Backwards]
+            .into_iter()
+            .any(|iter_dir| {
+                btree_access_order_consumed(
+                    rhs_table,
+                    iter_dir,
+                    best.index.as_deref(),
+                    &best.constraint_refs,
+                    order_target,
+                    0,
+                    schema,
+                    EqualityPrefixScope::AnyEquality,
+                )
+                .consumed
+                    == order_target.columns.len()
+            })
+    });
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
         *access_base_row_count
     } else {
@@ -1036,16 +1143,19 @@ fn find_best_access_method_for_btree(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        if let Some(in_seek_method) = consider_in_seek_access_method(
+        if let Some((in_seek_method, sort_penalty)) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
             lhs_mask,
+            rhs_table_idx,
             where_clause,
             table_references,
+            analyze_stats,
             input_cardinality,
             base_row_count,
             params,
             best_cost_with_filters,
+            best_is_ordered,
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
@@ -1058,14 +1168,14 @@ fn find_best_access_method_for_btree(
                     )?;
                 }
             }
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                in_seek_method,
-                ready_where,
-                input_cardinality,
-                params,
-            );
+            // The IN values are not read in index order, so choosing this
+            // method gives up the order of the btree access it replaces.
+            let in_seek_cost =
+                cost_with_where_work(&in_seek_method, ready_where, input_cardinality, params);
+            if in_seek_cost + sort_penalty < best_cost_with_filters {
+                best_access_method = in_seek_method;
+                best_cost_with_filters = in_seek_cost;
+            }
         }
 
         // Multi-index scans do not record matched rowids for a RIGHT or FULL JOIN,
