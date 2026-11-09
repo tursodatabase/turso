@@ -1946,3 +1946,149 @@ expect {
     2|2
     4|1
 }
+
+# A text compared with a time or timestamp takes the column's type first:
+# '10:00' is the time 10:00:00. Every query runs before and after the indexes
+# exist, so the expected rows are listed twice.
+test compare-time-with-text-same-rows-with-and-without-index {
+    CREATE TABLE cmp_time (id int PRIMARY KEY, tm time, ts timestamp);
+    INSERT INTO cmp_time VALUES (1, '09:30', '2024-01-05 09:30'), (2, '10:00', '2024-01-05 10:00'), (3, '23:59:59', '2024-01-06 00:00'), (4, NULL, NULL);
+    SELECT 'eq', id FROM cmp_time WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM cmp_time WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM cmp_time WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM cmp_time WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM cmp_time WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM cmp_time WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM cmp_time WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM cmp_time WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM cmp_time WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM cmp_time WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM cmp_time WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM cmp_time WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM cmp_time WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM cmp_time WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    CREATE INDEX cmp_time_tm ON cmp_time (tm);
+    CREATE INDEX cmp_time_ts ON cmp_time (ts);
+    SELECT 'eq', id FROM cmp_time WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM cmp_time WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM cmp_time WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM cmp_time WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM cmp_time WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM cmp_time WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM cmp_time WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM cmp_time WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM cmp_time WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM cmp_time WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM cmp_time WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM cmp_time WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM cmp_time WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM cmp_time WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    DROP TABLE cmp_time;
+}
+expect {
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+}
+
+# x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
+# when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
+# holds for a list and a subquery, correlated or not.
+test compare-text-on-the-left-of-in-with-time {
+    CREATE TABLE in_left_ev (id int PRIMARY KEY, tm time);
+    INSERT INTO in_left_ev VALUES (1, '09:45:00'), (2, '10:00:00');
+    SELECT 'list', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'list-two', id FROM in_left_ev WHERE '09:45' IN (tm, '10:00') ORDER BY id;
+    SELECT 'not-in', id FROM in_left_ev WHERE '09:45' NOT IN (tm) ORDER BY id;
+    SELECT 'column', id, ('09:45' IN (tm))::int FROM in_left_ev ORDER BY id;
+    SELECT 'subquery', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    SELECT 'correlated', id FROM in_left_ev WHERE '09:45' IN (SELECT e2.tm FROM in_left_ev e2 WHERE e2.id = in_left_ev.id) ORDER BY id;
+    SELECT 'plain', ('a' IN ('a'))::int;
+    CREATE INDEX in_left_ev_tm ON in_left_ev (tm);
+    SELECT 'list-index', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'subquery-index', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    DROP TABLE in_left_ev;
+}
+expect {
+    list|1
+    list-two|1
+    not-in|2
+    column|1|1
+    column|2|0
+    subquery|1
+    subquery|2
+    correlated|1
+    plain|1
+    list-index|1
+    subquery-index|1
+    subquery-index|2
+}
+
+# DELETE and UPDATE find their rows with the converted text, by a scan and
+# through an index.
+test compare-time-with-text-delete-and-update {
+    CREATE TABLE cmp_time_a (id int PRIMARY KEY, tm time);
+    CREATE TABLE cmp_time_b (id int PRIMARY KEY, tm time);
+    CREATE INDEX cmp_time_b_tm ON cmp_time_b (tm);
+    INSERT INTO cmp_time_a VALUES (1, '09:30'), (2, '10:00'), (3, '23:59:59'), (4, NULL);
+    INSERT INTO cmp_time_b SELECT * FROM cmp_time_a;
+    DELETE FROM cmp_time_a WHERE tm < '09:45';
+    DELETE FROM cmp_time_b WHERE tm < '09:45';
+    UPDATE cmp_time_a SET id = 20 WHERE tm = '10:00';
+    UPDATE cmp_time_b SET id = 20 WHERE tm = '10:00';
+    SELECT 'a', id, tm FROM cmp_time_a ORDER BY id;
+    SELECT 'b', id, tm FROM cmp_time_b ORDER BY id;
+    DROP TABLE cmp_time_a;
+    DROP TABLE cmp_time_b;
+}
+expect {
+    a|3|23:59:59
+    a|4|
+    a|20|10:00:00
+    b|3|23:59:59
+    b|4|
+    b|20|10:00:00
+}

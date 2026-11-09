@@ -223,7 +223,13 @@ pub(super) fn emit_array_encode_as(
                 col.array_dimensions(),
                 ArrayInput::Text(&target),
                 |program, leaf_reg| {
-                    emit_store_value(program, resolved, leaf_reg, &col.ty_params, resolver)
+                    emit_store_value(
+                        program,
+                        resolved,
+                        leaf_reg,
+                        Coerce::WithArgs(&col.ty_params),
+                        resolver,
+                    )
                 },
             )?;
         }
@@ -348,7 +354,13 @@ pub(crate) fn emit_custom_type_encode_columns(
             None
         };
 
-        emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
+        emit_store_value(
+            program,
+            &resolved,
+            reg,
+            Coerce::WithArgs(&col.ty_params),
+            resolver,
+        )?;
 
         if let Some(label) = skip_label {
             program.preassign_label_to_next_insn(label);

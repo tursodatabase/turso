@@ -68,8 +68,15 @@ fn emit_row_valued_binary_expr(
 
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_compared_pair(
+        program,
+        referenced_tables,
+        e1,
+        e2,
+        lhs_reg,
+        rhs_reg,
+        resolver,
+    )?;
 
     emit_binary_expr_row_valued(
         program,
@@ -159,8 +166,12 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        if op.is_comparison() {
+            translate_compared_pair(program, referenced_tables, e1, e2, e1_reg, e2_reg, resolver)?;
+        } else {
+            translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
+            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        }
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(

@@ -54,6 +54,426 @@ pub(super) fn emit_custom_type_operator(
     Ok(Some(result_reg))
 }
 
+/// Translates `operand`, which is compared with `other`, into `reg`. A string
+/// literal or parameter compared with a value of a custom type is read as a
+/// value of the type, as PostgreSQL reads it: it is stored as a column of the
+/// type stores it, then read back. So `ts = '2024-01-05T09:31'` compares ts
+/// with '2024-01-05 09:31:00', and a text the type does not accept is an
+/// error. In a row value such as `(tm, id) = ('10:00', 2)`, each element is
+/// compared with the element of `other` at its position.
+pub(crate) fn translate_compared_operand(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if let ast::Expr::Parenthesized(elements) = unwrap_parens(operand)? {
+        if elements.len() > 1 && !resolver.schema().type_registry.is_empty() {
+            for (i, element) in elements.iter().enumerate() {
+                let other_element = row_value_component_expr(other, i)?;
+                translate_compared_operand(
+                    program,
+                    referenced_tables,
+                    element,
+                    &other_element,
+                    reg + i,
+                    resolver,
+                )?;
+            }
+            return Ok(reg);
+        }
+    }
+    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+        Some(resolved) => translate_untyped_operand_as(
+            program,
+            referenced_tables,
+            operand,
+            &resolved,
+            reg,
+            resolver,
+        ),
+        None => translate_expr(program, referenced_tables, operand, reg, resolver),
+    }
+}
+
+/// Translates the two operands of a comparison into `lhs_reg` and `rhs_reg`.
+/// See [translate_compared_operand].
+pub(crate) fn translate_compared_pair(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    lhs_reg: usize,
+    rhs_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    translate_compared_operand(program, referenced_tables, lhs, rhs, lhs_reg, resolver)?;
+    translate_compared_operand(program, referenced_tables, rhs, lhs, rhs_reg, resolver)?;
+    Ok(())
+}
+
+/// The registers holding `lhs` as it is compared with `element`, an element of
+/// the list on the right of IN. PostgreSQL reads `x IN (a, b)` as
+/// `x = a OR x = b`, so a string literal or parameter in `lhs` is read as the
+/// type of each element it is compared with. `lhs_reg` holds `lhs` as written
+/// in `lhs_arity` registers; it is returned when nothing in `lhs` is read as a
+/// custom type, and otherwise a copy with those components converted.
+pub(crate) fn translate_in_lhs_for_element(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    lhs_reg: usize,
+    lhs_arity: usize,
+    element: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(lhs_reg);
+    }
+    let mut converted = Vec::new();
+    match unwrap_parens(lhs)? {
+        ast::Expr::Parenthesized(components) if components.len() > 1 => {
+            for (i, component) in components.iter().enumerate() {
+                let other = row_value_component_expr(element, i)?;
+                if let Some(resolved) =
+                    untyped_operand_type(component, &other, referenced_tables, resolver)?
+                {
+                    converted.push((i, component.as_ref(), resolved));
+                }
+            }
+        }
+        _ => {
+            if let Some(resolved) = untyped_operand_type(lhs, element, referenced_tables, resolver)?
+            {
+                converted.push((0, lhs, resolved));
+            }
+        }
+    }
+    if converted.is_empty() {
+        return Ok(lhs_reg);
+    }
+    let reg = program.alloc_registers(lhs_arity);
+    // A converted component is translated from its expression instead of being
+    // copied from `lhs_reg` first: its conversion is a constant, which runs
+    // before the copy would.
+    for i in 0..lhs_arity {
+        match converted.iter().find(|(index, _, _)| *index == i) {
+            Some((_, component, resolved)) => {
+                translate_untyped_operand_as(
+                    program,
+                    referenced_tables,
+                    component,
+                    resolved,
+                    reg + i,
+                    resolver,
+                )?;
+            }
+            None => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs_reg + i,
+                    dst_reg: reg + i,
+                    extra_amount: 0,
+                });
+            }
+        }
+    }
+    Ok(reg)
+}
+
+/// Translates the arguments of a scalar min or max into `start_reg..`. Their
+/// string literals and parameters are read as described in
+/// [untyped_values_type].
+pub(crate) fn translate_compared_args(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    args: &[Box<ast::Expr>],
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let values_type = untyped_values_type(
+        args.iter().map(|arg| arg.as_ref()),
+        referenced_tables,
+        resolver,
+    )?;
+    for (i, arg) in args.iter().enumerate() {
+        let reg = start_reg + i;
+        if !translate_untyped_value(
+            program,
+            referenced_tables,
+            arg,
+            values_type.as_ref(),
+            reg,
+            resolver,
+        )? {
+            translate_expr(program, referenced_tables, arg, reg, resolver)?;
+        }
+    }
+    Ok(())
+}
+
+/// The type the string literals and parameters among `values` are read as,
+/// where `values` are what an expression returns one of or compares with each
+/// other: the arguments of coalesce, ifnull, min and max, the values of iif,
+/// and the results of CASE. As in PostgreSQL, a string literal or parameter
+/// is read as a value of the values' common type when that is a custom type:
+/// in `coalesce(tm, '00:00')` on a time column, '00:00' is the time 00:00:00.
+/// Values of two custom types leave no single type to read a string literal
+/// as, which is an error. None when nothing is read as a custom type.
+pub(crate) fn untyped_values_type<'e>(
+    values: impl Iterator<Item = &'e ast::Expr> + Clone,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    let schema = resolver.schema();
+    if schema.type_registry.is_empty() {
+        return Ok(None);
+    }
+    let mut has_untyped_value = false;
+    for value in values.clone() {
+        has_untyped_value |= is_untyped_operand(value)?;
+    }
+    if !has_untyped_value {
+        return Ok(None);
+    }
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let common = common_type(values.clone(), &env);
+    match common {
+        ExprType::Custom { .. } => untyped_operands_read_as(schema, common),
+        ExprType::Array { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        | ExprType::NotKnownYet => {
+            refuse_two_custom_types(values, &env)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Fails when `values` have two different custom types. Called when string
+/// literals or parameters among them would be read as their common type.
+fn refuse_two_custom_types<'e>(
+    values: impl Iterator<Item = &'e ast::Expr>,
+    env: &TypeEnv,
+) -> Result<()> {
+    let mut seen: Option<Arc<TypeDef>> = None;
+    for value in values {
+        let type_def = match type_of(value, env) {
+            ExprType::Custom { type_def, .. } => type_def,
+            ExprType::Array { .. }
+            | ExprType::Builtin(_)
+            | ExprType::Untyped
+            | ExprType::Null
+            | ExprType::Unknown
+            | ExprType::RowValue
+            | ExprType::NotKnownYet => continue,
+        };
+        match &seen {
+            None => seen = Some(type_def),
+            Some(seen) if seen.name == type_def.name => {}
+            Some(seen) => crate::bail_parse_error!(
+                "cannot tell which type to read a string literal or parameter as: \
+                 it is compared with type {} and type {}",
+                seen.name,
+                type_def.name
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Translates `value`, one of the values an expression returns one of (see
+/// [untyped_values_type]), into `reg`, which the other values write too.
+pub(crate) fn translate_returned_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value: &ast::Expr,
+    values_type: Option<&ResolvedType>,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if translate_untyped_value(
+        program,
+        referenced_tables,
+        value,
+        values_type,
+        reg,
+        resolver,
+    )? {
+        return Ok(reg);
+    }
+    translate_expr_no_constant_opt(
+        program,
+        referenced_tables,
+        value,
+        reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )
+}
+
+/// Translates `value` into `reg` if it is a string literal or parameter read
+/// as `values_type` (see [untyped_values_type]), and returns whether it did.
+/// The conversion is computed once in a register of its own and copied into
+/// `reg`, so the other values may write `reg` too.
+pub(crate) fn translate_untyped_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value: &ast::Expr,
+    values_type: Option<&ResolvedType>,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let Some(resolved) = values_type else {
+        return Ok(false);
+    };
+    if !is_untyped_operand(value)? {
+        return Ok(false);
+    }
+    let value_reg = program.alloc_register();
+    translate_untyped_operand_as(
+        program,
+        referenced_tables,
+        value,
+        resolved,
+        value_reg,
+        resolver,
+    )?;
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    Ok(true)
+}
+
+/// Translates the string literal or parameter `operand` into `reg` as a value
+/// of `resolved`: stored as a column of the type stores it, then read back.
+pub(crate) fn translate_untyped_operand_as(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    // The operand is a constant, so its conversion is computed once with it.
+    let constant_span = (!program.constant_span_is_open()).then(|| program.constant_span_start());
+    translate_expr(program, referenced_tables, operand, reg, resolver)?;
+    emit_untyped_operand_store(program, resolved, reg, resolver)?;
+    emit_decode(program, resolved, reg, resolver)?;
+    if let Some(span) = constant_span {
+        program.constant_span_end(span);
+    }
+    Ok(reg)
+}
+
+/// The type a string literal or parameter compared with `other` is read as,
+/// or None when it is compared as written.
+pub(crate) fn untyped_operand_type(
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    read_untyped_operand_as(operand, resolver.schema(), || {
+        Ok(type_of(other, &TypeEnv::new(referenced_tables, resolver)))
+    })
+}
+
+/// The type a string literal or parameter compared with a value of
+/// `other_type` is read as, or None when it is compared as written. Scans and
+/// index seeks both decide here, so they read the same rows.
+pub(crate) fn read_untyped_operand_as(
+    operand: &ast::Expr,
+    schema: &crate::schema::Schema,
+    other_type: impl FnOnce() -> Result<ExprType>,
+) -> Result<Option<ResolvedType>> {
+    if schema.type_registry.is_empty() || !is_untyped_operand(operand)? {
+        return Ok(None);
+    }
+    untyped_operands_read_as(schema, other_type()?)
+}
+
+/// The type a string literal or parameter compared with a value of
+/// `other_type` is read as, if it is a string literal or parameter.
+fn untyped_operands_read_as(
+    schema: &crate::schema::Schema,
+    other_type: ExprType,
+) -> Result<Option<ResolvedType>> {
+    let type_def = match other_type {
+        ExprType::Custom { type_def, .. } => type_def,
+        // An array compares in its own order, which converts the other operand.
+        ExprType::Array { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        // `value` in a type's ENCODE, DECODE or CHECK, which is compiled
+        // without its type.
+        | ExprType::NotKnownYet => return Ok(None),
+    };
+    let resolved = schema
+        .resolve_type_unchecked(&type_def.name)?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("type {} does not resolve", type_def.name))
+        })?;
+    Ok(converts_untyped_operands(&resolved).then_some(resolved))
+}
+
+/// Whether `expr` takes its type from the value it is compared with: a string
+/// literal, or a parameter. A parameter that stands for a column, such as a
+/// foreign key's parent key, carries the column's type or collation and holds
+/// the column's value. Parentheses don't change this: `('10:00')` is a string
+/// literal too.
+fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
+    Ok(match unwrap_parens(expr)? {
+        ast::Expr::Literal(ast::Literal::String(_)) => true,
+        ast::Expr::Variable(variable) => {
+            variable.custom_type.is_none() && variable.col_collation.is_none()
+        }
+        _ => false,
+    })
+}
+
+/// Whether a string literal or parameter compared with a value of `resolved`
+/// is converted to the type. A type with its own order, such as numeric,
+/// converts the other operand when it compares instead, and a type without
+/// ENCODE or DECODE reads a value as it is written.
+fn converts_untyped_operands(resolved: &ResolvedType) -> bool {
+    resolved.ordering().is_none()
+        && (resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.encode().is_some())
+            || !resolved.decode_returns_value_unchanged())
+}
+
+/// Stores the string literal or parameter in `reg` as a value of `resolved`,
+/// as INSERT stores it in a column of the type, but without COERCE: as in
+/// PostgreSQL, a column's limits, such as the scale of `numeric(10,1)`, do not
+/// apply to the value it is compared with. NULL is left as it is.
+pub(crate) fn emit_untyped_operand_store(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let skip_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_null,
+    });
+    emit_store_value(program, resolved, reg, Coerce::Skip, resolver)?;
+    program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT)
 /// from the row's stored values in `column_regs`. Reading a custom-type column
 /// in the expression decodes it, so the expression sees the user's values.
@@ -229,17 +649,27 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
+/// Whether storing a value runs the type's COERCE.
+#[derive(Clone, Copy)]
+pub(crate) enum Coerce<'a> {
+    /// Run COERCE with these arguments, the ones written after the type name,
+    /// such as `10, 2` in `numeric(10, 2)`.
+    WithArgs(&'a [Box<ast::Expr>]),
+    /// Don't run COERCE: the value is only compared with values of the type.
+    Skip,
+}
+
 /// Emits what storing the value in `reg` as a value of `resolved` runs: each
-/// type's ENCODE, then its COERCE with `type_params`, the arguments written
-/// after the type name. The result is converted to the kind of the type's
-/// BASE as a STRICT column of the BASE converts it, so a type BASE integer
-/// whose ENCODE gives '5' stores 5, and one whose ENCODE gives 'abc' is an
-/// error. COERCE sees the converted value too. A CAST runs the same.
+/// type's ENCODE, then its COERCE unless `coerce` is [Coerce::Skip]. The
+/// result is converted to the kind of the type's BASE as a STRICT column of
+/// the BASE converts it, so a type BASE integer whose ENCODE gives '5' stores
+/// 5, and one whose ENCODE gives 'abc' is an error. COERCE sees the converted
+/// value too. A CAST runs the same.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
     reg: usize,
-    type_params: &[Box<ast::Expr>],
+    coerce: Coerce,
     resolver: &Resolver,
 ) -> Result<()> {
     let convert = Insn::ConvertToType {
@@ -255,9 +685,13 @@ pub(crate) fn emit_store_value(
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
         }
-        if let Some(coerce) = coerce_to_run(type_def, type_params) {
+        let type_params = match coerce {
+            Coerce::WithArgs(type_params) => type_params,
+            Coerce::Skip => continue,
+        };
+        if let Some(coerce_expr) = coerce_to_run(type_def, type_params) {
             program.emit_insn(convert.clone());
-            emit_coerce(program, type_def, coerce, reg, type_params, resolver)?;
+            emit_coerce(program, type_def, coerce_expr, reg, type_params, resolver)?;
         }
     }
     program.emit_insn(convert);

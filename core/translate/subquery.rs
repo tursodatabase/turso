@@ -1106,6 +1106,17 @@ fn get_subquery_parser<'a>(
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
+                // A string literal or parameter on the left is read as the
+                // type of the column it is compared with.
+                let result_column_env = TypeEnv::new(Some(table_references), resolver);
+                resolver.in_subquery_column_types.insert(
+                    subquery_id,
+                    result_columns
+                        .iter()
+                        .map(|result_col| type_of(&result_col.expr, &result_column_env))
+                        .collect(),
+                );
+
                 let columns = result_columns
                     .iter()
                     .enumerate()
