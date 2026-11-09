@@ -971,6 +971,7 @@ pub fn translate_create_sequence(
     min_value: &Option<i64>,
     max_value: &Option<i64>,
     cycle: bool,
+    conflicting_options: bool,
     resolver: &Resolver,
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -1028,6 +1029,13 @@ pub fn translate_create_sequence(
             return Ok(());
         }
         bail_parse_error!("sequence \"{}\" already exists", normalized_name);
+    }
+
+    // PostgreSQL validates the option list only for a sequence it is about
+    // to create, so a conflict deferred here by the frontend reports after
+    // the existence check, never on the IF NOT EXISTS skip path above.
+    if conflicting_options {
+        bail_parse_error!("conflicting or redundant options");
     }
 
     // Validate parameters early (gives immediate error instead of deferred)
