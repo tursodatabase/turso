@@ -1934,25 +1934,6 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::ArrayLength
-                | ScalarFunc::ArrayAppend
-                | ScalarFunc::ArrayPrepend
-                | ScalarFunc::ArrayCat
-                | ScalarFunc::ArrayRemove
-                | ScalarFunc::ArrayContains
-                | ScalarFunc::ArrayPosition
-                | ScalarFunc::ArraySlice
-                | ScalarFunc::StringToArray
-                | ScalarFunc::ArrayToString
-                | ScalarFunc::ArrayOverlap
-                | ScalarFunc::ArrayContainsAll => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
                 ScalarFunc::StructPack => {
                     translate_variadic_insn!(
                         program,

@@ -800,8 +800,12 @@ pub(super) fn emit_binary_insn(
             resolver.require_custom_types("Array features")?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+                ast::Operator::ArrayContains => {
+                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayContainsAll)
+                }
+                ast::Operator::ArrayOverlap => {
+                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayOverlap)
+                }
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {
@@ -809,7 +813,7 @@ pub(super) fn emit_binary_insn(
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1107,8 +1111,12 @@ pub(super) fn emit_binary_condition_insn(
             resolver.require_custom_types("Array features")?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+                ast::Operator::ArrayContains => {
+                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayContainsAll)
+                }
+                ast::Operator::ArrayOverlap => {
+                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayOverlap)
+                }
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {
@@ -1116,7 +1124,7 @@ pub(super) fn emit_binary_condition_insn(
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },

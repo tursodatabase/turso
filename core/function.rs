@@ -1019,19 +1019,6 @@ pub enum ScalarFunc {
     Array,
     ArrayElement,
     ArraySetElement,
-    // Array utility functions
-    ArrayLength,
-    ArrayAppend,
-    ArrayPrepend,
-    ArrayCat,
-    ArrayRemove,
-    ArrayContains,
-    ArrayPosition,
-    ArraySlice,
-    StringToArray,
-    ArrayToString,
-    ArrayOverlap,
-    ArrayContainsAll,
     // Struct/Union construction and access
     StructPack,
     StructExtractFunc,
@@ -1104,21 +1091,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::DatePlus
             | ScalarFunc::DateMinus
             | ScalarFunc::DateDiff => true,
-            ScalarFunc::Array
-            | ScalarFunc::ArrayElement
-            | ScalarFunc::ArraySetElement
-            | ScalarFunc::ArrayLength
-            | ScalarFunc::ArrayAppend
-            | ScalarFunc::ArrayPrepend
-            | ScalarFunc::ArrayCat
-            | ScalarFunc::ArrayRemove
-            | ScalarFunc::ArrayContains
-            | ScalarFunc::ArrayPosition
-            | ScalarFunc::ArraySlice
-            | ScalarFunc::StringToArray
-            | ScalarFunc::ArrayToString
-            | ScalarFunc::ArrayOverlap
-            | ScalarFunc::ArrayContainsAll => true,
+            ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => true,
             ScalarFunc::StructPack
             | ScalarFunc::StructExtractFunc
             | ScalarFunc::UnionValueFunc
@@ -1168,11 +1141,6 @@ impl ScalarFunc {
             | Self::Lcm
             | Self::BooleanToInt
             | Self::DateDiff
-            | Self::ArrayLength
-            | Self::ArrayContains
-            | Self::ArrayPosition
-            | Self::ArrayOverlap
-            | Self::ArrayContainsAll
             | Self::NextVal
             | Self::CurrVal
             | Self::SetVal => ResultType::Declared(ReturnType::Integer),
@@ -1200,19 +1168,11 @@ impl ScalarFunc {
             | Self::NumericNeg
             | Self::DatePlus
             | Self::DateMinus
-            | Self::ArrayToString
             | Self::TestUintEncode
             | Self::StatGet
             | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
             Self::RandomBlob | Self::NumericEncode | Self::NumericFit | Self::StatInit | Self::StatPush => ResultType::Declared(ReturnType::Blob),
-            Self::Array
-            | Self::ArraySetElement
-            | Self::ArrayAppend
-            | Self::ArrayPrepend
-            | Self::ArrayCat
-            | Self::ArrayRemove
-            | Self::ArraySlice
-            | Self::StringToArray => ResultType::Declared(ReturnType::Array),
+            Self::Array | Self::ArraySetElement => ResultType::Declared(ReturnType::Array),
         }
     }
 
@@ -1295,18 +1255,6 @@ impl Display for ScalarFunc {
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
-            Self::ArrayLength => "array_length",
-            Self::ArrayAppend => "array_append",
-            Self::ArrayPrepend => "array_prepend",
-            Self::ArrayCat => "array_cat",
-            Self::ArrayRemove => "array_remove",
-            Self::ArrayContains => "array_contains",
-            Self::ArrayPosition => "array_position",
-            Self::ArraySlice => "array_slice",
-            Self::StringToArray => "string_to_array",
-            Self::ArrayToString => "array_to_string",
-            Self::ArrayOverlap => "array_overlap",
-            Self::ArrayContainsAll => "array_contains_all",
             Self::StructPack => "struct_pack",
             Self::StructExtractFunc => "struct_extract",
             Self::UnionValueFunc => "union_value",
@@ -1410,19 +1358,6 @@ impl ScalarFunc {
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
             Self::ArraySetElement => &[3],
-            // Array functions
-            Self::ArrayLength => &[1, 2],
-            Self::ArrayAppend
-            | Self::ArrayPrepend
-            | Self::ArrayCat
-            | Self::ArrayRemove
-            | Self::ArrayContains
-            | Self::ArrayPosition
-            | Self::ArrayOverlap
-            | Self::ArrayContainsAll => &[2],
-            Self::ArraySlice => &[3],
-            Self::StringToArray => &[2, 3],
-            Self::ArrayToString => &[2, 3],
             // Struct/Union functions
             // struct_pack is intentionally variable-arity: field count validation
             // happens at INSERT time when the value is stored into a typed column.
@@ -1699,6 +1634,8 @@ pub enum ReturnType {
     /// An array. Its elements have the type of the elements of the function's
     /// array argument.
     Array,
+    /// A one-dimensional array of text values.
+    TextArray,
 }
 
 /// How the type of a function's result follows from the types of its

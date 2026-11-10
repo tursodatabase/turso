@@ -1,3 +1,5 @@
+pub(crate) mod arrays;
+
 pub(crate) mod values;
 
 use std::collections::HashMap;
@@ -154,6 +156,18 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&values::Repeat, &[]);
     catalog.register(&values::Lpad, &[]);
     catalog.register(&values::Rpad, &[]);
+    catalog.register(&arrays::ArrayLength, &["array_upper"]);
+    catalog.register(&arrays::ArrayAppend, &[]);
+    catalog.register(&arrays::ArrayCat, &[]);
+    catalog.register(&arrays::ArrayRemove, &[]);
+    catalog.register(&arrays::ArrayContains, &[]);
+    catalog.register(&arrays::ArrayPosition, &[]);
+    catalog.register(&arrays::ArrayOverlap, &["array_overlaps"]);
+    catalog.register(&arrays::ArrayContainsAll, &[]);
+    catalog.register(&arrays::ArrayPrepend, &[]);
+    catalog.register(&arrays::ArraySlice, &[]);
+    catalog.register(&arrays::StringToArray, &[]);
+    catalog.register(&arrays::ArrayToString, &[]);
     catalog
 });
 

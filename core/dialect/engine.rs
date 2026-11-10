@@ -507,18 +507,6 @@ pub(crate) fn resolve_builtin_function_name(
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),
         "array_set_element" => Ok(Some(Func::Scalar(ScalarFunc::ArraySetElement))),
         // Array functions
-        "array_length" | "array_upper" => Ok(Some(Func::Scalar(ScalarFunc::ArrayLength))),
-        "array_append" => Ok(Some(Func::Scalar(ScalarFunc::ArrayAppend))),
-        "array_prepend" => Ok(Some(Func::Scalar(ScalarFunc::ArrayPrepend))),
-        "array_cat" => Ok(Some(Func::Scalar(ScalarFunc::ArrayCat))),
-        "array_remove" => Ok(Some(Func::Scalar(ScalarFunc::ArrayRemove))),
-        "array_contains" => Ok(Some(Func::Scalar(ScalarFunc::ArrayContains))),
-        "array_position" => Ok(Some(Func::Scalar(ScalarFunc::ArrayPosition))),
-        "array_slice" => Ok(Some(Func::Scalar(ScalarFunc::ArraySlice))),
-        "string_to_array" => Ok(Some(Func::Scalar(ScalarFunc::StringToArray))),
-        "array_to_string" => Ok(Some(Func::Scalar(ScalarFunc::ArrayToString))),
-        "array_overlap" | "array_overlaps" => Ok(Some(Func::Scalar(ScalarFunc::ArrayOverlap))),
-        "array_contains_all" => Ok(Some(Func::Scalar(ScalarFunc::ArrayContainsAll))),
         // Struct/Union functions
         "struct_pack" => Ok(Some(Func::Scalar(ScalarFunc::StructPack))),
         "struct_extract" => Ok(Some(Func::Scalar(ScalarFunc::StructExtractFunc))),

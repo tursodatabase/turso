@@ -1066,9 +1066,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Scalar(ScalarFunc::Array) => {
             ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
         }
-        Func::Scalar(ScalarFunc::StringToArray) => {
-            ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
-        }
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -1187,6 +1184,7 @@ fn declared_return_type(
         // An array of the type of the array argument: array_prepend(element,
         // array) and array_cat(array1, array2) take it second when the first
         // is not one.
+        ReturnType::TextArray => ExprType::array(ExprType::Builtin(BuiltinType::Text), 1),
         ReturnType::Array => args
             .iter()
             .map(|arg| type_of(arg, env))
@@ -1550,6 +1548,15 @@ mod tests {
     #[test]
     fn arrays_never_nest() {
         check(&[
+            (
+                "string_to_array('a,b', ',')",
+                ExprType::array(builtin(BuiltinType::Text), 1),
+            ),
+            (
+                "array_prepend(1, array(2, 3))",
+                ExprType::array(builtin(BuiltinType::Integer), 1),
+            ),
+            ("array_length(array(1, 2))", builtin(BuiltinType::Integer)),
             (
                 "array_agg(CAST(1 AS INTEGER[]))",
                 ExprType::array(builtin(BuiltinType::Integer), 2),

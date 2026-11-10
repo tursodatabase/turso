@@ -450,7 +450,7 @@ fn resolve_func_return_type(
         ResultType::Declared(ReturnType::Custom(type_name)) => {
             resolve_type_name(type_name, resolver)
         }
-        ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
+        ResultType::Declared(ReturnType::Array | ReturnType::TextArray) => Ok(CheckExprType::Any),
         ResultType::FirstArgument => Ok(first_argument()?.unwrap_or(CheckExprType::Any)),
         ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
         ResultType::OneOfTheIifValues => {

@@ -151,10 +151,7 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compute_array_length, compute_array_length_at_dim,
-        exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
-        exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
-        exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
+        array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
@@ -11287,109 +11284,6 @@ pub fn op_function(
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::ArrayAppend => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let elem_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val)?);
-            }
-            ScalarFunc::ArrayPrepend => {
-                check_arg_count!(arg_count, 2);
-                let elem_val = state.registers[*start_reg].get_value().clone();
-                let arr_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val)?);
-            }
-            ScalarFunc::ArrayCat => {
-                check_arg_count!(arg_count, 2);
-                let a_val = state.registers[*start_reg].get_value().clone();
-                let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val)?);
-            }
-            ScalarFunc::ArrayRemove => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target)?);
-            }
-            ScalarFunc::ArrayContains => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_contains(&arr_val, &target));
-            }
-            ScalarFunc::ArrayPosition => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_position(&arr_val, &target));
-            }
-            ScalarFunc::ArrayLength => {
-                // 1-arg form: equivalent to `array_length(arr, 1)`. 2-arg form
-                // honors the dimension and walks into nested arrays for dim > 1
-                // (Turso arrays are 1-indexed, so `array_upper(arr, dim)` shares
-                // this code path via its alias and produces the same result).
-                let arr_val = state.registers[*start_reg].get_value();
-                let dim = if arg_count >= 2 {
-                    state.registers[*start_reg + 1]
-                        .get_value()
-                        .as_int()
-                        .unwrap_or(0)
-                } else {
-                    1
-                };
-                match compute_array_length_at_dim(arr_val, dim) {
-                    Some(count) => state.registers[*dest].set_int(count),
-                    None => state.registers[*dest].set_null(),
-                };
-            }
-            ScalarFunc::ArraySlice => {
-                check_arg_count!(arg_count, 3);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let start_idx = state.registers[*start_reg + 1].get_value().clone();
-                let end_idx = state.registers[*start_reg + 2].get_value().clone();
-                let result = exec_array_slice(&arr_val, &start_idx, &end_idx)?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StringToArray => {
-                let text = state.registers[*start_reg].get_value().clone();
-                let delimiter = state.registers[*start_reg + 1].get_value().clone();
-                let null_str = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value().clone())
-                } else {
-                    None
-                };
-                state.registers[*dest].set_value(exec_string_to_array(
-                    &text,
-                    &delimiter,
-                    null_str.as_ref(),
-                )?);
-            }
-            ScalarFunc::ArrayToString => {
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let delimiter = state.registers[*start_reg + 1].get_value().clone();
-                let null_str = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value().clone())
-                } else {
-                    None
-                };
-                state.registers[*dest].set_value(exec_array_to_string(
-                    &arr_val,
-                    &delimiter,
-                    null_str.as_ref(),
-                ));
-            }
-            ScalarFunc::ArrayOverlap => {
-                check_arg_count!(arg_count, 2);
-                let a_val = state.registers[*start_reg].get_value().clone();
-                let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_overlap(&a_val, &b_val));
-            }
-            ScalarFunc::ArrayContainsAll => {
-                check_arg_count!(arg_count, 2);
-                let a_val = state.registers[*start_reg].get_value().clone();
-                let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_contains_all(&a_val, &b_val));
             }
             ScalarFunc::StructPack
             | ScalarFunc::StructExtractFunc
