@@ -5600,6 +5600,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
         if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)? {
+            // The caller may have read a version created by a transaction that was
+            // committing at the time and has aborted since, which removed the version.
+            // This transaction depends on that one, so it must abort too.
+            if self.tx_should_abort(tx_id) {
+                return Err(LimboError::CommitDependencyAborted);
+            }
             return Ok(false);
         }
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
