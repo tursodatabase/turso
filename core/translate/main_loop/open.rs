@@ -333,7 +333,7 @@ impl OpenLoop {
 /// Skips the row the loop just read unless it passes the table's row-level
 /// security filter. The filter is checked before every other condition of
 /// the loop, so no expression of the statement sees a row that fails it.
-fn emit_row_filter(
+pub(super) fn emit_row_filter(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     table_references: &TableReferences,

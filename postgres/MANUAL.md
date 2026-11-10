@@ -38,9 +38,8 @@ policies allow that role. Unlike
 PostgreSQL, a superuser reading a view sees every row, whoever owns the
 view.
 
-A query of a role that joins a table with row-level security with `RIGHT JOIN`
-or `FULL JOIN` fails. Virtual tables that show the database file itself can
-only be read by a superuser.
+Virtual tables that show the database file itself can only be read by a
+superuser.
 
 `SET ROLE` applies to the statements that start after it. A statement that
 is already running, such as a query a superuser started and is still reading

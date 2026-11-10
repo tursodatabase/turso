@@ -323,27 +323,25 @@ fn subqueries_ctes_and_views_see_no_hidden_rows() {
 }
 
 #[test]
-fn right_and_full_join_with_table_with_row_security_are_rejected() {
+fn right_and_full_join_show_no_hidden_rows() {
     let db = TempDatabase::builder().build();
     let conn = connect_with_documents(&db);
     conn.execute("CREATE TABLE notes (id int)").unwrap();
+    conn.execute("INSERT INTO notes VALUES (1), (3)").unwrap();
     conn.execute("GRANT SELECT ON notes TO alice").unwrap();
     conn.execute("SET ROLE alice").unwrap();
 
-    let right = conn
-        .execute("SELECT * FROM notes n RIGHT JOIN documents d ON d.id = n.id")
-        .unwrap_err();
-    let full = conn
-        .execute("SELECT * FROM documents d FULL JOIN notes n ON d.id = n.id")
-        .unwrap_err();
-
+    assert!(rows(
+        &conn,
+        "SELECT d.id FROM notes n RIGHT JOIN documents d ON d.id = n.id"
+    )
+    .is_empty());
     assert_eq!(
-        right.to_string(),
-        "RIGHT JOIN with table \"documents\" that has row-level security is not supported"
-    );
-    assert_eq!(
-        full.to_string(),
-        "FULL JOIN with table \"documents\" that has row-level security is not supported"
+        rows(
+            &conn,
+            "SELECT n.id, d.id FROM documents d FULL JOIN notes n ON d.id = n.id ORDER BY n.id"
+        ),
+        vec![vec!["1", ""], vec!["3", ""]]
     );
 }
 

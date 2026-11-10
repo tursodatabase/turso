@@ -27,7 +27,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl},
-        plan::{JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
+        plan::{JoinInfo, JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
         planner::break_predicate_at_and_boundaries,
         roles,
         schema::emit_schema_cookie,
@@ -50,6 +50,9 @@ use crate::{
 /// The parts of the condition are also added to `where_clause` so that the
 /// optimizer can use them, for example to seek an index on the column a
 /// policy compares with the role. Rows that fail them were already skipped.
+/// They are not added for a table that a RIGHT or FULL JOIN can extend with
+/// NULLs, because there they would also remove the NULL-extended rows that the
+/// join keeps.
 pub(crate) fn filter_rows(
     command: Command,
     table_references: &mut TableReferences,
@@ -67,23 +70,23 @@ pub(crate) fn filter_rows(
             Policy::Deny => no_rows(),
             Policy::Filter(policies) => policy_filter(&policies, table, btree, resolver)?,
         };
-        reject_joins_that_keep_right_rows(table_references, &btree.declared_name)?;
-        let origin = if table
-            .join_info
-            .as_ref()
-            .is_some_and(|join_info| join_info.is_outer())
-        {
-            WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
-        } else {
-            WhereTermOrigin::Where
-        };
-        let mut parts: Vec<ast::Expr> = Vec::new();
-        break_predicate_at_and_boundaries(&filter, &mut parts);
-        terms.extend(parts.into_iter().map(|expr| WhereTerm {
-            expr,
-            origin,
-            consumed: false,
-        }));
+        let join_info = table.join_info.as_ref();
+        let extended_with_nulls_by_right_join = join_info.is_some_and(JoinInfo::keeps_right_rows)
+            || table_references.is_left_of_right_or_full_join(table.internal_id);
+        if !extended_with_nulls_by_right_join {
+            let origin = if join_info.is_some_and(JoinInfo::is_outer) {
+                WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
+            } else {
+                WhereTermOrigin::Where
+            };
+            let mut parts: Vec<ast::Expr> = Vec::new();
+            break_predicate_at_and_boundaries(&filter, &mut parts);
+            terms.extend(parts.into_iter().map(|expr| WhereTerm {
+                expr,
+                origin,
+                consumed: false,
+            }));
+        }
         let used_columns = columns_of_table(&filter, table.internal_id)?;
         let table = &mut table_references.joined_tables_mut()[index];
         for column in used_columns {
@@ -311,32 +314,6 @@ fn columns_of_table(expr: &ast::Expr, internal_id: ast::TableInternalId) -> Resu
         Ok(WalkControl::Continue)
     })?;
     Ok(columns)
-}
-
-/// A RIGHT or FULL JOIN emits the unmatched rows of its right side after the
-/// join loop, without the filters of the tables on its left. A filter on
-/// either side would then hide too many rows or too few.
-fn reject_joins_that_keep_right_rows(
-    table_references: &TableReferences,
-    table_name: &str,
-) -> Result<()> {
-    for join_info in table_references
-        .joined_tables()
-        .iter()
-        .filter_map(|table| table.join_info.as_ref())
-    {
-        if join_info.is_full_outer() {
-            bail_parse_error!(
-                "FULL JOIN with table \"{table_name}\" that has row-level security is not supported"
-            );
-        }
-        if join_info.keeps_right_rows() {
-            bail_parse_error!(
-                "RIGHT JOIN with table \"{table_name}\" that has row-level security is not supported"
-            );
-        }
-    }
-    Ok(())
 }
 
 /// A condition that no row passes.

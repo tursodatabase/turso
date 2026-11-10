@@ -524,3 +524,81 @@ test policy-with-subquery-that-reads-a-table-is-rejected {
 expect error {
     subqueries in policies are not supported
 }
+
+test right-join-to-table-with-policy-keeps-only-visible-rows {
+    CREATE ROLE rp_alice_35;
+    CREATE TABLE rp_docs_35 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_35 VALUES (1, 'rp_alice_35'), (2, 'bob'), (3, 'rp_alice_35');
+    CREATE TABLE rp_notes_35 (id INT);
+    INSERT INTO rp_notes_35 VALUES (1), (2), (4);
+    ALTER TABLE rp_docs_35 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_35 USING (owner = current_user);
+    GRANT SELECT ON rp_docs_35, rp_notes_35 TO rp_alice_35;
+    SET ROLE rp_alice_35;
+    SELECT coalesce(n.id, -1), d.id FROM rp_notes_35 n RIGHT JOIN rp_docs_35 d ON n.id = d.id ORDER BY d.id;
+}
+expect {
+    1|1
+    -1|3
+}
+
+test right-join-from-table-with-policy-keeps-every-right-row {
+    CREATE ROLE rp_alice_36;
+    CREATE TABLE rp_docs_36 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_36 VALUES (1, 'rp_alice_36'), (2, 'bob'), (3, 'rp_alice_36');
+    CREATE TABLE rp_notes_36 (id INT);
+    INSERT INTO rp_notes_36 VALUES (1), (2), (4);
+    ALTER TABLE rp_docs_36 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_36 USING (owner = current_user);
+    GRANT SELECT ON rp_docs_36, rp_notes_36 TO rp_alice_36;
+    SET ROLE rp_alice_36;
+    SELECT coalesce(d.id, -1), n.id FROM rp_docs_36 d RIGHT JOIN rp_notes_36 n ON d.id = n.id ORDER BY n.id;
+}
+expect {
+    1|1
+    -1|2
+    -1|4
+}
+
+test full-join-with-table-with-policy-on-either-side {
+    CREATE ROLE rp_alice_37;
+    CREATE TABLE rp_docs_37 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_37 VALUES (1, 'rp_alice_37'), (2, 'bob'), (3, 'rp_alice_37');
+    CREATE TABLE rp_notes_37 (id INT);
+    INSERT INTO rp_notes_37 VALUES (1), (2), (4);
+    ALTER TABLE rp_docs_37 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_37 USING (owner = current_user);
+    GRANT SELECT ON rp_docs_37, rp_notes_37 TO rp_alice_37;
+    SET ROLE rp_alice_37;
+    SELECT coalesce(d.id, -1), coalesce(n.id, -1) FROM rp_docs_37 d FULL JOIN rp_notes_37 n ON d.id = n.id ORDER BY 1, 2;
+    SELECT coalesce(d.id, -1), coalesce(n.id, -1) FROM rp_notes_37 n FULL JOIN rp_docs_37 d ON d.id = n.id ORDER BY 1, 2;
+}
+expect {
+    -1|2
+    -1|4
+    1|1
+    3|-1
+    -1|2
+    -1|4
+    1|1
+    3|-1
+}
+
+# The unmatched rows of a RIGHT JOIN are read after the join loop. The
+# division would fail on the hidden row, so it must not see it there either.
+test right-join-conditions-do-not-see-hidden-unmatched-rows {
+    CREATE ROLE rp_alice_38;
+    CREATE TABLE rp_docs_38 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rp_docs_38 VALUES (1, 'rp_alice_38', 1), (2, 'bob', 0), (3, 'rp_alice_38', 1);
+    CREATE TABLE rp_notes_38 (id INT);
+    INSERT INTO rp_notes_38 VALUES (1);
+    ALTER TABLE rp_docs_38 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_38 USING (owner = current_user);
+    GRANT SELECT ON rp_docs_38, rp_notes_38 TO rp_alice_38;
+    SET ROLE rp_alice_38;
+    SELECT coalesce(n.id, -1), d.id FROM rp_notes_38 n RIGHT JOIN rp_docs_38 d ON n.id = d.id WHERE 1 / d.n = 1 ORDER BY d.id;
+}
+expect {
+    1|1
+    -1|3
+}
