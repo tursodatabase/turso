@@ -521,6 +521,26 @@ expect {
     2
 }
 
+test orderby_removed_term_subquery_with_wrong_in_list_row_size {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT count(*) FROM y ORDER BY (SELECT 1 FROM z WHERE (q, p) IN ((1, 2, 3)));
+}
+expect error {
+    element has 3 terms - expected 2
+}
+
+test orderby_after_rowid_subquery_with_wrong_in_list_row_size {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT d FROM y ORDER BY id, (SELECT 1 FROM z WHERE (q, p) IN ((1, 2, 3)) AND p = y.d);
+}
+expect error {
+    element has 3 terms - expected 2
+}
+
 test where_rejects_aggregate_in_term_without_code {
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
     SELECT d FROM y WHERE 0 AND max(d);
@@ -620,6 +640,123 @@ test update_from_join_on_checks_function_names_in_term_without_code {
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
     INSERT INTO y VALUES (1, 5);
     UPDATE y SET d = 3 FROM y AS a JOIN y AS b ON 1 OR nosuchfn(b.d) WHERE a.id = y.id;
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test where_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR row_number() OVER ();
+}
+expect error {
+    misuse of window function row_number\(\)
+}
+
+test update_where_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR sum(d) OVER ();
+}
+expect error {
+    misuse of window function sum\(\)
+}
+
+test join_on_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR sum(w.d) OVER ();
+}
+expect error {
+    misuse of window function sum\(\)
+}
+
+test where_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR lag(d);
+}
+expect error {
+    misuse of window function lag\(\)
+}
+
+test update_where_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR row_number();
+}
+expect error {
+    misuse of window function row_number\(\)
+}
+
+test join_on_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR ntile(2);
+}
+expect error {
+    misuse of window function ntile\(\)
+}
+
+@cross-check-integrity
+test where_subquery_allows_window_function {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR (SELECT sum(d) OVER ());
+}
+expect {
+    5
+}
+
+test where_checks_function_names_in_exists_result_columns {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR EXISTS (SELECT nosuchfn(1));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test result_column_checks_function_names_in_exists_result_columns {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT EXISTS (SELECT nosuchfn(1));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+# SQLite checks a named window only where a function uses it, and a CTE only
+# where a FROM clause reads it.
+@cross-check-integrity
+test where_subquery_ignores_unused_window_and_cte {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE d > (SELECT 1 FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+    SELECT d FROM y WHERE 1 OR (WITH c AS (SELECT nosuchfn(1)) SELECT 1);
+    SELECT d FROM y ORDER BY id, (SELECT 1 FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+    SELECT 1 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (PARTITION BY nosuchcol);
+}
+expect {
+    5
+    5
+    1
+}
+
+test select_checks_window_used_through_another_window {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT count(*) OVER w2 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (w);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test where_subquery_checks_used_window {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR (SELECT sum(q) OVER w FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
 }
 expect error {
     no such function: nosuchfn
@@ -871,4 +1008,27 @@ expect {
     1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
     2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
     16|0|0|USE SORTER FOR ORDER BY
+}
+
+@skip-if sqlite "SQLite has no WITHIN GROUP syntax for percentile_disc and percentile_cont"
+test ordered_set_aggregates_in_where_and_order_by {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (5, 1), (6, 2);
+    SELECT d FROM y WHERE d > (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT d FROM y WHERE d IN (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT d FROM y WHERE EXISTS (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    UPDATE y SET d = 9 WHERE d > (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY d) FROM y ORDER BY percentile_disc(0.5) WITHIN GROUP (ORDER BY d);
+    SELECT d FROM y ORDER BY id, (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+}
+expect {
+    6
+    5
+    5
+    6
+    5
+    5
+    9
 }

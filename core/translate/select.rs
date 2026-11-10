@@ -21,9 +21,9 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
-    check_function_names_and_argument_counts, collect_subquery_table_refs_in_expr,
-    collect_subquery_table_refs_in_window_clause, first_aggregate_without_over_clause, parse_from,
-    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause,
+    first_aggregate_without_over_clause, parse_from, parse_limit, parse_where,
+    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
@@ -36,6 +36,7 @@ use crate::util::{exprs_are_equivalent, normalize_ident, walk_expr_with_subqueri
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
+use rustc_hash::FxHashSet as HashSet;
 use std::borrow::Cow;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
@@ -429,6 +430,13 @@ fn prepare_one_select_plan(
             let mut named_windows: Vec<NamedWindowDef> = Vec::with_capacity(window_clause.len());
             {
                 trace_stack!("bind_windows");
+                let windows_in_use = named_windows_in_use(
+                    &columns,
+                    where_clause.as_deref(),
+                    group_by.as_ref(),
+                    &window_clause,
+                    &order_by,
+                )?;
                 for window_def in window_clause.iter() {
                     let name = normalize_ident(window_def.name.as_str());
                     let mut partition_by: Vec<_> = window_def
@@ -449,7 +457,9 @@ fn prepare_one_select_plan(
                             )
                         })
                         .collect();
-                    for expr in partition_by.iter_mut() {
+                    // Like SQLite, resolve names only in the definitions that are used.
+                    let in_use = windows_in_use.contains(&name);
+                    for expr in partition_by.iter_mut().filter(|_| in_use) {
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -458,7 +468,7 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                     }
-                    for (expr, _, _) in order_by.iter_mut() {
+                    for (expr, _, _) in order_by.iter_mut().filter(|_| in_use) {
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -732,9 +742,6 @@ fn prepare_one_select_plan(
                     resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
-                // Checked here because some terms get no code: those cut below, and the
-                // whole ORDER BY of an EXISTS subquery or a single-row aggregate query.
-                check_function_names_and_argument_counts(&o.expr, resolver)?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
@@ -987,6 +994,60 @@ fn prepare_one_select_plan(
     }
 }
 
+/// The normalized names of the WINDOW clause definitions that a function names in
+/// its OVER clause, directly or through definitions based on them.
+fn named_windows_in_use(
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    group_by: Option<&ast::GroupBy>,
+    window_clause: &[ast::WindowDef],
+    order_by: &[ast::SortedColumn],
+) -> Result<HashSet<String>> {
+    let mut in_use = HashSet::default();
+    let exprs = columns
+        .iter()
+        .filter_map(|column| match column {
+            ResultColumn::Expr(expr, _) => Some(&**expr),
+            _ => None,
+        })
+        .chain(where_clause)
+        .chain(group_by.iter().flat_map(|group_by| {
+            group_by
+                .exprs
+                .iter()
+                .chain(group_by.having.iter())
+                .map(|expr| &**expr)
+        }))
+        .chain(order_by.iter().map(|sorted| &*sorted.expr));
+    for expr in exprs {
+        walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+            if let Expr::FunctionCall { filter_over, .. }
+            | Expr::FunctionCallStar { filter_over, .. } = expr
+            {
+                match filter_over.over_clause.as_deref() {
+                    Some(ast::Over::Name(name))
+                    | Some(ast::Over::Window(ast::Window {
+                        base: Some(name), ..
+                    })) => {
+                        in_use.insert(normalize_ident(name.as_str()));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    // A definition can be based only on an earlier one.
+    for window_def in window_clause.iter().rev() {
+        if let Some(base) = &window_def.window.base {
+            if in_use.contains(&normalize_ident(window_def.name.as_str())) {
+                in_use.insert(normalize_ident(base.as_str()));
+            }
+        }
+    }
+    Ok(in_use)
+}
+
 /// Checks an ORDER BY term that gets no code the way SQLite checks every term:
 /// the names in its subqueries must resolve, and its collation must exist. Returns
 /// whether the term reads a column of `plan`'s tables.
@@ -1089,8 +1150,7 @@ fn check_order_by_term_without_code(
 fn is_column_count_error(err: &crate::LimboError) -> bool {
     matches!(err, crate::LimboError::ParseError(msg)
         if msg == "row value misused"
-            || msg.starts_with("sub-select returns ")
-            || msg.starts_with("IN(...) element has "))
+            || msg.starts_with("sub-select returns "))
 }
 
 /// Whether a result column calls an aggregate, also one inside a window function

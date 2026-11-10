@@ -1128,7 +1128,7 @@ fn add_aggregate_if_not_exists(
 
 /// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
 /// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
-fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
+pub(crate) fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
     match normalized_name {
         "mode" => Some(AggFunc::Mode),
         "percentile_cont" => Some(AggFunc::PercentileCont),
@@ -2656,10 +2656,15 @@ pub fn parse_where(
         }
     }
     // Like SQLite, reject these while resolving names, so that a term that gets no code,
-    // such as `WHERE 1 OR nosuchfn(a)` or `ON 0 AND max(a)`, is rejected too. The list
+    // such as `WHERE 1 OR row_number()` or `ON 0 AND max(a)`, is rejected too. The list
     // also holds the ON terms that `parse_from` bound.
     for term in out_where_clause.iter() {
-        check_function_names_and_argument_counts(&term.expr, resolver)?;
+        walk_expr(&term.expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            if let Some(name) = window_function_name(expr, &resolver.catalog)? {
+                crate::bail_parse_error!("misuse of window function {}()", name);
+            }
+            Ok(WalkControl::Continue)
+        })?;
         if !aggregates_allowed {
             if let Some(name) = first_aggregate_without_over_clause(&term.expr, resolver)? {
                 crate::bail_parse_error!("misuse of aggregate function {}()", name);
@@ -2695,26 +2700,32 @@ pub fn parse_where(
     Ok(())
 }
 
-/// Fails like SQLite when a function in `expr`, also one inside its subqueries, does not
-/// exist or does not take the number of arguments it is given.
-pub(crate) fn check_function_names_and_argument_counts(
-    expr: &ast::Expr,
-    resolver: &Resolver,
-) -> Result<()> {
-    crate::util::walk_expr_with_subqueries(expr, &mut |expr| {
-        let (name, arg_count) = match expr {
-            ast::Expr::FunctionCall { name, args, .. } => (name, args.len()),
-            ast::Expr::FunctionCallStar { name, .. } => (name, 0),
-            _ => return Ok(WalkControl::Continue),
-        };
-        if resolver
-            .resolve_function(name.as_str(), arg_count)?
-            .is_none()
-        {
-            crate::bail_parse_error!("no such function: {}", name.as_str());
-        }
-        Ok(WalkControl::Continue)
-    })
+/// The name of the function `expr` calls if that is a window function: a call with
+/// an OVER clause, or a function that only works as a window function, such as
+/// `row_number()`.
+pub(crate) fn window_function_name<'a>(
+    expr: &'a ast::Expr,
+    resolver: &crate::translate::catalog::CatalogContext,
+) -> Result<Option<&'a str>> {
+    let (name, arg_count, filter_over) = match expr {
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => (name, args.len(), filter_over),
+        ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+        _ => return Ok(None),
+    };
+    if filter_over.over_clause.is_some()
+        || matches!(
+            resolver.resolve_function(name.as_str(), arg_count)?,
+            Some(Func::Window(_))
+        )
+    {
+        return Ok(Some(name.as_str()));
+    }
+    Ok(None)
 }
 
 /// The name of the first aggregate call in `expr` that has no OVER clause.
