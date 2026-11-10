@@ -4106,6 +4106,14 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        // SQLite's scalar max() and min() take more than one argument. The
+        // translator calls them for GREATEST and LEAST, but user SQL cannot.
+        if matches!(func_name.as_str(), "max" | "min") && func_call.args.len() > 1 {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+                message: format!("no such function: {func_name}"),
+            });
+        }
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {

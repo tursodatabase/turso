@@ -196,6 +196,33 @@ test zeroblob-is-not-available {
 @sqlstate 42883
 expect error {}
 
+# SQLite's scalar max and min take two or more arguments. PostgreSQL
+# has GREATEST and LEAST instead.
+
+test max-of-two-arguments-is-not-available {
+    SELECT max(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test max-of-three-arguments-is-not-available {
+    SELECT max(1, 2, 3);
+}
+@sqlstate 42883
+expect error {}
+
+test min-of-two-arguments-is-not-available {
+    SELECT min(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test min-of-column-and-argument-is-not-available {
+    SELECT min(x, 0) FROM (VALUES (1)) AS t(x);
+}
+@sqlstate 42883
+expect error {}
+
 # SQLite's aggregate functions.
 
 test group-concat-is-not-available {

@@ -57,7 +57,8 @@ SQLite built-ins are not available in the PostgreSQL frontend. It has only the
 built-in functions that PostgreSQL also has. A call to a SQLite or Turso
 function that PostgreSQL does not have, such as `typeof()`, `iif()`, `instr()`
 or `vector_distance_cos()`, fails with SQLSTATE 42883 (`undefined_function`),
-as in PostgreSQL.
+as in PostgreSQL. SQLite's scalar `max(X, Y, ...)` and `min(X, Y, ...)` also
+fail. Use `GREATEST` and `LEAST` instead.
 
 ## See Also
 
