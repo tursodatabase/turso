@@ -76,8 +76,8 @@ use crate::{
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    Database, DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
+    TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -86,6 +86,7 @@ use crate::{
         SQLITE_ERROR, SQLITE_FULL,
     },
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    functions::datetime::DateTimeClock,
     translate::emitter::TransactionMode,
 };
 use branches::{mark_unlikely, unlikely};
@@ -11283,12 +11284,8 @@ impl<'a> StatementClock<'a> {
     }
 }
 
-impl Clock for StatementClock<'_> {
-    fn current_time_monotonic(&self) -> MonotonicInstant {
-        self.io.current_time_monotonic()
-    }
-
-    fn current_time_wall_clock(&self) -> WallClockInstant {
+impl DateTimeClock for StatementClock<'_> {
+    fn now(&self) -> WallClockInstant {
         let now = self
             .now
             .get()

@@ -1,5 +1,5 @@
 use crate::functions::printf::exec_printf_values;
-use crate::io::clock::Clock;
+use crate::io::clock::{Clock, WallClockInstant};
 use crate::numeric::{format_float, Numeric};
 use crate::types::AsValueRef;
 use crate::types::{TextRef, TextSubtype, Value};
@@ -11,6 +11,22 @@ use crate::{Result, ValueRef};
 use chrono::{Local, Offset, TimeZone};
 use std::borrow::Cow;
 use std::fmt::Write;
+
+/// What a date and time function reads besides its arguments: the current
+/// time, and the local timezone that the 'localtime' and 'utc' modifiers
+/// convert with.
+pub trait DateTimeClock {
+    fn now(&self) -> WallClockInstant;
+
+    /// Called before a modifier converts with the local timezone.
+    fn use_local_timezone(&self) {}
+}
+
+impl<C: Clock + ?Sized> DateTimeClock for C {
+    fn now(&self) -> WallClockInstant {
+        self.current_time_wall_clock()
+    }
+}
 
 const JD_TO_MS: i64 = 86_400_000;
 const MAX_JD: i64 = 464269060799999; // 9999-12-31 23:59:59.999
@@ -205,8 +221,8 @@ fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32
     Some((val, &z[digits..]))
 }
 
-fn set_to_current(p: &mut DateTime, clock: &dyn Clock) {
-    let now = clock.current_time_wall_clock();
+fn set_to_current(p: &mut DateTime, clock: &dyn DateTimeClock) {
+    let now = clock.now();
     const UNIX_EPOCH_IJD: i64 = 210866760000000;
     p.i_jd = UNIX_EPOCH_IJD + now.secs * 1000 + i64::from(now.micros / 1000);
     p.valid_jd = true;
@@ -215,7 +231,7 @@ fn set_to_current(p: &mut DateTime, clock: &dyn Clock) {
     p.clear_ymd_hms_tz();
 }
 
-fn parse_date_or_time(value: &str, p: &mut DateTime, clock: &dyn Clock) -> Result<()> {
+fn parse_date_or_time(value: &str, p: &mut DateTime, clock: &dyn DateTimeClock) -> Result<()> {
     if parse_yyyy_mm_dd(value, p) {
         return Ok(());
     }
@@ -477,7 +493,7 @@ fn auto_adjust_date(p: &mut DateTime) {
     }
 }
 
-fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
+fn parse_modifier(p: &mut DateTime, z: &str, idx: usize, clock: &dyn DateTimeClock) -> Result<()> {
     let mut chars = z.chars();
     let first_char = match chars.next() {
         Some(c) => c.to_ascii_lowercase(),
@@ -525,6 +541,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
         }
         'l' if z.eq_ignore_ascii_case("localtime") => {
+            clock.use_local_timezone();
             if !p.is_local {
                 p.compute_jd();
                 let timestamp = (p.i_jd - 210866760000000) / 1000;
@@ -568,6 +585,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
         }
         'u' if z.eq_ignore_ascii_case("utc") => {
+            clock.use_local_timezone();
             if !p.is_utc {
                 p.compute_jd();
                 let timestamp = (p.i_jd - 210866760000000) / 1000;
@@ -864,7 +882,11 @@ fn parse_time_of_day_ms(z: &str) -> Option<i64> {
     Some((tx.i_jd - 43_200_000) % JD_TO_MS)
 }
 
-pub fn exec_datetime_general<I, E, V>(clock: &dyn Clock, values: I, func_type: &str) -> Value
+pub fn exec_datetime_general<I, E, V>(
+    clock: &dyn DateTimeClock,
+    values: I,
+    func_type: &str,
+) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -907,7 +929,7 @@ where
     for (i, val) in values.enumerate() {
         has_modifier = true;
         if let ValueRef::Text(s) = arg_as_text(val.as_value_ref()) {
-            if parse_modifier(&mut p, s.as_str(), i).is_err() {
+            if parse_modifier(&mut p, s.as_str(), i, clock).is_err() {
                 return Value::Null;
             }
         } else {
@@ -986,7 +1008,7 @@ where
     }
 }
 
-pub fn exec_date<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_date<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -995,7 +1017,7 @@ where
     exec_datetime_general(clock, values, "date")
 }
 
-pub fn exec_time<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_time<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1004,7 +1026,7 @@ where
     exec_datetime_general(clock, values, "time")
 }
 
-pub fn exec_datetime_full<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_datetime_full<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1013,7 +1035,7 @@ where
     exec_datetime_general(clock, values, "datetime")
 }
 
-pub fn exec_julianday<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_julianday<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1022,7 +1044,7 @@ where
     exec_datetime_general(clock, values, "julianday")
 }
 
-pub fn exec_unixepoch<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_unixepoch<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1031,7 +1053,7 @@ where
     exec_datetime_general(clock, values, "unixepoch")
 }
 
-pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_plus(clock: &dyn DateTimeClock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (date @ Value::Text(_), Value::Numeric(Numeric::Integer(days)))
@@ -1045,7 +1067,7 @@ pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
 }
 
 /// `date - days`: the date that many days earlier.
-pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_minus(clock: &dyn DateTimeClock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Numeric(Numeric::Integer(days))) => {
@@ -1058,7 +1080,7 @@ pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Va
 }
 
 /// `date - date`: the number of days from the second date to the first.
-pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_diff(clock: &dyn DateTimeClock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Text(_)) => {
@@ -1071,7 +1093,7 @@ pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
     }
 }
 
-fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
+fn add_days(clock: &dyn DateTimeClock, date: &Value, days: i64) -> Result<Value> {
     match exec_date(
         clock,
         [Value::from_f64(julian_day(clock, date)? + days as f64)],
@@ -1083,7 +1105,7 @@ fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
     }
 }
 
-fn julian_day(clock: &dyn Clock, date: &Value) -> Result<f64> {
+fn julian_day(clock: &dyn DateTimeClock, date: &Value) -> Result<f64> {
     match exec_julianday(clock, [date]) {
         Value::Numeric(Numeric::Float(jd)) => Ok(f64::from(jd)),
         _ => Err(crate::LimboError::Constraint(format!(
@@ -1092,7 +1114,7 @@ fn julian_day(clock: &dyn Clock, date: &Value) -> Result<f64> {
     }
 }
 
-pub fn exec_timediff<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_timediff<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1271,7 +1293,7 @@ where
     Value::from_text(res)
 }
 
-pub fn exec_strftime<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_strftime<I, E, V>(clock: &dyn DateTimeClock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1338,7 +1360,7 @@ where
 
         for (i, val) in values.enumerate() {
             if let ValueRef::Text(s) = arg_as_text(val.as_value_ref()) {
-                if parse_modifier(&mut p, s.as_str(), i).is_err() {
+                if parse_modifier(&mut p, s.as_str(), i, clock).is_err() {
                     return Value::Null;
                 }
             } else {
@@ -1840,7 +1862,7 @@ mod tests {
             let mut p = DateTime::default();
             p.compute_jd();
             let start_jd = p.i_jd;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 86_400_000.0
         };
 
@@ -1861,7 +1883,7 @@ mod tests {
             let mut p = DateTime::default();
             p.compute_jd();
             let start_jd = p.i_jd;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 3_600_000.0
         };
 
@@ -1878,7 +1900,7 @@ mod tests {
             let mut p = DateTime::default();
             p.compute_jd();
             let start_jd = p.i_jd;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 60_000.0
         };
 
@@ -1893,7 +1915,7 @@ mod tests {
             let mut p = DateTime::default();
             p.compute_jd();
             let start_jd = p.i_jd;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             (p.i_jd - start_jd) as f64 / 1000.0
         };
 
@@ -1908,7 +1930,7 @@ mod tests {
             let mut p = DateTime::default();
             let start_y = p.y;
             let start_m = p.m;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             ((p.y - start_y) * 12 + (p.m - start_m)) as f64
         };
 
@@ -1922,7 +1944,7 @@ mod tests {
         let get_years = |s: &str| -> f64 {
             let mut p = DateTime::default();
             let start_y = p.y;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             (p.y - start_y) as f64
         };
 
@@ -1937,7 +1959,7 @@ mod tests {
             let mut p = DateTime::default();
             p.compute_jd();
             let start_jd = p.i_jd;
-            parse_modifier(&mut p, s, 1).expect("Failed to parse modifier");
+            parse_modifier(&mut p, s, 1, &DefaultClock).expect("Failed to parse modifier");
             p.i_jd - start_jd
         };
 
@@ -2069,8 +2091,8 @@ mod tests {
     #[test]
     fn test_parse_ceiling_modifier() {
         let mut p = DateTime::default();
-        assert!(parse_modifier(&mut p, "ceiling", 1).is_ok());
-        assert!(parse_modifier(&mut p, "CEILING", 1).is_ok());
+        assert!(parse_modifier(&mut p, "ceiling", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "CEILING", 1, &DefaultClock).is_ok());
     }
 
     #[test]
@@ -2083,37 +2105,37 @@ mod tests {
         };
 
         // Modifiers that should just parse OK
-        assert!(parse_modifier(&mut p, "localtime", 1).is_ok());
-        assert!(parse_modifier(&mut p, "LOCALTIME", 1).is_ok());
-        assert!(parse_modifier(&mut p, "utc", 1).is_ok());
-        assert!(parse_modifier(&mut p, "UTC", 1).is_ok());
-        assert!(parse_modifier(&mut p, "subsec", 1).is_ok());
-        assert!(parse_modifier(&mut p, "SUBSEC", 1).is_ok());
-        assert!(parse_modifier(&mut p, "subsecond", 1).is_ok());
-        assert!(parse_modifier(&mut p, "SUBSECOND", 1).is_ok());
+        assert!(parse_modifier(&mut p, "localtime", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "LOCALTIME", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "utc", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "UTC", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "subsec", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "SUBSEC", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "subsecond", 1, &DefaultClock).is_ok());
+        assert!(parse_modifier(&mut p, "SUBSECOND", 1, &DefaultClock).is_ok());
 
         // These must be at index 0 to parse validly
-        assert!(parse_modifier(&mut p, "unixepoch", 0).is_ok());
+        assert!(parse_modifier(&mut p, "unixepoch", 0, &DefaultClock).is_ok());
         p.raw_s = true;
-        assert!(parse_modifier(&mut p, "UNIXEPOCH", 0).is_ok());
+        assert!(parse_modifier(&mut p, "UNIXEPOCH", 0, &DefaultClock).is_ok());
         p.raw_s = true;
-        assert!(parse_modifier(&mut p, "julianday", 0).is_ok());
+        assert!(parse_modifier(&mut p, "julianday", 0, &DefaultClock).is_ok());
         p.raw_s = true;
-        assert!(parse_modifier(&mut p, "JULIANDAY", 0).is_ok());
+        assert!(parse_modifier(&mut p, "JULIANDAY", 0, &DefaultClock).is_ok());
         p.raw_s = true;
-        assert!(parse_modifier(&mut p, "auto", 0).is_ok());
+        assert!(parse_modifier(&mut p, "auto", 0, &DefaultClock).is_ok());
         p.raw_s = true;
-        assert!(parse_modifier(&mut p, "AUTO", 0).is_ok());
+        assert!(parse_modifier(&mut p, "AUTO", 0, &DefaultClock).is_ok());
     }
 
     #[test]
     fn test_parse_invalid_modifier() {
         let mut p = DateTime::default();
-        assert!(parse_modifier(&mut p, "invalid modifier", 1).is_err());
-        assert!(parse_modifier(&mut p, "5", 1).is_err());
-        assert!(parse_modifier(&mut p, "days", 1).is_err());
-        assert!(parse_modifier(&mut p, "++5 days", 1).is_err());
-        assert!(parse_modifier(&mut p, "weekday 7", 1).is_err());
+        assert!(parse_modifier(&mut p, "invalid modifier", 1, &DefaultClock).is_err());
+        assert!(parse_modifier(&mut p, "5", 1, &DefaultClock).is_err());
+        assert!(parse_modifier(&mut p, "days", 1, &DefaultClock).is_err());
+        assert!(parse_modifier(&mut p, "++5 days", 1, &DefaultClock).is_err());
+        assert!(parse_modifier(&mut p, "weekday 7", 1, &DefaultClock).is_err());
     }
 
     #[test]

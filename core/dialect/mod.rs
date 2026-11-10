@@ -19,11 +19,12 @@ pub(crate) use engine::EngineDialect;
 
 use crate::{
     function::ScalarFunc,
+    functions::datetime::DateTimeClock,
     namespace::NamespaceId,
     schema::{BTreeTable, RelationKind, Schema},
     security::roles::RoleId,
     vdbe::{builder::ProgramBuilder, Register},
-    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
+    CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
@@ -94,7 +95,7 @@ pub struct ScalarFuncContext<'a> {
     pub connection: &'a Connection,
     pub io: &'a dyn IO,
     /// The statement's clock: every function of one step sees the same time.
-    pub clock: &'a dyn Clock,
+    pub clock: &'a dyn DateTimeClock,
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
 }
