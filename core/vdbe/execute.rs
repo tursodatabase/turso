@@ -10332,6 +10332,7 @@ pub fn op_function(
                 &program.connection,
                 pager.io.as_ref(),
                 &mut state.current_time,
+                func.collation,
             );
             let value = function.execute(&context, args)?;
             state.registers[*dest].set_value(value);
@@ -10468,31 +10469,6 @@ pub fn op_function(
                     .test_nondet_counter
                     .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
-            }
-            ScalarFunc::Min => {
-                let collation = func.collation;
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
-                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
-                })?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Max => {
-                let collation = func.collation;
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
-                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
-                })?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Nullif => {
-                let collation = func.collation;
-                let first_value = state.registers[*start_reg].get_value();
-                let second_value = state.registers[*start_reg + 1].get_value();
-                let result = first_value.exec_nullif(second_value, |a, b| {
-                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
-                })?;
-                state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {

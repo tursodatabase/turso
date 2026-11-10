@@ -205,15 +205,15 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
     Ok(func)
 }
 
-/// Resolves a built-in function by name without checking the argument count
-/// of scalar functions.
+/// Resolves built-in names and overloads, leaving scalar argument validation
+/// to the caller.
 pub(crate) fn resolve_builtin_function_name(
     name: &str,
     arg_count: usize,
 ) -> crate::Result<Option<Func>> {
     let normalized_name = crate::util::normalize_ident(name);
     if let Some(function) =
-        crate::function::scalar::BUILTIN_SCALAR_FUNCTIONS.lookup(&normalized_name)
+        crate::function::scalar::BUILTIN_SCALAR_FUNCTIONS.lookup(&normalized_name, arg_count)
     {
         return Ok(Some(Func::RegisteredScalar(function)));
     }
@@ -240,21 +240,18 @@ pub(crate) fn resolve_builtin_function_name(
             }
             Ok(Some(Func::Agg(AggFunc::GroupConcat)))
         }
-        "max" if arg_count > 1 => Ok(Some(Func::Scalar(ScalarFunc::Max))),
         "max" => {
             if arg_count < 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Max)))
         }
-        "min" if arg_count > 1 => Ok(Some(Func::Scalar(ScalarFunc::Min))),
         "min" => {
             if arg_count < 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Min)))
         }
-        "nullif" if arg_count == 2 => Ok(Some(Func::Scalar(ScalarFunc::Nullif))),
         "string_agg" => {
             if arg_count != 2 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)

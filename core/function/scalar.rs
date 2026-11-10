@@ -1,4 +1,5 @@
 pub(crate) mod arrays;
+pub(crate) mod comparison;
 pub(crate) mod context;
 pub(crate) mod datetime;
 pub(crate) mod numeric;
@@ -16,6 +17,10 @@ use crate::{Connection, Result, Value};
 
 pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
+    fn argument_translation(&self) -> ArgumentTranslation {
+        ArgumentTranslation::Values
+    }
+
     fn explain_name(&self, _arg_count: usize) -> String {
         self.metadata().name.to_string()
     }
@@ -24,6 +29,13 @@ pub trait ScalarFunction: Debug + Send + Sync {
         None
     }
     fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentTranslation {
+    Values,
+    ComparedValues,
+    ComparedPair,
 }
 
 /// Arguments checked for clock or timezone dependence in schema expressions.
@@ -55,6 +67,7 @@ pub struct FunctionContext<'a> {
     connection: &'a Connection,
     io: &'a dyn crate::IO,
     clock: datetime::StatementClock<'a>,
+    collation: crate::translate::collate::CollationSeq,
 }
 
 impl<'a> FunctionContext<'a> {
@@ -62,12 +75,20 @@ impl<'a> FunctionContext<'a> {
         connection: &'a Connection,
         io: &'a dyn crate::IO,
         current_time: &'a mut Option<crate::WallClockInstant>,
+        collation: crate::translate::collate::CollationSeq,
     ) -> Self {
         Self {
             connection,
             io,
+            collation,
             clock: datetime::StatementClock::new(io, current_time),
         }
+    }
+
+    pub fn compare(&self, lhs: &Value, rhs: &Value) -> std::cmp::Ordering {
+        use crate::types::AsValueRef;
+        self.collation
+            .compare(lhs.as_value_ref(), rhs.as_value_ref())
     }
 
     pub fn clock(&self) -> &dyn crate::Clock {
@@ -127,8 +148,14 @@ impl<'a> FunctionArgs<'a> {
 
 #[derive(Default)]
 pub(crate) struct FunctionCatalog {
-    by_name: HashMap<&'static str, &'static dyn ScalarFunction>,
+    by_name: HashMap<&'static str, CatalogEntry>,
     functions: Vec<&'static dyn ScalarFunction>,
+}
+
+struct CatalogEntry {
+    function: &'static dyn ScalarFunction,
+    /// Argument counts that select this scalar when resolving its name.
+    resolution_arity: FunctionArity,
 }
 
 impl FunctionCatalog {
@@ -136,6 +163,19 @@ impl FunctionCatalog {
         &mut self,
         function: &'static dyn ScalarFunction,
         aliases: &[&'static str],
+    ) {
+        self.register_with_arity(function, aliases, FunctionArity::Variadic);
+    }
+
+    fn register_overload(&mut self, function: &'static dyn ScalarFunction) {
+        self.register_with_arity(function, &[], function.metadata().arity);
+    }
+
+    fn register_with_arity(
+        &mut self,
+        function: &'static dyn ScalarFunction,
+        aliases: &[&'static str],
+        arity: FunctionArity,
     ) {
         function
             .metadata()
@@ -145,15 +185,31 @@ impl FunctionCatalog {
         for name in std::iter::once(function.metadata().name).chain(aliases.iter().copied()) {
             assert_eq!(name, crate::util::normalize_ident(name));
             assert!(
-                self.by_name.insert(name, function).is_none(),
+                self.by_name
+                    .insert(
+                        name,
+                        CatalogEntry {
+                            function,
+                            resolution_arity: arity
+                        }
+                    )
+                    .is_none(),
                 "duplicate function: {name}"
             );
         }
         self.functions.push(function);
     }
 
-    pub(crate) fn lookup(&self, normalized_name: &str) -> Option<&'static dyn ScalarFunction> {
-        self.by_name.get(normalized_name).copied()
+    pub(crate) fn lookup(
+        &self,
+        normalized_name: &str,
+        arg_count: usize,
+    ) -> Option<&'static dyn ScalarFunction> {
+        let entry = self.by_name.get(normalized_name)?;
+        entry
+            .resolution_arity
+            .accepts(arg_count)
+            .then_some(entry.function)
     }
 
     pub(crate) fn functions(&self) -> impl Iterator<Item = &'static dyn ScalarFunction> + '_ {
@@ -242,6 +298,9 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&datetime::DateDiff, &[]);
     catalog.register(&pattern::Glob, &[]);
     catalog.register(&pattern::Like, &[]);
+    catalog.register_overload(&comparison::Min);
+    catalog.register_overload(&comparison::Max);
+    catalog.register_overload(&comparison::Nullif);
     catalog
 });
 
@@ -572,6 +631,49 @@ impl ScalarFunction for Unhex {
 mod tests {
     use crate::dialect::engine::{resolve_builtin_function, resolve_builtin_function_name};
     use crate::Func;
+
+    #[test]
+    fn scalar_and_aggregate_overloads_resolve_by_argument_count() {
+        use crate::function::AggFunc;
+        for (name, aggregate) in [("min", AggFunc::Min), ("max", AggFunc::Max)] {
+            assert!(resolve_builtin_function(name, 0).is_err());
+            assert!(
+                matches!(resolve_builtin_function(name, 1).unwrap(), Some(Func::Agg(found)) if found == aggregate)
+            );
+            for count in [2, 3, 100] {
+                let function = resolve_builtin_function(name, count).unwrap().unwrap();
+                assert!(matches!(function, Func::RegisteredScalar(_)));
+                assert!(function.needs_collation());
+                assert_eq!(function.to_string(), name);
+            }
+        }
+        assert!(matches!(
+            resolve_builtin_function("nullif", 2).unwrap(),
+            Some(Func::RegisteredScalar(_))
+        ));
+        for count in [0, 1, 3] {
+            assert!(resolve_builtin_function_name("nullif", count)
+                .unwrap()
+                .is_none());
+        }
+        let functions = Func::builtin_function_list();
+        for name in ["min", "max"] {
+            assert_eq!(
+                functions
+                    .iter()
+                    .filter(|f| f.name == name && f.func_type == "s" && f.narg == -1)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                functions
+                    .iter()
+                    .filter(|f| f.name == name && f.func_type == "w" && f.narg == 1)
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[cfg(target_pointer_width = "64")]
     #[test]

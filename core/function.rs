@@ -952,9 +952,6 @@ pub enum ScalarFunc {
     Coalesce,
     IfNull,
     Iif,
-    Min,
-    Max,
-    Nullif,
     TursoVersion,
     #[cfg(feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
@@ -1003,9 +1000,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Coalesce => true,
             ScalarFunc::IfNull => true,
             ScalarFunc::Iif => true,
-            ScalarFunc::Min => true,
-            ScalarFunc::Max => true,
-            ScalarFunc::Nullif => true,
             ScalarFunc::TursoVersion => false,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
@@ -1041,10 +1035,9 @@ impl ScalarFunc {
     /// How the type of the function's result follows from its arguments.
     pub fn result_type(&self) -> ResultType {
         match self {
-            Self::Coalesce | Self::IfNull | Self::Min | Self::Max => ResultType::OneOfTheArguments,
+            Self::Coalesce | Self::IfNull => ResultType::OneOfTheArguments,
             Self::Iif => ResultType::OneOfTheIifValues,
-            Self::Nullif
-            | Self::Likely
+            Self::Likely
             | Self::Unlikely
             | Self::Likelihood
             | Self::TestUintDecode => ResultType::FirstArgument,
@@ -1091,9 +1084,6 @@ impl Display for ScalarFunc {
             Self::Coalesce => "coalesce",
             Self::IfNull => "ifnull",
             Self::Iif => "iif",
-            Self::Min => "min",
-            Self::Max => "max",
-            Self::Nullif => "nullif",
             Self::TursoVersion => "turso_version",
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
@@ -1164,9 +1154,7 @@ impl ScalarFunc {
             // 1-arg
             Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
             // 2-arg
-            Self::Nullif | Self::IfNull | Self::Likelihood => &[2],
-            // 3-arg
-            // Multi-arity (one row per valid arity)
+            Self::IfNull | Self::Likelihood => &[2],
             // Truly variable-arg
             Self::Coalesce | Self::Iif => &[-1],
             #[cfg(feature = "fs")]
@@ -1183,8 +1171,6 @@ impl ScalarFunc {
             Self::IsAutocommit => &[0],
             Self::TableColumnsJsonArray | Self::ConnTxnId => &[1],
             Self::BinRecordJsonObject => &[2],
-            // Scalar max/min (multi-arg)
-            Self::Max | Self::Min => &[-1],
             // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode => &[1],
             // Array construction / element access
@@ -1559,7 +1545,8 @@ impl Func {
     pub fn needs_collation(&self) -> bool {
         matches!(
             self,
-            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+            Self::RegisteredScalar(function)
+                if function.argument_translation() != scalar::ArgumentTranslation::Values
         )
     }
 

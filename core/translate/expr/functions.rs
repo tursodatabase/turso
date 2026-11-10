@@ -1,5 +1,6 @@
 use super::*;
 use crate::namespace::NamespaceId;
+use crate::scalar::ArgumentTranslation;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -106,11 +107,31 @@ pub(super) fn translate_function(
     func_ctx: FuncCtx,
 ) -> Result<usize> {
     let start_reg = program.alloc_registers(args.len());
-    let mut current_reg = start_reg;
-
-    for arg in args.iter() {
-        translate_expr(program, referenced_tables, arg, current_reg, resolver)?;
-        current_reg += 1;
+    let argument_translation = match &func_ctx.func {
+        Func::RegisteredScalar(function) => function.argument_translation(),
+        _ => ArgumentTranslation::Values,
+    };
+    match argument_translation {
+        ArgumentTranslation::Values => {
+            for (i, arg) in args.iter().enumerate() {
+                translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+            }
+        }
+        ArgumentTranslation::ComparedValues => {
+            translate_compared_args(program, referenced_tables, args, start_reg, resolver)?;
+        }
+        ArgumentTranslation::ComparedPair => {
+            assert_eq!(args.len(), 2);
+            translate_compared_pair(
+                program,
+                referenced_tables,
+                &args[0],
+                &args[1],
+                start_reg,
+                start_reg + 1,
+                resolver,
+            )?;
+        }
     }
 
     program.emit_insn(Insn::Function {
