@@ -1260,7 +1260,9 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
+test unchanged-decode-type-compares-text-with-and-without-index {
+    -- A literal is read as a value of the type, so 'hello' is stored as
+    -- 'HELLO' and matches. Any other text is compared as it is.
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE plain(x upper_text) STRICT;
     CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
@@ -1272,10 +1274,12 @@ test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
         (SELECT count(*) FROM plain WHERE x = 'HELLO'),
         (SELECT count(*) FROM indexed WHERE x = 'HELLO'),
         (SELECT count(*) FROM plain WHERE x IN ('hello', 'HELLO')),
-        (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
+        (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO')),
+        (SELECT count(*) FROM plain WHERE x = 'hel' || 'lo'),
+        (SELECT count(*) FROM indexed WHERE x = 'hel' || 'lo');
 }
 expect {
-    0|0|1|1|1|1
+    1|1|1|1|1|1|0|0
 }
 
 @requires strict "uses STRICT tables"

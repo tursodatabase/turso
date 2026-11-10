@@ -19,7 +19,6 @@ use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
-use turso_sqlite::SqliteDialect;
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -176,7 +175,12 @@ impl Dialect for PostgresDialect {
     }
 
     fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
-        SqliteDialect.format_rewritten_table_sql(stmt)
+        let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+            return Err(LimboError::InternalError(
+                "format_rewritten_table_sql requires CREATE TABLE".to_string(),
+            ));
+        };
+        turso_core::dialect::engine::format_table_sql(tbl_name, body)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -277,6 +281,10 @@ impl Dialect for PostgresDialect {
         crate::classes::role_may_read(schema, namespace, name, role)
     }
 
+    fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        crate::classes::table_rls_enabled(schema, namespace, name)
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }
@@ -289,6 +297,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
+        true
+    }
+
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }
@@ -298,10 +310,6 @@ impl Dialect for PostgresDialect {
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {
-        true
-    }
-
-    fn converts_strings_compared_with_custom_types(&self) -> bool {
         true
     }
 
@@ -565,6 +573,8 @@ impl SnapshotRows for PgClassTable {
             let relnatts = btree.columns().len() as i64;
             let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
+            let relrowsecurity =
+                i64::from(crate::classes::table_rls_enabled(&schema, *namespace, name));
 
             rows.push(vec![
                 Value::from_i64(table_oid),                                     // oid
@@ -582,24 +592,24 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),                                             // reltoastrelid
                 Value::from_i64(relhasindex),                                   // relhasindex
                 Value::from_i64(0),                                             // relisshared
-                Value::Text("p".into()),    // relpersistence (permanent)
-                Value::build_text(relkind), // relkind (regular table)
-                Value::from_i64(relnatts),  // relnatts
-                Value::from_i64(relchecks), // relchecks
-                Value::from_i64(0),         // relhasrules
-                Value::from_i64(0),         // relhastriggers
-                Value::from_i64(0),         // relhassubclass
-                Value::from_i64(0),         // relrowsecurity
-                Value::from_i64(0),         // relforcerowsecurity
-                Value::from_i64(1),         // relispopulated
-                Value::Text("d".into()),    // relreplident
-                Value::from_i64(0),         // relispartition
-                Value::from_i64(0),         // relrewrite
-                Value::from_i64(0),         // relfrozenxid
-                Value::from_i64(0),         // relminmxid
+                Value::Text("p".into()),         // relpersistence (permanent)
+                Value::build_text(relkind),      // relkind (regular table)
+                Value::from_i64(relnatts),       // relnatts
+                Value::from_i64(relchecks),      // relchecks
+                Value::from_i64(0),              // relhasrules
+                Value::from_i64(0),              // relhastriggers
+                Value::from_i64(0),              // relhassubclass
+                Value::from_i64(relrowsecurity), // relrowsecurity
+                Value::from_i64(0),              // relforcerowsecurity
+                Value::from_i64(1),              // relispopulated
+                Value::Text("d".into()),         // relreplident
+                Value::from_i64(0),              // relispartition
+                Value::from_i64(0),              // relrewrite
+                Value::from_i64(0),              // relfrozenxid
+                Value::from_i64(0),              // relminmxid
                 relation_acl(conn, &schema, *namespace, name), // relacl
-                Value::Null,                // reloptions
-                Value::Null,                // relpartbound
+                Value::Null,                     // reloptions
+                Value::Null,                     // relpartbound
             ]);
         }
 
@@ -4203,6 +4213,7 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
     use turso_core::ConnectOpts;
+    use turso_sqlite::SqliteDialect;
 
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.

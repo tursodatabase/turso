@@ -288,9 +288,9 @@ pub struct sqlite3_stmt {
     )>,
     pub(crate) next: *mut sqlite3_stmt,
     pub(crate) text_cache: Vec<Vec<u8>>,
-    /// Cached ExtValue instances for sqlite3_column_value().
+    /// Cached values for sqlite3_column_value().
     /// Populated lazily per column; cleared on each step/reset.
-    pub(crate) value_cache: Vec<Option<ExtValue>>,
+    pub(crate) value_cache: Vec<Option<sqlite3_value>>,
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
@@ -328,7 +328,7 @@ impl sqlite3_stmt {
         for r in &mut self.text_cache {
             r.clear();
         }
-        // Drop cached ExtValues for the previous row
+        // Drop cached values for the previous row
         for v in &mut self.value_cache {
             *v = None;
         }
@@ -376,10 +376,13 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
         }
     };
 
-    // Build array of *mut c_void each pointing into the argv slice.
     // The C callback reads these via sqlite3_value_* functions.
-    let mut arg_ptrs: Vec<*mut ffi::c_void> = (0..argc as usize)
-        .map(|i| argv.add(i) as *mut ffi::c_void)
+    let mut args: Vec<sqlite3_value> = (0..argc as usize)
+        .map(|i| sqlite3_value::new(Value::from_ffi_ref(&*argv.add(i)).unwrap_or(Value::Null)))
+        .collect();
+    let mut arg_ptrs: Vec<*mut ffi::c_void> = args
+        .iter_mut()
+        .map(|arg| arg as *mut sqlite3_value as *mut ffi::c_void)
         .collect();
 
     let mut ctx = SqliteContext {
@@ -2277,14 +2280,7 @@ unsafe fn column_value(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<&'sta
 /// fail on a legal call.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
-    match column_value(stmt, idx) {
-        Some(Value::Numeric(turso_core::Numeric::Integer(i))) => *i,
-        Some(v) => match v.exec_cast("INTEGER") {
-            Ok(Value::Numeric(turso_core::Numeric::Integer(i))) => i,
-            _ => 0,
-        },
-        None => 0,
-    }
+    column_value(stmt, idx).map_or(0, value_to_int64)
 }
 
 #[no_mangle]
@@ -2297,22 +2293,36 @@ pub unsafe extern "C" fn sqlite3_column_int(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> f64 {
-    match column_value(stmt, idx) {
-        Some(Value::Numeric(turso_core::Numeric::Float(f))) => f64::from(*f),
-        Some(v) => match v.exec_cast("REAL") {
+    column_value(stmt, idx).map_or(0.0, value_to_double)
+}
+
+/// Reads a value as an integer: text and blobs parse like CAST(x AS INTEGER).
+fn value_to_int64(value: &Value) -> i64 {
+    match value {
+        Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
+        v => match v.exec_cast("INTEGER") {
+            Ok(Value::Numeric(turso_core::Numeric::Integer(i))) => i,
+            _ => 0,
+        },
+    }
+}
+
+/// Reads a value as a float: text and blobs parse like CAST(x AS REAL).
+fn value_to_double(value: &Value) -> f64 {
+    match value {
+        Value::Numeric(turso_core::Numeric::Float(f)) => f64::from(*f),
+        v => match v.exec_cast("REAL") {
             Ok(Value::Numeric(n)) => match n {
                 turso_core::Numeric::Float(f) => f64::from(f),
                 turso_core::Numeric::Integer(i) => i as f64,
             },
             _ => 0.0,
         },
-        None => 0.0,
     }
 }
 
 /// Fills (when not yet done for this row) and returns the per-column cache
-/// holding the column's text conversion, NUL-terminated: text bytes as-is,
-/// raw blob bytes, or the decimal rendering of a number. None for NULL.
+/// holding the column's text conversion. None for NULL.
 unsafe fn column_text_cache(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<&'static Vec<u8>> {
     let value = column_value(stmt, idx)?;
     let stmt = &mut *stmt;
@@ -2321,16 +2331,22 @@ unsafe fn column_text_cache(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<
         return None;
     }
     if stmt.text_cache[i].is_empty() {
-        let buf = &mut stmt.text_cache[i];
-        match value {
-            Value::Null => return None,
-            Value::Text(t) => buf.extend(t.as_str().as_bytes()),
-            Value::Blob(b) => buf.extend(b.iter()),
-            numeric => buf.extend(numeric.to_string().as_bytes()),
-        }
-        buf.push(0);
+        stmt.text_cache[i] = text_with_nul(value)?;
     }
     Some(&stmt.text_cache[i])
+}
+
+/// The value as NUL-terminated text: text bytes as-is, raw blob bytes, or
+/// the decimal rendering of a number. None for NULL.
+fn text_with_nul(value: &Value) -> Option<Vec<u8>> {
+    let mut buf = match value {
+        Value::Null => return None,
+        Value::Text(t) => t.as_str().as_bytes().to_vec(),
+        Value::Blob(b) => b.clone(),
+        numeric => numeric.to_string().into_bytes(),
+    };
+    buf.push(0);
+    Some(buf)
 }
 
 #[no_mangle]
@@ -2360,21 +2376,53 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     }
 }
 
-// sqlite3_value_* functions interpret the void* as a pointer to turso_ext::Value,
-// which is what the function bridge passes for custom scalar function arguments.
+/// The struct behind an `sqlite3_value*`. Like SQLite's `Mem`, it keeps the
+/// text form that `sqlite3_value_text` makes next to the original value, so
+/// the pointer stays valid while the value lives and a number keeps its type.
+#[derive(Clone)]
+pub struct sqlite3_value {
+    value: Value,
+    /// NUL-terminated text form of the value.
+    text: Option<Vec<u8>>,
+}
+
+impl sqlite3_value {
+    fn new(value: Value) -> Self {
+        Self { value, text: None }
+    }
+
+    /// The value as text, without the NUL that follows it in memory, or None
+    /// for NULL.
+    fn text(&mut self) -> Option<&[u8]> {
+        if self.text.is_none() {
+            self.text = text_with_nul(&self.value);
+        }
+        self.text.as_deref().map(|text| &text[..text.len() - 1])
+    }
+
+    /// The blob bytes, or the text form for any other value.
+    fn bytes(&mut self) -> Option<&[u8]> {
+        match self.value {
+            Value::Blob(ref b) => Some(b),
+            _ => self.text(),
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_int {
     if value.is_null() {
         return SQLITE_NULL;
     }
-    let v = &*(value as *const ExtValue);
-    match v.value_type() {
-        turso_ext::ValueType::Null => SQLITE_NULL,
-        turso_ext::ValueType::Integer => SQLITE_INTEGER,
-        turso_ext::ValueType::Float => SQLITE_FLOAT,
-        turso_ext::ValueType::Text => SQLITE_TEXT,
-        turso_ext::ValueType::Blob => SQLITE_BLOB,
-        turso_ext::ValueType::Error => SQLITE_NULL,
+    let v = &*(value as *const sqlite3_value);
+    match v.value {
+        Value::Null => SQLITE_NULL,
+        Value::Numeric(turso_core::Numeric::Integer(_)) => SQLITE_INTEGER,
+        Value::Numeric(turso_core::Numeric::Float(_)) => SQLITE_FLOAT,
+        Value::Text(_) => SQLITE_TEXT,
+        // SQLite reports a blob that sqlite3_value_text has read as TEXT.
+        Value::Blob(_) if v.text.is_some() => SQLITE_TEXT,
+        Value::Blob(_) => SQLITE_BLOB,
     }
 }
 
@@ -2383,8 +2431,8 @@ pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     if value.is_null() {
         return 0;
     }
-    let v = &*(value as *const ExtValue);
-    v.to_integer().unwrap_or(0)
+    let v = &*(value as *const sqlite3_value);
+    value_to_int64(&v.value)
 }
 
 #[no_mangle]
@@ -2397,8 +2445,8 @@ pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
     if value.is_null() {
         return 0.0;
     }
-    let v = &*(value as *const ExtValue);
-    v.to_float().unwrap_or(0.0)
+    let v = &*(value as *const sqlite3_value);
+    value_to_double(&v.value)
 }
 
 #[no_mangle]
@@ -2406,22 +2454,24 @@ pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const f
     if value.is_null() {
         return std::ptr::null();
     }
-    let v = &*(value as *const ExtValue);
-    match v.to_text() {
-        Some(s) => s.as_ptr() as *const ffi::c_uchar,
+    let v = &mut *(value as *mut sqlite3_value);
+    match v.text() {
+        Some(s) => s.as_ptr(),
         None => std::ptr::null(),
     }
 }
 
+/// Returns the blob bytes, or the text form for any other value. Zero bytes
+/// report NULL, as in SQLite.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const ffi::c_void {
     if value.is_null() {
         return std::ptr::null();
     }
-    let v = &*(value as *const ExtValue);
-    match v.blob_ref() {
-        Some(b) => b.as_ptr() as *const ffi::c_void,
-        None => std::ptr::null(),
+    let v = &mut *(value as *mut sqlite3_value);
+    match v.bytes() {
+        Some(b) if !b.is_empty() => b.as_ptr() as *const ffi::c_void,
+        _ => std::ptr::null(),
     }
 }
 
@@ -2430,37 +2480,19 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
     if value.is_null() {
         return 0;
     }
-    let v = &*(value as *const ExtValue);
-    match v.value_type() {
-        turso_ext::ValueType::Text => v.to_text().map(|s| s.len()).unwrap_or(0) as ffi::c_int,
-        turso_ext::ValueType::Blob => v.blob_ref().map(|b| b.len()).unwrap_or(0) as ffi::c_int,
-        _ => 0,
-    }
+    let v = &mut *(value as *mut sqlite3_value);
+    v.bytes().map_or(0, |b| b.len()) as ffi::c_int
 }
 
 /// Deep-copies an `sqlite3_value`.  Returns a heap-allocated copy that must
-/// be freed with `sqlite3_value_free`.  Diesel uses this to create
-/// `OwnedSqliteValue` instances.
+/// be freed with `sqlite3_value_free`.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_dup(value: *mut ffi::c_void) -> *mut ffi::c_void {
     if value.is_null() {
         return std::ptr::null_mut();
     }
-    let v = &*(value as *const ExtValue);
-    let copy = match v.value_type() {
-        turso_ext::ValueType::Integer => ExtValue::from_integer(v.to_integer().unwrap_or(0)),
-        turso_ext::ValueType::Float => ExtValue::from_float(v.to_float().unwrap_or(0.0)),
-        turso_ext::ValueType::Text => {
-            let s = v.to_text().unwrap_or("");
-            ExtValue::from_text(s.to_owned())
-        }
-        turso_ext::ValueType::Blob => {
-            let b = v.to_blob().unwrap_or_default();
-            ExtValue::from_blob(b.to_vec())
-        }
-        _ => ExtValue::null(),
-    };
-    Box::into_raw(Box::new(copy)) as *mut ffi::c_void
+    let v = &*(value as *const sqlite3_value);
+    Box::into_raw(Box::new(v.clone())) as *mut ffi::c_void
 }
 
 /// Frees a value previously allocated by `sqlite3_value_dup`.
@@ -2469,7 +2501,7 @@ pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
     if value.is_null() {
         return;
     }
-    let _ = Box::from_raw(value as *mut ExtValue);
+    let _ = Box::from_raw(value as *mut sqlite3_value);
 }
 
 #[no_mangle]
@@ -2483,7 +2515,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
     }
 }
 
-/// Returns an `sqlite3_value*` (ExtValue pointer) for a column in the current
+/// Returns an `sqlite3_value*` for a column in the current
 /// result row.  The pointer remains valid until the next `sqlite3_step()`,
 /// `sqlite3_reset()`, or `sqlite3_finalize()`.  Diesel uses this via
 /// `sqlite3_column_value` → `sqlite3_value_dup` to read all column types.
@@ -2502,26 +2534,16 @@ pub unsafe extern "C" fn sqlite3_column_value(
     }
     // Return cached value if we already built one for this column.
     if stmt.value_cache[i].is_some() {
-        return stmt.value_cache[i].as_mut().unwrap() as *mut ExtValue as *mut ffi::c_void;
+        return stmt.value_cache[i].as_mut().unwrap() as *mut sqlite3_value as *mut ffi::c_void;
     }
     let binding = stmt.stmt.row();
     let row = match binding.as_ref() {
         Some(row) => row,
         None => return std::ptr::null_mut(),
     };
-    let ext = match row.get::<&Value>(i) {
-        Ok(turso_core::Value::Numeric(turso_core::Numeric::Integer(n))) => {
-            ExtValue::from_integer(*n)
-        }
-        Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(f))) => {
-            ExtValue::from_float(f64::from(*f))
-        }
-        Ok(turso_core::Value::Text(t)) => ExtValue::from_text(t.value.to_string()),
-        Ok(turso_core::Value::Blob(b)) => ExtValue::from_blob(b.clone()),
-        _ => ExtValue::null(),
-    };
-    stmt.value_cache[i] = Some(ext);
-    stmt.value_cache[i].as_mut().unwrap() as *mut ExtValue as *mut ffi::c_void
+    let value = row.get::<&Value>(i).map_or(Value::Null, Value::clone);
+    stmt.value_cache[i] = Some(sqlite3_value::new(value));
+    stmt.value_cache[i].as_mut().unwrap() as *mut sqlite3_value as *mut ffi::c_void
 }
 
 pub struct TabResult {

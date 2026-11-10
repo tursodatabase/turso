@@ -1,5 +1,7 @@
 //! Workload definitions for the simulator.
 
+use std::any::Any;
+
 use rand::{Rng, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
@@ -42,8 +44,23 @@ impl GenerationContext for WorkloadContext<'_> {
 /// A workload generates operations to be executed on a fiber.
 /// Returns Some(Operation) if an operation was generated, None if this
 /// workload couldn't be applied and another should be tried.
-pub trait Workload: Send + Sync {
+pub trait Workload: Any + Send + Sync {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation>;
+
+    /// True for a read-only workload whose results a property examines. Swarm
+    /// testing never turns such a workload off. A write workload, such as
+    /// NextVal, can be off even if a property examines its results. Then the run
+    /// does not use that feature, so there is nothing to examine.
+    fn checks_results(&self) -> bool {
+        false
+    }
+
+    /// The type name without its module path and `Workload` suffix, for example `Begin`.
+    fn name(&self) -> &'static str {
+        let path = std::any::type_name::<Self>();
+        let name = path.rsplit_once("::").map_or(path, |(_, name)| name);
+        name.strip_suffix("Workload").unwrap_or(name)
+    }
 }
 
 // ============================================================================
@@ -78,6 +95,10 @@ impl Workload for IntegrityCheckWorkload {
             return None;
         }
         Some(Operation::IntegrityCheck)
+    }
+
+    fn checks_results(&self) -> bool {
+        true
     }
 }
 
@@ -120,6 +141,10 @@ impl Workload for SimpleSelectWorkload {
         };
 
         Some(Operation::SimpleSelect { table_name, key })
+    }
+
+    fn checks_results(&self) -> bool {
+        true
     }
 }
 
@@ -695,6 +720,10 @@ impl Workload for CurrValWorkload {
         let seq_name = ctx.sim_state.sequences.pick(rng)?.0.clone();
         Some(Operation::CurrVal { seq_name })
     }
+
+    fn checks_results(&self) -> bool {
+        true
+    }
 }
 
 /// Call nextval() on a random existing sequence.
@@ -944,6 +973,10 @@ impl Workload for FtsMatchWorkload {
         Some(Operation::CompareFtsResults {
             word: word.to_string(),
         })
+    }
+
+    fn checks_results(&self) -> bool {
+        true
     }
 }
 

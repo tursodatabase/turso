@@ -356,6 +356,42 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     );
 }
 
+/// `--swarm` picks the workloads, the connection count and the fault
+/// probabilities from the seed. Two runs with the same seed and flags must
+/// print the same output, so that a seed that fails in CI fails again locally.
+#[test]
+fn test_swarm_runs_repeat_with_the_seed() {
+    fn run(seed: u64) -> String {
+        let directory = tempfile::tempdir().expect("create a directory for the run");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_turso_whopper"))
+            .args(["--mode", "fast", "--swarm", "--max-steps", "2000"])
+            .env("SEED", seed.to_string())
+            .env_remove("RUST_LOG")
+            .current_dir(directory.path())
+            .output()
+            .expect("start turso_whopper");
+        let stdout = String::from_utf8(output.stdout).expect("the output is UTF-8");
+        assert!(
+            output.status.success(),
+            "seed {seed} failed:\n{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    }
+
+    fn swarm_lines(output: &str) -> Vec<&str> {
+        output
+            .lines()
+            .filter(|line| line.starts_with("swarm:"))
+            .collect()
+    }
+
+    let first = run(11);
+    assert_eq!(swarm_lines(&first).len(), 3, "{first}");
+    assert_eq!(first, run(11));
+    assert_ne!(swarm_lines(&first), swarm_lines(&run(12)));
+}
+
 /// Seed 7705886949262960907 with allocation faults off reads k6 as [] after
 /// append 19 already committed. Elle reports G-single-item and incompatible-order.
 #[test]

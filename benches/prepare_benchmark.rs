@@ -117,12 +117,12 @@ fn bench_prepare(bencher: Bencher, sql: &str) {
 
 // --- Simple and filtered SELECTs ------------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn select_point_lookup_pk(bencher: Bencher) {
     bench_prepare(bencher, "SELECT id, name, email FROM users WHERE id = ?");
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn select_index_range_order_limit(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -130,7 +130,7 @@ fn select_index_range_order_limit(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn select_complex_predicates(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -143,7 +143,7 @@ fn select_complex_predicates(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench(args = [10, 100, 1000])]
+#[turso_macros::divan_bench_single_call(args = [10, 100, 1000])]
 fn select_in_list(bencher: Bencher, n: usize) {
     let mut sql = String::from("SELECT id, name FROM users WHERE id IN (");
     for i in 0..n {
@@ -158,7 +158,7 @@ fn select_in_list(bencher: Bencher, n: usize) {
 
 // The parser rejects expression trees deeper than 100 and each nesting step
 // below adds more than one depth unit, so 32 is the largest safe step.
-#[turso_macros::divan_bench(args = [4, 16, 32])]
+#[turso_macros::divan_bench_single_call(args = [4, 16, 32])]
 fn select_expression_depth(bencher: Bencher, depth: usize) {
     // Nest one level per iteration: ((((age + 0) * 2) CASE...) ...)
     let mut expr = String::from("age");
@@ -173,7 +173,7 @@ fn select_expression_depth(bencher: Bencher, depth: usize) {
     bench_prepare(bencher, &sql);
 }
 
-#[turso_macros::divan_bench(args = [8, 32, 128])]
+#[turso_macros::divan_bench_single_call(args = [8, 32, 128])]
 fn select_star_wide_table(bencher: Bencher, cols: usize) {
     let (db, conn) = setup();
     let mut ddl = String::from("CREATE TABLE wide (id INTEGER PRIMARY KEY");
@@ -191,7 +191,7 @@ fn select_star_wide_table(bencher: Bencher, cols: usize) {
 
 // --- Joins -----------------------------------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn join_two_way_indexed(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -200,7 +200,7 @@ fn join_two_way_indexed(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn join_four_way_mixed(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -214,7 +214,7 @@ fn join_four_way_mixed(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench(args = [2, 4, 8])]
+#[turso_macros::divan_bench_single_call(args = [2, 4, 8])]
 fn join_chain(bencher: Bencher, tables: usize) {
     // Chain joins cycling through the schema tables so the planner's join
     // order search grows with the join count.
@@ -233,7 +233,7 @@ fn join_chain(bencher: Bencher, tables: usize) {
 
 // --- Aggregates and window functions ---------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn agg_group_by_having(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -245,7 +245,7 @@ fn agg_group_by_having(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn agg_window_functions(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -259,7 +259,7 @@ fn agg_window_functions(bencher: Bencher) {
 
 // --- Subqueries ------------------------------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn subquery_scalar_correlated(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -268,7 +268,7 @@ fn subquery_scalar_correlated(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn subquery_in_select(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -277,7 +277,7 @@ fn subquery_in_select(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn subquery_exists_correlated(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -286,7 +286,7 @@ fn subquery_exists_correlated(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench(args = [3, 5, 7])]
+#[turso_macros::divan_bench_single_call(args = [3, 5, 7])]
 fn subquery_two_correlated_wide_join(bencher: Bencher, tables: usize) {
     let (db, conn) = open_db();
     for i in 0..tables {
@@ -321,7 +321,7 @@ fn subquery_two_correlated_wide_join(bencher: Bencher, tables: usize) {
     });
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn subquery_from_derived_table(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -333,7 +333,7 @@ fn subquery_from_derived_table(bencher: Bencher) {
 
 // --- CTEs and compound selects ---------------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn cte_join(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -348,7 +348,7 @@ fn cte_join(bencher: Bencher) {
 
 // NOTE: recursive CTEs are not benchmarked because Turso does not support
 // them yet; add a `WITH RECURSIVE` scenario once translation lands.
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn cte_chained(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -365,7 +365,7 @@ fn cte_chained(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench(args = [4, 16, 64])]
+#[turso_macros::divan_bench_single_call(args = [4, 16, 64])]
 fn compound_union_all(bencher: Bencher, arms: usize) {
     let mut sql = String::new();
     for i in 0..arms {
@@ -377,7 +377,7 @@ fn compound_union_all(bencher: Bencher, arms: usize) {
     bench_prepare(bencher, &sql);
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn compound_union_distinct(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -391,7 +391,7 @@ fn compound_union_distinct(bencher: Bencher) {
 
 // --- Writes ----------------------------------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn insert_single_row_params(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -400,7 +400,7 @@ fn insert_single_row_params(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench(args = [10, 100])]
+#[turso_macros::divan_bench_single_call(args = [10, 100])]
 fn insert_multirow_params(bencher: Bencher, rows: usize) {
     let mut sql = String::from(
         "INSERT INTO orders (user_id, product_id, quantity, price, status, placed_at) VALUES ",
@@ -414,7 +414,7 @@ fn insert_multirow_params(bencher: Bencher, rows: usize) {
     bench_prepare(bencher, &sql);
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn insert_select(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -424,7 +424,7 @@ fn insert_select(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn insert_upsert_on_conflict(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -434,7 +434,7 @@ fn insert_upsert_on_conflict(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn update_indexed_filter(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -443,7 +443,7 @@ fn update_indexed_filter(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn delete_range(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -453,7 +453,7 @@ fn delete_range(bencher: Bencher) {
 
 // --- DDL -------------------------------------------------------------------
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn ddl_create_table(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -468,7 +468,7 @@ fn ddl_create_table(bencher: Bencher) {
     );
 }
 
-#[turso_macros::divan_bench]
+#[turso_macros::divan_bench_single_call]
 fn ddl_create_index(bencher: Bencher) {
     bench_prepare(
         bencher,
@@ -553,7 +553,7 @@ fn tpch_sql(n: usize) -> &'static str {
     }
 }
 
-#[turso_macros::divan_bench(args = TPCH_IDS)]
+#[turso_macros::divan_bench_single_call(args = TPCH_IDS)]
 fn corpus_tpch(bencher: Bencher, q: usize) {
     let (db, conn) = open_db();
     for ddl in TPCH_SCHEMA {
@@ -582,7 +582,7 @@ fn clickbench_sql(n: usize) -> &'static str {
         .unwrap()
 }
 
-#[turso_macros::divan_bench(args = CLICKBENCH_IDS)]
+#[turso_macros::divan_bench_single_call(args = CLICKBENCH_IDS)]
 fn corpus_clickbench(bencher: Bencher, q: usize) {
     let (db, conn) = open_db();
     execute(&db, &conn, include_str!("../perf/clickbench/create.sql"));
@@ -646,7 +646,7 @@ const JOB_SCHEMA: &str = concat!(
 
 // Several JOB queries take hundreds of milliseconds to plan today, so cap
 // the sample count to keep local walltime runs reasonable.
-#[turso_macros::divan_bench(args = JOB_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
+#[turso_macros::divan_bench_single_call(args = JOB_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
 fn corpus_job(bencher: Bencher, q: &str) {
     bench_corpus_query(bencher, JOB_SCHEMA, corpus_sql(JOB_QUERIES, q));
 }
@@ -670,7 +670,7 @@ const TPCDS_QUERIES: &[(&str, &str)] = corpus_queries!(
 
 const TPCDS_SCHEMA: &str = include_str!("../perf/tpc-ds/schema.sql");
 
-#[turso_macros::divan_bench(args = TPCDS_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
+#[turso_macros::divan_bench_single_call(args = TPCDS_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
 fn corpus_tpcds(bencher: Bencher, q: &str) {
     bench_corpus_query(bencher, TPCDS_SCHEMA, corpus_sql(TPCDS_QUERIES, q));
 }

@@ -30,15 +30,17 @@ sync = [
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:bytes",
+    "dep:rustls",
+    "dep:rustls-native-certs",
 ]
 
 [dependencies]
-turso_core = { path = "../../core", version = "0.9.0-pre.2", default-features = false, features = ["baseline"] }
-turso_sdk_kit = { path = "../../sdk-kit", version = "0.9.0-pre.2", default-features = false, features = [
+turso_core = { path = "../../core", version = "0.9.0-pre.5", default-features = false, features = ["baseline"] }
+turso_sdk_kit = { path = "../../sdk-kit", version = "0.9.0-pre.5", default-features = false, features = [
     "encryption",
     "pure-rust-crypto",
 ] }
-turso_sync_sdk_kit = { path = "../../sync/sdk-kit", version = "0.9.0-pre.2", default-features = false, optional = true }
+turso_sync_sdk_kit = { path = "../../sync/sdk-kit", version = "0.9.0-pre.5", default-features = false, optional = true }
 thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
@@ -52,6 +54,10 @@ hyper-util = { version = "0.1.19", features = [
 ], optional = true }
 http-body-util = { version = "0.1.3", optional = true }
 bytes = { version = "1.11.1", optional = true }
+rustls = { version = "0.23.46", default-features = false, optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustls-native-certs = { version = "0.8.3", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { workspace = true, optional = true }
@@ -71,3 +77,5 @@ rand_chacha = { workspace = true }
 anyhow.workspace = true
 reqwest = { version = "0.13.2", features = ["json"] }
 serde_json.workspace = true
+tokio-rustls = "0.26.4"
+rustls-native-certs = "0.8.3"

@@ -1571,7 +1571,6 @@ pub fn op_vupdate(
             cursor_id,
             arg_count,
             start_reg,
-            conflict_action,
             ..
         },
         insn
@@ -1632,19 +1631,18 @@ pub fn op_vupdate(
     } else {
         virtual_table.update(&argv, &mut state.extension_state)
     };
+    // Like SQLite's OP_VUpdate, an INSERT (argv[0] is NULL) sets
+    // last_insert_rowid() to the rowid the module returns, and every write
+    // counts in changes() and total_changes().
+    let is_insert = matches!(argv[0], Value::Null);
     match result {
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
-        Ok(IOResult::Done(Some(new_rowid))) => {
+        Ok(IOResult::Done(new_rowid)) => {
             state.record_rows_written(1);
-            if *conflict_action == 5 {
-                // ResolveType::Replace
-                program.connection.update_last_rowid(new_rowid);
+            state.record_statement_change();
+            if is_insert {
+                program.connection.update_last_rowid(new_rowid.unwrap_or(0));
             }
-            state.pc += 1;
-        }
-        Ok(IOResult::Done(None)) => {
-            // no-op or successful update without rowid return
-            state.record_rows_written(1);
             state.pc += 1;
         }
         Err(e) => {
@@ -4302,6 +4300,7 @@ pub fn op_transaction(
         Ok(result) => Ok(result),
         Err(err) => {
             state.active_op_state.clear();
+            state.stop_counting_as_reader(&program.connection);
             Err(err)
         }
     }
@@ -4623,6 +4622,34 @@ pub fn op_transaction_inner(
                     return Err(
                         LimboError::StatementsInProgress("cannot start a write statement").into(),
                     );
+                }
+                // Like SQLite's OP_Destroy, refuse to free a b-tree while another
+                // statement on this connection reads a database: its cursors
+                // would read the freed pages after they are reused. SQLite checks
+                // at the Destroy itself and undoes the statement's earlier writes
+                // with a statement journal. Turso opens none for an autocommit
+                // statement that shares its transaction with a reader, so the
+                // check is made here, before the statement writes anything.
+                // SQLite never returns to the caller in the middle of a Destroy,
+                // but Turso can suspend there for I/O, so a statement must also
+                // not start reading while a DROP is in progress. A nested
+                // statement (an index method dropping its backing tables) is
+                // part of its parent's DROP, which already passed these checks.
+                // The counts are released if this instruction fails or returns
+                // busy, so a DROP waiting on a lock does not block readers.
+                if !conn.is_nested_stmt() && !state.is_active_read {
+                    let other_readers = conn.n_active_read_statements.load(Ordering::SeqCst);
+                    let other_destroyers = conn.n_active_destroy_statements.load(Ordering::SeqCst);
+                    if (program.destroys_btree && other_readers > 0) || other_destroyers > 0 {
+                        return Err(LimboError::TableLocked.into());
+                    }
+                    conn.n_active_read_statements.fetch_add(1, Ordering::SeqCst);
+                    state.is_active_read = true;
+                    if program.destroys_btree {
+                        conn.n_active_destroy_statements
+                            .fetch_add(1, Ordering::SeqCst);
+                        state.is_active_destroy = true;
+                    }
                 }
 
                 // Fast path: if checkpoint root publication already replaced the

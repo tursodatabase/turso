@@ -1177,7 +1177,7 @@ pub(crate) fn expression_type_ordering(
 }
 
 /// The type of an index expression over `table`'s columns.
-fn expression_type(
+pub(crate) fn expression_type(
     expr: &Expr,
     table: &BTreeTable,
     schema: &Schema,

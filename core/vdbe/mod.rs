@@ -1218,6 +1218,12 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// Whether this statement has passed a `Transaction` instruction and is
+    /// counted in `Connection::n_active_read_statements`.
+    pub(crate) is_active_read: bool,
+    /// Whether this statement is a DROP that has passed a `Transaction`
+    /// instruction and is counted in `Connection::n_active_destroy_statements`.
+    pub(crate) is_active_destroy: bool,
     /// Write activity on the main database when this statement became an
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
@@ -1329,6 +1335,8 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            is_active_read: false,
+            is_active_destroy: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
@@ -1401,6 +1409,10 @@ impl ProgramState {
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        turso_assert!(
+            !self.is_active_read && !self.is_active_destroy,
+            "resetting a statement still counted as an active reader"
+        );
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -1518,6 +1530,23 @@ impl ProgramState {
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
         self.pending_fresh_tx = None;
+    }
+
+    /// Removes this statement from the connection's counts of reading and
+    /// dropping statements. The next `Transaction` instruction counts it again.
+    pub(crate) fn stop_counting_as_reader(&mut self, connection: &Connection) {
+        if self.is_active_read {
+            connection
+                .n_active_read_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_read = false;
+        }
+        if self.is_active_destroy {
+            connection
+                .n_active_destroy_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_destroy = false;
+        }
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -2161,6 +2190,9 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Whether the program frees a b-tree (`Insn::Destroy`) or the storage of an
+    /// index method (`Insn::IndexMethodDestroy`), as DROP TABLE and DROP INDEX do.
+    pub destroys_btree: bool,
 }
 
 #[derive(Clone)]
@@ -3912,6 +3944,13 @@ impl Program {
                         _ => 0,
                     };
                     self.connection.set_changes(last_change);
+                    // The rows FAIL keeps also count in total_changes(). An
+                    // autocommit statement added them when it committed; one
+                    // inside an open transaction adds them here.
+                    if matches!(effective_resolve, ResolveType::Fail) && !can_autocommit_now {
+                        self.connection
+                            .add_total_changes(state.n_total_change.swap(0, Ordering::SeqCst));
+                    }
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(

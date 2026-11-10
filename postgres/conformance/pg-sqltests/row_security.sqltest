@@ -1,0 +1,130 @@
+# ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY through the PostgreSQL
+# frontend. pg_class.relrowsecurity shows which tables have it.
+
+@database :memory:
+
+test new-table-has-no-row-security {
+    CREATE TABLE rls_new (id INT);
+    SELECT relname FROM pg_class WHERE relname = 'rls_new' AND NOT relrowsecurity;
+}
+expect {
+    rls_new
+}
+
+test enable-row-security-shows-in-pg-class {
+    CREATE TABLE rls_enable (id INT);
+    ALTER TABLE rls_enable ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_enable' AND relrowsecurity;
+}
+expect {
+    rls_enable
+}
+
+test enable-row-security-of-table-qualified-with-public {
+    CREATE TABLE rls_public (id INT);
+    ALTER TABLE public.rls_public ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_public' AND relrowsecurity;
+}
+expect {
+    rls_public
+}
+
+test enable-row-security-of-table-with-quoted-mixed-case-name {
+    CREATE TABLE "RlsMixed" (id INT);
+    ALTER TABLE "RlsMixed" ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'RlsMixed' AND relrowsecurity;
+}
+expect {
+    RlsMixed
+}
+
+test enable-row-security-twice-keeps-it-enabled {
+    CREATE TABLE rls_twice (id INT);
+    ALTER TABLE rls_twice ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_twice ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_twice' AND relrowsecurity;
+}
+expect {
+    rls_twice
+}
+
+test disable-row-security-hides-it-from-pg-class {
+    CREATE TABLE rls_disable (id INT);
+    ALTER TABLE rls_disable ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_disable DISABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_disable' AND NOT relrowsecurity;
+}
+expect {
+    rls_disable
+}
+
+test disable-row-security-of-table-without-it {
+    CREATE TABLE rls_never (id INT);
+    ALTER TABLE rls_never DISABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_never' AND NOT relrowsecurity;
+}
+expect {
+    rls_never
+}
+
+test enable-row-security-affects-only-that-table {
+    CREATE TABLE rls_one (id INT);
+    CREATE TABLE rls_other (id INT);
+    ALTER TABLE rls_one ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class
+    WHERE relname IN ('rls_one', 'rls_other') AND relrowsecurity;
+}
+expect {
+    rls_one
+}
+
+test renamed-table-keeps-row-security {
+    CREATE TABLE rls_before_rename (id INT);
+    ALTER TABLE rls_before_rename ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_before_rename RENAME TO rls_after_rename;
+    CREATE TABLE rls_before_rename (id INT);
+    SELECT relname, relrowsecurity::int FROM pg_class
+    WHERE relname IN ('rls_before_rename', 'rls_after_rename')
+    ORDER BY relname;
+}
+expect {
+    rls_after_rename|1
+    rls_before_rename|0
+}
+
+test table-created-with-name-of-dropped-table-has-no-row-security {
+    CREATE TABLE rls_dropped (id INT);
+    ALTER TABLE rls_dropped ENABLE ROW LEVEL SECURITY;
+    DROP TABLE rls_dropped;
+    CREATE TABLE rls_dropped (id INT);
+    SELECT relname FROM pg_class WHERE relname = 'rls_dropped' AND NOT relrowsecurity;
+}
+expect {
+    rls_dropped
+}
+
+test rolled-back-enable-leaves-no-row-security {
+    CREATE TABLE rls_rollback (id INT);
+    BEGIN;
+    ALTER TABLE rls_rollback ENABLE ROW LEVEL SECURITY;
+    ROLLBACK;
+    SELECT relname FROM pg_class WHERE relname = 'rls_rollback' AND NOT relrowsecurity;
+}
+expect {
+    rls_rollback
+}
+
+test enable-row-security-of-table-in-another-schema {
+    CREATE SCHEMA rls_schema;
+    CREATE TABLE rls_schema.rls_same_name (id INT);
+    CREATE TABLE rls_same_name (id INT);
+    ALTER TABLE rls_schema.rls_same_name ENABLE ROW LEVEL SECURITY;
+    SELECT n.nspname, c.relrowsecurity::int
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'rls_same_name'
+    ORDER BY n.nspname;
+}
+expect {
+    public|0
+    rls_schema|1
+}

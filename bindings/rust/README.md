@@ -214,6 +214,15 @@ let db = Builder::new_remote("local.db")       // Local database path (or ":memo
     .await?;
 ```
 
+HTTPS sync uses native root CA certificates. On Android, if native-root discovery
+fails, it reads the Conscrypt APEX certificate directory when available and
+nonempty, otherwise the system certificate directory. Set `SSL_CERT_FILE` or
+`SSL_CERT_DIR` before building the database to use a custom CA store, including
+private CAs. These overrides disable the Android directory fallback. This reads system CA
+files rather than Android's Java trust manager: per-app network security
+configuration and changes in the user's certificate settings are not applied.
+If no valid roots can be loaded, `build()` returns an error.
+
 #### sync::Database
 
 Operations for synced databases:

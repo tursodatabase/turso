@@ -4,6 +4,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
@@ -847,6 +848,27 @@ pub fn translate_alter_table(
             connection,
         );
     }
+    match alter_table {
+        ast::AlterTableBody::EnableRowSecurity => {
+            return row_security::translate_set_row_security(
+                &qualified_name,
+                true,
+                resolver,
+                program,
+                connection,
+            );
+        }
+        ast::AlterTableBody::DisableRowSecurity => {
+            return row_security::translate_set_row_security(
+                &qualified_name,
+                false,
+                resolver,
+                program,
+                connection,
+            );
+        }
+        _ => {}
+    }
     let namespace = resolver.resolve_existing_table(&qualified_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -896,7 +918,6 @@ pub fn translate_alter_table(
     let Some(original_btree) = table.btree() else {
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
-
     // Check if this table has dependent materialized views
     let dependent_views = resolver.with_schema(database_id, |s| {
         s.get_dependent_materialized_views(namespace.id, table_name)
@@ -911,8 +932,12 @@ pub fn translate_alter_table(
     let mut btree = (*original_btree).clone();
 
     match alter_table {
-        ast::AlterTableBody::OwnerTo { .. } => {
-            unreachable!("OWNER TO is translated before the table is resolved")
+        ast::AlterTableBody::OwnerTo { .. }
+        | ast::AlterTableBody::EnableRowSecurity
+        | ast::AlterTableBody::DisableRowSecurity => {
+            unreachable!(
+                "OWNER TO and row-level security are translated before the table is resolved"
+            )
         }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
@@ -2655,8 +2680,10 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
-        // OWNER TO works on views; it is translated before this check runs.
-        ast::AlterTableBody::OwnerTo { .. } => Ok(()),
+        // These are translated before this check runs.
+        ast::AlterTableBody::OwnerTo { .. }
+        | ast::AlterTableBody::EnableRowSecurity
+        | ast::AlterTableBody::DisableRowSecurity => Ok(()),
     }
 }
 

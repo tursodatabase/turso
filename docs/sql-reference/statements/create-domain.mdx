@@ -26,6 +26,8 @@ CREATE DOMAIN [IF NOT EXISTS] domain-name AS base-type
 
 A domain wraps a base type with validation constraints. When a value is written to a column of a domain type, the CHECK constraints and NOT NULL restriction (if any) are verified. If validation passes, the value is stored using the base type's native format. When a value is read, it is returned unchanged.
 
+In an array column of a domain type, such as `positive_int[]`, each element is checked against the domain's constraints. The array itself is not a value of the domain, so a NULL array is accepted even when the domain is NOT NULL, while an array with a NULL element is not.
+
 Domains are transparent to the query engine for operations like ORDER BY, indexing, arithmetic, and aggregation. A domain column behaves exactly like a column of its base type, with the addition of input validation.
 
 Domains work only with STRICT tables. Using a domain name in a non-STRICT table has no effect.

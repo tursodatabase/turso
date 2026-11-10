@@ -36,6 +36,7 @@ pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod roles;
 pub(crate) mod rollback;
+pub(crate) mod row_security;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod sequence;
@@ -90,10 +91,7 @@ pub fn translate(
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
-        ast::Stmt::CreateIndex { .. }
-            | ast::Stmt::Delete { .. }
-            | ast::Stmt::Insert { .. }
-            | ast::Stmt::Update { .. }
+        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
 
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
@@ -136,6 +134,13 @@ pub fn translate(
         connection.search_path()
     };
     let qualifiers = connection.qualifiers(schema);
+    // Only a statement of the connection's user is limited by row-level
+    // security. The engine's own statements read every row.
+    let row_security_role = if matches!(origin, crate::statement::StatementOrigin::Root) {
+        connection.current_role()
+    } else {
+        crate::security::roles::RoleId::SUPERUSER
+    };
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
@@ -151,6 +156,7 @@ pub fn translate(
             connection.dialect()
         },
         search_path.as_deref(),
+        row_security_role,
     );
     resolver.automatic_index = connection.automatic_index();
     #[cfg(feature = "simulator")]
@@ -208,11 +214,13 @@ pub fn translate_inner(
     // Subqueries are numbered per program, and a trigger body or foreign-key
     // action is compiled into a program of its own with the resolver of the
     // statement that fires it. So the same number can name a subquery of
-    // each, and the statement's row-value subqueries are set aside while
+    // each, and the statement's row-value and IN subqueries are set aside while
     // another statement is compiled.
     let callers_row_value_subqueries = std::mem::take(&mut resolver.row_value_subqueries);
+    let callers_in_subquery_column_types = std::mem::take(&mut resolver.in_subquery_column_types);
     let result = translate_statement(stmt, resolver, program, connection, input);
     resolver.row_value_subqueries = callers_row_value_subqueries;
+    resolver.in_subquery_column_types = callers_in_subquery_column_types;
     result
 }
 

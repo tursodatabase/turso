@@ -15,7 +15,7 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use turso_sdk_kit::IoBackend;
 
 use crate::{connection::Connection, Error, Result};
@@ -405,7 +405,7 @@ impl Builder {
                 .map_err(Error::from)?;
 
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
-        let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone());
+        let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone()).await?;
 
         // Create (bootstrap + open) database in one go.
         let op = sync.create();
@@ -712,12 +712,13 @@ struct IoWorker {
 }
 
 impl IoWorker {
-    fn spawn(
+    async fn spawn(
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
         auth_token: Option<AuthTokenFn>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let wakers = Arc::new(Mutex::new(Vec::new()));
         let weak_sync = Arc::downgrade(&sync);
 
@@ -731,18 +732,47 @@ impl IoWorker {
         std::thread::Builder::new()
             .name("turso-sync-io".to_string())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("failed to build IO runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(Error::Error(format!(
+                            "failed to build IO runtime: {err}"
+                        ))));
+                        return;
+                    }
+                };
 
                 rt.block_on(async move {
-                    IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers).await
+                    let tls = match sync_tls_config() {
+                        Ok(tls) => tls,
+                        Err(err) => {
+                            let _ = ready_tx.send(Err(Error::Error(format!(
+                                "failed to load native root CA certificates: {err}"
+                            ))));
+                            return;
+                        }
+                    };
+                    let https = HttpsConnector::<HttpConnector>::builder()
+                        .with_tls_config(tls)
+                        .https_or_http()
+                        .enable_http1()
+                        .build();
+                    let client = Client::builder(TokioExecutor::new()).build(https);
+                    if ready_tx.send(Ok(())).is_ok() {
+                        IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers, client)
+                            .await;
+                    }
                 });
             })
-            .expect("failed to spawn IO worker thread");
+            .map_err(|err| Error::Error(format!("failed to spawn IO worker thread: {err}")))?;
 
-        worker
+        ready_rx
+            .await
+            .map_err(|err| Error::Error(format!("IO worker stopped during startup: {err}")))??;
+        Ok(worker)
     }
 
     // Register a waker to be awakened upon IO progress.
@@ -773,19 +803,8 @@ impl IoWorker {
         auth_token: Option<AuthTokenFn>,
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
+        client: Client<HttpsConnector<HttpConnector>, ChunkedBody>,
     ) {
-        // Create HTTPS-capable Hyper client.
-        let mut http_connector = HttpConnector::new();
-        http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::<HttpConnector>::builder()
-            .with_native_roots()
-            .expect("failed to load native root CA certificates")
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client: Client<HttpsConnector<HttpConnector>, ChunkedBody> =
-            Client::builder(TokioExecutor::new()).build::<_, ChunkedBody>(https);
-
         while rx.recv().await.is_some() {
             let Some(sync) = sync.upgrade() else {
                 break;
@@ -1010,6 +1029,50 @@ impl IoWorker {
     }
 }
 
+fn sync_tls_config() -> std::io::Result<rustls::ClientConfig> {
+    use hyper_rustls::ConfigBuilderExt;
+
+    let native = rustls::ClientConfig::builder().with_native_roots();
+    #[cfg(target_os = "android")]
+    if native.is_err()
+        && std::env::var_os("SSL_CERT_FILE").is_none()
+        && std::env::var_os("SSL_CERT_DIR").is_none()
+    {
+        let apex = std::path::Path::new("/apex/com.android.conscrypt/cacerts");
+        let system = std::path::Path::new("/system/etc/security/cacerts");
+        let has_apex_certs = apex
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        return android_tls_config(if has_apex_certs { apex } else { system });
+    }
+
+    Ok(native?.with_no_client_auth())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_tls_config(cert_dir: &std::path::Path) -> std::io::Result<rustls::ClientConfig> {
+    let loaded = rustls_native_certs::load_certs_from_paths(None, Some(cert_dir));
+    if !loaded.errors.is_empty() {
+        tracing::warn!(errors = ?loaded.errors, "Android root CA certificate loading errors");
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(loaded.certs);
+    if roots.is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "no valid root CA certificates in {} (errors: {:?})",
+                cert_dir.display(),
+                loaded.errors
+            ),
+        ));
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context, Result};
@@ -1030,6 +1093,193 @@ mod tests {
 
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
+
+    #[test]
+    fn missing_native_roots_returns_build_error() {
+        const CHILD: &str = "TURSO_TEST_MISSING_NATIVE_ROOTS";
+        if env::var_os(CHILD).is_none() {
+            let dir = TempDir::new().unwrap();
+            let cert_file = dir.path().join("empty.pem");
+            std::fs::write(&cert_file, "").unwrap();
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sync::tests::missing_native_roots_returns_build_error",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("SSL_CERT_FILE", cert_file)
+                .env("SSL_CERT_DIR", dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("local.db");
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::sync::Builder::new_remote(path.to_str().unwrap())
+                    .with_remote_url("https://localhost:1")
+                    .bootstrap_if_empty(false)
+                    .build(),
+            )
+            .await
+            .expect("build must return a certificate error instead of hanging");
+            let Err(err) = result else {
+                panic!("build must reject an empty root certificate store");
+            };
+            assert!(
+                err.to_string()
+                    .contains("failed to load native root CA certificates"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn native_tls_preserves_certificate_overrides() {
+        const CHILD: &str = "TURSO_TEST_CERTIFICATE_OVERRIDE";
+        if env::var_os(CHILD).is_none() {
+            for mode in ["file", "directory", "untrusted"] {
+                let dir = TempDir::new().unwrap();
+                let cert = if mode == "untrusted" {
+                    include_str!("../tests/fixtures/tls/untrusted-ca.pem")
+                } else {
+                    include_str!("../tests/fixtures/tls/ca.pem")
+                };
+                let cert_file = dir.path().join("ca.pem");
+                std::fs::write(&cert_file, cert).unwrap();
+                let mut child = Command::new(env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "sync::tests::native_tls_preserves_certificate_overrides",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .env_remove("SSL_CERT_FILE")
+                    .env_remove("SSL_CERT_DIR");
+                if mode == "directory" {
+                    child.env("SSL_CERT_DIR", dir.path());
+                } else {
+                    child.env("SSL_CERT_FILE", cert_file);
+                }
+                assert!(child.status().unwrap().success(), "override mode: {mode}");
+            }
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let tls = super::sync_tls_config().unwrap();
+            let result = test_https_request(tls.clone(), "localhost").await;
+            if env::var(CHILD).unwrap() == "untrusted" {
+                assert!(result.is_err(), "an untrusted server must be rejected");
+            } else {
+                assert_eq!(result.unwrap(), hyper::StatusCode::OK);
+                assert!(test_https_request(tls, "127.0.0.1").await.is_err());
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn android_tls_verifies_certificates() {
+        let dir = TempDir::new().unwrap();
+        let cert_file = dir.path().join("ca.pem");
+        assert!(super::android_tls_config(dir.path()).is_err());
+        std::fs::write(&cert_file, "not a certificate").unwrap();
+        assert!(super::android_tls_config(dir.path()).is_err());
+        std::fs::write(&cert_file, include_str!("../tests/fixtures/tls/ca.pem")).unwrap();
+        let tls = super::android_tls_config(dir.path()).unwrap();
+        assert_eq!(
+            test_https_request(tls.clone(), "localhost").await.unwrap(),
+            hyper::StatusCode::OK
+        );
+        assert!(test_https_request(tls, "127.0.0.1").await.is_err());
+        std::fs::write(
+            &cert_file,
+            include_str!("../tests/fixtures/tls/untrusted-ca.pem"),
+        )
+        .unwrap();
+        let tls = super::android_tls_config(dir.path()).unwrap();
+        assert!(test_https_request(tls, "localhost").await.is_err());
+    }
+
+    #[cfg(target_os = "android")]
+    #[tokio::test]
+    async fn sync_build_uses_android_system_roots() {
+        assert!(env::var_os("SSL_CERT_FILE").is_none());
+        assert!(env::var_os("SSL_CERT_DIR").is_none());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("local.db");
+        let db = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::sync::Builder::new_remote(path.to_str().unwrap())
+                .with_remote_url("https://localhost:1")
+                .bootstrap_if_empty(false)
+                .build(),
+        )
+        .await
+        .expect("Android sync build must not hang")
+        .expect("Android system certificates must load without environment overrides");
+        let conn = db.connect().await.unwrap();
+        conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+    }
+
+    async fn test_https_request(
+        tls: rustls::ClientConfig,
+        host: &str,
+    ) -> std::result::Result<hyper::StatusCode, hyper_util::client::legacy::Error> {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert =
+            CertificateDer::from_pem_slice(include_bytes!("../tests/fixtures/tls/localhost.pem"))
+                .unwrap();
+        let key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../tests/fixtures/tls/localhost.key"))
+                .unwrap();
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(https);
+        let request = hyper::Request::get(format!("https://{host}:{port}/"))
+            .body(super::ChunkedBody::new(bytes::Bytes::new()))
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+            .await
+            .expect("loopback HTTPS request must finish")
+            .map(|response| response.status());
+        server.abort();
+        result
+    }
 
     fn random_str() -> String {
         rand::rng()

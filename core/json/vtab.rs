@@ -180,6 +180,10 @@ impl InternalVirtualTable for JsonVirtualTable {
         );"
         .to_owned()
     }
+
+    fn superuser_only(&self) -> bool {
+        false
+    }
 }
 
 impl std::fmt::Debug for JsonVirtualTable {

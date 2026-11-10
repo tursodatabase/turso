@@ -40,6 +40,37 @@ expect {
 }
 
 @setup users
+test table-update-column-list-from-row {
+    UPDATE users SET (name, age) = ('bobby', 26) WHERE id = 2;
+    UPDATE users SET active = true, (name, age) = ROW('caroline', 36) WHERE id = 3;
+    UPDATE users SET (age) = ROW(31) WHERE id = 1;
+    SELECT name, age, active FROM users ORDER BY id;
+}
+expect {
+    alice|31|t
+    bobby|26|f
+    caroline|36|t
+}
+
+@setup users
+test table-update-column-list-from-subquery {
+    UPDATE users SET (name, age) = (SELECT name, age FROM users WHERE id = 3) WHERE id = 1;
+    SELECT name, age FROM users ORDER BY id;
+}
+expect {
+    carol|35
+    bob|25
+    carol|35
+}
+
+@setup users
+test table-update-column-list-from-a-plain-value-errors {
+    UPDATE users SET (age) = (31);
+}
+@sqlstate 0A000
+expect error {source for a multiple-column UPDATE item must be a sub-SELECT or ROW}
+
+@setup users
 test table-delete {
     DELETE FROM users WHERE age > 34;
     SELECT count(*) FROM users;
@@ -480,6 +511,15 @@ expect error {}
 setup upsert {
     CREATE TABLE upsert_t (a int PRIMARY KEY, k int UNIQUE, b int);
     INSERT INTO upsert_t VALUES (1, 1, 0);
+}
+
+@setup upsert
+test table-upsert-updates-column-list-from-row {
+    INSERT INTO upsert_t VALUES (1, 5, 7) ON CONFLICT (a) DO UPDATE SET (k, b) = (excluded.k + 1, excluded.b);
+    SELECT a, k, b FROM upsert_t;
+}
+expect {
+    1|6|7
 }
 
 @setup upsert

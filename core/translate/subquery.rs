@@ -886,6 +886,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::RowValue {
                         result_reg_start: 0,
                         num_regs: 0,
+                        row_count_reg: None,
                     },
                 };
                 let ast::Expr::Subquery(subselect) = ({
@@ -938,35 +939,68 @@ fn get_subquery_parser<'a>(
                     },
                 );
 
+                // An aggregate without GROUP BY returns one row, so it needs no row count.
+                let is_single_row_aggregate = !plan.aggregates.is_empty()
+                    && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+                    && plan.window.is_none();
+                let row_count_reg = (resolver
+                    .catalog
+                    .dialect
+                    .rejects_scalar_subquery_with_several_rows()
+                    && !is_single_row_aggregate)
+                    .then(|| program.alloc_register());
                 plan.query_destination = QueryDestination::RowValueSubqueryResult {
                     result_reg_start: reg_start,
                     num_regs: reg_count,
+                    row_count_reg,
                 };
 
-                // RowValue subqueries are satisfied after at most 1 row has been returned,
+                let numeric =
+                    |n: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
+                // When a second row is an error, the subquery stops after the second row:
+                // LIMIT 0 and LIMIT 1 stay, and any other LIMIT (a negative one means no limit)
+                // becomes 2, as `CASE X WHEN 0 THEN 0 WHEN 1 THEN 1 ELSE 2 END`.
+                // Otherwise RowValue subqueries are satisfied after at most 1 row has been returned,
                 // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
                 // Like SQLite, an existing LIMIT X becomes X != 0, with the 0 given NUMERIC
                 // affinity so that a text '0' also means no rows. Integer literals are folded here.
-                plan.limit = Some(match plan.limit.take() {
-                    None => Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
-                    Some(expr) => match parse_signed_number(&expr) {
-                        Ok(Value::Numeric(Numeric::Integer(v))) => Box::new(ast::Expr::Literal(
-                            ast::Literal::Numeric(((v != 0) as i64).to_string()),
-                        )),
-                        _ => Box::new(ast::Expr::Binary(
-                            expr,
-                            ast::Operator::NotEquals,
-                            Box::new(ast::Expr::cast(
-                                ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
-                                Some(ast::Type {
-                                    name: "NUMERIC".to_string(),
-                                    size: None,
-                                    array_dimensions: 0,
-                                }),
+                if row_count_reg.is_some() {
+                    plan.limit = Some(match plan.limit.take() {
+                        None => numeric(2),
+                        Some(expr) => match parse_signed_number(&expr) {
+                            Ok(Value::Numeric(Numeric::Integer(v))) => {
+                                numeric(if (0..2).contains(&v) { v } else { 2 })
+                            }
+                            _ => Box::new(ast::Expr::Case {
+                                base: Some(expr),
+                                when_then_pairs: vec![
+                                    (numeric(0), numeric(0)),
+                                    (numeric(1), numeric(1)),
+                                ],
+                                else_expr: Some(numeric(2)),
+                            }),
+                        },
+                    });
+                } else {
+                    plan.limit = Some(match plan.limit.take() {
+                        None => numeric(1),
+                        Some(expr) => match parse_signed_number(&expr) {
+                            Ok(Value::Numeric(Numeric::Integer(v))) => numeric((v != 0) as i64),
+                            _ => Box::new(ast::Expr::Binary(
+                                expr,
+                                ast::Operator::NotEquals,
+                                Box::new(ast::Expr::cast(
+                                    ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+                                    Some(ast::Type {
+                                        name: "NUMERIC".to_string(),
+                                        size: None,
+                                        array_dimensions: 0,
+                                    }),
+                                )),
                             )),
-                        )),
-                    },
-                });
+                        },
+                    });
+                }
 
                 let ast::Expr::SubqueryResult {
                     subquery_id,
@@ -976,6 +1010,7 @@ fn get_subquery_parser<'a>(
                         SubqueryType::RowValue {
                             result_reg_start,
                             num_regs,
+                            row_count_reg: expr_row_count_reg,
                         },
                 } = &mut *expr
                 else {
@@ -983,6 +1018,7 @@ fn get_subquery_parser<'a>(
                 };
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
+                *expr_row_count_reg = row_count_reg;
                 let subquery_id = *subquery_id;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -991,6 +1027,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::RowValue {
                         result_reg_start: reg_start,
                         num_regs: reg_count,
+                        row_count_reg,
                     },
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(Plan::Select(plan))),
@@ -1105,6 +1142,17 @@ fn get_subquery_parser<'a>(
                     lhs_exprs.push(lhs_expr);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
+
+                // A string literal or parameter on the left is read as the
+                // type of the column it is compared with.
+                let result_column_env = TypeEnv::new(Some(table_references), resolver);
+                resolver.in_subquery_column_types.insert(
+                    subquery_id,
+                    result_columns
+                        .iter()
+                        .map(|result_col| type_of(&result_col.expr, &result_column_env))
+                        .collect(),
+                );
 
                 let columns = result_columns
                     .iter()
@@ -2284,11 +2332,18 @@ pub fn emit_non_from_clause_subquery(
             SubqueryType::RowValue {
                 result_reg_start,
                 num_regs,
+                row_count_reg,
             } => {
                 for result_reg in *result_reg_start..*result_reg_start + *num_regs {
                     program.emit_insn(Insn::Null {
                         dest: result_reg,
                         dest_end: None,
+                    });
+                }
+                if let Some(row_count_reg) = *row_count_reg {
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: row_count_reg,
                     });
                 }
             }
