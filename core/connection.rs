@@ -1681,6 +1681,14 @@ impl Connection {
             .transpose()?;
         db_opts = db_opts.with_encryption(encryption_opts.is_some());
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
+        // Multiprocess WAL comes from the main database. An in-memory attach or
+        // one on an IO backend without shared WAL coordination is private to
+        // this process, so it opens with the ordinary WAL.
+        if db_opts.enable_multiprocess_wal
+            && (is_memory_like(&opts.path) || !io.supports_shared_wal_coordination())
+        {
+            db_opts = db_opts.with_multiprocess_wal(false);
+        }
         let db = Database::open(
             io.clone(),
             &opts.path,
