@@ -955,12 +955,8 @@ pub enum ScalarFunc {
     LoadExtension,
     Attach,
     Detach,
-    SequenceWatermark,
     // Test type functions (for custom type system testing)
     // Sequence functions
-    NextVal,
-    CurrVal,
-    SetVal,
 }
 
 impl Deterministic for ScalarFunc {
@@ -973,8 +969,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::LoadExtension => false,
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
-            ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
         }
     }
 }
@@ -991,10 +985,6 @@ impl ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => ResultType::Unknown,
-            Self::SequenceWatermark
-            | Self::NextVal
-            | Self::CurrVal
-            | Self::SetVal => ResultType::Declared(ReturnType::Integer),
             Self::TursoVersion => ResultType::Declared(ReturnType::Text),
         }
     }
@@ -1010,10 +1000,6 @@ impl Display for ScalarFunc {
             Self::LoadExtension => "load_extension",
             Self::Attach => "attach",
             Self::Detach => "detach",
-            Self::SequenceWatermark => "sequence_watermark_experimental",
-            Self::NextVal => "nextval",
-            Self::CurrVal => "currval",
-            Self::SetVal => "setval",
         };
         write!(f, "{str}")
     }
@@ -1033,7 +1019,6 @@ impl ScalarFunc {
             // 0-arg
             Self::TursoVersion => &[0],
             // 1-arg
-            Self::SequenceWatermark => &[1],
             // 2-arg
             // Truly variable-arg
             #[cfg(feature = "fs")]
@@ -1044,8 +1029,6 @@ impl ScalarFunc {
             // Internal functions that can be called by name
             // Test functions for custom types
             // Sequence functions
-            Self::NextVal | Self::CurrVal => &[1],
-            Self::SetVal => &[2, 3],
         }
     }
 

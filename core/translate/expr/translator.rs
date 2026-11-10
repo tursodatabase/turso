@@ -1372,18 +1372,6 @@ fn translate_function_call_expr(
                 }
                 // Arity and custom-types checks are done at bind time
                 // in validate_custom_type_function_call.
-                ScalarFunc::SequenceWatermark => {
-                    let args = expect_arguments_exact!(args, 1, srf);
-                    let start_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 #[cfg(feature = "fs")]
                 #[cfg(not(target_family = "wasm"))]
                 ScalarFunc::LoadExtension => {
@@ -1429,25 +1417,6 @@ fn translate_function_call_expr(
                     crate::bail_parse_error!(
                         "DETACH should be handled at statement level, not as expression"
                     );
-                }
-                ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
-                ScalarFunc::CurrVal => {
-                    let runtime_args = qualify_sequence_argument(args, resolver);
-                    translate_function(
-                        program,
-                        runtime_args.as_deref().unwrap_or(args),
-                        referenced_tables,
-                        resolver,
-                        target_register,
-                        func_ctx,
-                    )
                 }
             }
         }

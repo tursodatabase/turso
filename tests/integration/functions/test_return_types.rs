@@ -28,8 +28,7 @@ fn results_have_the_declared_return_type(tmp_db: TempDatabase) {
             vec![entry.narg]
         };
         // Experimental functions are for engine internals and take arguments
-        // that SQL samples can't make valid; sequence_watermark_experimental(NULL)
-        // never returns.
+        // that SQL samples can't make valid.
         if entry.name.ends_with("_experimental") {
             continue;
         }

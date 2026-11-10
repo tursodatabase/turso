@@ -473,3 +473,39 @@ impl FunctionCompileContext<'_, '_> {
                                 Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
     }
 }
+
+impl FunctionCompileContext<'_, '_> {
+    pub(crate) fn nextval(self) -> Result<usize> {
+        translate_sequence_function(
+            self.program,
+            self.args,
+            self.referenced_tables,
+            self.resolver,
+            self.target_register,
+            self.func_ctx,
+            true,
+        )
+    }
+    pub(crate) fn setval(self) -> Result<usize> {
+        translate_sequence_function(
+            self.program,
+            self.args,
+            self.referenced_tables,
+            self.resolver,
+            self.target_register,
+            self.func_ctx,
+            false,
+        )
+    }
+    pub(crate) fn currval(self) -> Result<usize> {
+        let runtime_args = qualify_sequence_argument(self.args, self.resolver);
+        translate_function(
+            self.program,
+            runtime_args.as_deref().unwrap_or(self.args),
+            self.referenced_tables,
+            self.resolver,
+            self.target_register,
+            self.func_ctx,
+        )
+    }
+}

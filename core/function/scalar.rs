@@ -7,6 +7,7 @@ pub(crate) mod datetime;
 pub(crate) mod internal;
 pub(crate) mod numeric;
 pub(crate) mod pattern;
+pub(crate) mod sequence;
 pub(crate) mod values;
 
 use std::collections::HashMap;
@@ -338,6 +339,10 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&internal::TestUintDecode, &[]);
     #[cfg(feature = "test_helper")]
     catalog.register(&internal::TestNondetCounter, &[]);
+    catalog.register(&sequence::NextVal, &[]);
+    catalog.register(&sequence::CurrVal, &[]);
+    catalog.register(&sequence::SetVal, &[]);
+    catalog.register(&sequence::SequenceWatermark, &[]);
     catalog
 });
 

@@ -394,7 +394,6 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_set" => Ok(Some(Func::Json(JsonFunc::JsonbSet))),
         #[cfg(feature = "json")]
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
-        "sequence_watermark_experimental" => Ok(Some(Func::Scalar(ScalarFunc::SequenceWatermark))),
         "acos" => Ok(Some(Func::Math(MathFunc::Acos))),
         "acosh" => Ok(Some(Func::Math(MathFunc::Acosh))),
         "asin" => Ok(Some(Func::Math(MathFunc::Asin))),
@@ -453,9 +452,6 @@ pub(crate) fn resolve_builtin_function_name(
         // Array functions
         // Struct/Union functions
         // Sequence functions
-        "nextval" => Ok(Some(Func::Scalar(ScalarFunc::NextVal))),
-        "currval" => Ok(Some(Func::Scalar(ScalarFunc::CurrVal))),
-        "setval" => Ok(Some(Func::Scalar(ScalarFunc::SetVal))),
         _ => Ok(None),
     }
 }

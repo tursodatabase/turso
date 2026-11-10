@@ -306,3 +306,7 @@ the declared PostgreSQL sequence type and cache size are not retained.
 
 - [DROP SEQUENCE](/docs/sql-reference/statements/drop-sequence) for removing sequences
 - [CREATE TABLE](/docs/sql-reference/statements/create-table) for `AUTOINCREMENT` on `INTEGER PRIMARY KEY` columns
+
+### Experimental sequence watermark
+
+`sequence_watermark_experimental(name)` returns the sequence's MVCC watermark, or NULL when no watermark is available. A NULL name returns NULL.
