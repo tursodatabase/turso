@@ -87,6 +87,6 @@ fn expected_typeof(declared: Option<ReturnType>) -> Option<&'static str> {
         ReturnType::Blob => Some("blob"),
         // A custom type is stored as its base type and an array as text or
         // a blob, so typeof() can't tell whether the declaration is right.
-        ReturnType::Custom(_) | ReturnType::Array => None,
+        ReturnType::Custom(_) | ReturnType::Array | ReturnType::TextArray => None,
     }
 }
