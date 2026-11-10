@@ -339,12 +339,6 @@ pub(crate) fn resolve_builtin_function_name(
             }
             Ok(Some(Func::Window(WindowFunc::CumeDist)))
         }
-        "timediff" => {
-            if arg_count != 2 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::TimeDiff)))
-        }
         "array_agg" => Ok(Some(Func::Agg(AggFunc::ArrayAgg))),
         #[cfg(feature = "json")]
         "jsonb_group_array" => Ok(Some(Func::Agg(AggFunc::JsonbGroupArray))),
@@ -359,9 +353,6 @@ pub(crate) fn resolve_builtin_function_name(
         "ifnull" => Ok(Some(Func::Scalar(ScalarFunc::IfNull))),
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
         "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
-        "date" => Ok(Some(Func::Scalar(ScalarFunc::Date))),
-        "time" => Ok(Some(Func::Scalar(ScalarFunc::Time))),
-        "datetime" => Ok(Some(Func::Scalar(ScalarFunc::DateTime))),
         "turso_version" => Ok(Some(Func::Scalar(ScalarFunc::TursoVersion))),
         "likely" => Ok(Some(Func::Scalar(ScalarFunc::Likely))),
         "likelihood" => Ok(Some(Func::Scalar(ScalarFunc::Likelihood))),
@@ -414,8 +405,6 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_set" => Ok(Some(Func::Json(JsonFunc::JsonbSet))),
         #[cfg(feature = "json")]
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
-        "unixepoch" => Ok(Some(Func::Scalar(ScalarFunc::UnixEpoch))),
-        "julianday" => Ok(Some(Func::Scalar(ScalarFunc::JulianDay))),
         "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
         "bin_record_json_object" => Ok(Some(Func::Scalar(ScalarFunc::BinRecordJsonObject))),
         "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
@@ -453,7 +442,6 @@ pub(crate) fn resolve_builtin_function_name(
         #[cfg(feature = "fs")]
         #[cfg(not(target_family = "wasm"))]
         "load_extension" => Ok(Some(Func::Scalar(ScalarFunc::LoadExtension))),
-        "strftime" => Ok(Some(Func::Scalar(ScalarFunc::StrfTime))),
         "vector" => Ok(Some(Func::Vector(VectorFunc::Vector))),
         "vector32" => Ok(Some(Func::Vector(VectorFunc::Vector32))),
         "vector32_sparse" => Ok(Some(Func::Vector(VectorFunc::Vector32Sparse))),
@@ -480,9 +468,6 @@ pub(crate) fn resolve_builtin_function_name(
         #[cfg(feature = "test_helper")]
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         // Built-in type support functions
-        "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),
-        "date_minus" => Ok(Some(Func::Scalar(ScalarFunc::DateMinus))),
-        "date_diff" => Ok(Some(Func::Scalar(ScalarFunc::DateDiff))),
         // Array construction / element access (desugared from syntax)
         "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),

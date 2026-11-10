@@ -1439,7 +1439,7 @@ fn emit_cdc_insns_v1(
     program.mark_last_insn_constant();
 
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
+        func: Func::RegisteredScalar(&crate::scalar::datetime::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
     };
@@ -1551,7 +1551,7 @@ fn emit_cdc_insns_v2(
 
     // change_time = unixepoch()
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
+        func: Func::RegisteredScalar(&crate::scalar::datetime::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
     };
@@ -1675,7 +1675,7 @@ pub fn emit_cdc_commit_insns(
 
     // reg+1: change_time = unixepoch()
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
+        func: Func::RegisteredScalar(&crate::scalar::datetime::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
     };

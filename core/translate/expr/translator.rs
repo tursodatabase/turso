@@ -1599,69 +1599,6 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Date | ScalarFunc::DateTime | ScalarFunc::JulianDay => {
-                    let start_reg = program.alloc_registers(args.len().max(1));
-                    for (i, arg) in args.iter().enumerate() {
-                        // register containing result of each argument expression
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::UnixEpoch => {
-                    let start_reg = program.alloc_registers(args.len().max(1));
-                    for (i, arg) in args.iter().enumerate() {
-                        // register containing result of each argument expression
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Time => {
-                    let start_reg = program.alloc_registers(args.len().max(1));
-                    for (i, arg) in args.iter().enumerate() {
-                        // register containing result of each argument expression
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::TimeDiff => {
-                    let args = expect_arguments_exact!(args, 2, srf);
-
-                    let start_reg = program.alloc_registers(2);
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                    translate_expr(
-                        program,
-                        referenced_tables,
-                        &args[1],
-                        start_reg + 1,
-                        resolver,
-                    )?;
-
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::Min => {
                     if args.is_empty() {
                         crate::bail_parse_error!("min function with no arguments");
@@ -1744,20 +1681,6 @@ fn translate_function_call_expr(
                         src_reg: output_register,
                         dst_reg: target_register,
                         extra_amount: 0,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::StrfTime => {
-                    let start_reg = program.alloc_registers(args.len().max(1));
-                    for (i, arg) in args.iter().enumerate() {
-                        // register containing result of each argument expression
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
                     });
                     Ok(target_register)
                 }
@@ -1883,11 +1806,7 @@ fn translate_function_call_expr(
                 ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
                     crate::bail_parse_error!("{} is an internal function used by CDC", srf);
                 }
-                ScalarFunc::TestUintEncode
-                | ScalarFunc::TestUintDecode
-                | ScalarFunc::DatePlus
-                | ScalarFunc::DateMinus
-                | ScalarFunc::DateDiff => translate_function(
+                ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => translate_function(
                     program,
                     args,
                     referenced_tables,

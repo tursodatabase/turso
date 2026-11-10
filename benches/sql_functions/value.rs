@@ -1073,7 +1073,9 @@ fn registered_scalar(bencher: Bencher, name: &str) {
     )
     .unwrap();
     let connection = db.connect(turso_core::ConnectOpts::new()).unwrap();
-    let context = turso_core::scalar::FunctionContext::new(&connection, db.io.as_ref());
+    let mut current_time = None;
+    let context =
+        turso_core::scalar::FunctionContext::new(&connection, db.io.as_ref(), &mut current_time);
     let registers = [turso_core::Register::Value(Value::from_i64(-12345))];
     bencher.bench_local(|| {
         black_box(black_box(function).execute(

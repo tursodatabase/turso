@@ -957,18 +957,11 @@ pub enum ScalarFunc {
     Min,
     Max,
     Nullif,
-    Date,
-    Time,
-    DateTime,
     TursoVersion,
-    UnixEpoch,
-    JulianDay,
     #[cfg(feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
-    StrfTime,
     Likely,
-    TimeDiff,
     Likelihood,
     TableColumnsJsonArray,
     BinRecordJsonObject,
@@ -989,10 +982,6 @@ pub enum ScalarFunc {
     /// equivalent SQL calls that contain nondeterministic functions.
     #[cfg(feature = "test_helper")]
     TestNondetCounter,
-    // Date type functions
-    DatePlus,
-    DateMinus,
-    DateDiff,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1021,18 +1010,11 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
             ScalarFunc::Nullif => true,
-            ScalarFunc::Date => false,
-            ScalarFunc::Time => false,
-            ScalarFunc::DateTime => false,
             ScalarFunc::TursoVersion => false,
-            ScalarFunc::UnixEpoch => false,
-            ScalarFunc::JulianDay => false,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => false,
-            ScalarFunc::StrfTime => false,
             ScalarFunc::Likely => true,
-            ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
             ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
             ScalarFunc::BinRecordJsonObject => true,
@@ -1048,7 +1030,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => true,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => true,
             ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => true,
             ScalarFunc::StructPack
             | ScalarFunc::StructExtractFunc
@@ -1076,8 +1057,6 @@ impl ScalarFunc {
             Self::Cast
             | Self::StructExtractFunc
             | Self::UnionExtractFunc
-            // An integer, or a real with the 'subsec' modifier.
-            | Self::UnixEpoch
             // A value of whatever struct or union type it is compared with or
             // stored in, such as `pos <> struct_pack(0, 0)` on a point column.
             | Self::StructPack
@@ -1093,23 +1072,14 @@ impl ScalarFunc {
             | Self::ConnTxnId
             | Self::IsAutocommit
             | Self::SequenceWatermark
-            | Self::DateDiff
             | Self::NextVal
             | Self::CurrVal
             | Self::SetVal => ResultType::Declared(ReturnType::Integer),
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
-            Self::JulianDay => ResultType::Declared(ReturnType::Real),
-            Self::Date
-            | Self::Time
-            | Self::DateTime
-            | Self::StrfTime
-            | Self::TimeDiff
-            | Self::TursoVersion
+            Self::TursoVersion
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
-            | Self::DatePlus
-            | Self::DateMinus
             | Self::TestUintEncode
             | Self::StatGet
             | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
@@ -1117,19 +1087,6 @@ impl ScalarFunc {
             | Self::StatPush => ResultType::Declared(ReturnType::Blob),
             Self::Array | Self::ArraySetElement => ResultType::Declared(ReturnType::Array),
         }
-    }
-
-    pub fn is_date_time_function(&self) -> bool {
-        matches!(
-            self,
-            Self::Date
-                | Self::Time
-                | Self::DateTime
-                | Self::JulianDay
-                | Self::UnixEpoch
-                | Self::StrfTime
-                | Self::TimeDiff
-        )
     }
 }
 
@@ -1145,18 +1102,11 @@ impl Display for ScalarFunc {
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
-            Self::Date => "date",
-            Self::Time => "time",
             Self::TursoVersion => "turso_version",
-            Self::JulianDay => "julianday",
-            Self::UnixEpoch => "unixepoch",
-            Self::DateTime => "datetime",
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension",
-            Self::StrfTime => "strftime",
             Self::Likely => "likely",
-            Self::TimeDiff => "timediff",
             Self::Likelihood => "likelihood",
             Self::TableColumnsJsonArray => "table_columns_json_array",
             Self::BinRecordJsonObject => "bin_record_json_object",
@@ -1173,9 +1123,6 @@ impl Display for ScalarFunc {
             Self::TestUintDecode => "test_uint_decode",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
-            Self::DatePlus => "date_plus",
-            Self::DateMinus => "date_minus",
-            Self::DateDiff => "date_diff",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1225,19 +1172,12 @@ impl ScalarFunc {
             // 1-arg
             Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
             // 2-arg
-            Self::Glob | Self::Nullif | Self::IfNull | Self::Likelihood | Self::TimeDiff => &[2],
+            Self::Glob | Self::Nullif | Self::IfNull | Self::Likelihood => &[2],
             // 3-arg
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
             // Truly variable-arg
-            Self::Coalesce
-            | Self::Iif
-            | Self::Date
-            | Self::Time
-            | Self::DateTime
-            | Self::UnixEpoch
-            | Self::JulianDay
-            | Self::StrfTime => &[-1],
+            Self::Coalesce | Self::Iif => &[-1],
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => &[-1],
@@ -1256,8 +1196,6 @@ impl ScalarFunc {
             Self::Max | Self::Min => &[-1],
             // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode => &[1],
-            // Built-in type functions
-            Self::DatePlus | Self::DateMinus | Self::DateDiff => &[2],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
@@ -1613,6 +1551,13 @@ impl Func {
     pub fn return_type(&self) -> Option<ReturnType> {
         match self.result_type() {
             ResultType::Declared(return_type) => Some(return_type),
+            _ => None,
+        }
+    }
+
+    pub fn date_time_arguments(&self) -> Option<scalar::DateTimeArguments> {
+        match self {
+            Self::RegisteredScalar(function) => function.date_time_arguments(),
             _ => None,
         }
     }

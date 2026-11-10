@@ -66,26 +66,26 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::CurrentDate => {
-            emit_current_time_function(program, ScalarFunc::Date, target_register)
+            emit_current_time_function(program, &crate::scalar::datetime::Date, target_register)
         }
         ast::Literal::CurrentTime => {
-            emit_current_time_function(program, ScalarFunc::Time, target_register)
+            emit_current_time_function(program, &crate::scalar::datetime::Time, target_register)
         }
         ast::Literal::CurrentTimestamp => {
-            emit_current_time_function(program, ScalarFunc::DateTime, target_register)
+            emit_current_time_function(program, &crate::scalar::datetime::DateTime, target_register)
         }
     }
 }
 
 fn emit_current_time_function(
     program: &mut ProgramBuilder,
-    func: ScalarFunc,
+    func: &'static dyn crate::scalar::ScalarFunction,
     target_register: usize,
 ) -> Result<usize> {
     emit_function_call(
         program,
         FuncCtx {
-            func: Func::Scalar(func),
+            func: Func::RegisteredScalar(func),
             arg_count: 0,
             collation: CollationSeq::BINARY,
         },

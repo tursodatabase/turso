@@ -1,5 +1,6 @@
 pub(crate) mod arrays;
 pub(crate) mod context;
+pub(crate) mod datetime;
 pub(crate) mod numeric;
 pub(crate) mod values;
 
@@ -14,7 +15,17 @@ use crate::{Connection, Result, Value};
 
 pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
+    fn date_time_arguments(&self) -> Option<DateTimeArguments> {
+        None
+    }
     fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value>;
+}
+
+/// Arguments checked for clock or timezone dependence in schema expressions.
+#[derive(Debug, Clone, Copy)]
+pub enum DateTimeArguments {
+    TimeValue { index: usize },
+    TimePair,
 }
 
 #[derive(Debug)]
@@ -38,11 +49,24 @@ impl ScalarFunctionMetadata {
 pub struct FunctionContext<'a> {
     connection: &'a Connection,
     io: &'a dyn crate::IO,
+    clock: datetime::StatementClock<'a>,
 }
 
 impl<'a> FunctionContext<'a> {
-    pub fn new(connection: &'a Connection, io: &'a dyn crate::IO) -> Self {
-        Self { connection, io }
+    pub fn new(
+        connection: &'a Connection,
+        io: &'a dyn crate::IO,
+        current_time: &'a mut Option<crate::WallClockInstant>,
+    ) -> Self {
+        Self {
+            connection,
+            io,
+            clock: datetime::StatementClock::new(io, current_time),
+        }
+    }
+
+    pub fn clock(&self) -> &dyn crate::Clock {
+        &self.clock
     }
 
     pub fn random_i64(&self) -> i64 {
@@ -201,6 +225,16 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&context::LastInsertRowid, &[]);
     catalog.register(&context::SqliteVersion, &[]);
     catalog.register(&context::SqliteSourceId, &[]);
+    catalog.register(&datetime::Date, &[]);
+    catalog.register(&datetime::Time, &[]);
+    catalog.register(&datetime::DateTime, &[]);
+    catalog.register(&datetime::JulianDay, &[]);
+    catalog.register(&datetime::UnixEpoch, &[]);
+    catalog.register(&datetime::StrfTime, &[]);
+    catalog.register(&datetime::TimeDiff, &[]);
+    catalog.register(&datetime::DatePlus, &[]);
+    catalog.register(&datetime::DateMinus, &[]);
+    catalog.register(&datetime::DateDiff, &[]);
     catalog
 });
 
