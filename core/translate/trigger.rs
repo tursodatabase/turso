@@ -152,8 +152,9 @@ pub fn translate_create_trigger(
         when_clause,
         commands,
     );
-    let mangled_trigger_name = resolver.mangle_name(namespace, &normalized_trigger_name);
-    let mangled_table_name = resolver.mangle_name(target_table_namespace, &normalized_table_name);
+    // sqlite_schema keeps the names as the user wrote them; lookups ignore case.
+    let stored_trigger_name = resolver.mangle_name(namespace, trigger_name.name.as_str());
+    let stored_table_name = resolver.mangle_name(target_table_namespace, tbl_name.name.as_str());
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -274,8 +275,8 @@ pub fn translate_create_trigger(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
         SchemaEntryType::Trigger,
-        &mangled_trigger_name,
-        &mangled_table_name,
+        &stored_trigger_name,
+        &stored_table_name,
         0, // triggers don't have a root page
         Some(sql),
     )?;
@@ -290,7 +291,7 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&mangled_trigger_name);
+    let escaped_trigger_name = escape_sql_string_literal(&stored_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
@@ -642,7 +643,7 @@ pub fn translate_drop_trigger(
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
 
     // Found it! Delete the row

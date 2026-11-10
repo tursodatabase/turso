@@ -292,7 +292,7 @@ pub fn translate_analyze(
             dest: tbl_col_reg,
             default: None,
         });
-        let mangled_table_name = resolver.mangle_name(namespace, &target_table.name);
+        let mangled_table_name = resolver.mangle_name(namespace, &target_table.declared_name);
         let target_tbl_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
             value: mangled_table_name.clone(),
@@ -306,7 +306,7 @@ pub fn translate_analyze(
             rhs: target_tbl_reg,
             target_pc: skip_label,
             flags: Default::default(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NOCASE,
         });
 
         if let Some(idx) = target_index.clone() {
@@ -319,7 +319,7 @@ pub fn translate_analyze(
             });
             let target_idx_reg = program.alloc_register();
             program.emit_insn(Insn::String8 {
-                value: idx.name.to_string(),
+                value: idx.declared_name.to_string(),
                 dest: target_idx_reg,
             });
             program.mark_last_insn_constant();
@@ -328,7 +328,7 @@ pub fn translate_analyze(
                 rhs: target_idx_reg,
                 target_pc: skip_label,
                 flags: Default::default(),
-                collation: CollationSeq::for_internal_values(),
+                collation: CollationSeq::NOCASE,
             });
             let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::RowId {
@@ -649,7 +649,7 @@ fn emit_index_stats(
     });
     program.mark_last_insn_constant();
     program.emit_insn(Insn::String8 {
-        value: index.name.to_string(),
+        value: index.declared_name.to_string(),
         dest: record_start + 1,
     });
     program.mark_last_insn_constant();

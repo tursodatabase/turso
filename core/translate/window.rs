@@ -652,6 +652,7 @@ fn allocate_window_minmax(
         let collation = ExprContext::new(Some(table_references), resolver).expr_collation(arg)?;
         let index = Arc::new(Index {
             name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
+            declared_name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
             table_name: String::new(),
             root_page: 0,
             columns: crate::alloc::vec![

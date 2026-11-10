@@ -1181,6 +1181,7 @@ fn get_subquery_parser<'a>(
                 let ephemeral_index = Arc::new(Index {
                     columns,
                     name: format!("ephemeral_index_where_sub_{subquery_id}"),
+                    declared_name: format!("ephemeral_index_where_sub_{subquery_id}"),
                     table_name: String::new(),
                     ephemeral: true,
                     has_rowid: false,

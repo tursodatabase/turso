@@ -12296,6 +12296,7 @@ mod tests {
                 .unwrap() as i64;
             let index_def = Index {
                 name: "testindex".to_string(),
+                declared_name: "testindex".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many((0..10).map(|i| format!("test{i}"))),
                 table_name: "test".to_string(),
@@ -12473,6 +12474,7 @@ mod tests {
                 .unwrap() as i64;
             let index_def = Index {
                 name: "testindex".to_string(),
+                declared_name: "testindex".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["testcol"]),
                 table_name: "test".to_string(),
@@ -12880,6 +12882,7 @@ mod tests {
                 .unwrap() as i64;
             let index_def = Index {
                 name: "testindex".to_string(),
+                declared_name: "testindex".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["testcol"]),
                 table_name: "test".to_string(),
@@ -14704,6 +14707,7 @@ mod tests {
         .unwrap() as i64;
         let index = Index {
             name: "seek_empty_index".to_string(),
+            declared_name: "seek_empty_index".to_string(),
             where_clause: None,
             columns: IndexColumn::new_many(["value".to_string()]),
             table_name: "seek_empty_table".to_string(),
@@ -15498,6 +15502,7 @@ mod tests {
             .unwrap() as i64;
             let index = Index {
                 name: "peer_index".to_string(),
+                declared_name: "peer_index".to_string(),
                 where_clause: None,
                 columns: IndexColumn::new_many(["k".to_string(), "v".to_string()]),
                 table_name: "peer_table".to_string(),

@@ -4359,12 +4359,14 @@ fn ephemeral_index_build(
             (None, None) => Ordering::Equal,
         }
     });
+    let ephemeral_index_name = format!(
+        "ephemeral_{}_{}",
+        table_reference.table.get_name(),
+        table_reference.internal_id
+    );
     let ephemeral_index = Index {
-        name: format!(
-            "ephemeral_{}_{}",
-            table_reference.table.get_name(),
-            table_reference.internal_id
-        ),
+        name: ephemeral_index_name.clone(),
+        declared_name: ephemeral_index_name,
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
