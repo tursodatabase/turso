@@ -302,3 +302,11 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+@cross-check-integrity
+test create-index-sqlite-compileoption-used {
+    CREATE TABLE t3b(x);
+    CREATE INDEX i3b ON t3b(sqlite_compileoption_used(x));
+}
+expect error {
+}

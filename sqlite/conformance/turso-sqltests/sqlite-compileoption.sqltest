@@ -1,0 +1,26 @@
+@database :memory:
+
+# Turso reports only the SQLite compile-time options whose features it has,
+# so these results differ from a given sqlite3 build.
+
+test sqlite-compileoption-get-lists-math-functions-first {
+    SELECT sqlite_compileoption_get(0);
+}
+expect {
+    ENABLE_MATH_FUNCTIONS
+}
+
+test sqlite-compileoption-used-percentile-matches-median {
+    SELECT sqlite_compileoption_used('ENABLE_PERCENTILE')
+         = (SELECT count(*) > 0 FROM pragma_function_list WHERE name = 'median');
+}
+expect {
+    1
+}
+
+test sqlite-compileoption-used-unsupported-feature {
+    SELECT sqlite_compileoption_used('ENABLE_FTS5'), sqlite_compileoption_used('ENABLE_RTREE');
+}
+expect {
+    0|0
+}

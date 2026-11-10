@@ -295,6 +295,45 @@ impl Value {
         Value::build_text(result)
     }
 
+    /// `sqlite_compileoption_used(X)`: 1 if X names one of
+    /// [`COMPILE_OPTIONS`](crate::dialect::engine::COMPILE_OPTIONS), else 0.
+    /// Like SQLite, the comparison ignores case and an `SQLITE_` prefix, and
+    /// a name without `=value` matches the option with any value.
+    pub fn exec_compileoption_used(&self) -> Option<Value> {
+        let value_bytes = self.byte_view()?;
+        let mut name = &value_bytes[..first_nul(&value_bytes).unwrap_or(value_bytes.len())];
+        if name
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"SQLITE_"))
+        {
+            name = &name[7..];
+        }
+        let used = crate::dialect::engine::COMPILE_OPTIONS
+            .iter()
+            .any(|option| {
+                let option = option.as_bytes();
+                option
+                    .get(..name.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(name))
+                    && !option
+                        .get(name.len())
+                        .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
+            });
+        Some(Value::from_i64(used as i64))
+    }
+
+    /// `sqlite_compileoption_get(N)`: the N-th of
+    /// [`COMPILE_OPTIONS`](crate::dialect::engine::COMPILE_OPTIONS), or NULL
+    /// when N is out of range. N is read like `sqlite3_value_int`: cast to an
+    /// integer and truncated to 32 bits.
+    pub fn exec_compileoption_get(&self) -> Result<Option<Value>> {
+        let index = self.exec_cast("INT")?.as_int().unwrap_or(0) as i32;
+        Ok(usize::try_from(index)
+            .ok()
+            .and_then(|index| crate::dialect::engine::COMPILE_OPTIONS.get(index))
+            .map(|option| Value::build_text(*option)))
+    }
+
     #[expect(
         clippy::unnecessary_lazy_evaluations,
         reason = "ok_or skips the drop glue that otherwise bloats the happy path"
@@ -737,7 +776,8 @@ impl Value {
     }
 
     /// Returns the raw bytes backing this value for the byte-manipulation
-    /// functions (`get_byte`/`set_byte`) and `soundex()`. Blobs are used verbatim; text is
+    /// functions (`get_byte`/`set_byte`), `soundex()` and
+    /// `sqlite_compileoption_used()`. Blobs are used verbatim; text is
     /// interpreted as its UTF-8 bytes; numbers use their textual form (matching
     /// how `hex()` coerces). `NULL` has no byte view.
     fn byte_view(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
