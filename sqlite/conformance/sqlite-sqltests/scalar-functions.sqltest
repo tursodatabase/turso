@@ -2912,3 +2912,61 @@ expect {
     real|0.0|0|3|3
     real|0.0|0|4|2
 }
+
+
+test scalar-catalog-optional-and-variadic-arguments {
+    SELECT round(1.25, 1), round(1.25), trim('  x  '), trim('xyx', 'x'),
+           ltrim('xyx', 'x'), rtrim('xyx', 'x'), concat(NULL), concat('a', NULL, 12),
+           round(NULL) IS NULL, trim('x', NULL) IS NULL;
+}
+expect {
+    1.3|1.0|x|y|yx|xy||a12|1|1
+}
+
+test scalar-catalog-optional-arity-zero {
+    SELECT trim();
+}
+expect error {
+    wrong number of arguments
+}
+
+test scalar-catalog-optional-arity-three {
+    SELECT round(1, 2, 3);
+}
+expect error {
+    wrong number of arguments
+}
+
+test scalar-catalog-variadic-minimum {
+    SELECT concat();
+}
+expect error {
+    wrong number of arguments
+}
+
+test scalar-catalog-stage-two-metadata {
+    SELECT name, CASE WHEN narg < 0 THEN -1 ELSE narg END, flags & 2048 FROM pragma_function_list
+    WHERE name IN ('round', 'trim', 'ltrim', 'rtrim', 'concat', 'changes', 'total_changes')
+    ORDER BY name, narg;
+}
+expect {
+    changes|0|0
+    concat|-1|2048
+    ltrim|1|2048
+    ltrim|2|2048
+    round|1|2048
+    round|2|2048
+    rtrim|1|2048
+    rtrim|2|2048
+    total_changes|0|0
+    trim|1|2048
+    trim|2|2048
+}
+
+test scalar-catalog-concat-keeps-unmatched-join-row {
+    WITH l(id) AS (VALUES (1), (2)), r(id, v) AS (VALUES (1, 'a'))
+    SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE concat(r.v, 'x') = 'x';
+}
+expect {
+    2
+}

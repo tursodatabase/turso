@@ -949,10 +949,8 @@ impl AggFunc {
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum ScalarFunc {
     Cast,
-    Changes,
     Char,
     Coalesce,
-    Concat,
     ConcatWs,
     Glob,
     IfNull,
@@ -962,10 +960,6 @@ pub enum ScalarFunc {
     Upper,
     Random,
     RandomBlob,
-    Trim,
-    LTrim,
-    RTrim,
-    Round,
     OctetLength,
     Min,
     Max,
@@ -976,7 +970,6 @@ pub enum ScalarFunc {
     Soundex,
     Date,
     Time,
-    TotalChanges,
     DateTime,
     Subtype,
     Typeof,
@@ -1081,10 +1074,8 @@ impl Deterministic for ScalarFunc {
     fn is_deterministic(&self) -> bool {
         match self {
             ScalarFunc::Cast => true,
-            ScalarFunc::Changes => false, // depends on DB state
             ScalarFunc::Char => true,
             ScalarFunc::Coalesce => true,
-            ScalarFunc::Concat => true,
             ScalarFunc::ConcatWs => true,
             ScalarFunc::Glob => true,
             ScalarFunc::IfNull => true,
@@ -1094,10 +1085,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Upper => true,
             ScalarFunc::Random => false,     // duh
             ScalarFunc::RandomBlob => false, // duh
-            ScalarFunc::Trim => true,
-            ScalarFunc::LTrim => true,
-            ScalarFunc::RTrim => true,
-            ScalarFunc::Round => true,
             ScalarFunc::OctetLength => true,
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
@@ -1108,7 +1095,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Soundex => true,
             ScalarFunc::Date => false,
             ScalarFunc::Time => false,
-            ScalarFunc::TotalChanges => false,
             ScalarFunc::DateTime => false,
             ScalarFunc::Subtype => true,
             ScalarFunc::Typeof => true,
@@ -1208,8 +1194,6 @@ impl ScalarFunc {
             | Self::Unlikely
             | Self::Likelihood
             | Self::TestUintDecode => ResultType::FirstArgument,
-            // A real for a real argument; see MathFunc::result_type.
-            Self::Round => ResultType::RealForARealArgument,
             Self::Substr | Self::Substring => ResultType::TextOrBlobLikeTheFirstArgument,
             Self::ArrayElement => ResultType::ElementOfTheFirstArgument,
             // CAST is translated as an expression, never called by name.
@@ -1228,9 +1212,7 @@ impl ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => ResultType::Unknown,
-            Self::Changes
-            | Self::TotalChanges
-            | Self::LastInsertRowid
+            Self::LastInsertRowid
             | Self::Glob
             | Self::Like
             | Self::Instr
@@ -1259,12 +1241,8 @@ impl ScalarFunc {
             Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
             Self::JulianDay => ResultType::Declared(ReturnType::Real),
             Self::Char
-            | Self::Concat
             | Self::ConcatWs
             | Self::Upper
-            | Self::Trim
-            | Self::LTrim
-            | Self::RTrim
             | Self::Replace
             | Self::Soundex
             | Self::Date
@@ -1339,10 +1317,8 @@ impl Display for ScalarFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
             Self::Cast => "cast",
-            Self::Changes => "changes",
             Self::Char => "char",
             Self::Coalesce => "coalesce",
-            Self::Concat => "concat",
             Self::ConcatWs => "concat_ws",
             Self::Glob => "glob",
             Self::IfNull => "ifnull",
@@ -1352,10 +1328,6 @@ impl Display for ScalarFunc {
             Self::Upper => "upper",
             Self::Random => "random",
             Self::RandomBlob => "randomblob",
-            Self::Trim => "trim",
-            Self::LTrim => "ltrim",
-            Self::RTrim => "rtrim",
-            Self::Round => "round",
             Self::OctetLength => "octet_length",
             Self::Min => "min",
             Self::Max => "max",
@@ -1366,7 +1338,6 @@ impl Display for ScalarFunc {
             Self::Soundex => "soundex",
             Self::Date => "date",
             Self::Time => "time",
-            Self::TotalChanges => "total_changes",
             Self::Subtype => "subtype",
             Self::Typeof => "typeof",
             Self::Unicode => "unicode",
@@ -1485,13 +1456,11 @@ impl ScalarFunc {
     pub fn arities(&self) -> &'static [i32] {
         match self {
             // 0-arg
-            Self::Changes
-            | Self::LastInsertRowid
+            Self::LastInsertRowid
             | Self::Random
             | Self::SqliteVersion
             | Self::TursoVersion
-            | Self::SqliteSourceId
-            | Self::TotalChanges => &[0],
+            | Self::SqliteSourceId => &[0],
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
@@ -1523,13 +1492,12 @@ impl ScalarFunc {
             Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
-            Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
+            Self::Unhex => &[1, 2],
             Self::Substr | Self::Substring => &[2, 3],
             // Truly variable-arg
             Self::Char
             | Self::Coalesce
             | Self::Iif
-            | Self::Concat
             | Self::ConcatWs
             | Self::Date
             | Self::Time
@@ -1964,9 +1932,7 @@ impl Func {
             Self::Scalar(scalar_func) => {
                 let basic = matches!(
                     scalar_func,
-                    ScalarFunc::Changes
-                        | ScalarFunc::Random
-                        | ScalarFunc::TotalChanges
+                    ScalarFunc::Random
                         | ScalarFunc::SqliteVersion
                         | ScalarFunc::TursoVersion
                         | ScalarFunc::SqliteSourceId
@@ -1975,6 +1941,9 @@ impl Func {
                 #[cfg(feature = "test_helper")]
                 let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
                 basic
+            }
+            Self::RegisteredScalar(function) => {
+                matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
             }
             Self::Math(math_func) => {
                 matches!(math_func.arity(), MathFuncArity::Nullary)

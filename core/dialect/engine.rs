@@ -356,20 +356,12 @@ pub(crate) fn resolve_builtin_function_name(
         "json_group_object" => Ok(Some(Func::Agg(AggFunc::JsonGroupObject))),
         "char" | "chr" => Ok(Some(Func::Scalar(ScalarFunc::Char))),
         "coalesce" => Ok(Some(Func::Scalar(ScalarFunc::Coalesce))),
-        "concat" => {
-            if arg_count == 0 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::Concat)))
-        }
         "concat_ws" => {
             if arg_count < 2 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Scalar(ScalarFunc::ConcatWs)))
         }
-        "changes" => Ok(Some(Func::Scalar(ScalarFunc::Changes))),
-        "total_changes" => Ok(Some(Func::Scalar(ScalarFunc::TotalChanges))),
         "glob" => Ok(Some(Func::Scalar(ScalarFunc::Glob))),
         "ifnull" => Ok(Some(Func::Scalar(ScalarFunc::IfNull))),
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
@@ -378,10 +370,6 @@ pub(crate) fn resolve_builtin_function_name(
         "upper" => Ok(Some(Func::Scalar(ScalarFunc::Upper))),
         "random" => Ok(Some(Func::Scalar(ScalarFunc::Random))),
         "randomblob" => Ok(Some(Func::Scalar(ScalarFunc::RandomBlob))),
-        "trim" | "btrim" => Ok(Some(Func::Scalar(ScalarFunc::Trim))),
-        "ltrim" => Ok(Some(Func::Scalar(ScalarFunc::LTrim))),
-        "rtrim" => Ok(Some(Func::Scalar(ScalarFunc::RTrim))),
-        "round" => Ok(Some(Func::Scalar(ScalarFunc::Round))),
         "octet_length" => Ok(Some(Func::Scalar(ScalarFunc::OctetLength))),
         "sign" => Ok(Some(Func::Scalar(ScalarFunc::Sign))),
         "substr" => {

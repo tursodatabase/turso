@@ -1392,19 +1392,6 @@ fn translate_function_call_expr(
                                 [array_reg <- 0, index_reg <- 1, value_reg <- 2],
                                 Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })
                 }
-                ScalarFunc::Changes => {
-                    if !args.is_empty() {
-                        crate::bail_parse_error!("{} function with more than 0 arguments", srf);
-                    }
-                    let start_reg = program.alloc_register();
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::Char => translate_function(
                     program,
                     args,
@@ -1449,27 +1436,6 @@ fn translate_function_call_expr(
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg: regs,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Concat => {
-                    if args.is_empty() {
-                        crate::bail_parse_error!(
-                            "wrong number of arguments to function {}()",
-                            srf.to_string()
-                        );
-                    };
-                    // Allocate all registers upfront to ensure they're consecutive,
-                    // since translate_expr may allocate internal registers.
-                    let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
                         dest: target_register,
                         func: func_ctx,
                     });
@@ -1811,27 +1777,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::TotalChanges => {
-                    if !args.is_empty() {
-                        crate::bail_parse_error!(
-                            "{} function with more than 0 arguments",
-                            srf.to_string()
-                        );
-                    }
-                    let start_reg = program.alloc_register();
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Trim
-                | ScalarFunc::LTrim
-                | ScalarFunc::RTrim
-                | ScalarFunc::Round
-                | ScalarFunc::Unhex => {
+                ScalarFunc::Unhex => {
                     let args = expect_arguments_max!(args, 2, srf);
 
                     let start_reg = program.alloc_registers(args.len());

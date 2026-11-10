@@ -5,11 +5,11 @@ use std::sync::LazyLock;
 pub use super::arity::FunctionArity;
 pub use super::{ResultType, ReturnType};
 use crate::vdbe::Register;
-use crate::{Result, Value};
+use crate::{Connection, Result, Value};
 
 pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
-    fn execute(&self, args: FunctionArgs<'_>) -> Result<Value>;
+    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value>;
 }
 
 #[derive(Debug)]
@@ -30,6 +30,24 @@ impl ScalarFunctionMetadata {
     }
 }
 
+pub struct FunctionContext<'a> {
+    connection: &'a Connection,
+}
+
+impl<'a> FunctionContext<'a> {
+    pub fn new(connection: &'a Connection) -> Self {
+        Self { connection }
+    }
+
+    pub fn changes(&self) -> i64 {
+        self.connection.changes()
+    }
+
+    pub fn total_changes(&self) -> i64 {
+        self.connection.total_changes()
+    }
+}
+
 pub struct FunctionArgs<'a> {
     registers: &'a [Register],
 }
@@ -41,6 +59,14 @@ impl<'a> FunctionArgs<'a> {
 
     pub fn get(&self, index: usize) -> &'a Value {
         self.registers[index].get_value()
+    }
+
+    pub fn get_optional(&self, index: usize) -> Option<&'a Value> {
+        self.registers.get(index).map(Register::get_value)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a Value> + 'a {
+        self.registers.iter().map(Register::get_value)
     }
 
     pub fn len(&self) -> usize {
@@ -93,6 +119,13 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&Abs, &[]);
     catalog.register(&Lower, &[]);
     catalog.register(&Length, &["char_length", "character_length"]);
+    catalog.register(&Round, &[]);
+    catalog.register(&Trim, &["btrim"]);
+    catalog.register(&LTrim, &[]);
+    catalog.register(&RTrim, &[]);
+    catalog.register(&Concat, &[]);
+    catalog.register(&Changes, &[]);
+    catalog.register(&TotalChanges, &[]);
     catalog
 });
 
@@ -110,7 +143,7 @@ impl ScalarFunction for Abs {
         }
     }
 
-    fn execute(&self, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
         args.get(0).exec_abs()
     }
 }
@@ -129,7 +162,7 @@ impl ScalarFunction for Lower {
         }
     }
 
-    fn execute(&self, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
         Ok(args.get(0).exec_lower().unwrap_or(Value::Null))
     }
 }
@@ -148,8 +181,141 @@ impl ScalarFunction for Length {
         }
     }
 
-    fn execute(&self, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
         Ok(args.get(0).exec_length())
+    }
+}
+
+#[derive(Debug)]
+struct Round;
+
+impl ScalarFunction for Round {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "round",
+            arity: FunctionArity::OneOf(&[1, 2]),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::RealForARealArgument,
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_round(args.get_optional(1)))
+    }
+}
+
+#[derive(Debug)]
+struct Trim;
+
+impl ScalarFunction for Trim {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "trim",
+            arity: FunctionArity::OneOf(&[1, 2]),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_trim(args.get_optional(1)))
+    }
+}
+
+#[derive(Debug)]
+struct LTrim;
+
+impl ScalarFunction for LTrim {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "ltrim",
+            arity: FunctionArity::OneOf(&[1, 2]),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_ltrim(args.get_optional(1)))
+    }
+}
+
+#[derive(Debug)]
+struct RTrim;
+
+impl ScalarFunction for RTrim {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "rtrim",
+            arity: FunctionArity::OneOf(&[1, 2]),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_rtrim(args.get_optional(1)))
+    }
+}
+
+#[derive(Debug)]
+struct Concat;
+
+impl ScalarFunction for Concat {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "concat",
+            arity: FunctionArity::AtLeast(1),
+            deterministic: true,
+            can_mask_nulls: true,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(Value::exec_concat_strings(args.iter()))
+    }
+}
+
+#[derive(Debug)]
+struct Changes;
+
+impl ScalarFunction for Changes {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "changes",
+            arity: FunctionArity::Exact(0),
+            deterministic: false,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Integer),
+        }
+    }
+
+    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(Value::from_i64(context.changes()))
+    }
+}
+
+#[derive(Debug)]
+struct TotalChanges;
+
+impl ScalarFunction for TotalChanges {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "total_changes",
+            arity: FunctionArity::Exact(0),
+            deterministic: false,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Integer),
+        }
+    }
+
+    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(Value::from_i64(context.total_changes()))
     }
 }
 

@@ -1066,12 +1066,20 @@ fn registered_scalar(bencher: Bencher, name: &str) {
     else {
         panic!("expected a registered scalar");
     };
+    let db = turso_core::Database::open_file(
+        std::sync::Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        std::sync::Arc::new(turso_sqlite::SqliteDialect),
+    )
+    .unwrap();
+    let connection = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let context = turso_core::scalar::FunctionContext::new(&connection);
     let registers = [turso_core::Register::Value(Value::from_i64(-12345))];
     bencher.bench_local(|| {
-        black_box(
-            black_box(function)
-                .execute(turso_core::scalar::FunctionArgs::new(black_box(&registers))),
-        )
+        black_box(black_box(function).execute(
+            &context,
+            turso_core::scalar::FunctionArgs::new(black_box(&registers)),
+        ))
     });
 }
 

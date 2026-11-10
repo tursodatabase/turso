@@ -10341,7 +10341,8 @@ pub fn op_function(
             let args = crate::function::scalar::FunctionArgs::new(
                 &state.registers[*start_reg..*start_reg + arg_count],
             );
-            let value = function.execute(args)?;
+            let context = crate::function::scalar::FunctionContext::new(&program.connection);
+            let value = function.execute(&context, args)?;
             state.registers[*dest].set_value(value);
         }
         crate::function::Func::Scalar(scalar_func) => match scalar_func {
@@ -10361,11 +10362,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::Changes => {
-                let res = &program.connection.changes;
-                let changes = res.load(Ordering::SeqCst);
-                state.registers[*dest].set_int(changes);
-            }
             ScalarFunc::Char => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 state.registers[*dest].set_value(Value::exec_char(
@@ -10373,12 +10369,6 @@ pub fn op_function(
                 ));
             }
             ScalarFunc::Coalesce => {}
-            ScalarFunc::Concat => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result =
-                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::ConcatWs => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
@@ -10677,55 +10667,6 @@ pub fn op_function(
                     .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
-            ScalarFunc::Trim => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_trim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::LTrim => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_ltrim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::RTrim => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_rtrim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Round => {
-                let reg_value = &state.registers[*start_reg];
-                assert!(arg_count == 1 || arg_count == 2);
-                let precision_value = if arg_count > 1 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_round(precision_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::Min => {
                 let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
@@ -10792,11 +10733,6 @@ pub fn op_function(
 
                     state.registers[*dest].set_value(result);
                 }
-            }
-            ScalarFunc::TotalChanges => {
-                let res = &program.connection.total_changes;
-                let total_changes = res.load(Ordering::SeqCst);
-                state.registers[*dest].set_int(total_changes);
             }
             ScalarFunc::DateTime => {
                 let values =

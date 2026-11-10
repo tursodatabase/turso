@@ -1080,6 +1080,49 @@ mod tests {
         conn.close().unwrap();
     }
 
+    #[test]
+    fn registered_scalar_context_uses_current_connection() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "trait-context.db", Arc::new(TestDialect::default())).unwrap();
+        let first = db.connect(ConnectOpts::new()).unwrap();
+        let second = db.connect(ConnectOpts::new()).unwrap();
+        first.execute("CREATE TABLE t(v)").unwrap();
+        let mut statement = first
+            .prepare("SELECT changes(), total_changes(), changes(*), total_changes(*)")
+            .unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(0); 4]]
+        );
+        first.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        statement.reset().unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2); 4]]
+        );
+        second.execute("INSERT INTO t VALUES (3)").unwrap();
+        let rows = second
+            .prepare("SELECT changes(), total_changes()")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1); 2]]);
+        first.execute("DELETE FROM t WHERE v = 1").unwrap();
+        statement.reset().unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(1),
+                Value::from_i64(3),
+                Value::from_i64(1),
+                Value::from_i64(3)
+            ]]
+        );
+        drop(statement);
+        first.close().unwrap();
+        second.close().unwrap();
+    }
+
     #[derive(Debug)]
     struct TestTraitAdd;
 
@@ -1096,7 +1139,11 @@ mod tests {
             }
         }
 
-        fn execute(&self, args: crate::function::scalar::FunctionArgs<'_>) -> Result<Value> {
+        fn execute(
+            &self,
+            _context: &crate::scalar::FunctionContext<'_>,
+            args: crate::function::scalar::FunctionArgs<'_>,
+        ) -> Result<Value> {
             let (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) =
                 (args.get(0), args.get(1))
             else {
