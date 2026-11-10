@@ -2157,12 +2157,12 @@ impl Connection {
         self.check_constraints_pragma.load(Ordering::Acquire)
     }
 
-    pub fn set_automatic_index(&self, enable: bool) {
+    pub(crate) fn set_automatic_index(&self, enable: bool) {
         self.automatic_index_pragma.store(enable, Ordering::Release);
         self.bump_prepare_context_generation();
     }
 
-    pub fn automatic_index(&self) -> bool {
+    pub(crate) fn automatic_index(&self) -> bool {
         self.automatic_index_pragma.load(Ordering::Acquire)
     }
 
