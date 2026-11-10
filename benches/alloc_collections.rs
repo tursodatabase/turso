@@ -1,8 +1,9 @@
 #![cfg_attr(nightly, feature(allocator_api))]
 
-use divan::{black_box, black_box_drop, AllocProfiler, Bencher};
+use divan::{black_box, black_box_drop, AllocProfiler};
 use mimalloc::MiMalloc;
 use rustc_hash::FxBuildHasher;
+use turso_benches::Bencher;
 use turso_core::alloc::{
     self, TryClone, TursoBinaryHeapExt, TursoFromIterator, TursoHashMapExt, TursoHashSetExt,
     TursoIteratorExt, TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
