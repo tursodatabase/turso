@@ -298,6 +298,36 @@ expect {
     t|f|t|t|null|t
 }
 
+test select-cast-text-to-boolean {
+    CREATE TABLE bool_text (s text);
+    INSERT INTO bool_text VALUES ('on'), ('f');
+    SELECT CASE WHEN 't'::bool THEN 't' ELSE 'f' END,
+           CASE WHEN 'yes'::text::bool THEN 't' ELSE 'f' END,
+           CASE WHEN 'off'::text::bool THEN 't' ELSE 'f' END,
+           CASE WHEN CAST('TRUE' AS boolean) THEN 't' ELSE 'f' END;
+    SELECT s, CASE WHEN s::bool THEN 't' ELSE 'f' END FROM bool_text ORDER BY s;
+}
+expect {
+    t|t|f|t
+    f|f
+    on|t
+}
+
+test select-cast-integer-to-boolean {
+    SELECT CASE WHEN 5::bool THEN 't' ELSE 'f' END,
+           CASE WHEN 0::bool THEN 't' ELSE 'f' END,
+           CASE WHEN (-3)::bool THEN 't' ELSE 'f' END,
+           CASE WHEN (NULL::integer)::bool IS NULL THEN 'null' END;
+}
+expect {
+    t|f|t|null
+}
+
+test select-cast-text-that-is-not-a-boolean-to-boolean-errors {
+    SELECT 'maybe'::text::bool;
+}
+expect error {}
+
 test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
     CREATE DOMAIN db AS boolean;
     SELECT '5'::db;

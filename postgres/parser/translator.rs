@@ -6525,9 +6525,9 @@ fn pg_type_name_to_ast_type(
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        // For CAST expressions, map all text-like PG types to TEXT. Boolean
+        // goes to the boolean type, whose ENCODE reads 't', 'yes', 'off', ...
+        "BOOLEAN" | "BOOL" => "boolean",
         "DATE" => "date",
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
