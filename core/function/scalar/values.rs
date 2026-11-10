@@ -108,7 +108,7 @@ impl ScalarFunction for Unistr {
         }
     }
     fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_unistr()?)
+        args.get(0).exec_unistr()
     }
 }
 
@@ -162,7 +162,7 @@ impl ScalarFunction for ZeroBlob {
         }
     }
     fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_zeroblob()?)
+        args.get(0).exec_zeroblob()
     }
 }
 
