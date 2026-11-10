@@ -260,8 +260,8 @@ impl ScalarFunction for TableColumnsJsonArray {
     }
     fn execute(
         &self,
-        context: &FunctionContext<'_>,
-        args: FunctionArgs<'_>,
+        _context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
         _state: &mut ScalarState,
     ) -> Result<IOResult<Value>> {
         #[cfg(not(feature = "json"))]
@@ -274,14 +274,14 @@ impl ScalarFunction for TableColumnsJsonArray {
         {
             use crate::types::TextSubtype;
 
-            let table = args.get(0);
+            let table = _args.get(0);
             let Value::Text(table) = table else {
                 return Err(LimboError::InvalidArgument(
                     "table_columns_json_array: function argument must be of type TEXT".to_string(),
                 ));
             };
             let table = {
-                let schema = context.connection.schema.read();
+                let schema = _context.connection.schema.read();
                 match schema.get_table(NamespaceId::ROOT, table.as_str()) {
                     Some(table) => table,
                     None => {
@@ -334,7 +334,7 @@ impl ScalarFunction for BinRecordJsonObject {
     fn execute(
         &self,
         _context: &FunctionContext<'_>,
-        args: FunctionArgs<'_>,
+        _args: FunctionArgs<'_>,
         _state: &mut ScalarState,
     ) -> Result<IOResult<Value>> {
         #[cfg(not(feature = "json"))]
@@ -348,8 +348,8 @@ impl ScalarFunction for BinRecordJsonObject {
             use crate::types::ValueIterator;
             use std::str::FromStr;
 
-            let columns_str = args.get(0);
-            let bin_record = args.get(1);
+            let columns_str = _args.get(0);
+            let bin_record = _args.get(1);
             let Value::Text(columns_str) = columns_str else {
                 return Err(LimboError::InvalidArgument(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()

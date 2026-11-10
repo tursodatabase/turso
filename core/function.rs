@@ -947,101 +947,6 @@ impl AggFunc {
 }
 
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
-pub enum ScalarFunc {
-    Cast,
-    TursoVersion,
-    #[cfg(feature = "fs")]
-    #[cfg(not(target_family = "wasm"))]
-    LoadExtension,
-    Attach,
-    Detach,
-    // Test type functions (for custom type system testing)
-    // Sequence functions
-}
-
-impl Deterministic for ScalarFunc {
-    fn is_deterministic(&self) -> bool {
-        match self {
-            ScalarFunc::Cast => true,
-            ScalarFunc::TursoVersion => false,
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => false,
-            ScalarFunc::Attach => false, // changes database state
-            ScalarFunc::Detach => false, // changes database state
-        }
-    }
-}
-
-impl ScalarFunc {
-    /// How the type of the function's result follows from its arguments.
-    pub fn result_type(&self) -> ResultType {
-        match self {
-            // CAST is translated as an expression, never called by name.
-            Self::Cast
-            // Always NULL.
-            | Self::Attach
-            | Self::Detach => ResultType::Unknown,
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => ResultType::Unknown,
-            Self::TursoVersion => ResultType::Declared(ReturnType::Text),
-        }
-    }
-}
-
-impl Display for ScalarFunc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = match self {
-            Self::Cast => "cast",
-            Self::TursoVersion => "turso_version",
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => "load_extension",
-            Self::Attach => "attach",
-            Self::Detach => "detach",
-        };
-        write!(f, "{str}")
-    }
-}
-
-impl ScalarFunc {
-    /// Returns true for internal functions that should not appear in PRAGMA function_list.
-    pub fn is_internal(&self) -> bool {
-        matches!(self, Self::Cast | Self::Attach | Self::Detach)
-    }
-
-    /// Returns the valid arities for this function.
-    /// Each value becomes a separate row in PRAGMA function_list.
-    /// -1 means truly variable arguments (e.g. coalesce, printf).
-    pub fn arities(&self) -> &'static [i32] {
-        match self {
-            // 0-arg
-            Self::TursoVersion => &[0],
-            // 1-arg
-            // 2-arg
-            // Truly variable-arg
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => &[-1],
-            // Internal functions that cannot be called by name
-            Self::Cast | Self::Attach | Self::Detach => &[0],
-            // Internal functions that can be called by name
-            // Test functions for custom types
-            // Sequence functions
-        }
-    }
-
-    /// Returns true for functions that can turn NULL arguments into a non-NULL result.
-    ///
-    /// This is used by planner/optimizer logic that needs to reason about whether
-    /// predicates are null-rejecting for outer-join simplification.
-    pub fn can_mask_nulls(&self) -> bool {
-        false
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum MathFunc {
     Acos,
     Acosh,
@@ -1210,7 +1115,6 @@ impl Display for AlterTableFunc {
 pub enum Func {
     Agg(AggFunc),
     Window(WindowFunc),
-    Scalar(ScalarFunc),
     RegisteredScalar(&'static dyn scalar::ScalarFunction),
     Math(MathFunc),
     Vector(VectorFunc),
@@ -1231,7 +1135,6 @@ impl Display for Func {
         match self {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
             Self::Window(window_func) => write!(f, "{window_func}"),
-            Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::RegisteredScalar(func) => f.write_str(func.metadata().name),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
@@ -1260,7 +1163,6 @@ impl Deterministic for Func {
         match self {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
             Self::Window(window_func) => window_func.is_deterministic(),
-            Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
             Self::RegisteredScalar(func) => func.metadata().deterministic,
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
@@ -1348,7 +1250,6 @@ impl Func {
             None => ResultType::Unknown,
         };
         match self {
-            Self::Scalar(func) => func.result_type(),
             Self::RegisteredScalar(func) => func.metadata().result_type,
             Self::Math(func) => func.result_type(),
             #[cfg(feature = "json")]
@@ -1397,10 +1298,6 @@ impl Func {
             return true;
         }
         match self {
-            Self::Scalar(scalar_func) => {
-                let basic = matches!(scalar_func, ScalarFunc::TursoVersion);
-                basic
-            }
             Self::RegisteredScalar(function) => {
                 !function.is_internal()
                     && matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
@@ -1420,7 +1317,6 @@ impl Func {
     /// This metadata is currently used by optimizer null-rejection analysis.
     pub fn can_mask_nulls(&self) -> bool {
         match self {
-            Self::Scalar(scalar_func) => scalar_func.can_mask_nulls(),
             Self::RegisteredScalar(func) => func.metadata().can_mask_nulls,
             _ => false,
         }
@@ -1471,14 +1367,6 @@ impl Func {
                 });
             }
         };
-
-        // Scalar functions (filter out internal-only variants)
-        for f in ScalarFunc::iter() {
-            if f.is_internal() {
-                continue;
-            }
-            push(f.to_string(), "s", f.arities(), f.is_deterministic());
-        }
 
         for function in scalar::BUILTIN_SCALAR_FUNCTIONS.functions() {
             if function.is_internal() {

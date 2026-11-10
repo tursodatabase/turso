@@ -16,7 +16,6 @@ use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
-use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
@@ -65,7 +64,7 @@ use crate::vector::{
 };
 use crate::{
     connection::Row,
-    get_cursor, info, is_attached_db,
+    get_cursor, is_attached_db,
     storage::wal::CheckpointResult,
     turso_assert,
     types::{AggContext, Cursor, SeekKey, SeekOp, SumAggState, Value, ValueType},
@@ -84,7 +83,7 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
-    function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    function::{AggFunc, MathFunc, MathFuncArity, VectorFunc},
     translate::emitter::TransactionMode,
 };
 use branches::{mark_unlikely, unlikely};
@@ -177,8 +176,6 @@ use crate::{
 
 use super::{Program, ProgramState, Register};
 
-#[cfg(feature = "fs")]
-use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
 use crate::{
     bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
@@ -10309,7 +10306,7 @@ pub fn op_function(
             );
             let context = crate::function::scalar::FunctionContext::new(
                 &program.connection,
-                pager.io.as_ref(),
+                pager,
                 &mut state.current_time,
                 func.collation,
             );
@@ -10318,107 +10315,6 @@ pub fn op_function(
             let value = return_if_io!(state, result);
             state.registers[*dest].set_value(value);
         }
-        crate::function::Func::Scalar(scalar_func) => match scalar_func {
-            ScalarFunc::Cast => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
-                let result = {
-                    let Value::Text(cast_type) = state.registers[*start_reg + 1].get_value() else {
-                        unreachable!("Cast with non-text type");
-                    };
-                    state.registers[*start_reg]
-                        .get_value()
-                        .exec_cast(cast_type.as_str())?
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TursoVersion => {
-                if !program.connection.is_db_initialized() {
-                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
-                } else {
-                    let version_integer =
-                        return_if_io!(state, pager.with_header(|header| header.version_number))
-                            .get() as i64;
-                    let version = execute_turso_version(version_integer);
-                    state.registers[*dest].set_text(Text::new(version))?;
-                }
-            }
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => {
-                if !program.connection.can_load_extensions() {
-                    crate::bail_parse_error!("runtime extension loading is disabled");
-                }
-                if !program.connection.current_role_is_superuser() {
-                    return Err(LimboError::PermissionDenied(Box::new(
-                        PermissionDenied::privilege(
-                            Action::Execute,
-                            Object::Function("load_extension".to_string()),
-                        ),
-                    ))
-                    .into());
-                }
-                let extension = &state.registers[*start_reg];
-                let ext = resolve_ext_path(&extension.get_value().to_string())?;
-                program.connection.load_extension(ext)?;
-            }
-            ScalarFunc::Attach => {
-                assert_eq!(arg_count, 3);
-                let filename = state.registers[*start_reg].get_value();
-                let dbname = state.registers[*start_reg + 1].get_value();
-                let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
-
-                let Value::Text(filename_str) = filename else {
-                    return Err(LimboError::InvalidArgument(
-                        "attach: filename argument must be text".to_string(),
-                    )
-                    .into());
-                };
-
-                let Value::Text(dbname_str) = dbname else {
-                    return Err(LimboError::InvalidArgument(
-                        "attach: database name argument must be text".to_string(),
-                    )
-                    .into());
-                };
-
-                return_if_io!(
-                    state,
-                    program.connection.attach_database(
-                        filename_str.as_str(),
-                        dbname_str.as_str(),
-                        state.active_op_state.attach(),
-                    )
-                );
-                // Sequence descriptors for the attached database are
-                // loaded lazily by `maybe_reparse_schema` on the next
-                // statement (ATTACH bumps the schema cookie, so the
-                // very next prepare reparses). Issuing a SQL load via
-                // `prepare_internal` from inside this opcode handler
-                // would drive `pager.io.step()` synchronously and break
-                // the vdbe async contract.
-
-                state.active_op_state.clear();
-                state.registers[*dest].set_null();
-            }
-            ScalarFunc::Detach => {
-                assert_eq!(arg_count, 1);
-                let dbname = state.registers[*start_reg].get_value();
-
-                let Value::Text(dbname_str) = dbname else {
-                    return Err(LimboError::InvalidArgument(
-                        "detach: database name argument must be text".to_string(),
-                    )
-                    .into());
-                };
-
-                // Call the detach_database method on the connection
-                program.connection.detach_database(dbname_str.as_str())?;
-
-                // Set result to NULL (detach doesn't return a value)
-                state.registers[*dest].set_null();
-            }
-        },
         crate::function::Func::Vector(vector_func) => {
             let args = &state.registers[*start_reg..*start_reg + arg_count];
             match vector_func {
@@ -11292,8 +11188,6 @@ pub fn op_function(
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
-
-pub(crate) type OpAttachState = crate::attach::AttachDatabaseState;
 
 pub fn op_sequence(
     _program: &Program,
@@ -18465,14 +18359,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
-fn execute_turso_version(version_integer: i64) -> String {
-    let major = version_integer / 1_000_000;
-    let minor = (version_integer % 1_000_000) / 1_000;
-    let release = version_integer % 1_000;
-
-    format!("{major}.{minor}.{release}")
-}
-
 /// Coerce a value to i64 using the same non-NULL conversion rules as
 /// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
@@ -20089,13 +19975,6 @@ mod tests {
             matches!(*err, LimboError::InternalError(ref message) if message.contains("content register")),
             "unexpected error: {err:?}"
         );
-    }
-
-    #[test]
-    fn test_execute_turso_version() {
-        let version_integer = 3046001;
-        let expected = "3.46.1";
-        assert_eq!(execute_turso_version(version_integer), expected);
     }
 
     #[test]

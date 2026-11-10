@@ -1365,61 +1365,6 @@ fn translate_function_call_expr(
                 Ok(target_register)
             }
         },
-        Func::Scalar(srf) => {
-            match srf {
-                ScalarFunc::Cast => {
-                    unreachable!("this is always ast::Expr::Cast")
-                }
-                // Arity and custom-types checks are done at bind time
-                // in validate_custom_type_function_call.
-                #[cfg(feature = "fs")]
-                #[cfg(not(target_family = "wasm"))]
-                ScalarFunc::LoadExtension => {
-                    let args = expect_arguments_exact!(args, 1, srf);
-                    let start_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::TursoVersion => {
-                    if !args.is_empty() {
-                        crate::bail_parse_error!("sqlite_version function with arguments");
-                    }
-
-                    let output_register = program.alloc_register();
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: output_register,
-                        dest: output_register,
-                        func: func_ctx,
-                    });
-
-                    program.emit_insn(Insn::Copy {
-                        src_reg: output_register,
-                        dst_reg: target_register,
-                        extra_amount: 0,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Attach => {
-                    // ATTACH is handled by the attach.rs module, not here
-                    crate::bail_parse_error!(
-                        "ATTACH should be handled at statement level, not as expression"
-                    );
-                }
-                ScalarFunc::Detach => {
-                    // DETACH is handled by the attach.rs module, not here
-                    crate::bail_parse_error!(
-                        "DETACH should be handled at statement level, not as expression"
-                    );
-                }
-            }
-        }
         Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => {
                 if !args.is_empty() {

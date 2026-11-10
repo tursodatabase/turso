@@ -35,7 +35,7 @@ use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 #[allow(unused_imports)]
-use crate::function::{AggFunc, Func, MathFunc, ScalarFunc, VectorFunc, WindowFunc};
+use crate::function::{AggFunc, Func, MathFunc, VectorFunc, WindowFunc};
 
 /// The dialect of the statements the engine runs for itself: SQLite SQL
 /// with the built-in functions and catalog tables.
@@ -190,15 +190,6 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
     let func = resolve_builtin_function_name(name, arg_count)?;
-    // Reject scalar calls whose argument count is not in `arities()`.
-    if let Some(Func::Scalar(srf)) = &func {
-        let arities = srf.arities();
-        if !arities.contains(&-1)
-            && !i32::try_from(arg_count).is_ok_and(|count| arities.contains(&count))
-        {
-            crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-        }
-    }
     if let Some(Func::RegisteredScalar(function)) = &func {
         function.metadata().validate_arg_count(name, arg_count)?;
     }
@@ -345,7 +336,6 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_group_object" => Ok(Some(Func::Agg(AggFunc::JsonbGroupObject))),
         #[cfg(feature = "json")]
         "json_group_object" => Ok(Some(Func::Agg(AggFunc::JsonGroupObject))),
-        "turso_version" => Ok(Some(Func::Scalar(ScalarFunc::TursoVersion))),
         #[cfg(feature = "json")]
         "json" => Ok(Some(Func::Json(JsonFunc::Json))),
         #[cfg(feature = "json")]
@@ -423,9 +413,6 @@ pub(crate) fn resolve_builtin_function_name(
         "tan" => Ok(Some(Func::Math(MathFunc::Tan))),
         "tanh" => Ok(Some(Func::Math(MathFunc::Tanh))),
         "trunc" => Ok(Some(Func::Math(MathFunc::Trunc))),
-        #[cfg(feature = "fs")]
-        #[cfg(not(target_family = "wasm"))]
-        "load_extension" => Ok(Some(Func::Scalar(ScalarFunc::LoadExtension))),
         "vector" => Ok(Some(Func::Vector(VectorFunc::Vector))),
         "vector32" => Ok(Some(Func::Vector(VectorFunc::Vector32))),
         "vector32_sparse" => Ok(Some(Func::Vector(VectorFunc::Vector32Sparse))),

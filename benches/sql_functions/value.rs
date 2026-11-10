@@ -1074,9 +1074,10 @@ fn registered_scalar(bencher: Bencher, name: &str) {
     .unwrap();
     let connection = db.connect(turso_core::ConnectOpts::new()).unwrap();
     let mut current_time = None;
+    let pager = connection.get_pager();
     let context = turso_core::scalar::FunctionContext::new(
         &connection,
-        db.io.as_ref(),
+        &pager,
         &mut current_time,
         CollationSeq::BINARY,
     );

@@ -2,7 +2,7 @@
 //! type its results really have.
 //!
 //! The list of functions comes from `Func::builtin_function_list`, which walks
-//! the function enums, so a new function is checked as soon as it is added.
+//! the builtin catalog and function families, so new entries are checked automatically.
 
 use crate::common::TempDatabase;
 use turso_core::native_ext::ReturnType;

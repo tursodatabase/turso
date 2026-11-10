@@ -262,6 +262,19 @@ fn scalar_derive_state_is_shared_across_calls_and_dropped_once(
 fn sql_extension_loading_is_disabled_by_default(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
+    for (sql, message) in [
+        (
+            "SELECT load_extension()",
+            "load_extension function with no arguments",
+        ),
+        (
+            "SELECT load_extension('x', 'y')",
+            "load_extension function called with not exactly 1 arguments",
+        ),
+    ] {
+        assert!(conn.prepare(sql).unwrap_err().to_string().contains(message));
+    }
+
     let err = conn
         .execute("SELECT load_extension('definitely_missing_extension')")
         .unwrap_err();

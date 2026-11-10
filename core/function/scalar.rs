@@ -10,6 +10,7 @@ pub(crate) mod numeric;
 pub(crate) mod pattern;
 pub(crate) mod sequence;
 mod state;
+pub(crate) mod system;
 pub(crate) mod values;
 pub use state::ScalarState;
 
@@ -90,24 +91,24 @@ impl ScalarFunctionMetadata {
 }
 
 pub struct FunctionContext<'a> {
-    connection: &'a Connection,
-    io: &'a dyn crate::IO,
+    connection: &'a crate::sync::Arc<Connection>,
+    pager: &'a crate::storage::pager::Pager,
     clock: datetime::StatementClock<'a>,
     collation: crate::translate::collate::CollationSeq,
 }
 
 impl<'a> FunctionContext<'a> {
     pub fn new(
-        connection: &'a Connection,
-        io: &'a dyn crate::IO,
+        connection: &'a crate::sync::Arc<Connection>,
+        pager: &'a crate::storage::pager::Pager,
         current_time: &'a mut Option<crate::WallClockInstant>,
         collation: crate::translate::collate::CollationSeq,
     ) -> Self {
         Self {
             connection,
-            io,
+            pager,
             collation,
-            clock: datetime::StatementClock::new(io, current_time),
+            clock: datetime::StatementClock::new(pager.io.as_ref(), current_time),
         }
     }
 
@@ -122,11 +123,11 @@ impl<'a> FunctionContext<'a> {
     }
 
     pub fn random_i64(&self) -> i64 {
-        self.io.generate_random_number()
+        self.pager.io.generate_random_number()
     }
 
     pub fn fill_random_bytes(&self, dest: &mut [u8]) {
-        self.io.fill_bytes(dest);
+        self.pager.io.fill_bytes(dest);
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -353,6 +354,9 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&sequence::CurrVal, &[]);
     catalog.register(&sequence::SetVal, &[]);
     catalog.register(&sequence::SequenceWatermark, &[]);
+    catalog.register(&system::TursoVersion, &[]);
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    catalog.register(&system::LoadExtension, &[]);
     catalog
 });
 

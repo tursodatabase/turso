@@ -57,11 +57,10 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
-            OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
-            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
-            VacuumIntoOpContext,
+            OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
+            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
+            OpProgramState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -784,7 +783,6 @@ enum ActiveOpState {
     NoConflict(OpNoConflictState),
     Column(OpColumnState),
     Transaction(OpTransactionState),
-    Attach(OpAttachState),
     JournalMode(OpJournalModeState),
     ParseSchema(OpParseSchemaState),
     HashBuild(Option<OpHashBuildState>),
@@ -809,7 +807,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Column(_) => "Column",
             ActiveOpState::Transaction(_) => "Transaction",
-            ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
             ActiveOpState::ParseSchema(_) => "ParseSchema",
             ActiveOpState::HashBuild(_) => "HashBuild",
@@ -946,7 +943,6 @@ impl ActiveOpStateSlot {
         OpTransactionState,
         OpTransactionState::Start
     );
-    active_state_accessor!(attach, Attach, OpAttachState, OpAttachState::default());
     active_state_accessor!(
         journal_mode,
         JournalMode,
