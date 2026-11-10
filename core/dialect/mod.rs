@@ -1045,6 +1045,87 @@ mod tests {
         }
     }
 
+    /// A dialect that resolves the built-in names but runs `upper` its own
+    /// way, as a frontend does for a built-in whose behavior differs in its
+    /// dialect.
+    struct ShoutingUpperDialect;
+
+    impl Dialect for ShoutingUpperDialect {
+        fn name(&self) -> &'static str {
+            "shouting"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            engine::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+            engine::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            engine::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            _input: &str,
+            tbl_name: &QualifiedName,
+            body: &CreateTableBody,
+        ) -> Result<String> {
+            engine::format_table_sql(tbl_name, body)
+        }
+
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
+            engine::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+            engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn call_scalar(
+            &self,
+            context: &ScalarFuncContext<'_>,
+            func: &ScalarFunc,
+            args: &[Register],
+        ) -> Result<Value> {
+            let value = engine::call_builtin_scalar(context, func, args)?;
+            if !matches!(func, ScalarFunc::Upper) {
+                return Ok(value);
+            }
+            Ok(Value::build_text(format!("{value}!")))
+        }
+    }
+
+    #[test]
+    fn dialect_owns_builtin_scalar_function_behavior() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-shouting.db", Arc::new(ShoutingUpperDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+
+        conn.execute("CREATE TABLE t (s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('hi')").unwrap();
+        let rows = conn
+            .prepare("SELECT upper(s), lower('ABC'), abs(-7) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::build_text("HI!"),
+                Value::build_text("abc"),
+                Value::from_i64(7),
+            ]]
+        );
+        conn.close().unwrap();
+    }
+
     #[test]
     fn dialect_scalar_function_resolves_and_executes() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
