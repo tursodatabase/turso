@@ -53,7 +53,14 @@ pub(super) fn translate_in_list(
 ) -> Result<()> {
     let lhs_arity = expr_vector_size(lhs)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
-    let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    translate_row_value(
+        program,
+        referenced_tables,
+        lhs,
+        lhs_arity,
+        lhs_reg,
+        resolver,
+    )?;
     let mut check_null_reg = 0;
     let mut check_null_in_row_values_reg = 0;
     let label_ok = program.allocate_label();
