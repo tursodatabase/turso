@@ -342,11 +342,11 @@ test aggregate-in-where-of-lateral-is-not-allowed {
     SELECT * FROM t1, LATERAL (SELECT c FROM t2 WHERE count(*) > 1) AS s;
 }
 expect error {
-    misuse of aggregate function count\(\*\)
+    misuse of aggregate function count\(\)
 }
 @sqlstate 42803
 expect @tursopg error {
-    misuse of aggregate function count\(\*\)
+    misuse of aggregate function count\(\)
 }
 @sqlstate 42803
 expect @postgres error {

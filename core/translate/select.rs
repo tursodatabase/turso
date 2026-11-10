@@ -17,20 +17,22 @@ use crate::translate::expr::{
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
-    GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+    plan_is_correlated, GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
-    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause, parse_from,
+    check_function_names_and_argument_counts, collect_subquery_table_refs_in_expr,
+    collect_subquery_table_refs_in_window_clause, first_aggregate_without_over_clause, parse_from,
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
 use crate::translate::subquery::{
-    plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+    outer_query_refs_for_correlated_subquery, plan_limit_offset_subqueries,
+    plan_subqueries_from_select_plan, plan_subqueries_from_values,
 };
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, normalize_ident, walk_expr_with_subqueries};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -588,6 +590,8 @@ fn prepare_one_select_plan(
                     &mut plan.table_references,
                     Some(&plan.result_columns),
                     &mut plan.where_clause,
+                    group_by.is_some()
+                        || result_columns_contain_aggregate(&plan.result_columns, resolver)?,
                     resolver,
                 )?;
             }
@@ -619,7 +623,16 @@ fn prepare_one_select_plan(
 
                     if !group_by.exprs.is_empty() {
                         // Normal GROUP BY with expressions
-                        for expr in group_by.exprs.iter_mut() {
+                        // Like SQLite, a GROUP BY term cannot name a column of an outer query,
+                        // but it can name a result column, by number or alias, that reads one.
+                        for expr in group_by.exprs.iter() {
+                            reject_outer_table_names_in_group_by_expr(
+                                expr,
+                                &plan.table_references,
+                            )?;
+                        }
+                        let outer_query_refs = plan.table_references.take_outer_query_refs();
+                        let bound = group_by.exprs.iter_mut().try_for_each(|expr| {
                             replace_column_number_with_copy_of_column_expr(
                                 expr,
                                 &plan.result_columns,
@@ -631,8 +644,11 @@ fn prepare_one_select_plan(
                                 Some(&plan.result_columns),
                                 resolver,
                                 BindingBehavior::TryCanonicalColumnsFirst,
-                            )?;
-                        }
+                            )
+                        });
+                        plan.table_references
+                            .restore_outer_query_refs(outer_query_refs);
+                        bound?;
 
                         let exprs: Vec<ast::Expr> =
                             group_by.exprs.into_iter().map(|expr| *expr).collect();
@@ -716,6 +732,9 @@ fn prepare_one_select_plan(
                     resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
+                // Checked here because some terms get no code: those cut below, and the
+                // whole ORDER BY of an EXISTS subquery or a single-row aggregate query.
+                check_function_names_and_argument_counts(&o.expr, resolver)?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
@@ -735,8 +754,10 @@ fn prepare_one_select_plan(
             // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
             // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
             // This means we truncate the ORDER BY to just the rowid column.
-            // We do this for SQLite compatibility - SQLite truncates before validating, so
-            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
+            // We do this for SQLite compatibility - SQLite never generates code for the cut terms,
+            // so even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
+            // Like SQLite (wherePathSatisfiesOrderBy() in where.c), the terms are cut only when
+            // each one is constant or reads the table; otherwise the rows are sorted by all terms.
             let mut terms_cut_after_rowid = Vec::new();
             if key.len() > 1 && plan.table_references.joined_tables().len() == 1 {
                 let joined = &plan.table_references.joined_tables()[0];
@@ -753,7 +774,16 @@ fn prepare_one_select_plan(
                     _ => false,
                 };
                 if first_is_rowid {
-                    terms_cut_after_rowid = key.split_off(1);
+                    let mut later_terms_can_be_cut = true;
+                    for (expr, _, _) in key[1..].iter() {
+                        let reads_table = check_order_by_term_without_code(
+                            expr, &plan, resolver, program, connection,
+                        )?;
+                        later_terms_can_be_cut &= reads_table || expr.is_constant(resolver);
+                    }
+                    if later_terms_can_be_cut {
+                        terms_cut_after_rowid = key.split_off(1);
+                    }
                 }
             }
 
@@ -805,14 +835,16 @@ fn prepare_one_select_plan(
             plan.order_by = key;
 
             // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
-            // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
-            // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
+            // produce exactly one row, so ORDER BY is meaningless. Clearing it here also skips
+            // the checks that SQLite only makes while generating code for ORDER BY subqueries.
             // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
             let is_single_row_aggregate = !plan.aggregates.is_empty()
                 && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
                 && windows.is_empty();
             if is_single_row_aggregate {
-                plan.order_by.clear();
+                for (expr, _, _) in std::mem::take(&mut plan.order_by) {
+                    check_order_by_term_without_code(&expr, &plan, resolver, program, connection)?;
+                }
             }
 
             if let Some(group_by) = &mut plan.group_by {
@@ -955,6 +987,112 @@ fn prepare_one_select_plan(
     }
 }
 
+/// Checks an ORDER BY term that gets no code the way SQLite checks every term:
+/// the names in its subqueries must resolve, and its collation must exist. Returns
+/// whether the term reads a column of `plan`'s tables.
+///
+/// An aggregate that a subquery of the term moves up to `plan` is dropped with the term.
+/// SQLite lets these subqueries use the aliases of the result columns, which subqueries
+/// cannot do in Turso yet, so a subquery that names an alias is not planned; it is
+/// taken to read the tables.
+fn check_order_by_term_without_code(
+    term: &ast::Expr,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<bool> {
+    // SQLite looks up the collation of every term to build the sorter's key, even when
+    // it then skips the sort.
+    ExprContext::new(Some(&plan.table_references), resolver).expr_collation(term)?;
+
+    let reads_column_of = |expr: &ast::Expr| {
+        let table_id = match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => *table,
+            _ => return false,
+        };
+        plan.table_references
+            .joined_tables()
+            .iter()
+            .any(|t| t.internal_id == table_id)
+    };
+    let names_result_column_alias = |expr: &ast::Expr| -> Result<bool> {
+        let mut found = false;
+        walk_expr_with_subqueries(expr, &mut |expr| {
+            if let ast::Expr::Id(id) = expr {
+                let id = normalize_ident(id.as_str());
+                found |= plan.result_columns.iter().any(|rc| {
+                    rc.alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&id))
+                });
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(found)
+    };
+    let outer_query_refs = outer_query_refs_for_correlated_subquery(&plan.table_references)?;
+    let mut reads_table = false;
+    resolver.begin_collecting_aggregates_from_subqueries();
+    let walked = walk_expr(term, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        reads_table |= reads_column_of(expr);
+        if let ast::Expr::Subquery(select)
+        | ast::Expr::Exists(select)
+        | ast::Expr::InSelect { rhs: select, .. } = expr
+        {
+            if names_result_column_alias(expr)? {
+                reads_table = true;
+                return Ok(WalkControl::Continue);
+            }
+            let collecting_depth = resolver.aggregate_collecting_depth();
+            match prepare_select_plan(
+                (**select).clone(),
+                resolver,
+                program,
+                &outer_query_refs,
+                QueryDestination::Unset,
+                connection,
+            ) {
+                Ok(subquery_plan) => reads_table |= plan_is_correlated(&subquery_plan),
+                // SQLite reports most wrong column counts only while generating code, which
+                // this term gets only if the subquery does not read the outer query. Planning
+                // it again without the outer tables shows that: a subquery that reads them
+                // fails to resolve a name instead of reaching the same column count error.
+                Err(err) if is_column_count_error(&err) => {
+                    resolver.stop_collecting_aggregates_above(collecting_depth);
+                    let cte_definitions: Vec<_> = outer_query_refs
+                        .iter()
+                        .filter(|outer_ref| outer_ref.cte_definition_only)
+                        .cloned()
+                        .collect();
+                    let replanned = prepare_select_plan(
+                        (**select).clone(),
+                        resolver,
+                        program,
+                        &cte_definitions,
+                        QueryDestination::Unset,
+                        connection,
+                    );
+                    resolver.stop_collecting_aggregates_above(collecting_depth);
+                    reads_table |= !matches!(replanned, Err(err) if is_column_count_error(&err));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    resolver.take_aggregates_from_subqueries();
+    walked?;
+    Ok(reads_table)
+}
+
+fn is_column_count_error(err: &crate::LimboError) -> bool {
+    matches!(err, crate::LimboError::ParseError(msg)
+        if msg == "row value misused"
+            || msg.starts_with("sub-select returns ")
+            || msg.starts_with("IN(...) element has "))
+}
+
 /// Whether a result column calls an aggregate, also one inside a window function
 /// such as the `sum(a)` in `row_number() OVER (ORDER BY sum(a))`.
 fn result_columns_contain_aggregate(
@@ -967,42 +1105,6 @@ fn result_columns_contain_aggregate(
         }
     }
     Ok(false)
-}
-
-fn first_aggregate_without_over_clause<'a>(
-    expr: &'a ast::Expr,
-    resolver: &Resolver,
-) -> Result<Option<&'a str>> {
-    let mut found = None;
-    walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
-        let (name, args_count, filter_over) = match e {
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => (name, args.len(), filter_over),
-            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
-            _ => return Ok(WalkControl::Continue),
-        };
-        if found.is_some() || filter_over.over_clause.is_some() {
-            return Ok(WalkControl::Continue);
-        }
-        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
-        {
-            Ok(Some(crate::function::Func::Agg(_))) => true,
-            _ => resolver
-                .catalog
-                .symbol_table
-                .resolve_function(name.as_str(), args_count)
-                .is_some_and(|f| f.func.is_aggregate()),
-        };
-        if is_aggregate {
-            found = Some(name.as_str());
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
 }
 
 /// Validate that all expressions in the plan return the correct number of values;
@@ -1073,8 +1175,44 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
     Ok(())
 }
 
-/// SQLite compatibility: GROUP BY expressions in a correlated subquery cannot
-/// reference columns from the outer query scope.
+/// Fails like SQLite when a GROUP BY expression names a column as `table.column`
+/// where the table belongs to an outer query.
+fn reject_outer_table_names_in_group_by_expr(
+    expr: &Expr,
+    table_references: &TableReferences,
+) -> Result<()> {
+    walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
+        let (schema, table, column) = match node {
+            Expr::Qualified(table, column) => (None, table, column),
+            Expr::DoublyQualified(schema, table, column) => (Some(schema), table, column),
+            _ => return Ok(WalkControl::Continue),
+        };
+        let table_name = normalize_ident(table.as_str());
+        let names_joined_table = table_references
+            .joined_tables()
+            .iter()
+            .any(|t| t.identifier == table_name);
+        if !names_joined_table
+            && table_references
+                .find_outer_query_ref_by_identifier(&table_name)
+                .is_some()
+        {
+            let schema = schema
+                .map(|s| format!("{}.", s.as_str()))
+                .unwrap_or_default();
+            crate::bail_parse_error!(
+                "no such column: {schema}{}.{}",
+                table.as_str(),
+                column.as_str()
+            );
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// SQLite compatibility: subqueries in the GROUP BY expressions of a correlated
+/// subquery cannot reference columns from the outer query scope.
 fn validate_group_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
     if plan.table_references.outer_query_refs().is_empty() {
         return Ok(());
@@ -1098,46 +1236,18 @@ fn reject_outer_query_refs_in_group_by_expr(
     subqueries: &[super::plan::NonFromClauseSubquery],
 ) -> Result<()> {
     walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
-        match node {
-            Expr::Column { table, column, .. } => {
-                if let Some(outer_ref) =
-                    table_references.find_outer_query_ref_by_internal_id(*table)
-                {
-                    let column_name = outer_ref
-                        .columns()
-                        .get(*column)
-                        .and_then(|col| col.name.as_deref())
-                        .expect(
-                            "bound outer-scope Expr::Column must point to a named column in schema",
-                        );
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}",
-                        outer_ref.identifier,
-                        normalize_ident(column_name)
-                    );
-                }
-            }
-            Expr::RowId { table, .. } => {
-                if let Some(outer_ref) =
-                    table_references.find_outer_query_ref_by_internal_id(*table)
-                {
-                    crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
-                }
-            }
-            Expr::SubqueryResult { subquery_id, .. } => {
-                let subquery = subqueries
-                    .iter()
-                    .find(|subquery| subquery.internal_id == *subquery_id)
-                    .expect("GROUP BY SubqueryResult must reference a planned subquery");
-                let super::plan::SubqueryState::Unevaluated {
-                    plan: Some(subquery_plan),
-                } = &subquery.state
-                else {
-                    unreachable!("GROUP BY subquery must be in unevaluated state during planning");
-                };
-                reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
-            }
-            _ => {}
+        if let Expr::SubqueryResult { subquery_id, .. } = node {
+            let subquery = subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == *subquery_id)
+                .expect("GROUP BY SubqueryResult must reference a planned subquery");
+            let super::plan::SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &subquery.state
+            else {
+                unreachable!("GROUP BY subquery must be in unevaluated state during planning");
+            };
+            reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
         }
         Ok(WalkControl::Continue)
     })?;

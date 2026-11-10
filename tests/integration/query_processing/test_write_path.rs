@@ -2355,3 +2355,30 @@ fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
     assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
     Ok(())
 }
+
+/// Wrong argument counts in WHERE and ON terms that get no code are rejected like
+/// in SQLite. The sqltest runner enables custom types, which already rejects them
+/// elsewhere, so this test opens the database without them.
+#[turso_macros::test(init_sql = "CREATE TABLE y(id INTEGER PRIMARY KEY, d INTEGER);")]
+fn test_update_rejects_wrong_argument_count_in_term_without_code(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO y VALUES (1, 5)")?;
+    for sql in [
+        "UPDATE y SET d = 1 WHERE 1 OR abs(1, 2)",
+        "UPDATE y SET d = 1 FROM y AS a JOIN y AS b ON 1 OR abs(1, 2) WHERE a.id = y.id",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("wrong number of arguments to function abs()"),
+            "{sql}: {err}"
+        );
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT d FROM y"),
+        vec![vec![rusqlite::types::Value::Integer(5)]]
+    );
+    Ok(())
+}

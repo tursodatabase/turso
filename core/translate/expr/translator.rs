@@ -2391,7 +2391,7 @@ fn translate_function_call_star_expr(
     match &func {
         Func::Agg(_) => {
             crate::bail_parse_error!(
-                "misuse of {} function {}(*)",
+                "misuse of {} function {}()",
                 if filter_over.over_clause.is_some() {
                     "window"
                 } else {
