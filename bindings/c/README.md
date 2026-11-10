@@ -11,6 +11,35 @@ This implementation provides SQLite3 API compatibility for Turso, allowing exist
 3. Maps SQLite operations to equivalent Turso operations
 4. Maintains API compatibility with SQLite
 
+## File access modes
+
+`sqlite3_open_v2` requires READONLY, READWRITE, or READWRITE with CREATE.
+READWRITE without CREATE and URI `mode=rw` require an existing main database
+file; a writable open may create its WAL. With
+`SQLITE_OPEN_URI`, decoded `mode=ro`, `mode=rw`, and `mode=rwc` may narrow the
+requested file access; repeating these modes cannot widen an earlier restriction.
+C opens and SQL ATTACH use the same URI parser.
+`mode=memory` selects writable memory storage, as in SQLite. URI fragments do not
+supply query parameters. Malformed percent escapes remain literal characters,
+while valid escapes are decoded. An empty decoded path opens a private temporary
+database, including `file:`, `file://`, and `file://localhost`. A read-only
+request for temporary storage allows opening and reading but rejects writes to
+its main schema.
+
+A read-only connection stays read-only when it shares an already writable
+database. Opening for writing can fail while the process retains a database
+opened with read-only storage; close those handles before reopening for writing.
+Failed opens return a handle for error inspection and closing when allocation
+succeeds.
+
+## Application functions
+
+`sqlite3_create_function_v2` supports scalar callbacks. C aggregate callbacks
+(`xStep` and `xFinal`) are not implemented: a valid aggregate registration returns
+`SQLITE_ERROR` with `sqlite3_errmsg` reporting that C aggregate callbacks are not
+supported. Incomplete or mixed scalar/aggregate callback combinations return
+`SQLITE_MISUSE`. Rejected registrations invoke `xDestroy` once when supplied.
+
 ## Testing Strategy
 
 We employ a dual-testing approach to ensure complete compatibility with SQLite:
@@ -102,4 +131,4 @@ When adding new features or fixing bugs:
 
 ## Status
 
-This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status. 
+This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status.

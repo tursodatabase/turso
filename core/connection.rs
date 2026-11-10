@@ -397,6 +397,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
+    pub(crate) main_readonly: bool,
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
@@ -2022,7 +2023,8 @@ impl Connection {
                 None,
                 dialect,
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn =
+                db.connect(ConnectOpts::new().with_readonly(flags.contains(OpenFlags::ReadOnly)))?;
             return Ok((io, conn));
         }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
@@ -2052,7 +2054,8 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn =
+            db.connect(ConnectOpts::new().with_readonly(flags.contains(OpenFlags::ReadOnly)))?;
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -2069,7 +2072,7 @@ impl Connection {
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
-    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
+    ) -> Result<(Arc<Database>, Option<EncryptionOpts>, bool)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
@@ -2106,7 +2109,7 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        Ok((db, encryption_opts))
+        Ok((db, encryption_opts, flags.contains(OpenFlags::ReadOnly)))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -2571,7 +2574,8 @@ impl Connection {
         // while statements are active — same rule as PRAGMA wal_checkpoint.
         // The guard also rejects new statements until the checkpoint finishes
         // and cleans up pager checkpoint state if we bail out mid-flight.
-        let _checkpoint_guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
+        let _checkpoint_guard =
+            self.begin_explicit_checkpoint(self.pager.load().clone(), crate::MAIN_DB_ID, false)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(
@@ -2658,7 +2662,7 @@ impl Connection {
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
-            && !self.db.is_readonly()
+            && !self.is_readonly(MAIN_DB_ID)
             && !is_memory_db
             && should_checkpoint_on_close
         {
@@ -2954,7 +2958,7 @@ impl Connection {
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
         match index {
-            crate::MAIN_DB_ID => self.db.is_readonly(),
+            crate::MAIN_DB_ID => self.main_readonly || self.db.is_readonly(),
             crate::TEMP_DB_ID => self
                 .temp
                 .database
@@ -2962,9 +2966,12 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|temp_db| temp_db.db.is_readonly()),
             _ => {
-                let db = self.attached_databases.read().get_database_by_index(index);
-                db.expect("Should never have called this without being sure the database exists")
-                    .is_readonly()
+                let attached = self.attached_databases.read();
+                let entry = attached
+                    .index_to_data
+                    .get(&index)
+                    .expect("attached database exists");
+                entry.readonly || entry.db.is_readonly()
             }
         }
     }
@@ -4563,6 +4570,8 @@ impl Connection {
             .read()
             .functions
             .values()
+            .flatten()
+            .filter_map(|entry| entry.function.as_ref())
             .flat_map(|f| {
                 let is_agg = f.func.is_aggregate();
                 f.func.arg_counts().into_iter().map(move |argc| {
@@ -4575,6 +4584,31 @@ impl Connection {
                 })
             })
             .collect()
+    }
+
+    pub fn external_function_signature(
+        &self,
+        name: &str,
+        argc: i32,
+    ) -> Option<Arc<function::ExternalFunc>> {
+        self.syms
+            .read()
+            .functions
+            .get(&crate::util::normalize_ident(name))?
+            .iter()
+            .find(|entry| entry.arg_counts == [argc])
+            .and_then(|entry| entry.function.clone())
+    }
+
+    pub fn unregister_external_function(&self, name: &str, argc: i32) {
+        let name = crate::util::normalize_ident(name);
+        let mut syms = self.syms.write();
+        if let Some(bucket) = syms.functions.get_mut(&name) {
+            if let Some(entry) = bucket.iter_mut().find(|entry| entry.arg_counts == [argc]) {
+                entry.function = None;
+                self.bump_prepare_context_generation();
+            }
+        }
     }
 
     pub fn register_external_collation(
@@ -4802,8 +4836,12 @@ impl Connection {
     pub(crate) fn begin_explicit_checkpoint(
         &self,
         pager: Arc<Pager>,
+        database_id: usize,
         from_statement: bool,
     ) -> Result<ExplicitCheckpointGuard> {
+        if self.is_readonly(database_id) {
+            return Err(LimboError::ReadOnly);
+        }
         let statements_expected = if from_statement { 1 } else { 0 };
         let mut activity = self.statement_activity.lock();
         // Parked incremental blob handles don't count: they hold a Root
@@ -5329,9 +5367,16 @@ pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 
+#[derive(Debug, Clone)]
+pub struct FunctionRegistration {
+    // A deleted exact arity must still prevent fallback to a variadic registration.
+    pub function: Option<Arc<function::ExternalFunc>>,
+    arg_counts: Vec<i32>,
+}
+
 #[derive(Default)]
 pub struct SymbolTable {
-    pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    pub functions: HashMap<String, Vec<FunctionRegistration>>,
     /// Custom collations by normalized name.
     pub collations: HashMap<String, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
@@ -5387,13 +5432,36 @@ impl SymbolTable {
     ) -> Option<Arc<function::ExternalFunc>> {
         self.functions
             .get(name)
-            .cloned()
-            .or_else(|| {
-                self.functions
-                    .get(&crate::util::normalize_ident(name))
-                    .cloned()
+            .or_else(|| self.functions.get(&crate::util::normalize_ident(name)))?
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry
+                    .arg_counts
+                    .iter()
+                    .any(|&argc| argc < 0 || argc as usize == arg_count)
             })
-            .filter(|func| func.func.matches_arg_count(arg_count))
+            .min_by_key(|entry| (entry.arg_counts.contains(&-1), entry.arg_counts.len()))
+            .and_then(|entry| entry.function.clone())
+    }
+
+    pub fn insert_function(&mut self, name: String, function: Arc<function::ExternalFunc>) {
+        let mut arg_counts = function.func.arg_counts();
+        arg_counts.sort_unstable();
+        arg_counts.dedup();
+        self.insert_function_registration(
+            name,
+            FunctionRegistration {
+                function: Some(function),
+                arg_counts,
+            },
+        );
+    }
+
+    fn insert_function_registration(&mut self, name: String, registration: FunctionRegistration) {
+        let bucket = self.functions.entry(name).or_default();
+        bucket.retain(|old| old.arg_counts != registration.arg_counts);
+        bucket.push(registration);
     }
 
     pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
@@ -5403,8 +5471,10 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
-        for (name, func) in &other.functions {
-            self.functions.insert(name.clone(), func.clone());
+        for (name, functions) in &other.functions {
+            for function in functions {
+                self.insert_function_registration(name.clone(), function.clone());
+            }
         }
         for (name, collation) in &other.collations {
             self.collations.insert(name.clone(), collation.clone());

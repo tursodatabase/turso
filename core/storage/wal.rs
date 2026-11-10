@@ -5840,6 +5840,11 @@ impl WalFileShared {
         db_file: &Arc<dyn DatabaseStorage>,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let snapshot = authority.snapshot();
+        let flags = if flags.contains(crate::OpenFlags::ReadOnly) {
+            flags
+        } else {
+            flags | crate::OpenFlags::Create
+        };
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -5973,6 +5978,11 @@ impl WalFileShared {
         path: &str,
         flags: crate::OpenFlags,
     ) -> Result<OpenSharedWal> {
+        let flags = if flags.contains(crate::OpenFlags::ReadOnly) {
+            flags
+        } else {
+            flags | crate::OpenFlags::Create
+        };
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -9416,6 +9426,32 @@ pub mod test {
                 AuthoritySnapshotRebuildReason::WalHeaderUnreadable
             )
         );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    #[cfg_attr(
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
+    )]
+    fn test_open_shared_from_authority_creates_missing_wal_for_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal_path = directory.path().join("existing.db-wal");
+        let shm_path = directory.path().join("existing.db-tshm");
+        let io = shared_wal_test_io();
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert!(!wal_path.exists());
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::None,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(wal_path).unwrap().len(), 0);
+        assert!(!shared.read().is_initialized().unwrap());
     }
 
     #[cfg(host_shared_wal)]

@@ -85,6 +85,83 @@ fn open_plain_file(path: &std::path::Path) -> turso_core::Result<Arc<Database>> 
     )
 }
 
+#[test]
+fn test_existing_readwrite_database_creates_missing_wal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("existing.db");
+    let wal = directory.path().join("existing.db-wal");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1)")
+            .unwrap();
+    }
+    assert!(!wal.exists());
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let database = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::None,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let connection = database.connect(ConnectOpts::new()).unwrap();
+    connection.execute("INSERT INTO t VALUES(2)").unwrap();
+    assert!(wal.exists());
+    connection.close().unwrap();
+    drop(connection);
+    drop(database);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        sqlite
+            .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn test_existing_only_open_preserves_main_file_permissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.db");
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    assert!(Database::open_file_with_flags(
+        io.clone(),
+        missing.to_str().unwrap(),
+        OpenFlags::None,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .is_err());
+    assert!(!missing.exists());
+    assert!(!directory.path().join("missing.db-wal").exists());
+    let path = directory.path().join("readonly.db");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite.execute_batch("CREATE TABLE t(x)").unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let database = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let connection = database.connect(ConnectOpts::new()).unwrap();
+    assert!(matches!(
+        connection.execute("INSERT INTO t VALUES(1)"),
+        Err(turso_core::LimboError::ReadOnly)
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!directory.path().join("readonly.db-wal").exists());
+}
+
 /// SQLite must refuse the file as "file is not a database" (SQLITE_NOTADB).
 /// Opening is lazy in SQLite, so run a query to make it read the header.
 fn assert_sqlite_says_not_a_database(path: &std::path::Path) {
@@ -423,28 +500,27 @@ fn test_database_open_with_options() {
     );
 }
 
-/// Database::open_async still requires storage: default-storage resolution is
-/// synchronous (registry lookup, file probes, file open) and only runs in the
-/// synchronous Database::open entry point.
 #[test]
-fn test_open_async_requires_storage() {
+fn test_open_async_resolves_default_storage() {
     let tmp_dir = tempfile::TempDir::new().unwrap();
-    let path = tmp_dir.path().join("async-needs-storage.db");
+    let path = tmp_dir.path().join("async-default-storage.db");
     let path = path.to_str().unwrap();
-
     let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect));
     let mut state = turso_core::OpenDbAsyncState::new();
-    let err = Database::open_async(
-        &mut state,
-        io,
-        path,
-        &turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
-    )
-    .expect_err("open_async without storage must fail");
-    assert!(
-        matches!(*err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
-        "expected InvalidArgument about missing storage, got {err:?}"
-    );
+    let db = loop {
+        match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+            turso_core::IOResult::Done(db) => break db,
+            turso_core::IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+        }
+    };
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(x); INSERT INTO t VALUES(7)")
+        .unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(7,)]);
+    let cached = Database::open(io, path, options).unwrap();
+    assert!(Arc::ptr_eq(&db, &cached));
 }
 
 /// The registry-aware Database::open rejects a custom WAL path: the process
