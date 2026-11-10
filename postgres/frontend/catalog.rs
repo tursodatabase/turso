@@ -313,6 +313,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn concat_of_blobs_is_blob(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }

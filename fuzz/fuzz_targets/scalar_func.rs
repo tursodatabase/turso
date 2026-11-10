@@ -336,7 +336,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = v1.exec_shift_right(&v2);
                 }
                 BinaryFunc::Concat => {
-                    let _ = v1.exec_concat(&v2);
+                    let _ = v1.exec_concat(&v2, false);
                 }
                 BinaryFunc::And => {
                     let _ = v1.exec_and(&v2);

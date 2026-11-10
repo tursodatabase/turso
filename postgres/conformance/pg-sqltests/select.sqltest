@@ -76,6 +76,17 @@ expect {
     foobar
 }
 
+test select-concat-bytea-stays-bytea {
+    CREATE TABLE b(x bytea, y bytea);
+    INSERT INTO b VALUES ('AB'::bytea, 'C'::bytea);
+    CREATE TABLE c(z bytea);
+    INSERT INTO c SELECT x || y FROM b;
+    SELECT length(z) FROM c WHERE z = 'ABC'::bytea;
+}
+expect {
+    3
+}
+
 test select-multiple-columns {
     SELECT 1, 'two', 3.5;
 }

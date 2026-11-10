@@ -479,11 +479,11 @@ mod tests {
                 fiber_idx: 11,
                 execution_id: 12,
             });
-            assert!(lhs.exec_concat(&rhs).is_err());
+            assert!(lhs.exec_concat(&rhs, true).is_err());
         }
         assert_eq!(injector.injected_faults(), before + 1);
         assert_eq!(
-            lhs.exec_concat(&rhs).unwrap().to_blob(),
+            lhs.exec_concat(&rhs, true).unwrap().to_blob(),
             Some([1, 2, 3, 4].as_slice())
         );
 

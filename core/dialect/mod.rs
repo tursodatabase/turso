@@ -473,6 +473,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `||` of two blobs returns a blob.
+    ///
+    /// PostgreSQL's `bytea || bytea` returns bytea. SQLite's `||` always
+    /// returns TEXT.
+    fn concat_of_blobs_is_blob(&self) -> bool {
+        false
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///
