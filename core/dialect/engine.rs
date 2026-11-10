@@ -354,46 +354,20 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_group_object" => Ok(Some(Func::Agg(AggFunc::JsonbGroupObject))),
         #[cfg(feature = "json")]
         "json_group_object" => Ok(Some(Func::Agg(AggFunc::JsonGroupObject))),
-        "char" | "chr" => Ok(Some(Func::Scalar(ScalarFunc::Char))),
         "coalesce" => Ok(Some(Func::Scalar(ScalarFunc::Coalesce))),
-        "concat_ws" => {
-            if arg_count < 2 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::ConcatWs)))
-        }
         "glob" => Ok(Some(Func::Scalar(ScalarFunc::Glob))),
         "ifnull" => Ok(Some(Func::Scalar(ScalarFunc::IfNull))),
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
-        "instr" | "strpos" => Ok(Some(Func::Scalar(ScalarFunc::Instr))),
         "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
         "random" => Ok(Some(Func::Scalar(ScalarFunc::Random))),
         "randomblob" => Ok(Some(Func::Scalar(ScalarFunc::RandomBlob))),
-        "substr" => {
-            if arg_count != 2 && arg_count != 3 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::Substr)))
-        }
-        "substring" => {
-            if arg_count != 2 && arg_count != 3 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::Substring)))
-        }
         "date" => Ok(Some(Func::Scalar(ScalarFunc::Date))),
         "time" => Ok(Some(Func::Scalar(ScalarFunc::Time))),
         "datetime" => Ok(Some(Func::Scalar(ScalarFunc::DateTime))),
-        "typeof" => Ok(Some(Func::Scalar(ScalarFunc::Typeof))),
-        "subtype" => Ok(Some(Func::Scalar(ScalarFunc::Subtype))),
         "last_insert_rowid" => Ok(Some(Func::Scalar(ScalarFunc::LastInsertRowid))),
-        "unistr" => Ok(Some(Func::Scalar(ScalarFunc::Unistr))),
-        "unistr_quote" => Ok(Some(Func::Scalar(ScalarFunc::UnistrQuote))),
-        "quote" => Ok(Some(Func::Scalar(ScalarFunc::Quote))),
         "sqlite_version" => Ok(Some(Func::Scalar(ScalarFunc::SqliteVersion))),
         "turso_version" => Ok(Some(Func::Scalar(ScalarFunc::TursoVersion))),
         "sqlite_source_id" => Ok(Some(Func::Scalar(ScalarFunc::SqliteSourceId))),
-        "replace" => Ok(Some(Func::Scalar(ScalarFunc::Replace))),
         "likely" => Ok(Some(Func::Scalar(ScalarFunc::Likely))),
         "likelihood" => Ok(Some(Func::Scalar(ScalarFunc::Likelihood))),
         "unlikely" => Ok(Some(Func::Scalar(ScalarFunc::Unlikely))),
@@ -447,9 +421,6 @@ pub(crate) fn resolve_builtin_function_name(
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
         "unixepoch" => Ok(Some(Func::Scalar(ScalarFunc::UnixEpoch))),
         "julianday" => Ok(Some(Func::Scalar(ScalarFunc::JulianDay))),
-        "get_byte" => Ok(Some(Func::Scalar(ScalarFunc::GetByte))),
-        "set_byte" => Ok(Some(Func::Scalar(ScalarFunc::SetByte))),
-        "zeroblob" => Ok(Some(Func::Scalar(ScalarFunc::ZeroBlob))),
         "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
         "bin_record_json_object" => Ok(Some(Func::Scalar(ScalarFunc::BinRecordJsonObject))),
         "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
@@ -488,7 +459,6 @@ pub(crate) fn resolve_builtin_function_name(
         #[cfg(not(target_family = "wasm"))]
         "load_extension" => Ok(Some(Func::Scalar(ScalarFunc::LoadExtension))),
         "strftime" => Ok(Some(Func::Scalar(ScalarFunc::StrfTime))),
-        "printf" | "format" => Ok(Some(Func::Scalar(ScalarFunc::Printf))),
         "vector" => Ok(Some(Func::Vector(VectorFunc::Vector))),
         "vector32" => Ok(Some(Func::Vector(VectorFunc::Vector32))),
         "vector32_sparse" => Ok(Some(Func::Vector(VectorFunc::Vector32Sparse))),
@@ -514,12 +484,8 @@ pub(crate) fn resolve_builtin_function_name(
         "test_uint_decode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDecode))),
         #[cfg(feature = "test_helper")]
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
-        "string_reverse" | "reverse" => Ok(Some(Func::Scalar(ScalarFunc::StringReverse))),
         "gcd" => Ok(Some(Func::Scalar(ScalarFunc::Gcd))),
         "lcm" => Ok(Some(Func::Scalar(ScalarFunc::Lcm))),
-        "repeat" => Ok(Some(Func::Scalar(ScalarFunc::Repeat))),
-        "lpad" => Ok(Some(Func::Scalar(ScalarFunc::Lpad))),
-        "rpad" => Ok(Some(Func::Scalar(ScalarFunc::Rpad))),
         // Built-in type support functions
         "boolean_to_int" => Ok(Some(Func::Scalar(ScalarFunc::BooleanToInt))),
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),

@@ -949,44 +949,29 @@ impl AggFunc {
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum ScalarFunc {
     Cast,
-    Char,
     Coalesce,
-    ConcatWs,
     Glob,
     IfNull,
     Iif,
-    Instr,
     Like,
     Random,
     RandomBlob,
     Min,
     Max,
     Nullif,
-    Substr,
-    Substring,
     Date,
     Time,
     DateTime,
-    Subtype,
-    Typeof,
-    Unistr,
-    UnistrQuote,
-    Quote,
     SqliteVersion,
     TursoVersion,
     SqliteSourceId,
     UnixEpoch,
     JulianDay,
-    GetByte,
-    SetByte,
-    ZeroBlob,
     LastInsertRowid,
-    Replace,
     #[cfg(feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
     StrfTime,
-    Printf,
     Likely,
     TimeDiff,
     Likelihood,
@@ -1009,13 +994,9 @@ pub enum ScalarFunc {
     /// equivalent SQL calls that contain nondeterministic functions.
     #[cfg(feature = "test_helper")]
     TestNondetCounter,
-    StringReverse,
     // SQL-standard string and math extensions (PG/MySQL/Oracle compatible)
     Gcd,
     Lcm,
-    Repeat,
-    Lpad,
-    Rpad,
     // Built-in type support functions
     BooleanToInt,
     IntToBoolean,
@@ -1067,44 +1048,29 @@ impl Deterministic for ScalarFunc {
     fn is_deterministic(&self) -> bool {
         match self {
             ScalarFunc::Cast => true,
-            ScalarFunc::Char => true,
             ScalarFunc::Coalesce => true,
-            ScalarFunc::ConcatWs => true,
             ScalarFunc::Glob => true,
             ScalarFunc::IfNull => true,
             ScalarFunc::Iif => true,
-            ScalarFunc::Instr => true,
             ScalarFunc::Like => true,
             ScalarFunc::Random => false,     // duh
             ScalarFunc::RandomBlob => false, // duh
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
             ScalarFunc::Nullif => true,
-            ScalarFunc::Substr => true,
-            ScalarFunc::Substring => true,
             ScalarFunc::Date => false,
             ScalarFunc::Time => false,
             ScalarFunc::DateTime => false,
-            ScalarFunc::Subtype => true,
-            ScalarFunc::Typeof => true,
-            ScalarFunc::Unistr => true,
-            ScalarFunc::UnistrQuote => true,
-            ScalarFunc::Quote => true,
             ScalarFunc::SqliteVersion => false,
             ScalarFunc::TursoVersion => false,
             ScalarFunc::SqliteSourceId => false,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
-            ScalarFunc::GetByte => true,
-            ScalarFunc::SetByte => true,
-            ScalarFunc::ZeroBlob => true,
             ScalarFunc::LastInsertRowid => false,
-            ScalarFunc::Replace => true,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => false,
             ScalarFunc::StrfTime => false,
-            ScalarFunc::Printf => true,
             ScalarFunc::Likely => true,
             ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
@@ -1119,14 +1085,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode | ScalarFunc::StringReverse => {
-                true
-            }
-            ScalarFunc::Gcd
-            | ScalarFunc::Lcm
-            | ScalarFunc::Repeat
-            | ScalarFunc::Lpad
-            | ScalarFunc::Rpad => true,
+            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => true,
+            ScalarFunc::Gcd | ScalarFunc::Lcm => true,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
             ScalarFunc::BooleanToInt
@@ -1180,7 +1140,6 @@ impl ScalarFunc {
             | Self::Unlikely
             | Self::Likelihood
             | Self::TestUintDecode => ResultType::FirstArgument,
-            Self::Substr | Self::Substring => ResultType::TextOrBlobLikeTheFirstArgument,
             Self::ArrayElement => ResultType::ElementOfTheFirstArgument,
             // CAST is translated as an expression, never called by name.
             Self::Cast
@@ -1201,10 +1160,7 @@ impl ScalarFunc {
             Self::LastInsertRowid
             | Self::Glob
             | Self::Like
-            | Self::Instr
             | Self::Random
-            | Self::Subtype
-            | Self::GetByte
             | Self::ConnTxnId
             | Self::IsAutocommit
             | Self::SequenceWatermark
@@ -1223,28 +1179,16 @@ impl ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
             Self::JulianDay => ResultType::Declared(ReturnType::Real),
-            Self::Char
-            | Self::ConcatWs
-            | Self::Replace
-            | Self::Date
+            Self::Date
             | Self::Time
             | Self::DateTime
             | Self::StrfTime
             | Self::TimeDiff
-            | Self::Typeof
-            | Self::Unistr
-            | Self::UnistrQuote
-            | Self::Quote
             | Self::SqliteVersion
             | Self::TursoVersion
             | Self::SqliteSourceId
-            | Self::Printf
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
-            | Self::StringReverse
-            | Self::Repeat
-            | Self::Lpad
-            | Self::Rpad
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1260,13 +1204,7 @@ impl ScalarFunc {
             | Self::TestUintEncode
             | Self::StatGet
             | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
-            Self::RandomBlob
-            | Self::ZeroBlob
-            | Self::SetByte
-            | Self::NumericEncode
-            | Self::NumericFit
-            | Self::StatInit
-            | Self::StatPush => ResultType::Declared(ReturnType::Blob),
+            Self::RandomBlob | Self::NumericEncode | Self::NumericFit | Self::StatInit | Self::StatPush => ResultType::Declared(ReturnType::Blob),
             Self::Array
             | Self::ArraySetElement
             | Self::ArrayAppend
@@ -1296,44 +1234,29 @@ impl Display for ScalarFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
             Self::Cast => "cast",
-            Self::Char => "char",
             Self::Coalesce => "coalesce",
-            Self::ConcatWs => "concat_ws",
             Self::Glob => "glob",
             Self::IfNull => "ifnull",
             Self::Iif => "iif",
-            Self::Instr => "instr",
             Self::Like => "like",
             Self::Random => "random",
             Self::RandomBlob => "randomblob",
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
-            Self::Substr => "substr",
-            Self::Substring => "substring",
             Self::Date => "date",
             Self::Time => "time",
-            Self::Subtype => "subtype",
-            Self::Typeof => "typeof",
-            Self::Unistr => "unistr",
-            Self::UnistrQuote => "unistr_quote",
-            Self::Quote => "quote",
             Self::SqliteVersion => "sqlite_version",
             Self::TursoVersion => "turso_version",
             Self::SqliteSourceId => "sqlite_source_id",
             Self::JulianDay => "julianday",
             Self::UnixEpoch => "unixepoch",
-            Self::GetByte => "get_byte",
-            Self::SetByte => "set_byte",
-            Self::ZeroBlob => "zeroblob",
             Self::LastInsertRowid => "last_insert_rowid",
-            Self::Replace => "replace",
             Self::DateTime => "datetime",
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension",
             Self::StrfTime => "strftime",
-            Self::Printf => "printf",
             Self::Likely => "likely",
             Self::TimeDiff => "timediff",
             Self::Likelihood => "likelihood",
@@ -1352,12 +1275,8 @@ impl Display for ScalarFunc {
             Self::TestUintDecode => "test_uint_decode",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
-            Self::StringReverse => "string_reverse",
             Self::Gcd => "gcd",
             Self::Lcm => "lcm",
-            Self::Repeat => "repeat",
-            Self::Lpad => "lpad",
-            Self::Rpad => "rpad",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
@@ -1436,41 +1355,21 @@ impl ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
-            Self::Quote
-            | Self::UnistrQuote
-            | Self::RandomBlob
-            | Self::Subtype
-            | Self::Typeof
-            | Self::Unistr
-            | Self::ZeroBlob
-            | Self::Likely
-            | Self::Unlikely
-            | Self::SequenceWatermark => &[1],
+            Self::RandomBlob | Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
             // 2-arg
-            Self::Glob
-            | Self::Instr
-            | Self::Nullif
-            | Self::IfNull
-            | Self::Likelihood
-            | Self::GetByte
-            | Self::TimeDiff => &[2],
+            Self::Glob | Self::Nullif | Self::IfNull | Self::Likelihood | Self::TimeDiff => &[2],
             // 3-arg
-            Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
-            Self::Substr | Self::Substring => &[2, 3],
             // Truly variable-arg
-            Self::Char
-            | Self::Coalesce
+            Self::Coalesce
             | Self::Iif
-            | Self::ConcatWs
             | Self::Date
             | Self::Time
             | Self::DateTime
             | Self::UnixEpoch
             | Self::JulianDay
-            | Self::StrfTime
-            | Self::Printf => &[-1],
+            | Self::StrfTime => &[-1],
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => &[-1],
@@ -1488,10 +1387,9 @@ impl ScalarFunc {
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
             // SQL-standard string and math extensions
-            Self::Gcd | Self::Lcm | Self::Repeat => &[2],
-            Self::Lpad | Self::Rpad => &[2, 3],
+            Self::Gcd | Self::Lcm => &[2],
             // Test functions for custom types
-            Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
+            Self::TestUintEncode | Self::TestUintDecode => &[1],
             // Built-in type functions
             Self::BooleanToInt
             | Self::IntToBoolean

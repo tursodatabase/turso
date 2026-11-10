@@ -86,12 +86,9 @@ use crate::{
         SQLITE_ERROR, SQLITE_FULL,
     },
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
-    functions::{
-        datetime::{
-            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
-            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
-        },
-        printf::exec_printf,
+    functions::datetime::{
+        exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
+        exec_julianday, exec_strftime, exec_time, exec_unixepoch,
     },
     stats::StatAccum,
     translate::emitter::TransactionMode,
@@ -10362,18 +10359,7 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::Char => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest].set_value(Value::exec_char(
-                    reg_values.iter().map(|reg| reg.get_value()),
-                ));
-            }
             ScalarFunc::Coalesce => {}
-            ScalarFunc::ConcatWs => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::Glob => {
                 if arg_count != 2 {
                     mark_unlikely();
@@ -10413,14 +10399,6 @@ pub fn op_function(
             }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
-            ScalarFunc::Instr => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = &state.registers[*start_reg + 1];
-                match reg_value.get_value().exec_instr(pattern_value.get_value()) {
-                    Value::Numeric(Numeric::Integer(i)) => state.registers[*dest].set_int(i),
-                    _ => state.registers[*dest].set_null(),
-                };
-            }
             ScalarFunc::LastInsertRowid => {
                 state.registers[*dest].set_int(program.connection.last_insert_rowid());
             }
@@ -10582,24 +10560,12 @@ pub fn op_function(
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
-            ScalarFunc::Subtype
-            | ScalarFunc::Typeof
-            | ScalarFunc::Unistr
-            | ScalarFunc::UnistrQuote
-            | ScalarFunc::Quote
-            | ScalarFunc::RandomBlob
-            | ScalarFunc::ZeroBlob => {
+            ScalarFunc::RandomBlob => {
                 let reg_value = state.registers[*start_reg].borrow_mut().get_value();
                 let result = match scalar_func {
-                    ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
-                    ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
-                    ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
-                    ScalarFunc::Quote => Some(reg_value.exec_quote()),
-                    ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),
                     ScalarFunc::RandomBlob => {
                         Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
                     }
-                    ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
                     _ => unreachable!(),
                 };
                 // this is a `match` instead of `unwrap_or_else` because on the current pinned
@@ -10609,19 +10575,6 @@ pub fn op_function(
                     None => Value::Null,
                 };
                 state.registers[*dest].set_value(value);
-            }
-            ScalarFunc::GetByte => {
-                let value = state.registers[*start_reg].get_value();
-                let offset = state.registers[*start_reg + 1].get_value();
-                let result = value.exec_get_byte(offset)?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::SetByte => {
-                let value = state.registers[*start_reg].get_value();
-                let offset = state.registers[*start_reg + 1].get_value();
-                let new_value = state.registers[*start_reg + 2].get_value();
-                let result = value.exec_set_byte(offset, new_value)?;
-                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Random => {
                 let bits = pager.io.generate_random_number();
@@ -10663,21 +10616,6 @@ pub fn op_function(
                 let result = first_value.exec_nullif(second_value, |a, b| {
                     Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
                 })?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Substr | ScalarFunc::Substring => {
-                let str_value = &state.registers[*start_reg];
-                let start_value = &state.registers[*start_reg + 1];
-                let length_value = if func.arg_count == 3 {
-                    Some(&state.registers[*start_reg + 2])
-                } else {
-                    None
-                };
-                let result = Value::exec_substring(
-                    str_value.get_value(),
-                    start_value.get_value(),
-                    length_value.map(|x| x.get_value()),
-                )?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Date => {
@@ -10751,17 +10689,6 @@ pub fn op_function(
                 );
                 state.registers[*dest].set_text(Text::new(src_id))?;
             }
-            ScalarFunc::Replace => {
-                assert_eq!(arg_count, 3);
-                let source = &state.registers[*start_reg];
-                let pattern = &state.registers[*start_reg + 1];
-                let replacement = &state.registers[*start_reg + 2];
-                state.registers[*dest].set_value(Value::exec_replace(
-                    source.get_value(),
-                    pattern.get_value(),
-                    replacement.get_value(),
-                )?);
-            }
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
@@ -10786,10 +10713,6 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
                 let result = exec_strftime(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Printf => {
-                let result = exec_printf(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TableColumnsJsonArray => {
@@ -11144,23 +11067,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::StringReverse => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Text(t) => {
-                        let reversed: String = t.to_string().chars().rev().collect();
-                        Value::build_text(reversed)
-                    }
-                    other => {
-                        let s = other.to_string();
-                        let reversed: String = s.chars().rev().collect();
-                        Value::build_text(reversed)
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::Gcd => {
                 check_arg_count!(arg_count, 2);
                 let a = state.registers[*start_reg].get_value();
@@ -11172,35 +11078,6 @@ pub fn op_function(
                 let a = state.registers[*start_reg].get_value();
                 let b = state.registers[*start_reg + 1].get_value();
                 state.registers[*dest].set_value(crate::functions::math::exec_lcm(a, b)?);
-            }
-            ScalarFunc::Repeat => {
-                check_arg_count!(arg_count, 2);
-                let input = state.registers[*start_reg].get_value();
-                let count = state.registers[*start_reg + 1].get_value();
-                state.registers[*dest]
-                    .set_value(crate::functions::string::exec_repeat(input, count)?);
-            }
-            ScalarFunc::Lpad => {
-                let input = state.registers[*start_reg].get_value();
-                let length = state.registers[*start_reg + 1].get_value();
-                let fill = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value())
-                } else {
-                    None
-                };
-                state.registers[*dest]
-                    .set_value(crate::functions::string::exec_lpad(input, length, fill)?);
-            }
-            ScalarFunc::Rpad => {
-                let input = state.registers[*start_reg].get_value();
-                let length = state.registers[*start_reg + 1].get_value();
-                let fill = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value())
-                } else {
-                    None
-                };
-                state.registers[*dest]
-                    .set_value(crate::functions::string::exec_rpad(input, length, fill)?);
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);

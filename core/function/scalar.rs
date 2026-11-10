@@ -1,3 +1,5 @@
+pub(crate) mod values;
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::LazyLock;
@@ -133,6 +135,25 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&Soundex, &[]);
     catalog.register(&Hex, &[]);
     catalog.register(&Unhex, &[]);
+    catalog.register(&values::Char, &["chr"]);
+    catalog.register(&values::ConcatWs, &[]);
+    catalog.register(&values::Instr, &["strpos"]);
+    catalog.register(&values::Subtype, &[]);
+    catalog.register(&values::Typeof, &[]);
+    catalog.register(&values::Unistr, &[]);
+    catalog.register(&values::UnistrQuote, &[]);
+    catalog.register(&values::Quote, &[]);
+    catalog.register(&values::ZeroBlob, &[]);
+    catalog.register(&values::GetByte, &[]);
+    catalog.register(&values::SetByte, &[]);
+    catalog.register(&values::Replace, &[]);
+    catalog.register(&values::Printf, &["format"]);
+    catalog.register(&values::Substr, &[]);
+    catalog.register(&values::Substring, &[]);
+    catalog.register(&values::StringReverse, &["reverse"]);
+    catalog.register(&values::Repeat, &[]);
+    catalog.register(&values::Lpad, &[]);
+    catalog.register(&values::Rpad, &[]);
     catalog
 });
 
@@ -475,7 +496,7 @@ mod tests {
             .metadata()
             .validate_arg_count("abs", (1usize << 32) + 1)
             .is_err());
-        assert!(resolve_builtin_function("quote", (1usize << 32) + 1).is_err());
+        assert!(resolve_builtin_function("randomblob", (1usize << 32) + 1).is_err());
     }
 
     #[test]

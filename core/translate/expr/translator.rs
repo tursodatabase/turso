@@ -1392,14 +1392,6 @@ fn translate_function_call_expr(
                                 [array_reg <- 0, index_reg <- 1, value_reg <- 2],
                                 Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })
                 }
-                ScalarFunc::Char => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
                 ScalarFunc::Coalesce => {
                     let args = expect_arguments_min!(args, 2, srf);
 
@@ -1438,38 +1430,6 @@ fn translate_function_call_expr(
                         start_reg: regs,
                         dest: target_register,
                         func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::ConcatWs => {
-                    if args.len() < 2 {
-                        crate::bail_parse_error!(
-                            "wrong number of arguments to function {}()",
-                            srf.to_string()
-                        );
-                    }
-
-                    let temp_register = program.alloc_registers(args.len() + 1);
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(
-                            program,
-                            referenced_tables,
-                            arg,
-                            temp_register + i + 1,
-                            resolver,
-                        )?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: temp_register + 1,
-                        dest: temp_register,
-                        func: func_ctx,
-                    });
-
-                    program.emit_insn(Insn::Copy {
-                        src_reg: temp_register,
-                        dst_reg: target_register,
-                        extra_amount: 0,
                     });
                     Ok(target_register)
                 }
@@ -1609,14 +1569,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Subtype
-                | ScalarFunc::Typeof
-                | ScalarFunc::Unistr
-                | ScalarFunc::UnistrQuote
-                | ScalarFunc::Quote
-                | ScalarFunc::RandomBlob
-                | ScalarFunc::ZeroBlob
-                | ScalarFunc::SequenceWatermark => {
+                ScalarFunc::RandomBlob | ScalarFunc::SequenceWatermark => {
                     let args = expect_arguments_exact!(args, 1, srf);
                     let start_reg = program.alloc_register();
                     translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
@@ -1678,32 +1631,6 @@ fn translate_function_call_expr(
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Substr | ScalarFunc::Substring => {
-                    if !(args.len() == 2 || args.len() == 3) {
-                        crate::bail_parse_error!(
-                            "{} function with wrong number of arguments",
-                            srf.to_string()
-                        )
-                    }
-
-                    let str_reg = program.alloc_register();
-                    let start_reg = program.alloc_register();
-                    let length_reg = program.alloc_register();
-                    let str_reg =
-                        translate_expr(program, referenced_tables, &args[0], str_reg, resolver)?;
-                    let _ =
-                        translate_expr(program, referenced_tables, &args[1], start_reg, resolver)?;
-                    if args.len() == 3 {
-                        translate_expr(program, referenced_tables, &args[2], length_reg, resolver)?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: str_reg,
                         dest: target_register,
                         func: func_ctx,
                     });
@@ -1788,7 +1715,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Nullif | ScalarFunc::Instr => {
+                ScalarFunc::Nullif => {
                     if args.len() != 2 {
                         crate::bail_parse_error!(
                             "{} function must have two argument",
@@ -1845,41 +1772,6 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Replace => {
-                    if args.len() != 3 {
-                        crate::bail_parse_error!(
-                            "wrong number of arguments to function {}()",
-                            srf.to_string()
-                        )
-                    }
-
-                    let str_reg = program.alloc_register();
-                    let pattern_reg = program.alloc_register();
-                    let replacement_reg = program.alloc_register();
-                    let _ =
-                        translate_expr(program, referenced_tables, &args[0], str_reg, resolver)?;
-                    let _ = translate_expr(
-                        program,
-                        referenced_tables,
-                        &args[1],
-                        pattern_reg,
-                        resolver,
-                    )?;
-                    let _ = translate_expr(
-                        program,
-                        referenced_tables,
-                        &args[2],
-                        replacement_reg,
-                        resolver,
-                    )?;
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: str_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::StrfTime => {
                     let start_reg = program.alloc_registers(args.len().max(1));
                     for (i, arg) in args.iter().enumerate() {
@@ -1894,22 +1786,6 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Printf => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
-                ScalarFunc::GetByte | ScalarFunc::SetByte => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
                 ScalarFunc::Likely => {
                     if args.len() != 1 {
                         crate::bail_parse_error!("likely function must have exactly 1 argument",);
@@ -2034,12 +1910,8 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
-                | ScalarFunc::StringReverse
                 | ScalarFunc::Gcd
                 | ScalarFunc::Lcm
-                | ScalarFunc::Repeat
-                | ScalarFunc::Lpad
-                | ScalarFunc::Rpad
                 | ScalarFunc::BooleanToInt
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
