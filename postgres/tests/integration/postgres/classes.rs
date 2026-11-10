@@ -472,15 +472,34 @@ fn a_rolled_back_grant_leaves_the_list_as_it_was(db: TempDatabase) {
 /// one made it: six columns, no `relacl`, and a class row for the table
 /// `app.t`, written by hand.
 fn write_catalog_without_relacl(path: &str) {
+    write_old_catalog(path, false);
+}
+
+/// Writes a database at `path` with the catalog as tursopg made it before
+/// row-level security: `relacl` but no `relrowsecurity`.
+fn write_catalog_without_relrowsecurity(path: &str) {
+    write_old_catalog(path, true);
+}
+
+/// Writes a database at `path` with a catalog that has no `relrowsecurity`,
+/// and no `relacl` either unless `with_relacl`, and a class row for the
+/// table `app.t`, written by hand.
+fn write_old_catalog(path: &str, with_relacl: bool) {
     let db = open_without_catalog(path);
     let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
     conn.create_namespace("app").unwrap();
     let app = conn.qualifier("app").unwrap().target.id.as_u32();
+    let (relacl_column, relacl_value) = if with_relacl {
+        (", relacl TEXT", ", NULL")
+    } else {
+        ("", "")
+    };
     for sql in [
-        "CREATE TABLE __turso_internal_classes (oid INTEGER PRIMARY KEY, relname TEXT NOT NULL, \
-         relnamespace INTEGER NOT NULL, relkind TEXT NOT NULL, relowner INTEGER NOT NULL, \
-         relownedby INTEGER NOT NULL)"
-            .to_string(),
+        format!(
+            "CREATE TABLE __turso_internal_classes (oid INTEGER PRIMARY KEY, \
+             relname TEXT NOT NULL, relnamespace INTEGER NOT NULL, relkind TEXT NOT NULL, \
+             relowner INTEGER NOT NULL, relownedby INTEGER NOT NULL{relacl_column})"
+        ),
         "CREATE UNIQUE INDEX __turso_internal_classes_name \
          ON __turso_internal_classes (relnamespace, relname)"
             .to_string(),
@@ -488,7 +507,10 @@ fn write_catalog_without_relacl(path: &str) {
         "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16384)"
             .to_string(),
         "CREATE TABLE app.t (x int)".to_string(),
-        format!("INSERT INTO __turso_internal_classes VALUES (16384, 't', {app}, 'r', 0, 0)"),
+        format!(
+            "INSERT INTO __turso_internal_classes \
+             VALUES (16384, 't', {app}, 'r', 0, 0{relacl_value})"
+        ),
     ] {
         conn.prepare_engine_schema_statement(&sql)
             .unwrap()
@@ -562,8 +584,72 @@ fn a_catalog_made_before_relacl_opens_read_only_without_the_column() {
         "ALTER TABLE app.t RENAME TO u",
         "ALTER TABLE app.t OWNER TO postgres",
         "GRANT SELECT ON app.t TO postgres",
+        "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY",
     ] {
         let error = pg.execute(sql).unwrap_err().to_string();
         assert!(error.contains("readonly"), "{sql}: {error}");
     }
+}
+
+/// Whether `relname` has row-level security, as `pg_class.relrowsecurity`
+/// shows it.
+fn relrowsecurity(conn: &turso_pg::Connection, relname: &str) -> bool {
+    let rows = conn
+        .query(format!(
+            "SELECT relrowsecurity FROM pg_class WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    rows[0][0].as_int() == Some(1)
+}
+
+fn open_pg_database(path: &str, flags: turso_core::OpenFlags) -> Arc<turso_core::Database> {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    turso_pg::open_database_with_io(io, path, flags, turso_core::DatabaseOpts::new()).unwrap()
+}
+
+#[test]
+fn a_catalog_made_before_relrowsecurity_gets_the_column_when_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relrowsecurity.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relrowsecurity(path);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    assert!(!relrowsecurity(&pg, "t"));
+
+    pg.execute("ALTER TABLE app.t ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    assert!(relrowsecurity(&pg, "t"));
+    pg.close().unwrap();
+    drop(pg);
+    drop(db);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    assert!(relrowsecurity(&pg, "t"));
+}
+
+#[test]
+fn a_catalog_made_before_relrowsecurity_opens_read_only_without_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relrowsecurity-read-only.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relrowsecurity(path);
+
+    let db = open_pg_database(
+        path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+
+    assert!(!relrowsecurity(&pg, "t"));
+    let error = pg
+        .execute("ALTER TABLE app.t ENABLE ROW LEVEL SECURITY")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("readonly"), "{error}");
 }

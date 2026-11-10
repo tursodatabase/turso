@@ -1575,6 +1575,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             Arc::new(crate::EngineDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         );
         let env = TypeEnv::new(None, &resolver);
         let mismatches: Vec<String> = cases

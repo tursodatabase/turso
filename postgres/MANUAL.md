@@ -2,6 +2,78 @@
 
 ## The SQL language
 
+### `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` — turn on row-level security
+
+**Synopsis:**
+
+```sql
+ALTER TABLE name ENABLE ROW LEVEL SECURITY
+ALTER TABLE name DISABLE ROW LEVEL SECURITY
+```
+
+**Description:**
+
+`ENABLE ROW LEVEL SECURITY` turns on row-level security for a table, and
+`DISABLE ROW LEVEL SECURITY` turns it off. The `relrowsecurity` column of
+`pg_class` shows which tables have it.
+
+A table with row-level security shows no rows to a role that is neither a
+superuser nor the table's owner, as a PostgreSQL table with row-level security
+and no policies does. Queries return no rows from it, wherever the table
+appears in them: in joins, subqueries, common table expressions, views and
+`COPY ... TO STDOUT`. In a `LEFT JOIN`, the table's columns read as NULL.
+Superusers and the table's owner see every row.
+
+**Parameters:**
+
+- `name`: The name of an existing table, optionally qualified with its schema.
+
+**Notes:**
+
+Policies and `CREATE POLICY` are not supported yet, so a role that is neither
+a superuser nor the table's owner cannot see any row of a table with row-level
+security.
+
+A view reads its tables as the view's owner, as in PostgreSQL, so it shows its
+readers the rows its owner sees. A view that a superuser or the table's owner
+owns shows every row; a view that another role owns shows none. Unlike
+PostgreSQL, a superuser reading a view sees every row, whoever owns the
+view.
+
+A query of a role that joins a table with row-level security with `RIGHT JOIN`
+or `FULL JOIN` fails. Virtual tables that show the database file itself can
+only be read by a superuser.
+
+`SET ROLE` applies to the statements that start after it. A statement that
+is already running, such as a query a superuser started and is still reading
+rows from, keeps the role it started with until it finishes.
+
+Enabling row-level security for a table that already has it, or disabling it
+for a table that does not, does nothing. Renaming a table keeps its row-level
+security, and a new table created with the name of a dropped table starts
+without it.
+
+Only the owner of a table or a superuser may enable or disable its row-level
+security.
+
+`FORCE ROW LEVEL SECURITY` and `NO FORCE ROW LEVEL SECURITY` are not
+supported.
+
+**Examples:**
+
+```sql
+CREATE TABLE accounts (id int, owner text);
+ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
+SELECT relname, relrowsecurity FROM pg_class WHERE relname = 'accounts';
+```
+
+```
+ relname  | relrowsecurity
+----------+----------------
+ accounts | t
+(1 row)
+```
+
 ### `CREATE ROLE` — create a role
 
 **Synopsis:**

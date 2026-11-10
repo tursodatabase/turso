@@ -30,6 +30,7 @@ use turso_parser::ast;
 
 use crate::incremental::dag;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -256,6 +257,7 @@ fn build_plan_for_connection(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
     // names the same way CREATE did: within the view's own database, never

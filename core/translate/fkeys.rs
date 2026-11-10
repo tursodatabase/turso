@@ -1924,13 +1924,17 @@ fn emit_fk_action_subprogram(
             .set_writes_stored_values(ctx.new_key_is_stored);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
-        translate_inner(
-            stmt,
-            resolver,
-            &mut subprogram_builder,
-            connection,
-            description,
-        )?;
+        // Foreign-key actions see every row, as in PostgreSQL, so a cascading
+        // delete also removes the rows that row-level security hides.
+        resolver.without_row_security(|resolver| {
+            translate_inner(
+                stmt,
+                resolver,
+                &mut subprogram_builder,
+                connection,
+                description,
+            )
+        })?;
         subprogram_builder.epilogue(resolver.schema());
         let built = subprogram_builder.build(connection.clone(), true, description)?;
         let prepared = built.prepared().clone();

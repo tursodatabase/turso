@@ -1,5 +1,6 @@
 use crate::namespace::NamespaceRef;
 use crate::schema::Table;
+use crate::security::policy::Command;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -11,6 +12,7 @@ use crate::translate::plan::{
 use crate::translate::planner::{
     collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
 };
+use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -255,6 +257,12 @@ pub fn prepare_delete_plan(
         where_clause.as_deref(),
         &mut table_references,
         None,
+        &mut where_predicates,
+        resolver,
+    )?;
+    row_security::filter_rows(
+        Command::Delete,
+        &table_references,
         &mut where_predicates,
         resolver,
     )?;
