@@ -1176,6 +1176,31 @@ impl ProgramBuilder {
         }
     }
 
+    /// Moves the instructions that `emit` emits to the end of the program,
+    /// where Init jumps before the first row is read, so they run once per
+    /// statement. Unlike a constant expression, they do not have to be
+    /// constant: `random()` emitted here is called once and every row sees
+    /// the same value. They must not read a cursor, because none is open yet.
+    pub fn emit_once_per_statement<T>(
+        &mut self,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        turso_assert!(
+            !self.constant_span_is_open(),
+            "code that runs once per statement is emitted outside constant code"
+        );
+        let first_span_of_emit = self.constant_spans.len();
+        let first_insn = self.insns.len();
+        let result = emit(self)?;
+        // One span over everything `emit` emitted replaces the spans of the
+        // constant expressions inside it.
+        self.constant_spans.truncate(first_span_of_emit);
+        if self.insns.len() > first_insn {
+            self.constant_spans.push((first_insn, self.insns.len() - 1));
+        }
+        Ok(result)
+    }
+
     /// Check if there is a constant span that is currently open.
     pub fn constant_span_is_open(&self) -> bool {
         self.constant_spans
