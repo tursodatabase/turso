@@ -27,7 +27,7 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
+    check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
     PgGrantSelectStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
@@ -443,17 +443,18 @@ fn prepare_statement_inner(
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
     if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
-        return pg_conn
+        let stmt = pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
-            .map_err(schema_error)
-            .map(|s| {
-                crate::Statement::new(s)
-                    .with_result_kind(result_kind)
-                    .with_tx_tracking(conn, tx, role)
-                    .with_query_start_marking(marks_query_start)
-                    .with_post_run(post_run)
-            });
+            .map_err(schema_error)?;
+        // Preparing CREATE TYPE refuses a taken type name, which PostgreSQL
+        // reports before bad enum labels.
+        check_enum_labels(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?;
+        return Ok(crate::Statement::new(stmt)
+            .with_result_kind(result_kind)
+            .with_tx_tracking(conn, tx, role)
+            .with_query_start_marking(marks_query_start)
+            .with_post_run(post_run));
     }
 
     // Validate the prerequisites and the target command during prepare
