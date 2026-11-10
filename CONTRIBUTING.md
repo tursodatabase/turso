@@ -65,7 +65,7 @@ Therefore, we adopt a constantly evolving set of best-practices.
 
 If you are an external contributor, do recommend you do not send fixes to things that are broken, but open issues instead.
 In our experience, most likely you have just asked your coding agent to fix the issue and sent us the result. If this is all you have done, we could have done that with our coding agent just the same.
-An issue that is includes a comprehensive set of tests and other relevant information that may help us fix it is as valuable as code and you will be credited by filing the issue in the commit that eventually fixes it.
+An issue that includes a comprehensive set of tests and other relevant information that may help us fix it is as valuable as code and you will be credited by filing the issue in the commit that eventually fixes it.
 
 Developing new features and architecture work is where humans excel, so this is where PRs are welcome the most.
 
