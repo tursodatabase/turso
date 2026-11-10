@@ -955,7 +955,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+    pub fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
         match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
