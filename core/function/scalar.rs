@@ -1,5 +1,5 @@
 pub(crate) mod arrays;
-
+pub(crate) mod numeric;
 pub(crate) mod values;
 
 use std::collections::HashMap;
@@ -168,6 +168,20 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&arrays::ArraySlice, &[]);
     catalog.register(&arrays::StringToArray, &[]);
     catalog.register(&arrays::ArrayToString, &[]);
+    catalog.register(&numeric::BooleanToInt, &[]);
+    catalog.register(&numeric::IntToBoolean, &[]);
+    catalog.register(&numeric::ValidateIpAddr, &[]);
+    catalog.register(&numeric::NumericEncode, &[]);
+    catalog.register(&numeric::NumericFit, &[]);
+    catalog.register(&numeric::NumericDecode, &[]);
+    catalog.register(&numeric::NumericNeg, &[]);
+    catalog.register(&numeric::Gcd, &[]);
+    catalog.register(&numeric::Lcm, &[]);
+    catalog.register(&numeric::NumericAdd, &[]);
+    catalog.register(&numeric::NumericSub, &[]);
+    catalog.register(&numeric::NumericMul, &[]);
+    catalog.register(&numeric::NumericDiv, &[]);
+    catalog.register(&numeric::NumericMod, &[]);
     catalog
 });
 

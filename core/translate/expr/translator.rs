@@ -1910,20 +1910,6 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
-                | ScalarFunc::Gcd
-                | ScalarFunc::Lcm
-                | ScalarFunc::BooleanToInt
-                | ScalarFunc::IntToBoolean
-                | ScalarFunc::ValidateIpAddr
-                | ScalarFunc::NumericEncode
-                | ScalarFunc::NumericFit
-                | ScalarFunc::NumericDecode
-                | ScalarFunc::NumericAdd
-                | ScalarFunc::NumericSub
-                | ScalarFunc::NumericMul
-                | ScalarFunc::NumericDiv
-                | ScalarFunc::NumericMod
-                | ScalarFunc::NumericNeg
                 | ScalarFunc::DatePlus
                 | ScalarFunc::DateMinus
                 | ScalarFunc::DateDiff => translate_function(

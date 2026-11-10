@@ -994,23 +994,6 @@ pub enum ScalarFunc {
     /// equivalent SQL calls that contain nondeterministic functions.
     #[cfg(feature = "test_helper")]
     TestNondetCounter,
-    // SQL-standard string and math extensions (PG/MySQL/Oracle compatible)
-    Gcd,
-    Lcm,
-    // Built-in type support functions
-    BooleanToInt,
-    IntToBoolean,
-    ValidateIpAddr,
-    // Numeric type functions
-    NumericEncode,
-    NumericFit,
-    NumericDecode,
-    NumericAdd,
-    NumericSub,
-    NumericMul,
-    NumericDiv,
-    NumericMod,
-    NumericNeg,
     // Date type functions
     DatePlus,
     DateMinus,
@@ -1073,24 +1056,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
             ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => true,
-            ScalarFunc::Gcd | ScalarFunc::Lcm => true,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
-            ScalarFunc::BooleanToInt
-            | ScalarFunc::IntToBoolean
-            | ScalarFunc::ValidateIpAddr
-            | ScalarFunc::NumericEncode
-            | ScalarFunc::NumericFit
-            | ScalarFunc::NumericDecode
-            | ScalarFunc::NumericAdd
-            | ScalarFunc::NumericSub
-            | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv
-            | ScalarFunc::NumericMod
-            | ScalarFunc::NumericNeg
-            | ScalarFunc::DatePlus
-            | ScalarFunc::DateMinus
-            | ScalarFunc::DateDiff => true,
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => true,
             ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => true,
             ScalarFunc::StructPack
             | ScalarFunc::StructExtractFunc
@@ -1137,9 +1105,6 @@ impl ScalarFunc {
             | Self::ConnTxnId
             | Self::IsAutocommit
             | Self::SequenceWatermark
-            | Self::Gcd
-            | Self::Lcm
-            | Self::BooleanToInt
             | Self::DateDiff
             | Self::NextVal
             | Self::CurrVal
@@ -1157,21 +1122,14 @@ impl ScalarFunc {
             | Self::SqliteSourceId
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
-            | Self::IntToBoolean
-            | Self::ValidateIpAddr
-            | Self::NumericDecode
-            | Self::NumericAdd
-            | Self::NumericSub
-            | Self::NumericMul
-            | Self::NumericDiv
-            | Self::NumericMod
-            | Self::NumericNeg
             | Self::DatePlus
             | Self::DateMinus
             | Self::TestUintEncode
             | Self::StatGet
             | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
-            Self::RandomBlob | Self::NumericEncode | Self::NumericFit | Self::StatInit | Self::StatPush => ResultType::Declared(ReturnType::Blob),
+            Self::RandomBlob
+            | Self::StatInit
+            | Self::StatPush => ResultType::Declared(ReturnType::Blob),
             Self::Array | Self::ArraySetElement => ResultType::Declared(ReturnType::Array),
         }
     }
@@ -1235,20 +1193,6 @@ impl Display for ScalarFunc {
             Self::TestUintDecode => "test_uint_decode",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
-            Self::Gcd => "gcd",
-            Self::Lcm => "lcm",
-            Self::BooleanToInt => "boolean_to_int",
-            Self::IntToBoolean => "int_to_boolean",
-            Self::ValidateIpAddr => "validate_ipaddr",
-            Self::NumericEncode => "numeric_encode",
-            Self::NumericFit => "numeric_fit",
-            Self::NumericDecode => "numeric_decode",
-            Self::NumericAdd => "numeric_add",
-            Self::NumericSub => "numeric_sub",
-            Self::NumericMul => "numeric_mul",
-            Self::NumericDiv => "numeric_div",
-            Self::NumericMod => "numeric_mod",
-            Self::NumericNeg => "numeric_neg",
             Self::DatePlus => "date_plus",
             Self::DateMinus => "date_minus",
             Self::DateDiff => "date_diff",
@@ -1334,26 +1278,10 @@ impl ScalarFunc {
             Self::BinRecordJsonObject => &[2],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
-            // SQL-standard string and math extensions
-            Self::Gcd | Self::Lcm => &[2],
             // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode => &[1],
             // Built-in type functions
-            Self::BooleanToInt
-            | Self::IntToBoolean
-            | Self::ValidateIpAddr
-            | Self::NumericEncode
-            | Self::NumericDecode
-            | Self::NumericNeg => &[1],
-            Self::NumericAdd
-            | Self::NumericSub
-            | Self::NumericMul
-            | Self::NumericDiv
-            | Self::NumericMod
-            | Self::DatePlus
-            | Self::DateMinus
-            | Self::DateDiff => &[2],
-            Self::NumericFit => &[3],
+            Self::DatePlus | Self::DateMinus | Self::DateDiff => &[2],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
