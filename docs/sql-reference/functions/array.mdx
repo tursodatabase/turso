@@ -65,6 +65,8 @@ string_to_array(text, delimiter, null_string)
 
 **Returns:** BLOB -- an array value.
 
+An empty input string returns an empty array.
+
 ```sql
 SELECT string_to_array('one,two,three', ',');
 -- ["one","two","three"]
@@ -157,8 +159,8 @@ For multi-dimensional arrays the walker peeks into element zero at each level, s
 SELECT array_length(ARRAY[10, 20, 30]);
 -- 3
 
-SELECT array_length('[]');
--- 0
+SELECT array_length('{}');
+-- NULL
 
 SELECT array_length(NULL);
 -- NULL

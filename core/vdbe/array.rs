@@ -276,10 +276,15 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     match val {
         Value::Null => None,
         Value::Blob(b) => match ValueIterator::new(b) {
-            Ok(iter) => Some(iter.count() as i64),
+            Ok(iter) => {
+                let count = iter.count();
+                (count > 0).then_some(count as i64)
+            }
             Err(_) => None,
         },
-        Value::Text(t) => parse_text_array(t.as_str()).map(|v| v.len() as i64),
+        Value::Text(t) => {
+            parse_text_array(t.as_str()).and_then(|v| (!v.is_empty()).then_some(v.len() as i64))
+        }
         _ => None,
     }
 }
@@ -448,6 +453,10 @@ pub(crate) fn exec_string_to_array(
         Some(Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
     };
+
+    if text_str.is_empty() {
+        return values_to_record_blob(&[]);
+    }
 
     // NULL delimiter: split into individual characters (PostgreSQL behavior)
     if matches!(delimiter, Value::Null) {
@@ -667,6 +676,12 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_array_length_empty_array_returns_none() {
+        let empty = values_to_record_blob(&[]).unwrap();
+        assert_eq!(compute_array_length(&empty), None);
+    }
+
+    #[test]
     fn test_compute_array_length_non_blob_returns_none() {
         assert_eq!(compute_array_length(&Value::from_i64(42)), None,);
     }
@@ -745,6 +760,14 @@ mod tests {
         assert_eq!(elements[0], Value::build_text("h"));
         assert_eq!(elements[1], Value::build_text("e"));
         assert_eq!(elements[4], Value::build_text("o"));
+    }
+
+    #[test]
+    fn test_string_to_array_empty_text_returns_empty_array() {
+        let result =
+            exec_string_to_array(&Value::build_text(""), &Value::build_text(","), None).unwrap();
+        assert_eq!(array_values_from_any(&result).unwrap(), Vec::<Value>::new());
+        assert_eq!(compute_array_length(&result), None);
     }
 
     #[test]

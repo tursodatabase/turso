@@ -41,6 +41,13 @@ expect {
     {hello,world}
 }
 
+test string-to-array-empty-input {
+    SELECT string_to_array('', ','), array_length(string_to_array('', ','), 1);
+}
+expect {
+    {}|
+}
+
 test select-integer-literal {
     SELECT 42;
 }
