@@ -1819,8 +1819,7 @@ fn query_pragma(
         }
         PragmaName::AutomaticIndex => {
             let enabled = connection.automatic_index();
-            let register = program.alloc_register();
-            program.emit_int(enabled as i64, register);
+            program.emit_bool(enabled, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
