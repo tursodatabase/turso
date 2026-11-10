@@ -22,7 +22,7 @@ use crate::{
     schema::{BTreeTable, RelationKind, Schema},
     security::roles::RoleId,
     vdbe::builder::ProgramBuilder,
-    Connection, Func, LimboError, OpenOptions, Result, Value,
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
@@ -86,6 +86,16 @@ pub enum NewOwner {
     Table(Option<String>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// What a built-in scalar function may read besides its arguments.
+pub struct ScalarFuncContext<'a> {
+    pub connection: &'a Connection,
+    pub io: &'a dyn IO,
+    /// The statement's clock: every function of one step sees the same time.
+    pub clock: &'a dyn Clock,
+    /// The collation of the call site, for functions that compare arguments.
+    pub collation: CollationSeq,
 }
 
 /// SQL dialect layered on top of the engine.
