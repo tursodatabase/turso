@@ -50,6 +50,7 @@ mod custom_types;
 mod emission;
 pub(crate) mod expr_type;
 pub(crate) mod functions;
+pub(crate) mod scalar;
 mod translator;
 mod utils;
 mod vectors;

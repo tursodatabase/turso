@@ -10354,9 +10354,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::Coalesce => {}
-            ScalarFunc::IfNull => {}
-            ScalarFunc::Iif => {}
             ScalarFunc::NextVal => {
                 // The translator no longer emits `Function NextVal` — nextval
                 // is now handled entirely by the SequenceComputeNext +
@@ -10691,11 +10688,6 @@ pub fn op_function(
 
                 // Set result to NULL (detach doesn't return a value)
                 state.registers[*dest].set_null();
-            }
-            ScalarFunc::Unlikely | ScalarFunc::Likely | ScalarFunc::Likelihood => {
-                panic!(
-                    "{scalar_func:?} should be stripped during expression translation and never reach VDBE",
-                );
             }
             ScalarFunc::StatInit => {
                 // stat_init(n_col): Initialize a statistics accumulator

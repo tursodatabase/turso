@@ -949,20 +949,14 @@ impl AggFunc {
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum ScalarFunc {
     Cast,
-    Coalesce,
-    IfNull,
-    Iif,
     TursoVersion,
     #[cfg(feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
-    Likely,
-    Likelihood,
     TableColumnsJsonArray,
     BinRecordJsonObject,
     Attach,
     Detach,
-    Unlikely,
     StatInit,
     StatPush,
     StatGet,
@@ -997,24 +991,18 @@ impl Deterministic for ScalarFunc {
     fn is_deterministic(&self) -> bool {
         match self {
             ScalarFunc::Cast => true,
-            ScalarFunc::Coalesce => true,
-            ScalarFunc::IfNull => true,
-            ScalarFunc::Iif => true,
             ScalarFunc::TursoVersion => false,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => false,
-            ScalarFunc::Likely => true,
-            ScalarFunc::Likelihood => true,
             ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
             ScalarFunc::BinRecordJsonObject => true,
-            ScalarFunc::Attach => false, // changes database state
-            ScalarFunc::Detach => false, // changes database state
-            ScalarFunc::Unlikely => true,
-            ScalarFunc::StatInit => false, // internal ANALYZE function
-            ScalarFunc::StatPush => false, // internal ANALYZE function
-            ScalarFunc::StatGet => false,  // internal ANALYZE function
-            ScalarFunc::ConnTxnId => false, // depends on connection state
+            ScalarFunc::Attach => false,       // changes database state
+            ScalarFunc::Detach => false,       // changes database state
+            ScalarFunc::StatInit => false,     // internal ANALYZE function
+            ScalarFunc::StatPush => false,     // internal ANALYZE function
+            ScalarFunc::StatGet => false,      // internal ANALYZE function
+            ScalarFunc::ConnTxnId => false,    // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
             ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => true,
@@ -1035,12 +1023,7 @@ impl ScalarFunc {
     /// How the type of the function's result follows from its arguments.
     pub fn result_type(&self) -> ResultType {
         match self {
-            Self::Coalesce | Self::IfNull => ResultType::OneOfTheArguments,
-            Self::Iif => ResultType::OneOfTheIifValues,
-            Self::Likely
-            | Self::Unlikely
-            | Self::Likelihood
-            | Self::TestUintDecode => ResultType::FirstArgument,
+            Self::TestUintDecode => ResultType::FirstArgument,
             Self::ArrayElement => ResultType::ElementOfTheFirstArgument,
             // CAST is translated as an expression, never called by name.
             Self::Cast
@@ -1081,20 +1064,14 @@ impl Display for ScalarFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
             Self::Cast => "cast",
-            Self::Coalesce => "coalesce",
-            Self::IfNull => "ifnull",
-            Self::Iif => "iif",
             Self::TursoVersion => "turso_version",
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension",
-            Self::Likely => "likely",
-            Self::Likelihood => "likelihood",
             Self::TableColumnsJsonArray => "table_columns_json_array",
             Self::BinRecordJsonObject => "bin_record_json_object",
             Self::Attach => "attach",
             Self::Detach => "detach",
-            Self::Unlikely => "unlikely",
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
@@ -1152,11 +1129,9 @@ impl ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
-            Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
+            Self::SequenceWatermark => &[1],
             // 2-arg
-            Self::IfNull | Self::Likelihood => &[2],
             // Truly variable-arg
-            Self::Coalesce | Self::Iif => &[-1],
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => &[-1],
@@ -1197,7 +1172,7 @@ impl ScalarFunc {
     /// This is used by planner/optimizer logic that needs to reason about whether
     /// predicates are null-rejecting for outer-join simplification.
     pub fn can_mask_nulls(&self) -> bool {
-        matches!(self, Self::Coalesce | Self::IfNull)
+        false
     }
 }
 

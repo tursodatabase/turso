@@ -1,6 +1,7 @@
 pub(crate) mod arrays;
 pub(crate) mod comparison;
 pub(crate) mod context;
+pub(crate) mod control;
 pub(crate) mod datetime;
 pub(crate) mod numeric;
 pub(crate) mod pattern;
@@ -12,11 +13,15 @@ use std::sync::LazyLock;
 
 pub use super::arity::FunctionArity;
 pub use super::{ResultType, ReturnType};
+pub use crate::translate::expr::scalar::FunctionCompileContext;
 use crate::vdbe::Register;
 use crate::{Connection, Result, Value};
 
 pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
+    fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+        context.compile_default()
+    }
     fn argument_translation(&self) -> ArgumentTranslation {
         ArgumentTranslation::Values
     }
@@ -28,7 +33,12 @@ pub trait ScalarFunction: Debug + Send + Sync {
     fn date_time_arguments(&self) -> Option<DateTimeArguments> {
         None
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value>;
+    fn execute(&self, _context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
+        Err(crate::LimboError::InternalError(format!(
+            "{} must be compiled to dedicated instructions",
+            self.metadata().name
+        )))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +311,12 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register_overload(&comparison::Min);
     catalog.register_overload(&comparison::Max);
     catalog.register_overload(&comparison::Nullif);
+    catalog.register(&control::Coalesce, &[]);
+    catalog.register(&control::IfNull, &[]);
+    catalog.register(&control::Iif, &["if"]);
+    catalog.register(&control::Likely, &[]);
+    catalog.register(&control::Unlikely, &[]);
+    catalog.register(&control::Likelihood, &[]);
     catalog
 });
 
