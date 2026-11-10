@@ -1,5 +1,6 @@
 use super::*;
 use crate::namespace::NamespaceId;
+use crate::scalar::ArgumentTranslation;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -42,8 +43,8 @@ pub(super) fn translate_like_base(
                 constant_mask = 1;
             }
             let func = match op {
-                ast::LikeOperator::Like => ScalarFunc::Like,
-                ast::LikeOperator::Glob => ScalarFunc::Glob,
+                ast::LikeOperator::Like => Func::RegisteredScalar(&crate::scalar::pattern::Like),
+                ast::LikeOperator::Glob => Func::RegisteredScalar(&crate::scalar::pattern::Glob),
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {
@@ -51,7 +52,7 @@ pub(super) fn translate_like_base(
                 start_reg,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count,
                     collation: CollationSeq::BINARY,
                 },
@@ -106,11 +107,31 @@ pub(super) fn translate_function(
     func_ctx: FuncCtx,
 ) -> Result<usize> {
     let start_reg = program.alloc_registers(args.len());
-    let mut current_reg = start_reg;
-
-    for arg in args.iter() {
-        translate_expr(program, referenced_tables, arg, current_reg, resolver)?;
-        current_reg += 1;
+    let argument_translation = match &func_ctx.func {
+        Func::RegisteredScalar(function) => function.argument_translation(),
+        _ => ArgumentTranslation::Values,
+    };
+    match argument_translation {
+        ArgumentTranslation::Values => {
+            for (i, arg) in args.iter().enumerate() {
+                translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+            }
+        }
+        ArgumentTranslation::ComparedValues => {
+            translate_compared_args(program, referenced_tables, args, start_reg, resolver)?;
+        }
+        ArgumentTranslation::ComparedPair => {
+            assert_eq!(args.len(), 2);
+            translate_compared_pair(
+                program,
+                referenced_tables,
+                &args[0],
+                &args[1],
+                start_reg,
+                start_reg + 1,
+                resolver,
+            )?;
+        }
     }
 
     program.emit_insn(Insn::Function {
@@ -194,9 +215,8 @@ pub(super) fn translate_sequence_function(
     resolver: &Resolver,
     target_register: usize,
     func_ctx: FuncCtx,
+    is_nextval: bool,
 ) -> Result<usize> {
-    let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
-
     let seq_name_raw = extract_string_literal(&args[0])?;
     let (namespace, normalized_name) =
         crate::translate::sequence::resolve_sequence_name(&seq_name_raw, resolver).ok_or_else(

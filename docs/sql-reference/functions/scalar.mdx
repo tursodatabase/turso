@@ -158,7 +158,7 @@ SELECT coalesce(NULL, 42);                 -- 42
 
 ### concat(X, ...) and concat_ws(SEP, X, ...)
 
-`concat` joins all arguments as strings, skipping NULLs. `concat_ws` inserts the separator between non-NULL arguments.
+`concat` takes at least one argument and joins all arguments as strings, skipping NULLs. If every argument is NULL, it returns an empty string. `concat_ws` inserts the separator between non-NULL arguments.
 
 ```sql
 SELECT concat('Hello', ' ', 'World');          -- 'Hello World'
@@ -211,6 +211,8 @@ The `glob(X, Y)` function is the functional form of the `Y GLOB X` operator. Not
 ### hex(X) and unhex(X)
 
 `hex` returns the uppercase hexadecimal representation of its argument. For text, it returns the hex encoding of the UTF-8 bytes. For blobs, it encodes each byte. For integers, it returns the hex of the value.
+
+`hex(NULL)` returns an empty string.
 
 `unhex` converts a hexadecimal string back to a blob. Returns NULL if the input contains non-hex characters, unless a second argument specifies characters to ignore.
 

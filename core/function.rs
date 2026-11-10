@@ -1,3 +1,6 @@
+pub(crate) mod arity;
+pub mod scalar;
+
 use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
@@ -944,691 +947,6 @@ impl AggFunc {
 }
 
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
-pub enum ScalarFunc {
-    Cast,
-    Changes,
-    Char,
-    Coalesce,
-    Concat,
-    ConcatWs,
-    Glob,
-    IfNull,
-    Iif,
-    Instr,
-    Like,
-    Abs,
-    Upper,
-    Lower,
-    Random,
-    RandomBlob,
-    Trim,
-    LTrim,
-    RTrim,
-    Round,
-    Length,
-    OctetLength,
-    Min,
-    Max,
-    Nullif,
-    Sign,
-    Substr,
-    Substring,
-    Soundex,
-    Date,
-    Time,
-    TotalChanges,
-    DateTime,
-    Subtype,
-    Typeof,
-    Unicode,
-    Unistr,
-    UnistrQuote,
-    Quote,
-    SqliteVersion,
-    TursoVersion,
-    SqliteSourceId,
-    UnixEpoch,
-    JulianDay,
-    Hex,
-    Unhex,
-    GetByte,
-    SetByte,
-    ZeroBlob,
-    LastInsertRowid,
-    Replace,
-    #[cfg(feature = "fs")]
-    #[cfg(not(target_family = "wasm"))]
-    LoadExtension,
-    StrfTime,
-    Printf,
-    Likely,
-    TimeDiff,
-    Likelihood,
-    TableColumnsJsonArray,
-    BinRecordJsonObject,
-    Attach,
-    Detach,
-    Unlikely,
-    StatInit,
-    StatPush,
-    StatGet,
-    ConnTxnId,
-    IsAutocommit,
-    SequenceWatermark,
-    // Test type functions (for custom type system testing)
-    TestUintEncode,
-    TestUintDecode,
-    /// Test-only: returns a monotonically increasing 64-bit integer on every
-    /// evaluation. Used to verify that the planner does not deduplicate
-    /// equivalent SQL calls that contain nondeterministic functions.
-    #[cfg(feature = "test_helper")]
-    TestNondetCounter,
-    StringReverse,
-    // SQL-standard string and math extensions (PG/MySQL/Oracle compatible)
-    Gcd,
-    Lcm,
-    Repeat,
-    Lpad,
-    Rpad,
-    // Built-in type support functions
-    BooleanToInt,
-    IntToBoolean,
-    ValidateIpAddr,
-    // Numeric type functions
-    NumericEncode,
-    NumericFit,
-    NumericDecode,
-    NumericAdd,
-    NumericSub,
-    NumericMul,
-    NumericDiv,
-    NumericMod,
-    NumericNeg,
-    // Date type functions
-    DatePlus,
-    DateMinus,
-    DateDiff,
-    // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
-    Array,
-    ArrayElement,
-    ArraySetElement,
-    // Array utility functions
-    ArrayLength,
-    ArrayAppend,
-    ArrayPrepend,
-    ArrayCat,
-    ArrayRemove,
-    ArrayContains,
-    ArrayPosition,
-    ArraySlice,
-    StringToArray,
-    ArrayToString,
-    ArrayOverlap,
-    ArrayContainsAll,
-    // Struct/Union construction and access
-    StructPack,
-    StructExtractFunc,
-    UnionValueFunc,
-    UnionTagFunc,
-    UnionExtractFunc,
-    // Sequence functions
-    NextVal,
-    CurrVal,
-    SetVal,
-}
-
-impl Deterministic for ScalarFunc {
-    fn is_deterministic(&self) -> bool {
-        match self {
-            ScalarFunc::Cast => true,
-            ScalarFunc::Changes => false, // depends on DB state
-            ScalarFunc::Char => true,
-            ScalarFunc::Coalesce => true,
-            ScalarFunc::Concat => true,
-            ScalarFunc::ConcatWs => true,
-            ScalarFunc::Glob => true,
-            ScalarFunc::IfNull => true,
-            ScalarFunc::Iif => true,
-            ScalarFunc::Instr => true,
-            ScalarFunc::Like => true,
-            ScalarFunc::Abs => true,
-            ScalarFunc::Upper => true,
-            ScalarFunc::Lower => true,
-            ScalarFunc::Random => false,     // duh
-            ScalarFunc::RandomBlob => false, // duh
-            ScalarFunc::Trim => true,
-            ScalarFunc::LTrim => true,
-            ScalarFunc::RTrim => true,
-            ScalarFunc::Round => true,
-            ScalarFunc::Length => true,
-            ScalarFunc::OctetLength => true,
-            ScalarFunc::Min => true,
-            ScalarFunc::Max => true,
-            ScalarFunc::Nullif => true,
-            ScalarFunc::Sign => true,
-            ScalarFunc::Substr => true,
-            ScalarFunc::Substring => true,
-            ScalarFunc::Soundex => true,
-            ScalarFunc::Date => false,
-            ScalarFunc::Time => false,
-            ScalarFunc::TotalChanges => false,
-            ScalarFunc::DateTime => false,
-            ScalarFunc::Subtype => true,
-            ScalarFunc::Typeof => true,
-            ScalarFunc::Unicode => true,
-            ScalarFunc::Unistr => true,
-            ScalarFunc::UnistrQuote => true,
-            ScalarFunc::Quote => true,
-            ScalarFunc::SqliteVersion => false,
-            ScalarFunc::TursoVersion => false,
-            ScalarFunc::SqliteSourceId => false,
-            ScalarFunc::UnixEpoch => false,
-            ScalarFunc::JulianDay => false,
-            ScalarFunc::Hex => true,
-            ScalarFunc::Unhex => true,
-            ScalarFunc::GetByte => true,
-            ScalarFunc::SetByte => true,
-            ScalarFunc::ZeroBlob => true,
-            ScalarFunc::LastInsertRowid => false,
-            ScalarFunc::Replace => true,
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => false,
-            ScalarFunc::StrfTime => false,
-            ScalarFunc::Printf => true,
-            ScalarFunc::Likely => true,
-            ScalarFunc::TimeDiff => false,
-            ScalarFunc::Likelihood => true,
-            ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
-            ScalarFunc::BinRecordJsonObject => true,
-            ScalarFunc::Attach => false, // changes database state
-            ScalarFunc::Detach => false, // changes database state
-            ScalarFunc::Unlikely => true,
-            ScalarFunc::StatInit => false, // internal ANALYZE function
-            ScalarFunc::StatPush => false, // internal ANALYZE function
-            ScalarFunc::StatGet => false,  // internal ANALYZE function
-            ScalarFunc::ConnTxnId => false, // depends on connection state
-            ScalarFunc::IsAutocommit => false, // depends on connection state
-            ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode | ScalarFunc::StringReverse => {
-                true
-            }
-            ScalarFunc::Gcd
-            | ScalarFunc::Lcm
-            | ScalarFunc::Repeat
-            | ScalarFunc::Lpad
-            | ScalarFunc::Rpad => true,
-            #[cfg(feature = "test_helper")]
-            ScalarFunc::TestNondetCounter => false,
-            ScalarFunc::BooleanToInt
-            | ScalarFunc::IntToBoolean
-            | ScalarFunc::ValidateIpAddr
-            | ScalarFunc::NumericEncode
-            | ScalarFunc::NumericFit
-            | ScalarFunc::NumericDecode
-            | ScalarFunc::NumericAdd
-            | ScalarFunc::NumericSub
-            | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv
-            | ScalarFunc::NumericMod
-            | ScalarFunc::NumericNeg
-            | ScalarFunc::DatePlus
-            | ScalarFunc::DateMinus
-            | ScalarFunc::DateDiff => true,
-            ScalarFunc::Array
-            | ScalarFunc::ArrayElement
-            | ScalarFunc::ArraySetElement
-            | ScalarFunc::ArrayLength
-            | ScalarFunc::ArrayAppend
-            | ScalarFunc::ArrayPrepend
-            | ScalarFunc::ArrayCat
-            | ScalarFunc::ArrayRemove
-            | ScalarFunc::ArrayContains
-            | ScalarFunc::ArrayPosition
-            | ScalarFunc::ArraySlice
-            | ScalarFunc::StringToArray
-            | ScalarFunc::ArrayToString
-            | ScalarFunc::ArrayOverlap
-            | ScalarFunc::ArrayContainsAll => true,
-            ScalarFunc::StructPack
-            | ScalarFunc::StructExtractFunc
-            | ScalarFunc::UnionValueFunc
-            | ScalarFunc::UnionTagFunc
-            | ScalarFunc::UnionExtractFunc => true,
-            ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
-        }
-    }
-}
-
-impl ScalarFunc {
-    /// How the type of the function's result follows from its arguments.
-    pub fn result_type(&self) -> ResultType {
-        match self {
-            Self::Coalesce | Self::IfNull | Self::Min | Self::Max => ResultType::OneOfTheArguments,
-            Self::Iif => ResultType::OneOfTheIifValues,
-            Self::Nullif
-            | Self::Likely
-            | Self::Unlikely
-            | Self::Likelihood
-            | Self::TestUintDecode => ResultType::FirstArgument,
-            Self::Abs => ResultType::AbsOfTheFirstArgument,
-            // A real for a real argument; see MathFunc::result_type.
-            Self::Round => ResultType::RealForARealArgument,
-            Self::Substr | Self::Substring => ResultType::TextOrBlobLikeTheFirstArgument,
-            Self::ArrayElement => ResultType::ElementOfTheFirstArgument,
-            // CAST is translated as an expression, never called by name.
-            Self::Cast
-            | Self::StructExtractFunc
-            | Self::UnionExtractFunc
-            // An integer, or a real with the 'subsec' modifier.
-            | Self::UnixEpoch
-            // A value of whatever struct or union type it is compared with or
-            // stored in, such as `pos <> struct_pack(0, 0)` on a point column.
-            | Self::StructPack
-            | Self::UnionValueFunc
-            // Always NULL.
-            | Self::Attach
-            | Self::Detach => ResultType::Unknown,
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => ResultType::Unknown,
-            Self::Changes
-            | Self::TotalChanges
-            | Self::LastInsertRowid
-            | Self::Glob
-            | Self::Like
-            | Self::Instr
-            | Self::Random
-            | Self::Length
-            | Self::OctetLength
-            | Self::Sign
-            | Self::Subtype
-            | Self::Unicode
-            | Self::GetByte
-            | Self::ConnTxnId
-            | Self::IsAutocommit
-            | Self::SequenceWatermark
-            | Self::Gcd
-            | Self::Lcm
-            | Self::BooleanToInt
-            | Self::DateDiff
-            | Self::ArrayLength
-            | Self::ArrayContains
-            | Self::ArrayPosition
-            | Self::ArrayOverlap
-            | Self::ArrayContainsAll
-            | Self::NextVal
-            | Self::CurrVal
-            | Self::SetVal => ResultType::Declared(ReturnType::Integer),
-            #[cfg(feature = "test_helper")]
-            Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
-            Self::JulianDay => ResultType::Declared(ReturnType::Real),
-            Self::Char
-            | Self::Concat
-            | Self::ConcatWs
-            | Self::Upper
-            | Self::Lower
-            | Self::Trim
-            | Self::LTrim
-            | Self::RTrim
-            | Self::Replace
-            | Self::Soundex
-            | Self::Date
-            | Self::Time
-            | Self::DateTime
-            | Self::StrfTime
-            | Self::TimeDiff
-            | Self::Typeof
-            | Self::Unistr
-            | Self::UnistrQuote
-            | Self::Quote
-            | Self::SqliteVersion
-            | Self::TursoVersion
-            | Self::SqliteSourceId
-            | Self::Hex
-            | Self::Printf
-            | Self::TableColumnsJsonArray
-            | Self::BinRecordJsonObject
-            | Self::StringReverse
-            | Self::Repeat
-            | Self::Lpad
-            | Self::Rpad
-            | Self::IntToBoolean
-            | Self::ValidateIpAddr
-            | Self::NumericDecode
-            | Self::NumericAdd
-            | Self::NumericSub
-            | Self::NumericMul
-            | Self::NumericDiv
-            | Self::NumericMod
-            | Self::NumericNeg
-            | Self::DatePlus
-            | Self::DateMinus
-            | Self::ArrayToString
-            | Self::TestUintEncode
-            | Self::StatGet
-            | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
-            Self::RandomBlob
-            | Self::ZeroBlob
-            | Self::Unhex
-            | Self::SetByte
-            | Self::NumericEncode
-            | Self::NumericFit
-            | Self::StatInit
-            | Self::StatPush => ResultType::Declared(ReturnType::Blob),
-            Self::Array
-            | Self::ArraySetElement
-            | Self::ArrayAppend
-            | Self::ArrayPrepend
-            | Self::ArrayCat
-            | Self::ArrayRemove
-            | Self::ArraySlice
-            | Self::StringToArray => ResultType::Declared(ReturnType::Array),
-        }
-    }
-
-    pub fn is_date_time_function(&self) -> bool {
-        matches!(
-            self,
-            Self::Date
-                | Self::Time
-                | Self::DateTime
-                | Self::JulianDay
-                | Self::UnixEpoch
-                | Self::StrfTime
-                | Self::TimeDiff
-        )
-    }
-}
-
-impl Display for ScalarFunc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = match self {
-            Self::Cast => "cast",
-            Self::Changes => "changes",
-            Self::Char => "char",
-            Self::Coalesce => "coalesce",
-            Self::Concat => "concat",
-            Self::ConcatWs => "concat_ws",
-            Self::Glob => "glob",
-            Self::IfNull => "ifnull",
-            Self::Iif => "iif",
-            Self::Instr => "instr",
-            Self::Like => "like",
-            Self::Abs => "abs",
-            Self::Upper => "upper",
-            Self::Lower => "lower",
-            Self::Random => "random",
-            Self::RandomBlob => "randomblob",
-            Self::Trim => "trim",
-            Self::LTrim => "ltrim",
-            Self::RTrim => "rtrim",
-            Self::Round => "round",
-            Self::Length => "length",
-            Self::OctetLength => "octet_length",
-            Self::Min => "min",
-            Self::Max => "max",
-            Self::Nullif => "nullif",
-            Self::Sign => "sign",
-            Self::Substr => "substr",
-            Self::Substring => "substring",
-            Self::Soundex => "soundex",
-            Self::Date => "date",
-            Self::Time => "time",
-            Self::TotalChanges => "total_changes",
-            Self::Subtype => "subtype",
-            Self::Typeof => "typeof",
-            Self::Unicode => "unicode",
-            Self::Unistr => "unistr",
-            Self::UnistrQuote => "unistr_quote",
-            Self::Quote => "quote",
-            Self::SqliteVersion => "sqlite_version",
-            Self::TursoVersion => "turso_version",
-            Self::SqliteSourceId => "sqlite_source_id",
-            Self::JulianDay => "julianday",
-            Self::UnixEpoch => "unixepoch",
-            Self::Hex => "hex",
-            Self::Unhex => "unhex",
-            Self::GetByte => "get_byte",
-            Self::SetByte => "set_byte",
-            Self::ZeroBlob => "zeroblob",
-            Self::LastInsertRowid => "last_insert_rowid",
-            Self::Replace => "replace",
-            Self::DateTime => "datetime",
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => "load_extension",
-            Self::StrfTime => "strftime",
-            Self::Printf => "printf",
-            Self::Likely => "likely",
-            Self::TimeDiff => "timediff",
-            Self::Likelihood => "likelihood",
-            Self::TableColumnsJsonArray => "table_columns_json_array",
-            Self::BinRecordJsonObject => "bin_record_json_object",
-            Self::Attach => "attach",
-            Self::Detach => "detach",
-            Self::Unlikely => "unlikely",
-            Self::StatInit => "stat_init",
-            Self::StatPush => "stat_push",
-            Self::StatGet => "stat_get",
-            Self::ConnTxnId => "conn_txn_id",
-            Self::IsAutocommit => "is_autocommit",
-            Self::SequenceWatermark => "sequence_watermark_experimental",
-            Self::TestUintEncode => "test_uint_encode",
-            Self::TestUintDecode => "test_uint_decode",
-            #[cfg(feature = "test_helper")]
-            Self::TestNondetCounter => "test_nondet_counter",
-            Self::StringReverse => "string_reverse",
-            Self::Gcd => "gcd",
-            Self::Lcm => "lcm",
-            Self::Repeat => "repeat",
-            Self::Lpad => "lpad",
-            Self::Rpad => "rpad",
-            Self::BooleanToInt => "boolean_to_int",
-            Self::IntToBoolean => "int_to_boolean",
-            Self::ValidateIpAddr => "validate_ipaddr",
-            Self::NumericEncode => "numeric_encode",
-            Self::NumericFit => "numeric_fit",
-            Self::NumericDecode => "numeric_decode",
-            Self::NumericAdd => "numeric_add",
-            Self::NumericSub => "numeric_sub",
-            Self::NumericMul => "numeric_mul",
-            Self::NumericDiv => "numeric_div",
-            Self::NumericMod => "numeric_mod",
-            Self::NumericNeg => "numeric_neg",
-            Self::DatePlus => "date_plus",
-            Self::DateMinus => "date_minus",
-            Self::DateDiff => "date_diff",
-            Self::Array => "array",
-            Self::ArrayElement => "array_element",
-            Self::ArraySetElement => "array_set_element",
-            Self::ArrayLength => "array_length",
-            Self::ArrayAppend => "array_append",
-            Self::ArrayPrepend => "array_prepend",
-            Self::ArrayCat => "array_cat",
-            Self::ArrayRemove => "array_remove",
-            Self::ArrayContains => "array_contains",
-            Self::ArrayPosition => "array_position",
-            Self::ArraySlice => "array_slice",
-            Self::StringToArray => "string_to_array",
-            Self::ArrayToString => "array_to_string",
-            Self::ArrayOverlap => "array_overlap",
-            Self::ArrayContainsAll => "array_contains_all",
-            Self::StructPack => "struct_pack",
-            Self::StructExtractFunc => "struct_extract",
-            Self::UnionValueFunc => "union_value",
-            Self::UnionTagFunc => "union_tag",
-            Self::UnionExtractFunc => "union_extract",
-            Self::NextVal => "nextval",
-            Self::CurrVal => "currval",
-            Self::SetVal => "setval",
-        };
-        write!(f, "{str}")
-    }
-}
-
-impl ScalarFunc {
-    /// Returns true for internal functions that should not appear in PRAGMA function_list.
-    pub fn is_internal(&self) -> bool {
-        matches!(
-            self,
-            Self::Cast
-                | Self::Array
-                | Self::ArrayElement
-                | Self::ArraySetElement
-                | Self::StatInit
-                | Self::StatPush
-                | Self::StatGet
-                | Self::Attach
-                | Self::Detach
-                | Self::TableColumnsJsonArray
-                | Self::BinRecordJsonObject
-                | Self::ConnTxnId
-                | Self::IsAutocommit
-        )
-    }
-
-    /// Returns the valid arities for this function.
-    /// Each value becomes a separate row in PRAGMA function_list.
-    /// -1 means truly variable arguments (e.g. coalesce, printf).
-    pub fn arities(&self) -> &'static [i32] {
-        match self {
-            // 0-arg
-            Self::Changes
-            | Self::LastInsertRowid
-            | Self::Random
-            | Self::SqliteVersion
-            | Self::TursoVersion
-            | Self::SqliteSourceId
-            | Self::TotalChanges => &[0],
-            #[cfg(feature = "test_helper")]
-            Self::TestNondetCounter => &[0],
-            // 1-arg
-            Self::Abs
-            | Self::Hex
-            | Self::Length
-            | Self::Lower
-            | Self::OctetLength
-            | Self::Quote
-            | Self::UnistrQuote
-            | Self::RandomBlob
-            | Self::Sign
-            | Self::Soundex
-            | Self::Subtype
-            | Self::Typeof
-            | Self::Unicode
-            | Self::Unistr
-            | Self::Upper
-            | Self::ZeroBlob
-            | Self::Likely
-            | Self::Unlikely
-            | Self::SequenceWatermark => &[1],
-            // 2-arg
-            Self::Glob
-            | Self::Instr
-            | Self::Nullif
-            | Self::IfNull
-            | Self::Likelihood
-            | Self::GetByte
-            | Self::TimeDiff => &[2],
-            // 3-arg
-            Self::Replace | Self::SetByte => &[3],
-            // Multi-arity (one row per valid arity)
-            Self::Like => &[2, 3],
-            Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
-            Self::Substr | Self::Substring => &[2, 3],
-            // Truly variable-arg
-            Self::Char
-            | Self::Coalesce
-            | Self::Iif
-            | Self::Concat
-            | Self::ConcatWs
-            | Self::Date
-            | Self::Time
-            | Self::DateTime
-            | Self::UnixEpoch
-            | Self::JulianDay
-            | Self::StrfTime
-            | Self::Printf => &[-1],
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => &[-1],
-            // Internal functions that cannot be called by name
-            Self::Cast
-            | Self::StatInit
-            | Self::StatPush
-            | Self::StatGet
-            | Self::Attach
-            | Self::Detach => &[0],
-            // Internal functions that can be called by name
-            Self::IsAutocommit => &[0],
-            Self::TableColumnsJsonArray | Self::ConnTxnId => &[1],
-            Self::BinRecordJsonObject => &[2],
-            // Scalar max/min (multi-arg)
-            Self::Max | Self::Min => &[-1],
-            // SQL-standard string and math extensions
-            Self::Gcd | Self::Lcm | Self::Repeat => &[2],
-            Self::Lpad | Self::Rpad => &[2, 3],
-            // Test functions for custom types
-            Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
-            // Built-in type functions
-            Self::BooleanToInt
-            | Self::IntToBoolean
-            | Self::ValidateIpAddr
-            | Self::NumericEncode
-            | Self::NumericDecode
-            | Self::NumericNeg => &[1],
-            Self::NumericAdd
-            | Self::NumericSub
-            | Self::NumericMul
-            | Self::NumericDiv
-            | Self::NumericMod
-            | Self::DatePlus
-            | Self::DateMinus
-            | Self::DateDiff => &[2],
-            Self::NumericFit => &[3],
-            // Array construction / element access
-            Self::Array => &[-1], // variable arity
-            Self::ArrayElement => &[2],
-            Self::ArraySetElement => &[3],
-            // Array functions
-            Self::ArrayLength => &[1, 2],
-            Self::ArrayAppend
-            | Self::ArrayPrepend
-            | Self::ArrayCat
-            | Self::ArrayRemove
-            | Self::ArrayContains
-            | Self::ArrayPosition
-            | Self::ArrayOverlap
-            | Self::ArrayContainsAll => &[2],
-            Self::ArraySlice => &[3],
-            Self::StringToArray => &[2, 3],
-            Self::ArrayToString => &[2, 3],
-            // Struct/Union functions
-            // struct_pack is intentionally variable-arity: field count validation
-            // happens at INSERT time when the value is stored into a typed column.
-            // Standalone calls produce a generic record blob.
-            Self::StructPack => &[-1],
-            Self::StructExtractFunc => &[2], // struct_extract(col, 'field')
-            Self::UnionValueFunc => &[2],    // union_value('tag', value)
-            Self::UnionTagFunc => &[1],      // union_tag(col)
-            Self::UnionExtractFunc => &[2],  // union_extract(col, 'tag')
-            // Sequence functions
-            Self::NextVal | Self::CurrVal => &[1],
-            Self::SetVal => &[2, 3],
-        }
-    }
-
-    /// Returns true for functions that can turn NULL arguments into a non-NULL result.
-    ///
-    /// This is used by planner/optimizer logic that needs to reason about whether
-    /// predicates are null-rejecting for outer-join simplification.
-    pub fn can_mask_nulls(&self) -> bool {
-        matches!(self, Self::Coalesce | Self::IfNull)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum MathFunc {
     Acos,
     Acosh,
@@ -1797,7 +1115,7 @@ impl Display for AlterTableFunc {
 pub enum Func {
     Agg(AggFunc),
     Window(WindowFunc),
-    Scalar(ScalarFunc),
+    RegisteredScalar(&'static dyn scalar::ScalarFunction),
     Math(MathFunc),
     Vector(VectorFunc),
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1817,7 +1135,7 @@ impl Display for Func {
         match self {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
             Self::Window(window_func) => write!(f, "{window_func}"),
-            Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
+            Self::RegisteredScalar(func) => f.write_str(func.metadata().name),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1845,7 +1163,7 @@ impl Deterministic for Func {
         match self {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
             Self::Window(window_func) => window_func.is_deterministic(),
-            Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
+            Self::RegisteredScalar(func) => func.metadata().deterministic,
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1877,6 +1195,8 @@ pub enum ReturnType {
     /// An array. Its elements have the type of the elements of the function's
     /// array argument.
     Array,
+    /// A one-dimensional array of text values.
+    TextArray,
 }
 
 /// How the type of a function's result follows from the types of its
@@ -1893,6 +1213,7 @@ pub enum ResultType {
     FirstArgument,
     /// One of the arguments, unchanged: `coalesce`, `ifnull`, `min`, `max`.
     OneOfTheArguments,
+    ArrayOfTheArguments,
     /// One of the values of `iif(c1, v1, c2, v2, ..., else)`: every second
     /// argument from the second on, and the last one when there is an odd
     /// number of arguments. The conditions are never returned.
@@ -1929,7 +1250,7 @@ impl Func {
             None => ResultType::Unknown,
         };
         match self {
-            Self::Scalar(func) => func.result_type(),
+            Self::RegisteredScalar(func) => func.metadata().result_type,
             Self::Math(func) => func.result_type(),
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
@@ -1953,13 +1274,21 @@ impl Func {
         }
     }
 
+    pub fn date_time_arguments(&self) -> Option<scalar::DateTimeArguments> {
+        match self {
+            Self::RegisteredScalar(function) => function.date_time_arguments(),
+            _ => None,
+        }
+    }
+
     /// Whether the function compares its arguments, and so needs the
     /// collation of its first argument that has one. SQLite marks these
     /// functions `SQLITE_FUNC_NEEDCOLL`.
     pub fn needs_collation(&self) -> bool {
         matches!(
             self,
-            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+            Self::RegisteredScalar(function)
+                if function.argument_translation() != scalar::ArgumentTranslation::Values
         )
     }
 
@@ -1969,20 +1298,9 @@ impl Func {
             return true;
         }
         match self {
-            Self::Scalar(scalar_func) => {
-                let basic = matches!(
-                    scalar_func,
-                    ScalarFunc::Changes
-                        | ScalarFunc::Random
-                        | ScalarFunc::TotalChanges
-                        | ScalarFunc::SqliteVersion
-                        | ScalarFunc::TursoVersion
-                        | ScalarFunc::SqliteSourceId
-                        | ScalarFunc::LastInsertRowid
-                );
-                #[cfg(feature = "test_helper")]
-                let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
-                basic
+            Self::RegisteredScalar(function) => {
+                !function.is_internal()
+                    && matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
             }
             Self::Math(math_func) => {
                 matches!(math_func.arity(), MathFuncArity::Nullary)
@@ -1999,7 +1317,7 @@ impl Func {
     /// This metadata is currently used by optimizer null-rejection analysis.
     pub fn can_mask_nulls(&self) -> bool {
         match self {
-            Self::Scalar(scalar_func) => scalar_func.can_mask_nulls(),
+            Self::RegisteredScalar(func) => func.metadata().can_mask_nulls,
             _ => false,
         }
     }
@@ -2050,12 +1368,17 @@ impl Func {
             }
         };
 
-        // Scalar functions (filter out internal-only variants)
-        for f in ScalarFunc::iter() {
-            if f.is_internal() {
+        for function in scalar::BUILTIN_SCALAR_FUNCTIONS.functions() {
+            if function.is_internal() {
                 continue;
             }
-            push(f.to_string(), "s", f.arities(), f.is_deterministic());
+            let metadata = function.metadata();
+            push(
+                metadata.name.to_owned(),
+                "s",
+                &metadata.arity.arg_counts(),
+                metadata.deterministic,
+            );
         }
 
         // Aggregate functions (External is #[strum(disabled)], skipped automatically).

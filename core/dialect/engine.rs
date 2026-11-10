@@ -35,7 +35,7 @@ use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 #[allow(unused_imports)]
-use crate::function::{AggFunc, Func, MathFunc, ScalarFunc, VectorFunc, WindowFunc};
+use crate::function::{AggFunc, Func, MathFunc, VectorFunc, WindowFunc};
 
 /// The dialect of the statements the engine runs for itself: SQLite SQL
 /// with the built-in functions and catalog tables.
@@ -190,23 +190,24 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
     let func = resolve_builtin_function_name(name, arg_count)?;
-    // Reject scalar calls whose argument count is not in `arities()`.
-    if let Some(Func::Scalar(srf)) = &func {
-        let arities = srf.arities();
-        if !arities.contains(&-1) && !arities.contains(&(arg_count as i32)) {
-            crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-        }
+    if let Some(Func::RegisteredScalar(function)) = &func {
+        function.metadata().validate_arg_count(name, arg_count)?;
     }
     Ok(func)
 }
 
-/// Resolves a built-in function by name without checking the argument count
-/// of scalar functions.
+/// Resolves built-in names and overloads, leaving scalar argument validation
+/// to the caller.
 pub(crate) fn resolve_builtin_function_name(
     name: &str,
     arg_count: usize,
 ) -> crate::Result<Option<Func>> {
     let normalized_name = crate::util::normalize_ident(name);
+    if let Some(function) =
+        crate::function::scalar::BUILTIN_SCALAR_FUNCTIONS.lookup(&normalized_name, arg_count)
+    {
+        return Ok(Some(Func::RegisteredScalar(function)));
+    }
     match normalized_name.as_str() {
         "avg" => {
             if arg_count != 1 {
@@ -230,21 +231,18 @@ pub(crate) fn resolve_builtin_function_name(
             }
             Ok(Some(Func::Agg(AggFunc::GroupConcat)))
         }
-        "max" if arg_count > 1 => Ok(Some(Func::Scalar(ScalarFunc::Max))),
         "max" => {
             if arg_count < 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Max)))
         }
-        "min" if arg_count > 1 => Ok(Some(Func::Scalar(ScalarFunc::Min))),
         "min" => {
             if arg_count < 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Min)))
         }
-        "nullif" if arg_count == 2 => Ok(Some(Func::Scalar(ScalarFunc::Nullif))),
         "string_agg" => {
             if arg_count != 2 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
@@ -329,12 +327,6 @@ pub(crate) fn resolve_builtin_function_name(
             }
             Ok(Some(Func::Window(WindowFunc::CumeDist)))
         }
-        "timediff" => {
-            if arg_count != 2 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::TimeDiff)))
-        }
         "array_agg" => Ok(Some(Func::Agg(AggFunc::ArrayAgg))),
         #[cfg(feature = "json")]
         "jsonb_group_array" => Ok(Some(Func::Agg(AggFunc::JsonbGroupArray))),
@@ -344,68 +336,6 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_group_object" => Ok(Some(Func::Agg(AggFunc::JsonbGroupObject))),
         #[cfg(feature = "json")]
         "json_group_object" => Ok(Some(Func::Agg(AggFunc::JsonGroupObject))),
-        "char" | "chr" => Ok(Some(Func::Scalar(ScalarFunc::Char))),
-        "coalesce" => Ok(Some(Func::Scalar(ScalarFunc::Coalesce))),
-        "concat" => {
-            if arg_count == 0 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::Concat)))
-        }
-        "concat_ws" => {
-            if arg_count < 2 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::ConcatWs)))
-        }
-        "changes" => Ok(Some(Func::Scalar(ScalarFunc::Changes))),
-        "total_changes" => Ok(Some(Func::Scalar(ScalarFunc::TotalChanges))),
-        "glob" => Ok(Some(Func::Scalar(ScalarFunc::Glob))),
-        "ifnull" => Ok(Some(Func::Scalar(ScalarFunc::IfNull))),
-        "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
-        "instr" | "strpos" => Ok(Some(Func::Scalar(ScalarFunc::Instr))),
-        "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
-        "abs" => Ok(Some(Func::Scalar(ScalarFunc::Abs))),
-        "upper" => Ok(Some(Func::Scalar(ScalarFunc::Upper))),
-        "lower" => Ok(Some(Func::Scalar(ScalarFunc::Lower))),
-        "random" => Ok(Some(Func::Scalar(ScalarFunc::Random))),
-        "randomblob" => Ok(Some(Func::Scalar(ScalarFunc::RandomBlob))),
-        "trim" | "btrim" => Ok(Some(Func::Scalar(ScalarFunc::Trim))),
-        "ltrim" => Ok(Some(Func::Scalar(ScalarFunc::LTrim))),
-        "rtrim" => Ok(Some(Func::Scalar(ScalarFunc::RTrim))),
-        "round" => Ok(Some(Func::Scalar(ScalarFunc::Round))),
-        "length" | "char_length" | "character_length" => Ok(Some(Func::Scalar(ScalarFunc::Length))),
-        "octet_length" => Ok(Some(Func::Scalar(ScalarFunc::OctetLength))),
-        "sign" => Ok(Some(Func::Scalar(ScalarFunc::Sign))),
-        "substr" => {
-            if arg_count != 2 && arg_count != 3 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::Substr)))
-        }
-        "substring" => {
-            if arg_count != 2 && arg_count != 3 {
-                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-            }
-            Ok(Some(Func::Scalar(ScalarFunc::Substring)))
-        }
-        "date" => Ok(Some(Func::Scalar(ScalarFunc::Date))),
-        "time" => Ok(Some(Func::Scalar(ScalarFunc::Time))),
-        "datetime" => Ok(Some(Func::Scalar(ScalarFunc::DateTime))),
-        "typeof" => Ok(Some(Func::Scalar(ScalarFunc::Typeof))),
-        "subtype" => Ok(Some(Func::Scalar(ScalarFunc::Subtype))),
-        "last_insert_rowid" => Ok(Some(Func::Scalar(ScalarFunc::LastInsertRowid))),
-        "unicode" => Ok(Some(Func::Scalar(ScalarFunc::Unicode))),
-        "unistr" => Ok(Some(Func::Scalar(ScalarFunc::Unistr))),
-        "unistr_quote" => Ok(Some(Func::Scalar(ScalarFunc::UnistrQuote))),
-        "quote" => Ok(Some(Func::Scalar(ScalarFunc::Quote))),
-        "sqlite_version" => Ok(Some(Func::Scalar(ScalarFunc::SqliteVersion))),
-        "turso_version" => Ok(Some(Func::Scalar(ScalarFunc::TursoVersion))),
-        "sqlite_source_id" => Ok(Some(Func::Scalar(ScalarFunc::SqliteSourceId))),
-        "replace" => Ok(Some(Func::Scalar(ScalarFunc::Replace))),
-        "likely" => Ok(Some(Func::Scalar(ScalarFunc::Likely))),
-        "likelihood" => Ok(Some(Func::Scalar(ScalarFunc::Likelihood))),
-        "unlikely" => Ok(Some(Func::Scalar(ScalarFunc::Unlikely))),
         #[cfg(feature = "json")]
         "json" => Ok(Some(Func::Json(JsonFunc::Json))),
         #[cfg(feature = "json")]
@@ -454,19 +384,6 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_set" => Ok(Some(Func::Json(JsonFunc::JsonbSet))),
         #[cfg(feature = "json")]
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
-        "unixepoch" => Ok(Some(Func::Scalar(ScalarFunc::UnixEpoch))),
-        "julianday" => Ok(Some(Func::Scalar(ScalarFunc::JulianDay))),
-        "hex" => Ok(Some(Func::Scalar(ScalarFunc::Hex))),
-        "unhex" => Ok(Some(Func::Scalar(ScalarFunc::Unhex))),
-        "get_byte" => Ok(Some(Func::Scalar(ScalarFunc::GetByte))),
-        "set_byte" => Ok(Some(Func::Scalar(ScalarFunc::SetByte))),
-        "zeroblob" => Ok(Some(Func::Scalar(ScalarFunc::ZeroBlob))),
-        "soundex" => Ok(Some(Func::Scalar(ScalarFunc::Soundex))),
-        "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
-        "bin_record_json_object" => Ok(Some(Func::Scalar(ScalarFunc::BinRecordJsonObject))),
-        "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
-        "is_autocommit" => Ok(Some(Func::Scalar(ScalarFunc::IsAutocommit))),
-        "sequence_watermark_experimental" => Ok(Some(Func::Scalar(ScalarFunc::SequenceWatermark))),
         "acos" => Ok(Some(Func::Math(MathFunc::Acos))),
         "acosh" => Ok(Some(Func::Math(MathFunc::Acosh))),
         "asin" => Ok(Some(Func::Math(MathFunc::Asin))),
@@ -496,11 +413,6 @@ pub(crate) fn resolve_builtin_function_name(
         "tan" => Ok(Some(Func::Math(MathFunc::Tan))),
         "tanh" => Ok(Some(Func::Math(MathFunc::Tanh))),
         "trunc" => Ok(Some(Func::Math(MathFunc::Trunc))),
-        #[cfg(feature = "fs")]
-        #[cfg(not(target_family = "wasm"))]
-        "load_extension" => Ok(Some(Func::Scalar(ScalarFunc::LoadExtension))),
-        "strftime" => Ok(Some(Func::Scalar(ScalarFunc::StrfTime))),
-        "printf" | "format" => Ok(Some(Func::Scalar(ScalarFunc::Printf))),
         "vector" => Ok(Some(Func::Vector(VectorFunc::Vector))),
         "vector32" => Ok(Some(Func::Vector(VectorFunc::Vector32))),
         "vector32_sparse" => Ok(Some(Func::Vector(VectorFunc::Vector32Sparse))),
@@ -522,59 +434,11 @@ pub(crate) fn resolve_builtin_function_name(
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         "fts_highlight" => Ok(Some(Func::Fts(FtsFunc::Highlight))),
         // Test type functions (for custom type system testing)
-        "test_uint_encode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEncode))),
-        "test_uint_decode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDecode))),
-        #[cfg(feature = "test_helper")]
-        "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
-        "string_reverse" | "reverse" => Ok(Some(Func::Scalar(ScalarFunc::StringReverse))),
-        "gcd" => Ok(Some(Func::Scalar(ScalarFunc::Gcd))),
-        "lcm" => Ok(Some(Func::Scalar(ScalarFunc::Lcm))),
-        "repeat" => Ok(Some(Func::Scalar(ScalarFunc::Repeat))),
-        "lpad" => Ok(Some(Func::Scalar(ScalarFunc::Lpad))),
-        "rpad" => Ok(Some(Func::Scalar(ScalarFunc::Rpad))),
         // Built-in type support functions
-        "boolean_to_int" => Ok(Some(Func::Scalar(ScalarFunc::BooleanToInt))),
-        "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
-        "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
-        "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
-        "numeric_fit" => Ok(Some(Func::Scalar(ScalarFunc::NumericFit))),
-        "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
-        "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
-        "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
-        "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
-        "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
-        "numeric_mod" => Ok(Some(Func::Scalar(ScalarFunc::NumericMod))),
-        "numeric_neg" => Ok(Some(Func::Scalar(ScalarFunc::NumericNeg))),
-        "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),
-        "date_minus" => Ok(Some(Func::Scalar(ScalarFunc::DateMinus))),
-        "date_diff" => Ok(Some(Func::Scalar(ScalarFunc::DateDiff))),
         // Array construction / element access (desugared from syntax)
-        "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
-        "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),
-        "array_set_element" => Ok(Some(Func::Scalar(ScalarFunc::ArraySetElement))),
         // Array functions
-        "array_length" | "array_upper" => Ok(Some(Func::Scalar(ScalarFunc::ArrayLength))),
-        "array_append" => Ok(Some(Func::Scalar(ScalarFunc::ArrayAppend))),
-        "array_prepend" => Ok(Some(Func::Scalar(ScalarFunc::ArrayPrepend))),
-        "array_cat" => Ok(Some(Func::Scalar(ScalarFunc::ArrayCat))),
-        "array_remove" => Ok(Some(Func::Scalar(ScalarFunc::ArrayRemove))),
-        "array_contains" => Ok(Some(Func::Scalar(ScalarFunc::ArrayContains))),
-        "array_position" => Ok(Some(Func::Scalar(ScalarFunc::ArrayPosition))),
-        "array_slice" => Ok(Some(Func::Scalar(ScalarFunc::ArraySlice))),
-        "string_to_array" => Ok(Some(Func::Scalar(ScalarFunc::StringToArray))),
-        "array_to_string" => Ok(Some(Func::Scalar(ScalarFunc::ArrayToString))),
-        "array_overlap" | "array_overlaps" => Ok(Some(Func::Scalar(ScalarFunc::ArrayOverlap))),
-        "array_contains_all" => Ok(Some(Func::Scalar(ScalarFunc::ArrayContainsAll))),
         // Struct/Union functions
-        "struct_pack" => Ok(Some(Func::Scalar(ScalarFunc::StructPack))),
-        "struct_extract" => Ok(Some(Func::Scalar(ScalarFunc::StructExtractFunc))),
-        "union_value" => Ok(Some(Func::Scalar(ScalarFunc::UnionValueFunc))),
-        "union_tag" => Ok(Some(Func::Scalar(ScalarFunc::UnionTagFunc))),
-        "union_extract" => Ok(Some(Func::Scalar(ScalarFunc::UnionExtractFunc))),
         // Sequence functions
-        "nextval" => Ok(Some(Func::Scalar(ScalarFunc::NextVal))),
-        "currval" => Ok(Some(Func::Scalar(ScalarFunc::CurrVal))),
-        "setval" => Ok(Some(Func::Scalar(ScalarFunc::SetVal))),
         _ => Ok(None),
     }
 }

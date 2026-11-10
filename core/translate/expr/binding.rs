@@ -657,7 +657,7 @@ pub(crate) fn validate_function_tail(
         // SQLite reports OVER on a scalar function before a wrong argument count.
         Err(err) if filter_over.over_clause.is_some() => {
             match crate::dialect::engine::resolve_builtin_function_name(name, arg_count) {
-                Ok(Some(Func::Scalar(_))) => {
+                Ok(Some(Func::RegisteredScalar(_))) => {
                     crate::bail_parse_error!("{} may not be used as a window function", name)
                 }
                 _ => return Err(err),

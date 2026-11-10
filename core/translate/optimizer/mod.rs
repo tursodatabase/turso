@@ -14,7 +14,7 @@ use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
-    function::{AggFunc, Deterministic, Func},
+    function::{AggFunc, Deterministic},
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
@@ -4163,8 +4163,8 @@ impl Optimizable for ast::Expr {
                 // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and time
                 // functions return the same value for the whole statement, so they
                 // can be computed once instead of on every row.
-                let same_for_whole_statement = func.is_deterministic()
-                    || matches!(func, Func::Scalar(f) if f.is_date_time_function());
+                let same_for_whole_statement =
+                    func.is_deterministic() || func.date_time_arguments().is_some();
                 same_for_whole_statement && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,

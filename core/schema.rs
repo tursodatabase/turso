@@ -1,7 +1,7 @@
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
-use crate::function::{Deterministic, Func, ScalarFunc};
+use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::view::{
     create_dbsp_state_index, dbsp_version_marker_table_name, DBSP_CIRCUIT_VERSION,
@@ -6928,41 +6928,18 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
-    match func {
-        Func::Scalar(scalar_func) if scalar_func.is_date_time_function() => {
-            is_deterministic_datetime_call(func, args)
-        }
-        _ => func.is_deterministic(),
-    }
-}
-
-// SQLite allows date/time functions in schema-persistent expressions only when
-// they do not depend on the current clock or local timezone. This applies to
-// expression indexes, partial index WHERE clauses, and generated columns.
-fn is_deterministic_datetime_call(func: &Func, args: &[Box<Expr>]) -> bool {
-    match func {
-        Func::Scalar(ScalarFunc::Date)
-        | Func::Scalar(ScalarFunc::Time)
-        | Func::Scalar(ScalarFunc::DateTime)
-        | Func::Scalar(ScalarFunc::UnixEpoch)
-        | Func::Scalar(ScalarFunc::JulianDay) => {
-            !args.is_empty()
-                && !is_current_time_expr(args[0].as_ref())
-                && !args[1..]
+    match func.date_time_arguments() {
+        Some(crate::scalar::DateTimeArguments::TimeValue { index }) => {
+            args.len() > index
+                && !is_current_time_expr(args[index].as_ref())
+                && !args[index + 1..]
                     .iter()
                     .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
         }
-        Func::Scalar(ScalarFunc::StrfTime) => {
-            args.len() >= 2
-                && !is_current_time_expr(args[1].as_ref())
-                && !args[2..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
-        }
-        Func::Scalar(ScalarFunc::TimeDiff) => {
+        Some(crate::scalar::DateTimeArguments::TimePair) => {
             !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
         }
-        _ => unreachable!("non-datetime function passed to datetime index validator"),
+        None => func.is_deterministic(),
     }
 }
 

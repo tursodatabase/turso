@@ -1,7 +1,7 @@
 //! ATTACH and DETACH: open a database on the connection and give it a
 //! namespace, or remove both.
 
-use crate::function::{Func, ScalarFunc};
+use crate::function::Func;
 #[cfg(feature = "fs")]
 use crate::io::{MemoryIO, IO};
 #[cfg(feature = "fs")]
@@ -123,7 +123,7 @@ pub fn translate_attach(
         start_reg: arg_reg,
         dest: arg_reg + 3, // Result register (not used but required)
         func: crate::function::FuncCtx {
-            func: Func::Scalar(ScalarFunc::Attach),
+            func: Func::RegisteredScalar(&crate::scalar::system::Attach),
             arg_count: 3,
             collation: CollationSeq::BINARY,
         },
@@ -186,7 +186,7 @@ pub fn translate_detach(
         start_reg: arg_reg,
         dest: arg_reg + 1, // Result register (not used but required)
         func: crate::function::FuncCtx {
-            func: Func::Scalar(ScalarFunc::Detach),
+            func: Func::RegisteredScalar(&crate::scalar::system::Detach),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },

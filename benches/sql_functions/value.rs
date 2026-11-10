@@ -1056,3 +1056,49 @@ fn exec_randomblob_large(bencher: Bencher) {
 fn binary(a: &Value, b: &Value) -> turso_core::Result<std::cmp::Ordering> {
     Ok(CollationSeq::BINARY.compare(a.as_ref(), b.as_ref()))
 }
+
+#[turso_macros::divan_bench(args = ["abs", "lower", "length"])]
+fn registered_scalar(bencher: Bencher, name: &str) {
+    let turso_core::Func::RegisteredScalar(function) =
+        turso_core::dialect::engine::resolve_builtin_function(name, 1)
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a registered scalar");
+    };
+    let db = turso_core::Database::open_file(
+        std::sync::Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        std::sync::Arc::new(turso_sqlite::SqliteDialect),
+    )
+    .unwrap();
+    let connection = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let mut current_time = None;
+    let pager = connection.get_pager();
+    let context = turso_core::scalar::FunctionContext::new(
+        &connection,
+        &pager,
+        &mut current_time,
+        CollationSeq::BINARY,
+    );
+    let registers = [turso_core::Register::Value(Value::from_i64(-12345))];
+    let mut state = turso_core::scalar::ScalarState::default();
+    bencher.bench_local(|| {
+        black_box(black_box(function).execute(
+            &context,
+            turso_core::scalar::FunctionArgs::new(black_box(&registers)),
+            &mut state,
+        ))
+    });
+}
+
+#[turso_macros::divan_bench(args = ["abs", "lower", "length"])]
+fn direct_scalar(bencher: Bencher, name: &str) {
+    let value = Value::from_i64(-12345);
+    match name {
+        "abs" => bencher.bench_local(|| black_box(black_box(&value).exec_abs())),
+        "lower" => bencher.bench_local(|| black_box(black_box(&value).exec_lower())),
+        "length" => bencher.bench_local(|| black_box(black_box(&value).exec_length())),
+        _ => unreachable!(),
+    }
+}

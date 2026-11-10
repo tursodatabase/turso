@@ -304,8 +304,7 @@ pub fn expr_contains_function_that_changes_within_statement(
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
     expr_contains_function(expr, resolver, |func| {
-        is_nondeterministic_scalar_like_function(func)
-            && !matches!(func, Func::Scalar(f) if f.is_date_time_function())
+        is_nondeterministic_scalar_like_function(func) && func.date_time_arguments().is_none()
     })
 }
 

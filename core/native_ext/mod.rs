@@ -1,11 +1,10 @@
 mod function;
 mod vtab;
 
+pub use crate::function::arity::FunctionArity;
 pub use crate::function::ReturnType;
 
-pub use function::{
-    Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
-};
+pub use function::{Aggregate, AggregateFunction, ScalarCall, ScalarFunction, ScalarReturn};
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
 pub use vtab::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
 
@@ -22,8 +21,29 @@ use crate::{Database, OpenOptions, Result};
 
 pub(crate) enum ExtensionState {
     None,
-    ScalarCall(Box<dyn ScalarStep>),
+    ScalarCall(crate::scalar::ScalarState),
     TableUpdate(Box<dyn TableUpdate>),
+}
+
+impl ExtensionState {
+    pub(crate) fn scalar(&mut self) -> &mut crate::scalar::ScalarState {
+        if matches!(self, Self::None) {
+            *self = Self::ScalarCall(crate::scalar::ScalarState::default());
+        }
+        let Self::ScalarCall(state) = self else {
+            unreachable!("scalar instruction requires scalar call state");
+        };
+        state
+    }
+
+    pub(crate) fn finish_scalar<T, E>(
+        &mut self,
+        result: &std::result::Result<crate::IOResult<T>, E>,
+    ) {
+        if !matches!(result, Ok(crate::IOResult::IO(_))) {
+            *self = Self::None;
+        }
+    }
 }
 
 impl OpenOptions {

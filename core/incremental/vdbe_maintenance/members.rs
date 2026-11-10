@@ -19,7 +19,7 @@
 //!
 //! [`dag::KeyColumn::ambiguous`]: crate::incremental::dag::KeyColumn::ambiguous
 
-use crate::function::{Func, FuncCtx, ScalarFunc};
+use crate::function::{Func, FuncCtx};
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::translate::collate::CollationSeq;
@@ -143,7 +143,7 @@ pub(super) fn emit_member_columns(
             start_reg: values_start + column,
             dest: dest + width + column,
             func: FuncCtx {
-                func: Func::Scalar(ScalarFunc::Typeof),
+                func: Func::RegisteredScalar(&crate::scalar::values::Typeof),
                 arg_count: 1,
                 collation: CollationSeq::BINARY,
             },

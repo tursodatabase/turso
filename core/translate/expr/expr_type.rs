@@ -9,7 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
+use crate::function::{AggFunc, Func, ResultType, ReturnType, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -1063,12 +1063,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         return ExprType::Builtin(BuiltinType::Any);
     };
     match func {
-        Func::Scalar(ScalarFunc::Array) => {
-            ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
-        }
-        Func::Scalar(ScalarFunc::StringToArray) => {
-            ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
-        }
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -1100,6 +1094,9 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
     match result_type {
         ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
         ResultType::FirstArgument => first_argument().unwrap_or(any),
+        ResultType::ArrayOfTheArguments => {
+            ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
+        }
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
         ResultType::NumberOfTheFirstArgumentsType => match first_argument() {
@@ -1187,6 +1184,7 @@ fn declared_return_type(
         // An array of the type of the array argument: array_prepend(element,
         // array) and array_cat(array1, array2) take it second when the first
         // is not one.
+        ReturnType::TextArray => ExprType::array(ExprType::Builtin(BuiltinType::Text), 1),
         ReturnType::Array => args
             .iter()
             .map(|arg| type_of(arg, env))
@@ -1440,6 +1438,17 @@ mod tests {
             ("1.5", builtin(BuiltinType::Decimal)),
             ("-1.5", builtin(BuiltinType::Decimal)),
             ("abs(-1.5)", builtin(BuiltinType::Decimal)),
+            ("abs(-1)", builtin(BuiltinType::Integer)),
+            ("abs('3')", builtin(BuiltinType::Real)),
+            ("lower('ABC')", builtin(BuiltinType::Text)),
+            ("upper('abc')", builtin(BuiltinType::Text)),
+            ("hex(1)", builtin(BuiltinType::Text)),
+            ("unhex('FF')", builtin(BuiltinType::Blob)),
+            ("unicode('A')", builtin(BuiltinType::Integer)),
+            ("octet_length('é')", builtin(BuiltinType::Integer)),
+            ("sign(-1)", builtin(BuiltinType::Integer)),
+            ("soundex('Robert')", builtin(BuiltinType::Text)),
+            ("length('ABC')", builtin(BuiltinType::Integer)),
             ("'a'", ExprType::Untyped),
             ("x'00'", builtin(BuiltinType::Blob)),
             ("NULL", ExprType::Null),
@@ -1539,6 +1548,15 @@ mod tests {
     #[test]
     fn arrays_never_nest() {
         check(&[
+            (
+                "string_to_array('a,b', ',')",
+                ExprType::array(builtin(BuiltinType::Text), 1),
+            ),
+            (
+                "array_prepend(1, array(2, 3))",
+                ExprType::array(builtin(BuiltinType::Integer), 1),
+            ),
+            ("array_length(array(1, 2))", builtin(BuiltinType::Integer)),
             (
                 "array_agg(CAST(1 AS INTEGER[]))",
                 ExprType::array(builtin(BuiltinType::Integer), 2),

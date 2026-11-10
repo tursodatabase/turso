@@ -2889,3 +2889,144 @@ test uuid7-negative-timestamp {
 }
 expect {
 }
+
+
+test scalar-catalog-metadata {
+    SELECT name, type, narg, flags & 2048 FROM pragma_function_list
+    WHERE name IN ('abs', 'lower', 'length') ORDER BY name;
+}
+expect {
+    abs|s|1|2048
+    length|s|1|2048
+    lower|s|1|2048
+}
+
+test scalar-catalog-nested-values {
+    WITH t(v) AS (VALUES (NULL), (-42), ('AbC'), (x'41420043'))
+    SELECT typeof(abs(v)), abs(v), lower(v) IS NULL, length(v), length(lower(v))
+    FROM t;
+}
+expect {
+    null||1||
+    integer|42|0|3|3
+    real|0.0|0|3|3
+    real|0.0|0|4|2
+}
+
+
+test scalar-catalog-optional-and-variadic-arguments {
+    SELECT round(1.25, 1), round(1.25), trim('  x  '), trim('xyx', 'x'),
+           ltrim('xyx', 'x'), rtrim('xyx', 'x'), concat(NULL), concat('a', NULL, 12),
+           round(NULL) IS NULL, trim('x', NULL) IS NULL;
+}
+expect {
+    1.3|1.0|x|y|yx|xy||a12|1|1
+}
+
+test scalar-catalog-optional-arity-zero {
+    SELECT trim();
+}
+expect error {
+    wrong number of arguments
+}
+
+test scalar-catalog-optional-arity-three {
+    SELECT round(1, 2, 3);
+}
+expect error {
+    wrong number of arguments
+}
+
+test scalar-catalog-variadic-minimum {
+    SELECT concat();
+}
+expect error {
+    wrong number of arguments
+}
+
+test scalar-catalog-stage-two-metadata {
+    SELECT name, CASE WHEN narg < 0 THEN -1 ELSE narg END, flags & 2048 FROM pragma_function_list
+    WHERE name IN ('round', 'trim', 'ltrim', 'rtrim', 'concat', 'changes', 'total_changes')
+    ORDER BY name, narg;
+}
+expect {
+    changes|0|0
+    concat|-1|2048
+    ltrim|1|2048
+    ltrim|2|2048
+    round|1|2048
+    round|2|2048
+    rtrim|1|2048
+    rtrim|2|2048
+    total_changes|0|0
+    trim|1|2048
+    trim|2|2048
+}
+
+test scalar-catalog-concat-keeps-unmatched-join-row {
+    WITH l(id) AS (VALUES (1), (2)), r(id, v) AS (VALUES (1, 'a'))
+    SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE concat(r.v, 'x') = 'x';
+}
+expect {
+    2
+}
+
+
+test scalar-catalog-string-conversions {
+    SELECT upper('aBc'), octet_length('é'), unicode('é'), sign('-2'),
+           hex(x'00ff'), hex(unhex('00-ff', '-'));
+}
+expect {
+    ABC|2|233|-1|00FF|00FF
+}
+
+test scalar-catalog-string-null-results {
+    SELECT upper(NULL) IS NULL, octet_length(NULL) IS NULL, unicode(NULL) IS NULL,
+           sign(NULL) IS NULL, hex(NULL), unhex(NULL) IS NULL,
+           unhex('ff', NULL) IS NULL;
+}
+expect {
+    1|1|1|1||1|1
+}
+
+test scalar-catalog-hex-keeps-unmatched-join-row {
+    WITH l(id) AS (VALUES (1), (2)), r(id, v) AS (VALUES (1, 'a'))
+    SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE hex(r.v) = '';
+}
+expect {
+    2
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test scalar-catalog-soundex-keeps-unmatched-join-row {
+    WITH l(id) AS (VALUES (1), (2)), r(id, v) AS (VALUES (1, 'Robert'))
+    SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE soundex(r.v) = '?000';
+}
+expect {
+    2
+}
+
+
+test scalar-catalog-string-metadata {
+    SELECT name, narg, flags & 2048 FROM pragma_function_list
+    WHERE name IN ('upper', 'octet_length', 'unicode', 'sign', 'hex', 'unhex')
+    ORDER BY name, narg;
+}
+expect {
+    hex|1|2048
+    octet_length|1|2048
+    sign|1|2048
+    unhex|1|2048
+    unhex|2|2048
+    unicode|1|2048
+    upper|1|2048
+}
+
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test scalar-catalog-soundex-metadata {
+    SELECT name, narg, flags & 2048 FROM pragma_function_list WHERE name = 'soundex';
+}
+expect {
+    soundex|1|2048
+}

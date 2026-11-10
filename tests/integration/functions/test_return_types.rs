@@ -2,7 +2,7 @@
 //! type its results really have.
 //!
 //! The list of functions comes from `Func::builtin_function_list`, which walks
-//! the function enums, so a new function is checked as soon as it is added.
+//! the builtin catalog and function families, so new entries are checked automatically.
 
 use crate::common::TempDatabase;
 use turso_core::native_ext::ReturnType;
@@ -28,8 +28,7 @@ fn results_have_the_declared_return_type(tmp_db: TempDatabase) {
             vec![entry.narg]
         };
         // Experimental functions are for engine internals and take arguments
-        // that SQL samples can't make valid; sequence_watermark_experimental(NULL)
-        // never returns.
+        // that SQL samples can't make valid.
         if entry.name.ends_with("_experimental") {
             continue;
         }
@@ -87,6 +86,6 @@ fn expected_typeof(declared: Option<ReturnType>) -> Option<&'static str> {
         ReturnType::Blob => Some("blob"),
         // A custom type is stored as its base type and an array as text or
         // a blob, so typeof() can't tell whether the declaration is right.
-        ReturnType::Custom(_) | ReturnType::Array => None,
+        ReturnType::Custom(_) | ReturnType::Array | ReturnType::TextArray => None,
     }
 }

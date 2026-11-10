@@ -582,6 +582,12 @@ mod tests {
             if name.eq_ignore_ascii_case("nvl") {
                 return engine::resolve_builtin_function("coalesce", arg_count);
             }
+            if name.eq_ignore_ascii_case("test_trait_yield") {
+                return Ok(Some(Func::RegisteredScalar(&TestTraitYield)));
+            }
+            if name.eq_ignore_ascii_case("test_trait_add") {
+                return Ok(Some(Func::RegisteredScalar(&TestTraitAdd)));
+            }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
                 return Ok(Some(Func::Dialect("test_add_one".to_string())));
             }
@@ -1046,6 +1052,191 @@ mod tests {
         let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
         assert!(err.to_string().contains("no such function"));
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn registered_scalar_executes_without_builtin_dispatch() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "trait-funcs.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let rows = conn
+            .prepare("WITH t(a,b) AS (VALUES (1,2), (40,2)) SELECT test_trait_add(a,b) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_i64(3)], vec![Value::from_i64(42)]]
+        );
+        assert!(conn
+            .prepare("SELECT test_trait_add(1)")
+            .unwrap_err()
+            .to_string()
+            .contains("wrong number of arguments"));
+        assert!(conn
+            .prepare("SELECT test_trait_add('x', 1)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap_err()
+            .to_string()
+            .contains("expected integers"));
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn registered_scalar_context_uses_current_connection() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "trait-context.db", Arc::new(TestDialect::default())).unwrap();
+        let first = db.connect(ConnectOpts::new()).unwrap();
+        let second = db.connect(ConnectOpts::new()).unwrap();
+        first.execute("CREATE TABLE t(v)").unwrap();
+        let mut statement = first
+            .prepare("SELECT changes(), total_changes(), changes(*), total_changes(*)")
+            .unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(0); 4]]
+        );
+        first.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        statement.reset().unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2); 4]]
+        );
+        second.execute("INSERT INTO t VALUES (3)").unwrap();
+        let rows = second
+            .prepare("SELECT changes(), total_changes()")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1); 2]]);
+        first.execute("DELETE FROM t WHERE v = 1").unwrap();
+        statement.reset().unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(1),
+                Value::from_i64(3),
+                Value::from_i64(1),
+                Value::from_i64(3)
+            ]]
+        );
+        drop(statement);
+        first.close().unwrap();
+        second.close().unwrap();
+    }
+
+    #[test]
+    fn registered_scalar_resumes_and_resets_call_state() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "trait-yield.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let mut statement = conn
+            .prepare("WITH t(x) AS (VALUES (3), (7)) SELECT test_trait_yield(x) FROM t")
+            .unwrap();
+        let expected = vec![vec![Value::from_i64(3)], vec![Value::from_i64(7)]];
+        assert_eq!(collect_yielding_scalar(&mut statement).unwrap(), expected);
+        statement.reset().unwrap();
+        assert!(matches!(statement.step().unwrap(), crate::StepResult::IO));
+        statement.io_completions().unwrap().0.complete(0);
+        statement.reset().unwrap();
+        assert_eq!(collect_yielding_scalar(&mut statement).unwrap(), expected);
+        let mut error = conn.prepare("SELECT test_trait_yield(-1)").unwrap();
+        for _ in 0..2 {
+            assert!(matches!(error.step().unwrap(), crate::StepResult::IO));
+            error.io_completions().unwrap().0.complete(0);
+            assert!(error
+                .run_collect_rows()
+                .unwrap_err()
+                .to_string()
+                .contains("negative argument"));
+            error.reset().unwrap();
+        }
+        drop(error);
+        drop(statement);
+        conn.close().unwrap();
+    }
+
+    fn collect_yielding_scalar(statement: &mut crate::Statement) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        for _ in 0..20 {
+            match statement.step()? {
+                crate::StepResult::Row => {
+                    rows.push(statement.row().unwrap().get_values().cloned().collect())
+                }
+                crate::StepResult::IO => statement.io_completions().unwrap().0.complete(0),
+                crate::StepResult::Done => return Ok(rows),
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        panic!("scalar statement did not finish");
+    }
+
+    #[derive(Debug)]
+    struct TestTraitYield;
+
+    impl crate::scalar::ScalarFunction for TestTraitYield {
+        fn metadata(&self) -> &crate::scalar::ScalarFunctionMetadata {
+            &crate::scalar::ScalarFunctionMetadata {
+                name: "test_trait_yield",
+                arity: crate::scalar::FunctionArity::Exact(1),
+                deterministic: false,
+                can_mask_nulls: false,
+                result_type: crate::function::ResultType::FirstArgument,
+            }
+        }
+
+        fn execute(
+            &self,
+            _context: &crate::scalar::FunctionContext<'_>,
+            args: crate::scalar::FunctionArgs<'_>,
+            state: &mut crate::scalar::ScalarState,
+        ) -> Result<crate::IOResult<Value>> {
+            let call = state.get_or_try_init(|| Ok((false, args.get(0).clone())))?;
+            assert_eq!(&call.1, args.get(0), "arguments changed while resuming");
+            if !call.0 {
+                call.0 = true;
+                let completion = crate::io::Completion::new_wait();
+                return Ok(crate::IOResult::IO(crate::types::IOCompletions(completion)));
+            }
+            if call.1.as_int() == Some(-1) {
+                return Err(LimboError::InvalidArgument("negative argument".into()));
+            }
+            Ok(crate::IOResult::Done(call.1.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestTraitAdd;
+
+    impl crate::function::scalar::ScalarFunction for TestTraitAdd {
+        fn metadata(&self) -> &crate::function::scalar::ScalarFunctionMetadata {
+            &crate::function::scalar::ScalarFunctionMetadata {
+                name: "test_trait_add",
+                arity: crate::scalar::FunctionArity::Exact(2),
+                deterministic: true,
+                can_mask_nulls: false,
+                result_type: crate::function::ResultType::Declared(
+                    crate::function::ReturnType::Integer,
+                ),
+            }
+        }
+
+        fn execute(
+            &self,
+            _context: &crate::scalar::FunctionContext<'_>,
+            args: crate::function::scalar::FunctionArgs<'_>,
+            _state: &mut crate::scalar::ScalarState,
+        ) -> Result<crate::IOResult<Value>> {
+            let (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) =
+                (args.get(0), args.get(1))
+            else {
+                return Err(LimboError::InvalidArgument("expected integers".into()));
+            };
+            Ok(crate::IOResult::Done(Value::from_i64(
+                a.checked_add(*b).ok_or(LimboError::IntegerOverflow)?,
+            )))
+        }
     }
 
     #[test]

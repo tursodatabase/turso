@@ -94,6 +94,7 @@ mod uuid;
 mod vdbe;
 mod vtab;
 
+pub use function::scalar;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func};

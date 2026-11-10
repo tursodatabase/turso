@@ -270,7 +270,7 @@ fn write_pg_text_element(result: &mut String, s: &str) {
 }
 
 /// Compute the number of elements in an array value. Shared by
-/// op_array_length (instruction) and ScalarFunc::ArrayLength (function).
+/// op_array_length (instruction) and array_length (function).
 /// Returns None for NULL or non-blob input (maps to SQL NULL).
 pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     match val {
