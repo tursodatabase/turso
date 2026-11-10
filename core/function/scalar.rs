@@ -1,3 +1,4 @@
+use crate::IOResult;
 pub(crate) mod arrays;
 pub(crate) mod comparison;
 pub(crate) mod constructors;
@@ -8,7 +9,9 @@ pub(crate) mod internal;
 pub(crate) mod numeric;
 pub(crate) mod pattern;
 pub(crate) mod sequence;
+mod state;
 pub(crate) mod values;
+pub use state::ScalarState;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -39,7 +42,14 @@ pub trait ScalarFunction: Debug + Send + Sync {
     fn date_time_arguments(&self) -> Option<DateTimeArguments> {
         None
     }
-    fn execute(&self, _context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
+    /// Resume with the same arguments and state after I/O completes.
+    /// The VM discards state on completion, error, reset, or cancellation.
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         Err(crate::LimboError::InternalError(format!(
             "{} must be compiled to dedicated instructions",
             self.metadata().name
@@ -360,8 +370,13 @@ impl ScalarFunction for Abs {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        args.get(0).exec_abs()
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        args.get(0).exec_abs().map(IOResult::Done)
     }
 }
 
@@ -379,8 +394,15 @@ impl ScalarFunction for Lower {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_lower().unwrap_or(Value::Null))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(
+            args.get(0).exec_lower().unwrap_or(Value::Null),
+        ))
     }
 }
 
@@ -398,8 +420,13 @@ impl ScalarFunction for Length {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_length())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_length()))
     }
 }
 
@@ -417,8 +444,13 @@ impl ScalarFunction for Round {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_round(args.get_optional(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_round(args.get_optional(1))))
     }
 }
 
@@ -436,8 +468,13 @@ impl ScalarFunction for Trim {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_trim(args.get_optional(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_trim(args.get_optional(1))))
     }
 }
 
@@ -455,8 +492,13 @@ impl ScalarFunction for LTrim {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_ltrim(args.get_optional(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_ltrim(args.get_optional(1))))
     }
 }
 
@@ -474,8 +516,13 @@ impl ScalarFunction for RTrim {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_rtrim(args.get_optional(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_rtrim(args.get_optional(1))))
     }
 }
 
@@ -493,8 +540,13 @@ impl ScalarFunction for Concat {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::exec_concat_strings(args.iter()))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::exec_concat_strings(args.iter())))
     }
 }
 
@@ -512,8 +564,13 @@ impl ScalarFunction for Changes {
         }
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::from_i64(context.changes()))
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::from_i64(context.changes())))
     }
 }
 
@@ -531,8 +588,13 @@ impl ScalarFunction for TotalChanges {
         }
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::from_i64(context.total_changes()))
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::from_i64(context.total_changes())))
     }
 }
 
@@ -550,8 +612,15 @@ impl ScalarFunction for Upper {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_upper().unwrap_or(Value::Null))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(
+            args.get(0).exec_upper().unwrap_or(Value::Null),
+        ))
     }
 }
 
@@ -569,8 +638,13 @@ impl ScalarFunction for OctetLength {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_octet_length())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_octet_length()))
     }
 }
 
@@ -588,8 +662,13 @@ impl ScalarFunction for Unicode {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_unicode())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_unicode()))
     }
 }
 
@@ -607,8 +686,15 @@ impl ScalarFunction for Sign {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_sign().unwrap_or(Value::Null))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(
+            args.get(0).exec_sign().unwrap_or(Value::Null),
+        ))
     }
 }
 
@@ -626,8 +712,13 @@ impl ScalarFunction for Soundex {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_soundex())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_soundex()))
     }
 }
 
@@ -645,8 +736,13 @@ impl ScalarFunction for Hex {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_hex())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_hex()))
     }
 }
 
@@ -664,8 +760,13 @@ impl ScalarFunction for Unhex {
         }
     }
 
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_unhex(args.get_optional(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_unhex(args.get_optional(1))))
     }
 }
 

@@ -1,7 +1,9 @@
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::IOResult;
 use crate::{Result, Value};
 
 #[derive(Debug)]
@@ -17,8 +19,13 @@ impl ScalarFunction for Char {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::exec_char(args.iter()))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::exec_char(args.iter())))
     }
 }
 
@@ -35,8 +42,13 @@ impl ScalarFunction for ConcatWs {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::exec_concat_ws(args.iter()))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::exec_concat_ws(args.iter())))
     }
 }
 
@@ -53,8 +65,13 @@ impl ScalarFunction for Instr {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_instr(args.get(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_instr(args.get(1))))
     }
 }
 
@@ -71,8 +88,13 @@ impl ScalarFunction for Subtype {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_subtype())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_subtype()))
     }
 }
 
@@ -89,8 +111,13 @@ impl ScalarFunction for Typeof {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_typeof())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_typeof()))
     }
 }
 
@@ -107,8 +134,13 @@ impl ScalarFunction for Unistr {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        args.get(0).exec_unistr()
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        args.get(0).exec_unistr().map(IOResult::Done)
     }
 }
 
@@ -125,8 +157,13 @@ impl ScalarFunction for UnistrQuote {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_unistr_quote())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_unistr_quote()))
     }
 }
 
@@ -143,8 +180,13 @@ impl ScalarFunction for Quote {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(args.get(0).exec_quote())
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(args.get(0).exec_quote()))
     }
 }
 
@@ -161,8 +203,13 @@ impl ScalarFunction for ZeroBlob {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        args.get(0).exec_zeroblob()
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        args.get(0).exec_zeroblob().map(IOResult::Done)
     }
 }
 
@@ -179,8 +226,13 @@ impl ScalarFunction for GetByte {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        args.get(0).exec_get_byte(args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        args.get(0).exec_get_byte(args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -197,8 +249,15 @@ impl ScalarFunction for SetByte {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        args.get(0).exec_set_byte(args.get(1), args.get(2))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        args.get(0)
+            .exec_set_byte(args.get(1), args.get(2))
+            .map(IOResult::Done)
     }
 }
 
@@ -215,8 +274,17 @@ impl ScalarFunction for Replace {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::exec_replace(args.get(0), args.get(1), args.get(2))?)
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::exec_replace(
+            args.get(0),
+            args.get(1),
+            args.get(2),
+        )?))
     }
 }
 
@@ -233,8 +301,13 @@ impl ScalarFunction for Printf {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        crate::functions::printf::exec_printf(args.registers)
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        crate::functions::printf::exec_printf(args.registers).map(IOResult::Done)
     }
 }
 
@@ -251,12 +324,17 @@ impl ScalarFunction for Substr {
             result_type: ResultType::TextOrBlobLikeTheFirstArgument,
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::exec_substring(
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::exec_substring(
             args.get(0),
             args.get(1),
             args.get_optional(2),
-        )?)
+        )?))
     }
 }
 
@@ -273,12 +351,17 @@ impl ScalarFunction for Substring {
             result_type: ResultType::TextOrBlobLikeTheFirstArgument,
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::exec_substring(
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::exec_substring(
             args.get(0),
             args.get(1),
             args.get_optional(2),
-        )?)
+        )?))
     }
 }
 
@@ -295,11 +378,16 @@ impl ScalarFunction for StringReverse {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(match args.get(0) {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(match args.get(0) {
             Value::Null => Value::Null,
             value => Value::build_text(value.to_string().chars().rev().collect::<String>()),
-        })
+        }))
     }
 }
 
@@ -316,8 +404,13 @@ impl ScalarFunction for Repeat {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        crate::functions::string::exec_repeat(args.get(0), args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        crate::functions::string::exec_repeat(args.get(0), args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -334,8 +427,14 @@ impl ScalarFunction for Lpad {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         crate::functions::string::exec_lpad(args.get(0), args.get(1), args.get_optional(2))
+            .map(IOResult::Done)
     }
 }
 
@@ -352,7 +451,13 @@ impl ScalarFunction for Rpad {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         crate::functions::string::exec_rpad(args.get(0), args.get(1), args.get_optional(2))
+            .map(IOResult::Done)
     }
 }

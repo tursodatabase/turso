@@ -1,7 +1,9 @@
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::IOResult;
 use crate::{Result, Value};
 
 #[derive(Debug)]
@@ -17,8 +19,13 @@ impl ScalarFunction for Random {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::from_i64(context.random_i64()))
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::from_i64(context.random_i64())))
     }
 }
 
@@ -35,9 +42,15 @@ impl ScalarFunction for RandomBlob {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         args.get(0)
             .exec_randomblob(|dest| context.fill_random_bytes(dest))
+            .map(IOResult::Done)
     }
 }
 
@@ -54,8 +67,13 @@ impl ScalarFunction for LastInsertRowid {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::from_i64(context.last_insert_rowid()))
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::from_i64(context.last_insert_rowid())))
     }
 }
 
@@ -72,8 +90,15 @@ impl ScalarFunction for SqliteVersion {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::build_text(crate::dialect::engine::SQLITE_VERSION))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::build_text(
+            crate::dialect::engine::SQLITE_VERSION,
+        )))
     }
 }
 
@@ -90,11 +115,16 @@ impl ScalarFunction for SqliteSourceId {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(Value::build_text(format!(
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::build_text(format!(
             "{} {}",
             crate::info::build::BUILT_TIME_SQLITE,
             crate::info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
-        )))
+        ))))
     }
 }

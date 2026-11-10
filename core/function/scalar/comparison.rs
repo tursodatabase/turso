@@ -1,7 +1,9 @@
+use super::ScalarState;
 use super::{
     ArgumentTranslation, FunctionArgs, FunctionArity, FunctionContext, ResultType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::IOResult;
 use crate::{Result, Value};
 
 #[derive(Debug)]
@@ -21,8 +23,13 @@ impl ScalarFunction for Min {
             result_type: ResultType::OneOfTheArguments,
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Value::exec_min(args.iter(), |a, b| Ok(context.compare(a, b)))
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Value::exec_min(args.iter(), |a, b| Ok(context.compare(a, b))).map(IOResult::Done)
     }
 }
 
@@ -43,8 +50,13 @@ impl ScalarFunction for Max {
             result_type: ResultType::OneOfTheArguments,
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Value::exec_max(args.iter(), |a, b| Ok(context.compare(a, b)))
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Value::exec_max(args.iter(), |a, b| Ok(context.compare(a, b))).map(IOResult::Done)
     }
 }
 
@@ -65,8 +77,14 @@ impl ScalarFunction for Nullif {
             result_type: ResultType::FirstArgument,
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         args.get(0)
             .exec_nullif(args.get(1), |a, b| Ok(context.compare(a, b)))
+            .map(IOResult::Done)
     }
 }

@@ -134,16 +134,8 @@ pub(crate) fn step_scalar(
     connection: &Arc<Connection>,
     args: &[Register],
 ) -> IOResultOr<Value> {
-    if matches!(state, ExtensionState::None) {
-        *state = ExtensionState::ScalarCall(factory.create_call()?);
-    }
-    let ExtensionState::ScalarCall(call) = state else {
-        unreachable!("scalar instruction requires scalar call state");
-    };
-    let result = call.step(connection, args);
-    if !matches!(result, Ok(IOResult::IO(_))) {
-        *state = ExtensionState::None;
-    }
+    let result = (|| state.scalar().native_call(factory)?.step(connection, args))();
+    state.finish_scalar(&result);
     result
 }
 

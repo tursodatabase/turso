@@ -10313,7 +10313,9 @@ pub fn op_function(
                 &mut state.current_time,
                 func.collation,
             );
-            let value = function.execute(&context, args)?;
+            let result = function.execute(&context, args, state.extension_state.scalar());
+            state.extension_state.finish_scalar(&result);
+            let value = return_if_io!(state, result);
             state.registers[*dest].set_value(value);
         }
         crate::function::Func::Scalar(scalar_func) => match scalar_func {

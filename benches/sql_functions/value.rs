@@ -1081,10 +1081,12 @@ fn registered_scalar(bencher: Bencher, name: &str) {
         CollationSeq::BINARY,
     );
     let registers = [turso_core::Register::Value(Value::from_i64(-12345))];
+    let mut state = turso_core::scalar::ScalarState::default();
     bencher.bench_local(|| {
         black_box(black_box(function).execute(
             &context,
             turso_core::scalar::FunctionArgs::new(black_box(&registers)),
+            &mut state,
         ))
     });
 }

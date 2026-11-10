@@ -1,8 +1,10 @@
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
 use crate::vdbe::array;
+use crate::IOResult;
 use crate::{Result, Value};
 
 #[derive(Debug)]
@@ -18,12 +20,19 @@ impl ScalarFunction for ArrayLength {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let dim = args
             .get_optional(1)
             .map_or(1, |value| value.as_int().unwrap_or(0));
-        Ok(array::compute_array_length_at_dim(args.get(0), dim)
-            .map_or(Value::Null, Value::from_i64))
+        Ok(IOResult::Done(
+            array::compute_array_length_at_dim(args.get(0), dim)
+                .map_or(Value::Null, Value::from_i64),
+        ))
     }
 }
 
@@ -40,8 +49,13 @@ impl ScalarFunction for ArrayAppend {
             result_type: ResultType::Declared(ReturnType::Array),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        array::exec_array_append(args.get(0), args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        array::exec_array_append(args.get(0), args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -58,8 +72,13 @@ impl ScalarFunction for ArrayCat {
             result_type: ResultType::Declared(ReturnType::Array),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        array::exec_array_cat(args.get(0), args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        array::exec_array_cat(args.get(0), args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -76,8 +95,13 @@ impl ScalarFunction for ArrayRemove {
             result_type: ResultType::Declared(ReturnType::Array),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        array::exec_array_remove(args.get(0), args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        array::exec_array_remove(args.get(0), args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -94,8 +118,16 @@ impl ScalarFunction for ArrayContains {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(array::exec_array_contains(args.get(0), args.get(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(array::exec_array_contains(
+            args.get(0),
+            args.get(1),
+        )))
     }
 }
 
@@ -112,8 +144,16 @@ impl ScalarFunction for ArrayPosition {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(array::exec_array_position(args.get(0), args.get(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(array::exec_array_position(
+            args.get(0),
+            args.get(1),
+        )))
     }
 }
 
@@ -130,8 +170,16 @@ impl ScalarFunction for ArrayOverlap {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(array::exec_array_overlap(args.get(0), args.get(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(array::exec_array_overlap(
+            args.get(0),
+            args.get(1),
+        )))
     }
 }
 
@@ -148,8 +196,16 @@ impl ScalarFunction for ArrayContainsAll {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(array::exec_array_contains_all(args.get(0), args.get(1)))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(array::exec_array_contains_all(
+            args.get(0),
+            args.get(1),
+        )))
     }
 }
 
@@ -166,8 +222,13 @@ impl ScalarFunction for ArrayPrepend {
             result_type: ResultType::Declared(ReturnType::Array),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        array::exec_array_prepend(args.get(1), args.get(0))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        array::exec_array_prepend(args.get(1), args.get(0)).map(IOResult::Done)
     }
 }
 
@@ -184,8 +245,13 @@ impl ScalarFunction for ArraySlice {
             result_type: ResultType::Declared(ReturnType::Array),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        array::exec_array_slice(args.get(0), args.get(1), args.get(2))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        array::exec_array_slice(args.get(0), args.get(1), args.get(2)).map(IOResult::Done)
     }
 }
 
@@ -202,8 +268,14 @@ impl ScalarFunction for StringToArray {
             result_type: ResultType::Declared(ReturnType::TextArray),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         array::exec_string_to_array(args.get(0), args.get(1), args.get_optional(2))
+            .map(IOResult::Done)
     }
 }
 
@@ -220,11 +292,16 @@ impl ScalarFunction for ArrayToString {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(array::exec_array_to_string(
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(array::exec_array_to_string(
             args.get(0),
             args.get(1),
             args.get_optional(2),
-        ))
+        )))
     }
 }

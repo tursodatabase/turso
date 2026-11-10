@@ -1,10 +1,12 @@
 use super::FunctionCompileContext;
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
 use crate::numeric::Numeric;
 use crate::stats::StatAccum;
+use crate::IOResult;
 use crate::LimboError;
 #[cfg(feature = "json")]
 use crate::{json, namespace::NamespaceId, ValueRef};
@@ -34,7 +36,12 @@ impl ScalarFunction for StatInit {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         // stat_init(n_col): Initialize a statistics accumulator
         // Returns a blob containing the serialized StatAccum
         let n_col = match args.get(0) {
@@ -42,7 +49,7 @@ impl ScalarFunction for StatInit {
             _ => 0,
         };
         let accum = StatAccum::new(n_col);
-        Ok(Value::from_blob(accum.to_bytes()))
+        Ok(IOResult::Done(Value::from_blob(accum.to_bytes())))
     }
 }
 
@@ -69,7 +76,12 @@ impl ScalarFunction for StatPush {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         // stat_push(accum_blob, i_chng): Push a row into the accumulator
         // i_chng is the index of the leftmost column that changed from the previous row
         // Returns the updated accumulator blob
@@ -89,7 +101,7 @@ impl ScalarFunction for StatPush {
             }
             _ => Value::Null,
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -116,7 +128,12 @@ impl ScalarFunction for StatGet {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         // stat_get(accum_blob): Get the stat1 string from the accumulator
         // Returns the stat string "total avg1 avg2 ..."
         let accum_blob = args.get(0);
@@ -135,7 +152,7 @@ impl ScalarFunction for StatGet {
             }
             _ => Value::Null,
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -162,7 +179,12 @@ impl ScalarFunction for ConnTxnId {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
         // If unset (-1), store the candidate and return it.
         // If already set, return the existing value, ignoring the candidate.
@@ -173,9 +195,9 @@ impl ScalarFunction for ConnTxnId {
         let current = context.connection.get_cdc_transaction_id();
         if current == -1 {
             context.connection.set_cdc_transaction_id(candidate);
-            Ok(Value::from_i64(candidate))
+            Ok(IOResult::Done(Value::from_i64(candidate)))
         } else {
-            Ok(Value::from_i64(current))
+            Ok(IOResult::Done(Value::from_i64(current)))
         }
     }
 }
@@ -203,10 +225,19 @@ impl ScalarFunction for IsAutocommit {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         // is_autocommit(): returns 1 if autocommit, 0 otherwise.
         let auto_commit = context.connection.auto_commit.load(Ordering::SeqCst);
-        Ok(Value::from_i64(if auto_commit { 1 } else { 0 }))
+        Ok(IOResult::Done(Value::from_i64(if auto_commit {
+            1
+        } else {
+            0
+        })))
     }
 }
 
@@ -227,7 +258,12 @@ impl ScalarFunction for TableColumnsJsonArray {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         #[cfg(not(feature = "json"))]
         {
             return Err(LimboError::InvalidArgument(
@@ -273,6 +309,7 @@ impl ScalarFunction for TableColumnsJsonArray {
                 json::jsonb::ElementType::ARRAY,
                 json::OutputVariant::String,
             )
+            .map(IOResult::Done)
         }
     }
 }
@@ -294,7 +331,12 @@ impl ScalarFunction for BinRecordJsonObject {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         #[cfg(not(feature = "json"))]
         {
             return Err(LimboError::InvalidArgument(
@@ -315,7 +357,7 @@ impl ScalarFunction for BinRecordJsonObject {
             };
 
             if let Value::Null = bin_record {
-                return Ok(Value::Null);
+                return Ok(IOResult::Done(Value::Null));
             }
 
             let Value::Blob(bin_record) = bin_record else {
@@ -367,6 +409,7 @@ impl ScalarFunction for BinRecordJsonObject {
                 json::jsonb::ElementType::OBJECT,
                 json::OutputVariant::String,
             )
+            .map(IOResult::Done)
         }
     }
 }
@@ -384,7 +427,12 @@ impl ScalarFunction for TestUintEncode {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
@@ -417,7 +465,7 @@ impl ScalarFunction for TestUintEncode {
                 ));
             }
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -434,13 +482,18 @@ impl ScalarFunction for TestUintDecode {
             result_type: ResultType::FirstArgument,
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
             other => other.clone(),
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -459,7 +512,12 @@ impl ScalarFunction for TestNondetCounter {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, _args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        _args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         // Test-only: per-connection counter that increments on every
         // evaluation. Used in sqltests to verify that the planner does
         // not deduplicate equivalent SQL calls that contain
@@ -468,6 +526,6 @@ impl ScalarFunction for TestNondetCounter {
             .connection
             .test_nondet_counter
             .fetch_add(1, Ordering::Relaxed);
-        Ok(Value::from_i64(value))
+        Ok(IOResult::Done(Value::from_i64(value)))
     }
 }

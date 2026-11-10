@@ -1,8 +1,10 @@
 use super::DateTimeArguments;
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::IOResult;
 use crate::{Clock, MonotonicInstant, WallClockInstant};
 use crate::{Result, Value};
 use std::cell::Cell;
@@ -24,11 +26,16 @@ impl ScalarFunction for Date {
         Some(DateTimeArguments::TimeValue { index: 0 })
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_date(
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(crate::functions::datetime::exec_date(
             context.clock(),
             args.iter(),
-        ))
+        )))
     }
 }
 
@@ -49,11 +56,16 @@ impl ScalarFunction for Time {
         Some(DateTimeArguments::TimeValue { index: 0 })
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_time(
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(crate::functions::datetime::exec_time(
             context.clock(),
             args.iter(),
-        ))
+        )))
     }
 }
 
@@ -74,10 +86,14 @@ impl ScalarFunction for DateTime {
         Some(DateTimeArguments::TimeValue { index: 0 })
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_datetime_full(
-            context.clock(),
-            args.iter(),
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(
+            crate::functions::datetime::exec_datetime_full(context.clock(), args.iter()),
         ))
     }
 }
@@ -99,11 +115,16 @@ impl ScalarFunction for JulianDay {
         Some(DateTimeArguments::TimeValue { index: 0 })
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_julianday(
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(crate::functions::datetime::exec_julianday(
             context.clock(),
             args.iter(),
-        ))
+        )))
     }
 }
 
@@ -124,11 +145,16 @@ impl ScalarFunction for UnixEpoch {
         Some(DateTimeArguments::TimeValue { index: 0 })
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_unixepoch(
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(crate::functions::datetime::exec_unixepoch(
             context.clock(),
             args.iter(),
-        ))
+        )))
     }
 }
 
@@ -149,11 +175,16 @@ impl ScalarFunction for StrfTime {
         Some(DateTimeArguments::TimeValue { index: 1 })
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_strftime(
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(crate::functions::datetime::exec_strftime(
             context.clock(),
             args.iter(),
-        ))
+        )))
     }
 }
 
@@ -174,11 +205,16 @@ impl ScalarFunction for TimeDiff {
         Some(DateTimeArguments::TimePair)
     }
 
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        Ok(crate::functions::datetime::exec_timediff(
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(crate::functions::datetime::exec_timediff(
             context.clock(),
             args.iter(),
-        ))
+        )))
     }
 }
 
@@ -195,8 +231,14 @@ impl ScalarFunction for DatePlus {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         crate::functions::datetime::exec_date_plus(context.clock(), args.get(0), args.get(1))
+            .map(IOResult::Done)
     }
 }
 
@@ -213,8 +255,14 @@ impl ScalarFunction for DateMinus {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         crate::functions::datetime::exec_date_minus(context.clock(), args.get(0), args.get(1))
+            .map(IOResult::Done)
     }
 }
 
@@ -231,8 +279,14 @@ impl ScalarFunction for DateDiff {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         crate::functions::datetime::exec_date_diff(context.clock(), args.get(0), args.get(1))
+            .map(IOResult::Done)
     }
 }
 

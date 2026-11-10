@@ -1,7 +1,9 @@
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::IOResult;
 use crate::{Result, Value};
 
 #[derive(Debug)]
@@ -17,7 +19,12 @@ impl ScalarFunction for Glob {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         if args.len() != 2 {
             return Err(crate::LimboError::ParseError(
                 "wrong number of arguments to function GLOB()".to_string(),
@@ -25,11 +32,11 @@ impl ScalarFunction for Glob {
         }
         let (pattern, text) = (args.get(0), args.get(1));
         if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
-            return Ok(Value::Null);
+            return Ok(IOResult::Done(Value::Null));
         }
-        Ok(Value::from_i64(
+        Ok(IOResult::Done(Value::from_i64(
             Value::exec_glob(&as_text(pattern)?, &as_text(text)?)? as i64,
-        ))
+        )))
     }
 }
 
@@ -50,14 +57,19 @@ impl ScalarFunction for Like {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let (pattern, text) = (args.get(0), args.get(1));
         if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
-            return Ok(Value::Null);
+            return Ok(IOResult::Done(Value::Null));
         }
         let escape = match args.get_optional(2) {
             None => None,
-            Some(Value::Null) => return Ok(Value::Null),
+            Some(Value::Null) => return Ok(IOResult::Done(Value::Null)),
             Some(value) => {
                 let text = as_text(value)?;
                 let mut chars = text.chars();
@@ -76,7 +88,7 @@ impl ScalarFunction for Like {
             }
             _ => exec_like_converted(pattern, text, escape)?,
         };
-        Ok(Value::from_i64(matches as i64))
+        Ok(IOResult::Done(Value::from_i64(matches as i64)))
     }
 }
 

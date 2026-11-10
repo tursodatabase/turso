@@ -1,8 +1,10 @@
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
 use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
+use crate::IOResult;
 use crate::{numeric::Numeric, LimboError, Result, Value};
 use bigdecimal::{BigDecimal, Zero};
 
@@ -19,7 +21,12 @@ impl ScalarFunction for BooleanToInt {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
@@ -50,7 +57,7 @@ impl ScalarFunction for BooleanToInt {
                 )));
             }
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -67,14 +74,19 @@ impl ScalarFunction for IntToBoolean {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
             Value::Numeric(Numeric::Integer(0)) => Value::build_text("false".to_string()),
             _ => Value::build_text("true".to_string()),
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -91,7 +103,12 @@ impl ScalarFunction for ValidateIpAddr {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
@@ -108,7 +125,7 @@ impl ScalarFunction for ValidateIpAddr {
                 )));
             }
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -125,7 +142,12 @@ impl ScalarFunction for NumericEncode {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let result = match args.get(0) {
             Value::Null => Value::Null,
             other => {
@@ -133,7 +155,7 @@ impl ScalarFunction for NumericEncode {
                 Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&bd))
             }
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -150,7 +172,12 @@ impl ScalarFunction for NumericFit {
             result_type: ResultType::Declared(ReturnType::Blob),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let precision_value = args.get(1);
         let scale_value = args.get(2);
@@ -183,7 +210,7 @@ impl ScalarFunction for NumericFit {
                 )));
             }
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -200,7 +227,12 @@ impl ScalarFunction for NumericDecode {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
@@ -214,7 +246,7 @@ impl ScalarFunction for NumericDecode {
                 )));
             }
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -231,7 +263,12 @@ impl ScalarFunction for NumericNeg {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let val = args.get(0);
         let result = match val {
             Value::Null => Value::Null,
@@ -240,7 +277,7 @@ impl ScalarFunction for NumericNeg {
                 &-numeric_from_value(val)?,
             )),
         };
-        Ok(result)
+        Ok(IOResult::Done(result))
     }
 }
 
@@ -257,8 +294,13 @@ impl ScalarFunction for Gcd {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        crate::functions::math::exec_gcd(args.get(0), args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        crate::functions::math::exec_gcd(args.get(0), args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -275,8 +317,13 @@ impl ScalarFunction for Lcm {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
-        crate::functions::math::exec_lcm(args.get(0), args.get(1))
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
+        crate::functions::math::exec_lcm(args.get(0), args.get(1)).map(IOResult::Done)
     }
 }
 
@@ -293,11 +340,17 @@ impl ScalarFunction for NumericAdd {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         execute_binary(args, |a, b| {
             let (a_scale, b_scale) = (a.fractional_digit_count(), b.fractional_digit_count());
             Ok((a + b).with_scale(a_scale.max(b_scale)))
         })
+        .map(IOResult::Done)
     }
 }
 
@@ -314,11 +367,17 @@ impl ScalarFunction for NumericSub {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         execute_binary(args, |a, b| {
             let (a_scale, b_scale) = (a.fractional_digit_count(), b.fractional_digit_count());
             Ok((a - b).with_scale(a_scale.max(b_scale)))
         })
+        .map(IOResult::Done)
     }
 }
 
@@ -335,7 +394,12 @@ impl ScalarFunction for NumericMul {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         execute_binary(args, |a, b| {
             let (a_scale, b_scale) = (a.fractional_digit_count(), b.fractional_digit_count());
             Ok((a * b).with_scale_round(
@@ -343,6 +407,7 @@ impl ScalarFunction for NumericMul {
                 bigdecimal::RoundingMode::HalfUp,
             ))
         })
+        .map(IOResult::Done)
     }
 }
 
@@ -359,13 +424,19 @@ impl ScalarFunction for NumericDiv {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         execute_binary(args, |a, b| {
             if b.is_zero() {
                 return Err(LimboError::Constraint("division by zero".to_string()));
             }
             Ok(a / b)
         })
+        .map(IOResult::Done)
     }
 }
 
@@ -382,7 +453,12 @@ impl ScalarFunction for NumericMod {
             result_type: ResultType::Declared(ReturnType::Text),
         }
     }
-    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        _context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         execute_binary(args, |a, b| {
             if b.is_zero() {
                 return Err(LimboError::Constraint("division by zero".to_string()));
@@ -390,6 +466,7 @@ impl ScalarFunction for NumericMod {
             let (a_scale, b_scale) = (a.fractional_digit_count(), b.fractional_digit_count());
             Ok((a % b).with_scale(a_scale.max(b_scale)))
         })
+        .map(IOResult::Done)
     }
 }
 

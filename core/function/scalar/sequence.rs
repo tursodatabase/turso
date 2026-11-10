@@ -1,8 +1,10 @@
 use super::FunctionCompileContext;
+use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::IOResult;
 use crate::{namespace::mangle_name, LimboError};
 use crate::{Result, Value};
 
@@ -42,7 +44,12 @@ impl ScalarFunction for CurrVal {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let seq_name = match args.get(0) {
             Value::Text(t) => t.as_str().to_string(),
             _ => {
@@ -61,7 +68,7 @@ impl ScalarFunction for CurrVal {
             namespace.database_id,
             &mangle_name(namespace.id, &sequence.name),
         ) {
-            Some(val) => Ok(Value::from_i64(val)),
+            Some(val) => Ok(IOResult::Done(Value::from_i64(val))),
             None => Err(LimboError::ParseError(format!(
                 "currval of sequence \"{}\" is not yet defined in this session",
                 sequence.name
@@ -87,7 +94,12 @@ impl ScalarFunction for SetVal {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         if context.connection.is_tx_read_only() {
             return Err(LimboError::ReadOnly);
         }
@@ -133,7 +145,7 @@ impl ScalarFunction for SetVal {
                 value, seq.name, seq.min_value, seq.max_value
             )));
         }
-        Ok(Value::from_i64(value))
+        Ok(IOResult::Done(Value::from_i64(value)))
     }
 }
 
@@ -150,11 +162,16 @@ impl ScalarFunction for SequenceWatermark {
             result_type: ResultType::Declared(ReturnType::Integer),
         }
     }
-    fn execute(&self, context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+    fn execute(
+        &self,
+        context: &FunctionContext<'_>,
+        args: FunctionArgs<'_>,
+        _state: &mut ScalarState,
+    ) -> Result<IOResult<Value>> {
         let sequence_name = match args.get(0) {
             Value::Text(text) => text.as_str(),
             Value::Null => {
-                return Ok(Value::Null);
+                return Ok(IOResult::Done(Value::Null));
             }
             _ => {
                 return Err(LimboError::InternalError(
@@ -170,8 +187,8 @@ impl ScalarFunction for SequenceWatermark {
                 mv_store.sequence_watermark(&mangle_name(namespace.id, &sequence.name))
             });
         match watermark {
-            Some(watermark) => Ok(Value::from_i64(watermark)),
-            None => Ok(Value::Null),
+            Some(watermark) => Ok(IOResult::Done(Value::from_i64(watermark))),
+            None => Ok(IOResult::Done(Value::Null)),
         }
     }
 }
