@@ -6487,6 +6487,115 @@ mod tests {
         assert!(inspect_frame_prefix(&overflow, None).is_err());
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_rejects_authenticated_malformed_extensions() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "malformed-extensions.db-log");
+        let crypto = test_enc_ctx();
+        let mut tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "portable", 10)],
+            None,
+        );
+        tx.portable_changes_enabled = true;
+        write_first_encrypted_tx(file.clone(), &io, &crypto, tx);
+        let stored = read_file_bytes(file, &io);
+        let log_header = validate_log_header(&stored[..LOG_HDR_SIZE]).unwrap();
+        let frame = &stored[LOG_HDR_SIZE..];
+        let mut plaintext = Vec::new();
+        let extension_size = validate_frame_into(
+            &log_header,
+            LOG_HDR_SIZE as u64,
+            frame,
+            log_header.initial_crc(),
+            Some(&crypto),
+            &mut plaintext,
+        )
+        .unwrap()
+        .extension()
+        .len();
+        assert!(extension_size >= EXTENSION_RECORD_HEADER_SIZE);
+
+        let encode = |header: &[u8], plaintext: &[u8]| {
+            let mut frame = header.to_vec();
+            let count = plaintext.len().div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+            for (index, chunk) in plaintext.chunks(ENCRYPTED_PAYLOAD_CHUNK_SIZE).enumerate() {
+                let aad = build_encrypted_chunk_aad(
+                    u64::from_le_bytes(stored[8..16].try_into().unwrap()),
+                    (index + 1 == count).then_some(plaintext.len() as u64),
+                    u32::from_le_bytes(header[12..16].try_into().unwrap()),
+                    u64::from_le_bytes(header[16..24].try_into().unwrap()),
+                    index as u32,
+                );
+                let (ciphertext, nonce) = crypto.encrypt_chunk(chunk, &aad).unwrap();
+                frame.extend(ciphertext);
+                frame.extend(nonce);
+            }
+            let crc = crc32c::crc32c_append(log_header.initial_crc(), &frame);
+            frame.extend(crc.to_le_bytes());
+            frame.extend(END_MAGIC.to_le_bytes());
+            frame
+        };
+        for case in [
+            "unknown flags",
+            "missing flag",
+            "zero count",
+            "extra record",
+            "record flags",
+            "record length",
+            "trailing bytes",
+        ] {
+            let mut header = frame[..TX_EXT_HEADER_SIZE].to_vec();
+            let mut body = plaintext.clone();
+            let expected = match case {
+                "unknown flags" => {
+                    header[36..40].copy_from_slice(&2u32.to_le_bytes());
+                    "extension flags or count"
+                }
+                "missing flag" => {
+                    header[36..40].fill(0);
+                    "extension flags or count"
+                }
+                "zero count" => {
+                    header[32..36].fill(0);
+                    "extension flags or count"
+                }
+                "extra record" => {
+                    header[32..36].copy_from_slice(&2u32.to_le_bytes());
+                    "truncated logical log extension header"
+                }
+                "record flags" => {
+                    body[2] = 1;
+                    "unsupported logical log extension flags"
+                }
+                "record length" => {
+                    body[4..8].copy_from_slice(&(extension_size as u32).to_le_bytes());
+                    "truncated logical log extension body"
+                }
+                "trailing bytes" => {
+                    body[4..8].fill(0);
+                    "extension count does not match its size"
+                }
+                _ => unreachable!(),
+            };
+            let malformed = encode(&header, &body);
+            let mut output = vec![0xff];
+            let error = validate_frame_into(
+                &log_header,
+                LOG_HDR_SIZE as u64,
+                &malformed,
+                log_header.initial_crc(),
+                Some(&crypto),
+                &mut output,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+            assert!(output.is_empty(), "{case} exposed an invalid frame");
+        }
+    }
+
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
         use crate::storage::encryption::{CipherMode, EncryptionKey};
         let key = EncryptionKey::Key128([0x42u8; 16]);

@@ -98,7 +98,7 @@ export interface DatabaseOpts {
      * optional remote encryption parameters if cloud database were encrypted by default
      */
     remoteEncryption?: EncryptionOpts;
-    /** Hex-encoded local key. Uses the cipher in remoteEncryption. */
+    /** Hex-encoded local key. Requires experimental: ["sync_encryption"]. Uses remoteEncryption.cipher. */
     localEncryptionKey?: string;
     /**
      * optional callback which will be called for every mutation before sending it to the remote

@@ -8,6 +8,7 @@ export default defineConfig({
         'Cross-Origin-Opener-Policy': 'same-origin',
     } },
     test: {
+        globalSetup: './turso-encryption-setup.ts',
         include: ['encryption.test.ts'],
         testTimeout: 30000,
         browser: { enabled: true, provider: playwright(), instances: [{ browser: 'chromium' }] },

@@ -49,5 +49,9 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
+      - name: Build encrypted sync test server
+        working-directory: .
+        run: cargo build --locked -p turso_cli --bin tursodb
+
       - name: Run tests
         run: make test

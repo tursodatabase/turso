@@ -115,7 +115,7 @@ public sealed class TursoSyncDatabaseOptions
     public bool BootstrapIfEmpty { get; init; } = true;
     public TursoPartialSyncOptions? PartialSync { get; init; }
     public TursoRemoteEncryptionOptions? RemoteEncryption { get; init; }
-    /// <summary>Hex local key, using RemoteEncryption.Cipher. Never sent to the server.</summary>
+    /// <summary>Hex local key, using RemoteEncryption.Cipher. Never sent to the server. Requires "sync_encryption" in ExperimentalFeatures.</summary>
     public string? LocalEncryptionKey { get; init; }
     public long? PushOperationsThreshold { get; init; }
     public long? PullBytesThreshold { get; init; }

@@ -4,6 +4,19 @@ import { SyncOperationResultType, TursoStatus } from '../types';
 
 afterEach(() => vi.unstubAllGlobals());
 
+test.each([
+  [undefined, undefined],
+  [['encryption'], 'encryption'],
+  [['sync_encryption_extra'], 'sync_encryption_extra'],
+] as const)('experimental features reach native validation: %j', async (experimental, expectedFeatures) => {
+  const create = installProxy();
+  const nativeError = new Error('native configuration rejected');
+  create.mockImplementationOnce(() => { throw nativeError; });
+  await expect(new Database({ path: 'replica.db', localEncryptionKey: '16'.repeat(32),
+    remoteEncryption: { cipher: 'aes256gcm' }, experimental: experimental && [...experimental] }).connect()).rejects.toBe(nativeError);
+  expect(create).toHaveBeenCalledWith(expect.objectContaining({ experimental_features: expectedFeatures }), expect.anything());
+});
+
 function installProxy() {
   const operation = (kind: SyncOperationResultType) => ({
     resume: () => TursoStatus.DONE,
@@ -24,10 +37,10 @@ test('encrypted bootstrap passes separate local and cloud keys with one cipher',
   const localKey = '16'.repeat(32);
   const cloudKey = 'CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=';
   const db = new Database({ path: 'replica.db', url: 'https://example.invalid',
-    localEncryptionKey: localKey, remoteEncryption: { cipher: 'aes256gcm', key: cloudKey } });
+    experimental: ['sync_encryption' as const], localEncryptionKey: localKey, remoteEncryption: { cipher: 'aes256gcm', key: cloudKey } });
   await db.connect();
   expect(create).toHaveBeenCalledWith(expect.objectContaining({
-    encryption_hexkey: localKey, encryption_cipher: 'aes256gcm', experimental_features: 'encryption',
+    encryption_hexkey: localKey, encryption_cipher: 'aes256gcm', experimental_features: 'sync_encryption',
   }), expect.objectContaining({
     remoteEncryptionKey: cloudKey, remoteEncryptionCipher: 'aes256gcm', reservedBytes: 28,
     bootstrapIfEmpty: true,
@@ -36,7 +49,7 @@ test('encrypted bootstrap passes separate local and cloud keys with one cipher',
 
 test('offline encrypted reopen still uses the sync bridge without a cloud key', async () => {
   const create = installProxy();
-  await new Database({ path: 'replica.db', localEncryptionKey: '16'.repeat(32),
+  await new Database({ path: 'replica.db', experimental: ['sync_encryption' as const], localEncryptionKey: '16'.repeat(32),
     remoteEncryption: { cipher: 'aes256gcm' } }).connect();
   expect(create).toHaveBeenCalledWith(expect.objectContaining({ encryption_cipher: 'aes256gcm' }),
     expect.objectContaining({ remoteUrl: null, remoteEncryptionKey: undefined, bootstrapIfEmpty: false }));
@@ -44,7 +57,7 @@ test('offline encrypted reopen still uses the sync bridge without a cloud key', 
 
 test('a local key without the shared cipher is rejected before native creation', async () => {
   const create = installProxy();
-  await expect(new Database({ path: 'replica.db', localEncryptionKey: '16'.repeat(32) }).connect())
+  await expect(new Database({ path: 'replica.db', experimental: ['sync_encryption' as const], localEncryptionKey: '16'.repeat(32) }).connect())
     .rejects.toThrow('localEncryptionKey requires remoteEncryption.cipher');
   expect(create).not.toHaveBeenCalled();
 });

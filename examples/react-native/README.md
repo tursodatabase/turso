@@ -151,4 +151,12 @@ TURSO_ENCRYPTION_CIPHER=aes256gcm \
 npm start -- --reset-cache
 ```
 
-Supported ciphers: `aes256gcm`, `aes128gcm`, `chacha20poly1305` (default: `aes256gcm`)
+Native ciphers: `aes256gcm`, `aes128gcm`, `aegis128l`, `aegis128x2`,
+`aegis128x4`, `aegis256`, `aegis256x2`, and `aegis256x4` (default:
+`aes256gcm`). `chacha20poly1305` remains available for legacy cloud encryption.
+
+With a native encrypted source, the app also runs a local-encryption integration
+test with `experimental: ["sync_encryption"]` through the real JSI/C++ bridge: two replicas push and pull test rows, checkpoint,
+reopens offline with its local key, and rejects a wrong local key. The local key
+is a public test fixture independent of `TURSO_ENCRYPTION_KEY`. This case requires
+a running Android/iOS app; the mocked binding unit tests do not execute it.
