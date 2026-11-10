@@ -8521,8 +8521,21 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     Ok(name)
 }
 
-/// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
-const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
+/// The functions that the translator calls in the SQL it writes, such as
+/// `array_element()` for a subscript. PostgreSQL does not have them, so user
+/// SQL cannot call them.
+pub const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
+    "array",
+    "array_contains",
+    "array_contains_all",
+    "array_element",
+    "array_overlap",
+    "array_slice",
+    "coalesce",
+    "int8_out_of_range",
+    "json_type",
+    "nullif",
+];
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
     match names {

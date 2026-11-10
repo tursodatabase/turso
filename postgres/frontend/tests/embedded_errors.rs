@@ -256,7 +256,7 @@ fn errors_report_postgres_sqlstates() {
         ("SELECT nonexistent_fn_xyz()", "42883"),
         ("CREATE TABLE t_present (id INT)", "42P07"),
         ("SELECT abs(-9223372036854775808)", "22003"),
-        ("SELECT zeroblob(1000000001)", "22001"),
+        ("SELECT repeat('x', 1000000001)", "22001"),
         ("SELECT nextval('s_exhaust')", "2200H"),
     ] {
         let e = exec_err(&conn, sql);

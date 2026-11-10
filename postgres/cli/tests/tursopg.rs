@@ -458,19 +458,6 @@ fn d_upper_t_empty() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn role_without_privileges_cannot_load_extensions() {
-    let output = stdout(&run_tursopg(
-        b"CREATE ROLE alice;\n\
-          SET ROLE alice;\n\
-          SELECT load_extension('/nonexistent/extension.so');\n",
-    ));
-    assert!(
-        output.contains("permission denied for function load_extension"),
-        "{output}"
-    );
-}
-
-#[test]
 fn role_without_privileges_can_use_table_valued_functions() {
     let output = run_tursopg(
         b"CREATE ROLE alice;\n\
@@ -1356,32 +1343,40 @@ fn wire_copy_from_returns_copy_n() {
     server.wait().ok();
 }
 
+/// load_extension() is a SQLite built-in, so it is not available in tursopg,
+/// whatever the role.
 #[test]
-fn repl_load_extension_still_attempts_to_open_the_file() {
-    let output = run_tursopg(b"SELECT load_extension('/nonexistent/turso-audit-ext');\n");
+fn repl_has_no_load_extension_function() {
+    let output = run_tursopg(
+        b"SELECT load_extension('/nonexistent/turso-audit-ext');\n\
+          CREATE ROLE alice;\n\
+          SET ROLE alice;\n\
+          SELECT load_extension('/nonexistent/turso-audit-ext');\n",
+    );
     let combined = format!(
         "{}{}",
         stdout(&output),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        combined.contains("Extension file not found"),
-        "interactive CLI should still try to load the library: {combined}"
+    assert_eq!(
+        combined.matches("no such function: load_extension").count(),
+        2,
+        "{combined}"
     );
     assert!(
-        !combined.contains("runtime extension loading is disabled"),
-        "interactive CLI must keep load_extension enabled: {combined}"
+        !combined.contains("Extension file not found"),
+        "the CLI must not try to open the library: {combined}"
     );
 }
 
 #[test]
-fn wire_load_extension_is_disabled() {
+fn wire_has_no_load_extension_function() {
     with_pg_client(|client| {
         client.send_query("SELECT load_extension('/nonexistent/turso-audit-ext')");
         let response = client.read_until_ready();
         let text = String::from_utf8_lossy(&response);
         assert!(
-            text.contains("runtime extension loading is disabled"),
+            text.contains("no such function: load_extension"),
             "wire listener must refuse load_extension, got: {text}"
         );
         assert!(
