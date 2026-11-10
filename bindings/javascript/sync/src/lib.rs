@@ -192,6 +192,15 @@ struct SyncEngineOptsFilled {
 impl SyncEngine {
     #[napi(constructor)]
     pub fn new(opts: SyncEngineOpts) -> napi::Result<Self> {
+        turso_sync_engine::sync_encryption::validate_experimental_opt_in(
+            opts.local_encryption_key.is_some(),
+            opts.experimental
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        )
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?;
         let is_memory = opts.path == ":memory:";
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
@@ -230,7 +239,7 @@ impl SyncEngine {
                 turso_node::browser::opfs()
             }
         };
-        let mut experimental = opts.experimental.clone().unwrap_or_default();
+        let experimental = opts.experimental.clone().unwrap_or_default();
         if opts.local_encryption_key.is_some() && opts.remote_encryption_cipher.is_none() {
             return Err(napi::Error::from_reason(
                 "local sync encryption requires a shared cipher",
@@ -253,12 +262,6 @@ impl SyncEngine {
             cloud_key,
         )
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
-        if opts.local_encryption_key.is_some()
-            && !experimental.iter().any(|value| value == "encryption")
-        {
-            experimental.push("encryption".into());
-        }
-
         let db_opts =
             turso_node::apply_experimental_features(turso_core::DatabaseOpts::new(), &experimental);
         #[allow(clippy::arc_with_non_send_sync)]

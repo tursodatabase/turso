@@ -163,7 +163,7 @@ export class Database {
     const dbConfig = {
       path: this._opts.path,
       async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
-      experimental_features: this._opts.localEncryptionKey != null ? 'encryption' : undefined,
+      experimental_features: this._opts.experimental?.join(',') || undefined,
       encryption_cipher: this._opts.localEncryptionKey != null ? this._opts.remoteEncryption?.cipher : undefined,
       encryption_hexkey: this._opts.localEncryptionKey,
     };

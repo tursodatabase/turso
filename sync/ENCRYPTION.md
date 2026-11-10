@@ -69,13 +69,18 @@ python3 testing/cli_tests/sync_encryption.py
 
 ## Rust
 
-Enable the `sync` crate feature:
+Enable the `sync` crate feature. Local encrypted replicas require an explicit
+experimental opt-in on every open, including offline reopen. String-based
+feature lists use `sync_encryption`; Rust uses
+`experimental_sync_encryption(true)`. The opt-in also enables core encryption.
+Existing cloud-only encryption does not require it.
 
 ```rust,no_run
 use turso::sync::{Builder, RemoteEncryptionCipher};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let db = Builder::new_remote("app.db")
+    .experimental_sync_encryption(true)
     .with_remote_url("https://your-database.turso.io")
     .with_auth_token(std::env::var("TURSO_AUTH_TOKEN")?)
     .with_encryption(
@@ -89,7 +94,8 @@ db.pull().await?;
 ```
 
 The existing `with_remote_encryption(cloud_key, cipher)` builder remains available;
-add `with_local_encryption_key(local_hex_key)` to encrypt its local replica.
+add `experimental_sync_encryption(true)` and
+`with_local_encryption_key(local_hex_key)` to encrypt its local replica.
 
 ## JavaScript
 
@@ -97,6 +103,7 @@ add `with_local_encryption_key(local_hex_key)` to encrypt its local replica.
 import { connect } from "@tursodatabase/sync";
 
 const db = await connect({
+    experimental: ["sync_encryption"],
     path: "app.db",
     url: "https://your-database.turso.io",
     authToken: process.env.TURSO_AUTH_TOKEN,
@@ -122,7 +129,8 @@ encrypted bootstrap can be retried automatically only if the main file is also e
 
 Pass `LocalEncryptionKey` (hex), `RemoteEncryptionKey` (base64), and the shared
 `RemoteEncryptionCipher` to `TursoSyncDbConfig`, alongside `Path`, `RemoteUrl`,
-and `AuthToken`. `NewTursoSyncDb` enables core encryption automatically. For an
+and `AuthToken`. Set `ExperimentalFeatures: "sync_encryption"`;
+`NewTursoSyncDb` enables core encryption automatically. For an
 initialized offline replica, retain the local key and cipher and omit the URL
 and cloud key. Requests carrying a cloud key follow redirects only within the
 same origin (scheme, hostname, and effective port). Cross-origin redirects,
@@ -131,10 +139,12 @@ including HTTPS-to-HTTP downgrades, return an error before forwarding the key.
 ## .NET
 
 Set `TursoSyncDatabaseOptions.LocalEncryptionKey` to the local hex key and
-`RemoteEncryption` to a `TursoRemoteEncryptionOptions` containing the shared
+`ExperimentalFeatures` to `"sync_encryption"`, and `RemoteEncryption` to a
+`TursoRemoteEncryptionOptions` containing the shared
 `Cipher` and base64 cloud `Key`. Offline reopen retains the local key and cipher;
 the remote `Key` may be null. Connection strings expose the same configuration
-as `Local Encryption Key`, `Remote Encryption Cipher`, and `Remote Encryption Key`.
+as `Local Encryption Key`, `Remote Encryption Cipher`, and `Remote Encryption Key`;
+also set `Sync Experimental Features=sync_encryption`.
 
 ## Python
 
@@ -148,6 +158,7 @@ connection = sync.connect(
     remote_encryption_cipher=sync.RemoteEncryptionCipher.Aes256Gcm,
     remote_encryption_key=cloud_key_base64,
     local_encryption_key=local_key_hex,
+    experimental_features="sync_encryption",
 )
 ```
 
@@ -157,16 +168,16 @@ arguments.
 The C SDK uses the ordinary database encryption configuration for the local key
 and its existing `remote_encryption_key` and `remote_encryption_cipher` fields for
 cloud settings. If both configurations name a cipher, they must agree. Low-level
-SDK callers must enable the ordinary core `encryption` experimental feature;
-the Rust, Python, JavaScript, Go, .NET, and React Native convenience APIs enable
-it with the local key.
+SDK callers must include `sync_encryption` in the database configuration
+`experimental_features` string. The core `encryption` flag alone does not opt
+into encrypted sync.
 
 ## Reopen and failures
 
 Reopen an initialized replica with the same local key and cipher. Offline reopen
 does not need the cloud key or a URL; the next network operation does need the
-cloud key. In JavaScript, retain `localEncryptionKey` and
-`remoteEncryption: { cipher: "aes256gcm" }` when omitting `url` and the cloud key.
+cloud key. Keep the experimental opt-in on reopen. In JavaScript, retain
+`experimental: ["sync_encryption"]`, `localEncryptionKey`, and `remoteEncryption: { cipher: "aes256gcm" }` when omitting `url` and the cloud key.
 
 Omit the local key to use a plaintext local replica of an encrypted source.
 AES-128-GCM, AES-256-GCM, and all six native AEGIS variants are supported.

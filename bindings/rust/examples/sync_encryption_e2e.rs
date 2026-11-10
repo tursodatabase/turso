@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         value => Some(value.to_string()),
     };
     let cipher = std::env::var("SYNC_E2E_CIPHER").unwrap_or_else(|_| "aes256gcm".into());
-    let mut builder = Builder::new_remote(path);
+    let mut builder = Builder::new_remote(path).experimental_sync_encryption(true);
     if action == "partial-checkpoint" {
         builder = builder.with_partial_sync_opts_experimental(PartialSyncOpts {
             bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 8192 }),

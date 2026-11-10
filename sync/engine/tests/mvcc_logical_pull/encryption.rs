@@ -60,6 +60,173 @@ fn encrypted_replica_without_metadata_preserves_all_files() {
     }
 }
 
+#[test]
+fn interrupted_encrypted_bootstrap_requires_explicit_cleanup() {
+    for failure in [1, 4, 5] {
+        let remote = Remote::new_encrypted(&[
+            "CREATE TABLE items(value TEXT)",
+            "INSERT INTO items VALUES (hex(zeroblob(12000)))",
+        ])
+        .unwrap();
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let server = InProcessServer::new(remote.clone());
+        server
+            .bootstrap_failure
+            .store(u8::from(failure == 1), Ordering::SeqCst);
+        let io = Arc::new(BootstrapIo {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            failure: Arc::new(AtomicU8::new(if failure == 1 { 0 } else { failure })),
+        });
+        let error = Replica::open_encrypted_with_io(&directory, server, Some([22; 32]), io)
+            .err()
+            .expect("injected bootstrap failure");
+        assert!(
+            error.to_string().contains(if failure == 1 {
+                "interrupted bootstrap"
+            } else {
+                "write"
+            }),
+            "{error}"
+        );
+        assert!(!directory.path().join("replica.db-info").exists());
+        let bytes = std::fs::read(directory.path().join("replica.db")).unwrap();
+        let crypto = turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([22; 32]),
+            4096,
+        )
+        .unwrap();
+        let page = crypto.decrypt_page(&bytes[..4096], 1).unwrap();
+        assert!(page.starts_with(b"SQLite format 3\0"));
+        assert!(Replica::open_encrypted(
+            &directory,
+            InProcessServer::new(remote.clone()),
+            Some([22; 32]),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("replica.db")).unwrap(),
+            bytes
+        );
+        std::fs::remove_file(directory.path().join("replica.db")).unwrap();
+        let retry = Replica::open_encrypted(
+            &directory,
+            InProcessServer::new(remote.clone()),
+            Some([22; 32]),
+        )
+        .unwrap();
+        assert_eq!(retry.snapshot().unwrap(), remote.snapshot().unwrap());
+    }
+}
+
+#[test]
+fn encrypted_bootstrap_rejects_nonzero_reserved_bytes_before_installing_page() {
+    let remote = Remote::new_encrypted(&["CREATE TABLE items(value TEXT)"]).unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let server = InProcessServer::new(remote.clone());
+    server.bootstrap_failure.store(2, Ordering::SeqCst);
+    let error = Replica::open_encrypted(&directory, server, Some([22; 32]))
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("encryption reserve is not empty"),
+        "{error}"
+    );
+    assert!(!directory.path().join("replica.db-info").exists());
+    assert!(std::fs::read(directory.path().join("replica.db"))
+        .unwrap()
+        .iter()
+        .all(|b| *b == 0));
+    std::fs::remove_file(directory.path().join("replica.db")).unwrap();
+    let replica = Replica::open_encrypted(
+        &directory,
+        InProcessServer::new(remote.clone()),
+        Some([22; 32]),
+    )
+    .unwrap();
+    assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+}
+
+#[test]
+fn encrypted_incremental_pull_replays_unpushed_local_changes() {
+    for pages in [false, true] {
+        let remote = Remote::new_encrypted(&[
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)",
+            "INSERT INTO items VALUES (1, 'base')",
+        ])
+        .unwrap();
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let mut server = InProcessServer::new(remote.clone());
+        server.force_page_updates = pages;
+        let replica = Replica::open_encrypted(&directory, server, Some([22; 32])).unwrap();
+        replica
+            .execute("UPDATE items SET value='local' WHERE id=1")
+            .unwrap();
+        replica
+            .execute("INSERT INTO items VALUES (2, 'unpushed')")
+            .unwrap();
+        remote
+            .execute_transaction(&["INSERT INTO items VALUES (3, 'remote')"])
+            .unwrap();
+        replica.pull().unwrap();
+        remote
+            .execute_transaction(&[
+                "UPDATE items SET value='local' WHERE id=1",
+                "INSERT INTO items VALUES (2, 'unpushed')",
+            ])
+            .unwrap();
+        assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+        replica.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let expected = replica.snapshot().unwrap();
+        drop(replica);
+        let reopened =
+            Replica::open_encrypted(&directory, InProcessServer::new(remote), Some([22; 32]))
+                .unwrap();
+        assert_eq!(reopened.snapshot().unwrap(), expected);
+    }
+}
+
+#[test]
+fn encrypted_late_staging_failure_does_not_publish_progress_or_delete_replica() {
+    for pages in [false, true] {
+        let remote =
+            Remote::new_encrypted(&["CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)"])
+                .unwrap();
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let mut server = InProcessServer::new(remote.clone());
+        server.force_page_updates = pages;
+        let replica = Replica::open_encrypted(&directory, server, Some([22; 32])).unwrap();
+        let before = replica.snapshot().unwrap();
+        let info = std::fs::read(directory.path().join("replica.db-info")).unwrap();
+        remote
+            .execute_transaction(&["INSERT INTO items VALUES (1, 'first valid record')"])
+            .unwrap();
+        remote
+            .execute_transaction(&["INSERT INTO items VALUES (2, hex(zeroblob(40000)))"])
+            .unwrap();
+        let error = replica.pull_with_tampered_staging_at(None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                turso_sync_engine::errors::Error::AuthenticationFailed
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("replica.db-info")).unwrap(),
+            info
+        );
+        assert!(directory.path().join("replica.db").exists());
+        if !pages {
+            assert_eq!(replica.snapshot().unwrap(), before);
+            replica.pull().unwrap();
+            assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+        }
+    }
+}
+
 // Observe writes before they reach storage, and stop bootstrap on either side
 // of its main-file sync. Host metadata publication is injected separately.
 struct BootstrapIo {
@@ -126,6 +293,22 @@ impl File for BootstrapFile {
             .as_slice()
             .windows(PRIVATE_MARKER.len())
             .any(|b| b == PRIVATE_MARKER));
+        if self.main && pos >= 4096 {
+            match self.failure.load(Ordering::SeqCst) {
+                4 => {
+                    self.failure.store(0, Ordering::SeqCst);
+                    let partial =
+                        Arc::new(Buffer::new(buffer.as_slice()[..buffer.len() - 1].to_vec()));
+                    return self.inner.pwrite(pos, partial, c);
+                }
+                5 => {
+                    self.failure.store(0, Ordering::SeqCst);
+                    c.error(turso_core::CompletionError::ShortWrite);
+                    return Ok(c);
+                }
+                _ => {}
+            }
+        }
         self.inner.pwrite(pos, buffer, c)
     }
     fn sync(&self, c: Completion, kind: FileSyncType) -> turso_core::Result<Completion> {
@@ -908,4 +1091,48 @@ fn encrypted_metadata_uses_host_existence_when_storage_differs_from_core() {
         std::fs::read(directory.path().join("replica.db")).unwrap(),
         main
     );
+}
+
+#[test]
+fn encrypted_replica_without_metadata_preserves_all_files() {
+    for empty_metadata in [false, true] {
+        for open_key in [Some([22; 32]), Some([33; 32]), None] {
+            let remote = Remote::new_encrypted(&["CREATE TABLE items(value TEXT)"]).unwrap();
+            let directory = Arc::new(tempfile::tempdir().unwrap());
+            let path = directory.path().join("replica.db");
+            std::fs::write(&path, []).unwrap();
+            let replica = Replica::open_encrypted(
+                &directory,
+                InProcessServer::new(remote.clone()),
+                Some([22; 32]),
+            )
+            .unwrap();
+            replica
+                .execute("INSERT INTO items VALUES ('unpushed local row')")
+                .unwrap();
+            replica.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            drop(replica);
+            let metadata = directory.path().join("replica.db-info");
+            if empty_metadata {
+                std::fs::write(metadata, []).unwrap();
+            } else {
+                std::fs::remove_file(metadata).unwrap();
+            }
+            let files = || {
+                std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (path.clone(), std::fs::read(path).unwrap())
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = files();
+            assert!(
+                Replica::open_encrypted(&directory, InProcessServer::new(remote), open_key)
+                    .is_err()
+            );
+            assert_eq!(files(), before);
+        }
+    }
 }

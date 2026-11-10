@@ -29,7 +29,8 @@ class EncryptedSync(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sample-sync-encryption-") as tmp:
             tmp = Path(tmp)
             key = tmp / "key.hex"
-            key.write_text("0b" * 32)
+            key_size = 16 if cipher in ["aes128gcm", "aegis128l", "aegis128x2", "aegis128x4"] else 32
+            key.write_text("0b" * key_size)
             key.chmod(0o600)
             dbs = tmp / "dbs"
             dbs.mkdir()
@@ -43,11 +44,13 @@ class EncryptedSync(unittest.TestCase):
                 args += ["--sync-encryption-cipher", cipher,
                          "--sync-encryption-key-file", str(key)]
             args += ["--sync-dir", str(dbs)] if directory else [str(tmp / "source.db")]
-            headers = {"x-turso-encryption-key": base64.b64encode(bytes([11]) * 32).decode(),
+            headers = {"x-turso-encryption-key": base64.b64encode(bytes([11]) * key_size).decode(),
                        "x-turso-encryption-cipher": cipher} if cipher else {}
             key_only_headers = {name: value for name, value in headers.items()
                                 if name == "x-turso-encryption-key"}
-            env = {**os.environ, "SYNC_E2E_CIPHER": cipher or "none"}
+            env = {**os.environ, "SYNC_E2E_CIPHER": cipher or "none",
+                   "SYNC_E2E_LOCAL_KEY": "16" * key_size,
+                   "SYNC_E2E_CLOUD_KEY": headers.get("x-turso-encryption-key", "none")}
             replica = tmp / "replica.db"
             source = dbs / "example/data" if directory else tmp / "source.db"
             self.prepare_legacy_source(source, mvcc and not cipher)
@@ -77,9 +80,13 @@ class EncryptedSync(unittest.TestCase):
             try:
                 start()
                 # Reject missing/wrong credentials before opening or mutating a database.
-                for bad in ([{}, {**headers, "x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
-                            {"x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
-                            {**headers, "x-turso-encryption-cipher": "aes128gcm"}] if cipher else []):
+                for bad in ([
+                    {},
+                    {**headers, "x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
+                    {"x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
+                    {**headers, "x-turso-encryption-cipher":
+                        "aes256gcm" if cipher == "aes128gcm" else "aes128gcm"},
+                ] if cipher else []):
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         pipeline("CREATE TABLE forbidden(x)", bad)
                     self.assertEqual(error.exception.code, 400)
@@ -95,8 +102,11 @@ class EncryptedSync(unittest.TestCase):
                 # JavaScript RemoteWriter sends the cloud key without a cipher.
                 pipeline("INSERT INTO items VALUES (2, '" + "server secret " * 8000 + "')",
                          key_only_headers)
+                run("exec", "UPDATE items SET value='pending local update' WHERE id=1")
                 run("pull")
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items")["value"], 2)
+                self.assertEqual(run("scalar", "SELECT value='pending local update' FROM items WHERE id=1")["value"], 1)
+                run("push")
                 run("checkpoint")
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items", remote="-")["value"], 2)
                 stop_server(process)
@@ -188,7 +198,10 @@ class EncryptedSync(unittest.TestCase):
         self.fail("sample server did not start")
 
     def test_mvcc(self):
-        for cipher in [None, "aes256gcm", "aegis256"]:
+        for cipher in [
+            None, "aes256gcm", "aes128gcm", "aegis128l", "aegis128x2", "aegis128x4",
+            "aegis256", "aegis256x2", "aegis256x4",
+        ]:
             for directory in [False, True]:
                 with self.subTest(cipher=cipher, directory=directory):
                     self.scenario(cipher, directory, mvcc=True)

@@ -39,7 +39,7 @@ type TursoSyncDbConfig struct {
 	RemoteEncryptionCipher string
 	// Base64 cloud key. May be omitted when reopening offline.
 	RemoteEncryptionKey string
-	// Hex local key; never sent to the server.
+	// Hex local key; never sent to the server. Requires "sync_encryption" in ExperimentalFeatures.
 	LocalEncryptionKey string
 
 	// Path to the main database file locally.
@@ -164,21 +164,13 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	}
 
 	remoteUrl := normalizeUrl(config.RemoteUrl)
-	features := config.ExperimentalFeatures
-	if config.LocalEncryptionKey != "" {
-		if config.RemoteEncryptionCipher == "" {
-			return nil, errors.New("local encryption requires RemoteEncryptionCipher")
-		}
-		if features == "" {
-			features = "encryption"
-		} else {
-			features += ",encryption"
-		}
+	if config.LocalEncryptionKey != "" && config.RemoteEncryptionCipher == "" {
+		return nil, errors.New("local encryption requires RemoteEncryptionCipher")
 	}
 	// Create sync database holder
 	dbCfg := TursoDatabaseConfig{
 		Path:                 dbPath,
-		ExperimentalFeatures: features,
+		ExperimentalFeatures: config.ExperimentalFeatures,
 		AsyncIO:              true, // MUST be true for external IO handling
 		Encryption:           TursoDatabaseEncryptionOpts{Hexkey: config.LocalEncryptionKey},
 	}

@@ -261,6 +261,16 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
+        turso_sync_engine::sync_encryption::validate_experimental_opt_in(
+            db_config.encryption.is_some(),
+            db_config
+                .experimental_features
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim),
+        )
+        .map_err(|error| TursoError::Misuse(error.to_string()))?;
         // Mirror the database's experimental features onto the connections the
         // sync engine opens internally (e.g. the revert connection), so they
         // match the main database opened via TursoDatabase below.
@@ -649,7 +659,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let config = TursoDatabaseConfig {
             path: ":memory:".into(),
-            experimental_features: Some("encryption".into()),
+            experimental_features: Some("sync_encryption".into()),
             async_io: true,
             encryption: Some(turso_core::EncryptionOpts {
                 cipher: "aes256gcm".into(),
@@ -676,8 +686,26 @@ mod tests {
             pull_parallel_requests: None,
             logical_mvcc_pull: None,
         };
+        for features in [
+            Some("encryption"),
+            None,
+            Some("sync_encryption_disabled"),
+            Some("encryption,sync_encryption_extra"),
+            Some("sync-encryption"),
+        ] {
+            let mut missing_opt_in = config.clone();
+            missing_opt_in.experimental_features = features.map(str::to_string);
+            let error = TursoDatabaseSync::<Vec<u8>>::new(missing_opt_in, sync_config.clone())
+                .err()
+                .expect("local encrypted sync must require an explicit opt-in");
+            assert!(error.to_string().contains("sync_encryption"), "{error}");
+            assert!(io
+                .open_file(":memory:-info", OpenFlags::None, false)
+                .is_err());
+        }
         let mut cloud_database = config.clone();
         cloud_database.encryption = None;
+        cloud_database.experimental_features = None;
         let mut cloud_sync = sync_config.clone();
         cloud_sync.remote_encryption_key = Some("cloud-key".into());
         for cipher in [None, Some("chacha20poly1305"), Some("future-cloud-cipher")] {
@@ -696,12 +724,64 @@ mod tests {
         assert_eq!(encryption.cipher(), turso_core::CipherMode::Aes256Gcm);
         assert!(encryption.local_key().is_none());
         assert_eq!(encryption.cloud_key().unwrap().expose(), "cloud-key");
+        let mut whitespace = config.clone();
+        whitespace.experimental_features = Some(" views, sync_encryption , encryption ".into());
+        assert!(TursoDatabaseSync::<Vec<u8>>::new(whitespace, sync_config.clone()).is_ok());
         let mut mismatched = sync_config.clone();
         mismatched.cipher = Some("aes128gcm".into());
         assert!(TursoDatabaseSync::<Vec<u8>>::new(config.clone(), mismatched).is_err());
         let mut disabled = config.clone();
         disabled.experimental_features = None;
         assert!(TursoDatabaseSync::<Vec<u8>>::new(disabled, sync_config.clone()).is_err());
+        struct UnexpectedPageCodec;
+        impl turso_core::PageCodec for UnexpectedPageCodec {
+            fn codec_id(&self) -> turso_core::PageCodecId {
+                panic!("codec must not be initialized")
+            }
+            fn required_reserved_bytes(&self) -> u8 {
+                panic!("codec must not be initialized")
+            }
+            fn encode_page(
+                &self,
+                _: turso_core::PageCodecContext,
+                _: &[u8],
+                _: &mut [u8],
+            ) -> turso_core::Result<()> {
+                panic!("codec must not encode")
+            }
+            fn decode_page(
+                &self,
+                _: turso_core::PageCodecContext,
+                _: &[u8],
+                _: &mut [u8],
+            ) -> turso_core::Result<()> {
+                panic!("codec must not decode")
+            }
+        }
+        let mut with_codec = config.clone();
+        with_codec.page_codec = Some(Arc::new(UnexpectedPageCodec));
+        let error = TursoDatabaseSync::<Vec<u8>>::new(with_codec, sync_config.clone())
+            .err()
+            .expect("conflicting codecs");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with an external page codec"),
+            "{error}"
+        );
+        let mut partial = sync_config.clone();
+        partial.partial_sync_opts = Some(turso_sync_engine::types::PartialSyncOpts {
+            bootstrap_strategy: None,
+            segment_size: 4096,
+            prefetch: false,
+        });
+        let error = TursoDatabaseSync::<Vec<u8>>::new(config.clone(), partial)
+            .err()
+            .expect("partial encryption");
+        assert!(
+            error.to_string().contains("full sync with protocol V1"),
+            "{error}"
+        );
         let sync = TursoDatabaseSync::<Vec<u8>>::new(config, sync_config).expect("sync config");
         let encryption = sync
             .sync_engine_opts
