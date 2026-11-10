@@ -7,7 +7,7 @@ use crate::HashSet;
 use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
-use crate::function::{Func, ScalarFunc};
+use crate::function::Func;
 use crate::translate::eqp::EqpCteMaterialization;
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
@@ -1609,10 +1609,9 @@ pub fn insn_to_row(
                 *start_reg as i64,
                 *dest as i64,
                 {
-                    let s = if matches!(&func.func, Func::Scalar(ScalarFunc::Like)) {
-                        format!("like({})", func.arg_count)
-                    } else {
-                        func.func.to_string()
+                    let s = match &func.func {
+                        Func::RegisteredScalar(function) => function.explain_name(func.arg_count),
+                        function => function.to_string(),
                     };
                     Value::build_text(s)
                 },

@@ -950,10 +950,8 @@ impl AggFunc {
 pub enum ScalarFunc {
     Cast,
     Coalesce,
-    Glob,
     IfNull,
     Iif,
-    Like,
     Min,
     Max,
     Nullif,
@@ -1003,10 +1001,8 @@ impl Deterministic for ScalarFunc {
         match self {
             ScalarFunc::Cast => true,
             ScalarFunc::Coalesce => true,
-            ScalarFunc::Glob => true,
             ScalarFunc::IfNull => true,
             ScalarFunc::Iif => true,
-            ScalarFunc::Like => true,
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
             ScalarFunc::Nullif => true,
@@ -1067,9 +1063,7 @@ impl ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => ResultType::Unknown,
-            Self::Glob
-            | Self::Like
-            | Self::ConnTxnId
+            Self::ConnTxnId
             | Self::IsAutocommit
             | Self::SequenceWatermark
             | Self::NextVal
@@ -1095,10 +1089,8 @@ impl Display for ScalarFunc {
         let str = match self {
             Self::Cast => "cast",
             Self::Coalesce => "coalesce",
-            Self::Glob => "glob",
             Self::IfNull => "ifnull",
             Self::Iif => "iif",
-            Self::Like => "like",
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
@@ -1172,10 +1164,9 @@ impl ScalarFunc {
             // 1-arg
             Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
             // 2-arg
-            Self::Glob | Self::Nullif | Self::IfNull | Self::Likelihood => &[2],
+            Self::Nullif | Self::IfNull | Self::Likelihood => &[2],
             // 3-arg
             // Multi-arity (one row per valid arity)
-            Self::Like => &[2, 3],
             // Truly variable-arg
             Self::Coalesce | Self::Iif => &[-1],
             #[cfg(feature = "fs")]

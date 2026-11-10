@@ -1534,31 +1534,6 @@ fn translate_function_call_expr(
                     Ok(target_register)
                 }
 
-                ScalarFunc::Glob | ScalarFunc::Like => {
-                    if args.len() < 2 {
-                        crate::bail_parse_error!(
-                            "{} function with less than 2 arguments",
-                            srf.to_string()
-                        );
-                    }
-                    let func_registers = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        let _ = translate_expr(
-                            program,
-                            referenced_tables,
-                            arg,
-                            func_registers + i,
-                            resolver,
-                        )?;
-                    }
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: func_registers,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::SequenceWatermark => {
                     let args = expect_arguments_exact!(args, 1, srf);
                     let start_reg = program.alloc_register();

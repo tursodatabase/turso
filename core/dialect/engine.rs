@@ -349,10 +349,8 @@ pub(crate) fn resolve_builtin_function_name(
         #[cfg(feature = "json")]
         "json_group_object" => Ok(Some(Func::Agg(AggFunc::JsonGroupObject))),
         "coalesce" => Ok(Some(Func::Scalar(ScalarFunc::Coalesce))),
-        "glob" => Ok(Some(Func::Scalar(ScalarFunc::Glob))),
         "ifnull" => Ok(Some(Func::Scalar(ScalarFunc::IfNull))),
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
-        "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
         "turso_version" => Ok(Some(Func::Scalar(ScalarFunc::TursoVersion))),
         "likely" => Ok(Some(Func::Scalar(ScalarFunc::Likely))),
         "likelihood" => Ok(Some(Func::Scalar(ScalarFunc::Likelihood))),

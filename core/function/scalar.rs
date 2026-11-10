@@ -2,6 +2,7 @@ pub(crate) mod arrays;
 pub(crate) mod context;
 pub(crate) mod datetime;
 pub(crate) mod numeric;
+pub(crate) mod pattern;
 pub(crate) mod values;
 
 use std::collections::HashMap;
@@ -15,6 +16,10 @@ use crate::{Connection, Result, Value};
 
 pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
+    fn explain_name(&self, _arg_count: usize) -> String {
+        self.metadata().name.to_string()
+    }
+
     fn date_time_arguments(&self) -> Option<DateTimeArguments> {
         None
     }
@@ -235,6 +240,8 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&datetime::DatePlus, &[]);
     catalog.register(&datetime::DateMinus, &[]);
     catalog.register(&datetime::DateDiff, &[]);
+    catalog.register(&pattern::Glob, &[]);
+    catalog.register(&pattern::Like, &[]);
     catalog
 });
 
@@ -577,7 +584,7 @@ mod tests {
             .metadata()
             .validate_arg_count("abs", (1usize << 32) + 1)
             .is_err());
-        assert!(resolve_builtin_function("like", (1usize << 32) + 2).is_err());
+        assert!(resolve_builtin_function("likelihood", (1usize << 32) + 2).is_err());
     }
 
     #[test]

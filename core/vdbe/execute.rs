@@ -10354,102 +10354,8 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Coalesce => {}
-            ScalarFunc::Glob => {
-                if arg_count != 2 {
-                    mark_unlikely();
-                    return Err(LimboError::ParseError(
-                        "wrong number of arguments to function GLOB()".to_string(),
-                    )
-                    .into());
-                }
-                let pattern_reg = &state.registers[*start_reg];
-                let match_reg = &state.registers[*start_reg + 1];
-
-                let pattern_value = pattern_reg.get_value();
-                let match_value = match_reg.get_value();
-
-                if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
-                    state.registers[*dest].set_null();
-                } else {
-                    let pattern_cow = match pattern_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
-                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                            _ => unreachable!("Cast to TEXT should yield Text"),
-                        },
-                    };
-
-                    let match_cow = match match_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
-                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                            _ => unreachable!("Cast to TEXT should yield Text"),
-                        },
-                    };
-
-                    let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
-                    state.registers[*dest].set_int(matches as i64);
-                }
-            }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
-            ScalarFunc::Like => {
-                let pattern_reg = &state.registers[*start_reg];
-                let match_reg = &state.registers[*start_reg + 1];
-
-                let pattern_value = pattern_reg.get_value();
-                let match_value = match_reg.get_value();
-
-                // 1. Check for NULL inputs
-                if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
-                    state.registers[*dest].set_null();
-                } else {
-                    // 2. Resolve Escape Character (if 3rd arg exists)
-                    let mut escape_char = None;
-                    let mut is_null_result = false;
-
-                    if arg_count == 3 {
-                        let escape_value = state.registers[*start_reg + 2].get_value();
-                        match escape_value {
-                            Value::Null => {
-                                is_null_result = true;
-                            }
-                            _ => {
-                                let escape_cow = match escape_value {
-                                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT")? {
-                                        Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                                        _ => unreachable!("Cast to TEXT should yield Text"),
-                                    },
-                                };
-
-                                let mut chars = escape_cow.chars();
-                                let c = chars.next();
-                                if c.is_none() || chars.next().is_some() {
-                                    return Err(LimboError::SqlError(
-                                        "ESCAPE expression must be a single character".to_string(),
-                                    )
-                                    .into());
-                                }
-                                escape_char = c;
-                            }
-                        }
-                    }
-
-                    if is_null_result {
-                        state.registers[*dest].set_null();
-                    } else {
-                        // 3. and 4. Prepare Pattern and Text, then execute Like.
-                        let matches = match (pattern_value, match_value) {
-                            (Value::Text(pattern), Value::Text(text)) => {
-                                Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
-                            }
-                            _ => exec_like_converted(pattern_value, match_value, escape_char)?,
-                        };
-                        state.registers[*dest].set_int(matches as i64);
-                    }
-                }
-            }
             ScalarFunc::NextVal => {
                 // The translator no longer emits `Function NextVal` — nextval
                 // is now handled entirely by the SequenceComputeNext +
@@ -11856,30 +11762,6 @@ pub fn op_function(
 }
 
 pub(crate) type OpAttachState = crate::attach::AttachDatabaseState;
-
-/// LIKE with an operand that is not TEXT: both are converted to TEXT first.
-#[inline(never)]
-fn exec_like_converted(
-    pattern_value: &Value,
-    match_value: &Value,
-    escape_char: Option<char>,
-) -> Result<bool> {
-    let pattern_cow = match pattern_value {
-        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
-            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-            _ => unreachable!("Cast to TEXT should yield Text"),
-        },
-    };
-    let match_cow = match match_value {
-        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
-            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-            _ => unreachable!("Cast to TEXT should yield Text"),
-        },
-    };
-    Value::exec_like(&pattern_cow, &match_cow, escape_char)
-}
 
 pub fn op_sequence(
     _program: &Program,

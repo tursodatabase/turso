@@ -42,8 +42,8 @@ pub(super) fn translate_like_base(
                 constant_mask = 1;
             }
             let func = match op {
-                ast::LikeOperator::Like => ScalarFunc::Like,
-                ast::LikeOperator::Glob => ScalarFunc::Glob,
+                ast::LikeOperator::Like => Func::RegisteredScalar(&crate::scalar::pattern::Like),
+                ast::LikeOperator::Glob => Func::RegisteredScalar(&crate::scalar::pattern::Glob),
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {
@@ -51,7 +51,7 @@ pub(super) fn translate_like_base(
                 start_reg,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count,
                     collation: CollationSeq::BINARY,
                 },
