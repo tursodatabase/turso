@@ -428,8 +428,14 @@ pub(crate) fn estimate_rows_per_in_seek_value(
     }
     let prefix_selectivity: f64 = eq_prefix
         .iter()
-        .filter_map(|cref| cref.eq.as_ref())
-        .map(|eq| constraints[eq.constraint_pos].selectivity)
+        .map(|cref| {
+            // `in_seek_eq_prefix` only returns references that have an equality.
+            let eq = cref
+                .eq
+                .as_ref()
+                .expect("an IN seek prefix column has an equality");
+            constraints[eq.constraint_pos].selectivity
+        })
         .product();
     let rows_per_prefix = (prefix_selectivity * base).max(1.0);
     (rows_per_prefix * params.sel_eq_indexed).sqrt().max(1.0)
