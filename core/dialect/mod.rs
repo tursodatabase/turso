@@ -237,7 +237,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// Whether the dialect has the engine's built-in function `name`, or the
     /// function `name` of one of the engine's built-in extensions, such as
     /// `uuid4`. SQL cannot call a built-in function that the dialect does not
-    /// have.
+    /// have. The SQL that the engine defines itself, such as the ENCODE of a
+    /// built-in type, can call every built-in function.
     fn has_builtin_function(&self, name: &str) -> bool;
 
     /// Run built-in scalar function `func` on the registers that hold its
@@ -1271,6 +1272,60 @@ mod tests {
             assert!(err.to_string().contains("no such function"), "{sql}: {err}");
         }
         conn.close().unwrap();
+    }
+
+    /// The ENCODE, DECODE and operators of a built-in type, and the REGEXP
+    /// operator, are the engine's SQL. They call functions such as
+    /// `boolean_to_int`, `uuid_blob`, `numeric_add` and `regexp`, which work
+    /// also where the dialect does not have them.
+    #[test]
+    fn engine_sql_calls_builtin_functions_that_the_dialect_does_not_have() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let results = |path: &str, dialect: Arc<dyn Dialect>| {
+            let db = open_db_with_custom_types(&io, path, dialect);
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute(
+                "CREATE TABLE t (b boolean, d date, ts timestamp, n numeric(10, 2), u uuid) STRICT",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (1, '2020-01-02', '2020-01-02 03:04:05.5', 1.5, \
+                 '0190163d-8f2c-7b3c-8e4f-1a2b3c4d5e6f')",
+            )
+            .unwrap();
+            let rows = conn
+                .prepare("SELECT b, d, d + 1, d - '2020-01-01', ts, n, n + n, -n, u, 'abc' REGEXP 'b' FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            conn.close().unwrap();
+            rows
+        };
+        let expected = results("dialect-engine-types.db", Arc::new(EngineDialect));
+        assert_eq!(
+            results(
+                "dialect-few-builtins-types.db",
+                Arc::new(FewBuiltinsDialect)
+            ),
+            expected
+        );
+        assert_eq!(expected.len(), 1);
+    }
+
+    fn open_db_with_custom_types(
+        io: &Arc<dyn IO>,
+        path: &str,
+        dialect: Arc<dyn Dialect>,
+    ) -> Arc<Database> {
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(dialect)
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .db_opts(DatabaseOpts::new().with_custom_types(true)),
+        )
+        .unwrap()
     }
 
     #[test]

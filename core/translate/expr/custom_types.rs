@@ -566,7 +566,7 @@ pub(crate) fn emit_decode(
     // Apply decode in reverse order (parent/ancestor first, then child)
     for td in resolved.chain.iter().rev() {
         if let Some(decode_expr) = td.decode() {
-            emit_type_expr(program, decode_expr, reg, reg, resolver)?;
+            emit_type_expr(program, td, decode_expr, reg, reg, resolver)?;
         }
     }
 
@@ -698,7 +698,7 @@ pub(crate) fn emit_store_value(
     });
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
+            emit_type_expr(program, type_def, encode, reg, reg, resolver)?;
         }
         let type_params = match coerce {
             Coerce::WithArgs(type_params) => type_params,
@@ -727,7 +727,7 @@ pub(crate) fn emit_encode_for_comparison(
 ) -> Result<()> {
     for type_def in chain {
         if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
+            emit_type_expr(program, type_def, encode, reg, reg, resolver)?;
         }
     }
     program.emit_insn(Insn::Affinity {
@@ -738,16 +738,19 @@ pub(crate) fn emit_encode_for_comparison(
     Ok(())
 }
 
-/// Emit bytecode for a custom type ENCODE or DECODE expression, with `value`
-/// referencing `value_reg`. The result is written to `dest_reg`.
+/// Emit bytecode for `expr`, the ENCODE or DECODE expression of `type_def`,
+/// with `value` referencing `value_reg`. The result is written to `dest_reg`.
 pub(crate) fn emit_type_expr(
     program: &mut ProgramBuilder,
+    type_def: &TypeDef,
     expr: &ast::Expr,
     value_reg: usize,
     dest_reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
+    with_type_functions(type_def, resolver, || {
+        emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
+    })
 }
 
 /// The type's COERCE, unless the type has parameters and is used without
@@ -788,9 +791,22 @@ fn emit_coerce(
         reg,
         target_pc: skip_null,
     });
-    emit_expr_with_bindings(program, coerce, reg, reg, &bindings, resolver)?;
+    with_type_functions(type_def, resolver, || {
+        emit_expr_with_bindings(program, coerce, reg, reg, &bindings, resolver)
+    })?;
     program.preassign_label_to_next_insn(skip_null);
     Ok(())
+}
+
+/// Runs `emit`, which compiles SQL of `type_def`'s definition. A built-in
+/// type is defined by the engine, so its SQL can call every built-in
+/// function, also the ones that the dialect does not have.
+fn with_type_functions<T>(type_def: &TypeDef, resolver: &Resolver, emit: impl FnOnce() -> T) -> T {
+    if type_def.is_builtin {
+        resolver.catalog.with_engine_functions(emit)
+    } else {
+        emit()
+    }
 }
 
 /// Translates `expr` with `value` referencing `value_reg` and each name in

@@ -229,6 +229,21 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
+    /// The engine's function `name`, whatever the dialect has, as the
+    /// operator of a built-in type calls it.
+    pub(crate) fn resolve_engine_function(
+        &self,
+        name: &str,
+        arg_count: usize,
+    ) -> Result<Option<Func>> {
+        match self {
+            Self::Statement { resolver, .. } => {
+                resolver.catalog.resolve_engine_function(name, arg_count)
+            }
+            Self::Table { .. } | Self::TypeBody { .. } => self.resolve_function(name, arg_count),
+        }
+    }
+
     /// The function a custom type's operator calls.
     pub(crate) fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         match self {
