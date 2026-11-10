@@ -1,6 +1,4 @@
 use super::*;
-use crate::translate::expr::expr_type::TypeEnv;
-use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::InSeekPrefix;
 
 /// Emit the start of the two-level loop for an `IN` search.
@@ -126,23 +124,15 @@ fn emit_in_seek_prefix(
     }
     for (i, term) in prefix.iter().enumerate() {
         let reg = key_start + i;
-        translate_expr_no_constant_opt(
+        translate_seek_key_expr(program, table_references, resolver, &term.expr, reg)?;
+        emit_seek_key_null_exit(
             program,
-            Some(table_references),
+            table_references,
+            resolver,
             &term.expr,
             reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-        if !term.expr.is_nonnull(
-            &TableMetadata::new(Some(table_references)),
-            &TypeEnv::new(Some(table_references), resolver),
-        ) {
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: loop_end,
-            });
-        }
+            loop_end,
+        );
     }
     let Some(index) = index else {
         return Ok(());
@@ -167,13 +157,7 @@ fn emit_in_seek_prefix(
             }
         })
         .collect();
-    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: key_start,
-            count: std::num::NonZeroUsize::new(prefix.len()).expect("the prefix is not empty"),
-            affinities,
-        });
-    }
+    emit_seek_key_affinity(program, key_start, prefix.len(), affinities);
     Ok(())
 }
 
