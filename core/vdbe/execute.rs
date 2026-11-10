@@ -3,7 +3,6 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
-use crate::dialect::engine::call_builtin_scalar;
 use crate::dialect::ScalarFuncContext;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
@@ -10386,7 +10385,7 @@ pub fn op_function(
                 clock: &clock,
                 collation: func.collation,
             };
-            let value = call_builtin_scalar(
+            let value = program.connection.dialect().call_scalar(
                 &context,
                 scalar_func,
                 &state.registers[*start_reg..*start_reg + arg_count],

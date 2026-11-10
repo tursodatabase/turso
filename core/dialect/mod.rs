@@ -18,10 +18,11 @@ pub mod engine;
 pub(crate) use engine::EngineDialect;
 
 use crate::{
+    function::ScalarFunc,
     namespace::NamespaceId,
     schema::{BTreeTable, RelationKind, Schema},
     security::roles::RoleId,
-    vdbe::builder::ProgramBuilder,
+    vdbe::{builder::ProgramBuilder, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
@@ -231,6 +232,21 @@ pub trait Dialect: Send + Sync + 'static {
     /// always resolve with SQLite semantics instead.
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         engine::resolve_builtin_function(name, arg_count)
+    }
+
+    /// Run built-in scalar function `func` on the registers that hold its
+    /// arguments.
+    ///
+    /// The default runs the shared implementation in
+    /// [`engine::call_builtin_scalar`]; a dialect overrides it for the
+    /// functions whose behavior differs and delegates the rest.
+    fn call_scalar(
+        &self,
+        context: &ScalarFuncContext<'_>,
+        func: &ScalarFunc,
+        args: &[Register],
+    ) -> Result<Value> {
+        engine::call_builtin_scalar(context, func, args)
     }
 
     /// Execute a dialect scalar function at runtime.
