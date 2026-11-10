@@ -1172,8 +1172,8 @@ pub fn allow_user_dml(table_name: &str) -> bool {
 // sequences additionally mirror their watermark into `sqlite_sequence` so
 // the high-water mark is readable by SQLite-compatible tools.
 //
-// Rollback semantics fall out of bundling the backing-table writes with
-// the user's transaction:
+// In WAL mode and in exclusive MVCC transactions (BEGIN, BEGIN IMMEDIATE),
+// the backing-table writes are part of the user's transaction:
 //   * Commit → the sequence advance is on disk.
 //   * Rollback → the sequence advance is not on disk.
 // A value emitted only by rolled-back transactions may be re-emitted by a
@@ -1182,6 +1182,12 @@ pub fn allow_user_dml(table_name: &str) -> bool {
 // not match PostgreSQL's "permanently burned" semantics; consumers
 // needing globally unique ids should pair nextval with an INSERT in the
 // same transaction.
+//
+// Under MVCC outside an exclusive transaction (autocommit and BEGIN
+// CONCURRENT), nextval writes the backing table in its own inner
+// transaction that commits before nextval returns (see
+// `Insn::SequenceBeginInnerTx`). There, a rollback of the user's
+// transaction does not undo the sequence advance, as in PostgreSQL.
 //
 // Cross-process correctness comes for free from the disk-only model:
 // under WAL the write lock serializes processes so the next holder
