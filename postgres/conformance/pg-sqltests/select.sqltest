@@ -2092,3 +2092,193 @@ expect {
     b|4|
     b|20|10:00:00
 }
+
+setup scalar_subquery {
+    CREATE TABLE scalar_t (a int, b int);
+    INSERT INTO scalar_t VALUES (1, 30), (2, 10), (3, 20);
+    CREATE TABLE scalar_u (a int, b int);
+    INSERT INTO scalar_u VALUES (1, 5), (1, 6), (2, 7);
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-rejected {
+    SELECT (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-read-from-index-rejected {
+    CREATE INDEX ON scalar_t (b);
+    SELECT (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-where-rejected {
+    CREATE INDEX ON scalar_t (b);
+    SELECT 1 WHERE 10 = (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-of-two-rejected {
+    SELECT (SELECT b FROM scalar_t LIMIT 2);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-above-two-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT 5);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-computed-limit-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT 2 + 3);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-all-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT ALL);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-sorted-rows-rejected {
+    SELECT (SELECT b FROM scalar_t ORDER BY b);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-groups-rejected {
+    SELECT (SELECT max(b) FROM scalar_t GROUP BY a);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-distinct-rows-rejected {
+    SELECT (SELECT DISTINCT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+test scalar-subquery-with-several-values-rows-rejected {
+    SELECT (VALUES (1), (2));
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-with-several-rows-rejected {
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a >= scalar_t.a) FROM scalar_t;
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-update-rejected {
+    UPDATE scalar_t SET b = (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-insert-rejected {
+    INSERT INTO scalar_t VALUES ((SELECT a FROM scalar_t), 0);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-delete-rejected {
+    DELETE FROM scalar_t WHERE a = (SELECT a FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-one-row {
+    SELECT (SELECT b FROM scalar_t LIMIT 1);
+    SELECT (SELECT b FROM scalar_t ORDER BY b OFFSET 2);
+    SELECT (SELECT b FROM scalar_u ORDER BY b LIMIT 1 + 0);
+    SELECT (SELECT b FROM scalar_u ORDER BY b LIMIT 5 OFFSET 2);
+    SELECT (SELECT max(b) FROM scalar_t);
+    SELECT (SELECT DISTINCT a / 10 FROM scalar_t);
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a = scalar_t.a) FROM scalar_t ORDER BY a;
+}
+expect {
+    30
+    30
+    5
+    7
+    30
+    0
+    1|30
+    2|10
+    3|20
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-no-rows-is-null {
+    SELECT coalesce((SELECT b FROM scalar_t WHERE b > 100)::text, 'N');
+    SELECT coalesce((SELECT b FROM scalar_t LIMIT 0)::text, 'N');
+}
+expect {
+    N
+    N
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-whose-value-is-not-read {
+    SELECT CASE WHEN a = 99 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+    SELECT coalesce(1, (SELECT b FROM scalar_u));
+    SELECT count(*) FROM (SELECT (SELECT b FROM scalar_u) FROM scalar_t WHERE false) s;
+    SELECT count(*) FROM scalar_t WHERE a = 5 AND b = (SELECT b FROM scalar_u);
+    SELECT CASE WHEN EXISTS (SELECT (SELECT b FROM scalar_u)) THEN 'yes' ELSE 'no' END;
+}
+expect {
+    0
+    0
+    0
+    1
+    0
+    0
+    yes
+}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-read-only-for-rows-with-one-match {
+    SELECT a, CASE WHEN a = 2 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+}
+expect {
+    1|0
+    2|7
+    3|0
+}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-read-for-a-row-with-several-matches-rejected {
+    SELECT a, CASE WHEN a = 1 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test correlated-aggregate-scalar-subquery {
+    SELECT a, coalesce((SELECT max(b) FROM scalar_u WHERE scalar_u.a = scalar_t.a)::text, 'N') FROM scalar_t ORDER BY a;
+}
+expect {
+    1|6
+    2|7
+    3|N
+}

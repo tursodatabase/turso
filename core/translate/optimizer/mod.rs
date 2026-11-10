@@ -678,10 +678,14 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
                 SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 } => {
                     resources
                         .register_ranges
                         .insert((*result_reg_start, *num_regs));
+                    if let Some(row_count_reg) = row_count_reg {
+                        resources.register_ranges.insert((*row_count_reg, 1));
+                    }
                 }
                 SubqueryType::In { cursor_id, .. } => {
                     resources.cursor_ids.insert(*cursor_id);
