@@ -406,19 +406,6 @@ impl Display for EqpDetail {
 
 /// Build the human-readable key constraints for an index seek,
 /// e.g. `["label=?", "fromId>?"]`.
-/// The constrained columns of an IN seek: the equality prefix, then the IN column.
-pub(crate) fn in_seek_constraint_parts(index: Option<&Index>, prefix_len: usize) -> Vec<String> {
-    match index {
-        Some(index) => index
-            .columns
-            .iter()
-            .take(prefix_len + 1)
-            .map(|col| format!("{}=?", col.name))
-            .collect(),
-        None => vec!["rowid=?".to_string()],
-    }
-}
-
 pub(crate) fn seek_constraint_parts(index: Option<&Index>, seek_def: &SeekDef) -> Vec<String> {
     let mut parts = Vec::new();
     // Equality prefix constraints
@@ -479,6 +466,19 @@ pub(crate) fn seek_constraint_parts(index: Option<&Index>, seek_def: &SeekDef) -
         }
     }
     parts
+}
+
+/// The constrained columns of an IN seek: the equality prefix, then the IN column.
+pub(crate) fn in_seek_constraint_parts(index: Option<&Index>, prefix_len: usize) -> Vec<String> {
+    match index {
+        Some(index) => index
+            .columns
+            .iter()
+            .take(prefix_len + 1)
+            .map(|col| format!("{}=?", col.name))
+            .collect(),
+        None => vec!["rowid=?".to_string()],
+    }
 }
 
 fn eqp_index(index: &Index, covering: bool) -> EqpIndex {

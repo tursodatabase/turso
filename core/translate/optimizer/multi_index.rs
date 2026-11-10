@@ -429,7 +429,6 @@ fn choose_multi_index_branch_access(
         in_seek_threshold,
         BranchReadMode::RowIdOnly,
         false,
-        false,
     )? {
         let Some(source) = in_seek_source_from_expr(
             &branch_terms[chosen_in_seek.constraint_idx].expr,

@@ -570,7 +570,8 @@ fn in_seek_eq_prefix(
 /// Because of that execution shape, only rowid or an index column that follows
 /// the index's leading equalities can drive `InSeek`, and the comparison
 /// collation must match the chosen index column's collation. With
-/// `allow_eq_prefix` false only the first column of an index qualifies.
+/// `read_mode` `RowIdOnly` (a multi-index branch) only the first column of an
+/// index qualifies.
 ///
 /// `alternative_is_ordered` says that the plain btree access this one would
 /// replace returns rows in the `ORDER BY` order, which `InSeek` does not.
@@ -587,7 +588,6 @@ pub(super) fn choose_best_in_seek_candidate(
     params: &CostModelParams,
     best_cost: Cost,
     read_mode: BranchReadMode,
-    allow_eq_prefix: bool,
     alternative_is_ordered: bool,
 ) -> Result<Option<ChosenInSeekCandidate>> {
     let Table::BTree(btree) = &rhs_table.table else {
@@ -605,8 +605,8 @@ pub(super) fn choose_best_in_seek_candidate(
     for candidate in rhs_constraints.candidates.iter() {
         // The equalities that fix the leading index columns. The IN constrains
         // the column after them.
-        let eq_prefix = match (&candidate.index, allow_eq_prefix) {
-            (Some(_), true) => {
+        let eq_prefix = match (&candidate.index, read_mode) {
+            (Some(_), BranchReadMode::FullRow) => {
                 in_seek_eq_prefix(rhs_constraints, &candidate.refs, lhs_mask, rhs_table_idx)
             }
             _ => SmallVec::new(),
@@ -776,7 +776,6 @@ fn consider_in_seek_access_method(
         params,
         best_cost,
         BranchReadMode::FullRow,
-        true,
         alternative_is_ordered,
     )?
     .map(|chosen| -> Result<(AccessMethod, Cost)> {

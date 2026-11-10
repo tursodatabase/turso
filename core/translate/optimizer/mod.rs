@@ -3769,8 +3769,12 @@ fn in_seek_prefix(
 ) -> Vec<InSeekPrefix> {
     prefix_refs
         .iter()
-        .filter_map(|cref| cref.eq.as_ref())
-        .map(|eq| {
+        .map(|cref| {
+            // `in_seek_eq_prefix` only returns references that have an equality.
+            let eq = cref
+                .eq
+                .as_ref()
+                .expect("an IN seek prefix column has an equality");
             let (_, expr, affinity) = constraints[eq.constraint_pos].get_constraining_expr(
                 where_clause,
                 Some(table_references),
