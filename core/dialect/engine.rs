@@ -74,6 +74,10 @@ impl super::Dialect for EngineDialect {
     fn name(&self) -> &'static str {
         "engine"
     }
+
+    fn has_builtin_function(&self, _name: &str) -> bool {
+        true
+    }
 }
 
 /// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that

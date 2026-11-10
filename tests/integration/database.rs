@@ -605,6 +605,9 @@ fn test_errors_on_zero_divisor_dialect() {
         ) -> turso_core::Result<Option<turso_core::Func>> {
             SqliteDialect.resolve_function(name, arg_count)
         }
+        fn has_builtin_function(&self, name: &str) -> bool {
+            SqliteDialect.has_builtin_function(name)
+        }
         fn errors_on_zero_divisor(&self) -> bool {
             true
         }

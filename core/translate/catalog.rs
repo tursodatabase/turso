@@ -176,14 +176,29 @@ impl<'a> CatalogContext<'a> {
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
         // The dialect owns the function name surface of user SQL; extension
-        // functions resolve after it.
-        match self.dialect.resolve_function(func_name, arg_count)? {
-            Some(func) => Ok(Some(func)),
-            None => Ok(self
-                .symbol_table
-                .resolve_function(func_name, arg_count)
-                .map(Func::External)),
+        // functions resolve after it. A built-in function that the dialect
+        // does not have is an error, not an unknown name: the planner looks
+        // for aggregates among the engine's functions, so it would still
+        // run an unknown name that is the engine's aggregate. A wrong number
+        // of arguments to such a function gives the same error.
+        match self.dialect.resolve_function(func_name, arg_count) {
+            Ok(Some(func @ Func::Dialect(_))) => return Ok(Some(func)),
+            Ok(Some(_)) | Err(_) if !self.dialect.has_builtin_function(func_name) => {
+                crate::bail_parse_error!("no such function: {}", func_name);
+            }
+            Ok(Some(func)) => return Ok(Some(func)),
+            Err(err) => return Err(err),
+            Ok(None) => {}
         }
+        let Some(func) = self.symbol_table.resolve_function(func_name, arg_count) else {
+            return Ok(None);
+        };
+        if self.symbol_table.is_builtin_extension_function(func_name)
+            && !self.dialect.has_builtin_function(func_name)
+        {
+            crate::bail_parse_error!("no such function: {}", func_name);
+        }
+        Ok(Some(Func::External(func)))
     }
 
     pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {

@@ -597,7 +597,7 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count)? {
+                match resolve_builtin_function_of_dialect(resolver, name.as_str(), args_count)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
@@ -648,6 +648,7 @@ pub fn resolve_window_and_aggregate_functions(
                         {
                             let func = AggFunc::External(f.func.clone().into());
                             if f.func.is_aggregate() {
+                                check_dialect_has_function(resolver, name.as_str(), args_count)?;
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
@@ -684,7 +685,7 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                match Func::resolve_function(name.as_str(), 0)? {
+                match resolve_builtin_function_of_dialect(resolver, name.as_str(), 0)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
@@ -746,6 +747,7 @@ pub fn resolve_window_and_aggregate_functions(
                         {
                             let func = AggFunc::External(f.func.clone().into());
                             if f.func.is_aggregate() {
+                                check_dialect_has_function(resolver, name.as_str(), 0)?;
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
@@ -1104,6 +1106,34 @@ fn resolve_window<'a>(
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
     }
+}
+
+/// The engine's function `name`, in which the planner looks for aggregate and
+/// window functions. If the dialect does not have `name`, an aggregate or
+/// window function, or a wrong number of arguments, fails as an unknown
+/// function.
+fn resolve_builtin_function_of_dialect(
+    resolver: &Resolver,
+    name: &str,
+    arg_count: usize,
+) -> Result<Option<Func>> {
+    match Func::resolve_function(name, arg_count) {
+        Ok(Some(func @ (Func::Agg(_) | Func::Window(_)))) => {
+            check_dialect_has_function(resolver, name, arg_count)?;
+            Ok(Some(func))
+        }
+        Ok(func) => Ok(func),
+        Err(err) => {
+            check_dialect_has_function(resolver, name, arg_count)?;
+            Err(err)
+        }
+    }
+}
+
+/// Fails when the dialect does not have `name`, which the planner found among
+/// the engine's functions.
+fn check_dialect_has_function(resolver: &Resolver, name: &str, arg_count: usize) -> Result<()> {
+    resolver.resolve_function(name, arg_count).map(|_| ())
 }
 
 fn add_aggregate_if_not_exists(

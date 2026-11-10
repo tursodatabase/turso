@@ -336,6 +336,10 @@ mod tests {
             EngineDialect.resolve_function(name, arg_count)
         }
 
+        fn has_builtin_function(&self, name: &str) -> bool {
+            EngineDialect.has_builtin_function(name)
+        }
+
         fn table_rls_enabled(&self, schema: &Schema, _namespace: NamespaceId, _name: &str) -> bool {
             schema.dialect_schema.is_some()
         }

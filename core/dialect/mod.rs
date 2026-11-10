@@ -234,6 +234,12 @@ pub trait Dialect: Send + Sync + 'static {
         engine::resolve_builtin_function(name, arg_count)
     }
 
+    /// Whether the dialect has the engine's built-in function `name`, or the
+    /// function `name` of one of the engine's built-in extensions, such as
+    /// `uuid4`. SQL cannot call a built-in function that the dialect does not
+    /// have.
+    fn has_builtin_function(&self, name: &str) -> bool;
+
     /// Run built-in scalar function `func` on the registers that hold its
     /// arguments.
     ///
@@ -614,6 +620,10 @@ mod tests {
             engine::resolve_builtin_function(name, arg_count)
         }
 
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            true
+        }
+
         fn exec_scalar_function(
             &self,
             _conn: &Connection,
@@ -689,6 +699,10 @@ mod tests {
 
         fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
             engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            true
         }
     }
 
@@ -1043,6 +1057,10 @@ mod tests {
         fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
             Ok(None)
         }
+
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            false
+        }
     }
 
     /// A dialect that resolves the built-in names but runs `upper` its own
@@ -1086,6 +1104,10 @@ mod tests {
 
         fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
             engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            true
         }
 
         fn call_scalar(
@@ -1201,6 +1223,53 @@ mod tests {
             err.to_string().contains("no such function"),
             "unexpected error: {err}"
         );
+        conn.close().unwrap();
+    }
+
+    /// A dialect that has only two of the engine's built-in functions.
+    struct FewBuiltinsDialect;
+
+    impl Dialect for FewBuiltinsDialect {
+        fn name(&self) -> &'static str {
+            "fewbuiltins"
+        }
+
+        fn has_builtin_function(&self, name: &str) -> bool {
+            matches!(name, "abs" | "count")
+        }
+    }
+
+    #[test]
+    fn user_sql_calls_only_the_builtin_functions_of_its_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-few-builtins.db", Arc::new(FewBuiltinsDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (-7)").unwrap();
+
+        let rows = conn
+            .prepare("SELECT abs(x), count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(7), Value::from_i64(1)]]);
+
+        // A scalar, a scalar with OVER, an aggregate, a window function's
+        // aggregate and a function of a built-in extension that the dialect
+        // does not have, also with a wrong number of arguments.
+        for sql in [
+            "SELECT typeof(x) FROM t",
+            "SELECT typeof(x, x) FROM t",
+            "SELECT typeof(x) OVER () FROM t",
+            "SELECT group_concat(x) FROM t",
+            "SELECT group_concat(x, x, x) FROM t",
+            "SELECT total(x) OVER () FROM t",
+            "SELECT uuid4()",
+            "SELECT regexp('a', 'a')",
+        ] {
+            let err = conn.prepare(sql).map(|_| ()).expect_err(sql);
+            assert!(err.to_string().contains("no such function"), "{sql}: {err}");
+        }
         conn.close().unwrap();
     }
 

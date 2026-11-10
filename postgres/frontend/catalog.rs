@@ -203,6 +203,10 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
     }
 
+    fn has_builtin_function(&self, _name: &str) -> bool {
+        true
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
