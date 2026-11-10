@@ -1,3 +1,4 @@
+pub(crate) mod arity;
 pub mod scalar;
 
 use crate::sync::Arc;
@@ -2055,7 +2056,7 @@ impl Func {
             push(
                 metadata.name.to_owned(),
                 "s",
-                metadata.arities,
+                &metadata.arity.arg_counts(),
                 metadata.deterministic,
             );
         }

@@ -2,7 +2,7 @@ use super::ExtensionState;
 use crate::function::ReturnType;
 use crate::sync::Arc;
 use crate::types::{AggContext, IOResultOr, ValueBlob};
-use crate::{Connection, IOResult, LimboError, Register, Result, Value};
+use crate::{Connection, IOResult, Register, Result, Value};
 use std::fmt::Debug;
 
 pub trait ScalarFunction: Debug + Send + Sync {
@@ -208,49 +208,5 @@ impl AggregateState {
 impl PartialEq for AggregateState {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.0.as_ref(), other.0.as_ref())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum FunctionArity {
-    Exact(usize),
-    OneOf(&'static [usize]),
-    Variadic,
-}
-
-impl FunctionArity {
-    pub fn accepts(self, count: usize) -> bool {
-        match self {
-            Self::Exact(expected) => count == expected,
-            Self::OneOf(counts) => counts.contains(&count),
-            Self::Variadic => true,
-        }
-    }
-
-    pub(crate) fn validate(self) -> Result<()> {
-        let valid = match self {
-            Self::Exact(count) => i32::try_from(count).is_ok(),
-            Self::OneOf(counts) => {
-                !counts.is_empty() && counts.iter().all(|count| i32::try_from(*count).is_ok())
-            }
-            Self::Variadic => true,
-        };
-        if !valid {
-            return Err(LimboError::InvalidArgument(
-                "function argument counts must be nonempty and fit in i32".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn arg_counts(self) -> Vec<i32> {
-        match self {
-            Self::Exact(count) => vec![i32::try_from(count).expect("validated argument count")],
-            Self::OneOf(counts) => counts
-                .iter()
-                .map(|count| i32::try_from(*count).expect("validated argument count"))
-                .collect(),
-            Self::Variadic => vec![-1],
-        }
     }
 }

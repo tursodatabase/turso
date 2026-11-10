@@ -1087,7 +1087,7 @@ mod tests {
         fn metadata(&self) -> &crate::function::scalar::ScalarFunctionMetadata {
             &crate::function::scalar::ScalarFunctionMetadata {
                 name: "test_trait_add",
-                arities: &[2],
+                arity: crate::scalar::FunctionArity::Exact(2),
                 deterministic: true,
                 can_mask_nulls: false,
                 result_type: crate::function::ResultType::Declared(

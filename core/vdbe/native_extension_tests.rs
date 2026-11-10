@@ -67,6 +67,39 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 }
 
 #[test]
+fn native_scalar_variadic_minimum_rejects_short_calls() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "null_to_nine".into(),
+                FunctionArity::AtLeast(2),
+                false,
+                NullToNine,
+            )
+            .unwrap(),
+        ),
+    );
+    for sql in ["SELECT null_to_nine()", "SELECT null_to_nine(NULL)"] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+    for sql in [
+        "SELECT null_to_nine(NULL, 1)",
+        "SELECT null_to_nine(NULL, 1, 2)",
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(9)]]
+        );
+    }
+    let signatures = conn
+        .get_syms_functions()
+        .into_iter()
+        .filter(|(name, _, _, _)| name == "null_to_nine")
+        .collect::<Vec<_>>();
+    assert_eq!(signatures, vec![("null_to_nine".into(), false, -1, false)]);
+}
+
+#[test]
 fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
     let conn = connection(
         OpenOptions::new(Arc::new(EngineDialect))

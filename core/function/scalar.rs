@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::LazyLock;
 
+pub use super::arity::FunctionArity;
 pub use super::{ResultType, ReturnType};
 use crate::vdbe::Register;
 use crate::{Result, Value};
@@ -14,7 +15,7 @@ pub trait ScalarFunction: Debug + Send + Sync {
 #[derive(Debug)]
 pub struct ScalarFunctionMetadata {
     pub name: &'static str,
-    pub arities: &'static [i32],
+    pub arity: FunctionArity,
     pub deterministic: bool,
     pub can_mask_nulls: bool,
     pub result_type: ResultType,
@@ -22,7 +23,7 @@ pub struct ScalarFunctionMetadata {
 
 impl ScalarFunctionMetadata {
     pub fn validate_arg_count(&self, name: &str, arg_count: usize) -> Result<()> {
-        if !self.arities.contains(&-1) && !self.arities.contains(&(arg_count as i32)) {
+        if !self.arity.accepts(arg_count) {
             crate::bail_parse_error!("wrong number of arguments to function {}()", name);
         }
         Ok(())
@@ -63,6 +64,11 @@ impl FunctionCatalog {
         function: &'static dyn ScalarFunction,
         aliases: &[&'static str],
     ) {
+        function
+            .metadata()
+            .arity
+            .validate()
+            .expect("invalid built-in function arity");
         for name in std::iter::once(function.metadata().name).chain(aliases.iter().copied()) {
             assert_eq!(name, crate::util::normalize_ident(name));
             assert!(
@@ -97,7 +103,7 @@ impl ScalarFunction for Abs {
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "abs",
-            arities: &[1],
+            arity: FunctionArity::Exact(1),
             deterministic: true,
             can_mask_nulls: false,
             result_type: ResultType::AbsOfTheFirstArgument,
@@ -116,7 +122,7 @@ impl ScalarFunction for Lower {
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "lower",
-            arities: &[1],
+            arity: FunctionArity::Exact(1),
             deterministic: true,
             can_mask_nulls: false,
             result_type: ResultType::Declared(ReturnType::Text),
@@ -135,7 +141,7 @@ impl ScalarFunction for Length {
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "length",
-            arities: &[1],
+            arity: FunctionArity::Exact(1),
             deterministic: true,
             can_mask_nulls: false,
             result_type: ResultType::Declared(ReturnType::Integer),
@@ -151,6 +157,20 @@ impl ScalarFunction for Length {
 mod tests {
     use crate::dialect::engine::{resolve_builtin_function, resolve_builtin_function_name};
     use crate::Func;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn argument_count_does_not_truncate() {
+        let Func::RegisteredScalar(function) = resolve_builtin_function("abs", 1).unwrap().unwrap()
+        else {
+            panic!("expected a registered scalar");
+        };
+        assert!(function
+            .metadata()
+            .validate_arg_count("abs", (1usize << 32) + 1)
+            .is_err());
+        assert!(resolve_builtin_function("upper", (1usize << 32) + 1).is_err());
+    }
 
     #[test]
     fn catalog_aliases_preserve_names_and_schema_loading() {
