@@ -2479,19 +2479,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::PrepareCheckpoint => {
                 let passive = self.mvstore.uses_passive_checkpoint();
                 if passive {
-                    // The passive checkpoint acquires the blocking lock only after
-                    // collection, so it needs an explicit single-orchestrator gate. The
-                    // blocking (flag-off) path takes the lock up front and gets that
-                    // invariant — plus Busy-on-contention — from the lock itself, so it
-                    // must NOT use this gate, which would turn a contended explicit
-                    // TRUNCATE into a silent no-op.
+                    // With the flag on, PASSIVE and TRUNCATE both acquire the blocking lock
+                    // only after collection, so they need an explicit single-orchestrator
+                    // gate. The blocking (flag-off) path takes the lock up front and gets
+                    // that invariant, plus Busy on contention, from the lock itself.
                     if self
                         .mvstore
                         .checkpoint_in_progress
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_err()
                     {
-                        // Another checkpoint is already running: no-op (no work, no resources).
+                        // Another checkpoint is already running. A TRUNCATE returns Busy, like
+                        // the flag-off path, because an empty result looks the same as a
+                        // TRUNCATE that emptied the WAL.
+                        if self.mode.should_restart_log() {
+                            return Err(crate::LimboError::Busy);
+                        }
+                        // A PASSIVE checkpoint does nothing (no work, no resources).
                         self.state = CheckpointState::Finalize;
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }

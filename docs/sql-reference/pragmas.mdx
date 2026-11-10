@@ -622,6 +622,8 @@ A checkpoint writes pages from the WAL file back to the database file.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 
+In MVCC mode, `PRAGMA wal_checkpoint(TRUNCATE)` fails with a busy error if another checkpoint runs at the same time. Run it again when that checkpoint is done.
+
 ### wal_autocheckpoint
 
 Returns or sets how many pages the WAL can hold before a commit on this connection runs a checkpoint. The default is 1000 pages. Zero or a negative value turns automatic checkpoints off.

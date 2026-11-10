@@ -3315,6 +3315,72 @@ fn test_flag_off_truncate_busy_when_lock_contended() {
     c1.execute("COMMIT").unwrap();
 }
 
+/// With `experimental_mvcc_passive_checkpoint` enabled, an explicit TRUNCATE that starts while
+/// another checkpoint runs must also report `Busy`. If it does nothing and reports success,
+/// `PRAGMA wal_checkpoint(TRUNCATE)` returns `0|0|0`, the same row as a TRUNCATE that emptied
+/// the WAL.
+#[test]
+fn test_passive_flag_truncate_busy_while_auto_checkpoint_runs() {
+    use crate::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mvcc_store = db.get_mvcc_store();
+    let wal_path = wal_path_for_db(db.path.as_ref().unwrap());
+    let auto = db.connect();
+    auto.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    auto.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    // The INSERT commits. Then its auto-checkpoint stops after it marks a checkpoint as running.
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+    auto.set_yield_injector(Some(injector.clone()));
+    let mut insert = auto.prepare("INSERT INTO t VALUES (1, 'x')").unwrap();
+    let mut stopped = false;
+    for _ in 0..10_000 {
+        match insert.step().unwrap() {
+            StepResult::IO | StepResult::Yield if injector.is_empty() => {
+                stopped = true;
+                break;
+            }
+            StepResult::IO => insert.get_pager().io.step().unwrap(),
+            StepResult::Yield => {}
+            other => panic!("INSERT finished before its auto-checkpoint stopped: {other:?}"),
+        }
+    }
+    assert!(
+        stopped,
+        "the auto-checkpoint must stop before it collects table rows"
+    );
+
+    let explicit = db.connect();
+    let res = explicit
+        .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    let log_size = mvcc_store.get_logical_log_file().size().unwrap();
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "TRUNCATE that starts while another checkpoint runs must return Busy, \
+         got {res:?} with {log_size} bytes still in the logical log"
+    );
+
+    insert.run_collect_rows().unwrap();
+    drop(insert);
+    auto.set_yield_injector(None);
+
+    // With no other checkpoint running, the same TRUNCATE empties the logical log and the WAL.
+    assert_eq!(
+        get_rows(&explicit, "PRAGMA wal_checkpoint(TRUNCATE)"),
+        vec![vec![Value::from_i64(0); 3]]
+    );
+    assert_eq!(mvcc_store.get_logical_log_file().size().unwrap(), 0);
+    assert_eq!(wal_path.metadata().map(|m| m.len()).unwrap_or(0), 0);
+    let rows = get_rows(&explicit, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
+}
+
 /// `checkpoint_snapshot_ts` must clamp the published checkpoint boundary below any
 /// in-flight (Preparing) commit. `last_committed_tx_ts` is a fetch_max high-water mark,
 /// so a commit that assigned a LOWER end_ts and is still Preparing (commits finalize out
