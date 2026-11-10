@@ -1668,6 +1668,44 @@ expect error {
     no such column: y
 }
 
+# A FROM clause subquery can read a CTE through a nested subquery, but the CTE's
+# columns are not visible in the FROM clause subquery itself.
+test cte-columns-not-visible-in-from-subquery-whose-exists-reads-cte {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT x WHERE EXISTS (SELECT 1 FROM c));
+}
+expect error {
+    no such column: x
+}
+
+test cte-columns-not-visible-in-from-subquery-whose-scalar-subquery-reads-cte {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT (SELECT x FROM c), (SELECT x));
+}
+expect error {
+    no such column: x
+}
+
+test cte-qualified-column-not-visible-in-from-subquery-whose-exists-reads-cte {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT c.x WHERE EXISTS (SELECT 1 FROM c));
+}
+expect error {
+    no such column: c\.x
+}
+
+test cte-columns-not-visible-in-joined-from-subquery-whose-exists-reads-cte {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT 1) JOIN (SELECT x WHERE EXISTS (SELECT 1 FROM c));
+}
+expect error {
+    no such column: x
+}
+
+test cte-columns-visible-in-from-subquery-that-selects-from-cte {
+    WITH c AS (SELECT 5 AS x)
+    SELECT * FROM (SELECT x, (SELECT x), (SELECT count(*) FROM c) FROM c);
+}
+expect {
+    5|5|1
+}
+
 # A CTE is not a table-valued function; calling it with arguments is an error.
 test cte-referenced-with-call-arguments-rejected {
     WITH cte1(x) AS (VALUES(1)) SELECT * FROM cte1(7);

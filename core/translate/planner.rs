@@ -1643,9 +1643,6 @@ fn parse_from_clause_table(
                 if already_visible {
                     continue;
                 }
-                let name_used_by_table_on_the_left = outer_query_refs_for_subquery
-                    .iter()
-                    .any(|reference| reference.identifier == cte_definition.name);
                 // This plan only makes the name visible. A later FROM lookup performs
                 // the real CTE use and validates its explicit column list.
                 let cte_table = plan_cte(
@@ -1669,7 +1666,7 @@ fn parse_from_clause_table(
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: name_used_by_table_on_the_left,
+                    cte_definition_only: true,
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
