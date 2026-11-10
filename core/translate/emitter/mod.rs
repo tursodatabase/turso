@@ -45,7 +45,7 @@ use crate::vdbe::{
 };
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
-    function::Func,
+    function::{Func, SchemaExpr},
     sync::Arc,
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
@@ -54,7 +54,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
@@ -160,6 +160,9 @@ pub struct Resolver<'a> {
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
+    /// The schema expression being compiled, which function calls in it carry
+    /// to [crate::function::FuncCtx::schema_expr].
+    schema_expr: Cell<Option<SchemaExpr>>,
     /// One list per enclosing query, mirroring SQLite's NameContext chain
     /// (resolve.c `resolveExprStep`). An aggregate whose argument columns
     /// belong to an enclosing query is computed by that query, not by the
@@ -435,6 +438,7 @@ impl<'a> Resolver<'a> {
             row_value_subqueries: Rc::default(),
             in_subquery_column_types: Rc::default(),
             self_table_scope: RefCell::new(None),
+            schema_expr: Cell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
             #[cfg(feature = "simulator")]
@@ -472,6 +476,7 @@ impl<'a> Resolver<'a> {
             row_value_subqueries: self.row_value_subqueries.fork(),
             in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            schema_expr: self.schema_expr.clone(),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
             #[cfg(feature = "simulator")]
@@ -491,6 +496,7 @@ impl<'a> Resolver<'a> {
             row_value_subqueries: self.row_value_subqueries.fork(),
             in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            schema_expr: self.schema_expr.clone(),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
             #[cfg(feature = "simulator")]
@@ -524,6 +530,18 @@ impl<'a> Resolver<'a> {
         let result = f();
         *self.self_table_scope.borrow_mut() = prev;
         result
+    }
+
+    /// Runs `f` with function calls marked as part of `schema_expr`.
+    pub(crate) fn with_schema_expr<T>(&self, schema_expr: SchemaExpr, f: impl FnOnce() -> T) -> T {
+        let prev = self.schema_expr.replace(Some(schema_expr));
+        let result = f();
+        self.schema_expr.set(prev);
+        result
+    }
+
+    pub(crate) fn schema_expr(&self) -> Option<SchemaExpr> {
+        self.schema_expr.get()
     }
 
     pub(crate) fn with_existing_self_table_context<T>(
@@ -1442,6 +1460,7 @@ fn emit_cdc_insns_v1(
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        schema_expr: None,
     };
 
     program.emit_insn(Insn::Function {
@@ -1554,6 +1573,7 @@ fn emit_cdc_insns_v2(
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        schema_expr: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1572,6 +1592,7 @@ fn emit_cdc_insns_v2(
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
         collation: CollationSeq::BINARY,
+        schema_expr: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1678,6 +1699,7 @@ pub fn emit_cdc_commit_insns(
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        schema_expr: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1694,6 +1716,7 @@ pub fn emit_cdc_commit_insns(
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
         collation: CollationSeq::BINARY,
+        schema_expr: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1765,6 +1788,7 @@ pub fn emit_cdc_autocommit_commit(
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        schema_expr: None,
     };
     let autocommit_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
@@ -1798,6 +1822,7 @@ pub fn emit_cdc_autocommit_commit(
                     func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
                     arg_count: 1,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             });
             program.emit_insn(Insn::Eq {
@@ -1853,6 +1878,7 @@ pub fn emit_cdc_explicit_commit_insns(
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
             collation: CollationSeq::BINARY,
+            schema_expr: None,
         },
     });
 
@@ -2134,14 +2160,16 @@ pub(crate) fn emit_index_column_value_old_image(
             referenced_tables: table_references.clone(),
         };
         resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+            resolver.with_schema_expr(SchemaExpr::Index, || {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &expr,
+                    dest_reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )
+            })?;
             Ok(())
         })?;
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
@@ -2331,14 +2359,16 @@ fn emit_check_constraint_bytecode(
             )?;
         }
 
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            &rewritten_expr,
-            expr_result_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        resolver.with_schema_expr(SchemaExpr::Check, || {
+            translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                &rewritten_expr,
+                expr_result_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )
+        })?;
 
         // CHECK constraint passes if the result is NULL or non-zero (truthy)
         let constraint_passed_label = program.allocate_label();

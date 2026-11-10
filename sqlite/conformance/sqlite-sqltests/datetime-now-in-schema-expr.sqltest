@@ -1,0 +1,141 @@
+@database :memory:
+
+# A date and time function in an index, CHECK constraint or generated column
+# must give the same value every time. When a value read from a column makes
+# it read the clock ('now', 'subsec') or the local timezone ('localtime',
+# 'utc'), the statement fails, as in SQLite. Before, Turso stored an index
+# key that could never be found again, so a later UPDATE failed with
+# "IdxDelete: no matching index entry found".
+
+@cross-check-integrity
+test datetime-now-in-index-insert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT);
+    CREATE INDEX i ON t(julianday(s));
+    INSERT INTO t VALUES (1, 'now');
+}
+expect error {
+    non-deterministic use of julianday\(\) in an index
+}
+
+@cross-check-integrity
+test datetime-now-in-index-update {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT);
+    CREATE INDEX i ON t(julianday(s));
+    INSERT INTO t VALUES (1, '2024-01-01');
+    UPDATE t SET s = 'NOW' WHERE id = 1;
+}
+expect error {
+    non-deterministic use of julianday\(\) in an index
+}
+
+@cross-check-integrity
+test datetime-now-in-index-upsert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT);
+    CREATE INDEX i ON t(julianday(s));
+    INSERT INTO t VALUES (1, '2024-01-01');
+    INSERT INTO t VALUES (1, '2024-01-02') ON CONFLICT(id) DO UPDATE SET s = 'subsec';
+}
+expect error {
+    non-deterministic use of julianday\(\) in an index
+}
+
+@cross-check-integrity
+test datetime-now-in-create-index {
+    CREATE TABLE t(s TEXT, f TEXT);
+    INSERT INTO t VALUES ('now', '%Y');
+    CREATE INDEX i ON t(strftime(f, s));
+}
+expect error {
+    non-deterministic use of strftime\(\) in an index
+}
+
+@cross-check-integrity
+test datetime-localtime-modifier-in-index {
+    CREATE TABLE t(s TEXT, m TEXT);
+    CREATE INDEX i ON t(date(s, m));
+    INSERT INTO t VALUES ('2024-01-01', 'UTC');
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+# The function only fails when it reaches the clock or the timezone. An
+# argument it rejects first makes it return NULL, as in SQLite.
+@cross-check-integrity
+test datetime-index-without-now-or-localtime {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, m TEXT);
+    CREATE INDEX i ON t(date(s, m));
+    CREATE INDEX j ON t(julianday(s));
+    INSERT INTO t VALUES (1, 'bogus', 'localtime');
+    INSERT INTO t VALUES (2, '2024-01-01', '+1 day');
+    INSERT INTO t VALUES (3, ' now', '+1 day');
+    UPDATE t SET s = '2024-02-01' WHERE id = 2;
+    SELECT id, date(s, m), julianday(s) FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1||
+    2|2024-02-02|2460341.5
+    3||
+    ok
+}
+
+@cross-check-integrity
+test datetime-now-in-check-constraint {
+    CREATE TABLE t(s TEXT CHECK (date(s) > '2000-01-01'));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+@cross-check-integrity
+test datetime-literal-now-in-check-constraint {
+    CREATE TABLE t(s TEXT CHECK (date('now') > '2000-01-01'));
+    INSERT INTO t VALUES (1);
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+@cross-check-integrity
+test datetime-now-in-virtual-generated-column {
+    CREATE TABLE t(s TEXT, j REAL AS (julianday(s)));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of julianday\(\) in a generated column
+}
+
+@cross-check-integrity
+test datetime-now-in-stored-generated-column {
+    CREATE TABLE t(s TEXT, j REAL AS (julianday(s)) STORED);
+    INSERT INTO t VALUES ('2024-01-01');
+    UPDATE t SET s = 'now';
+}
+expect error {
+    non-deterministic use of julianday\(\) in a generated column
+}
+
+@cross-check-integrity
+test datetime-now-in-indexed-generated-column {
+    CREATE TABLE t(s TEXT, j REAL AS (julianday(s)));
+    CREATE INDEX i ON t(j);
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of julianday\(\) in a generated column
+}
+
+# Outside a schema expression, 'now' reads the clock as usual.
+@cross-check-integrity
+test datetime-now-in-query-on-indexed-table {
+    CREATE TABLE t(s TEXT);
+    CREATE INDEX i ON t(julianday(s));
+    INSERT INTO t VALUES ('2024-01-01');
+    UPDATE t SET s = date('now', '-1 day');
+    SELECT count(*) FROM t WHERE julianday(s) < julianday('now');
+}
+expect {
+    1
+}

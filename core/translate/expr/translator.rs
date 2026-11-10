@@ -1082,6 +1082,7 @@ fn translate_function_call_expr(
         func,
         arg_count: args_count,
         collation,
+        schema_expr: resolver.schema_expr(),
     };
 
     match &func_ctx.func {

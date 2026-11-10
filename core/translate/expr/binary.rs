@@ -776,6 +776,7 @@ pub(super) fn emit_binary_insn(
                     func: Func::Json(json_func),
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             })
         }
@@ -812,6 +813,7 @@ pub(super) fn emit_binary_insn(
                     func: Func::Scalar(func),
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             });
         }
@@ -1081,6 +1083,7 @@ pub(super) fn emit_binary_condition_insn(
                     func: Func::Json(json_func),
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             });
             eval_result(program, target_register);
@@ -1119,6 +1122,7 @@ pub(super) fn emit_binary_condition_insn(
                     func: Func::Scalar(func),
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             });
             eval_result(program, target_register);

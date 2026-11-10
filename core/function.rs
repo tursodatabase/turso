@@ -1838,6 +1838,30 @@ pub struct FuncCtx {
     /// The collation the function compares its arguments with when
     /// [Func::needs_collation] is true. BINARY for the other functions.
     pub collation: CollationSeq,
+    /// The schema expression the call is part of, if any. Such an expression
+    /// must give the same value every time, so a date and time function there
+    /// fails instead of reading the current time or the local timezone.
+    pub schema_expr: Option<SchemaExpr>,
+}
+
+/// An expression whose value the database stores or compares with stored
+/// values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaExpr {
+    /// An index expression or a partial index's WHERE clause.
+    Index,
+    Check,
+    GeneratedColumn,
+}
+
+impl Display for SchemaExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Index => "an index",
+            Self::Check => "a CHECK constraint",
+            Self::GeneratedColumn => "a generated column",
+        })
+    }
 }
 
 impl Deterministic for Func {
