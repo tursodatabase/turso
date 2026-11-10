@@ -10337,6 +10337,78 @@ pub fn op_function(
                 }
             }
         },
+        crate::function::Func::Scalar(ScalarFunc::Coalesce) => {}
+        crate::function::Func::Scalar(ScalarFunc::IfNull) => {}
+        crate::function::Func::Scalar(ScalarFunc::Iif) => {}
+        crate::function::Func::Scalar(ScalarFunc::TursoVersion) => {
+            if !program.connection.is_db_initialized() {
+                state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
+            } else {
+                let version_integer =
+                    return_if_io!(state, pager.with_header(|header| header.version_number)).get()
+                        as i64;
+                let version = execute_turso_version(version_integer);
+                state.registers[*dest].set_text(Text::new(version))?;
+            }
+        }
+        #[cfg(feature = "fs")]
+        #[cfg(not(target_family = "wasm"))]
+        crate::function::Func::Scalar(ScalarFunc::LoadExtension) => {
+            if !program.connection.can_load_extensions() {
+                crate::bail_parse_error!("runtime extension loading is disabled");
+            }
+            if !program.connection.current_role_is_superuser() {
+                return Err(
+                    LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
+                        Action::Execute,
+                        Object::Function("load_extension".to_string()),
+                    )))
+                    .into(),
+                );
+            }
+            let extension = &state.registers[*start_reg];
+            let ext = resolve_ext_path(&extension.get_value().to_string())?;
+            program.connection.load_extension(ext)?;
+        }
+        crate::function::Func::Scalar(ScalarFunc::Attach) => {
+            assert_eq!(arg_count, 3);
+            let filename = state.registers[*start_reg].get_value();
+            let dbname = state.registers[*start_reg + 1].get_value();
+            let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
+
+            let Value::Text(filename_str) = filename else {
+                return Err(LimboError::InvalidArgument(
+                    "attach: filename argument must be text".to_string(),
+                )
+                .into());
+            };
+
+            let Value::Text(dbname_str) = dbname else {
+                return Err(LimboError::InvalidArgument(
+                    "attach: database name argument must be text".to_string(),
+                )
+                .into());
+            };
+
+            return_if_io!(
+                state,
+                program.connection.attach_database(
+                    filename_str.as_str(),
+                    dbname_str.as_str(),
+                    state.active_op_state.attach(),
+                )
+            );
+            // Sequence descriptors for the attached database are
+            // loaded lazily by `maybe_reparse_schema` on the next
+            // statement (ATTACH bumps the schema cookie, so the
+            // very next prepare reparses). Issuing a SQL load via
+            // `prepare_internal` from inside this opcode handler
+            // would drive `pager.io.step()` synchronously and break
+            // the vdbe async contract.
+
+            state.active_op_state.clear();
+            state.registers[*dest].set_null();
+        }
         crate::function::Func::Scalar(scalar_func) => {
             match exec_scalar_function(program, state, pager, func, scalar_func, start_reg, dest)? {
                 InsnFunctionStepResult::Step => {}
@@ -11256,7 +11328,23 @@ fn exec_scalar_function(
                 reg_values.iter().map(|reg| reg.get_value()),
             ));
         }
-        ScalarFunc::Coalesce => {}
+        ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Iif => {
+            unreachable!("{scalar_func} is compiled to jumps, not Function")
+        }
+        ScalarFunc::Attach | ScalarFunc::TursoVersion => {
+            return Err(LimboError::InternalError(format!(
+                "{scalar_func} is executed by op_function"
+            ))
+            .into());
+        }
+        #[cfg(feature = "fs")]
+        #[cfg(not(target_family = "wasm"))]
+        ScalarFunc::LoadExtension => {
+            return Err(LimboError::InternalError(format!(
+                "{scalar_func} is executed by op_function"
+            ))
+            .into());
+        }
         ScalarFunc::Concat => {
             let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
             let result = Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
@@ -11304,8 +11392,6 @@ fn exec_scalar_function(
                 state.registers[*dest].set_int(matches as i64);
             }
         }
-        ScalarFunc::IfNull => {}
-        ScalarFunc::Iif => {}
         ScalarFunc::Instr => {
             let reg_value = &state.registers[*start_reg];
             let pattern_value = &state.registers[*start_reg + 1];
@@ -11708,17 +11794,6 @@ fn exec_scalar_function(
             let result = exec_unixepoch(&clock, values);
             state.registers[*dest].set_value(result);
         }
-        ScalarFunc::TursoVersion => {
-            if !program.connection.is_db_initialized() {
-                state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
-            } else {
-                let version_integer =
-                    return_if_io!(state, pager.with_header(|header| header.version_number)).get()
-                        as i64;
-                let version = execute_turso_version(version_integer);
-                state.registers[*dest].set_text(Text::new(version))?;
-            }
-        }
         ScalarFunc::SqliteVersion => {
             let version = execute_sqlite_version();
             state.registers[*dest].set_text(Text::new(version))?;
@@ -11741,25 +11816,6 @@ fn exec_scalar_function(
                 pattern.get_value(),
                 replacement.get_value(),
             )?);
-        }
-        #[cfg(feature = "fs")]
-        #[cfg(not(target_family = "wasm"))]
-        ScalarFunc::LoadExtension => {
-            if !program.connection.can_load_extensions() {
-                crate::bail_parse_error!("runtime extension loading is disabled");
-            }
-            if !program.connection.current_role_is_superuser() {
-                return Err(
-                    LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
-                        Action::Execute,
-                        Object::Function("load_extension".to_string()),
-                    )))
-                    .into(),
-                );
-            }
-            let extension = &state.registers[*start_reg];
-            let ext = resolve_ext_path(&extension.get_value().to_string())?;
-            program.connection.load_extension(ext)?;
         }
         ScalarFunc::StrfTime => {
             let values =
@@ -11903,45 +11959,6 @@ fn exec_scalar_function(
                     json::OutputVariant::String,
                 )?);
             }
-        }
-        ScalarFunc::Attach => {
-            assert_eq!(arg_count, 3);
-            let filename = state.registers[*start_reg].get_value();
-            let dbname = state.registers[*start_reg + 1].get_value();
-            let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
-
-            let Value::Text(filename_str) = filename else {
-                return Err(LimboError::InvalidArgument(
-                    "attach: filename argument must be text".to_string(),
-                )
-                .into());
-            };
-
-            let Value::Text(dbname_str) = dbname else {
-                return Err(LimboError::InvalidArgument(
-                    "attach: database name argument must be text".to_string(),
-                )
-                .into());
-            };
-
-            return_if_io!(
-                state,
-                program.connection.attach_database(
-                    filename_str.as_str(),
-                    dbname_str.as_str(),
-                    state.active_op_state.attach(),
-                )
-            );
-            // Sequence descriptors for the attached database are
-            // loaded lazily by `maybe_reparse_schema` on the next
-            // statement (ATTACH bumps the schema cookie, so the
-            // very next prepare reparses). Issuing a SQL load via
-            // `prepare_internal` from inside this opcode handler
-            // would drive `pager.io.step()` synchronously and break
-            // the vdbe async contract.
-
-            state.active_op_state.clear();
-            state.registers[*dest].set_null();
         }
         ScalarFunc::Detach => {
             assert_eq!(arg_count, 1);
