@@ -1423,16 +1423,6 @@ fn translate_function_call_expr(
 
                     Ok(target_register)
                 }
-                ScalarFunc::LastInsertRowid => {
-                    let regs = program.alloc_register();
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: regs,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::IfNull => {
                     if args.len() != 2 {
                         crate::bail_parse_error!(
@@ -1569,7 +1559,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::RandomBlob | ScalarFunc::SequenceWatermark => {
+                ScalarFunc::SequenceWatermark => {
                     let args = expect_arguments_exact!(args, 1, srf);
                     let start_reg = program.alloc_register();
                     translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
@@ -1590,19 +1580,6 @@ fn translate_function_call_expr(
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Random => {
-                    if !args.is_empty() {
-                        crate::bail_parse_error!("{} function with arguments", srf.to_string());
-                    }
-                    let regs = program.alloc_register();
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: regs,
                         dest: target_register,
                         func: func_ctx,
                     });
@@ -1750,9 +1727,7 @@ fn translate_function_call_expr(
 
                     Ok(target_register)
                 }
-                ScalarFunc::SqliteVersion
-                | ScalarFunc::TursoVersion
-                | ScalarFunc::SqliteSourceId => {
+                ScalarFunc::TursoVersion => {
                     if !args.is_empty() {
                         crate::bail_parse_error!("sqlite_version function with arguments");
                     }

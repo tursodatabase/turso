@@ -98,7 +98,6 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::str::FromStr;
 use std::{
-    borrow::BorrowMut,
     cell::Cell,
     num::NonZero,
     sync::{atomic::Ordering, Arc},
@@ -10334,7 +10333,10 @@ pub fn op_function(
             let args = crate::function::scalar::FunctionArgs::new(
                 &state.registers[*start_reg..*start_reg + arg_count],
             );
-            let context = crate::function::scalar::FunctionContext::new(&program.connection);
+            let context = crate::function::scalar::FunctionContext::new(
+                &program.connection,
+                pager.io.as_ref(),
+            );
             let value = function.execute(&context, args)?;
             state.registers[*dest].set_value(value);
         }
@@ -10395,9 +10397,6 @@ pub fn op_function(
             }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
-            ScalarFunc::LastInsertRowid => {
-                state.registers[*dest].set_int(program.connection.last_insert_rowid());
-            }
             ScalarFunc::Like => {
                 let pattern_reg = &state.registers[*start_reg];
                 let match_reg = &state.registers[*start_reg + 1];
@@ -10556,27 +10555,6 @@ pub fn op_function(
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
-            ScalarFunc::RandomBlob => {
-                let reg_value = state.registers[*start_reg].borrow_mut().get_value();
-                let result = match scalar_func {
-                    ScalarFunc::RandomBlob => {
-                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
-                    }
-                    _ => unreachable!(),
-                };
-                // this is a `match` instead of `unwrap_or_else` because on the current pinned
-                // toolchain, it compiles to fewer instructions
-                let value = match result {
-                    Some(value) => value,
-                    None => Value::Null,
-                };
-                state.registers[*dest].set_value(value);
-            }
-            ScalarFunc::Random => {
-                let bits = pager.io.generate_random_number();
-                let value = Value::from_i64(bits);
-                state.registers[*dest].set_value(value);
-            }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
                 // Test-only: per-connection counter that increments on every
@@ -10672,18 +10650,6 @@ pub fn op_function(
                     let version = execute_turso_version(version_integer);
                     state.registers[*dest].set_text(Text::new(version))?;
                 }
-            }
-            ScalarFunc::SqliteVersion => {
-                let version = execute_sqlite_version();
-                state.registers[*dest].set_text(Text::new(version))?;
-            }
-            ScalarFunc::SqliteSourceId => {
-                let src_id = format!(
-                    "{} {}",
-                    info::build::BUILT_TIME_SQLITE,
-                    info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
-                );
-                state.registers[*dest].set_text(Text::new(src_id))?;
             }
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
@@ -19189,11 +19155,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
-// Compat for applications that test for SQLite.
-fn execute_sqlite_version() -> String {
-    crate::dialect::engine::SQLITE_VERSION.to_string()
-}
-
 fn execute_turso_version(version_integer: i64) -> String {
     let major = version_integer / 1_000_000;
     let minor = (version_integer % 1_000_000) / 1_000;
@@ -20817,14 +20778,6 @@ mod tests {
         assert!(
             matches!(*err, LimboError::InternalError(ref message) if message.contains("content register")),
             "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_execute_sqlite_version() {
-        assert_eq!(
-            execute_sqlite_version(),
-            crate::dialect::engine::SQLITE_VERSION
         );
     }
 

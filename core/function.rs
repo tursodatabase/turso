@@ -954,20 +954,15 @@ pub enum ScalarFunc {
     IfNull,
     Iif,
     Like,
-    Random,
-    RandomBlob,
     Min,
     Max,
     Nullif,
     Date,
     Time,
     DateTime,
-    SqliteVersion,
     TursoVersion,
-    SqliteSourceId,
     UnixEpoch,
     JulianDay,
-    LastInsertRowid,
     #[cfg(feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
@@ -1023,20 +1018,15 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::IfNull => true,
             ScalarFunc::Iif => true,
             ScalarFunc::Like => true,
-            ScalarFunc::Random => false,     // duh
-            ScalarFunc::RandomBlob => false, // duh
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
             ScalarFunc::Nullif => true,
             ScalarFunc::Date => false,
             ScalarFunc::Time => false,
             ScalarFunc::DateTime => false,
-            ScalarFunc::SqliteVersion => false,
             ScalarFunc::TursoVersion => false,
-            ScalarFunc::SqliteSourceId => false,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
-            ScalarFunc::LastInsertRowid => false,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => false,
@@ -1098,10 +1088,8 @@ impl ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => ResultType::Unknown,
-            Self::LastInsertRowid
-            | Self::Glob
+            Self::Glob
             | Self::Like
-            | Self::Random
             | Self::ConnTxnId
             | Self::IsAutocommit
             | Self::SequenceWatermark
@@ -1117,9 +1105,7 @@ impl ScalarFunc {
             | Self::DateTime
             | Self::StrfTime
             | Self::TimeDiff
-            | Self::SqliteVersion
             | Self::TursoVersion
-            | Self::SqliteSourceId
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
             | Self::DatePlus
@@ -1127,8 +1113,7 @@ impl ScalarFunc {
             | Self::TestUintEncode
             | Self::StatGet
             | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
-            Self::RandomBlob
-            | Self::StatInit
+            Self::StatInit
             | Self::StatPush => ResultType::Declared(ReturnType::Blob),
             Self::Array | Self::ArraySetElement => ResultType::Declared(ReturnType::Array),
         }
@@ -1157,19 +1142,14 @@ impl Display for ScalarFunc {
             Self::IfNull => "ifnull",
             Self::Iif => "iif",
             Self::Like => "like",
-            Self::Random => "random",
-            Self::RandomBlob => "randomblob",
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
             Self::Date => "date",
             Self::Time => "time",
-            Self::SqliteVersion => "sqlite_version",
             Self::TursoVersion => "turso_version",
-            Self::SqliteSourceId => "sqlite_source_id",
             Self::JulianDay => "julianday",
             Self::UnixEpoch => "unixepoch",
-            Self::LastInsertRowid => "last_insert_rowid",
             Self::DateTime => "datetime",
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
@@ -1239,15 +1219,11 @@ impl ScalarFunc {
     pub fn arities(&self) -> &'static [i32] {
         match self {
             // 0-arg
-            Self::LastInsertRowid
-            | Self::Random
-            | Self::SqliteVersion
-            | Self::TursoVersion
-            | Self::SqliteSourceId => &[0],
+            Self::TursoVersion => &[0],
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
-            Self::RandomBlob | Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
+            Self::Likely | Self::Unlikely | Self::SequenceWatermark => &[1],
             // 2-arg
             Self::Glob | Self::Nullif | Self::IfNull | Self::Likelihood | Self::TimeDiff => &[2],
             // 3-arg
@@ -1658,14 +1634,7 @@ impl Func {
         }
         match self {
             Self::Scalar(scalar_func) => {
-                let basic = matches!(
-                    scalar_func,
-                    ScalarFunc::Random
-                        | ScalarFunc::SqliteVersion
-                        | ScalarFunc::TursoVersion
-                        | ScalarFunc::SqliteSourceId
-                        | ScalarFunc::LastInsertRowid
-                );
+                let basic = matches!(scalar_func, ScalarFunc::TursoVersion);
                 #[cfg(feature = "test_helper")]
                 let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
                 basic

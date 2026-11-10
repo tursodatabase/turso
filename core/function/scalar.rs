@@ -1,4 +1,5 @@
 pub(crate) mod arrays;
+pub(crate) mod context;
 pub(crate) mod numeric;
 pub(crate) mod values;
 
@@ -36,11 +37,24 @@ impl ScalarFunctionMetadata {
 
 pub struct FunctionContext<'a> {
     connection: &'a Connection,
+    io: &'a dyn crate::IO,
 }
 
 impl<'a> FunctionContext<'a> {
-    pub fn new(connection: &'a Connection) -> Self {
-        Self { connection }
+    pub fn new(connection: &'a Connection, io: &'a dyn crate::IO) -> Self {
+        Self { connection, io }
+    }
+
+    pub fn random_i64(&self) -> i64 {
+        self.io.generate_random_number()
+    }
+
+    pub fn fill_random_bytes(&self, dest: &mut [u8]) {
+        self.io.fill_bytes(dest);
+    }
+
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.connection.last_insert_rowid()
     }
 
     pub fn changes(&self) -> i64 {
@@ -182,6 +196,11 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&numeric::NumericMul, &[]);
     catalog.register(&numeric::NumericDiv, &[]);
     catalog.register(&numeric::NumericMod, &[]);
+    catalog.register(&context::Random, &[]);
+    catalog.register(&context::RandomBlob, &[]);
+    catalog.register(&context::LastInsertRowid, &[]);
+    catalog.register(&context::SqliteVersion, &[]);
+    catalog.register(&context::SqliteSourceId, &[]);
     catalog
 });
 
@@ -524,7 +543,7 @@ mod tests {
             .metadata()
             .validate_arg_count("abs", (1usize << 32) + 1)
             .is_err());
-        assert!(resolve_builtin_function("randomblob", (1usize << 32) + 1).is_err());
+        assert!(resolve_builtin_function("like", (1usize << 32) + 2).is_err());
     }
 
     #[test]
