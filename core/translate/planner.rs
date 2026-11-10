@@ -1636,12 +1636,16 @@ fn parse_from_clause_table(
                 if !ctes_read[cte_definition_index] {
                     continue;
                 }
+                let already_visible = outer_query_refs_for_subquery.iter().any(|reference| {
+                    reference.identifier == cte_definition.name
+                        && reference.cte_id == Some(cte_definition.cte_id)
+                });
+                if already_visible {
+                    continue;
+                }
                 let name_used_by_table_on_the_left = outer_query_refs_for_subquery
                     .iter()
                     .any(|reference| reference.identifier == cte_definition.name);
-                if name_used_by_table_on_the_left && !lateral {
-                    continue;
-                }
                 // This plan only makes the name visible. A later FROM lookup performs
                 // the real CTE use and validates its explicit column list.
                 let cte_table = plan_cte(
@@ -2050,8 +2054,13 @@ fn parse_table(
         }
 
         // A non-recursive CTE cannot read its own name, even when a table or view
-        // with that name exists.
-        if program.is_cte_being_defined(&normalized_qualified_name) {
+        // with that name exists. A CTE with that name that is visible here comes
+        // from a WITH clause inside the definition, and it hides the name.
+        if program.is_cte_being_defined(&normalized_qualified_name)
+            && table_references
+                .find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
+                .is_none()
+        {
             crate::bail_parse_error!("circular reference: {}", table_name.as_str());
         }
 
