@@ -1,4 +1,5 @@
 pub mod alloc;
+mod changes_file;
 pub mod client_proto;
 pub mod database_replay_generator;
 pub mod database_sync_engine;
@@ -9,6 +10,8 @@ pub mod database_tape;
 pub mod errors;
 pub mod io_operations;
 pub mod server_proto;
+mod sync_cipher;
+pub mod sync_encryption;
 pub mod types;
 pub mod wal_session;
 

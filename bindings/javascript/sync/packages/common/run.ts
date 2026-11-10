@@ -70,6 +70,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
     } else if (requestType.type == 'FullRead') {
         try {
             const metadata = await io.read(requestType.path);
+            completion.status(metadata == null ? 404 : metadata.length === 0 ? 204 : 200);
             if (metadata != null) {
                 completion.pushBuffer(metadata);
             }

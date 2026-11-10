@@ -17,6 +17,11 @@ pub trait DataCompletion<T>: Send + Sync + 'static {
 pub trait SyncEngineIo: Send + Sync + 'static {
     type DataCompletionBytes: DataCompletion<u8>;
     type DataCompletionTransform: DataCompletion<DatabaseRowTransformResult>;
+    /// Read a complete host file. Hosts whose storage differs from core IO
+    /// should report status 404 for a missing file, 204 for an existing empty
+    /// file, and 200 for nonempty data. This lets encrypted metadata reject an
+    /// empty/corrupt file without confusing it with a fresh bootstrap. Legacy
+    /// hosts may omit status when their files are also visible through core IO.
     fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes>;
     fn full_write(&self, path: &str, content: Vec<u8>) -> Result<Self::DataCompletionBytes>;
     fn transform(

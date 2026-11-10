@@ -184,7 +184,8 @@ export declare const enum EncryptionCipher {
   Aegis256x2 = 3,
   Aegis128l = 4,
   Aegis128x2 = 5,
-  Aegis128x4 = 6
+  Aegis128x4 = 6,
+  Aegis256x4 = 7
 }
 
 /** Encryption configuration for local database encryption. */
@@ -322,6 +323,7 @@ export interface SyncEngineOpts {
    * Must match the key used when creating the encrypted database.
    */
   remoteEncryptionKey?: string
+  localEncryptionKey?: string
   partialSyncOpts?: JsPartialSyncOpts
   /**
    * Optional cap on the number of CDC operations packed into a single push

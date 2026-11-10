@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ pub enum DbChangesStreamKind {
 pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
-    pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub(crate) file_slot: Option<MutexSlot<crate::changes_file::ChangesFile>>,
     pub stream_kind: DbChangesStreamKind,
 }
 
@@ -223,6 +223,33 @@ pub enum DatabaseSyncEngineProtocolVersion {
 }
 
 impl DatabaseMetadata {
+    pub fn load_with_encryption(
+        data: &[u8],
+        crypto: Option<&turso_core::EncryptionContext>,
+    ) -> Result<Self> {
+        let Some(crypto) = crypto else {
+            if data.starts_with(b"TSYNMETA") {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync metadata requires a local key".into(),
+                ));
+            }
+            return Self::load(data);
+        };
+        let plaintext = crate::sync_cipher::open_metadata(crypto, data)?;
+        Self::load(&plaintext)
+    }
+
+    pub fn dump_with_encryption(
+        &self,
+        crypto: Option<&turso_core::EncryptionContext>,
+    ) -> Result<Vec<u8>> {
+        let plaintext = self.dump()?;
+        match crypto {
+            Some(crypto) => crate::sync_cipher::seal_metadata(crypto, &plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
     pub fn remote_url(&self) -> Option<String> {
         self.saved_configuration
             .as_ref()
@@ -873,5 +900,32 @@ mod tests {
             RemotePullProtocol::MvccLogical
         );
         assert!(reloaded.logical_mvcc_pull_active());
+        let crypto = turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([7; 32]),
+            4096,
+        )
+        .unwrap();
+        let sealed = meta.dump_with_encryption(Some(&crypto)).unwrap();
+        let json = crate::sync_cipher::open_metadata(&crypto, &sealed).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(value.get("encryption_cipher").is_none());
+        assert_eq!(
+            DatabaseMetadata::load_with_encryption(&sealed, Some(&crypto)).unwrap(),
+            meta
+        );
+        assert!(DatabaseMetadata::load_with_encryption(&sealed, None).is_err());
+        assert!(DatabaseMetadata::load_with_encryption(&[], Some(&crypto)).is_err());
+        assert!(DatabaseMetadata::load_with_encryption(&json, Some(&crypto)).is_err());
+        // Previously serialized cipher names are harmless unknown JSON fields.
+        let mut previous = value;
+        previous["encryption_cipher"] = serde_json::json!("aes256gcm");
+        let previous =
+            crate::sync_cipher::seal_metadata(&crypto, &serde_json::to_vec(&previous).unwrap())
+                .unwrap();
+        assert_eq!(
+            DatabaseMetadata::load_with_encryption(&previous, Some(&crypto)).unwrap(),
+            meta
+        );
     }
 }

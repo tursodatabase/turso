@@ -945,3 +945,52 @@ func TestSyncPullAfterCanceledPull(t *testing.T) {
 		t.Fatal("Pull blocked after a previous Pull was canceled")
 	}
 }
+
+func TestSyncEncryptionBootstrapOfflineReopen(t *testing.T) {
+	ctx := context.Background()
+	cloudKey := "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws="
+	localKey := strings.Repeat("16", 32)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, cloudKey, r.Header.Get("x-turso-encryption-key"))
+		require.Equal(t, "aes256gcm", r.Header.Get("x-turso-encryption-cipher"))
+		require.NotContains(t, fmt.Sprint(r.Header), localKey)
+		_, _ = w.Write([]byte{9, 10, 3, 114, 101, 118, 26, 0, 64, 1})
+	}))
+	defer server.Close()
+	file := filepath.Join(t.TempDir(), "replica.db")
+	config := TursoSyncDbConfig{Path: file, RemoteUrl: server.URL,
+		RemoteEncryptionCipher: "aes256gcm", RemoteEncryptionKey: cloudKey, LocalEncryptionKey: localKey}
+	replica, err := NewTursoSyncDb(ctx, config)
+	require.NoError(t, err)
+	conn, err := replica.Connect(ctx)
+	require.NoError(t, err)
+	_, err = conn.Exec("CREATE TABLE t(value TEXT)")
+	require.NoError(t, err)
+	_, err = conn.Exec("INSERT INTO t VALUES ('binding private marker')")
+	require.NoError(t, err)
+	require.NoError(t, replica.Checkpoint(ctx))
+	require.NoError(t, conn.Close())
+	turso_sync_database_deinit(replica.db)
+	meta, err := os.ReadFile(file + "-info")
+	require.NoError(t, err)
+	require.True(t, bytes.HasPrefix(meta, []byte("TSYNMETA")))
+	data, err := os.ReadFile(file)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "binding private marker")
+	noBootstrap := false
+	config.BootstrapIfEmpty = &noBootstrap
+	config.RemoteUrl = ""
+	config.RemoteEncryptionKey = ""
+	replica, err = NewTursoSyncDb(ctx, config)
+	require.NoError(t, err)
+	conn, err = replica.Connect(ctx)
+	require.NoError(t, err)
+	var value string
+	require.NoError(t, conn.QueryRow("SELECT value FROM t").Scan(&value))
+	require.Equal(t, "binding private marker", value)
+	require.NoError(t, conn.Close())
+	turso_sync_database_deinit(replica.db)
+	config.LocalEncryptionKey = strings.Repeat("17", 32)
+	_, err = NewTursoSyncDb(ctx, config)
+	require.Error(t, err)
+}

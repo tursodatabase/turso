@@ -244,10 +244,18 @@ namespace turso
                 {
                     db_config.async_io = dbConfigObj.getProperty(rt, "async_io").getBool() ? 1 : 0;
                 }
-                db_config.experimental_features = nullptr;
+                // Keep these strings alive until the SDK copies the configuration.
+                auto configString = [&](const char *name) -> std::string {
+                    auto value = dbConfigObj.getProperty(rt, name);
+                    return value.isString() ? value.asString(rt).utf8(rt) : std::string();
+                };
+                std::string features = configString("experimental_features");
+                std::string localCipher = configString("encryption_cipher");
+                std::string localKey = configString("encryption_hexkey");
+                db_config.experimental_features = features.empty() ? nullptr : features.c_str();
                 db_config.vfs = nullptr;
-                db_config.encryption_cipher = nullptr;
-                db_config.encryption_hexkey = nullptr;
+                db_config.encryption_cipher = localCipher.empty() ? nullptr : localCipher.c_str();
+                db_config.encryption_hexkey = localKey.empty() ? nullptr : localKey.c_str();
 
                 // Parse syncConfig
                 turso_sync_database_config_t sync_config = {0};
