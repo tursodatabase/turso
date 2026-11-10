@@ -126,6 +126,13 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&Concat, &[]);
     catalog.register(&Changes, &[]);
     catalog.register(&TotalChanges, &[]);
+    catalog.register(&Upper, &[]);
+    catalog.register(&OctetLength, &[]);
+    catalog.register(&Unicode, &[]);
+    catalog.register(&Sign, &[]);
+    catalog.register(&Soundex, &[]);
+    catalog.register(&Hex, &[]);
+    catalog.register(&Unhex, &[]);
     catalog
 });
 
@@ -319,6 +326,139 @@ impl ScalarFunction for TotalChanges {
     }
 }
 
+#[derive(Debug)]
+struct Upper;
+
+impl ScalarFunction for Upper {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "upper",
+            arity: FunctionArity::Exact(1),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_upper().unwrap_or(Value::Null))
+    }
+}
+
+#[derive(Debug)]
+struct OctetLength;
+
+impl ScalarFunction for OctetLength {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "octet_length",
+            arity: FunctionArity::Exact(1),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Integer),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_octet_length())
+    }
+}
+
+#[derive(Debug)]
+struct Unicode;
+
+impl ScalarFunction for Unicode {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "unicode",
+            arity: FunctionArity::Exact(1),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Integer),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_unicode())
+    }
+}
+
+#[derive(Debug)]
+struct Sign;
+
+impl ScalarFunction for Sign {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "sign",
+            arity: FunctionArity::Exact(1),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Integer),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_sign().unwrap_or(Value::Null))
+    }
+}
+
+#[derive(Debug)]
+struct Soundex;
+
+impl ScalarFunction for Soundex {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "soundex",
+            arity: FunctionArity::Exact(1),
+            deterministic: true,
+            can_mask_nulls: true,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_soundex())
+    }
+}
+
+#[derive(Debug)]
+struct Hex;
+
+impl ScalarFunction for Hex {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "hex",
+            arity: FunctionArity::Exact(1),
+            deterministic: true,
+            can_mask_nulls: true,
+            result_type: ResultType::Declared(ReturnType::Text),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_hex())
+    }
+}
+
+#[derive(Debug)]
+struct Unhex;
+
+impl ScalarFunction for Unhex {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        &ScalarFunctionMetadata {
+            name: "unhex",
+            arity: FunctionArity::OneOf(&[1, 2]),
+            deterministic: true,
+            can_mask_nulls: false,
+            result_type: ResultType::Declared(ReturnType::Blob),
+        }
+    }
+
+    fn execute(&self, _context: &FunctionContext<'_>, args: FunctionArgs<'_>) -> Result<Value> {
+        Ok(args.get(0).exec_unhex(args.get_optional(1)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::dialect::engine::{resolve_builtin_function, resolve_builtin_function_name};
@@ -335,7 +475,7 @@ mod tests {
             .metadata()
             .validate_arg_count("abs", (1usize << 32) + 1)
             .is_err());
-        assert!(resolve_builtin_function("upper", (1usize << 32) + 1).is_err());
+        assert!(resolve_builtin_function("quote", (1usize << 32) + 1).is_err());
     }
 
     #[test]
@@ -345,6 +485,12 @@ mod tests {
             "ABS",
             "lower",
             "LOWER",
+            "upper",
+            "octet_length",
+            "unicode",
+            "sign",
+            "soundex",
+            "hex",
             "length",
             "char_length",
             "CHARACTER_LENGTH",
@@ -357,6 +503,15 @@ mod tests {
                     .unwrap()
                     .is_some());
             }
+        }
+        for count in [1, 2] {
+            assert!(matches!(
+                resolve_builtin_function("unhex", count).unwrap(),
+                Some(Func::RegisteredScalar(_))
+            ));
+        }
+        for count in [0, 3] {
+            assert!(resolve_builtin_function("unhex", count).is_err());
         }
         for alias in ["length", "char_length", "character_length"] {
             assert_eq!(

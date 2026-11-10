@@ -212,6 +212,8 @@ The `glob(X, Y)` function is the functional form of the `Y GLOB X` operator. Not
 
 `hex` returns the uppercase hexadecimal representation of its argument. For text, it returns the hex encoding of the UTF-8 bytes. For blobs, it encodes each byte. For integers, it returns the hex of the value.
 
+`hex(NULL)` returns an empty string.
+
 `unhex` converts a hexadecimal string back to a blob. Returns NULL if the input contains non-hex characters, unless a second argument specifies characters to ignore.
 
 ```sql

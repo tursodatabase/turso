@@ -10582,26 +10582,17 @@ pub fn op_function(
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
-            ScalarFunc::Upper
-            | ScalarFunc::OctetLength
-            | ScalarFunc::Subtype
+            ScalarFunc::Subtype
             | ScalarFunc::Typeof
-            | ScalarFunc::Unicode
             | ScalarFunc::Unistr
             | ScalarFunc::UnistrQuote
             | ScalarFunc::Quote
             | ScalarFunc::RandomBlob
-            | ScalarFunc::Sign
-            | ScalarFunc::Soundex
             | ScalarFunc::ZeroBlob => {
                 let reg_value = state.registers[*start_reg].borrow_mut().get_value();
                 let result = match scalar_func {
-                    ScalarFunc::Sign => reg_value.exec_sign(),
-                    ScalarFunc::Upper => reg_value.exec_upper(),
-                    ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
                     ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
-                    ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
                     ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),
@@ -10609,7 +10600,6 @@ pub fn op_function(
                         Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
                     }
                     ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
-                    ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
                     _ => unreachable!(),
                 };
                 // this is a `match` instead of `unwrap_or_else` because on the current pinned
@@ -10619,23 +10609,6 @@ pub fn op_function(
                     None => Value::Null,
                 };
                 state.registers[*dest].set_value(value);
-            }
-            ScalarFunc::Hex => {
-                let reg_value = state.registers[*start_reg].borrow_mut();
-                let result = reg_value.get_value().exec_hex();
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Unhex => {
-                let reg_value = &state.registers[*start_reg];
-                let ignored_chars = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_unhex(ignored_chars.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
             }
             ScalarFunc::GetByte => {
                 let value = state.registers[*start_reg].get_value();

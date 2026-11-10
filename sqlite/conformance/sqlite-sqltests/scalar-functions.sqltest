@@ -2970,3 +2970,63 @@ test scalar-catalog-concat-keeps-unmatched-join-row {
 expect {
     2
 }
+
+
+test scalar-catalog-string-conversions {
+    SELECT upper('aBc'), octet_length('é'), unicode('é'), sign('-2'),
+           hex(x'00ff'), hex(unhex('00-ff', '-'));
+}
+expect {
+    ABC|2|233|-1|00FF|00FF
+}
+
+test scalar-catalog-string-null-results {
+    SELECT upper(NULL) IS NULL, octet_length(NULL) IS NULL, unicode(NULL) IS NULL,
+           sign(NULL) IS NULL, hex(NULL), unhex(NULL) IS NULL,
+           unhex('ff', NULL) IS NULL;
+}
+expect {
+    1|1|1|1||1|1
+}
+
+test scalar-catalog-hex-keeps-unmatched-join-row {
+    WITH l(id) AS (VALUES (1), (2)), r(id, v) AS (VALUES (1, 'a'))
+    SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE hex(r.v) = '';
+}
+expect {
+    2
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test scalar-catalog-soundex-keeps-unmatched-join-row {
+    WITH l(id) AS (VALUES (1), (2)), r(id, v) AS (VALUES (1, 'Robert'))
+    SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE soundex(r.v) = '?000';
+}
+expect {
+    2
+}
+
+
+test scalar-catalog-string-metadata {
+    SELECT name, narg, flags & 2048 FROM pragma_function_list
+    WHERE name IN ('upper', 'octet_length', 'unicode', 'sign', 'hex', 'unhex')
+    ORDER BY name, narg;
+}
+expect {
+    hex|1|2048
+    octet_length|1|2048
+    sign|1|2048
+    unhex|1|2048
+    unhex|2|2048
+    unicode|1|2048
+    upper|1|2048
+}
+
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test scalar-catalog-soundex-metadata {
+    SELECT name, narg, flags & 2048 FROM pragma_function_list WHERE name = 'soundex';
+}
+expect {
+    soundex|1|2048
+}

@@ -957,23 +957,18 @@ pub enum ScalarFunc {
     Iif,
     Instr,
     Like,
-    Upper,
     Random,
     RandomBlob,
-    OctetLength,
     Min,
     Max,
     Nullif,
-    Sign,
     Substr,
     Substring,
-    Soundex,
     Date,
     Time,
     DateTime,
     Subtype,
     Typeof,
-    Unicode,
     Unistr,
     UnistrQuote,
     Quote,
@@ -982,8 +977,6 @@ pub enum ScalarFunc {
     SqliteSourceId,
     UnixEpoch,
     JulianDay,
-    Hex,
-    Unhex,
     GetByte,
     SetByte,
     ZeroBlob,
@@ -1082,23 +1075,18 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Iif => true,
             ScalarFunc::Instr => true,
             ScalarFunc::Like => true,
-            ScalarFunc::Upper => true,
             ScalarFunc::Random => false,     // duh
             ScalarFunc::RandomBlob => false, // duh
-            ScalarFunc::OctetLength => true,
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
             ScalarFunc::Nullif => true,
-            ScalarFunc::Sign => true,
             ScalarFunc::Substr => true,
             ScalarFunc::Substring => true,
-            ScalarFunc::Soundex => true,
             ScalarFunc::Date => false,
             ScalarFunc::Time => false,
             ScalarFunc::DateTime => false,
             ScalarFunc::Subtype => true,
             ScalarFunc::Typeof => true,
-            ScalarFunc::Unicode => true,
             ScalarFunc::Unistr => true,
             ScalarFunc::UnistrQuote => true,
             ScalarFunc::Quote => true,
@@ -1107,8 +1095,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::SqliteSourceId => false,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
-            ScalarFunc::Hex => true,
-            ScalarFunc::Unhex => true,
             ScalarFunc::GetByte => true,
             ScalarFunc::SetByte => true,
             ScalarFunc::ZeroBlob => true,
@@ -1217,10 +1203,7 @@ impl ScalarFunc {
             | Self::Like
             | Self::Instr
             | Self::Random
-            | Self::OctetLength
-            | Self::Sign
             | Self::Subtype
-            | Self::Unicode
             | Self::GetByte
             | Self::ConnTxnId
             | Self::IsAutocommit
@@ -1242,9 +1225,7 @@ impl ScalarFunc {
             Self::JulianDay => ResultType::Declared(ReturnType::Real),
             Self::Char
             | Self::ConcatWs
-            | Self::Upper
             | Self::Replace
-            | Self::Soundex
             | Self::Date
             | Self::Time
             | Self::DateTime
@@ -1257,7 +1238,6 @@ impl ScalarFunc {
             | Self::SqliteVersion
             | Self::TursoVersion
             | Self::SqliteSourceId
-            | Self::Hex
             | Self::Printf
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
@@ -1282,7 +1262,6 @@ impl ScalarFunc {
             | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
             Self::RandomBlob
             | Self::ZeroBlob
-            | Self::Unhex
             | Self::SetByte
             | Self::NumericEncode
             | Self::NumericFit
@@ -1325,22 +1304,17 @@ impl Display for ScalarFunc {
             Self::Iif => "iif",
             Self::Instr => "instr",
             Self::Like => "like",
-            Self::Upper => "upper",
             Self::Random => "random",
             Self::RandomBlob => "randomblob",
-            Self::OctetLength => "octet_length",
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
-            Self::Sign => "sign",
             Self::Substr => "substr",
             Self::Substring => "substring",
-            Self::Soundex => "soundex",
             Self::Date => "date",
             Self::Time => "time",
             Self::Subtype => "subtype",
             Self::Typeof => "typeof",
-            Self::Unicode => "unicode",
             Self::Unistr => "unistr",
             Self::UnistrQuote => "unistr_quote",
             Self::Quote => "quote",
@@ -1349,8 +1323,6 @@ impl Display for ScalarFunc {
             Self::SqliteSourceId => "sqlite_source_id",
             Self::JulianDay => "julianday",
             Self::UnixEpoch => "unixepoch",
-            Self::Hex => "hex",
-            Self::Unhex => "unhex",
             Self::GetByte => "get_byte",
             Self::SetByte => "set_byte",
             Self::ZeroBlob => "zeroblob",
@@ -1464,18 +1436,12 @@ impl ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
-            Self::Hex
-            | Self::OctetLength
-            | Self::Quote
+            Self::Quote
             | Self::UnistrQuote
             | Self::RandomBlob
-            | Self::Sign
-            | Self::Soundex
             | Self::Subtype
             | Self::Typeof
-            | Self::Unicode
             | Self::Unistr
-            | Self::Upper
             | Self::ZeroBlob
             | Self::Likely
             | Self::Unlikely
@@ -1492,7 +1458,6 @@ impl ScalarFunc {
             Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
-            Self::Unhex => &[1, 2],
             Self::Substr | Self::Substring => &[2, 3],
             // Truly variable-arg
             Self::Char

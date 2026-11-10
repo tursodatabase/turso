@@ -1609,17 +1609,12 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Upper
-                | ScalarFunc::OctetLength
-                | ScalarFunc::Subtype
+                ScalarFunc::Subtype
                 | ScalarFunc::Typeof
-                | ScalarFunc::Unicode
                 | ScalarFunc::Unistr
                 | ScalarFunc::UnistrQuote
                 | ScalarFunc::Quote
                 | ScalarFunc::RandomBlob
-                | ScalarFunc::Sign
-                | ScalarFunc::Soundex
                 | ScalarFunc::ZeroBlob
                 | ScalarFunc::SequenceWatermark => {
                     let args = expect_arguments_exact!(args, 1, srf);
@@ -1714,20 +1709,6 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Hex => {
-                    if args.len() != 1 {
-                        crate::bail_parse_error!("hex function must have exactly 1 argument",);
-                    }
-                    let start_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::UnixEpoch => {
                     let start_reg = program.alloc_registers(args.len().max(1));
                     for (i, arg) in args.iter().enumerate() {
@@ -1769,21 +1750,6 @@ fn translate_function_call_expr(
                         resolver,
                     )?;
 
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Unhex => {
-                    let args = expect_arguments_max!(args, 2, srf);
-
-                    let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg,

@@ -367,11 +367,8 @@ pub(crate) fn resolve_builtin_function_name(
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
         "instr" | "strpos" => Ok(Some(Func::Scalar(ScalarFunc::Instr))),
         "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
-        "upper" => Ok(Some(Func::Scalar(ScalarFunc::Upper))),
         "random" => Ok(Some(Func::Scalar(ScalarFunc::Random))),
         "randomblob" => Ok(Some(Func::Scalar(ScalarFunc::RandomBlob))),
-        "octet_length" => Ok(Some(Func::Scalar(ScalarFunc::OctetLength))),
-        "sign" => Ok(Some(Func::Scalar(ScalarFunc::Sign))),
         "substr" => {
             if arg_count != 2 && arg_count != 3 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
@@ -390,7 +387,6 @@ pub(crate) fn resolve_builtin_function_name(
         "typeof" => Ok(Some(Func::Scalar(ScalarFunc::Typeof))),
         "subtype" => Ok(Some(Func::Scalar(ScalarFunc::Subtype))),
         "last_insert_rowid" => Ok(Some(Func::Scalar(ScalarFunc::LastInsertRowid))),
-        "unicode" => Ok(Some(Func::Scalar(ScalarFunc::Unicode))),
         "unistr" => Ok(Some(Func::Scalar(ScalarFunc::Unistr))),
         "unistr_quote" => Ok(Some(Func::Scalar(ScalarFunc::UnistrQuote))),
         "quote" => Ok(Some(Func::Scalar(ScalarFunc::Quote))),
@@ -451,12 +447,9 @@ pub(crate) fn resolve_builtin_function_name(
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
         "unixepoch" => Ok(Some(Func::Scalar(ScalarFunc::UnixEpoch))),
         "julianday" => Ok(Some(Func::Scalar(ScalarFunc::JulianDay))),
-        "hex" => Ok(Some(Func::Scalar(ScalarFunc::Hex))),
-        "unhex" => Ok(Some(Func::Scalar(ScalarFunc::Unhex))),
         "get_byte" => Ok(Some(Func::Scalar(ScalarFunc::GetByte))),
         "set_byte" => Ok(Some(Func::Scalar(ScalarFunc::SetByte))),
         "zeroblob" => Ok(Some(Func::Scalar(ScalarFunc::ZeroBlob))),
-        "soundex" => Ok(Some(Func::Scalar(ScalarFunc::Soundex))),
         "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
         "bin_record_json_object" => Ok(Some(Func::Scalar(ScalarFunc::BinRecordJsonObject))),
         "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
