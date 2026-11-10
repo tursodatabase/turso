@@ -35,7 +35,10 @@ This document is a quick helper to get you going.
 
 ## Getting Started
 
-Turso is a rewrite of SQLite in Rust. If you are new to SQLite, the following articles and books are a good starting point:
+Turso is an embedded in-process relational database. Initially conceived solely as a rewrite of SQLite in Rust, we eventually leveraged SQLite's bytecode-based architecture
+to implement other database frontends, including Postgres.
+
+If you are new to SQLite, the following articles and books are a good starting point:
 
 * [Architecture of SQLite](https://www.sqlite.org/arch.html)
 * Sibsankar Haldar. [SQLite Database System Design and Implementation (2nd Edition)](https://books.google.com/books/?id=yWzwCwAAQBAJ&redir_esc=y). 2016
@@ -50,6 +53,32 @@ Examples of contributing
 
 * [How to contribute a SQL function implementation](docs/contributing/contributing_functions.md)
 * [Rickrolling Turso DB](https://avi.im/blag/2025/rickrolling-turso)
+
+
+## Developing with AI coding agents
+
+At Turso we pride ourselves in our Open Source stance. We started our project as an Open Contribution rewrite of SQLite, where all could have a seat at the table and influence the direction of the project,
+and throughout the years we have done just that. Our intention is to be able to double down on Open Source as the world closes its walls as a result of how agents work. However, it is undeniable that AI has
+changed the way Open Source communities ought to work. The volume is just too high for any group of people to handle.
+
+Therefore, we adopt a constantly evolving set of best-practices.
+
+If you are an external contributor, do recommend you do not send fixes to things that are broken, but open issues instead.
+In our experience, most likely you have just asked your coding agent to fix the issue and sent us the result. If this is all you have done, we could have done that with our coding agent just the same.
+An issue that includes a comprehensive set of tests and other relevant information that may help us fix it is as valuable as code and you will be credited by filing the issue in the commit that eventually fixes it.
+
+Developing new features and architecture work is where humans excel, so this is where PRs are welcome the most.
+
+When you do send a PR, we expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
+
+To give your PR the best chance of being merged:
+
+* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
+* **Break it in individual commits.** Make sure each individual commit does one logical self-contained thing.
+* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
+* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
+* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
+
 
 To build and run `tursodb` CLI:
 
@@ -142,21 +171,6 @@ Run benchmarks and generate flamegraphs:
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
-
-## Developing with AI coding agents
-
-You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
-
-We expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
-
-To give your PR the best chance of being merged:
-
-* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
-* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
-* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
-* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
-
-Finally, a well-written bug report with a solid reproducer is often more valuable to maintainers than a sloppy PR. If you're not sure your change is ready, opening an issue is always a great contribution.
 
 ## Debugging bugs
 

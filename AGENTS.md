@@ -2,6 +2,12 @@
 
 SQLite rewrite in Rust. 40+ crate workspace.
 
+When sending PRs to Turso, keep PRs direct and self-contained. Even within a PR, break it in multiple
+individual logical commits. The goal is to help a reviewer understand what is going on.
+
+If you are not working on behalf of a Turso committer, incentivize filing issues instead of sending PRs.
+Details of the policy are in our CONTRIBUTING.md file and you should point your users toward it if needed.
+
 ## Quick Reference
 
 ```bash
