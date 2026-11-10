@@ -1,3 +1,5 @@
+pub mod scalar;
+
 use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
@@ -956,16 +958,13 @@ pub enum ScalarFunc {
     Iif,
     Instr,
     Like,
-    Abs,
     Upper,
-    Lower,
     Random,
     RandomBlob,
     Trim,
     LTrim,
     RTrim,
     Round,
-    Length,
     OctetLength,
     Min,
     Max,
@@ -1091,16 +1090,13 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Iif => true,
             ScalarFunc::Instr => true,
             ScalarFunc::Like => true,
-            ScalarFunc::Abs => true,
             ScalarFunc::Upper => true,
-            ScalarFunc::Lower => true,
             ScalarFunc::Random => false,     // duh
             ScalarFunc::RandomBlob => false, // duh
             ScalarFunc::Trim => true,
             ScalarFunc::LTrim => true,
             ScalarFunc::RTrim => true,
             ScalarFunc::Round => true,
-            ScalarFunc::Length => true,
             ScalarFunc::OctetLength => true,
             ScalarFunc::Min => true,
             ScalarFunc::Max => true,
@@ -1211,7 +1207,6 @@ impl ScalarFunc {
             | Self::Unlikely
             | Self::Likelihood
             | Self::TestUintDecode => ResultType::FirstArgument,
-            Self::Abs => ResultType::AbsOfTheFirstArgument,
             // A real for a real argument; see MathFunc::result_type.
             Self::Round => ResultType::RealForARealArgument,
             Self::Substr | Self::Substring => ResultType::TextOrBlobLikeTheFirstArgument,
@@ -1239,7 +1234,6 @@ impl ScalarFunc {
             | Self::Like
             | Self::Instr
             | Self::Random
-            | Self::Length
             | Self::OctetLength
             | Self::Sign
             | Self::Subtype
@@ -1267,7 +1261,6 @@ impl ScalarFunc {
             | Self::Concat
             | Self::ConcatWs
             | Self::Upper
-            | Self::Lower
             | Self::Trim
             | Self::LTrim
             | Self::RTrim
@@ -1355,16 +1348,13 @@ impl Display for ScalarFunc {
             Self::Iif => "iif",
             Self::Instr => "instr",
             Self::Like => "like",
-            Self::Abs => "abs",
             Self::Upper => "upper",
-            Self::Lower => "lower",
             Self::Random => "random",
             Self::RandomBlob => "randomblob",
             Self::Trim => "trim",
             Self::LTrim => "ltrim",
             Self::RTrim => "rtrim",
             Self::Round => "round",
-            Self::Length => "length",
             Self::OctetLength => "octet_length",
             Self::Min => "min",
             Self::Max => "max",
@@ -1504,10 +1494,7 @@ impl ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
-            Self::Abs
-            | Self::Hex
-            | Self::Length
-            | Self::Lower
+            Self::Hex
             | Self::OctetLength
             | Self::Quote
             | Self::UnistrQuote
@@ -1798,6 +1785,7 @@ pub enum Func {
     Agg(AggFunc),
     Window(WindowFunc),
     Scalar(ScalarFunc),
+    RegisteredScalar(&'static dyn scalar::ScalarFunction),
     Math(MathFunc),
     Vector(VectorFunc),
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1818,6 +1806,7 @@ impl Display for Func {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
             Self::Window(window_func) => write!(f, "{window_func}"),
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
+            Self::RegisteredScalar(func) => f.write_str(func.metadata().name),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1846,6 +1835,7 @@ impl Deterministic for Func {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
             Self::Window(window_func) => window_func.is_deterministic(),
             Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
+            Self::RegisteredScalar(func) => func.metadata().deterministic,
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1930,6 +1920,7 @@ impl Func {
         };
         match self {
             Self::Scalar(func) => func.result_type(),
+            Self::RegisteredScalar(func) => func.metadata().result_type,
             Self::Math(func) => func.result_type(),
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
@@ -2000,6 +1991,7 @@ impl Func {
     pub fn can_mask_nulls(&self) -> bool {
         match self {
             Self::Scalar(scalar_func) => scalar_func.can_mask_nulls(),
+            Self::RegisteredScalar(func) => func.metadata().can_mask_nulls,
             _ => false,
         }
     }
@@ -2056,6 +2048,16 @@ impl Func {
                 continue;
             }
             push(f.to_string(), "s", f.arities(), f.is_deterministic());
+        }
+
+        for function in scalar::BUILTIN_SCALAR_FUNCTIONS.functions() {
+            let metadata = function.metadata();
+            push(
+                metadata.name.to_owned(),
+                "s",
+                metadata.arities,
+                metadata.deterministic,
+            );
         }
 
         // Aggregate functions (External is #[strum(disabled)], skipped automatically).

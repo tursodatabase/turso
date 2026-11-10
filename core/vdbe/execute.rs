@@ -10337,6 +10337,13 @@ pub fn op_function(
                 }
             }
         },
+        crate::function::Func::RegisteredScalar(function) => {
+            let args = crate::function::scalar::FunctionArgs::new(
+                &state.registers[*start_reg..*start_reg + arg_count],
+            );
+            let value = function.execute(args)?;
+            state.registers[*dest].set_value(value);
+        }
         crate::function::Func::Scalar(scalar_func) => match scalar_func {
             ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
                 unreachable!("desugared to dedicated instructions, not Function")
@@ -10585,10 +10592,7 @@ pub fn op_function(
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
-            ScalarFunc::Abs
-            | ScalarFunc::Lower
-            | ScalarFunc::Upper
-            | ScalarFunc::Length
+            ScalarFunc::Upper
             | ScalarFunc::OctetLength
             | ScalarFunc::Subtype
             | ScalarFunc::Typeof
@@ -10603,10 +10607,7 @@ pub fn op_function(
                 let reg_value = state.registers[*start_reg].borrow_mut().get_value();
                 let result = match scalar_func {
                     ScalarFunc::Sign => reg_value.exec_sign(),
-                    ScalarFunc::Abs => Some(reg_value.exec_abs()?),
-                    ScalarFunc::Lower => reg_value.exec_lower(),
                     ScalarFunc::Upper => reg_value.exec_upper(),
-                    ScalarFunc::Length => Some(reg_value.exec_length()),
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
                     ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),

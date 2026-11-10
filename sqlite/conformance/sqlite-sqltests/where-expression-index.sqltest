@@ -145,3 +145,15 @@ test where-expr-index-like {
 expect {
     2
 }
+
+
+test scalar-catalog-expression-index {
+    CREATE TABLE scalar_catalog_values(v TEXT);
+    CREATE INDEX scalar_catalog_index ON scalar_catalog_values(lower(v), length(v), abs(length(v)));
+    INSERT INTO scalar_catalog_values VALUES ('ABC'), ('X'), (NULL);
+    SELECT v FROM scalar_catalog_values INDEXED BY scalar_catalog_index
+    WHERE lower(v) = 'abc' AND length(v) = 3 AND abs(length(v)) = 3;
+}
+expect {
+    ABC
+}

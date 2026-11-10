@@ -1099,6 +1099,19 @@ fn translate_function_call_expr(
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
+        Func::RegisteredScalar(function) => {
+            function
+                .metadata()
+                .validate_arg_count(name.as_str(), args_count)?;
+            translate_function(
+                program,
+                args,
+                referenced_tables,
+                resolver,
+                target_register,
+                func_ctx,
+            )
+        }
         Func::External(_) | Func::Dialect(_) => {
             let regs = program.alloc_registers(args_count);
             for (i, arg_expr) in args.iter().enumerate() {
@@ -1630,10 +1643,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Abs
-                | ScalarFunc::Lower
-                | ScalarFunc::Upper
-                | ScalarFunc::Length
+                ScalarFunc::Upper
                 | ScalarFunc::OctetLength
                 | ScalarFunc::Subtype
                 | ScalarFunc::Typeof

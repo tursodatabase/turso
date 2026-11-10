@@ -1056,3 +1056,32 @@ fn exec_randomblob_large(bencher: Bencher) {
 fn binary(a: &Value, b: &Value) -> turso_core::Result<std::cmp::Ordering> {
     Ok(CollationSeq::BINARY.compare(a.as_ref(), b.as_ref()))
 }
+
+#[turso_macros::divan_bench(args = ["abs", "lower", "length"])]
+fn registered_scalar(bencher: Bencher, name: &str) {
+    let turso_core::Func::RegisteredScalar(function) =
+        turso_core::dialect::engine::resolve_builtin_function(name, 1)
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a registered scalar");
+    };
+    let registers = [turso_core::Register::Value(Value::from_i64(-12345))];
+    bencher.bench_local(|| {
+        black_box(
+            black_box(function)
+                .execute(turso_core::scalar::FunctionArgs::new(black_box(&registers))),
+        )
+    });
+}
+
+#[turso_macros::divan_bench(args = ["abs", "lower", "length"])]
+fn direct_scalar(bencher: Bencher, name: &str) {
+    let value = Value::from_i64(-12345);
+    match name {
+        "abs" => bencher.bench_local(|| black_box(black_box(&value).exec_abs())),
+        "lower" => bencher.bench_local(|| black_box(black_box(&value).exec_lower())),
+        "length" => bencher.bench_local(|| black_box(black_box(&value).exec_length())),
+        _ => unreachable!(),
+    }
+}

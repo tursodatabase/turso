@@ -2889,3 +2889,26 @@ test uuid7-negative-timestamp {
 }
 expect {
 }
+
+
+test scalar-catalog-metadata {
+    SELECT name, type, narg, flags & 2048 FROM pragma_function_list
+    WHERE name IN ('abs', 'lower', 'length') ORDER BY name;
+}
+expect {
+    abs|s|1|2048
+    length|s|1|2048
+    lower|s|1|2048
+}
+
+test scalar-catalog-nested-values {
+    WITH t(v) AS (VALUES (NULL), (-42), ('AbC'), (x'41420043'))
+    SELECT typeof(abs(v)), abs(v), lower(v) IS NULL, length(v), length(lower(v))
+    FROM t;
+}
+expect {
+    null||1||
+    integer|42|0|3|3
+    real|0.0|0|3|3
+    real|0.0|0|4|2
+}

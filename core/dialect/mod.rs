@@ -582,6 +582,9 @@ mod tests {
             if name.eq_ignore_ascii_case("nvl") {
                 return engine::resolve_builtin_function("coalesce", arg_count);
             }
+            if name.eq_ignore_ascii_case("test_trait_add") {
+                return Ok(Some(Func::RegisteredScalar(&TestTraitAdd)));
+            }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
                 return Ok(Some(Func::Dialect("test_add_one".to_string())));
             }
@@ -1046,6 +1049,63 @@ mod tests {
         let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
         assert!(err.to_string().contains("no such function"));
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn registered_scalar_executes_without_builtin_dispatch() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "trait-funcs.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let rows = conn
+            .prepare("WITH t(a,b) AS (VALUES (1,2), (40,2)) SELECT test_trait_add(a,b) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_i64(3)], vec![Value::from_i64(42)]]
+        );
+        assert!(conn
+            .prepare("SELECT test_trait_add(1)")
+            .unwrap_err()
+            .to_string()
+            .contains("wrong number of arguments"));
+        assert!(conn
+            .prepare("SELECT test_trait_add('x', 1)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap_err()
+            .to_string()
+            .contains("expected integers"));
+        conn.close().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct TestTraitAdd;
+
+    impl crate::function::scalar::ScalarFunction for TestTraitAdd {
+        fn metadata(&self) -> &crate::function::scalar::ScalarFunctionMetadata {
+            &crate::function::scalar::ScalarFunctionMetadata {
+                name: "test_trait_add",
+                arities: &[2],
+                deterministic: true,
+                can_mask_nulls: false,
+                result_type: crate::function::ResultType::Declared(
+                    crate::function::ReturnType::Integer,
+                ),
+            }
+        }
+
+        fn execute(&self, args: crate::function::scalar::FunctionArgs<'_>) -> Result<Value> {
+            let (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) =
+                (args.get(0), args.get(1))
+            else {
+                return Err(LimboError::InvalidArgument("expected integers".into()));
+            };
+            Ok(Value::from_i64(
+                a.checked_add(*b).ok_or(LimboError::IntegerOverflow)?,
+            ))
+        }
     }
 
     #[test]

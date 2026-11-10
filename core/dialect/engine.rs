@@ -197,6 +197,9 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
             crate::bail_parse_error!("wrong number of arguments to function {}()", name)
         }
     }
+    if let Some(Func::RegisteredScalar(function)) = &func {
+        function.metadata().validate_arg_count(name, arg_count)?;
+    }
     Ok(func)
 }
 
@@ -207,6 +210,11 @@ pub(crate) fn resolve_builtin_function_name(
     arg_count: usize,
 ) -> crate::Result<Option<Func>> {
     let normalized_name = crate::util::normalize_ident(name);
+    if let Some(function) =
+        crate::function::scalar::BUILTIN_SCALAR_FUNCTIONS.lookup(&normalized_name)
+    {
+        return Ok(Some(Func::RegisteredScalar(function)));
+    }
     match normalized_name.as_str() {
         "avg" => {
             if arg_count != 1 {
@@ -365,16 +373,13 @@ pub(crate) fn resolve_builtin_function_name(
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
         "instr" | "strpos" => Ok(Some(Func::Scalar(ScalarFunc::Instr))),
         "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
-        "abs" => Ok(Some(Func::Scalar(ScalarFunc::Abs))),
         "upper" => Ok(Some(Func::Scalar(ScalarFunc::Upper))),
-        "lower" => Ok(Some(Func::Scalar(ScalarFunc::Lower))),
         "random" => Ok(Some(Func::Scalar(ScalarFunc::Random))),
         "randomblob" => Ok(Some(Func::Scalar(ScalarFunc::RandomBlob))),
         "trim" | "btrim" => Ok(Some(Func::Scalar(ScalarFunc::Trim))),
         "ltrim" => Ok(Some(Func::Scalar(ScalarFunc::LTrim))),
         "rtrim" => Ok(Some(Func::Scalar(ScalarFunc::RTrim))),
         "round" => Ok(Some(Func::Scalar(ScalarFunc::Round))),
-        "length" | "char_length" | "character_length" => Ok(Some(Func::Scalar(ScalarFunc::Length))),
         "octet_length" => Ok(Some(Func::Scalar(ScalarFunc::OctetLength))),
         "sign" => Ok(Some(Func::Scalar(ScalarFunc::Sign))),
         "substr" => {
