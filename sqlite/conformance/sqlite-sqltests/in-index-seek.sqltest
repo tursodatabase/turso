@@ -1211,6 +1211,20 @@ expect {
     z|1|
 }
 
+# A NULL outer key ends the IN loop before its first value, so the
+# NULL-extended row does not resume it at a later value.
+@setup eq_prefix
+@setup eq_prefix_left_join
+test in-list-after-eq-prefix-left-join-on-null-key {
+    INSERT INTO ts VALUES(11, NULL, 3);
+    SELECT tl.k, tl.v, ts.id
+    FROM tl LEFT JOIN ts ON ts.source = tl.k AND ts.item_id IN (1, 3)
+    WHERE tl.k IS NULL;
+}
+expect {
+    |9|
+}
+
 # A WHERE term on the right table also filters the NULL-extended rows.
 @setup eq_prefix
 @setup eq_prefix_left_join

@@ -37,12 +37,10 @@ pub(super) fn emit_in_seek_start(
     program.emit_insn(Insn::NullRow {
         cursor_id: source_cursor_id,
     });
-    program.emit_insn(Insn::Rewind {
-        cursor_id: source_cursor_id,
-        pc_if_empty: loop_end,
-    });
-
     // The prefix registers are followed by the register that holds each `IN` value.
+    // The prefix is checked before `Rewind`: a NULL prefix leaves the source
+    // cursor on its NULL row, so the outer loop's `Next` ends at once when an
+    // outer join re-enters the loop body to emit its NULL-extended row.
     let key_start = program.alloc_registers(prefix.len() + 1);
     emit_in_seek_prefix(
         program,
@@ -53,6 +51,10 @@ pub(super) fn emit_in_seek_start(
         key_start,
         loop_end,
     )?;
+    program.emit_insn(Insn::Rewind {
+        cursor_id: source_cursor_id,
+        pc_if_empty: loop_end,
+    });
     let num_regs = prefix.len() + 1;
 
     let outer_loop_start = program.allocate_label();
