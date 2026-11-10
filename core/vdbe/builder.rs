@@ -279,11 +279,22 @@ impl BuilderQueryMode {
     }
 }
 
+/// Where the instructions of a constant span run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstantSpanPlacement {
+    /// Moved to the end of the program, which runs them before the first loop.
+    Hoisted,
+    /// Left in place behind an [Insn::Once], so they run the first time the program
+    /// reaches them. Used for constants that can fail, such as function calls, so that
+    /// the error is raised only if a row needs the value, as in SQLite.
+    FirstUse,
+}
+
 pub struct ProgramBuilder {
-    /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
-    /// that are deemed to be compile-time constant and can be hoisted out of loops
-    /// so that they get evaluated only once at the start of the program.
-    pub constant_spans: Vec<(usize, usize)>,
+    /// A span of instructions from (offset_start_inclusive, offset_end_inclusive),
+    /// that are deemed to be compile-time constant, so that they get evaluated
+    /// only once per execution of the program.
+    pub constant_spans: Vec<(usize, usize, ConstantSpanPlacement)>,
     /// Cursors that are referenced by the program. Indexed by [CursorKey].
     /// Certain types of cursors do not need a [CursorKey] (e.g. temp tables, sorter),
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
@@ -1136,10 +1147,10 @@ impl ProgramBuilder {
 
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
-    pub fn constant_span_start(&mut self) -> usize {
+    pub fn constant_span_start(&mut self, placement: ConstantSpanPlacement) -> usize {
         let span = self.constant_spans.len();
         let start = self.insns.len();
-        self.constant_spans.push((start, usize::MAX));
+        self.constant_spans.push((start, usize::MAX, placement));
         span
     }
 
@@ -1167,7 +1178,7 @@ impl ProgramBuilder {
     pub fn constant_span_is_open(&self) -> bool {
         self.constant_spans
             .last()
-            .is_some_and(|(_, end)| *end == usize::MAX)
+            .is_some_and(|(_, end, _)| *end == usize::MAX)
     }
 
     /// Get the index of the next constant span.
@@ -1650,22 +1661,26 @@ impl ProgramBuilder {
         }
 
         let prev = self.insns.len().saturating_sub(1);
-        self.constant_spans.push((prev, prev));
+        self.constant_spans
+            .push((prev, prev, ConstantSpanPlacement::Hoisted));
     }
 
     fn emit_constant_insns(&mut self) {
-        // Move compile-time constant instructions to the end of the program,
-        // where they are executed once after Init jumps to it.
+        // Move hoisted constant instructions to the end of the program,
+        // where they are executed once after Init jumps to it. Put an
+        // Insn::Once in front of each span that is computed at first use.
 
         // Stable partition: non-constant instructions first, then constant.
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        let mut non_constant = Vec::with_capacity(self.insns.len());
+        let insns = std::mem::take(&mut self.insns);
+        let old_len = insns.len();
+        let mut non_constant = Vec::with_capacity(old_len);
         let mut constant = Vec::new();
         let mut span_idx = 0;
 
-        for item in self.insns.drain(..) {
+        for item in insns {
             let idx = item.1;
 
             // Advance past spans we've completely passed
@@ -1674,13 +1689,37 @@ impl ProgramBuilder {
             }
 
             // Check if current span contains this index
-            let is_constant =
-                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+            let span = self
+                .constant_spans
+                .get(span_idx)
+                .copied()
+                .filter(|(start, _, _)| *start <= idx);
 
-            if is_constant {
-                constant.push(item);
-            } else {
+            let Some((start, end, placement)) = span else {
                 non_constant.push(item);
+                continue;
+            };
+            match placement {
+                ConstantSpanPlacement::Hoisted => constant.push(item),
+                ConstantSpanPlacement::FirstUse => {
+                    if idx == start {
+                        // A label holds the old index of the instruction before its
+                        // target, so this one targets the instruction after the span.
+                        let after_span =
+                            BranchOffset::Label(self.label_to_resolved_offset.len() as u32);
+                        self.label_to_resolved_offset
+                            .push(Some(end as InsnReference));
+                        // The Once has no old index. It gets one past the end, which
+                        // the remap below skips.
+                        non_constant.push((
+                            Insn::Once {
+                                target_pc_when_reentered: after_span,
+                            },
+                            old_len,
+                        ));
+                    }
+                    non_constant.push(item);
+                }
             }
         }
 
@@ -1688,9 +1727,11 @@ impl ProgramBuilder {
         self.insns.extend(constant);
 
         // Build old index -> new position mapping
-        let mut old_to_new = vec![0usize; self.insns.len()];
+        let mut old_to_new = vec![0usize; old_len];
         for (new_pos, (_, old_idx)) in self.insns.iter().enumerate() {
-            old_to_new[*old_idx] = new_pos;
+            if *old_idx < old_len {
+                old_to_new[*old_idx] = new_pos;
+            }
         }
 
         for resolved_offset in self.label_to_resolved_offset.iter_mut() {

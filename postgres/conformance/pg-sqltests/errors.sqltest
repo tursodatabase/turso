@@ -80,3 +80,19 @@ test error-drop-domain-used-by-table-in-other-schema {
 }
 @sqlstate 2BP01
 expect error {}
+
+# PostgreSQL computes constant function calls when it plans the query, so
+# their errors are raised even when the table has no rows.
+test error-constant-function-call-in-select-list-of-empty-table {
+    CREATE TABLE t (a bigint);
+    SELECT abs(-9223372036854775807 - 1) FROM t;
+}
+@sqlstate 22003
+expect error {}
+
+test error-constant-function-call-in-where-of-empty-table {
+    CREATE TABLE t (a bigint);
+    SELECT a FROM t WHERE a = abs(-9223372036854775807 - 1);
+}
+@sqlstate 22003
+expect error {}

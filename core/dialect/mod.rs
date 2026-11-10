@@ -466,6 +466,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a constant expression that calls a function is computed before
+    /// the statement reads any row, so its error is raised even when no row
+    /// uses the value.
+    ///
+    /// PostgreSQL computes these calls when it plans the query. SQLite
+    /// computes them when the first row needs the value.
+    fn computes_constant_calls_before_reading_rows(&self) -> bool {
+        false
+    }
+
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.

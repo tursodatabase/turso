@@ -2785,6 +2785,7 @@ pub fn determine_where_to_eval_term(
 ) -> Result<EvalAt> {
     let mut eval_at =
         determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
+    let reads_no_table = eval_at == EvalAt::BeforeLoop;
     // A term like `random() < 0` reads no tables but gives a different answer each time, so like
     // SQLite we run it once per row of the outermost loop instead of once before the loops.
     // A call with the wrong number of arguments fails to resolve here. Callers drop a term whose
@@ -2794,7 +2795,22 @@ pub fn determine_where_to_eval_term(
     if changes_per_call && !join_order.is_empty() {
         eval_at = eval_at.max(EvalAt::Loop(0));
     }
-    if let Some(origin) = term.origin.join_origin() {
+    // Like SQLite, an inner-join ON term that reads no table is a WHERE term, unless a RIGHT or
+    // FULL join keeps rows that the ON term must not remove.
+    let on_term_acts_as_where_term = reads_no_table
+        && table_references.is_some_and(|tables| {
+            !tables.joined_tables().iter().any(|table| {
+                table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::keeps_right_rows)
+            })
+        });
+    if let Some(origin) = term
+        .origin
+        .join_origin()
+        .filter(|origin| origin.is_outer() || !on_term_acts_as_where_term)
+    {
         // A materialized hash input can remove an inner join's right table.
         // The ON term then runs when all of its remaining tables are ready.
         if let Some(join_loop) =
