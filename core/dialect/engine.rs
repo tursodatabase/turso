@@ -458,16 +458,8 @@ pub(crate) fn resolve_builtin_function_name(
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         // Built-in type support functions
         // Array construction / element access (desugared from syntax)
-        "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
-        "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),
-        "array_set_element" => Ok(Some(Func::Scalar(ScalarFunc::ArraySetElement))),
         // Array functions
         // Struct/Union functions
-        "struct_pack" => Ok(Some(Func::Scalar(ScalarFunc::StructPack))),
-        "struct_extract" => Ok(Some(Func::Scalar(ScalarFunc::StructExtractFunc))),
-        "union_value" => Ok(Some(Func::Scalar(ScalarFunc::UnionValueFunc))),
-        "union_tag" => Ok(Some(Func::Scalar(ScalarFunc::UnionTagFunc))),
-        "union_extract" => Ok(Some(Func::Scalar(ScalarFunc::UnionExtractFunc))),
         // Sequence functions
         "nextval" => Ok(Some(Func::Scalar(ScalarFunc::NextVal))),
         "currval" => Ok(Some(Func::Scalar(ScalarFunc::CurrVal))),

@@ -971,16 +971,6 @@ pub enum ScalarFunc {
     /// equivalent SQL calls that contain nondeterministic functions.
     #[cfg(feature = "test_helper")]
     TestNondetCounter,
-    // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
-    Array,
-    ArrayElement,
-    ArraySetElement,
-    // Struct/Union construction and access
-    StructPack,
-    StructExtractFunc,
-    UnionValueFunc,
-    UnionTagFunc,
-    UnionExtractFunc,
     // Sequence functions
     NextVal,
     CurrVal,
@@ -1008,12 +998,6 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => true,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
-            ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => true,
-            ScalarFunc::StructPack
-            | ScalarFunc::StructExtractFunc
-            | ScalarFunc::UnionValueFunc
-            | ScalarFunc::UnionTagFunc
-            | ScalarFunc::UnionExtractFunc => true,
             ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
         }
     }
@@ -1024,15 +1008,8 @@ impl ScalarFunc {
     pub fn result_type(&self) -> ResultType {
         match self {
             Self::TestUintDecode => ResultType::FirstArgument,
-            Self::ArrayElement => ResultType::ElementOfTheFirstArgument,
             // CAST is translated as an expression, never called by name.
             Self::Cast
-            | Self::StructExtractFunc
-            | Self::UnionExtractFunc
-            // A value of whatever struct or union type it is compared with or
-            // stored in, such as `pos <> struct_pack(0, 0)` on a point column.
-            | Self::StructPack
-            | Self::UnionValueFunc
             // Always NULL.
             | Self::Attach
             | Self::Detach => ResultType::Unknown,
@@ -1051,11 +1028,9 @@ impl ScalarFunc {
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
             | Self::TestUintEncode
-            | Self::StatGet
-            | Self::UnionTagFunc => ResultType::Declared(ReturnType::Text),
+            | Self::StatGet => ResultType::Declared(ReturnType::Text),
             Self::StatInit
             | Self::StatPush => ResultType::Declared(ReturnType::Blob),
-            Self::Array | Self::ArraySetElement => ResultType::Declared(ReturnType::Array),
         }
     }
 }
@@ -1082,14 +1057,6 @@ impl Display for ScalarFunc {
             Self::TestUintDecode => "test_uint_decode",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
-            Self::Array => "array",
-            Self::ArrayElement => "array_element",
-            Self::ArraySetElement => "array_set_element",
-            Self::StructPack => "struct_pack",
-            Self::StructExtractFunc => "struct_extract",
-            Self::UnionValueFunc => "union_value",
-            Self::UnionTagFunc => "union_tag",
-            Self::UnionExtractFunc => "union_extract",
             Self::NextVal => "nextval",
             Self::CurrVal => "currval",
             Self::SetVal => "setval",
@@ -1104,9 +1071,6 @@ impl ScalarFunc {
         matches!(
             self,
             Self::Cast
-                | Self::Array
-                | Self::ArrayElement
-                | Self::ArraySetElement
                 | Self::StatInit
                 | Self::StatPush
                 | Self::StatGet
@@ -1148,19 +1112,6 @@ impl ScalarFunc {
             Self::BinRecordJsonObject => &[2],
             // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode => &[1],
-            // Array construction / element access
-            Self::Array => &[-1], // variable arity
-            Self::ArrayElement => &[2],
-            Self::ArraySetElement => &[3],
-            // Struct/Union functions
-            // struct_pack is intentionally variable-arity: field count validation
-            // happens at INSERT time when the value is stored into a typed column.
-            // Standalone calls produce a generic record blob.
-            Self::StructPack => &[-1],
-            Self::StructExtractFunc => &[2], // struct_extract(col, 'field')
-            Self::UnionValueFunc => &[2],    // union_value('tag', value)
-            Self::UnionTagFunc => &[1],      // union_tag(col)
-            Self::UnionExtractFunc => &[2],  // union_extract(col, 'tag')
             // Sequence functions
             Self::NextVal | Self::CurrVal => &[1],
             Self::SetVal => &[2, 3],
@@ -1446,6 +1397,7 @@ pub enum ResultType {
     FirstArgument,
     /// One of the arguments, unchanged: `coalesce`, `ifnull`, `min`, `max`.
     OneOfTheArguments,
+    ArrayOfTheArguments,
     /// One of the values of `iif(c1, v1, c2, v2, ..., else)`: every second
     /// argument from the second on, and the last one when there is an odd
     /// number of arguments. The conditions are never returned.
@@ -1538,7 +1490,8 @@ impl Func {
                 basic
             }
             Self::RegisteredScalar(function) => {
-                matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
+                !function.is_internal()
+                    && matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
             }
             Self::Math(math_func) => {
                 matches!(math_func.arity(), MathFuncArity::Nullary)
@@ -1616,6 +1569,9 @@ impl Func {
         }
 
         for function in scalar::BUILTIN_SCALAR_FUNCTIONS.functions() {
+            if function.is_internal() {
+                continue;
+            }
             let metadata = function.metadata();
             push(
                 metadata.name.to_owned(),

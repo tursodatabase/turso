@@ -10338,9 +10338,6 @@ pub fn op_function(
             state.registers[*dest].set_value(value);
         }
         crate::function::Func::Scalar(scalar_func) => match scalar_func {
-            ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
-                unreachable!("desugared to dedicated instructions, not Function")
-            }
             ScalarFunc::Cast => {
                 assert_eq!(arg_count, 2);
                 assert!(*start_reg + 1 < state.registers.len());
@@ -10843,16 +10840,6 @@ pub fn op_function(
                     other => other.clone(),
                 };
                 state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StructPack
-            | ScalarFunc::StructExtractFunc
-            | ScalarFunc::UnionValueFunc
-            | ScalarFunc::UnionTagFunc
-            | ScalarFunc::UnionExtractFunc => {
-                return Err(LimboError::InternalError(format!(
-                    "{scalar_func} should be desugared to a dedicated instruction, not Function"
-                ))
-                .into());
             }
         },
         crate::function::Func::Vector(vector_func) => {

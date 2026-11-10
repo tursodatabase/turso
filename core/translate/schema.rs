@@ -494,7 +494,7 @@ fn resolve_func_return_type(
                 name
             );
         }
-        ResultType::Unknown => Ok(CheckExprType::Any),
+        ResultType::Unknown | ResultType::ArrayOfTheArguments => Ok(CheckExprType::Any),
     }
 }
 

@@ -1,5 +1,6 @@
 pub(crate) mod arrays;
 pub(crate) mod comparison;
+pub(crate) mod constructors;
 pub(crate) mod context;
 pub(crate) mod control;
 pub(crate) mod datetime;
@@ -19,6 +20,9 @@ use crate::{Connection, Result, Value};
 
 pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
+    fn is_internal(&self) -> bool {
+        false
+    }
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.compile_default()
     }
@@ -317,6 +321,14 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&control::Likely, &[]);
     catalog.register(&control::Unlikely, &[]);
     catalog.register(&control::Likelihood, &[]);
+    catalog.register(&constructors::Array, &[]);
+    catalog.register(&constructors::ArrayElement, &[]);
+    catalog.register(&constructors::ArraySetElement, &[]);
+    catalog.register(&constructors::StructPack, &[]);
+    catalog.register(&constructors::StructExtractFunc, &[]);
+    catalog.register(&constructors::UnionValueFunc, &[]);
+    catalog.register(&constructors::UnionTagFunc, &[]);
+    catalog.register(&constructors::UnionExtractFunc, &[]);
     catalog
 });
 

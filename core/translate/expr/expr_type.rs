@@ -9,7 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
+use crate::function::{AggFunc, Func, ResultType, ReturnType, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -1063,9 +1063,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         return ExprType::Builtin(BuiltinType::Any);
     };
     match func {
-        Func::Scalar(ScalarFunc::Array) => {
-            ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
-        }
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -1097,6 +1094,9 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
     match result_type {
         ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
         ResultType::FirstArgument => first_argument().unwrap_or(any),
+        ResultType::ArrayOfTheArguments => {
+            ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
+        }
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
         ResultType::NumberOfTheFirstArgumentsType => match first_argument() {

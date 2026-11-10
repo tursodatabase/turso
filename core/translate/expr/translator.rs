@@ -1372,27 +1372,6 @@ fn translate_function_call_expr(
                 }
                 // Arity and custom-types checks are done at bind time
                 // in validate_custom_type_function_call.
-                ScalarFunc::Array => {
-                    translate_variadic_insn!(
-                        program,
-                        referenced_tables,
-                        resolver,
-                        args,
-                        target_register,
-                        MakeArray
-                    )
-                }
-                ScalarFunc::ArrayElement => {
-                    translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [array_reg <- 0, index_reg <- 1],
-                                Insn::ArrayElement { array_reg, index_reg, dest: target_register })
-                }
-                ScalarFunc::ArraySetElement => {
-                    translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [array_reg <- 0, index_reg <- 1, value_reg <- 2],
-                                Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })
-                }
-
                 ScalarFunc::SequenceWatermark => {
                     let args = expect_arguments_exact!(args, 1, srf);
                     let start_reg = program.alloc_register();
@@ -1518,101 +1497,6 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::StructPack => {
-                    translate_variadic_insn!(
-                        program,
-                        referenced_tables,
-                        resolver,
-                        args,
-                        target_register,
-                        MakeArray
-                    )
-                }
-                ScalarFunc::UnionValueFunc => {
-                    let args = expect_arguments_exact!(args, 2, srf);
-                    let tag_name = extract_string_literal(&args[0])?;
-                    // union_value('tag', val): resolve the tag against the
-                    // target column's union type. The target is set by
-                    // INSERT/UPDATE/UPSERT before translating the value.
-                    let Some(ref union_td) = program.target_union_type else {
-                        return Err(crate::LimboError::ParseError(
-                                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column".to_string()
-                                ));
-                    };
-                    let Some((tag_index, variant)) = union_td.find_union_variant(&tag_name) else {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "unknown variant '{}' in union type '{}'",
-                            tag_name, union_td.name
-                        )));
-                    };
-                    // If the variant's type is itself a union, set
-                    // target_union_type so nested union_value() resolves
-                    // against the inner union type, not the outer one.
-                    let inner_union_td = resolver
-                        .schema()
-                        .get_type_def_unchecked(&variant.type_name)
-                        .filter(|td| td.is_union())
-                        .cloned();
-                    let prev = program.target_union_type.take();
-                    program.target_union_type = inner_union_td;
-                    let value_reg = program.alloc_register();
-                    let result =
-                        translate_expr(program, referenced_tables, &args[1], value_reg, resolver);
-                    program.target_union_type = prev;
-                    result?;
-                    program.emit_insn(Insn::UnionPack {
-                        tag_index,
-                        value_reg,
-                        dest: target_register,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::UnionTagFunc => {
-                    // union_tag(col): resolve col's union type for index→name lookup.
-                    let args = expect_arguments_exact!(args, 1, srf);
-                    let td = resolve_union_from_column(&args[0], referenced_tables, resolver);
-                    let tag_names = td
-                        .as_ref()
-                        .and_then(|td| td.union_def())
-                        .map(|ud| Arc::clone(&ud.tag_names))
-                        .unwrap_or_else(|| Arc::from(Vec::<String>::new()));
-                    translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::UnionTag { src_reg, dest: target_register, tag_names })
-                }
-                ScalarFunc::UnionExtractFunc => {
-                    let args = expect_arguments_exact!(args, 2, srf);
-                    let tag_name = extract_string_literal(&args[1])?;
-                    // union_extract(col, 'tag'): resolve col's union type for name→index.
-                    let td = resolve_union_from_column(&args[0], referenced_tables, resolver);
-                    let tag_index = td
-                        .as_ref()
-                        .and_then(|td| td.resolve_union_tag_index(&tag_name))
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "cannot resolve union variant '{tag_name}' for union_extract"
-                            ))
-                        })?;
-                    translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
-                }
-                ScalarFunc::StructExtractFunc => {
-                    let args = expect_arguments_exact!(args, 2, srf);
-                    let field_name = extract_string_literal(&args[1])?;
-                    let td = resolve_struct_from_expr(&args[0], referenced_tables, resolver);
-                    let (field_index, _) = td
-                        .as_ref()
-                        .and_then(|td| td.find_struct_field(&field_name))
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "cannot resolve struct field '{field_name}' for struct_extract"
-                            ))
-                        })?;
-                    translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::StructField { src_reg, field_index, dest: target_register })
-                }
                 ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
                     program,
                     args,
