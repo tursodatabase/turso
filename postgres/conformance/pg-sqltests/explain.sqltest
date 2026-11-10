@@ -122,3 +122,19 @@ test explain-select-seeks-index-of-policy-column {
 expect {
     1|0|0|SEARCH explain_policy_docs USING INDEX explain_policy_docs_owner (owner=?)
 }
+
+# A subquery of a policy that reads no column is computed once, so the role
+# is still sought through the index.
+test explain-select-seeks-index-with-subquery-of-policy {
+    CREATE ROLE explain_policy_subquery_role;
+    CREATE TABLE explain_policy_subquery_docs (id int primary key, owner text);
+    CREATE INDEX explain_policy_subquery_docs_owner ON explain_policy_subquery_docs (owner);
+    ALTER TABLE explain_policy_subquery_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON explain_policy_subquery_docs USING (owner = (SELECT current_user));
+    GRANT SELECT ON explain_policy_subquery_docs TO explain_policy_subquery_role;
+    SET ROLE explain_policy_subquery_role;
+    EXPLAIN SELECT id FROM explain_policy_subquery_docs;
+}
+expect {
+    1|0|0|SEARCH explain_policy_subquery_docs USING COVERING INDEX explain_policy_subquery_docs_owner (owner=?)
+}

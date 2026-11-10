@@ -380,6 +380,7 @@ fn prepare_update_plan(
         &mut from_tables,
         &mut where_clause,
         resolver,
+        program,
     )?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
@@ -430,6 +431,7 @@ fn prepare_update_plan(
         &mut read_scope_tables,
         &mut where_clause,
         resolver,
+        program,
     )?;
     read_scope_tables.extend(from_tables);
 

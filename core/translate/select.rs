@@ -366,6 +366,7 @@ fn prepare_one_select_plan(
                     &mut table_references,
                     &mut where_predicates,
                     resolver,
+                    program,
                 )?;
             }
 

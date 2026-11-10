@@ -26,7 +26,10 @@ use crate::{
     security::roles::{RoleCatalog, RoleId},
     translate::{
         emitter::Resolver,
-        expr::{bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl},
+        expr::{
+            bind_and_rewrite_expr, translate_expr, walk_expr, walk_expr_mut, BindingBehavior,
+            WalkControl,
+        },
         plan::{JoinInfo, JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
         planner::break_predicate_at_and_boundaries,
         roles,
@@ -58,6 +61,7 @@ pub(crate) fn filter_rows(
     table_references: &mut TableReferences,
     where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
+    program: &mut ProgramBuilder,
 ) -> Result<()> {
     let mut terms = Vec::new();
     for index in 0..table_references.joined_tables().len() {
@@ -68,7 +72,7 @@ pub(crate) fn filter_rows(
         let filter = match policy(resolver, table.namespace, &btree.declared_name, command) {
             Policy::Allow => continue,
             Policy::Deny => no_rows(),
-            Policy::Filter(policies) => policy_filter(&policies, table, btree, resolver)?,
+            Policy::Filter(policies) => policy_filter(&policies, table, btree, resolver, program)?,
         };
         let join_info = table.join_info.as_ref();
         let extended_with_nulls_by_right_join = join_info.is_some_and(JoinInfo::keeps_right_rows)
@@ -245,6 +249,7 @@ fn policy_filter(
     table: &JoinedTable,
     btree: &BTreeTable,
     resolver: &Resolver,
+    program: &mut ProgramBuilder,
 ) -> Result<ast::Expr> {
     let mut permissive = None;
     let mut restrictive = None;
@@ -253,7 +258,7 @@ fn policy_filter(
             .using_expr
             .as_ref()
             .expect("policy_for keeps only policies with USING");
-        let condition = bind_policy_expr(using_expr, table, btree, resolver)?;
+        let condition = bind_policy_expr(using_expr, table, btree, resolver, program)?;
         if policy.permissive {
             permissive = Some(combine(permissive, ast::Operator::Or, condition));
         } else {
@@ -285,6 +290,7 @@ fn bind_policy_expr(
     table: &JoinedTable,
     btree: &BTreeTable,
     resolver: &Resolver,
+    program: &mut ProgramBuilder,
 ) -> Result<ast::Expr> {
     let mut policy_table = table.clone();
     policy_table.identifier = normalize_ident(&btree.declared_name);
@@ -292,6 +298,7 @@ fn bind_policy_expr(
     policy_table.join_info = None;
     let mut table_references = TableReferences::new(vec![policy_table], Vec::new());
     let mut expr = expr.clone();
+    compute_scalar_selects_once(&mut expr, &mut table_references, resolver, program)?;
     bind_and_rewrite_expr(
         &mut expr,
         Some(&mut table_references),
@@ -300,6 +307,67 @@ fn bind_policy_expr(
         BindingBehavior::ResultColumnsNotAllowed,
     )?;
     Ok(expr)
+}
+
+/// Replaces each `(SELECT <expr>)` of a policy condition by the register that
+/// holds its value, computed once when the statement starts, as PostgreSQL
+/// computes such a subquery once per query. `auth.uid()` is then called once
+/// instead of for every row. A `<expr>` that reads a column of the row is
+/// computed for every row, as in PostgreSQL.
+fn compute_scalar_selects_once(
+    expr: &mut ast::Expr,
+    table_references: &mut TableReferences,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+        let ast::Expr::Subquery(select) = expr else {
+            return Ok(WalkControl::Continue);
+        };
+        let mut value = single_value_of(select)
+            .expect("CREATE POLICY stores no other subqueries")
+            .clone();
+        compute_scalar_selects_once(&mut value, table_references, resolver, program)?;
+        if reads_a_column(&value)? {
+            *expr = parenthesized(value);
+            return Ok(WalkControl::SkipChildren);
+        }
+        bind_and_rewrite_expr(
+            &mut value,
+            Some(table_references),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        let register = program.alloc_register();
+        program.emit_once_per_statement(|program| {
+            translate_expr(program, Some(table_references), &value, register, resolver)
+        })?;
+        *expr = ast::Expr::Register {
+            register,
+            custom_type: None,
+        };
+        Ok(WalkControl::SkipChildren)
+    })?;
+    Ok(())
+}
+
+fn reads_a_column(expr: &ast::Expr) -> Result<bool> {
+    let mut reads_column = false;
+    walk_expr(expr, &mut |expr| {
+        if matches!(
+            expr,
+            ast::Expr::Id(_)
+                | ast::Expr::Qualified(..)
+                | ast::Expr::DoublyQualified(..)
+                | ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+        ) {
+            reads_column = true;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(reads_column)
 }
 
 /// The columns of the table `internal_id` that the bound `expr` reads.
@@ -351,9 +419,10 @@ pub(crate) fn translate_set_row_security(
 /// is dropped.
 ///
 /// The conditions may refer to the columns of the table, written as `column`
-/// or `table.column`, and call scalar functions. `(SELECT <expr>)` without
-/// FROM, which Supabase recommends for function calls, stands for `<expr>`.
-/// The conditions are stored with unqualified column names.
+/// or `table.column`, call scalar functions, and use `(SELECT <expr>)`
+/// without FROM, which Supabase recommends for function calls because
+/// PostgreSQL computes it once per query. The conditions are stored with
+/// unqualified column names.
 /// [`crate::translate::roles::check_statement_privileges`] lets the table's
 /// owner and superusers run it.
 pub(crate) fn translate_create_policy(
@@ -463,7 +532,11 @@ fn policy_uses_column(policy: &RowPolicy, column_name: &str) -> bool {
     [&policy.using_expr, &policy.check_expr]
         .into_iter()
         .flatten()
-        .any(|expr| collect_column_dependencies_of_expr(expr, &[]).contains(column_name))
+        .any(|expr| {
+            let mut expr = expr.clone();
+            replace_scalar_selects(&mut expr);
+            collect_column_dependencies_of_expr(&expr, &[]).contains(column_name)
+        })
 }
 
 /// The table of the main database that row-level security statements name.
@@ -517,27 +590,37 @@ fn translate_change(
 }
 
 /// Checks a policy condition of `table` of `namespace` and puts it in the
-/// form it is stored in: `(SELECT <expr>)` without FROM becomes `(<expr>)`,
-/// and columns lose their schema and table names, so the condition still
-/// holds after the table is renamed. Column names are quoted, so a column named like a keyword, such
-/// as `true`, is still read as the column.
+/// form it is stored in: columns lose their schema and table names, so the
+/// condition still holds after the table is renamed, and are quoted, so a
+/// column named like a keyword, such as `true`, is still read as the column.
+/// `(SELECT <expr>)` without FROM stays, because it is computed once per
+/// statement.
 fn prepare_policy_expr(
     expr: &mut ast::Expr,
     namespace: NamespaceRef,
     table: &BTreeTable,
     resolver: &Resolver,
 ) -> Result<()> {
-    replace_scalar_selects(expr)?;
     let table_name = normalize_ident(&table.declared_name);
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         match expr {
+            ast::Expr::Subquery(select) => {
+                let Some(value) = single_value_of_mut(select) else {
+                    bail_parse_error!("subqueries in policies are not supported")
+                };
+                prepare_policy_expr(value, namespace, table, resolver)?;
+                return Ok(WalkControl::SkipChildren);
+            }
+            ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                bail_parse_error!("subqueries in policies are not supported")
+            }
             ast::Expr::Qualified(qualifier, name) => {
                 if normalize_ident(qualifier.as_str()) != table_name {
                     bail_parse_error!(
                         "a policy of table \"{table_name}\" can only refer to the columns of that table"
                     );
                 }
-                *expr = ast::Expr::Id(name.clone());
+                *expr = policy_column(name, table)?;
             }
             ast::Expr::DoublyQualified(schema, qualifier, name) => {
                 if resolver.namespace_named(&normalize_ident(schema.as_str())) != Some(namespace)
@@ -547,27 +630,13 @@ fn prepare_policy_expr(
                         "a policy of table \"{table_name}\" can only refer to the columns of that table"
                     );
                 }
-                *expr = ast::Expr::Id(name.clone());
+                *expr = policy_column(name, table)?;
             }
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
-                bail_parse_error!("subqueries in policies are not supported")
+            ast::Expr::Id(name) => {
+                *expr = policy_column(name, table)?;
             }
             ast::Expr::Variable(_) => {
                 bail_parse_error!("there is no parameter $1")
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    walk_expr(expr, &mut |expr| {
-        match expr {
-            ast::Expr::Id(name) => {
-                let Some((_, column)) = table.get_column(name.as_str()) else {
-                    bail_parse_error!("column \"{}\" does not exist", name.as_str());
-                };
-                if column.is_virtual_generated() {
-                    bail_parse_error!("policies cannot use generated column \"{}\"", name.as_str());
-                }
             }
             ast::Expr::FunctionCall { name, args, .. } => {
                 check_policy_function(name.as_str(), args.len(), resolver)?;
@@ -579,13 +648,21 @@ fn prepare_policy_expr(
         }
         Ok(WalkControl::Continue)
     })?;
-    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
-        if let ast::Expr::Id(name) = expr {
-            *name = ast::Name::from_string(format!("\"{}\"", name.as_str().replace('"', "\"\"")));
-        }
-        Ok(WalkControl::Continue)
-    })?;
     Ok(())
+}
+
+/// Column `name` of `table` as a policy stores it: unqualified and quoted.
+fn policy_column(name: &ast::Name, table: &BTreeTable) -> Result<ast::Expr> {
+    let Some((_, column)) = table.get_column(name.as_str()) else {
+        bail_parse_error!("column \"{}\" does not exist", name.as_str());
+    };
+    if column.is_virtual_generated() {
+        bail_parse_error!("policies cannot use generated column \"{}\"", name.as_str());
+    }
+    Ok(ast::Expr::Id(ast::Name::from_string(format!(
+        "\"{}\"",
+        name.as_str().replace('"', "\"\"")
+    ))))
 }
 
 /// A policy condition is checked on one row at a time, so it can only call
@@ -605,7 +682,7 @@ fn check_policy_function(name: &str, arg_count: usize, resolver: &Resolver) -> R
 
 /// Replaces each `(SELECT <expr>)` without FROM or any other clause by
 /// `(<expr>)`.
-fn replace_scalar_selects(expr: &mut ast::Expr) -> Result<()> {
+fn replace_scalar_selects(expr: &mut ast::Expr) {
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         if let ast::Expr::Subquery(select) = expr {
             if let Some(value) = single_value_of(select) {
@@ -613,8 +690,8 @@ fn replace_scalar_selects(expr: &mut ast::Expr) -> Result<()> {
             }
         }
         Ok(WalkControl::Continue)
-    })?;
-    Ok(())
+    })
+    .expect("the walk never fails");
 }
 
 fn parenthesized(expr: ast::Expr) -> ast::Expr {
@@ -639,6 +716,18 @@ fn single_value_of(select: &ast::Select) -> Option<&ast::Expr> {
             group_by: None,
             window_clause,
         } if window_clause.is_empty() => match columns.as_slice() {
+            [ast::ResultColumn::Expr(expr, _)] => Some(expr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`single_value_of`], to change the expression.
+fn single_value_of_mut(select: &mut ast::Select) -> Option<&mut ast::Expr> {
+    single_value_of(select)?;
+    match &mut select.body.select {
+        ast::OneSelect::Select { columns, .. } => match columns.as_mut_slice() {
             [ast::ResultColumn::Expr(expr, _)] => Some(expr),
             _ => None,
         },

@@ -112,9 +112,8 @@ role may not read.
   the policy is created.
 - `using_expression`: Which existing rows the policy shows. It can use the
   columns of the table, written alone, with the table's name, or with the
-  schema and table names, and call
-  scalar functions such as `current_user`. A subquery without `FROM`, such as
-  `(SELECT current_user)`, stands for its value.
+  schema and table names, and call scalar functions such as `current_user`.
+  It can also use a subquery without `FROM`, such as `(SELECT auth.uid())`.
 - `check_expression`: Which new rows the policy lets a role write. It is
   stored but has no effect yet, because roles cannot write to tables.
 
@@ -135,9 +134,10 @@ policies, and dropping the table drops them.
 A policy whose expression is nested too deeply, such as a hundred conditions
 joined with `OR`, is rejected; write it with `IN` instead.
 
-A function that a policy calls, such as `current_user`, runs for each row
-that the policy checks, unlike in PostgreSQL, where `(SELECT current_user)`
-runs once per query.
+As in PostgreSQL, a function that a policy calls, such as `auth.uid()`,
+runs for each row that the policy checks, and a subquery such as
+`(SELECT auth.uid())` that reads no column of the row runs once per query,
+so writing the call as a subquery is cheaper on large tables.
 
 `pg_policy` and `pg_policies` do not show the policies yet.
 

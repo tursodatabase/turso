@@ -602,3 +602,46 @@ expect {
     1|1
     -1|3
 }
+
+# PostgreSQL computes a subquery that reads no column of the row once per
+# query, so a coin flipped in it shows a role every row or none, and the
+# next query flips it again.
+test scalar-subquery-of-policy-is-computed-once-per-statement {
+    CREATE ROLE rp_alice_40;
+    CREATE TABLE rp_docs_40 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_40 SELECT g FROM generate_series(1, 200) AS g;
+    ALTER TABLE rp_docs_40 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY coin ON rp_docs_40 USING ((SELECT random()) < 0.5);
+    GRANT SELECT ON rp_docs_40 TO rp_alice_40;
+    SET ROLE rp_alice_40;
+    SELECT CASE WHEN count(*) IN (0, 200) THEN 'once' ELSE 'per row' END FROM rp_docs_40;
+}
+expect {
+    once
+}
+
+test scalar-subquery-of-policy-that-reads-a-column-is-computed-per-row {
+    CREATE ROLE rp_alice_41;
+    CREATE TABLE rp_docs_41 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_41 VALUES (1, 'rp_alice_41'), (2, 'bob'), (3, 'rp_alice_41');
+    ALTER TABLE rp_docs_41 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_41 USING ((SELECT owner) = (SELECT (SELECT current_user)));
+    GRANT SELECT ON rp_docs_41 TO rp_alice_41;
+    SET ROLE rp_alice_41;
+    SELECT id FROM rp_docs_41 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@skip-if postgres "PostgreSQL renames the column in the policy too"
+test rename-of-column-a-policy-reads-in-a-subquery-is-rejected {
+    CREATE TABLE rp_docs_42 (id INT PRIMARY KEY, owner TEXT);
+    CREATE POLICY own ON rp_docs_42 USING ((SELECT owner) = current_user);
+    ALTER TABLE rp_docs_42 RENAME COLUMN owner TO author;
+}
+@sqlstate 2BP01
+expect error {
+    cannot change column "owner" of table "rp_docs_42" because policy "own" uses it
+}
