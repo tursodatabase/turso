@@ -150,11 +150,17 @@ impl Replica {
     }
 
     pub fn pull_with_tampered_staging(&self) -> Result<()> {
+        self.pull_with_tampered_staging_at(Some(40))
+    }
+
+    // None corrupts the final nonce byte, after all preceding records/chunks.
+    pub fn pull_with_tampered_staging_at(&self, offset: Option<usize>) -> Result<()> {
         drive(&self.io, async |coro| {
             let changes = self.engine.wait_changes_from_remote(coro).await?;
             let path = self._dir.path().join("replica.db-changes");
             let mut bytes = std::fs::read(&path)?;
-            bytes[40] ^= 1;
+            let offset = offset.unwrap_or(bytes.len() - 1);
+            bytes[offset] ^= 1;
             std::fs::write(path, bytes)?;
             self.engine.apply_changes_from_remote(coro, changes).await
         })
