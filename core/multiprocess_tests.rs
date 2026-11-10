@@ -1241,6 +1241,30 @@ fn attached_db_observes_other_process_commits_with_read_only_multiprocess_wal() 
 }
 
 #[test]
+fn in_memory_attach_works_with_multiprocess_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("attach-memory-main.db");
+    let main_db = Database::open_file_with_flags(
+        multiprocess_test_io(),
+        main_path.to_str().unwrap(),
+        OpenFlags::default(),
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    let conn = main_db.connect(ConnectOpts::new()).unwrap();
+    for (alias, path) in [("mem", ":memory:"), ("tmp", "")] {
+        conn.execute(format!("attach '{path}' as {alias}")).unwrap();
+        conn.execute(format!("create table {alias}.u(x)")).unwrap();
+        conn.execute(format!("insert into {alias}.u values (1)"))
+            .unwrap();
+        let rows = get_rows(&conn, &format!("select count(*) from {alias}.u"));
+        assert_eq!(rows[0][0].to_string(), "1");
+    }
+}
+
+#[test]
 fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-subprocess.db");
