@@ -458,6 +458,30 @@ pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_
     }
 }
 
+/// Writes the `len` components of the row value `expr` into the registers
+/// starting at `start_reg`. Each component is translated as one value, so a
+/// row value nested inside another is "row value misused", as in SQLite.
+pub(super) fn translate_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &Expr,
+    len: usize,
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for idx in 0..len {
+        let component = row_value_component_expr(expr, idx)?;
+        translate_expr(
+            program,
+            referenced_tables,
+            &component,
+            start_reg + idx,
+            resolver,
+        )?;
+    }
+    Ok(())
+}
+
 /// The number of components [row_value_component_expr] splits `expr` into.
 /// As in SQLite's `sqlite3ExprVectorSize`, only `(a, b)` and a planned row
 /// subquery have more than one; every other expression is one value.

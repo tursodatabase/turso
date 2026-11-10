@@ -69,22 +69,37 @@ pub(crate) fn translate_compared_operand(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    if let ast::Expr::Parenthesized(elements) = unwrap_parens(operand)? {
-        if elements.len() > 1 && !resolver.schema().type_registry.is_empty() {
-            for (i, element) in elements.iter().enumerate() {
-                let other_element = row_value_component_expr(other, i)?;
-                translate_compared_operand(
-                    program,
-                    referenced_tables,
-                    element,
-                    &other_element,
-                    reg + i,
-                    resolver,
-                )?;
-            }
-            return Ok(reg);
-        }
+    let len = row_value_len(operand)?;
+    if len <= 1 {
+        return translate_compared_value(program, referenced_tables, operand, other, reg, resolver);
     }
+    // Each component is translated as one value, so a row value nested
+    // inside another is "row value misused", as in SQLite.
+    for i in 0..len {
+        let component = row_value_component_expr(operand, i)?;
+        let other_component = row_value_component_expr(other, i)?;
+        translate_compared_value(
+            program,
+            referenced_tables,
+            &component,
+            &other_component,
+            reg + i,
+            resolver,
+        )?;
+    }
+    Ok(reg)
+}
+
+/// Translates `operand`, one value compared with `other`, into `reg`. See
+/// [translate_compared_operand].
+fn translate_compared_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
     match untyped_operand_type(operand, other, referenced_tables, resolver)? {
         Some(resolved) => translate_untyped_operand_as(
             program,
