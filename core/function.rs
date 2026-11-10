@@ -953,24 +953,10 @@ pub enum ScalarFunc {
     #[cfg(feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
-    TableColumnsJsonArray,
-    BinRecordJsonObject,
     Attach,
     Detach,
-    StatInit,
-    StatPush,
-    StatGet,
-    ConnTxnId,
-    IsAutocommit,
     SequenceWatermark,
     // Test type functions (for custom type system testing)
-    TestUintEncode,
-    TestUintDecode,
-    /// Test-only: returns a monotonically increasing 64-bit integer on every
-    /// evaluation. Used to verify that the planner does not deduplicate
-    /// equivalent SQL calls that contain nondeterministic functions.
-    #[cfg(feature = "test_helper")]
-    TestNondetCounter,
     // Sequence functions
     NextVal,
     CurrVal,
@@ -985,19 +971,9 @@ impl Deterministic for ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => false,
-            ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
-            ScalarFunc::BinRecordJsonObject => true,
-            ScalarFunc::Attach => false,       // changes database state
-            ScalarFunc::Detach => false,       // changes database state
-            ScalarFunc::StatInit => false,     // internal ANALYZE function
-            ScalarFunc::StatPush => false,     // internal ANALYZE function
-            ScalarFunc::StatGet => false,      // internal ANALYZE function
-            ScalarFunc::ConnTxnId => false,    // depends on connection state
-            ScalarFunc::IsAutocommit => false, // depends on connection state
+            ScalarFunc::Attach => false, // changes database state
+            ScalarFunc::Detach => false, // changes database state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => true,
-            #[cfg(feature = "test_helper")]
-            ScalarFunc::TestNondetCounter => false,
             ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
         }
     }
@@ -1007,7 +983,6 @@ impl ScalarFunc {
     /// How the type of the function's result follows from its arguments.
     pub fn result_type(&self) -> ResultType {
         match self {
-            Self::TestUintDecode => ResultType::FirstArgument,
             // CAST is translated as an expression, never called by name.
             Self::Cast
             // Always NULL.
@@ -1016,21 +991,11 @@ impl ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => ResultType::Unknown,
-            Self::ConnTxnId
-            | Self::IsAutocommit
-            | Self::SequenceWatermark
+            Self::SequenceWatermark
             | Self::NextVal
             | Self::CurrVal
             | Self::SetVal => ResultType::Declared(ReturnType::Integer),
-            #[cfg(feature = "test_helper")]
-            Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
-            Self::TursoVersion
-            | Self::TableColumnsJsonArray
-            | Self::BinRecordJsonObject
-            | Self::TestUintEncode
-            | Self::StatGet => ResultType::Declared(ReturnType::Text),
-            Self::StatInit
-            | Self::StatPush => ResultType::Declared(ReturnType::Blob),
+            Self::TursoVersion => ResultType::Declared(ReturnType::Text),
         }
     }
 }
@@ -1043,20 +1008,9 @@ impl Display for ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension",
-            Self::TableColumnsJsonArray => "table_columns_json_array",
-            Self::BinRecordJsonObject => "bin_record_json_object",
             Self::Attach => "attach",
             Self::Detach => "detach",
-            Self::StatInit => "stat_init",
-            Self::StatPush => "stat_push",
-            Self::StatGet => "stat_get",
-            Self::ConnTxnId => "conn_txn_id",
-            Self::IsAutocommit => "is_autocommit",
             Self::SequenceWatermark => "sequence_watermark_experimental",
-            Self::TestUintEncode => "test_uint_encode",
-            Self::TestUintDecode => "test_uint_decode",
-            #[cfg(feature = "test_helper")]
-            Self::TestNondetCounter => "test_nondet_counter",
             Self::NextVal => "nextval",
             Self::CurrVal => "currval",
             Self::SetVal => "setval",
@@ -1068,19 +1022,7 @@ impl Display for ScalarFunc {
 impl ScalarFunc {
     /// Returns true for internal functions that should not appear in PRAGMA function_list.
     pub fn is_internal(&self) -> bool {
-        matches!(
-            self,
-            Self::Cast
-                | Self::StatInit
-                | Self::StatPush
-                | Self::StatGet
-                | Self::Attach
-                | Self::Detach
-                | Self::TableColumnsJsonArray
-                | Self::BinRecordJsonObject
-                | Self::ConnTxnId
-                | Self::IsAutocommit
-        )
+        matches!(self, Self::Cast | Self::Attach | Self::Detach)
     }
 
     /// Returns the valid arities for this function.
@@ -1090,8 +1032,6 @@ impl ScalarFunc {
         match self {
             // 0-arg
             Self::TursoVersion => &[0],
-            #[cfg(feature = "test_helper")]
-            Self::TestNondetCounter => &[0],
             // 1-arg
             Self::SequenceWatermark => &[1],
             // 2-arg
@@ -1100,18 +1040,9 @@ impl ScalarFunc {
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => &[-1],
             // Internal functions that cannot be called by name
-            Self::Cast
-            | Self::StatInit
-            | Self::StatPush
-            | Self::StatGet
-            | Self::Attach
-            | Self::Detach => &[0],
+            Self::Cast | Self::Attach | Self::Detach => &[0],
             // Internal functions that can be called by name
-            Self::IsAutocommit => &[0],
-            Self::TableColumnsJsonArray | Self::ConnTxnId => &[1],
-            Self::BinRecordJsonObject => &[2],
             // Test functions for custom types
-            Self::TestUintEncode | Self::TestUintDecode => &[1],
             // Sequence functions
             Self::NextVal | Self::CurrVal => &[1],
             Self::SetVal => &[2, 3],
@@ -1485,8 +1416,6 @@ impl Func {
         match self {
             Self::Scalar(scalar_func) => {
                 let basic = matches!(scalar_func, ScalarFunc::TursoVersion);
-                #[cfg(feature = "test_helper")]
-                let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
                 basic
             }
             Self::RegisteredScalar(function) => {

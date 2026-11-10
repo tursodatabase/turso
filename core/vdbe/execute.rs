@@ -85,7 +85,6 @@ use crate::{
         SQLITE_ERROR, SQLITE_FULL,
     },
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
-    stats::StatAccum,
     translate::emitter::TransactionMode,
 };
 use branches::{mark_unlikely, unlikely};
@@ -215,26 +214,6 @@ macro_rules! return_if_io {
             }
         }
     };
-}
-
-use arg_count::check_arg_count;
-mod arg_count {
-    use crate::LimboError;
-
-    macro_rules! check_arg_count {
-        ($actual:expr, $expected:expr) => {
-            if unlikely($actual != $expected) {
-                return Err(arg_count::wrong_arg_count($expected, $actual));
-            }
-        };
-    }
-    pub(super) use check_arg_count;
-
-    #[cold]
-    #[inline(never)]
-    pub(super) fn wrong_arg_count(expected: usize, actual: usize) -> Box<LimboError> {
-        LimboError::InternalError(format!("expected {expected} argument(s), got {actual}")).into()
-    }
 }
 
 /// Errors are boxed so an op's whole return value stays small: a LimboError
@@ -10452,18 +10431,6 @@ pub fn op_function(
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
-            #[cfg(feature = "test_helper")]
-            ScalarFunc::TestNondetCounter => {
-                // Test-only: per-connection counter that increments on every
-                // evaluation. Used in sqltests to verify that the planner does
-                // not deduplicate equivalent SQL calls that contain
-                // nondeterministic functions.
-                let value = program
-                    .connection
-                    .test_nondet_counter
-                    .fetch_add(1, Ordering::Relaxed);
-                state.registers[*dest].set_int(value);
-            }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
                     state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
@@ -10493,142 +10460,6 @@ pub fn op_function(
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_value().to_string())?;
                 program.connection.load_extension(ext)?;
-            }
-            ScalarFunc::TableColumnsJsonArray => {
-                assert_eq!(arg_count, 1);
-                #[cfg(not(feature = "json"))]
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "table_columns_json_array: turso must be compiled with JSON support"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                #[cfg(feature = "json")]
-                {
-                    use crate::types::TextSubtype;
-
-                    let table = state.registers[*start_reg].get_value();
-                    let Value::Text(table) = table else {
-                        return Err(LimboError::InvalidArgument(
-                            "table_columns_json_array: function argument must be of type TEXT"
-                                .to_string(),
-                        )
-                        .into());
-                    };
-                    let table = {
-                        let schema = program.connection.schema.read();
-                        match schema.get_table(NamespaceId::ROOT, table.as_str()) {
-                            Some(table) => table,
-                            None => {
-                                return Err(LimboError::InvalidArgument(format!(
-                                    "table_columns_json_array: table {table} doesn't exists"
-                                ))
-                                .into());
-                            }
-                        }
-                    };
-
-                    let mut json =
-                        json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10)?;
-                    for column in table.columns() {
-                        use crate::types::TextRef;
-
-                        let name = column.name.as_ref().expect("column should have a name");
-                        let name_json = json::convert_ref_dbtype_to_jsonb(
-                            ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
-                            json::Conv::ToString,
-                        )?;
-                        json.append_jsonb_to_end(name_json.data());
-                    }
-                    json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
-                    state.registers[*dest].set_value(json::json_string_to_db_type(
-                        json,
-                        json::jsonb::ElementType::ARRAY,
-                        json::OutputVariant::String,
-                    )?);
-                }
-            }
-            ScalarFunc::BinRecordJsonObject => {
-                assert_eq!(arg_count, 2);
-                #[cfg(not(feature = "json"))]
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "bin_record_json_object: turso must be compiled with JSON support"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                #[cfg(feature = "json")]
-                'outer: {
-                    use crate::types::ValueIterator;
-                    use std::str::FromStr;
-
-                    let columns_str = state.registers[*start_reg].get_value();
-                    let bin_record = state.registers[*start_reg + 1].get_value();
-                    let Value::Text(columns_str) = columns_str else {
-                        return Err(LimboError::InvalidArgument(
-                            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
-                        ).into());
-                    };
-
-                    if let Value::Null = bin_record {
-                        state.registers[*dest].set_null();
-                        break 'outer;
-                    }
-
-                    let Value::Blob(bin_record) = bin_record else {
-                        return Err(LimboError::InvalidArgument(
-                            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
-                        ).into());
-                    };
-                    let mut columns_json_array =
-                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
-                    let columns_len = columns_json_array.array_len()?;
-
-                    let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
-
-                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
-                    for i in 0..columns_len {
-                        let mut op = json::jsonb::SearchOperation::new(0)?;
-                        let path = json::path::JsonPath {
-                            elements: vec![
-                                json::path::PathElement::Root(),
-                                json::path::PathElement::ArrayLocator(Some(i as i32)),
-                            ],
-                        };
-
-                        columns_json_array.operate_on_path(&path, &mut op)?;
-                        let column_name = op.result();
-                        json.append_jsonb_to_end(column_name.data());
-
-                        let val = match payload_iterator.next() {
-                            Some(Ok(v)) => v,
-                            Some(Err(e)) => return Err(e.into()),
-                            None => {
-                                return Err(LimboError::InvalidArgument(
-                                    "bin_record_json_object: binary record has fewer columns than specified in the columns argument".to_string()
-                                ).into());
-                            }
-                        };
-
-                        if let ValueRef::Blob(..) = val {
-                            return Err(LimboError::InvalidArgument(
-                                "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
-                            ).into());
-                        }
-                        let val_json =
-                            json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
-                        json.append_jsonb_to_end(val_json.data());
-                    }
-                    json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
-
-                    state.registers[*dest].set_value(json::json_string_to_db_type(
-                        json,
-                        json::jsonb::ElementType::OBJECT,
-                        json::OutputVariant::String,
-                    )?);
-                }
             }
             ScalarFunc::Attach => {
                 assert_eq!(arg_count, 3);
@@ -10686,84 +10517,6 @@ pub fn op_function(
                 // Set result to NULL (detach doesn't return a value)
                 state.registers[*dest].set_null();
             }
-            ScalarFunc::StatInit => {
-                // stat_init(n_col): Initialize a statistics accumulator
-                // Returns a blob containing the serialized StatAccum
-                assert!(arg_count >= 1);
-                let n_col = match state.registers[*start_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(n)) => *n as usize,
-                    _ => 0,
-                };
-                let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes())?;
-            }
-            ScalarFunc::StatPush => {
-                // stat_push(accum_blob, i_chng): Push a row into the accumulator
-                // i_chng is the index of the leftmost column that changed from the previous row
-                // Returns the updated accumulator blob
-                assert!(arg_count >= 2);
-                let accum_blob = state.registers[*start_reg].get_value();
-                let i_chng = match state.registers[*start_reg + 1].get_value() {
-                    Value::Numeric(Numeric::Integer(n)) => *n as usize,
-                    _ => 0,
-                };
-                let result = match accum_blob {
-                    Value::Blob(bytes) => {
-                        if let Some(mut accum) = StatAccum::from_bytes(bytes) {
-                            accum.push(i_chng);
-                            Value::Blob(accum.to_bytes())
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StatGet => {
-                // stat_get(accum_blob): Get the stat1 string from the accumulator
-                // Returns the stat string "total avg1 avg2 ..."
-                assert!(arg_count >= 1);
-                let accum_blob = state.registers[*start_reg].get_value();
-                let result = match accum_blob {
-                    Value::Blob(bytes) => {
-                        if let Some(accum) = StatAccum::from_bytes(bytes) {
-                            let stat_str = accum.get_stat1();
-                            if stat_str.is_empty() {
-                                Value::Null
-                            } else {
-                                Value::build_text(stat_str)
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::ConnTxnId => {
-                // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
-                // If unset (-1), store the candidate and return it.
-                // If already set, return the existing value, ignoring the candidate.
-                assert_eq!(arg_count, 1);
-                let candidate = match state.registers[*start_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(n)) => *n,
-                    _ => -1,
-                };
-                let current = program.connection.get_cdc_transaction_id();
-                if current == -1 {
-                    program.connection.set_cdc_transaction_id(candidate);
-                    state.registers[*dest].set_int(candidate);
-                } else {
-                    state.registers[*dest].set_int(current);
-                }
-            }
-            ScalarFunc::IsAutocommit => {
-                // is_autocommit(): returns 1 if autocommit, 0 otherwise.
-                let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-                state.registers[*dest].set_int(if auto_commit { 1 } else { 0 });
-            }
             ScalarFunc::SequenceWatermark => {
                 assert_eq!(arg_count, 1);
                 let sequence_name = match state.registers[*start_reg].get_value() {
@@ -10790,56 +10543,6 @@ pub fn op_function(
                     Some(watermark) => state.registers[*dest].set_int(watermark),
                     None => state.registers[*dest].set_value(Value::Null),
                 }
-            }
-            ScalarFunc::TestUintEncode => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Numeric(Numeric::Integer(i)) => {
-                        if *i < 0 {
-                            return Err(LimboError::InternalError(
-                                "test_uint_encode: negative value".to_string(),
-                            )
-                            .into());
-                        }
-                        Value::build_text(i.to_string())
-                    }
-                    Value::Numeric(Numeric::Float(f)) => {
-                        if *f < 0.0 || f.fract() != 0.0 {
-                            return Err(LimboError::InternalError(
-                                "test_uint_encode: not a non-negative integer".to_string(),
-                            )
-                            .into());
-                        }
-                        Value::build_text((f64::from(*f) as u64).to_string())
-                    }
-                    Value::Text(t) => {
-                        let s = t.to_string();
-                        s.parse::<u64>().map_err(|_| {
-                            LimboError::InternalError(format!(
-                                "test_uint_encode: invalid uint: {s}"
-                            ))
-                        })?;
-                        Value::build_text(s)
-                    }
-                    _ => {
-                        return Err(LimboError::InternalError(
-                            "test_uint_encode: unsupported type".to_string(),
-                        )
-                        .into());
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintDecode => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    other => other.clone(),
-                };
-                state.registers[*dest].set_value(result);
             }
         },
         crate::function::Func::Vector(vector_func) => {

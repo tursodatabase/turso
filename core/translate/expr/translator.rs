@@ -1398,20 +1398,6 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                #[cfg(feature = "test_helper")]
-                ScalarFunc::TestNondetCounter => {
-                    if !args.is_empty() {
-                        crate::bail_parse_error!("{} function with arguments", srf.to_string());
-                    }
-                    let regs = program.alloc_register();
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg: regs,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::TursoVersion => {
                     if !args.is_empty() {
                         crate::bail_parse_error!("sqlite_version function with arguments");
@@ -1432,45 +1418,6 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::TableColumnsJsonArray => {
-                    if args.len() != 1 {
-                        crate::bail_parse_error!(
-                            "table_columns_json_array() function must have exactly 1 argument",
-                        );
-                    }
-                    let start_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::BinRecordJsonObject => {
-                    if args.len() != 2 {
-                        crate::bail_parse_error!(
-                            "bin_record_json_object() function must have exactly 2 arguments",
-                        );
-                    }
-                    let start_reg = program.alloc_registers(2);
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
-                    translate_expr(
-                        program,
-                        referenced_tables,
-                        &args[1],
-                        start_reg + 1,
-                        resolver,
-                    )?;
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
                 ScalarFunc::Attach => {
                     // ATTACH is handled by the attach.rs module, not here
                     crate::bail_parse_error!(
@@ -1483,20 +1430,6 @@ fn translate_function_call_expr(
                         "DETACH should be handled at statement level, not as expression"
                     );
                 }
-                ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet => {
-                    crate::bail_parse_error!("{} is an internal function used by ANALYZE", srf);
-                }
-                ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
-                    crate::bail_parse_error!("{} is an internal function used by CDC", srf);
-                }
-                ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
                 ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
                     program,
                     args,

@@ -4,6 +4,7 @@ pub(crate) mod constructors;
 pub(crate) mod context;
 pub(crate) mod control;
 pub(crate) mod datetime;
+pub(crate) mod internal;
 pub(crate) mod numeric;
 pub(crate) mod pattern;
 pub(crate) mod values;
@@ -329,6 +330,14 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&constructors::UnionValueFunc, &[]);
     catalog.register(&constructors::UnionTagFunc, &[]);
     catalog.register(&constructors::UnionExtractFunc, &[]);
+    catalog.register(&internal::ConnTxnId, &[]);
+    catalog.register(&internal::IsAutocommit, &[]);
+    catalog.register(&internal::TableColumnsJsonArray, &[]);
+    catalog.register(&internal::BinRecordJsonObject, &[]);
+    catalog.register(&internal::TestUintEncode, &[]);
+    catalog.register(&internal::TestUintDecode, &[]);
+    #[cfg(feature = "test_helper")]
+    catalog.register(&internal::TestNondetCounter, &[]);
     catalog
 });
 

@@ -1569,7 +1569,7 @@ fn emit_cdc_insns_v2(
     let candidate_reg = program.alloc_register();
     emit_cdc_change_id(program, resolver, cdc_cursor_id, candidate_reg)?;
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-        func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+        func: Func::RegisteredScalar(&crate::scalar::internal::ConnTxnId),
         arg_count: 1,
         collation: CollationSeq::BINARY,
     };
@@ -1691,7 +1691,7 @@ pub fn emit_cdc_commit_insns(
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-        func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+        func: Func::RegisteredScalar(&crate::scalar::internal::ConnTxnId),
         arg_count: 1,
         collation: CollationSeq::BINARY,
     };
@@ -1762,7 +1762,7 @@ pub fn emit_cdc_autocommit_commit(
 
     // Check if we're in autocommit mode; if so, emit a COMMIT record.
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
-        func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
+        func: Func::RegisteredScalar(&crate::scalar::internal::IsAutocommit),
         arg_count: 0,
         collation: CollationSeq::BINARY,
     };
@@ -1795,7 +1795,7 @@ pub fn emit_cdc_autocommit_commit(
                 start_reg: minus_one_reg,
                 dest: txn_id_reg,
                 func: crate::function::FuncCtx {
-                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+                    func: Func::RegisteredScalar(&crate::scalar::internal::ConnTxnId),
                     arg_count: 1,
                     collation: CollationSeq::BINARY,
                 },
@@ -1850,7 +1850,7 @@ pub fn emit_cdc_explicit_commit_insns(
         start_reg: minus_one_reg,
         dest: txn_id_reg,
         func: crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+            func: Func::RegisteredScalar(&crate::scalar::internal::ConnTxnId),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },

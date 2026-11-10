@@ -394,10 +394,6 @@ pub(crate) fn resolve_builtin_function_name(
         "jsonb_set" => Ok(Some(Func::Json(JsonFunc::JsonbSet))),
         #[cfg(feature = "json")]
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
-        "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
-        "bin_record_json_object" => Ok(Some(Func::Scalar(ScalarFunc::BinRecordJsonObject))),
-        "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
-        "is_autocommit" => Ok(Some(Func::Scalar(ScalarFunc::IsAutocommit))),
         "sequence_watermark_experimental" => Ok(Some(Func::Scalar(ScalarFunc::SequenceWatermark))),
         "acos" => Ok(Some(Func::Math(MathFunc::Acos))),
         "acosh" => Ok(Some(Func::Math(MathFunc::Acosh))),
@@ -452,10 +448,6 @@ pub(crate) fn resolve_builtin_function_name(
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         "fts_highlight" => Ok(Some(Func::Fts(FtsFunc::Highlight))),
         // Test type functions (for custom type system testing)
-        "test_uint_encode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEncode))),
-        "test_uint_decode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDecode))),
-        #[cfg(feature = "test_helper")]
-        "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         // Built-in type support functions
         // Array construction / element access (desugared from syntax)
         // Array functions

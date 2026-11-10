@@ -4,7 +4,7 @@ use crate::translate::collate::CollationSeq;
 
 use crate::{
     bail_parse_error,
-    function::{Func, FuncCtx, ScalarFunc},
+    function::{Func, FuncCtx},
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
@@ -518,7 +518,7 @@ fn emit_index_stats(
         start_reg: reg_chng,
         dest: reg_accum,
         func: FuncCtx {
-            func: Func::Scalar(ScalarFunc::StatInit),
+            func: Func::RegisteredScalar(&crate::scalar::internal::StatInit),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },
@@ -607,7 +607,7 @@ fn emit_index_stats(
         start_reg: reg_accum,
         dest: reg_accum,
         func: FuncCtx {
-            func: Func::Scalar(ScalarFunc::StatPush),
+            func: Func::RegisteredScalar(&crate::scalar::internal::StatPush),
             arg_count: 2,
             collation: CollationSeq::BINARY,
         },
@@ -628,7 +628,7 @@ fn emit_index_stats(
         start_reg: reg_accum,
         dest: reg_stat,
         func: FuncCtx {
-            func: Func::Scalar(ScalarFunc::StatGet),
+            func: Func::RegisteredScalar(&crate::scalar::internal::StatGet),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },
