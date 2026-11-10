@@ -438,17 +438,18 @@ fn prepare_update_plan(
     };
 
     let columns = table.columns();
+    // As in SQLite, WHERE cannot name a RETURNING alias.
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
-        Some(&result_columns),
+        None,
         &mut where_clause,
         resolver,
     )?;
     append_vtab_predicates_to_where_clause(
         &mut vtab_predicates,
         &mut read_scope_tables,
-        &result_columns,
+        &[],
         &mut where_clause,
         resolver,
     )?;
