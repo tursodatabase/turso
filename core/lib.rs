@@ -97,6 +97,9 @@ mod vtab;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func};
+/// The input functions of the network address types, which PostgreSQL's
+/// pg_input_is_valid() also uses.
+pub use functions::network::{parse_cidr, parse_inet, parse_macaddr, parse_macaddr8};
 /// The printf engine backing the SQL printf()/format() functions, also used
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.

@@ -856,3 +856,85 @@ expect {
     1|0
     1
 }
+
+test network-types-are-stored-as-postgres-prints-them {
+    CREATE TABLE addrs (id int PRIMARY KEY, i inet, c cidr, m macaddr, m8 macaddr8);
+    INSERT INTO addrs VALUES
+        (1, '192.168.1.5/24', '10', '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05'),
+        (2, '::1/128', '192.168.1', '08-00-2B-01-02-03', '08-00-2b-01-02-03'),
+        (3, '0:0:0:0:0:0:0:1', '2001:DB8::/32', '0800.2b01.0203', '0800.2b01.0203.0405'),
+        (4, '192.168.1.5/32', '1.2.3.4', '08002b:010203', '08002b0102030405'),
+        (5, '10/8', '::1', '1:2:3:4:5:6', ' 08:00:2b:01:02:03 '),
+        (6, '::ffff:1.2.3.4', '224', ' 08:00:2b:01:02:03 ', NULL);
+    SELECT id, i, c, m, m8 FROM addrs ORDER BY id;
+}
+expect {
+    1|192.168.1.5/24|10.0.0.0/8|08:00:2b:01:02:03|08:00:2b:01:02:03:04:05
+    2|::1|192.168.1.0/24|08:00:2b:01:02:03|08:00:2b:ff:fe:01:02:03
+    3|::1|2001:db8::/32|08:00:2b:01:02:03|08:00:2b:01:02:03:04:05
+    4|192.168.1.5|1.2.3.4/32|08:00:2b:01:02:03|08:00:2b:01:02:03:04:05
+    5|10.0.0.0/8|::1/128|01:02:03:04:05:06|08:00:2b:ff:fe:01:02:03
+    6|::ffff:1.2.3.4|224.0.0.0/4|08:00:2b:01:02:03|
+}
+
+test network-types-compare-with-the-printed-value {
+    CREATE TABLE addrs (id int PRIMARY KEY, i inet, m macaddr);
+    INSERT INTO addrs VALUES (1, '0:0:0:0:0:0:0:1', '08-00-2B-01-02-03'), (2, '10.0.0.1', '08:00:2b:01:02:04');
+    SELECT id FROM addrs WHERE i = '::1' AND m = '08:00:2b:01:02:03';
+}
+expect {
+    1
+}
+
+test network-types-input-is-valid {
+    SELECT pg_input_is_valid('192.168.1.5/24', 'inet')::int,
+        pg_input_is_valid('192.168.1.5/24', 'cidr')::int,
+        pg_input_is_valid('08-00-2b-01-02-03', 'macaddr')::int,
+        pg_input_is_valid('08:00:2b:01:02:03:04:05', 'macaddr8')::int,
+        pg_input_is_valid('garbage', 'macaddr8')::int;
+}
+expect {
+    1|0|1|1|0
+}
+
+test inet-garbage-rejected {
+    CREATE TABLE addrs (i inet);
+    INSERT INTO addrs VALUES ('garbage');
+}
+@sqlstate 22P02
+expect error {}
+
+test cidr-garbage-rejected {
+    CREATE TABLE addrs (c cidr);
+    INSERT INTO addrs VALUES ('garbage');
+}
+@sqlstate 22P02
+expect error {}
+
+test cidr-with-bits-right-of-the-netmask-rejected {
+    CREATE TABLE addrs (c cidr);
+    INSERT INTO addrs VALUES ('192.168.1.5/24');
+}
+@sqlstate 22P02
+expect error {}
+
+test macaddr-garbage-rejected {
+    CREATE TABLE addrs (m macaddr);
+    INSERT INTO addrs VALUES ('garbage');
+}
+@sqlstate 22P02
+expect error {}
+
+test macaddr-octet-out-of-range-rejected {
+    CREATE TABLE addrs (m macaddr);
+    INSERT INTO addrs VALUES ('1:2:3:4:5:300');
+}
+@sqlstate 22003
+expect error {}
+
+test macaddr8-garbage-rejected {
+    CREATE TABLE addrs (m8 macaddr8);
+    INSERT INTO addrs VALUES ('garbage');
+}
+@sqlstate 22P02
+expect error {}

@@ -495,7 +495,13 @@ fn check_divisor(
     let rhs_val = state.registers[rhs].get_value();
     if let Value::Text(t) = rhs_val {
         match Numeric::from_value_strict(rhs_val) {
-            None => return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()).into()),
+            None => {
+                return Err(LimboError::InvalidTextRepresentation {
+                    type_name: "numeric",
+                    input: t.as_str().to_owned(),
+                }
+                .into())
+            }
             Some(n) if !n.to_bool() => return Err(LimboError::DivisionByZero.into()),
             _ => {}
         }
@@ -11339,24 +11345,19 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::ValidateIpAddr => {
+            ScalarFunc::ValidateIpAddr
+            | ScalarFunc::ValidateCidr
+            | ScalarFunc::ValidateMacAddr
+            | ScalarFunc::ValidateMacAddr8 => {
+                use crate::functions::network;
                 check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Text(t) => {
-                        let v = &t.value;
-                        v.parse::<std::net::IpAddr>().map_err(|_| {
-                            LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
-                        })?;
-                        val.get_value().clone()
-                    }
-                    other => {
-                        return Err(LimboError::Constraint(format!(
-                            "invalid input for type inet: \"{other}\""
-                        ))
-                        .into());
-                    }
+                let val = state.registers[*start_reg].get_value();
+                let result = match scalar_func {
+                    ScalarFunc::ValidateIpAddr => network::exec_inet_in(val)?,
+                    ScalarFunc::ValidateCidr => network::exec_cidr_in(val)?,
+                    ScalarFunc::ValidateMacAddr => network::exec_macaddr_in(val)?,
+                    ScalarFunc::ValidateMacAddr8 => network::exec_macaddr8_in(val)?,
+                    _ => unreachable!("not a network type input function"),
                 };
                 state.registers[*dest].set_value(result);
             }

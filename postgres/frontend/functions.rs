@@ -1,6 +1,6 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
-use crate::error::sqlstate_error;
+use crate::error::{sqlstate, sqlstate_error};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
@@ -1449,41 +1449,15 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "inet" | "cidr" => {
-            // Accept IP address with optional /prefix
-            let addr_part = trimmed.split('/').next().unwrap_or(trimmed);
-            if addr_part.parse::<std::net::IpAddr>().is_ok() {
-                // If there's a prefix, validate it
-                if let Some(prefix_str) = trimmed.split('/').nth(1) {
-                    if prefix_str.parse::<u8>().is_err() {
-                        return Some((
-                            format!("invalid input syntax for type {base_type}: \"{input}\""),
-                            "22P02".to_string(),
-                        ));
-                    }
-                }
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type {base_type}: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
-        }
-        "macaddr" => {
-            let parts: Vec<&str> = trimmed.split(':').collect();
-            if parts.len() == 6
-                && parts
-                    .iter()
-                    .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type macaddr: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
+        "inet" | "cidr" | "macaddr" | "macaddr8" => {
+            let parse = match base_type.as_str() {
+                "inet" => turso_core::parse_inet,
+                "cidr" => turso_core::parse_cidr,
+                "macaddr" => turso_core::parse_macaddr,
+                _ => turso_core::parse_macaddr8,
+            };
+            let error = parse(input).err()?;
+            Some((error.to_string(), sqlstate(&error).to_string()))
         }
         "oid" => {
             if trimmed.parse::<u32>().is_ok() {

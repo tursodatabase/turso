@@ -217,7 +217,7 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-fn sqlstate(error: &LimboError) -> &'static str {
+pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
@@ -235,7 +235,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::SqlError(msg) => sql_error_sqlstate(msg),
         LimboError::PlanningError(_) => SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION,
         LimboError::DivisionByZero => SQLSTATE_DIVISION_BY_ZERO,
-        LimboError::InvalidTextRepresentation(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        LimboError::InvalidTextRepresentation { .. } => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         LimboError::IntegerOverflow => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
         LimboError::TooBig => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
         LimboError::InvalidDate(_)
@@ -369,6 +369,10 @@ fn is_duplicate_object_error(msg: &str) -> bool {
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("no such database") {
         SQLSTATE_INVALID_SCHEMA_NAME
+    } else if msg.starts_with("invalid cidr value: ") {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg.starts_with("invalid octet value in ") {
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else {
         SQLSTATE_DATA_EXCEPTION
     }
