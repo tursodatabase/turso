@@ -8530,8 +8530,8 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 }
 
 /// The functions that the translator calls in the SQL it writes, such as
-/// `array_element()` for a subscript. PostgreSQL does not have them, so user
-/// SQL cannot call them.
+/// `array_element()` for a subscript and `pg_limit_value()` for a LIMIT
+/// expression. PostgreSQL does not have them, so user SQL cannot call them.
 pub const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
     "array",
     "array_contains",
@@ -8540,9 +8540,13 @@ pub const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
     "array_overlap",
     "array_slice",
     "coalesce",
+    "current_role",
     "int8_out_of_range",
     "json_type",
     "nullif",
+    "pg_limit_value",
+    "pg_lock_access_share",
+    "user",
 ];
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {

@@ -1053,3 +1053,32 @@ test regexp-is-not-available {
 }
 @sqlstate 42883
 expect error {}
+
+# The frontend's own functions that PostgreSQL has only as keywords, such
+# as USER, or that only the translator calls, such as pg_limit_value for a
+# LIMIT expression, are not available either. select.sqltest tests
+# int8_out_of_range.
+
+test current-role-is-not-available {
+    SELECT "current_role"();
+}
+@sqlstate 42883
+expect error {}
+
+test pg-limit-value-is-not-available {
+    SELECT pg_limit_value(1, 'LIMIT');
+}
+@sqlstate 42883
+expect error {}
+
+test pg-lock-access-share-is-not-available {
+    SELECT pg_lock_access_share();
+}
+@sqlstate 42883
+expect error {}
+
+test user-is-not-available {
+    SELECT "user"();
+}
+@sqlstate 42883
+expect error {}
