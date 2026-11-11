@@ -81,7 +81,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         | "pg_get_statisticsobjdef_columns"(FunctionArity::Exact(1), true) => None::<String>,
         "pg_relation_is_publishable"(FunctionArity::Exact(1), true) => None::<Boolean>,
         "quote_ident"(FunctionArity::Exact(1), true) => {
-            turso_pg_parser::quote_identifier(&text_arg(args, 0))
+            typed_text_arg("quote_ident", args, 0)?.map(turso_pg_parser::quote_identifier)
         },
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
@@ -104,12 +104,11 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "age"(FunctionArity::OneOf(&[1, 2]), false, called_on_null_input) => exec_age(args)?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true, called_on_null_input) => {
-            let input = args[0].get_value();
+            let input = typed_text_arg("pg_input_is_valid", args, 0)?;
             let type_name = typed_text_arg("pg_input_is_valid", args, 1)?;
-            match input {
-                Value::Null => None,
-                input => type_name.map(|type_name| exec_pg_input_is_valid(input, type_name)),
-            }
+            input
+                .zip(type_name)
+                .map(|(input, type_name)| exec_pg_input_is_valid(input, type_name))
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -1178,12 +1177,8 @@ fn format_interval(months: i64, days: i64, micros: i64) -> String {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Boolean {
-    let s = match input {
-        Value::Text(t) => t.as_str().to_string(),
-        v => v.to_string(),
-    };
-    Boolean(validate_pg_input(&s, type_name).is_none())
+fn exec_pg_input_is_valid(input: &str, type_name: &str) -> Boolean {
+    Boolean(validate_pg_input(input, type_name).is_none())
 }
 
 /// The text argument at `i`, or None if it is NULL. Any other type gets

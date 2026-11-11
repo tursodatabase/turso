@@ -413,6 +413,22 @@ expect error {
     function pg_input_is_valid\(.*, integer\) does not exist
 }
 
+test pg-input-is-valid-integer-input-errors {
+    SELECT pg_input_is_valid(1, 'int4');
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(integer, .*\) does not exist
+}
+
+test pg-input-is-valid-integer-input-errors-with-a-null-type-name {
+    SELECT pg_input_is_valid(1, NULL);
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(integer, .*\) does not exist
+}
+
 test to-char-integer-format-errors-with-a-null-value {
     SELECT to_char(NULL, 5);
 }
@@ -434,6 +450,14 @@ test age-integer-errors-with-a-null-argument {
 }
 expect error {
     function age\(integer, unknown\) does not exist
+}
+
+test quote-ident-integer-errors {
+    SELECT quote_ident(5);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(integer\) does not exist
 }
 
 test current-setting-numeric-parameter-name-errors {
