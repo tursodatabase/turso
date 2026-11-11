@@ -290,7 +290,9 @@ pub fn expr_contains_nondeterministic_scalar_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    expr_contains_function(expr, resolver, is_nondeterministic_scalar_like_function)
+    expr_contains_function(expr, resolver, |func, _| {
+        is_scalar_like_function(func) && !func.is_deterministic()
+    })
 }
 
 /// Returns true if this expression calls a scalar function that can give a
@@ -303,20 +305,19 @@ pub fn expr_contains_function_that_changes_within_statement(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    expr_contains_function(expr, resolver, |func| {
-        is_nondeterministic_scalar_like_function(func) && func.date_time_arguments().is_none()
+    expr_contains_function(expr, resolver, |func, args| {
+        is_scalar_like_function(func)
+            && func.volatility(args) == crate::scalar::Volatility::Volatile
     })
 }
 
-fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
+fn is_scalar_like_function(func: &Func) -> bool {
     match func {
         // Aggregate and window function calls themselves are not flagged
         // at any nesting depth — their outputs are deterministic given the
         // same input rows. The walker still descends into their args,
         // FILTER, and OVER subexprs, so nondet scalars buried inside
-        // (e.g. `sum(random())`) are still caught. Note also that
-        // `AggFunc::is_deterministic` returns `false`, so the catch-all
-        // below would otherwise flag every aggregate call.
+        // (e.g. `sum(random())`) are still caught.
         Func::Agg(_) | Func::Window(_) => false,
 
         // User-defined scalar functions can do anything, so treat them
@@ -326,14 +327,14 @@ fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
         // stable.
         Func::External(external) if external.func.is_aggregate() => false,
 
-        _ => !func.is_deterministic(),
+        _ => true,
     }
 }
 
 fn expr_contains_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
-    matches_function: impl Fn(&Func) -> bool,
+    matches_function: impl Fn(&Func, &[Box<ast::Expr>]) -> bool,
 ) -> Result<bool> {
     let mut found = false;
     crate::util::walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
@@ -341,18 +342,21 @@ fn expr_contains_function(
             return Ok(WalkControl::SkipChildren);
         }
 
-        let func = match e {
+        let (func, args): (_, &[Box<ast::Expr>]) = match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                resolver.resolve_function(name.as_str(), args.len())?
+                (resolver.resolve_function(name.as_str(), args.len())?, args)
             }
             ast::Expr::FunctionCallStar { name, .. } => {
-                resolver.resolve_function(name.as_str(), 0)?
+                (resolver.resolve_function(name.as_str(), 0)?, &[])
             }
-            _ => None,
+            _ => (None, &[]),
         };
 
         // If the name is unknown here, leave the error to the normal resolver.
-        if func.as_ref().is_some_and(&matches_function) {
+        if func
+            .as_ref()
+            .is_some_and(|func| matches_function(func, args))
+        {
             found = true;
             return Ok(WalkControl::SkipChildren);
         }

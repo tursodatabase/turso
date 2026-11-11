@@ -6927,46 +6927,6 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
     Ok(clone.to_string())
 }
 
-pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
-    match func.date_time_arguments() {
-        Some(crate::scalar::DateTimeArguments::TimeValue { index }) => {
-            args.len() > index
-                && !is_current_time_expr(args[index].as_ref())
-                && !args[index + 1..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
-        }
-        Some(crate::scalar::DateTimeArguments::TimePair) => {
-            !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
-        }
-        None => func.is_deterministic(),
-    }
-}
-
-fn is_current_time_expr(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
-    ) || matches!(
-        expr,
-        Expr::Literal(
-            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
-        )
-    )
-}
-
-fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ast::Literal::String(value))
-            if string_literal_eq(value, "localtime") || string_literal_eq(value, "utc")
-    ) || is_current_time_expr(expr)
-}
-
-fn string_literal_eq(value: &str, expected: &str) -> bool {
-    value.trim_matches('\'').eq_ignore_ascii_case(expected)
-}
-
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
@@ -7004,7 +6964,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            if !is_deterministic_schema_function_call(&func, args) {
+            if func.volatility(args) != crate::scalar::Volatility::Immutable {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {

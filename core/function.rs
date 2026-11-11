@@ -1274,10 +1274,11 @@ impl Func {
         }
     }
 
-    pub fn date_time_arguments(&self) -> Option<scalar::DateTimeArguments> {
+    pub fn volatility(&self, args: &[Box<turso_parser::ast::Expr>]) -> scalar::Volatility {
         match self {
-            Self::Scalar(function) => function.date_time_arguments(),
-            _ => None,
+            Self::Scalar(function) => function.volatility(args),
+            _ if self.is_deterministic() => scalar::Volatility::Immutable,
+            _ => scalar::Volatility::Volatile,
         }
     }
 

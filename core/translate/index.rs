@@ -31,10 +31,7 @@ use crate::{
     bail_parse_error, CaptureDataChangesExt, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
-    schema::{
-        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
-        SchemaObjectType,
-    },
+    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType, SchemaObjectType},
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
@@ -1279,8 +1276,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+        Func::resolve_function(&n, args.len()).is_ok_and(|f| {
+            f.is_some_and(|f| f.volatility(args) == crate::scalar::Volatility::Immutable)
+        })
     };
 
     let mut ok = true;

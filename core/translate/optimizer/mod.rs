@@ -14,7 +14,7 @@ use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
-    function::{AggFunc, Deterministic},
+    function::AggFunc,
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
@@ -4160,11 +4160,8 @@ impl Optimizable for ast::Expr {
                 else {
                     return false;
                 };
-                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and time
-                // functions return the same value for the whole statement, so they
-                // can be computed once instead of on every row.
                 let same_for_whole_statement =
-                    func.is_deterministic() || func.date_time_arguments().is_some();
+                    func.volatility(args) != crate::scalar::Volatility::Volatile;
                 same_for_whole_statement && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,

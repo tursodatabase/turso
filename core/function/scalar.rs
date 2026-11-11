@@ -40,8 +40,13 @@ pub trait ScalarFunction: Debug + Send + Sync {
         self.metadata().name.to_string()
     }
 
-    fn date_time_arguments(&self) -> Option<DateTimeArguments> {
-        None
+    /// How the result can change for fixed argument values.
+    fn volatility(&self, _args: &[Box<turso_parser::ast::Expr>]) -> Volatility {
+        if self.metadata().deterministic {
+            Volatility::Immutable
+        } else {
+            Volatility::Volatile
+        }
     }
     /// Resume with the same arguments and state after I/O completes.
     /// The VM discards state on completion, error, reset, or cancellation.
@@ -65,11 +70,14 @@ pub enum ArgumentTranslation {
     ComparedPair,
 }
 
-/// Arguments checked for clock or timezone dependence in schema expressions.
-#[derive(Debug, Clone, Copy)]
-pub enum DateTimeArguments {
-    TimeValue { index: usize },
-    TimePair,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Volatility {
+    /// The same arguments always produce the same result.
+    Immutable,
+    /// The same arguments produce the same result within a statement.
+    Stable,
+    /// The result can change between calls within a statement.
+    Volatile,
 }
 
 #[derive(Debug)]
