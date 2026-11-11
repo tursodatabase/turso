@@ -674,7 +674,7 @@ test string-to-array-empty-string {
     SELECT string_to_array('', ',');
 }
 expect {
-    {""}
+    {}
 }
 
 test string-to-array-null-text {

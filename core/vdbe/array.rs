@@ -276,15 +276,10 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     match val {
         Value::Null => None,
         Value::Blob(b) => match ValueIterator::new(b) {
-            Ok(iter) => {
-                let count = iter.count();
-                (count > 0).then_some(count as i64)
-            }
+            Ok(iter) => Some(iter.count() as i64),
             Err(_) => None,
         },
-        Value::Text(t) => {
-            parse_text_array(t.as_str()).and_then(|v| (!v.is_empty()).then_some(v.len() as i64))
-        }
+        Value::Text(t) => parse_text_array(t.as_str()).map(|v| v.len() as i64),
         _ => None,
     }
 }

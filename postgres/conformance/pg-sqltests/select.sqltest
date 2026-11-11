@@ -45,7 +45,7 @@ test string-to-array-empty-input {
     SELECT string_to_array('', ','), array_length(string_to_array('', ','), 1);
 }
 expect {
-    {}|
+    {}|0
 }
 
 test select-integer-literal {

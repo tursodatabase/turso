@@ -168,7 +168,7 @@ test string-to-array-empty-string {
     SELECT array_length(string_to_array('', ','));
 }
 expect {
-    1
+    0
 }
 
 test string-to-array-empty-delimiter {
