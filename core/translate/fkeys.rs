@@ -1926,7 +1926,7 @@ fn emit_fk_action_subprogram(
         subprogram_builder.prologue();
         // Foreign-key actions see every row, as in PostgreSQL, so a cascading
         // delete also removes the rows that row-level security hides.
-        resolver.without_row_security(|resolver| {
+        resolver.as_superuser(|resolver| {
             translate_inner(
                 stmt,
                 resolver,

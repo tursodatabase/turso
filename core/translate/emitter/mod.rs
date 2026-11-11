@@ -189,7 +189,7 @@ pub struct Resolver<'a> {
     /// compiled. Every caller of [`Resolver::new`] says which role it is, so
     /// that compiling a statement as the superuser is a visible choice: the
     /// engine makes it for the statements it runs on its own behalf and
-    /// inside [`Resolver::without_row_security`].
+    /// inside [`Resolver::as_superuser`].
     pub(crate) row_security_role: RoleId,
 }
 
@@ -396,7 +396,7 @@ impl Resolver<'static> {
 impl<'a> Resolver<'a> {
     /// Compiles `f` as for the superuser, so row-level security limits
     /// nothing, and then restores the role.
-    pub(crate) fn without_row_security<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+    pub(crate) fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
         let result = f(self);
         self.row_security_role = role;
