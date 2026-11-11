@@ -8922,6 +8922,9 @@ fn camel_to_sql(s: &str) -> String {
 /// Returns a human-readable SQL name for a `NodeRef` statement type.
 /// Strips the "Stmt" suffix and converts CamelCase → "CREATE EXTENSION" etc.
 fn node_ref_name(node: &NodeRef) -> String {
+    if let NodeRef::CreateTrigStmt(_) = node {
+        return "CREATE TRIGGER".to_string();
+    }
     let debug = format!("{node:?}");
     let variant = debug.split('(').next().unwrap_or("unknown");
     camel_to_sql(variant.trim_end_matches("Stmt"))
