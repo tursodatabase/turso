@@ -25,8 +25,9 @@ use turso_pg_parser::sqlstate::{
 ///
 /// An entry can list the types of its arguments (`[Text, Any]`). A call whose
 /// arguments do not have those types fails with PostgreSQL's "function ... does
-/// not exist" error, also when another argument is NULL, because PostgreSQL
-/// picks the function by its argument types before it runs it. Then the
+/// not exist" error, and an untyped literal that does not convert to its type
+/// fails with that type's input error, also when another argument is NULL,
+/// because PostgreSQL resolves the call before it runs the function. Then the
 /// function returns NULL when any argument is NULL, without running its body,
 /// like a PostgreSQL STRICT function, unless it is marked `called_on_null_input`.
 macro_rules! scalar_functions {
@@ -77,13 +78,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
         "acldefault"(FunctionArity::Exact(2), true, [Text, Oid]) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false, [Oid]) => {
-            oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
+            exec_pg_get_user_by_id(connection, oid_value(args, 0))
         },
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true, [Oid]
-        ) => oid_arg(args, 0)?.map(exec_pg_is_visible),
+        ) => exec_pg_is_visible(oid_value(args, 0)),
         "pg_encoding_to_char"(FunctionArity::Exact(1), true, [Integer]) => {
-            exec_pg_encoding_to_char(int_arg(args, 0, 0))
+            exec_pg_encoding_to_char(int_value(args, 0))
         },
         "pg_get_function_result"
         | "pg_get_function_arguments"
@@ -95,22 +96,24 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
         },
-        "json_strip_nulls"(FunctionArity::Exact(1), true) => {
-            exec_json_strip_nulls(args[0].get_value())?
+        "json_strip_nulls"(FunctionArity::Exact(1), true, [Text]) => {
+            exec_json_strip_nulls(text_value(args, 0))?
         },
-        "format_type"(FunctionArity::OneOf(&[1, 2]), true, [Oid, Integer], called_on_null_input) => oid_arg(args, 0)?
+        "format_type"(FunctionArity::OneOf(&[1, 2]), true, [Oid, Integer], called_on_null_input) => oid_arg(args, 0)
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
-        "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Boolean]) => oid_arg(args, 0)?
-            .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
-        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Any]) => oid_arg(args, 0)?
-            .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
+        "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Boolean]) => {
+            crate::catalog::pg_get_constraintdef(connection, oid_value(args, 0))
+        },
+        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Any]) => {
+            crate::catalog::pg_get_indexdef(connection, oid_value(args, 0))
+        },
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Boolean]) => None::<String>,
         "obj_description"(FunctionArity::OneOf(&[1, 2]), true, [Oid, Text]) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true, [Text, Oid, Boolean]) => {
             // TursoPG stores adbin and conbin as rendered SQL, so the relation OID and pretty flag do not change the output.
             text_value(args, 0).to_string()
         },
-        "to_char"(FunctionArity::Exact(2), true, [Any, Text]) => {
+        "to_char"(FunctionArity::Exact(2), true, [NumericOrTimestamp, Text]) => {
             exec_to_char(args[0].get_value(), text_value(args, 1))
         },
         "age"(FunctionArity::OneOf(&[1, 2]), false, [Timestamp, Timestamp]) => exec_age(args)?,
@@ -139,7 +142,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             crate::session::current_schema(connection)
         },
         "current_schemas"(FunctionArity::Exact(1), false, [Boolean]) => {
-            exec_current_schemas(connection, args[0].get_value())?
+            exec_current_schemas(connection, bool_value(args, 0))
         },
         "current_user" | "current_role" | "user"(FunctionArity::Exact(0), false) => {
             role_name(connection, connection.current_role())?
@@ -158,7 +161,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             }
             0i64
         },
-        "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "pg_limit_value"(FunctionArity::Exact(2), true, [Any, Text]) => exec_pg_limit_value(args)?,
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -263,29 +266,7 @@ impl ScalarReturn for Uuid {
     }
 }
 
-fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<String>> {
-    let include_implicit = match argument {
-        Value::Null => return Ok(None),
-        Value::Text(text) => parse_pg_bool(text.as_str()).ok_or_else(|| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type boolean: \"{}\"",
-                    text.as_str()
-                ),
-            )
-        })?,
-        value => match value.as_int() {
-            Some(0) => false,
-            Some(1) => true,
-            _ => {
-                return Err(undefined_function(
-                    "current_schemas",
-                    &[pg_type_name(value)],
-                ))
-            }
-        },
-    };
+fn exec_current_schemas(conn: &Connection, include_implicit: bool) -> String {
     let schemas = crate::session::current_schemas(conn, include_implicit);
     let mut result = String::from("{");
     for (i, schema) in schemas.iter().enumerate() {
@@ -311,14 +292,12 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
         }
     }
     result.push('}');
-    Ok(Some(result))
+    result
 }
 
 fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<String> {
     let kind_code = text_value(args, 0);
-    let owner = args[1].get_value().as_int().ok_or_else(|| {
-        LimboError::InvalidArgument("acldefault owner must be an OID".to_string())
-    })?;
+    let owner = oid_value(args, 1);
     if !(0..=u32::MAX as i64).contains(&owner) {
         return Err(LimboError::InvalidArgument(
             "acldefault owner must be an OID".to_string(),
@@ -410,19 +389,16 @@ impl AclObjectKind {
 }
 
 fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {
-    args.get(i)
-        .and_then(|arg| arg.get_value().as_int())
-        .unwrap_or(default)
+    match args.get(i).map(Register::get_value) {
+        None | Some(Value::Null) => default,
+        Some(_) => int_value(args, i),
+    }
 }
 
-fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
-    let value = args[i].get_value();
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(text) => parse_oid(text.as_str()).map(Some),
-        value => value.as_int().map(Some).ok_or_else(|| {
-            LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
-        }),
+fn oid_arg(args: &[Register], i: usize) -> Option<i64> {
+    match args[i].get_value() {
+        Value::Null => None,
+        _ => Some(oid_value(args, i)),
     }
 }
 
@@ -463,13 +439,6 @@ fn parse_oid(text: &str) -> Result<i64> {
         return Err(out_of_range());
     }
     Ok(i64::from(oid))
-}
-
-fn text_arg(args: &[Register], i: usize) -> String {
-    match args.get(i).map(Register::get_value) {
-        Some(Value::Text(t)) => t.as_str().to_string(),
-        _ => String::new(),
-    }
 }
 
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
@@ -516,27 +485,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
 
 fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
     let name = text_value(args, 0);
-    let missing_ok = match args.get(1).map(Register::get_value) {
-        None => false,
-        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type boolean: \"{}\"",
-                    text.as_str()
-                ),
-            )
-        })?,
-        Some(value) => match value.as_int() {
-            Some(0) => false,
-            Some(1) => true,
-            _ => {
-                return Err(LimboError::InvalidArgument(
-                    "current_setting requires a boolean".to_string(),
-                ));
-            }
-        },
-    };
+    let missing_ok = args.len() > 1 && bool_value(args, 1);
     let setting = match find_parameter(name) {
         Some(Parameter::BuiltIn(parameter)) => Some(parameter.get(conn)),
         Some(Parameter::Custom(name)) => crate::session::custom_parameter(conn, name),
@@ -565,9 +514,9 @@ fn exec_random(bits: i64) -> f64 {
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
 /// fractions half away from zero, and rejects negative values.
-fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
+fn exec_pg_limit_value(args: &[Register]) -> Result<i64> {
     let value = match args[0].get_value() {
-        Value::Null => return Ok(None),
+        Value::Null => unreachable!("pg_limit_value is strict"),
         Value::Numeric(Numeric::Integer(value)) => *value,
         Value::Numeric(Numeric::Float(value)) => {
             let rounded = f64::from(*value).round();
@@ -591,7 +540,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
     if value < 0 {
-        let clause = text_arg(args, 1);
+        let clause = text_value(args, 1);
         let sqlstate = if clause == "OFFSET" {
             SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
         } else {
@@ -602,7 +551,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
             format!("{clause} must not be negative"),
         ));
     }
-    Ok(Some(value))
+    Ok(value)
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
@@ -647,10 +596,7 @@ fn exec_version() -> String {
 /// in SQL, doubling embedded quotes. Backslashes force the E'' escape-string
 /// form so the result reads back identically regardless of
 /// standard_conforming_strings.
-fn exec_quote_literal(value: &Value) -> Option<String> {
-    if matches!(value, Value::Null) {
-        return None;
-    }
+fn exec_quote_literal(value: &Value) -> String {
     let text = match value {
         Value::Text(t) => t.as_str().to_string(),
         other => other.to_string(),
@@ -660,27 +606,17 @@ fn exec_quote_literal(value: &Value) -> Option<String> {
     } else {
         format!("'{}'", text.replace('\'', "''"))
     };
-    Some(quoted)
+    quoted
 }
 
 /// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
 /// keeping number text and duplicate keys as the json type does.
-fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
-    let json = match value {
-        Value::Null => return Ok(None),
-        Value::Text(text) => text.as_str(),
-        other => {
-            return Err(undefined_function(
-                "json_strip_nulls",
-                &[pg_type_name(other)],
-            ))
-        }
-    };
+fn exec_json_strip_nulls(json: &str) -> Result<String> {
     // Validate first, so the walk below can assume well-formed input.
     serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
     let mut stripped = String::with_capacity(json.len());
     copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
-    Ok(Some(stripped))
+    Ok(stripped)
 }
 
 /// The nesting limit of the walk below, the same as core's jsonb parser. Past
@@ -841,14 +777,14 @@ fn push_json_string(string: &str, out: &mut String) {
     out.push('"');
 }
 
-fn exec_textlike(args: &[Register]) -> Result<Option<Boolean>> {
-    let (Some(text), Some(pattern)) = (
-        args[0].get_value().cast_text_ref(),
-        args[1].get_value().cast_text_ref(),
-    ) else {
-        return Ok(None);
+fn exec_textlike(args: &[Register]) -> Result<Boolean> {
+    let text_of = |i: usize| {
+        args[i]
+            .get_value()
+            .cast_text_ref()
+            .expect("textlike is strict, so its arguments are not NULL")
     };
-    Ok(Some(Boolean(like_matches(&text, &pattern)?)))
+    Ok(Boolean(like_matches(&text_of(0), &text_of(1))?))
 }
 
 /// PostgreSQL's LIKE (MatchText in like_match.c): case-sensitive, `%` and `_`
@@ -987,12 +923,58 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<String> {
     }
 }
 
+/// PostgreSQL's encoding names, indexed by encoding number (pg_wchar.h).
+const PG_ENCODING_NAMES: [&str; 42] = [
+    "SQL_ASCII",
+    "EUC_JP",
+    "EUC_CN",
+    "EUC_KR",
+    "EUC_TW",
+    "EUC_JIS_2004",
+    "UTF8",
+    "MULE_INTERNAL",
+    "LATIN1",
+    "LATIN2",
+    "LATIN3",
+    "LATIN4",
+    "LATIN5",
+    "LATIN6",
+    "LATIN7",
+    "LATIN8",
+    "LATIN9",
+    "LATIN10",
+    "WIN1256",
+    "WIN1258",
+    "WIN866",
+    "WIN874",
+    "KOI8R",
+    "WIN1251",
+    "WIN1252",
+    "ISO_8859_5",
+    "ISO_8859_6",
+    "ISO_8859_7",
+    "ISO_8859_8",
+    "WIN1250",
+    "WIN1253",
+    "WIN1254",
+    "WIN1255",
+    "WIN1257",
+    "KOI8U",
+    "SJIS",
+    "BIG5",
+    "GBK",
+    "UHC",
+    "GB18030",
+    "JOHAB",
+    "SHIFT_JIS_2004",
+];
+
 fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
-    match encoding {
-        6 => "UTF8",
-        0 => "SQL_ASCII",
-        _ => "UTF8",
-    }
+    usize::try_from(encoding)
+        .ok()
+        .and_then(|i| PG_ENCODING_NAMES.get(i))
+        .copied()
+        .unwrap_or("")
 }
 
 /// The name of a type as `format_type` prints it.
@@ -1057,7 +1039,7 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
     let num = match value {
         Value::Numeric(_) => value.as_float(),
         Value::Text(t) => t.as_str().parse::<f64>().ok()?,
-        _ => return None,
+        other => unreachable!("to_char's value is declared numeric or timestamp, got {other:?}"),
     };
     Some(pg_to_char_numeric(num, format))
 }
@@ -1069,7 +1051,9 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
 fn exec_age(args: &[Register]) -> Result<Value> {
     let mut timestamps = Vec::with_capacity(args.len());
     for i in 0..args.len() {
-        timestamps.push(parse_timestamp(text_value(args, i))?);
+        let timestamp = parse_timestamp(text_value(args, i))
+            .expect("check_arg_types accepts only timestamp text for a timestamp argument");
+        timestamps.push(timestamp);
     }
     let (end, start) = match timestamps[..] {
         [start] => (Utc::now().date_naive().and_time(NaiveTime::MIN), start),
@@ -1172,6 +1156,8 @@ pub(crate) enum ArgType {
     Text,
     TextOrBytea,
     Timestamp,
+    /// A number, or text, which stands for a timestamp or interval.
+    NumericOrTimestamp,
     Oid,
     Integer,
     Boolean,
@@ -1186,16 +1172,27 @@ fn check_arg_types(name: &str, arg_types: &[ArgType], args: &[Register]) -> Resu
             (_, Value::Null)
             | (ArgType::Any, _)
             | (ArgType::Text | ArgType::TextOrBytea, Value::Text(_))
-            | (ArgType::TextOrBytea, Value::Blob(_)) => true,
+            | (ArgType::TextOrBytea, Value::Blob(_))
+            | (ArgType::NumericOrTimestamp, Value::Numeric(_) | Value::Text(_)) => true,
             (ArgType::Timestamp, Value::Text(text)) => {
                 parse_timestamp(text.as_str()).map(|_| true)?
             }
             (ArgType::Oid, Value::Text(text)) => parse_oid(text.as_str()).map(|_| true)?,
             (ArgType::Integer, Value::Text(text)) => {
-                text.as_str()
+                let value = text
+                    .as_str()
                     .trim()
                     .parse::<i64>()
                     .map_err(|_| invalid_text_representation("integer", text.as_str()))?;
+                if i32::try_from(value).is_err() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                        format!(
+                            "value \"{}\" is out of range for type integer",
+                            text.as_str()
+                        ),
+                    ));
+                }
                 true
             }
             (ArgType::Boolean, Value::Text(text)) => {
@@ -1203,7 +1200,11 @@ fn check_arg_types(name: &str, arg_types: &[ArgType], args: &[Register]) -> Resu
                     .ok_or_else(|| invalid_text_representation("boolean", text.as_str()))?;
                 true
             }
-            (ArgType::Oid | ArgType::Integer, Value::Numeric(Numeric::Integer(_))) => true,
+            (ArgType::Oid, Value::Numeric(Numeric::Integer(_))) => true,
+            // A larger integer is a bigint, which PostgreSQL does not pass to an integer argument.
+            (ArgType::Integer, Value::Numeric(Numeric::Integer(value))) => {
+                i32::try_from(*value).is_ok()
+            }
             // Booleans are stored as the integers 0 and 1.
             (ArgType::Boolean, Value::Numeric(Numeric::Integer(0 | 1))) => true,
             _ => false,
@@ -1234,6 +1235,29 @@ fn bool_value(args: &[Register], i: usize) -> bool {
         Value::Text(text) => parse_pg_bool(text.as_str())
             .expect("check_arg_types accepts only boolean text for a boolean argument"),
         other => unreachable!("argument {i} is declared boolean, got {other:?}"),
+    }
+}
+
+/// The non-NULL argument at `i` of a function that declares it as an integer.
+fn int_value(args: &[Register], i: usize) -> i64 {
+    match args[i].get_value() {
+        Value::Numeric(Numeric::Integer(value)) => *value,
+        Value::Text(text) => text
+            .as_str()
+            .trim()
+            .parse()
+            .expect("check_arg_types accepts only integer text for an integer argument"),
+        other => unreachable!("argument {i} is declared integer, got {other:?}"),
+    }
+}
+
+/// The non-NULL argument at `i` of a function that declares it as an oid.
+fn oid_value(args: &[Register], i: usize) -> i64 {
+    match args[i].get_value() {
+        Value::Numeric(Numeric::Integer(value)) => *value,
+        Value::Text(text) => parse_oid(text.as_str())
+            .expect("check_arg_types accepts only oid text for an oid argument"),
+        other => unreachable!("argument {i} is declared oid, got {other:?}"),
     }
 }
 

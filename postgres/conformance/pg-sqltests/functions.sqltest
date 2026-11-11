@@ -508,6 +508,97 @@ expect {
     equal|different
 }
 
+test integer-arguments-read-untyped-number-literals {
+    SELECT pg_encoding_to_char('6'), format_type(1043, '20');
+}
+expect {
+    UTF8|character varying(16)
+}
+
+test pg-encoding-to-char-names-every-encoding {
+    SELECT pg_encoding_to_char(1), pg_encoding_to_char(7), pg_encoding_to_char(41),
+           CASE WHEN pg_encoding_to_char(42) = '' THEN 'empty' ELSE 'not empty' END;
+}
+expect {
+    EUC_JP|MULE_INTERNAL|SHIFT_JIS_2004|empty
+}
+
+test oid-arguments-read-untyped-oid-literals {
+    SELECT acldefault('r', '4294967294');
+}
+expect {
+    {4294967294=arwdDxtm/4294967294}
+}
+
+test to-char-bytea-value-errors {
+    SELECT to_char('\x41'::bytea, '9');
+}
+@sqlstate 42883
+expect error {
+    function to_char\(bytea, .*\) does not exist
+}
+
+test boolean-arguments-read-untyped-boolean-literals {
+    SELECT CASE WHEN current_setting('no_such.setting', 'on') IS NULL THEN 'null' ELSE 'not null' END,
+           CASE WHEN current_schemas('t') = current_schemas(true) THEN 'same' ELSE 'different' END;
+}
+expect {
+    null|same
+}
+
+test pg-get-expr-integer-expression-errors-with-every-argument-type {
+    SELECT pg_get_expr(5, 1259);
+}
+@sqlstate 42883
+expect error {
+    function pg_get_expr\(integer, integer\) does not exist
+}
+
+test current-setting-integer-missing-ok-errors {
+    SELECT current_setting('search_path', 2);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(.*, integer\) does not exist
+}
+
+test integer-argument-untyped-literal-must-be-an-integer {
+    SELECT format_type(23, 'abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "abc"
+}
+
+test integer-argument-untyped-literal-must-fit-an-integer {
+    SELECT format_type(23, '3000000000');
+}
+@sqlstate 22003
+expect error {
+    value "3000000000" is out of range for type integer
+}
+
+test integer-argument-bigint-errors {
+    SELECT format_type(23, 3000000000);
+}
+@sqlstate 42883
+expect error {
+    function format_type\(integer, .*\) does not exist
+}
+
+test oid-argument-numeric-errors {
+    SELECT format_type(1.5, 1);
+}
+@sqlstate 42883
+expect error {
+    function format_type\(numeric, integer\) does not exist
+}
+
+test timestamp-argument-untyped-literal-must-be-a-timestamp {
+    SELECT age(NULL, 'garbage');
+}
+expect error {}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
