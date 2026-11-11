@@ -18,7 +18,7 @@ test invalid-date-rejected {
     INSERT INTO t1 VALUES (1, 'not-a-date');
 }
 expect error {
-    invalid date value
+    invalid input syntax for type date
 }
 
 @requires strict "uses STRICT tables"
@@ -27,7 +27,7 @@ test invalid-date-format-rejected {
     INSERT INTO t1 VALUES (1, '15/01/2024');
 }
 expect error {
-    invalid date value
+    invalid input syntax for type date
 }
 
 @requires strict "uses STRICT tables"
@@ -83,7 +83,7 @@ test invalid-time-rejected {
     INSERT INTO t1 VALUES (1, 'not-a-time');
 }
 expect error {
-    invalid time value
+    invalid input syntax for type time
 }
 
 @requires strict "uses STRICT tables"
@@ -114,5 +114,5 @@ test invalid-timestamp-rejected {
     INSERT INTO t1 VALUES (1, 'not-a-timestamp');
 }
 expect error {
-    invalid timestamp value
+    invalid input syntax for type timestamp
 }

@@ -555,6 +555,12 @@ pub struct TypeDef {
     /// Whether values of the type take a COLLATE, as PostgreSQL's text types
     /// do. None for a domain, which takes the answer of its base type.
     pub accepts_collate: Option<bool>,
+    /// Whether the stored form of the type sorts in the same order as its
+    /// values, so an index on a column of the type can serve a range or ORDER
+    /// BY even though the type has no ordering of its own. True only for the
+    /// built-in date and time types, which store one text form with a 4-digit
+    /// year. False for a domain, whose index then serves only `=`.
+    pub stored_form_sorts_in_value_order: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -834,6 +840,14 @@ impl TypeDef {
                         // A user type takes a COLLATE when its values are text.
                         TypeOrigin::User => base.eq_ignore_ascii_case("text"),
                     }),
+                    stored_form_sorts_in_value_order: match origin {
+                        TypeOrigin::Builtin {
+                            stored_form_sorts_in_value_order,
+                            ..
+                        } => stored_form_sorts_in_value_order,
+                        // A user type's ENCODE may store any form.
+                        TypeOrigin::User => false,
+                    },
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -869,6 +883,7 @@ impl TypeDef {
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
+                    stored_form_sorts_in_value_order: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -903,6 +918,7 @@ impl TypeDef {
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
+                    stored_form_sorts_in_value_order: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -933,6 +949,7 @@ impl TypeDef {
             is_domain: true,
             range_offsets: None,
             accepts_collate: None,
+            stored_form_sorts_in_value_order: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1426,11 +1443,14 @@ impl RangeOffsets {
 /// Whether a type is built into Turso or made by a user's CREATE TYPE.
 #[derive(Debug, Clone, Copy)]
 pub enum TypeOrigin {
-    /// `accepts_collate` says whether values of the type take a COLLATE, and
-    /// `range_offsets` what kind of number they are in a RANGE frame.
+    /// `accepts_collate` says whether values of the type take a COLLATE,
+    /// `range_offsets` what kind of number they are in a RANGE frame, and
+    /// `stored_form_sorts_in_value_order` whether the stored form sorts in
+    /// the same order as the values.
     Builtin {
         accepts_collate: bool,
         range_offsets: RangeOffsets,
+        stored_form_sorts_in_value_order: bool,
     },
     User,
 }
@@ -1443,38 +1463,36 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     // types do, so of the types below only varchar does.
     const COLLATE: bool = true;
     const NO_COLLATE: bool = false;
-    let types: &[(bool, RangeOffsets, &str)] = &[
+    // Whether the stored form sorts in the same order as the values.
+    const SORTS: bool = true;
+    const NO_SORT: bool = false;
+    let types: &[(bool, RangeOffsets, bool, &str)] = &[
         #[cfg(feature = "uuid")]
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
         #[cfg(feature = "json")]
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
         #[cfg(feature = "json")]
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
-        (COLLATE, RangeOffsets::None, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'"),
-        // ENCODE preserves sub-second precision through strftime + a rtrim pair
-        // that strips trailing zeros and the dangling dot, matching PostgreSQL's
-        // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
-        // zeros are dropped (`.500` -> `.5`), and the dot is removed when no
-        // fractional digits remain. `time(...)` / `datetime(...)` would truncate
-        // the fraction outright, silently dropping precision on insert.
-        // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
-        // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Integer, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Integer, "CREATE TYPE bigint(value integer) BASE integer"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Numeric, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
+        (COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
+        // The ENCODEs read PostgreSQL's input forms and store one text form
+        // with a 4-digit year, which sorts in time order (see
+        // functions/datetime_input.rs).
+        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE date(value text) BASE text ENCODE temporal_encode(value, 'date') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE time(value text) BASE text ENCODE temporal_encode(value, 'time') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamp(value text) BASE text ENCODE temporal_encode(value, 'timestamp') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamptz(value text) BASE text ENCODE temporal_encode(value, 'timestamptz') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE bigint(value integer) BASE integer"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Numeric, NO_SORT, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
-    for &(accepts_collate, range_offsets, sql) in types {
+    for &(accepts_collate, range_offsets, stored_form_sorts_in_value_order, sql) in types {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
@@ -1491,6 +1509,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
             TypeOrigin::Builtin {
                 accepts_collate,
                 range_offsets,
+                stored_form_sorts_in_value_order,
             },
             sql.to_string(),
         )?;
@@ -8432,7 +8451,10 @@ impl Column {
         } else {
             self.type_ordering
         };
-        ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
+        ordering.is_none()
+            && schema
+                .get_type_def(&self.ty_str, is_strict)
+                .is_some_and(|type_def| !type_def.stored_form_sorts_in_value_order)
     }
     /// Fill in what a column of a STRICT table gets from its custom type: the
     /// type, affinity and key order of the type it is stored as. Every path

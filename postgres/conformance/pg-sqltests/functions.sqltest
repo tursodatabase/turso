@@ -351,6 +351,35 @@ expect {
     invalid
 }
 
+test pg-input-is-valid-reads-date-and-time-as-the-types-do {
+    SELECT CASE WHEN pg_input_is_valid('Jan 5 2024', 'date') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('2024-02-30', 'date') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('9:30', 'time') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('2024-01-05T10:00+02', 'timestamptz') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('zzz', 'timestamp') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    invalid
+    valid
+    valid
+    invalid
+}
+
+test pg-input-error-info-date-out-of-range {
+    SELECT message, sql_error_code FROM pg_input_error_info('2024-02-30', 'date');
+}
+expect {
+    date/time field value out of range: "2024-02-30"|22008
+}
+
+test pg-input-error-info-date-bad-syntax {
+    SELECT message, sql_error_code FROM pg_input_error_info('zzz', 'date');
+}
+expect {
+    invalid input syntax for type date: "zzz"|22007
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
@@ -1509,7 +1538,7 @@ expect error {
     date/time field value out of range: "26-10-08"
 }
 expect @tursopg error {
-    invalid timestamp value
+    invalid input syntax for type timestamp with time zone: "26-10-08"
 }
 
 test age-of-a-zone-hour-out-of-range-errors {
@@ -1518,18 +1547,12 @@ test age-of-a-zone-hour-out-of-range-errors {
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+99:00"
 }
-expect @tursopg error {
-    invalid timestamp value
-}
 
 test age-of-a-zone-minute-out-of-range-errors {
     SELECT age('2026-10-08 12:34:56+05:61', '2025-01-01');
 }
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+05:61"
-}
-expect @tursopg error {
-    invalid timestamp value
 }
 
 test age-of-integers-errors {
@@ -1570,7 +1593,7 @@ expect error {
     invalid input syntax for type timestamp: "hello"
 }
 expect @tursopg error {
-    invalid timestamp value
+    invalid input syntax for type timestamp with time zone: "hello"
 }
 
 test check-constraint-calls-a-text-function {

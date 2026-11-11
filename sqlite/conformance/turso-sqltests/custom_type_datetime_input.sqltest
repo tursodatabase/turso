@@ -1,0 +1,552 @@
+@database :memory:
+
+# The built-in date, time, timestamp and timestamptz types read the input
+# forms PostgreSQL reads and store one text form with a 4-digit year.
+# Expected values are PostgreSQL 17's, with the session time zone UTC.
+
+@requires strict "uses STRICT tables"
+test datetime-input-postgresql-forms {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, tm time, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-1-5', '9:30', '2024-1-5 10:00', '2024-1-5 10:00+00');
+    INSERT INTO t VALUES (2, 'Jan 5 2024', '10:00 PM', 'Jan 5 2024 10:00', '2024-01-05T10:00:00+02');
+    INSERT INTO t VALUES (3, '20240105', '12:00 AM', '2024-01-05T10:00', '2024-01-05 10:00:00+0530');
+    INSERT INTO t VALUES (4, '5 January, 2024', 'allballs', '2024/01/05 10:00:00Z', '2024-01-05 10:00:00-05:00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00
+    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
+    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00
+    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00
+}
+
+@requires custom_types "date and time types are custom types"
+test datetime-input-cast {
+    SELECT CAST('2024-1-5' AS date), CAST('9:30' AS time), CAST('2024-1-5 10:00' AS timestamp);
+}
+expect {
+    2024-01-05|09:30:00|2024-01-05 10:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-keeps-microseconds {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '10:00:00.123456', '2024-01-05 10:00:00.123456', '2024-01-05 10:00:00.123456+00:00');
+    INSERT INTO t VALUES (2, '10:00:00.0005', '2024-01-05 10:00:00.0005', '2024-01-05 10:00:00.500+00');
+    INSERT INTO t VALUES (3, '10:00:00.0000025', '2024-01-05 10:00:00.1234575', '2024-01-05 23:59:59.9999995+00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456
+    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5
+    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-unique-microseconds {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, tm time, ts timestamp) STRICT;
+    CREATE UNIQUE INDEX ut ON u(tm);
+    CREATE UNIQUE INDEX uts ON u(ts);
+    INSERT INTO u VALUES (1, '10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO u VALUES (2, '10:00:00.0001', '2024-01-05 10:00:00.0001');
+    SELECT count(*) FROM u;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-offsets {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '10:00:00+02:00', '2024-01-05 10:00:00+02:00', '2024-01-05 10:00:00+02:00');
+    INSERT INTO t VALUES (2, '10:00:00-05', '2024-01-05 01:00:00+02', '2024-01-05 01:00:00+02');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
+    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-midnight-and-leap-second-carry {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time, ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '24:00:00', '2024-01-05 24:00:00');
+    INSERT INTO t VALUES (2, '23:59:60', '2024-12-31 23:59:60');
+    INSERT INTO t VALUES (3, '10:00:60', '2024-01-05 10:00:60');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|24:00:00|2024-01-06 00:00:00
+    2|24:00:00|2025-01-01 00:00:00
+    3|10:01:00|2024-01-05 10:01:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-feb-30 {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-02-30');
+}
+expect error {
+    date/time field value out of range: "2024-02-30"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-feb-29-in-non-leap-year {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2023-02-29');
+}
+expect error {
+    date/time field value out of range: "2023-02-29"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-feb-30-timestamp {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-02-30 00:00:00');
+}
+expect error {
+    date/time field value out of range: "2024-02-30 00:00:00"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-24-00-01 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 24:00:01');
+}
+expect error {
+    date/time field value out of range
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-accepts-second-60-as-next-day {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05 23:59:60', '2024-01-05 23:59:60', '2024-01-05 23:59:60');
+    SELECT * FROM t;
+}
+expect {
+    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-fraction-past-midnight-timestamp-23-59-60-5 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 23:59:60.5');
+}
+expect error {
+    date/time field value out of range: "2024-01-05 23:59:60.5"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-fraction-past-midnight-date-23-59-60-5 {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 23:59:60.5');
+}
+expect error {
+    date/time field value out of range: "2024-01-05 23:59:60.5"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-fraction-past-midnight-timestamptz-23-59-60-5 {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 23:59:60.5');
+}
+expect error {
+    date/time field value out of range: "2024-01-05 23:59:60.5"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-fraction-past-midnight-timestamp-23-59-60-000001 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 23:59:60.000001');
+}
+expect error {
+    date/time field value out of range: "2024-01-05 23:59:60.000001"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-fraction-past-midnight-timestamp-24-00-00-1 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 24:00:00.1');
+}
+expect error {
+    date/time field value out of range: "2024-01-05 24:00:00.1"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-time-input-accepts-iso-date-before-time {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05 10:00');
+    INSERT INTO t VALUES (2, '2024-1-5 10:00');
+    INSERT INTO t VALUES (3, '2024-01-05 10:00:00+02');
+    INSERT INTO t VALUES (4, '10:00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10:00:00
+    2|10:00:00
+    3|10:00:00
+    4|10:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-time-input-rejects-date-form-1 {
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('Jan 5 2024 10:00');
+}
+expect error {
+    invalid input syntax for type time: "Jan 5 2024 10:00"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-time-input-rejects-date-form-2 {
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('10:00 Jan 5 2024');
+}
+expect error {
+    invalid input syntax for type time: "10:00 Jan 5 2024"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-time-input-rejects-date-form-3 {
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('2024-01-05T10:00');
+}
+expect error {
+    invalid input syntax for type time: "2024-01-05T10:00"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-time-input-rejects-date-form-4 {
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type time: "10:00 2024-01-05"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-time-input-rejects-date-form-5 {
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('20240105 10:00');
+}
+expect error {
+    invalid input syntax for type time: "20240105 10:00"
+}
+
+# PostgreSQL accepts the values below, but their stored text would not sort in
+# time order, so Turso rejects them.
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-bc {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('0044-03-15 BC');
+}
+expect error {
+    BC dates are not supported for type date
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-year-past-9999 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('10000-01-01 00:00:00');
+}
+expect error {
+    years must be written with 4 digits
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-3-digit-year {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('999-01-01');
+}
+expect error {
+    years must be written with 4 digits
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-offset-past-9999 {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('9999-12-31 23:00:00-02');
+}
+expect error {
+    timestamp with time zone values must be between years 0001 and 9999
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-infinity {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('infinity');
+}
+expect error {
+    the timestamp value "infinity" is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-epoch {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('epoch');
+}
+expect error {
+    the date value "epoch" is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-now {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    the timestamp value "now" is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-today {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('today');
+}
+expect error {
+    the date value "today" is not supported
+}
+
+# The input is read without the clock, so the ENCODE can be part of an index
+# or a generated column.
+
+@requires strict "uses STRICT tables"
+test datetime-encode-in-index-expression-and-generated-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s text, d text GENERATED ALWAYS AS (temporal_encode(s, 'date'))) STRICT;
+    CREATE INDEX ti ON t(CAST(s AS timestamp));
+    INSERT INTO t(id, s) VALUES (1, '2024-1-5 10:00'), (2, 'Jan 4 2024');
+    SELECT id, d, CAST(s AS timestamp) FROM t ORDER BY CAST(s AS timestamp);
+}
+expect {
+    2|2024-01-04|2024-01-04 00:00:00
+    1|2024-01-05|2024-01-05 10:00:00
+}
+
+# The stored text sorts in time order, so a range on the column can use an
+# index.
+
+@requires strict "uses STRICT tables"
+test datetime-range-uses-index-timestamp {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE INDEX ti ON t(ts);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE ts > '2024-01-05 09:30';
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX ti (ts>?)
+}
+
+@requires strict "uses STRICT tables"
+test datetime-range-uses-index-date-between {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE INDEX ti ON t(d);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE d BETWEEN '2024-01-01' AND '2024-02-01';
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX ti (d>=? AND d<=?)
+}
+
+@requires strict "uses STRICT tables"
+test datetime-range-uses-index-time {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    CREATE INDEX ti ON t(tm);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE tm < '09:45:00';
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX ti (tm<?)
+}
+
+@requires strict "uses STRICT tables"
+test datetime-range-uses-index-timestamptz {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tz timestamptz) STRICT;
+    CREATE INDEX ti ON t(tz);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE tz >= '2024-01-05 08:00:00+00';
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX ti (tz>=?)
+}
+
+@requires strict "uses STRICT tables"
+test datetime-range-through-index-matches-scan {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '2024-1-5 10:00'), (2, '2024-01-05 09:30:00.5'), (3, '0999-12-31 23:59:59'), (4, '2024-12-01 00:00:00'), (5, NULL);
+    CREATE INDEX ti ON t(ts);
+    SELECT id FROM t WHERE ts > '2024-01-05 09:30:00' ORDER BY ts;
+    SELECT id FROM t WHERE ts BETWEEN '0999-12-31 23:59:59' AND '2024-01-05 10:00:00' ORDER BY id;
+}
+expect {
+    2
+    1
+    4
+    1
+    2
+    3
+}
+
+# timestamptz is stored as the UTC instant with no offset, so it equals the
+# same timestamp and SQLite's date functions can read it.
+@requires strict "uses STRICT tables"
+test datetime-timestamp-equals-timestamptz {
+    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
+    SELECT id FROM t WHERE ts = tz;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-sqlite-date-functions {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 10:00:00'), ('2024-01-05 12:00:00+02');
+    SELECT datetime(tz), date(tz), unixepoch(tz) FROM t;
+}
+expect {
+    2024-01-05 10:00:00|2024-01-05|1704448800
+    2024-01-05 10:00:00|2024-01-05|1704448800
+}
+
+# The order of the fields matters, as in PostgreSQL: `T` needs a date before
+# it and a time after it, a date cannot follow a time, and the order of a
+# date's numbers and month name is limited.
+@requires strict "uses STRICT tables"
+test datetime-input-field-order-accepted {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05T10:00');
+    INSERT INTO t VALUES (2, '2024-01-05 T10:00');
+    INSERT INTO t VALUES (3, '2024-01-05 T 10:00');
+    INSERT INTO t VALUES (4, '2024-01-05 10:00 PM');
+    INSERT INTO t VALUES (5, '5 Jan 2024');
+    INSERT INTO t VALUES (6, '2024 Jan 5');
+    INSERT INTO t VALUES (7, 'Jan 2024 5');
+    INSERT INTO t VALUES (8, '2024 5 Jan');
+    INSERT INTO t VALUES (9, '10:00 Jan 5 2024');
+    INSERT INTO t VALUES (10, '2024-01-05 PM');
+    INSERT INTO t VALUES (11, '2024-01-05 T PM 10:00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00
+    2|2024-01-05 10:00:00
+    3|2024-01-05 10:00:00
+    4|2024-01-05 22:00:00
+    5|2024-01-05 00:00:00
+    6|2024-01-05 00:00:00
+    7|2024-01-05 00:00:00
+    8|2024-01-05 00:00:00
+    9|2024-01-05 10:00:00
+    10|2024-01-05 12:00:00
+    11|2024-01-05 22:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-time-with-t {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO t VALUES (1, 'T 10:00'), (2, 'T10:00 PM'), (3, '2024-01-05 10:00');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10:00:00
+    2|22:00:00
+    3|10:00:00
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-2024-01-05t {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05T');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05T"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-2024-01-05-10-00-t {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 10:00 T');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 10:00 T"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-t-2024-01-05-10-00 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('T 2024-01-05 10:00');
+}
+expect error {
+    invalid input syntax for type timestamp: "T 2024-01-05 10:00"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-t-2024-01-05 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('t 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "t 2024-01-05"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-pm-10-00-2024-01-05 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('PM 10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "PM 10:00 2024-01-05"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-10-00-pm-2024-01-05 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('10:00 PM 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "10:00 PM 2024-01-05"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-5-2024-jan {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('5 2024 Jan');
+}
+expect error {
+    invalid input syntax for type timestamp: "5 2024 Jan"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-10-00-2024-01-05 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type timestamp: "10:00 2024-01-05"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-2024-01-05-t-t10-00 {
+    CREATE TABLE t(ts timestamp) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 T T10:00');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 T T10:00"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-date-after-time {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('10:00 2024-01-05');
+}
+expect error {
+    invalid input syntax for type date: "10:00 2024-01-05"
+}
+
+@requires strict "uses STRICT tables"
+test datetime-input-rejects-order-time-after-am-pm-and-date {
+    CREATE TABLE t(tm time) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 PM 10:00');
+}
+expect error {
+    invalid input syntax for type time: "2024-01-05 PM 10:00"
+}
