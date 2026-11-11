@@ -978,8 +978,6 @@ pub struct HashTable {
     /// LRU of resident spilled partitions to cap memory for DISTINCT, grace,
     /// and unmatched-scan partition loads.
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
-    /// Memory used by resident (loaded or in-memory) partitions
-    loaded_partitions_mem: usize,
     /// Temp storage mode (memory vs file) for spilled data
     temp_store: crate::TempStore,
     /// Whether to track matched entries (for FULL OUTER JOIN).
@@ -1078,7 +1076,6 @@ impl HashTable {
             spill_state: None,
             current_spill_partition_idx: 0,
             loaded_partitions_lru: VecDeque::new().into(),
-            loaded_partitions_mem: 0,
             non_empty_buckets: vec![],
             temp_store: config.temp_store,
             track_matched: config.track_matched,
@@ -1500,7 +1497,6 @@ impl HashTable {
             self.probe_entry_idx = 0;
             self.current_spill_partition_idx = 0;
             self.loaded_partitions_lru.borrow_mut().clear();
-            self.loaded_partitions_mem = 0;
             self.non_empty_buckets.clear();
             self.probe_spill_state = None;
             self.grace_state = None;
@@ -1529,7 +1525,6 @@ impl HashTable {
         self.probe_entry_idx = 0;
         self.current_spill_partition_idx = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
-        self.loaded_partitions_mem = 0;
         Ok(())
     }
 
@@ -1621,8 +1616,7 @@ impl HashTable {
         // Find existing partition or create new one
         let io_state = if let Some(existing) = spill_state.find_partition_mut(partition_idx) {
             if existing.state == PartitionState::Loaded {
-                self.loaded_partitions_mem =
-                    self.loaded_partitions_mem.saturating_sub(existing.unload());
+                existing.unload();
             }
             existing.add_chunk(file_offset, data_size, num_entries)?;
             if let Some(metrics) = metrics.as_deref_mut() {
@@ -1783,8 +1777,7 @@ impl HashTable {
             // Find existing partition or create new one
             let io_state = if let Some(existing) = spill_state.find_partition_mut(meta.idx) {
                 if existing.state == PartitionState::Loaded {
-                    self.loaded_partitions_mem =
-                        self.loaded_partitions_mem.saturating_sub(existing.unload());
+                    existing.unload();
                 }
                 existing.add_chunk(file_offset, meta.data_size, meta.num_entries)?;
                 if let Some(metrics) = metrics.as_deref_mut() {
@@ -2687,11 +2680,12 @@ impl HashTable {
                         .try_collect()?;
                 }
                 partition.state = PartitionState::Loaded;
-                partition.resident_mem = Self::partition_bucket_mem(&partition.buckets);
+                // `record_partition_resident` is the only place that sets `resident_mem`.
+                let resident_mem = Self::partition_bucket_mem(&partition.buckets);
                 // Release staging buffer to free memory now that buckets are built.
                 partition.buffer_len.store(0, atomic::Ordering::SeqCst);
                 partition.read_buffer.write().clear();
-                (false, partition.resident_mem)
+                (false, resident_mem)
             }
         };
 
@@ -2789,18 +2783,24 @@ impl HashTable {
     fn record_partition_resident(&mut self, partition_idx: usize, mem_used: usize) {
         if let Some(spill_state) = self.spill_state.as_mut() {
             if let Some(partition) = spill_state.find_partition_mut(partition_idx) {
-                self.loaded_partitions_mem = self
-                    .loaded_partitions_mem
-                    .saturating_sub(partition.resident_mem);
                 partition.resident_mem = mem_used;
-                self.loaded_partitions_mem += mem_used;
                 self.touch_partition_lru(partition_idx);
             }
         }
     }
 
+    /// Memory held by loaded spilled partitions, derived from the partitions
+    /// themselves. In-memory partitions are charged to `mem_used` instead and
+    /// have `resident_mem == 0`; `unload` zeroes it.
+    fn loaded_partitions_mem(&self) -> usize {
+        self.spill_state
+            .as_ref()
+            .map_or(0, |s| s.partitions.iter().map(|p| p.resident_mem).sum())
+    }
+
     fn evict_partitions_to_fit(&mut self, incoming_mem: usize, protect_idx: usize) {
-        while self.mem_used + self.loaded_partitions_mem + incoming_mem > self.mem_budget {
+        let mut loaded_mem = self.loaded_partitions_mem();
+        while self.mem_used + loaded_mem + incoming_mem > self.mem_budget {
             let Some(victim_idx) = self.next_evictable(protect_idx) else {
                 break;
             };
@@ -2814,7 +2814,7 @@ impl HashTable {
                 }
             }
 
-            self.loaded_partitions_mem = self.loaded_partitions_mem.saturating_sub(freed);
+            loaded_mem = loaded_mem.saturating_sub(freed);
         }
     }
 
@@ -3209,7 +3209,6 @@ impl HashTable {
             }
         }
         self.loaded_partitions_lru.borrow_mut().clear();
-        self.loaded_partitions_mem = 0;
     }
 
     /// Load probe entries for a given partition into grace_state.probe_entries.
@@ -3402,7 +3401,6 @@ impl HashTable {
         self.num_entries = 0;
         self.mem_used = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
-        self.loaded_partitions_mem = 0;
         let _ = self.spill_state.take();
         self.probe_spill_state = None;
         self.grace_state = None;
@@ -4465,8 +4463,71 @@ mod hashtests {
         // We can't *guarantee* that without knowing exact sizes, but in practice
         // this test will detect regressions in the LRU bookkeeping.
         assert!(
-            !ht.is_partition_loaded(pa) || ht.loaded_partitions_mem <= ht.mem_budget,
+            !ht.is_partition_loaded(pa) || ht.loaded_partitions_mem() <= ht.mem_budget,
             "either partition A is evicted, or loaded memory is within budget"
+        );
+    }
+
+    #[test]
+    fn test_loaded_partitions_mem_counts_every_reloaded_partition() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 8 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::BINARY],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        insert_many_force_spill(&mut ht, 0, 4096);
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(ht.has_spilled());
+
+        let mut partitions = Vec::new();
+        for k in 0..4096 {
+            let p = ht.partition_for_keys(&[Value::from_i64(k)]).unwrap();
+            if !partitions.contains(&p) {
+                partitions.push(p);
+            }
+        }
+        assert!(partitions.len() > 1);
+        let load_all = |ht: &mut HashTable| {
+            for &p in &partitions {
+                while let IOResult::IO(_) = ht.load_spilled_partition(p, None).unwrap() {}
+            }
+        };
+        let loaded_count = |ht: &HashTable| {
+            let spill_state = ht.spill_state.as_ref().unwrap();
+            spill_state
+                .partitions
+                .iter()
+                .filter(|p| matches!(p.state, PartitionState::Loaded))
+                .count()
+        };
+
+        // First pass with an unlimited budget: every partition stays resident.
+        ht.mem_budget = usize::MAX / 2;
+        load_all(&mut ht);
+        let total = ht.loaded_partitions_mem();
+        let resident = loaded_count(&ht);
+        assert!(
+            total > 0 && resident > 1,
+            "several partitions must be loaded"
+        );
+
+        // Reload everything with a budget that fits the total exactly. Each
+        // partition must be counted once, so nothing may be evicted.
+        ht.evict_all_loaded_partitions();
+        assert_eq!(ht.loaded_partitions_mem(), 0);
+        ht.mem_budget = ht.mem_used + total;
+        load_all(&mut ht);
+        assert_eq!(ht.loaded_partitions_mem(), total);
+        assert_eq!(
+            loaded_count(&ht),
+            resident,
+            "loading within the budget must not evict loaded partitions"
         );
     }
 
