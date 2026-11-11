@@ -8007,9 +8007,41 @@ pub fn op_ivm_sum_finalize(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// `2^64`, used to convert an exact-integer total that overflowed i64
-/// (`wrapped + wrap_count * 2^64`) into an approximate REAL.
-const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+/// Convert the exact integer total encoded as `wrapped + wrap_count * 2^64`
+/// to a float without losing precision when the two terms have opposite
+/// signs. Converting and adding those terms separately can cancel away the
+/// low bits (for example, `i64::MAX + 1026`).
+fn ivm_integer_sum_to_f64(wrapped: i64, wrap_count: i64) -> f64 {
+    let two_pow_64 = 1_u128 << 64;
+    let (negative, magnitude) = match (wrap_count, wrapped) {
+        (0, wrapped) if wrapped < 0 => (true, u128::from(wrapped.unsigned_abs())),
+        (0, wrapped) => (false, u128::from(wrapped as u64)),
+        (wrap_count, wrapped) if wrap_count > 0 && wrapped >= 0 => (
+            false,
+            u128::from(wrap_count as u64) * two_pow_64 + u128::from(wrapped as u64),
+        ),
+        (wrap_count, wrapped) if wrap_count > 0 => (
+            false,
+            u128::from((wrap_count - 1) as u64) * two_pow_64 + two_pow_64
+                - u128::from(wrapped.unsigned_abs()),
+        ),
+        (wrap_count, wrapped) if wrapped < 0 => (
+            true,
+            u128::from(wrap_count.unsigned_abs()) * two_pow_64 + u128::from(wrapped.unsigned_abs()),
+        ),
+        (wrap_count, wrapped) => (
+            true,
+            u128::from(wrap_count.unsigned_abs() - 1) * two_pow_64 + two_pow_64
+                - u128::from(wrapped as u64),
+        ),
+    };
+    let magnitude = magnitude as f64;
+    if negative {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
 
 /// Compute SUM, TOTAL, or AVG's current result from IVM's linear state: an
 /// exact integer total, a floating-point total, and two row counts. Unlike
@@ -8053,10 +8085,10 @@ fn finalize_ivm_sum(
             apply_kbn_step_int(&mut acc, wrapped, &mut sum_state);
         }
     } else {
-        // The exact integer total overflowed i64, but a non-integer
-        // contribution already forces a REAL result, so approximate it
-        // instead of erroring (see the module doc comment above).
-        let approx = wrap_count as f64 * TWO_POW_64 + wrapped as f64;
+        // SUM over integer-only input returned or errored above. AVG and
+        // TOTAL always produce REAL, while mixed-input SUM also needs a REAL
+        // total, so convert the wrapped integer total without cancellation.
+        let approx = ivm_integer_sum_to_f64(wrapped, wrap_count);
         apply_kbn_step(&mut acc, approx, &mut sum_state);
     }
     if matches!(acc, Value::Null) {
@@ -19602,6 +19634,27 @@ mod tests {
         }
         // The steps cancel except for 12345 and -2 * 7.
         assert_eq!((wrapped, wrap_count), (12345 - 14, 0));
+    }
+
+    #[test]
+    fn ivm_integer_sum_to_f64_preserves_wrapped_total_precision() {
+        let cases = [
+            (i64::MIN + 1, 1),
+            (i64::MAX, 1),
+            (i64::MAX, -1),
+            (i64::MIN, -1),
+            (i64::MIN, 0),
+            (i64::MAX, 0),
+        ];
+
+        for (wrapped, wrap_count) in cases {
+            let exact = i128::from(wrap_count) * (1_i128 << 64) + i128::from(wrapped);
+            assert_eq!(
+                ivm_integer_sum_to_f64(wrapped, wrap_count).to_bits(),
+                (exact as f64).to_bits(),
+                "for wrapped={wrapped}, wrap_count={wrap_count}"
+            );
+        }
     }
 
     #[test]
