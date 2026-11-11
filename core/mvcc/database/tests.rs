@@ -5442,6 +5442,58 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// A checkpoint that stops after its pager commit leaves its row versions in the MV store.
+/// The B-tree already holds those rows, so the next checkpoint must remove the versions.
+#[test]
+fn test_checkpoint_empties_mv_store_after_interrupted_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let mvcc_store = db.get_mvcc_store();
+
+    let interrupted_conn = db.connect();
+    let interrupted_pager = interrupted_conn.pager.load().clone();
+    let mut interrupted_checkpoint = CheckpointStateMachine::new(
+        interrupted_pager.clone(),
+        mvcc_store.clone(),
+        interrupted_conn.clone(),
+        true,
+        interrupted_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    while interrupted_checkpoint.state_for_test() != CheckpointState::CheckpointWal {
+        match interrupted_checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(interrupted_pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                panic!("checkpoint finished before reaching WAL checkpoint")
+            }
+        }
+    }
+    interrupted_checkpoint
+        .cleanup_after_external_io_error(LimboError::Interrupt)
+        .unwrap();
+    assert!(!mvcc_store.rows.is_empty());
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(mvcc_store.rows.is_empty());
+    for index in mvcc_store.index_rows.iter() {
+        assert!(index.value().is_empty());
+    }
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 10);
+}
+
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
