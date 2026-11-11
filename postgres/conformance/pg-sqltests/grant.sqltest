@@ -917,6 +917,59 @@ expect {
     2|12
 }
 
+test role-without-delete-cannot-delete {
+    CREATE ROLE gw_no_delete;
+    CREATE TABLE gw_no_delete_docs (id INT);
+    GRANT SELECT, INSERT, UPDATE ON gw_no_delete_docs TO gw_no_delete;
+    SET ROLE gw_no_delete;
+    DELETE FROM gw_no_delete_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_no_delete_docs
+}
+
+test grant-delete-lets-a-role-delete-every-row {
+    CREATE ROLE gw_deleter;
+    CREATE TABLE gw_deleted (id INT);
+    INSERT INTO gw_deleted VALUES (1), (2);
+    GRANT DELETE ON gw_deleted TO gw_deleter;
+    SET ROLE gw_deleter;
+    DELETE FROM gw_deleted;
+    RESET ROLE;
+    SELECT count(*) FROM gw_deleted;
+}
+expect {
+    0
+}
+
+test delete-with-where-needs-select {
+    CREATE ROLE gw_delete_where;
+    CREATE TABLE gw_delete_where_docs (id INT);
+    GRANT DELETE ON gw_delete_where_docs TO gw_delete_where;
+    SET ROLE gw_delete_where;
+    DELETE FROM gw_delete_where_docs WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_delete_where_docs
+}
+
+test delete-with-where-with-select {
+    CREATE ROLE gw_delete_reader;
+    CREATE TABLE gw_delete_read (id INT);
+    INSERT INTO gw_delete_read VALUES (1), (2);
+    GRANT SELECT, DELETE ON gw_delete_read TO gw_delete_reader;
+    SET ROLE gw_delete_reader;
+    DELETE FROM gw_delete_read WHERE id = 1 RETURNING id;
+    RESET ROLE;
+    SELECT id FROM gw_delete_read;
+}
+expect {
+    1
+    2
+}
+
 # A subquery needs SELECT on the table that is written only when it reads a
 # column of that table.
 test update-with-subqueries-that-do-not-read-the-table-needs-no-select {
@@ -962,6 +1015,39 @@ expect error {
     permission denied for table gw_update_nested_docs
 }
 
+test delete-with-subqueries-that-do-not-read-the-table-needs-no-select {
+    CREATE ROLE gw_delete_subquery;
+    CREATE TABLE gw_delete_subquery_docs (id INT);
+    CREATE TABLE gw_delete_subquery_src (id INT);
+    INSERT INTO gw_delete_subquery_docs VALUES (1), (2);
+    INSERT INTO gw_delete_subquery_src VALUES (1);
+    GRANT DELETE ON gw_delete_subquery_docs TO gw_delete_subquery;
+    GRANT SELECT ON gw_delete_subquery_src TO gw_delete_subquery;
+    SET ROLE gw_delete_subquery;
+    DELETE FROM gw_delete_subquery_docs WHERE EXISTS (SELECT 1 FROM gw_delete_subquery_src) RETURNING (SELECT 'ok');
+    RESET ROLE;
+    SELECT count(*) FROM gw_delete_subquery_docs;
+}
+expect {
+    ok
+    ok
+    0
+}
+
+test delete-with-a-subquery-that-reads-the-table-needs-select {
+    CREATE ROLE gw_delete_correlated;
+    CREATE TABLE gw_delete_correlated_docs (id INT);
+    CREATE TABLE gw_delete_correlated_src (id INT);
+    GRANT DELETE ON gw_delete_correlated_docs TO gw_delete_correlated;
+    GRANT SELECT ON gw_delete_correlated_src TO gw_delete_correlated;
+    SET ROLE gw_delete_correlated;
+    DELETE FROM gw_delete_correlated_docs WHERE EXISTS (SELECT 1 FROM gw_delete_correlated_src s WHERE s.id = gw_delete_correlated_docs.id);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_delete_correlated_docs
+}
+
 test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-select {
     CREATE ROLE gw_insert_subquery;
     CREATE TABLE gw_insert_subquery_docs (id INT);
@@ -971,6 +1057,34 @@ test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-s
 }
 expect {
     ok
+}
+
+test grant-all-lets-a-role-write {
+    CREATE ROLE gw_all;
+    CREATE TABLE gw_all_docs (id INT, n INT);
+    GRANT ALL ON gw_all_docs TO gw_all;
+    SET ROLE gw_all;
+    INSERT INTO gw_all_docs VALUES (1, 1), (2, 2);
+    UPDATE gw_all_docs SET n = n * 10 WHERE id = 2;
+    DELETE FROM gw_all_docs WHERE id = 1;
+    SELECT id, n FROM gw_all_docs;
+}
+expect {
+    2|20
+}
+
+test owner-writes-its-own-table {
+    CREATE ROLE gw_owner;
+    CREATE TABLE gw_owned (id INT, n INT);
+    ALTER TABLE gw_owned OWNER TO gw_owner;
+    SET ROLE gw_owner;
+    INSERT INTO gw_owned VALUES (1, 1), (2, 2);
+    UPDATE gw_owned SET n = n + 1 WHERE id = 1;
+    DELETE FROM gw_owned WHERE id = 2;
+    SELECT id, n FROM gw_owned;
+}
+expect {
+    1|2
 }
 
 # ALTER TABLE rewrites the table's definition in the schema, which needs no

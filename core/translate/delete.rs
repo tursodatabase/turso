@@ -12,16 +12,16 @@ use crate::translate::plan::{
 use crate::translate::planner::{
     collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
 };
-use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
+use crate::translate::{roles, row_security};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{self, Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -139,6 +139,7 @@ pub fn translate_delete(
                 connection,
             )?;
         }
+        check_delete_privileges(delete_plan_inner, resolver, connection)?;
     }
 
     optimize_plan(program, &mut delete_plan, resolver, connection)?;
@@ -183,6 +184,43 @@ pub fn translate_delete(
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
     Ok(())
+}
+
+/// Checks the privileges on the target table: DELETE, and SELECT too
+/// when WHERE or RETURNING reads the table's columns, as in PostgreSQL.
+/// Subqueries must be planned first, so that only a subquery that refers to
+/// the target table counts as reading it.
+fn check_delete_privileges(
+    plan: &DeletePlan,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let target = &plan.table_references.joined_tables()[0];
+    let reads_in_where = match &plan.rowset_plan {
+        Some(rowset_plan) => roles::reads_columns_of(
+            target.internal_id,
+            rowset_plan.where_clause.iter().map(|term| &term.expr),
+            &rowset_plan.non_from_clause_subqueries,
+        )?,
+        None => roles::reads_columns_of(
+            target.internal_id,
+            plan.where_clause.iter().map(|term| &term.expr),
+            &plan.non_from_clause_subqueries,
+        )?,
+    };
+    let reads_in_returning = roles::reads_columns_of(
+        target.internal_id,
+        plan.result_columns.iter().map(|column| &column.expr),
+        &plan.non_from_clause_subqueries,
+    )?;
+    roles::check_write_privileges(
+        resolver,
+        connection,
+        target.namespace,
+        target.table.get_name(),
+        ast::Privilege::Delete,
+        reads_in_where || reads_in_returning,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

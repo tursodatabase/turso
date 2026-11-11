@@ -188,6 +188,38 @@ fn statement_prepared_as_role_without_privileges_runs_after_reset_role() {
     conn.execute("SELECT x FROM t").unwrap();
 }
 
+/// Foreign-key checks and actions need no privileges on the other table, as
+/// in PostgreSQL. The PostgreSQL frontend does not turn foreign keys on, so
+/// the test does.
+#[test]
+fn foreign_key_checks_and_actions_need_no_privileges_on_the_other_table() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.inner().set_foreign_keys_enabled(true);
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE parent (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id int, parent int REFERENCES parent (id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("GRANT INSERT ON child TO alice").unwrap();
+    conn.execute("GRANT DELETE ON parent TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.execute("INSERT INTO child VALUES (10, 1), (20, 2)")
+        .unwrap();
+    conn.execute("DELETE FROM parent").unwrap();
+
+    conn.execute("RESET ROLE").unwrap();
+    let mut count = conn.query("SELECT count(*) FROM child").unwrap().unwrap();
+    assert_eq!(
+        count.run_collect_rows().unwrap(),
+        vec![vec![turso_core::Value::from_i64(0)]]
+    );
+}
+
 #[test]
 fn set_role_changes_only_its_own_connection() {
     let db = TempDatabase::builder().build();

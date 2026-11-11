@@ -6,10 +6,9 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! A role that is not a superuser reads, inserts into and updates the tables
-//! it owns or was granted privileges on, which row-level security limits,
-//! and switches roles. It may not delete rows, use a sequence or change the
-//! schema it does not own.
+//! A role that is not a superuser reads and writes the tables it owns or was
+//! granted privileges on, which row-level security limits, and switches
+//! roles. It may not use a sequence or change the schema it does not own.
 
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
@@ -45,8 +44,10 @@ pub fn check_statement_privileges(
     let denial = match stmt {
         // The privileges on the tables a statement reads and writes are
         // checked when it resolves them, with check_privilege.
-        ast::Stmt::Select(_) | ast::Stmt::Insert { .. } | ast::Stmt::Update(_) => return Ok(()),
-        ast::Stmt::Delete { tbl_name, .. } => write_denial(tbl_name),
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. } => return Ok(()),
         ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }
         | ast::Stmt::Rollback { .. }
@@ -272,13 +273,6 @@ fn role_spec_name(role: &ast::RoleSpec) -> String {
         ast::RoleSpec::CurrentRole => "current_user".to_string(),
         ast::RoleSpec::SessionUser => "session_user".to_string(),
     }
-}
-
-fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
-    PermissionDenied::privilege(
-        Action::Write,
-        Object::Table(tbl_name.name.as_str().to_string()),
-    )
 }
 
 /// Fails if the statement is compiled for a role that is not a superuser,
