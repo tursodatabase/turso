@@ -39,7 +39,7 @@ addr  opcode                      p1  p2  p3  p4                                
   18    Integer                    0   7   0                                             0  r[7]=0
   19    HashProbe                  2   4   1  r[8]=26 payload=r[5]..r[5]                 0
   20    Column                     0   1   1                                             0  r[1]=t.a
-  21    HashDistinct      1073741824   1   1  jmp=23                                     0
+  21    HashDistinct      1073741824   1   1  jmp=23 save=false count=false              0
   22    ResultRow                  1   1   0                                             0  output=r[1]
   23    IfPos                      7  34   0                                             0  r[7]>0 -> r[7]-=0, goto 34
   24    HashNext                   2   8  26   payload=r[5]..r[5]                        0
