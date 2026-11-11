@@ -1637,14 +1637,6 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
         Pr,
     }
 
-    fn matches_at(chars: &[char], index: usize, word: &str) -> bool {
-        word.chars().enumerate().all(|(offset, expected)| {
-            chars
-                .get(index + offset)
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected))
-        })
-    }
-
     let is_negative = num < 0.0;
     let abs_num = num.abs();
 
@@ -1895,6 +1887,14 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+fn matches_at(chars: &[char], index: usize, word: &str) -> bool {
+    word.chars().enumerate().all(|(offset, expected)| {
+        chars
+            .get(index + offset)
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected))
+    })
 }
 
 #[cfg(test)]
