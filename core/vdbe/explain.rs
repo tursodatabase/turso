@@ -2766,19 +2766,6 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashDistinctNext {
-            hash_table_id,
-            dest_reg,
-            target_pc,
-        } => (
-            "HashDistinctNext",
-            *hash_table_id as i64,
-            *dest_reg as i64,
-            target_pc.as_debug_int() as i64,
-            Value::build_text(""),
-            0,
-            String::new(),
-        ),
         Insn::HashDistinctCount {
             hash_table_id,
             acc_reg,
