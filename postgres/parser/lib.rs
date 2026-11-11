@@ -1,5 +1,6 @@
 pub mod cmdtag;
 pub mod copy;
+mod names;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;

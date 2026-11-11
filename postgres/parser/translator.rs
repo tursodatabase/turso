@@ -3,12 +3,16 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use crate::names::{
+    extract_key_columns, is_default_schema, is_pg_catalog, object_name, schema_qualifier,
+    unqualified_name,
+};
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -5749,27 +5753,6 @@ fn bare_table_name(name: &str) -> &str {
     }
 }
 
-/// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
-/// The schema that a qualifier written in a statement names. PostgreSQL has
-/// no schema called main or temp: those name databases of the engine, and
-/// an object stored under them would be in no schema the catalogs show.
-fn schema_qualifier(schema: &str) -> Result<&str, ParseError> {
-    if schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp") {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_SCHEMA_NAME,
-            message: format!("schema \"{schema}\" does not exist"),
-        });
-    }
-    Ok(map_schema_name(schema))
-}
-
-fn map_schema_name(schema: &str) -> &str {
-    match schema.to_ascii_lowercase().as_str() {
-        "pg_catalog" | "information_schema" => "main",
-        _ => schema,
-    }
-}
-
 pub fn is_catalog_table_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -6766,19 +6749,6 @@ fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
         )));
     }
     Ok(())
-}
-
-fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
-    use pg_query::protobuf::node::Node;
-
-    let mut cols = Vec::new();
-    for key_node in keys {
-        let Some(Node::String(s)) = &key_node.node else {
-            return Err(ParseError::ParseError("expected a name".into()));
-        };
-        cols.push(s.sval.clone());
-    }
-    Ok(cols)
 }
 
 /// Extract a foreign key constraint from a PG Constraint node.
@@ -8588,26 +8558,6 @@ fn no_such_function(name: &str) -> ParseError {
     ParseError::ParseError(format!("no such function: {name}"))
 }
 
-fn object_name(
-    names: &[pg_query::protobuf::Node],
-    allowed_schema: fn(&str) -> bool,
-    kind: &str,
-) -> Result<String, ParseError> {
-    let names = extract_key_columns(names)?;
-    if names.is_empty() {
-        return Err(ParseError::ParseError(format!("missing {kind} name")));
-    }
-    unqualified_name(&names, allowed_schema)
-        .cloned()
-        .ok_or_else(|| match names.as_slice() {
-            [schema, _] => ParseError::SchemaQualifiedName {
-                kind: kind.to_string(),
-                schema: schema.clone(),
-            },
-            _ => ParseError::not_supported(format!("a schema-qualified {kind} name")),
-        })
-}
-
 /// The name of a function call, in the FROM clause or in an expression.
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
     if let [schema, name] = extract_key_columns(names)?.as_slice() {
@@ -8641,24 +8591,6 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
 const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
-
-fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
-    match names {
-        [name] => Some(name),
-        [schema, name] if allowed_schema(schema) => Some(name),
-        _ => None,
-    }
-}
-
-fn is_pg_catalog(schema: &str) -> bool {
-    schema == "pg_catalog"
-}
-
-/// Whether `schema` names the schema that types and functions are looked
-/// up in anyway: the catalog, or public, where PostgreSQL puts user types.
-fn is_default_schema(schema: &str) -> bool {
-    map_schema_name(schema) == "main" || schema.eq_ignore_ascii_case("public")
-}
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
