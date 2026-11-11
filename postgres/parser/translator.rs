@@ -7430,7 +7430,7 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
 /// and roles exist, expands `ALL TABLES IN SCHEMA`, and hands the engine a
 /// GRANT statement that stores the privilege with each table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PgGrantSelectStmt {
+pub struct PgGrantStmt {
     pub tables: PgGrantTables,
     pub roles: Vec<PgGrantee>,
 }
@@ -7474,9 +7474,7 @@ impl PgGrantee {
 /// Extracts a GRANT SELECT statement on tables. Only SELECT on tables is
 /// stored, so any other GRANT, and REVOKE, are rejected rather than reported
 /// as done.
-pub fn try_extract_grant_select(
-    parse_result: &ParseResult,
-) -> Result<Option<PgGrantSelectStmt>, ParseError> {
+pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStmt>, ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
     use pg_query::NodeRef;
@@ -7553,7 +7551,7 @@ pub fn try_extract_grant_select(
             }
         })
         .collect::<Result<_, _>>()?;
-    Ok(Some(PgGrantSelectStmt { tables, roles }))
+    Ok(Some(PgGrantStmt { tables, roles }))
 }
 
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
@@ -7795,7 +7793,7 @@ pub enum FrontendStmt {
     DropSchema(PgDropSchemaStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
-    GrantSelect(PgGrantSelectStmt),
+    Grant(PgGrantStmt),
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -7833,8 +7831,8 @@ pub fn frontend_stmt(
     if let Some(stmt) = try_extract_comment_on(parse_result) {
         return Ok(Some(FrontendStmt::CommentOn(stmt)));
     }
-    if let Some(stmt) = try_extract_grant_select(parse_result)? {
-        return Ok(Some(FrontendStmt::GrantSelect(stmt)));
+    if let Some(stmt) = try_extract_grant(parse_result)? {
+        return Ok(Some(FrontendStmt::Grant(stmt)));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -8572,7 +8570,7 @@ mod tests {
                 FrontendStmt::DropSchema(_) => "drop schema",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
-                FrontendStmt::GrantSelect(_) => "grant select",
+                FrontendStmt::Grant(_) => "grant",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -8591,7 +8589,7 @@ mod tests {
             ("DROP SCHEMA app CASCADE", "drop schema"),
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
-            ("GRANT SELECT ON t TO alice", "grant select"),
+            ("GRANT SELECT ON t TO alice", "grant"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
             ("COPY t TO STDOUT", "copy to"),
         ] {
@@ -12561,14 +12559,14 @@ mod tests {
 
     #[test]
     fn grant_select_names_its_tables_and_roles() {
-        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap());
+        let grant = |sql: &str| try_extract_grant(&crate::parse(sql).unwrap());
 
         assert_eq!(
             grant(
                 "GRANT SELECT ON t, app.\"Docs\" TO alice, \"Bob\", PUBLIC, CURRENT_USER, SESSION_USER"
             )
             .unwrap(),
-            Some(PgGrantSelectStmt {
+            Some(PgGrantStmt {
                 tables: PgGrantTables::Named(vec![
                     ast::QualifiedName::single(exact_name("t")),
                     ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
@@ -12584,7 +12582,7 @@ mod tests {
         );
         assert_eq!(
             grant("GRANT SELECT ON ALL TABLES IN SCHEMA public, app TO anon").unwrap(),
-            Some(PgGrantSelectStmt {
+            Some(PgGrantStmt {
                 tables: PgGrantTables::AllInSchemas(vec!["public".to_string(), "app".to_string()]),
                 roles: vec![PgGrantee::Role("anon".to_string())],
             })
@@ -12594,7 +12592,7 @@ mod tests {
 
     #[test]
     fn grant_select_names_catalog_tables_as_other_statements_do() {
-        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap();
+        let grant = |sql: &str| try_extract_grant(&crate::parse(sql).unwrap()).unwrap();
         let names = |sql: &str| match grant(sql).unwrap().tables {
             PgGrantTables::Named(tables) => tables
                 .into_iter()
@@ -12656,7 +12654,7 @@ mod tests {
                 "a cross-database reference is not supported",
             ),
         ] {
-            let error = try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap_err();
+            let error = try_extract_grant(&crate::parse(sql).unwrap()).unwrap_err();
             assert_eq!(error.to_string(), message, "{sql}");
         }
     }
