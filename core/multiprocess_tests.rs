@@ -920,10 +920,12 @@ fn multiprocess_new_db_creator_child_process() {
     conn.close().unwrap();
 }
 
-/// A read-only open never creates or initializes the coordination file: a
-/// short file with no live creator is reported as corrupt and left alone.
+/// A read-only open never creates or initializes the coordination file. A
+/// writer creates it empty before it takes the init lock, so a short file with
+/// no live creator is a creator that has not started yet (or died): the open
+/// reports retryable `Busy`, not `Corrupt`, and leaves the file alone.
 #[test]
-fn readonly_open_does_not_initialize_a_short_coordination_file() {
+fn readonly_open_reports_an_empty_coordination_file_as_busy() {
     let dir = tempfile::tempdir().unwrap();
     let shm_path = dir.path().join("short.db-tshm");
     std::fs::File::create(&shm_path).unwrap();
@@ -931,10 +933,33 @@ fn readonly_open_does_not_initialize_a_short_coordination_file() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let err = MappedSharedWalCoordination::open_existing(&io, &shm_path, 64).err();
     assert!(
-        matches!(err, Some(LimboError::Corrupt(_))),
-        "short file without a creator: {err:?}"
+        matches!(err, Some(LimboError::Busy)),
+        "empty file without a creator: {err:?}"
     );
     assert_eq!(std::fs::metadata(&shm_path).unwrap().len(), 0);
+}
+
+/// Same for a file that was sized but whose header was never published, such
+/// as one left by a creator that died: a writable opener re-initializes it, a
+/// read-only opener reports `Busy` and does not touch it.
+#[test]
+fn readonly_open_reports_an_unpublished_coordination_file_as_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let shm_path = dir.path().join("unpublished.db-tshm");
+    // Larger than the header for 64 reader slots, all zero: no magic.
+    let len = 1 << 20;
+    std::fs::File::create(&shm_path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let err = MappedSharedWalCoordination::open_existing(&io, &shm_path, 64).err();
+    assert!(
+        matches!(err, Some(LimboError::Busy)),
+        "unpublished file without a creator: {err:?}"
+    );
+    assert_eq!(std::fs::metadata(&shm_path).unwrap().len(), len);
 }
 
 /// A flagged open must not be rejected as a legacy open while another process

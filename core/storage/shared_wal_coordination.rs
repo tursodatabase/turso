@@ -1185,8 +1185,9 @@ impl MappedSharedWalCoordination {
     ///
     /// `initial_file_len` is `Some` for openers that may create the file; they
     /// take the init lock exclusively. With `None` the lock is shared, the
-    /// file is never resized or initialized, and a short file with no live
-    /// creator is reported as corrupt.
+    /// file is never resized or initialized, and a short file or an
+    /// unpublished header with no live creator is reported as `Busy`: a
+    /// writable opener will repair it.
     ///
     /// `after_probe` runs after the lifetime byte was probed and before it is
     /// taken; tests use it to pause an opener there.
@@ -1205,10 +1206,13 @@ impl MappedSharedWalCoordination {
         let mut initialize = false;
         if !multi_process && metadata_len < base_len {
             let Some(initial_file_len) = initial_file_len else {
+                // A creator makes the file empty before it takes the init
+                // lock, so a short file with no lifetime holder is a creator
+                // that has not started or one that died. Neither is
+                // corruption; a writable opener repairs the file, so the
+                // read-only opener retries.
                 file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-                return Err(LimboError::Corrupt(format!(
-                    "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
-                )));
+                return Err(LimboError::Busy);
             };
             file.shared_wal_set_len(initial_file_len as u64)?;
             initialize = true;
@@ -1223,7 +1227,10 @@ impl MappedSharedWalCoordination {
             return Err(LimboError::Busy);
         }
         let base_mapping = file.shared_wal_map(0, base_len)?;
-        if multi_process && !Self::header_published(&*base_mapping) {
+        // Only an opener that may create the file can finish an unpublished
+        // header in exclusive mode; a read-only one waits for a writer.
+        if (multi_process || initial_file_len.is_none()) && !Self::header_published(&*base_mapping)
+        {
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
             return Err(LimboError::Busy);
         }
