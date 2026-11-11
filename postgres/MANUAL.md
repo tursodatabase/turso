@@ -187,8 +187,15 @@ sequences. A catalog table such as `pg_catalog.pg_class` can be named, but
 nothing is stored for it. `ALTER ... OWNER TO` puts the new owner in the
 new owner's place in the list, and a rename keeps it.
 
-Every privilege is stored, but only `SELECT` lets a role do more yet: roles
-that are not superusers cannot write rows (see `SET ROLE`). Column
+`SELECT` and `INSERT` let a role read the table and insert into it, as in
+PostgreSQL. An `INSERT` that reads the table's columns also needs `SELECT`:
+`RETURNING` that returns them, and `ON CONFLICT` with a conflict target or
+`DO UPDATE`. `INSERT ... ON CONFLICT DO UPDATE` also needs `UPDATE`. A
+subquery in `RETURNING` needs `SELECT` only when it reads a column of the
+table, as in PostgreSQL. The other privileges are stored but let a role do
+nothing more yet: roles that are not superusers cannot update or delete rows
+(see `SET ROLE`). A table with row-level security still refuses inserts by a
+role that does not own it. Column
 privileges, `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of
 objects, and `REVOKE` fail as not supported, so that a script never believes
 it changed what a role may do when it did not. `GRANT role_name TO
@@ -238,11 +245,11 @@ keeps the role, and `DISCARD ALL` resets it.
 **Notes:**
 
 Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT` on
-tables (see `GRANT`). A role that is
-not a superuser may read the tables it owns or was granted `SELECT` on, and
-it may alter and drop the relations it owns, except that renaming a
-relation or creating an index on it also needs CREATE on the schema, which
-only a superuser has; it cannot insert, update, delete or truncate rows,
+tables (see `GRANT`). A role that is not a superuser may read and insert
+into the tables it owns or was granted privileges on, and it may alter and
+drop the relations it owns, except that renaming a relation or creating an
+index on it also needs CREATE on the schema, which only a superuser has; it
+cannot update, delete or truncate rows,
 call `nextval` or `setval`, create objects or roles, or `COPY FROM` a file.
 Creating objects stays superuser-only because PostgreSQL gates it on the
 schema's CREATE privilege, which does not exist yet. Catalog tables and

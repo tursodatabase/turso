@@ -714,3 +714,154 @@ test role-without-select-cannot-count-the-table {
 expect error {
     permission denied for table gs_closed_count
 }
+
+# What the write privileges let a role do. As in PostgreSQL, a write that
+# reads the table's columns, in WHERE, SET, RETURNING or ON CONFLICT, also
+# needs SELECT.
+
+test role-without-insert-cannot-insert {
+    CREATE ROLE gw_no_insert;
+    CREATE TABLE gw_no_insert_docs (id INT);
+    GRANT SELECT ON gw_no_insert_docs TO gw_no_insert;
+    SET ROLE gw_no_insert;
+    INSERT INTO gw_no_insert_docs VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_no_insert_docs
+}
+
+test grant-insert-lets-a-role-insert {
+    CREATE ROLE gw_inserter;
+    CREATE TABLE gw_inserted (id INT, body TEXT);
+    GRANT INSERT ON gw_inserted TO gw_inserter;
+    SET ROLE gw_inserter;
+    INSERT INTO gw_inserted VALUES (1, 'a'), (2, 'b');
+    INSERT INTO gw_inserted (id) SELECT 3;
+    RESET ROLE;
+    SELECT id, coalesce(body, 'null') FROM gw_inserted ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|null
+}
+
+test grant-insert-to-public-lets-every-role-insert {
+    CREATE ROLE gw_public_inserter;
+    CREATE TABLE gw_public_inserted (id INT);
+    GRANT INSERT ON gw_public_inserted TO PUBLIC;
+    SET ROLE gw_public_inserter;
+    INSERT INTO gw_public_inserted VALUES (1);
+    RESET ROLE;
+    SELECT id FROM gw_public_inserted;
+}
+expect {
+    1
+}
+
+test insert-returning-a-column-needs-select {
+    CREATE ROLE gw_returning;
+    CREATE TABLE gw_returning_docs (id INT);
+    GRANT INSERT ON gw_returning_docs TO gw_returning;
+    SET ROLE gw_returning;
+    INSERT INTO gw_returning_docs VALUES (1) RETURNING id;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_returning_docs
+}
+
+test insert-returning-a-column-with-select {
+    CREATE ROLE gw_returning_reader;
+    CREATE TABLE gw_returning_read (id INT);
+    GRANT INSERT, SELECT ON gw_returning_read TO gw_returning_reader;
+    SET ROLE gw_returning_reader;
+    INSERT INTO gw_returning_read VALUES (7) RETURNING id;
+}
+expect {
+    7
+}
+
+test insert-on-conflict-with-a-target-needs-select {
+    CREATE ROLE gw_conflict_target;
+    CREATE TABLE gw_conflict_target_docs (id INT PRIMARY KEY);
+    GRANT INSERT ON gw_conflict_target_docs TO gw_conflict_target;
+    SET ROLE gw_conflict_target;
+    INSERT INTO gw_conflict_target_docs VALUES (1) ON CONFLICT (id) DO NOTHING;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_conflict_target_docs
+}
+
+test insert-on-conflict-do-nothing-without-a-target-needs-only-insert {
+    CREATE ROLE gw_conflict_any;
+    CREATE TABLE gw_conflict_any_docs (id INT PRIMARY KEY);
+    INSERT INTO gw_conflict_any_docs VALUES (1);
+    GRANT INSERT ON gw_conflict_any_docs TO gw_conflict_any;
+    SET ROLE gw_conflict_any;
+    INSERT INTO gw_conflict_any_docs VALUES (1), (2) ON CONFLICT DO NOTHING;
+    RESET ROLE;
+    SELECT id FROM gw_conflict_any_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test insert-on-conflict-do-update-needs-update {
+    CREATE ROLE gw_upsert_no_update;
+    CREATE TABLE gw_upsert_no_update_docs (id INT PRIMARY KEY, n INT);
+    GRANT INSERT, SELECT ON gw_upsert_no_update_docs TO gw_upsert_no_update;
+    SET ROLE gw_upsert_no_update;
+    INSERT INTO gw_upsert_no_update_docs VALUES (1, 1)
+        ON CONFLICT (id) DO UPDATE SET n = excluded.n;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_upsert_no_update_docs
+}
+
+@skip-if postgres "PostgreSQL rejects DO UPDATE without a conflict target as a syntax error"
+test insert-on-conflict-do-update-without-a-target-needs-select {
+    CREATE ROLE gw_upsert_no_target;
+    CREATE TABLE gw_upsert_no_target_docs (id INT PRIMARY KEY, secret INT, n INT);
+    INSERT INTO gw_upsert_no_target_docs VALUES (1, 42, 0);
+    GRANT INSERT, UPDATE ON gw_upsert_no_target_docs TO gw_upsert_no_target;
+    SET ROLE gw_upsert_no_target;
+    INSERT INTO gw_upsert_no_target_docs VALUES (1, 0, 0)
+        ON CONFLICT DO UPDATE SET n = 1 WHERE gw_upsert_no_target_docs.secret = 42;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_upsert_no_target_docs
+}
+
+test insert-on-conflict-do-update-with-insert-select-and-update {
+    CREATE ROLE gw_upserter;
+    CREATE TABLE gw_upserted (id INT PRIMARY KEY, n INT);
+    INSERT INTO gw_upserted VALUES (1, 1);
+    GRANT INSERT, SELECT, UPDATE ON gw_upserted TO gw_upserter;
+    SET ROLE gw_upserter;
+    INSERT INTO gw_upserted VALUES (1, 10), (2, 20)
+        ON CONFLICT (id) DO UPDATE SET n = gw_upserted.n + excluded.n;
+    RESET ROLE;
+    SELECT id, n FROM gw_upserted ORDER BY id;
+}
+expect {
+    1|11
+    2|20
+}
+
+test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-select {
+    CREATE ROLE gw_insert_subquery;
+    CREATE TABLE gw_insert_subquery_docs (id INT);
+    GRANT INSERT ON gw_insert_subquery_docs TO gw_insert_subquery;
+    SET ROLE gw_insert_subquery;
+    INSERT INTO gw_insert_subquery_docs VALUES (1) RETURNING (SELECT 'ok');
+}
+expect {
+    ok
+}
+

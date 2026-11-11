@@ -6,10 +6,10 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! Privileges other than ownership are not checked yet, so a role that is
-//! not a superuser may not write to any table, use a sequence or change the
-//! schema it does not own. It may read tables, which row-level security
-//! limits, and switch roles.
+//! A role that is not a superuser reads the tables it owns or was granted
+//! SELECT on, which row-level security limits, inserts into those it owns or
+//! was granted INSERT on, and switches roles. It may not update or delete
+//! rows, use a sequence or change the schema it does not own.
 
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
@@ -22,6 +22,8 @@ use crate::security::roles::{
     ROLES_TABLE_NAME,
 };
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -41,10 +43,10 @@ pub fn check_statement_privileges(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let denial = match stmt {
-        ast::Stmt::Select(_) => return Ok(()),
-        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
-            write_denial(tbl_name)
-        }
+        // The privileges on the tables a statement reads and writes are
+        // checked when it resolves them, with check_privilege.
+        ast::Stmt::Select(_) | ast::Stmt::Insert { .. } => return Ok(()),
+        ast::Stmt::Delete { tbl_name, .. } => write_denial(tbl_name),
         ast::Stmt::Update(update) => write_denial(&update.tbl_name),
         ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }
@@ -326,6 +328,84 @@ pub(crate) fn check_privilege(
     Err(permission_denied(PermissionDenied::privilege(
         action, object,
     )))
+}
+
+/// Checks the privileges that a write to table `name` of `namespace` needs:
+/// `privilege`, and SELECT too when `reads_columns` says that the statement
+/// reads the table's columns, as in PostgreSQL.
+pub(crate) fn check_write_privileges(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    privilege: ast::Privilege,
+    reads_columns: bool,
+) -> Result<()> {
+    let object = || Object::Table(name.to_string());
+    check_privilege(resolver, connection, namespace, name, privilege, object())?;
+    if reads_columns {
+        check_privilege(
+            resolver,
+            connection,
+            namespace,
+            name,
+            ast::Privilege::Select,
+            object(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether any of `exprs` reads a column of table `table`, directly or from
+/// one of the planned `subqueries` that it refers to.
+pub(crate) fn reads_columns_of<'a>(
+    table: ast::TableInternalId,
+    exprs: impl IntoIterator<Item = &'a ast::Expr>,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let mut reads = false;
+    for expr in exprs {
+        walk_expr(expr, &mut |expr| {
+            reads |= match expr {
+                ast::Expr::Column { table: read, .. } | ast::Expr::RowId { table: read, .. } => {
+                    *read == table
+                }
+                ast::Expr::SubqueryResult { subquery_id, .. } => {
+                    subquery_reads_columns_of(table, *subquery_id, subqueries)?
+                }
+                ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_) => {
+                    return Err(LimboError::InternalError(
+                        "subquery is not planned before its privileges are checked".to_string(),
+                    ));
+                }
+                _ => false,
+            };
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(reads)
+}
+
+fn subquery_reads_columns_of(
+    table: ast::TableInternalId,
+    subquery_id: ast::TableInternalId,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let Some(subquery) = subqueries.iter().find(|s| s.internal_id == subquery_id) else {
+        return Err(LimboError::InternalError(format!(
+            "subquery {subquery_id} not found"
+        )));
+    };
+    let outer_ref_ids = match &subquery.state {
+        SubqueryState::Unevaluated { plan: Some(plan) } => plan.used_outer_query_ref_ids(),
+        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids.clone(),
+        SubqueryState::Unevaluated { plan: None } => {
+            return Err(LimboError::InternalError(format!(
+                "subquery {subquery_id} has no plan"
+            )));
+        }
+    };
+    Ok(outer_ref_ids.contains(&table))
 }
 
 /// The role that reads the tables of a statement compiled for `role`. Inside

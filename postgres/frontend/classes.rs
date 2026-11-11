@@ -460,8 +460,8 @@ pub(crate) fn relation_owner(
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// the owner has every privilege, and another role has the ones the list
 /// gives it, by oid or through PUBLIC. A relation without a class row is the
-/// engine's, such as a catalog table, and every role has every privilege on
-/// it.
+/// engine's, such as a catalog table, and every role reads it, but only a
+/// superuser writes it.
 pub(crate) fn role_has_privilege(
     schema: &Schema,
     namespace: NamespaceId,
@@ -472,7 +472,7 @@ pub(crate) fn role_has_privilege(
     let Some(class) =
         class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
     else {
-        return true;
+        return privilege == ast::Privilege::Select;
     };
     if class.relowner == role {
         return true;
