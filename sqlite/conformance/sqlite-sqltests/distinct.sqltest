@@ -443,6 +443,9 @@ test distinct-spilled-sum-does-not-overflow {
 expect {
     -250|-250.0|-0.5
 }
+expect @js {
+    -250|-250|-0.5
+}
 
 # A DISTINCT value must keep its JSON subtype after a spill, so the elements are
 # arrays and not JSON strings.
