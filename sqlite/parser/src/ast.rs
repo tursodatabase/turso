@@ -237,6 +237,9 @@ pub enum Stmt {
         where_clause: Option<Box<Expr>>,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
+        /// Whether the statement is PostgreSQL's `TRUNCATE`, which deletes
+        /// every row and needs the TRUNCATE privilege rather than DELETE.
+        truncate: bool,
     },
     /// `DETACH DATABASE`: db name
     Detach {

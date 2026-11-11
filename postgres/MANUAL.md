@@ -204,17 +204,18 @@ CONFLICT` with a conflict target or `DO UPDATE`. `INSERT ... ON CONFLICT DO
 UPDATE` also needs `UPDATE`. A subquery in these places needs `SELECT` only
 when it reads a column of the table that is written, as in PostgreSQL.
 Foreign-key checks and
-actions need no privileges on the other table. `TRUNCATE` runs as a
-`DELETE` of every row, so it needs `DELETE`, not `TRUNCATE`. The
-`TRUNCATE`, `REFERENCES`, `TRIGGER` and `MAINTAIN` privileges are stored
-but let a role do nothing more yet. On a sequence, `nextval` needs `USAGE`
+actions need no privileges on the other table. `TRUNCATE` needs the
+`TRUNCATE` privilege, not `DELETE`, as in PostgreSQL. The `REFERENCES`,
+`TRIGGER` and `MAINTAIN` privileges are stored but let a role do nothing
+yet. On a sequence, `nextval` needs `USAGE`
 or `UPDATE` and `setval` needs `UPDATE`, as in PostgreSQL, so a role that
 inserts into a table with a `serial` column needs `USAGE` on the column's
 sequence too. A `serial PRIMARY KEY` column is the exception: its value
 comes from the row's rowid, not from the sequence, so the insert needs no
 privilege on the sequence. A table with row-level security still
 refuses writes by a role that does not own it: `INSERT` fails, and
-`UPDATE` and `DELETE` change no rows. Column
+`UPDATE` and `DELETE` change no rows. As in PostgreSQL, row-level security
+does not apply to `TRUNCATE`, which removes every row. Column
 privileges, `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of
 objects, and `REVOKE` fail as not supported, so that a script never believes
 it changed what a role may do when it did not. `GRANT role_name TO

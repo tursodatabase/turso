@@ -365,6 +365,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 returning: vec![],
                 indexed: None,
                 with: None,
+                truncate: false,
             })
         }
         ast::TriggerCmd::Select(select) => {

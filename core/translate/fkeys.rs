@@ -1992,6 +1992,7 @@ fn generate_cascade_delete_stmt(
             ctx,
         ))),
         returning: vec![],
+        truncate: false,
     }
 }
 

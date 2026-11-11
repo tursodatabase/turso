@@ -93,9 +93,15 @@ pub fn translate_delete(
     returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
+    truncate: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    let (privilege, command) = if truncate {
+        (ast::Privilege::Truncate, Command::Truncate)
+    } else {
+        (ast::Privilege::Delete, Command::Delete)
+    };
     let namespace = resolver.resolve_queried_table(tbl_name)?;
     let database_id = namespace.database_id;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
@@ -120,6 +126,7 @@ pub fn translate_delete(
         returning,
         indexed,
         with,
+        command,
         connection,
         namespace,
     )?;
@@ -139,7 +146,7 @@ pub fn translate_delete(
                 connection,
             )?;
         }
-        check_delete_privileges(delete_plan_inner, resolver, connection)?;
+        check_delete_privileges(delete_plan_inner, privilege, resolver, connection)?;
     }
 
     optimize_plan(program, &mut delete_plan, resolver, connection)?;
@@ -186,12 +193,13 @@ pub fn translate_delete(
     Ok(())
 }
 
-/// Checks the privileges on the target table: DELETE, and SELECT too
+/// Checks the privileges on the target table: `privilege`, and SELECT too
 /// when WHERE or RETURNING reads the table's columns, as in PostgreSQL.
 /// Subqueries must be planned first, so that only a subquery that refers to
 /// the target table counts as reading it.
 fn check_delete_privileges(
     plan: &DeletePlan,
+    privilege: ast::Privilege,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
@@ -218,7 +226,7 @@ fn check_delete_privileges(
         connection,
         target.namespace,
         target.table.get_name(),
-        ast::Privilege::Delete,
+        privilege,
         reads_in_where || reads_in_returning,
     )
 }
@@ -234,6 +242,7 @@ pub fn prepare_delete_plan(
     mut returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
+    command: Command,
     connection: &Arc<crate::Connection>,
     namespace: NamespaceRef,
 ) -> Result<Plan> {
@@ -298,12 +307,7 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         resolver,
     )?;
-    row_security::filter_rows(
-        Command::Delete,
-        &table_references,
-        &mut where_predicates,
-        resolver,
-    )?;
+    row_security::filter_rows(command, &table_references, &mut where_predicates, resolver)?;
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)

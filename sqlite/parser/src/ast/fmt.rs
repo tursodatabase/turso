@@ -486,6 +486,9 @@ impl ToTokens for Stmt {
                 indexed,
                 where_clause,
                 returning,
+                // Written as the DELETE it runs as: this is SQLite's syntax,
+                // which has no TRUNCATE.
+                truncate: _,
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;

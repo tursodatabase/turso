@@ -943,6 +943,60 @@ expect {
     0
 }
 
+test truncate-needs-truncate-not-delete {
+    CREATE ROLE gw_truncate_delete;
+    CREATE TABLE gw_truncate_delete_docs (id INT);
+    GRANT DELETE ON gw_truncate_delete_docs TO gw_truncate_delete;
+    SET ROLE gw_truncate_delete;
+    TRUNCATE gw_truncate_delete_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_truncate_delete_docs
+}
+
+test grant-truncate-lets-a-role-truncate {
+    CREATE ROLE gw_truncater;
+    CREATE TABLE gw_truncated (id INT);
+    INSERT INTO gw_truncated VALUES (1), (2);
+    GRANT TRUNCATE ON gw_truncated TO gw_truncater;
+    SET ROLE gw_truncater;
+    TRUNCATE gw_truncated;
+    RESET ROLE;
+    SELECT count(*) FROM gw_truncated;
+}
+expect {
+    0
+}
+
+# Row-level security does not apply to TRUNCATE, as in PostgreSQL.
+test truncate-empties-a-table-with-row-level-security {
+    CREATE ROLE gw_truncate_rls;
+    CREATE TABLE gw_truncated_rls (id INT);
+    INSERT INTO gw_truncated_rls VALUES (1), (2);
+    ALTER TABLE gw_truncated_rls ENABLE ROW LEVEL SECURITY;
+    GRANT TRUNCATE ON gw_truncated_rls TO gw_truncate_rls;
+    SET ROLE gw_truncate_rls;
+    TRUNCATE gw_truncated_rls;
+    RESET ROLE;
+    SELECT count(*) FROM gw_truncated_rls;
+}
+expect {
+    0
+}
+
+test grant-truncate-does-not-let-a-role-delete {
+    CREATE ROLE gw_truncate_only;
+    CREATE TABLE gw_truncate_only_docs (id INT);
+    GRANT TRUNCATE ON gw_truncate_only_docs TO gw_truncate_only;
+    SET ROLE gw_truncate_only;
+    DELETE FROM gw_truncate_only_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_truncate_only_docs
+}
+
 test delete-with-where-needs-select {
     CREATE ROLE gw_delete_where;
     CREATE TABLE gw_delete_where_docs (id INT);

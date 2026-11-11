@@ -16,6 +16,7 @@ pub enum Command {
     Insert,
     Update,
     Delete,
+    Truncate,
 }
 
 /// Which rows of a table a role may access.

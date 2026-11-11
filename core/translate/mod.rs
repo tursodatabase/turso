@@ -397,6 +397,7 @@ fn translate_statement(
             returning,
             indexed,
             with,
+            truncate,
         } => {
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
@@ -410,6 +411,7 @@ fn translate_statement(
                 returning,
                 indexed,
                 with,
+                truncate,
                 program,
                 connection,
             )?

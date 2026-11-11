@@ -1507,6 +1507,7 @@ impl PostgreSQLTranslator {
             indexed: None,
             where_clause: None,
             returning: vec![],
+            truncate: true,
         })
     }
 
@@ -2041,6 +2042,7 @@ impl PostgreSQLTranslator {
             indexed: None,
             where_clause,
             returning,
+            truncate: false,
         })
     }
 
@@ -10367,11 +10369,13 @@ mod tests {
         if let ast::Stmt::Delete {
             tbl_name,
             where_clause,
+            truncate,
             ..
         } = translated
         {
             assert_eq!(tbl_name.name.as_str(), "users");
             assert!(where_clause.is_none(), "TRUNCATE should have no WHERE");
+            assert!(truncate, "TRUNCATE should need the TRUNCATE privilege");
         } else {
             panic!("Expected Delete for TRUNCATE, got: {translated:?}");
         }
