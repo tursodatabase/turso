@@ -1924,8 +1924,9 @@ fn emit_fk_action_subprogram(
             .set_writes_stored_values(ctx.new_key_is_stored);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
-        // Foreign-key actions see every row, as in PostgreSQL, so a cascading
-        // delete also removes the rows that row-level security hides.
+        // Foreign-key actions see every row and need no privileges, as in
+        // PostgreSQL, so a cascading delete also removes the rows that
+        // row-level security hides from the role whose delete started it.
         resolver.as_superuser(|resolver| {
             translate_inner(
                 stmt,

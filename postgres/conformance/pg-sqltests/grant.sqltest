@@ -854,6 +854,114 @@ expect {
     2|20
 }
 
+test role-without-update-cannot-update {
+    CREATE ROLE gw_no_update;
+    CREATE TABLE gw_no_update_docs (id INT);
+    GRANT SELECT, INSERT ON gw_no_update_docs TO gw_no_update;
+    SET ROLE gw_no_update;
+    UPDATE gw_no_update_docs SET id = 2;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_no_update_docs
+}
+
+test grant-update-lets-a-role-update-every-row {
+    CREATE ROLE gw_updater;
+    CREATE TABLE gw_updated (id INT, body TEXT);
+    INSERT INTO gw_updated VALUES (1, 'a'), (2, 'b');
+    GRANT UPDATE ON gw_updated TO gw_updater;
+    SET ROLE gw_updater;
+    UPDATE gw_updated SET body = 'x';
+    RESET ROLE;
+    SELECT id, body FROM gw_updated ORDER BY id;
+}
+expect {
+    1|x
+    2|x
+}
+
+test update-with-where-needs-select {
+    CREATE ROLE gw_update_where;
+    CREATE TABLE gw_update_where_docs (id INT, body TEXT);
+    GRANT UPDATE ON gw_update_where_docs TO gw_update_where;
+    SET ROLE gw_update_where;
+    UPDATE gw_update_where_docs SET body = 'x' WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_where_docs
+}
+
+test update-that-reads-a-column-in-set-needs-select {
+    CREATE ROLE gw_update_set;
+    CREATE TABLE gw_update_set_docs (id INT, n INT);
+    GRANT UPDATE ON gw_update_set_docs TO gw_update_set;
+    SET ROLE gw_update_set;
+    UPDATE gw_update_set_docs SET n = n + 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_set_docs
+}
+
+test update-with-where-and-returning-with-select {
+    CREATE ROLE gw_update_reader;
+    CREATE TABLE gw_update_read (id INT, n INT);
+    INSERT INTO gw_update_read VALUES (1, 1), (2, 2);
+    GRANT SELECT, UPDATE ON gw_update_read TO gw_update_reader;
+    SET ROLE gw_update_reader;
+    UPDATE gw_update_read SET n = n + 10 WHERE id = 2 RETURNING id, n;
+}
+expect {
+    2|12
+}
+
+# A subquery needs SELECT on the table that is written only when it reads a
+# column of that table.
+test update-with-subqueries-that-do-not-read-the-table-needs-no-select {
+    CREATE ROLE gw_update_subquery;
+    CREATE TABLE gw_update_subquery_docs (id INT, n INT);
+    INSERT INTO gw_update_subquery_docs VALUES (1, 1), (2, 2);
+    GRANT UPDATE ON gw_update_subquery_docs TO gw_update_subquery;
+    SET ROLE gw_update_subquery;
+    UPDATE gw_update_subquery_docs SET n = (SELECT 10) WHERE EXISTS (SELECT 1) RETURNING (SELECT 'ok');
+    RESET ROLE;
+    SELECT id, n FROM gw_update_subquery_docs ORDER BY id;
+}
+expect {
+    ok
+    ok
+    1|10
+    2|10
+}
+
+test update-with-a-subquery-that-reads-the-table-needs-select {
+    CREATE ROLE gw_update_correlated;
+    CREATE TABLE gw_update_correlated_docs (id INT, n INT);
+    CREATE TABLE gw_update_correlated_src (id INT, n INT);
+    GRANT UPDATE ON gw_update_correlated_docs TO gw_update_correlated;
+    GRANT SELECT ON gw_update_correlated_src TO gw_update_correlated;
+    SET ROLE gw_update_correlated;
+    UPDATE gw_update_correlated_docs SET n = (SELECT s.n FROM gw_update_correlated_src s WHERE s.id = gw_update_correlated_docs.id);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_correlated_docs
+}
+
+test update-with-a-nested-subquery-that-reads-the-table-needs-select {
+    CREATE ROLE gw_update_nested;
+    CREATE TABLE gw_update_nested_docs (id INT, n INT);
+    GRANT UPDATE ON gw_update_nested_docs TO gw_update_nested;
+    SET ROLE gw_update_nested;
+    UPDATE gw_update_nested_docs SET n = (SELECT (SELECT gw_update_nested_docs.id));
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_nested_docs
+}
+
 test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-select {
     CREATE ROLE gw_insert_subquery;
     CREATE TABLE gw_insert_subquery_docs (id INT);
@@ -863,5 +971,26 @@ test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-s
 }
 expect {
     ok
+}
+
+# ALTER TABLE rewrites the table's definition in the schema, which needs no
+# privilege besides owning the table.
+test owner-alters-the-columns-of-its-own-table {
+    CREATE ROLE gw_alter_owner;
+    CREATE TABLE gw_altered (id INT);
+    CREATE INDEX gw_altered_id ON gw_altered (id);
+    CREATE VIEW gw_altered_ids AS SELECT id FROM gw_altered;
+    ALTER TABLE gw_altered OWNER TO gw_alter_owner;
+    ALTER VIEW gw_altered_ids OWNER TO gw_alter_owner;
+    SET ROLE gw_alter_owner;
+    ALTER TABLE gw_altered ADD COLUMN n INT;
+    ALTER TABLE gw_altered RENAME COLUMN n TO m;
+    ALTER TABLE gw_altered RENAME COLUMN id TO key;
+    ALTER TABLE gw_altered DROP COLUMN m;
+    INSERT INTO gw_altered VALUES (1);
+    SELECT key FROM gw_altered;
+}
+expect {
+    1
 }
 

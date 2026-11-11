@@ -6,10 +6,10 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! A role that is not a superuser reads the tables it owns or was granted
-//! SELECT on, which row-level security limits, inserts into those it owns or
-//! was granted INSERT on, and switches roles. It may not update or delete
-//! rows, use a sequence or change the schema it does not own.
+//! A role that is not a superuser reads, inserts into and updates the tables
+//! it owns or was granted privileges on, which row-level security limits,
+//! and switches roles. It may not delete rows, use a sequence or change the
+//! schema it does not own.
 
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
@@ -45,9 +45,8 @@ pub fn check_statement_privileges(
     let denial = match stmt {
         // The privileges on the tables a statement reads and writes are
         // checked when it resolves them, with check_privilege.
-        ast::Stmt::Select(_) | ast::Stmt::Insert { .. } => return Ok(()),
+        ast::Stmt::Select(_) | ast::Stmt::Insert { .. } | ast::Stmt::Update(_) => return Ok(()),
         ast::Stmt::Delete { tbl_name, .. } => write_denial(tbl_name),
-        ast::Stmt::Update(update) => write_denial(&update.tbl_name),
         ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }
         | ast::Stmt::Rollback { .. }
