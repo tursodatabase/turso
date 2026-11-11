@@ -15,7 +15,8 @@ use turso_core::{
     Register, Result, Value, WallClockInstant,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_ARGUMENT_FOR_LOGARITHM, SQLSTATE_INVALID_DATETIME_FORMAT,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -149,6 +150,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
+        "log"(FunctionArity::Exact(2), true) => exec_log(args)?,
         // The time the transaction started, or the statement outside a
         // transaction.
         "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
@@ -589,6 +591,37 @@ fn unrecognized_parameter(name: &str) -> LimboError {
 fn exec_random(bits: i64) -> f64 {
     let mantissa = (bits as u64) >> 11;
     mantissa as f64 / (1_u64 << 53) as f64
+}
+
+/// log(b, x) as PostgreSQL computes it: defined for every positive base
+/// other than 1, and an error, not NULL, outside that domain.
+fn exec_log(args: &[Register]) -> Result<Option<f64>> {
+    let number = |i: usize| Numeric::from_value_strict(args[i].get_value()).map(|n| n.to_f64());
+    let (Some(base), Some(x)) = (number(0), number(1)) else {
+        return Ok(None);
+    };
+    let ln_base = ln(base)?;
+    let ln_x = ln(x)?;
+    if ln_base == 0.0 {
+        return Err(LimboError::DivisionByZero);
+    }
+    Ok(Some(ln_x / ln_base))
+}
+
+fn ln(x: f64) -> Result<f64> {
+    if x == 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_LOGARITHM,
+            "cannot take logarithm of zero",
+        ));
+    }
+    if x < 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_LOGARITHM,
+            "cannot take logarithm of a negative number",
+        ));
+    }
+    Ok(x.ln())
 }
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
