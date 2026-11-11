@@ -1,0 +1,23 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/11402
+#
+# ALTER TABLE DROP COLUMN checks that the column exists before it checks that
+# another column would remain, as SQLite does: dropping a column that is not
+# there reports "no such column", also on a table with one column.
+
+test drop-missing-column-from-one-column-table {
+    CREATE TABLE t (a);
+    ALTER TABLE t DROP COLUMN c;
+}
+expect error {
+    no such column: "c"
+}
+
+test drop-only-column-still-rejected {
+    CREATE TABLE t (a);
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+    cannot drop column "a": no other columns exist
+}
