@@ -4,7 +4,7 @@ use crate::turso_assert;
 use crate::types::IOResultOr;
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, TempFile, IO},
+    io::{Buffer, Completion, File, TempFile, IO},
     io_yield_one, return_if_io,
     storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint},
     sync::{
@@ -36,6 +36,13 @@ const DEFAULT_BUCKETS: usize = 1024;
 pub const MIN_PARTITIONS: usize = 16;
 /// Maximum number of partitions for adaptive partitioning.
 pub const MAX_PARTITIONS: usize = 128;
+/// Hash bits a grace re-split of an oversized partition routes on.
+const GRACE_SPLIT_BITS: u32 = 4;
+/// Number of sub-partitions one grace re-split produces.
+const GRACE_SPLIT_FANOUT: usize = 1 << GRACE_SPLIT_BITS;
+/// Low hash bits that re-splitting never routes on, so they stay free for the
+/// bucket index (`hash % bucket_count`).
+const GRACE_SPLIT_RESERVED_BITS: u32 = 16;
 const NULL_HASH: u8 = 0;
 const INT_HASH: u8 = 1;
 const FLOAT_HASH: u8 = 2;
@@ -564,6 +571,9 @@ struct SpillChunk {
     size_bytes: usize,
     /// Number of entries in this chunk
     num_entries: usize,
+    /// In-memory size of the entries when they were flushed (the sum of their
+    /// `HashEntry::size_bytes`), used to estimate the resident size of a partition.
+    mem_bytes: usize,
 }
 
 /// Tracks a partition that has been spilled to disk during grace hash join.
@@ -592,6 +602,19 @@ pub struct SpilledPartition {
     partial_entry: Vec<u8>,
     /// Parsed entries for validation
     parsed_entries: usize,
+    /// Number of high hash bits shared by every entry of a grace sub-partition
+    /// (0 for top-level partitions, whose routing is `Partitioning`).
+    hash_bits: u32,
+    /// Value of those high hash bits for a grace sub-partition.
+    hash_prefix: u64,
+    /// False once splitting this partition cannot help, because all of its
+    /// entries share the same hash bits (skew).
+    splittable: bool,
+    /// Set once grace split this partition: the id of its first sub-partition. Its
+    /// sub-partitions have the ids `first..first + GRACE_SPLIT_FANOUT`, and are kept
+    /// for the lifetime of the build, since the build never changes after it is
+    /// finalized. The partition itself is never loaded as a whole again.
+    split_first_id: Option<usize>,
 }
 
 impl SpilledPartition {
@@ -609,17 +632,45 @@ impl SpilledPartition {
             matched_bits: vec![],
             partial_entry: vec![],
             parsed_entries: 0,
+            hash_bits: 0,
+            hash_prefix: 0,
+            splittable: true,
+            split_first_id: None,
         }
     }
 
+    /// A grace sub-partition holding the entries of its parent whose hash starts
+    /// with the `hash_bits` high bits `hash_prefix`.
+    fn new_sub_partition(partition_idx: usize, hash_bits: u32, hash_prefix: u64) -> Self {
+        let mut partition = Self::new(partition_idx);
+        partition.hash_bits = hash_bits;
+        partition.hash_prefix = hash_prefix;
+        partition
+    }
+
     /// Add a new chunk of data to this partition
-    fn add_chunk(&mut self, file_offset: u64, size_bytes: usize, num_entries: usize) -> Result<()> {
+    fn add_chunk(
+        &mut self,
+        file_offset: u64,
+        size_bytes: usize,
+        num_entries: usize,
+        mem_bytes: usize,
+    ) -> Result<()> {
         self.chunks.try_push(SpillChunk {
             file_offset,
             size_bytes,
             num_entries,
+            mem_bytes,
         })?;
         Ok(())
+    }
+
+    /// Estimated resident size once loaded: the entries plus the bucket array
+    /// that `load_spilled_partition` allocates for them.
+    fn resident_estimate(&self) -> usize {
+        let entries_mem: usize = self.chunks.iter().map(|c| c.mem_bytes).sum();
+        let bucket_count = self.total_num_entries().next_power_of_two().max(64);
+        entries_mem.saturating_add(bucket_count.saturating_mul(std::mem::size_of::<HashBucket>()))
     }
 
     /// Get total size in bytes across all chunks
@@ -754,6 +805,9 @@ struct SpillState {
     /// on disk needs to read only that one key, not its whole partition.
     distinct_key_places: Vec<HashMap<u64, PackedDistinctKeyPlace>>,
     distinct_key_read: Option<DistinctKeyRead>,
+    /// Id for the next grace sub-partition. Ids start at `partitioning.count`, so
+    /// they never collide with the top-level partition indices.
+    next_sub_partition_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,6 +881,7 @@ impl SpillState {
                 .map(|_| HashMap::default())
                 .try_collect()?,
             distinct_key_read: None,
+            next_sub_partition_id: partitioning.count,
         })
     }
 
@@ -908,6 +963,8 @@ struct GraceState {
     partition_list_idx: usize,
     /// Current load state for the active grace partition.
     load_state: GracePartitionLoadState,
+    /// Re-split of the current partition that is waiting for IO.
+    split: Option<PartitionSplit>,
 }
 
 impl GraceState {
@@ -923,6 +980,205 @@ enum GracePartitionLoadState {
     NeedBuildLoad,
     NeedProbeLoad,
     Ready,
+}
+
+/// Reads one spilled chunk at a time, re-entrantly across IO completions.
+struct ChunkReader {
+    io_state: Arc<AtomicSpillIOState>,
+    buffer: Arc<RwLock<Vec<u8>>>,
+    len: Arc<AtomicUsize>,
+}
+
+impl ChunkReader {
+    fn new() -> Self {
+        Self {
+            io_state: Arc::new(AtomicSpillIOState::new(SpillIOState::None)),
+            buffer: Arc::new(RwLock::new(vec![])),
+            len: Arc::new(atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitStage {
+    Build,
+    Probe,
+    Done,
+}
+
+/// One side (build or probe) of a partition re-split.
+struct SplitSide {
+    /// Chunks of the partition being split: (file offset, size in bytes, entries).
+    source: Vec<(u64, usize, usize)>,
+    /// Next entry of `source` to read.
+    next_source: usize,
+    /// Entries routed to each sub-partition and not yet flushed.
+    buffers: Vec<PartitionBuffer>,
+    /// The sub-partitions being filled, with the chunks flushed so far.
+    subs: Vec<SpilledPartition>,
+}
+
+/// Re-split of an oversized grace partition into `GRACE_SPLIT_FANOUT`
+/// sub-partitions, on both the build and the probe side (only the probe side when
+/// the build was already split). It streams one chunk at a time, so its memory
+/// stays near the memory budget.
+struct PartitionSplit {
+    parent_idx: usize,
+    /// Id of the first sub-partition.
+    first_id: usize,
+    /// Whether the build side is split too. False when the build sub-partitions of
+    /// the parent exist from an earlier probe pass: only the probe side is routed.
+    split_build: bool,
+    /// Shift that brings the sub-partition routing bits of a hash to the bottom.
+    shift: u32,
+    /// Flush a sub-partition buffer once it holds more than this much memory.
+    flush_threshold: usize,
+    stage: SplitStage,
+    reader: ChunkReader,
+    /// Entries read and not yet routed, in reverse order (`pop` yields the next).
+    pending: Vec<HashEntry>,
+    /// Whether the in-memory probe buffer of the parent was queued yet.
+    probe_buffer_queued: bool,
+    build: SplitSide,
+    probe: SplitSide,
+}
+
+impl PartitionSplit {
+    #[inline]
+    fn route(&self, hash: u64) -> usize {
+        ((hash >> self.shift) as usize) & (GRACE_SPLIT_FANOUT - 1)
+    }
+}
+
+/// Serialize `entries` into one chunk, in the format of the spill writers, and
+/// start writing it at `*next_offset`. Returns (file offset, size, completion).
+fn write_entries_chunk(
+    file: &Arc<dyn File>,
+    next_offset: &mut u64,
+    entries: &[HashEntry],
+    io_state: Arc<AtomicSpillIOState>,
+) -> Result<(u64, usize, Completion)> {
+    let mut entry_sizes = Vec::try_with_capacity_ext(entries.len())?;
+    let mut total_size = 0usize;
+    for entry in entries {
+        let entry_size = entry.serialized_size();
+        entry_sizes.try_push(entry_size)?;
+        total_size += varint_len(entry_size as u64) + entry_size;
+    }
+    let buffer = Buffer::new_temporary(total_size);
+    let buf = buffer.as_mut_slice();
+    let mut offset = 0;
+    for (entry, &entry_size) in entries.iter().zip(entry_sizes.iter()) {
+        offset += write_varint(&mut buf[offset..], entry_size as u64);
+        offset += entry.serialize_to_slice(&mut buf[offset..]);
+    }
+    turso_assert!(offset == total_size, "serialized size mismatch");
+
+    let file_offset = *next_offset;
+    io_state.set(SpillIOState::WaitingForWrite);
+    let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
+        Ok(_) => io_state.set(SpillIOState::WriteComplete),
+        Err(e) => {
+            tracing::error!("Error writing re-split partition chunk to disk: {e:?}");
+            io_state.set(SpillIOState::Error);
+        }
+    });
+    let completion = Completion::new_write(write_complete);
+    let completion = file.pwrite(file_offset, Arc::new(buffer), completion)?;
+    *next_offset += total_size as u64;
+    Ok((file_offset, total_size, completion))
+}
+
+/// Decode the entries of one self-contained spilled chunk.
+fn parse_chunk_entries(data: &[u8], expected_entries: usize) -> Result<Vec<HashEntry>> {
+    let mut entries = Vec::try_with_capacity_ext(expected_entries)?;
+    let mut offset = 0;
+    while offset < data.len() {
+        let Some((entry_len, varint_size)) = read_varint_partial(&data[offset..])? else {
+            return Err(LimboError::Corrupt("truncated spill chunk header".into()));
+        };
+        let start = offset + varint_size;
+        let end = start + entry_len as usize;
+        if end > data.len() {
+            return Err(LimboError::Corrupt("truncated spill chunk payload".into()));
+        }
+        let (entry, consumed) = HashEntry::deserialize(&data[start..end])?;
+        turso_assert!(
+            consumed == entry_len as usize,
+            "expected to consume entire entry"
+        );
+        entries.try_push(entry)?;
+        offset = end;
+    }
+    if unlikely(entries.len() != expected_entries) {
+        return Err(LimboError::Corrupt(format!(
+            "spill chunk entry count mismatch: expected {expected_entries}, got {}",
+            entries.len()
+        )));
+    }
+    Ok(entries)
+}
+
+/// Read the chunk at `file_offset` and decode its entries. Yields while the read
+/// is in flight; call again with the same arguments to resume.
+fn poll_chunk_entries(
+    reader: &ChunkReader,
+    file: &Arc<dyn File>,
+    file_offset: u64,
+    size_bytes: usize,
+    expected_entries: usize,
+) -> IOResultOr<Vec<HashEntry>> {
+    loop {
+        match reader.io_state.get() {
+            SpillIOState::Error => {
+                return Err(LimboError::InternalError("hash join spill I/O failure".into()).into());
+            }
+            SpillIOState::WaitingForRead => {
+                io_yield_one!(Completion::new_yield());
+            }
+            SpillIOState::ReadComplete => {
+                let len = reader.len.load(atomic::Ordering::Acquire);
+                let entries = {
+                    let data = reader.buffer.read();
+                    parse_chunk_entries(&data[..len], expected_entries)?
+                };
+                reader.len.store(0, atomic::Ordering::Release);
+                reader.buffer.write().clear();
+                reader.io_state.set(SpillIOState::None);
+                return Ok(IOResult::Done(entries));
+            }
+            _ => {
+                reader.io_state.set(SpillIOState::WaitingForRead);
+                let io_state = reader.io_state.clone();
+                let buffer = reader.buffer.clone();
+                let len = reader.len.clone();
+                let read_complete = Box::new(
+                    move |res: Result<(Arc<Buffer>, i32), CompletionError>| match res {
+                        Ok((buf, bytes_read)) => {
+                            let mut persistent_buf = buffer.write();
+                            persistent_buf.clear();
+                            persistent_buf
+                                .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                            len.store(bytes_read as usize, atomic::Ordering::Release);
+                            io_state.set(SpillIOState::ReadComplete);
+                            None
+                        }
+                        Err(e) => {
+                            tracing::error!("Error reading spilled chunk: {e:?}");
+                            io_state.set(SpillIOState::Error);
+                            None
+                        }
+                    },
+                );
+                let read_buffer = Arc::new(Buffer::new_temporary(size_bytes));
+                let completion = Completion::new_read(read_buffer, read_complete);
+                let c = file.pread(file_offset, completion)?;
+                if !c.finished() {
+                    io_yield_one!(c);
+                }
+            }
+        }
+    }
 }
 
 /// HashTable is the build-side data structure used for hash joins and DISTINCT. It behaves like a
@@ -1624,7 +1880,7 @@ impl HashTable {
                 self.loaded_partitions_mem =
                     self.loaded_partitions_mem.saturating_sub(existing.unload());
             }
-            existing.add_chunk(file_offset, data_size, num_entries)?;
+            existing.add_chunk(file_offset, data_size, num_entries, mem_freed)?;
             if let Some(metrics) = metrics.as_deref_mut() {
                 metrics.spill_bytes_written =
                     metrics.spill_bytes_written.saturating_add(data_size as u64);
@@ -1639,7 +1895,7 @@ impl HashTable {
             existing.io_state.clone()
         } else {
             let mut new_partition = SpilledPartition::new(partition_idx);
-            new_partition.add_chunk(file_offset, data_size, num_entries)?;
+            new_partition.add_chunk(file_offset, data_size, num_entries, mem_freed)?;
             if let Some(metrics) = metrics {
                 metrics.spill_bytes_written =
                     metrics.spill_bytes_written.saturating_add(data_size as u64);
@@ -1786,7 +2042,12 @@ impl HashTable {
                     self.loaded_partitions_mem =
                         self.loaded_partitions_mem.saturating_sub(existing.unload());
                 }
-                existing.add_chunk(file_offset, meta.data_size, meta.num_entries)?;
+                existing.add_chunk(
+                    file_offset,
+                    meta.data_size,
+                    meta.num_entries,
+                    meta.mem_freed,
+                )?;
                 if let Some(metrics) = metrics.as_deref_mut() {
                     metrics.spill_bytes_written = metrics
                         .spill_bytes_written
@@ -1802,7 +2063,12 @@ impl HashTable {
                 existing.io_state.clone()
             } else {
                 let mut new_partition = SpilledPartition::new(meta.idx);
-                new_partition.add_chunk(file_offset, meta.data_size, meta.num_entries)?;
+                new_partition.add_chunk(
+                    file_offset,
+                    meta.data_size,
+                    meta.num_entries,
+                    meta.mem_freed,
+                )?;
                 if let Some(metrics) = metrics.as_deref_mut() {
                     metrics.spill_bytes_written = metrics
                         .spill_bytes_written
@@ -2150,7 +2416,11 @@ impl HashTable {
         if let Some(spill_state) = self.spill_state.as_ref() {
             let partition_idx = self.current_spill_partition_idx;
 
-            turso_assert_eq!(partition_idx, self.partition_index(hash));
+            turso_assert!(
+                self.partition_routes_hash(partition_idx, hash),
+                "probe hash does not belong to the current partition",
+                { "partition_idx": partition_idx }
+            );
             let Some(partition) = spill_state.find_partition(partition_idx) else {
                 return Ok(None);
             };
@@ -2306,6 +2576,13 @@ impl HashTable {
         let spill_state = self.spill_state.as_ref()?;
         while self.unmatched_scan_partition < spill_state.partitions.len() {
             let partition = &spill_state.partitions[self.unmatched_scan_partition];
+            if partition.split_first_id.is_some() {
+                // Its sub-partitions hold its rows and are scanned in its place.
+                self.unmatched_scan_partition += 1;
+                self.unmatched_scan_bucket = 0;
+                self.unmatched_scan_entry = 0;
+                continue;
+            }
             if !partition.is_loaded() {
                 // Partition not loaded yet — caller needs to load it.
                 // Return None to signal we need I/O; caller will re-enter.
@@ -2337,7 +2614,10 @@ impl HashTable {
         let spill_state = self.spill_state.as_ref()?;
         while self.unmatched_scan_partition < spill_state.partitions.len() {
             let partition = &spill_state.partitions[self.unmatched_scan_partition];
-            if !partition.chunks.is_empty() {
+            // Grace sub-partitions are never resident in memory without disk chunks.
+            if !partition.chunks.is_empty()
+                || partition.partition_idx >= spill_state.partitioning.count
+            {
                 self.unmatched_scan_partition += 1;
                 self.unmatched_scan_bucket = 0;
                 self.unmatched_scan_entry = 0;
@@ -2410,11 +2690,13 @@ impl HashTable {
             return None;
         }
         let spill_state = self.spill_state.as_ref()?;
-        if self.unmatched_scan_partition < spill_state.partitions.len() {
-            Some(spill_state.partitions[self.unmatched_scan_partition].partition_idx)
-        } else {
-            None
-        }
+        // Skip the partitions that next_unmatched_spilled skips.
+        spill_state
+            .partitions
+            .iter()
+            .skip(self.unmatched_scan_partition)
+            .find(|partition| partition.split_first_id.is_none())
+            .map(|partition| partition.partition_idx)
     }
 
     /// Get the number of spilled partitions.
@@ -2962,11 +3244,11 @@ impl HashTable {
 
         // Record chunk
         let io_state = if let Some(existing) = probe_state.find_partition_mut(partition_idx) {
-            existing.add_chunk(file_offset, total_size, num_entries)?;
+            existing.add_chunk(file_offset, total_size, num_entries, mem_freed)?;
             existing.io_state.clone()
         } else {
             let mut new_partition = SpilledPartition::new(partition_idx);
-            new_partition.add_chunk(file_offset, total_size, num_entries)?;
+            new_partition.add_chunk(file_offset, total_size, num_entries, mem_freed)?;
             let io_state = new_partition.io_state.clone();
             probe_state.partitions.try_push(new_partition)?;
             io_state
@@ -3055,13 +3337,28 @@ impl HashTable {
             return Ok(false);
         }
 
-        // Build list of partitions that were spilled on the build side
+        // Probe sub-partitions of an earlier grace run over these probe rows are
+        // stale. The build sub-partitions stay: the build does not change.
+        let top_level_count = self
+            .spill_state
+            .as_ref()
+            .expect("spill state exists")
+            .partitioning
+            .count;
+        if let Some(probe_state) = self.probe_spill_state.as_mut() {
+            probe_state
+                .partitions
+                .retain(|p| p.partition_idx < top_level_count);
+        }
+
+        // Build list of top-level partitions that were spilled on the build side.
+        // Grace swaps a partition for its sub-partitions when it gets to it.
         let partitions_to_process: Vec<usize> = {
             let spill_state = self.spill_state.as_ref().expect("spill state exists");
             spill_state
                 .partitions
                 .iter()
-                .filter(|p| !p.chunks.is_empty())
+                .filter(|p| p.partition_idx < top_level_count && !p.chunks.is_empty())
                 .map(|p| p.partition_idx)
                 .try_collect()?
         };
@@ -3076,6 +3373,7 @@ impl HashTable {
             partitions_to_process,
             partition_list_idx: 0,
             load_state: GracePartitionLoadState::NeedBuildLoad,
+            split: None,
         });
 
         if let Some(probe_state) = self.probe_spill_state.as_mut() {
@@ -3109,6 +3407,16 @@ impl HashTable {
             match grace.load_state {
                 GracePartitionLoadState::NeedBuildLoad => {
                     self.evict_all_loaded_partitions();
+                    if self.grace_partition_is_split(partition_idx)
+                        || self.grace_partition_needs_split(partition_idx)
+                    {
+                        return_if_io!(
+                            self.grace_split_partition(partition_idx, metrics.as_deref_mut())
+                        );
+                        // The partition was replaced by its sub-partitions; look at
+                        // the first of them, which may need to be split again.
+                        continue;
+                    }
                     return_if_io!(
                         self.load_spilled_partition(partition_idx, metrics.as_deref_mut())
                     );
@@ -3198,6 +3506,428 @@ impl HashTable {
         grace.partition_list_idx < grace.partitions_to_process.len()
     }
 
+    /// The partition grace is processing. It can be a sub-partition, so grace
+    /// probes must use it rather than route from the probe keys.
+    pub fn grace_current_partition_idx(&self) -> Option<usize> {
+        if self.state != HashTableState::GraceProcessing {
+            return None;
+        }
+        self.grace_state.as_ref()?.current_partition_idx()
+    }
+
+    /// Whether `hash` belongs to the partition `partition_idx`, top-level or grace
+    /// sub-partition.
+    fn partition_routes_hash(&self, partition_idx: usize, hash: u64) -> bool {
+        let Some(spill_state) = self.spill_state.as_ref() else {
+            return true;
+        };
+        if partition_idx < spill_state.partitioning.count {
+            return spill_state.partitioning.index(hash) == partition_idx;
+        }
+        spill_state
+            .find_partition(partition_idx)
+            .is_some_and(|p| p.hash_bits > 0 && (hash >> (64 - p.hash_bits)) == p.hash_prefix)
+    }
+
+    /// Whether the grace partition must be re-split before it is loaded: its
+    /// estimated resident size is over the memory budget and splitting can help.
+    fn grace_partition_needs_split(&self, partition_idx: usize) -> bool {
+        let Some(spill_state) = self.spill_state.as_ref() else {
+            return false;
+        };
+        let Some(partition) = spill_state.find_partition(partition_idx) else {
+            return false;
+        };
+        // Marks are reset at the start of every probe pass and only set while a
+        // partition is loaded, so a partition about to be loaded by grace has none.
+        // If it somehow has, they are laid out by its bucket order and splitting
+        // would drop them: load it whole.
+        if !partition.splittable
+            || partition.split_first_id.is_some()
+            || partition.chunks.is_empty()
+            || partition
+                .matched_bits
+                .iter()
+                .flatten()
+                .any(|marked| *marked)
+            || partition.total_num_entries() < 2
+        {
+            return false;
+        }
+        let used_bits = if partition_idx < spill_state.partitioning.count {
+            spill_state.partitioning.count.trailing_zeros()
+        } else {
+            partition.hash_bits
+        };
+        if used_bits + GRACE_SPLIT_BITS > 64 - GRACE_SPLIT_RESERVED_BITS {
+            return false;
+        }
+        partition.resident_estimate() > self.mem_budget
+    }
+
+    /// Whether grace already split this partition in an earlier probe pass, so its
+    /// probe rows only have to be routed to the existing sub-partitions.
+    fn grace_partition_is_split(&self, partition_idx: usize) -> bool {
+        self.spill_state
+            .as_ref()
+            .and_then(|spill_state| spill_state.find_partition(partition_idx))
+            .is_some_and(|partition| partition.split_first_id.is_some())
+    }
+
+    /// Replace a grace partition by its sub-partitions in the grace list: split it
+    /// if it is oversized, or route its probe rows to the sub-partitions made in an
+    /// earlier probe pass. Re-entrant: yields on IO and resumes.
+    fn grace_split_partition(
+        &mut self,
+        partition_idx: usize,
+        mut metrics: Option<&mut HashJoinMetrics>,
+    ) -> IOResultOr<()> {
+        let resumed = self.grace_state.as_mut().expect("grace state").split.take();
+        let mut split = match resumed {
+            Some(split) => split,
+            None => self.begin_partition_split(partition_idx)?,
+        };
+        turso_assert!(
+            split.parent_idx == partition_idx,
+            "grace split resumed for a different partition"
+        );
+        match self.run_partition_split(&mut split, metrics.as_deref_mut())? {
+            IOResult::Done(()) => {}
+            IOResult::IO(io) => {
+                self.grace_state.as_mut().expect("grace state").split = Some(split);
+                return Ok(IOResult::IO(io));
+            }
+        }
+        self.finish_partition_split(split, metrics)?;
+        Ok(IOResult::Done(()))
+    }
+
+    fn begin_partition_split(&mut self, parent_idx: usize) -> Result<PartitionSplit> {
+        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+        let count = spill_state.partitioning.count;
+        let (parent_bits, parent_prefix, build_source, existing_first_id) = {
+            let parent = spill_state
+                .find_partition(parent_idx)
+                .expect("grace partition to split must exist");
+            let (bits, prefix) = if parent_idx < count {
+                (count.trailing_zeros(), parent_idx as u64)
+            } else {
+                (parent.hash_bits, parent.hash_prefix)
+            };
+            let source: Vec<(u64, usize, usize)> = parent
+                .chunks
+                .iter()
+                .map(|c| (c.file_offset, c.size_bytes, c.num_entries))
+                .try_collect()?;
+            (bits, prefix, source, parent.split_first_id)
+        };
+        let split_build = existing_first_id.is_none();
+        let first_id = match existing_first_id {
+            Some(first_id) => first_id,
+            None => {
+                let first_id = spill_state.next_sub_partition_id;
+                spill_state.next_sub_partition_id += GRACE_SPLIT_FANOUT;
+                first_id
+            }
+        };
+
+        let probe_source: Vec<(u64, usize, usize)> = match self
+            .probe_spill_state
+            .as_ref()
+            .and_then(|probe_state| probe_state.find_partition(parent_idx))
+        {
+            Some(parent) => parent
+                .chunks
+                .iter()
+                .map(|c| (c.file_offset, c.size_bytes, c.num_entries))
+                .try_collect()?,
+            None => vec![],
+        };
+
+        let sub_bits = parent_bits + GRACE_SPLIT_BITS;
+        let prefix_base = parent_prefix << GRACE_SPLIT_BITS;
+        let new_side = |source: Vec<(u64, usize, usize)>| -> Result<SplitSide> {
+            Ok(SplitSide {
+                source,
+                next_source: 0,
+                buffers: (0..GRACE_SPLIT_FANOUT)
+                    .map(|_| PartitionBuffer::new())
+                    .try_collect()?,
+                subs: (0..GRACE_SPLIT_FANOUT)
+                    .map(|k| {
+                        SpilledPartition::new_sub_partition(
+                            first_id + k,
+                            sub_bits,
+                            prefix_base | k as u64,
+                        )
+                    })
+                    .try_collect()?,
+            })
+        };
+        let build = if split_build {
+            new_side(build_source)?
+        } else {
+            SplitSide {
+                source: vec![],
+                next_source: 0,
+                buffers: vec![],
+                subs: vec![],
+            }
+        };
+        Ok(PartitionSplit {
+            parent_idx,
+            first_id,
+            split_build,
+            shift: 64 - sub_bits,
+            flush_threshold: (self.mem_budget / GRACE_SPLIT_FANOUT).max(1),
+            stage: if split_build {
+                SplitStage::Build
+            } else {
+                SplitStage::Probe
+            },
+            reader: ChunkReader::new(),
+            pending: vec![],
+            probe_buffer_queued: false,
+            build,
+            probe: new_side(probe_source)?,
+        })
+    }
+
+    /// Stream the chunks of the partition, build side then probe side, routing each
+    /// entry to its sub-partition by the next hash bits.
+    fn run_partition_split(
+        &mut self,
+        split: &mut PartitionSplit,
+        mut metrics: Option<&mut HashJoinMetrics>,
+    ) -> IOResultOr<()> {
+        loop {
+            let stage = split.stage;
+            let is_probe = match stage {
+                SplitStage::Build => false,
+                SplitStage::Probe => true,
+                SplitStage::Done => return Ok(IOResult::Done(())),
+            };
+
+            // Route what was read, flushing a sub-partition buffer when it fills up.
+            while let Some(entry) = split.pending.pop() {
+                let k = split.route(entry.hash);
+                let flush_threshold = split.flush_threshold;
+                let side = if is_probe {
+                    &mut split.probe
+                } else {
+                    &mut split.build
+                };
+                side.buffers[k].insert(entry)?;
+                if side.buffers[k].mem_used > flush_threshold {
+                    return_if_io!(self.flush_split_buffer(
+                        side,
+                        k,
+                        is_probe,
+                        metrics.as_deref_mut()
+                    ));
+                }
+            }
+
+            if is_probe && !split.probe_buffer_queued {
+                split.probe_buffer_queued = true;
+                // Probe rows of the parent that never spilled sit in a buffer. The
+                // buffer is left in place, so a second grace run can split again.
+                let buffered = self
+                    .probe_spill_state
+                    .as_ref()
+                    .and_then(|probe_state| probe_state.partition_buffers.get(split.parent_idx))
+                    .filter(|buffer| !buffer.is_empty());
+                if let Some(buffer) = buffered {
+                    let mut entries: Vec<HashEntry> =
+                        buffer.entries.iter().cloned().try_collect()?;
+                    entries.reverse();
+                    split.pending = entries;
+                    continue;
+                }
+            }
+
+            let side = if is_probe {
+                &mut split.probe
+            } else {
+                &mut split.build
+            };
+            if side.next_source < side.source.len() {
+                let (file_offset, size_bytes, num_entries) = side.source[side.next_source];
+                if size_bytes > 0 {
+                    let file = if is_probe {
+                        self.probe_spill_state
+                            .as_ref()
+                            .expect("probe spill state")
+                            .temp_file
+                            .file
+                            .clone()
+                    } else {
+                        self.spill_state
+                            .as_ref()
+                            .expect("spill state must exist")
+                            .temp_file
+                            .file
+                            .clone()
+                    };
+                    let mut entries = return_if_io!(poll_chunk_entries(
+                        &split.reader,
+                        &file,
+                        file_offset,
+                        size_bytes,
+                        num_entries
+                    ));
+                    entries.reverse();
+                    split.pending = entries;
+                }
+                side.next_source += 1;
+                continue;
+            }
+
+            for k in 0..GRACE_SPLIT_FANOUT {
+                if !side.buffers[k].is_empty() {
+                    return_if_io!(self.flush_split_buffer(
+                        side,
+                        k,
+                        is_probe,
+                        metrics.as_deref_mut()
+                    ));
+                }
+            }
+            split.stage = if is_probe {
+                SplitStage::Done
+            } else {
+                SplitStage::Probe
+            };
+        }
+    }
+
+    /// Append sub-partition buffer `k` to the temp file of its side as a new chunk.
+    fn flush_split_buffer(
+        &mut self,
+        side: &mut SplitSide,
+        k: usize,
+        is_probe: bool,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> IOResultOr<()> {
+        let (file, next_offset) = if is_probe {
+            let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
+            (
+                probe_state.temp_file.file.clone(),
+                &mut probe_state.next_spill_offset,
+            )
+        } else {
+            let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+            (
+                spill_state.temp_file.file.clone(),
+                &mut spill_state.next_spill_offset,
+            )
+        };
+        let buffer = &mut side.buffers[k];
+        let sub = &mut side.subs[k];
+        let num_entries = buffer.entries.len();
+        let mem_bytes = buffer.mem_used;
+        let (file_offset, size, completion) =
+            write_entries_chunk(&file, next_offset, &buffer.entries, sub.io_state.clone())?;
+        buffer.clear();
+        sub.add_chunk(file_offset, size, num_entries, mem_bytes)?;
+        if let Some(metrics) = metrics {
+            if is_probe {
+                metrics.probe_spill_bytes_written = metrics
+                    .probe_spill_bytes_written
+                    .saturating_add(size as u64);
+                metrics.probe_spill_chunks = metrics.probe_spill_chunks.saturating_add(1);
+            } else {
+                metrics.spill_bytes_written =
+                    metrics.spill_bytes_written.saturating_add(size as u64);
+                metrics.spill_chunks = metrics.spill_chunks.saturating_add(1);
+            }
+        }
+        if !completion.finished() {
+            io_yield_one!(completion);
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Install the sub-partitions of a finished split and put them in the place of
+    /// the parent in the grace list.
+    fn finish_partition_split(
+        &mut self,
+        split: PartitionSplit,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<()> {
+        let PartitionSplit {
+            parent_idx,
+            first_id,
+            split_build,
+            build,
+            probe,
+            ..
+        } = split;
+        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+
+        if split_build {
+            let parent_entries = spill_state
+                .find_partition(parent_idx)
+                .map_or(0, |parent| parent.total_num_entries());
+            for mut build_sub in build.subs {
+                if build_sub.chunks.is_empty() {
+                    continue;
+                }
+                if build_sub.total_num_entries() == parent_entries {
+                    // Every entry shares these hash bits: splitting again cannot help.
+                    build_sub.splittable = false;
+                }
+                spill_state.partitions.try_push(build_sub)?;
+            }
+            if let Some(parent) = spill_state.find_partition_mut(parent_idx) {
+                parent.split_first_id = Some(first_id);
+            }
+            if let Some(metrics) = metrics {
+                metrics.grace_partitions_split = metrics.grace_partitions_split.saturating_add(1);
+            }
+        }
+
+        let mut sub_ids = vec![];
+        for probe_sub in probe.subs {
+            let id = probe_sub.partition_idx;
+            let has_probe_rows = !probe_sub.chunks.is_empty();
+            let has_build_rows = spill_state
+                .find_partition(id)
+                .is_some_and(|sub| !sub.chunks.is_empty());
+            // A sub-partition with probe rows but no build rows is still processed:
+            // an outer join emits those probe rows unmatched.
+            if !has_build_rows && !has_probe_rows {
+                continue;
+            }
+            if spill_state.find_partition(id).is_none() {
+                spill_state
+                    .partitions
+                    .try_push(SpilledPartition::new_sub_partition(
+                        id,
+                        probe_sub.hash_bits,
+                        probe_sub.hash_prefix,
+                    ))?;
+            }
+            sub_ids.try_push(id)?;
+            if has_probe_rows {
+                self.probe_spill_state
+                    .as_mut()
+                    .expect("probe spill state")
+                    .partitions
+                    .try_push(probe_sub)?;
+            }
+        }
+
+        let grace = self.grace_state.as_mut().expect("grace state");
+        let at = grace.partition_list_idx;
+        turso_assert!(
+            grace.partitions_to_process.get(at) == Some(&parent_idx),
+            "split partition is not the current grace partition"
+        );
+        drop(grace.partitions_to_process.splice(at..at + 1, sub_ids));
+        Ok(())
+    }
+
     /// Evict all currently loaded build partitions.
     fn evict_all_loaded_partitions(&mut self) {
         if let Some(spill_state) = self.spill_state.as_mut() {
@@ -3225,12 +3955,14 @@ impl HashTable {
             return Ok(IOResult::Done(()));
         };
 
-        // First: check if there are in-memory entries for this partition
-        let buffer = &probe_state.partition_buffers[partition_idx];
-        if !buffer.is_empty() {
-            let grace = self.grace_state.as_mut().expect("grace state");
-            grace.probe_entries.clone_from(&buffer.entries);
-            return Ok(IOResult::Done(()));
+        // First: check if there are in-memory entries for this partition.
+        // Grace sub-partitions have no in-memory buffer: their probe rows are chunks.
+        if let Some(buffer) = probe_state.partition_buffers.get(partition_idx) {
+            if !buffer.is_empty() {
+                let grace = self.grace_state.as_mut().expect("grace state");
+                grace.probe_entries.clone_from(&buffer.entries);
+                return Ok(IOResult::Done(()));
+            }
         }
 
         // Check if there are spill chunks
@@ -3782,13 +4514,13 @@ mod hashtests {
         assert_eq!(partition.total_num_entries(), 0);
 
         // Add first chunk
-        partition.add_chunk(0, 1000, 50).unwrap();
+        partition.add_chunk(0, 1000, 50, 0).unwrap();
         assert_eq!(partition.chunks.len(), 1);
         assert_eq!(partition.total_size_bytes(), 1000);
         assert_eq!(partition.total_num_entries(), 50);
 
         // Add second chunk
-        partition.add_chunk(1000, 500, 25).unwrap();
+        partition.add_chunk(1000, 500, 25, 0).unwrap();
         assert_eq!(partition.chunks.len(), 2);
         assert_eq!(partition.total_size_bytes(), 1500);
         assert_eq!(partition.total_num_entries(), 75);
@@ -3915,7 +4647,7 @@ mod hashtests {
         let temp_file = TempFile::with_temp_store(&io, crate::TempStore::Default).unwrap();
 
         let mut partition = SpilledPartition::new(0);
-        partition.add_chunk(0, 0, 0).unwrap();
+        partition.add_chunk(0, 0, 0, 0).unwrap();
 
         let spill_state = SpillState {
             partition_buffers: (0..partitioning.count)
@@ -3970,7 +4702,7 @@ mod hashtests {
 
         let partitioning = Partitioning::new(16);
         let mut partition = SpilledPartition::new(0);
-        partition.add_chunk(0, truncated.len(), 1).unwrap();
+        partition.add_chunk(0, truncated.len(), 1, 0).unwrap();
 
         let spill_state = SpillState {
             partition_buffers: (0..partitioning.count)
@@ -4866,6 +5598,16 @@ mod hashtests {
         ht
     }
 
+    /// The partition grace is processing. Grace probes use it instead of routing
+    /// from the keys, because it can be a sub-partition of an oversized partition.
+    fn current_grace_partition(ht: &HashTable) -> usize {
+        ht.grace_state
+            .as_ref()
+            .expect("grace state")
+            .current_partition_idx()
+            .expect("current grace partition")
+    }
+
     /// Helper: run grace processing with the new fine-grained API.
     /// Returns (build_rowid, probe_rowid) pairs for all matches found.
     fn run_grace_processing(ht: &mut HashTable) -> Vec<(i64, i64)> {
@@ -4897,7 +5639,7 @@ mod hashtests {
                 // Use probe_partition + next_match to find build matches
                 let key_values = entry.key_values;
                 let probe_rowid = entry.probe_rowid;
-                let partition_idx = ht.partition_for_keys(&key_values).unwrap();
+                let partition_idx = current_grace_partition(ht);
 
                 if ht
                     .probe_partition(partition_idx, &key_values, None)
@@ -5151,7 +5893,7 @@ mod hashtests {
                     break;
                 };
                 let key_values = entry.key_values;
-                let partition_idx = ht.partition_for_keys(&key_values).unwrap();
+                let partition_idx = current_grace_partition(&ht);
                 if let Some(build_entry) = ht
                     .probe_partition(partition_idx, &key_values, None)
                     .unwrap()
@@ -5183,7 +5925,8 @@ mod hashtests {
             collations: vec![CollationSeq::BINARY],
             temp_store: crate::TempStore::Default,
             track_matched: true,
-            partition_count: Some(4),
+            // Small enough partitions that grace loads each one whole.
+            partition_count: Some(64),
         };
         let mut ht = HashTable::new(config, io).unwrap();
 
@@ -5257,7 +6000,7 @@ mod hashtests {
             let Some(entry) = entry else {
                 break;
             };
-            let partition_idx = ht.partition_for_keys(&entry.key_values).unwrap();
+            let partition_idx = current_grace_partition(&ht);
             if ht
                 .probe_partition(partition_idx, &entry.key_values, None)
                 .unwrap()
