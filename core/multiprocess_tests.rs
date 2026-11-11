@@ -42,6 +42,8 @@ const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
 const MULTIPROCESS_DB_FILE_LOCK_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_db_file_lock_child_process";
+const DISABLED_FILE_LOCK_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_open_with_disabled_file_lock_child_process";
 const MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_paused_creator_child_process";
 
@@ -697,6 +699,45 @@ fn multiprocess_db_file_lock_child_process() {
     file.lock_file(false).unwrap();
     std::fs::write(&ready_file, b"ready").unwrap();
     wait_for_file(&release_file);
+}
+
+/// With `LIMBO_DISABLE_FILE_LOCK` set, a flagged open must not probe the database
+/// file lock, as `open_file` takes none.
+#[test]
+fn multiprocess_open_ignores_legacy_lock_when_file_locks_are_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("disabled-file-lock.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(DISABLED_FILE_LOCK_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env(crate::io::common::ENV_DISABLE_FILE_LOCK, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "flagged child open unexpectedly failed with file locks disabled: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+/// Child half of `multiprocess_open_ignores_legacy_lock_when_file_locks_are_disabled`.
+#[test]
+fn multiprocess_open_with_disabled_file_lock_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    open_multiprocess_db(io, db_path.to_str().unwrap())
+        .expect("flagged open must not probe the database file lock when file locks are disabled");
 }
 
 /// The real IO, except that every `sleep` moves the monotonic clock forward by

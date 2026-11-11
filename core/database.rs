@@ -1088,6 +1088,11 @@ impl Database {
             return Ok(());
         }
 
+        // `open_file` takes no database file lock when this is set, so neither
+        // does the probe.
+        if std::env::var(crate::io::common::ENV_DISABLE_FILE_LOCK).is_ok() {
+            return Ok(());
+        }
         // Shared, so concurrent multiprocess openers do not reject each other.
         let probe_flags = (flags | OpenFlags::Create | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
         let probe = io
