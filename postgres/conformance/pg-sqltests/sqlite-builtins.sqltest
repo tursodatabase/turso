@@ -1,0 +1,1084 @@
+# SQLite built-ins are not available in tursopg. Core has the built-in
+# functions of SQLite and Turso, such as typeof and iif, and the functions
+# of the extensions that Turso has built in, such as uuid4. tursopg has
+# only those that PostgreSQL also has. A call to another one fails with
+# SQLSTATE 42883, as a call to an unknown function fails in PostgreSQL.
+# Each test gives the arguments that the function takes.
+
+@database :memory:
+
+# SQLite's scalar functions. COALESCE, NULLIF and TRIM are PostgreSQL
+# syntax, and only their quoted names call a function.
+
+test changes-is-not-available {
+    SELECT changes();
+}
+@sqlstate 42883
+expect error {}
+
+test coalesce-is-not-available {
+    SELECT "coalesce"(NULL, 1);
+}
+@sqlstate 42883
+expect error {}
+
+test glob-is-not-available {
+    SELECT glob('a*', 'abc');
+}
+@sqlstate 42883
+expect error {}
+
+test hex-is-not-available {
+    SELECT hex('a');
+}
+@sqlstate 42883
+expect error {}
+
+test if-is-not-available {
+    SELECT if(true, 1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test ifnull-is-not-available {
+    SELECT ifnull(NULL, 1);
+}
+@sqlstate 42883
+expect error {}
+
+test iif-is-not-available {
+    SELECT iif(true, 1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test instr-is-not-available {
+    SELECT instr('abc', 'b');
+}
+@sqlstate 42883
+expect error {}
+
+test last-insert-rowid-is-not-available {
+    SELECT last_insert_rowid();
+}
+@sqlstate 42883
+expect error {}
+
+test likelihood-is-not-available {
+    SELECT likelihood(true, 0.5);
+}
+@sqlstate 42883
+expect error {}
+
+test likely-is-not-available {
+    SELECT likely(true);
+}
+@sqlstate 42883
+expect error {}
+
+test load-extension-is-not-available {
+    SELECT load_extension('no_such_extension');
+}
+@sqlstate 42883
+expect error {}
+
+test log2-is-not-available {
+    SELECT log2(8);
+}
+@sqlstate 42883
+expect error {}
+
+test nullif-is-not-available {
+    SELECT "nullif"(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test printf-is-not-available {
+    SELECT printf('%d', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test quote-is-not-available {
+    SELECT quote('a');
+}
+@sqlstate 42883
+expect error {}
+
+test randomblob-is-not-available {
+    SELECT randomblob(2) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test soundex-is-not-available {
+    SELECT soundex('robert');
+}
+@sqlstate 42883
+expect error {}
+
+test sqlite-source-id-is-not-available {
+    SELECT sqlite_source_id();
+}
+@sqlstate 42883
+expect error {}
+
+test sqlite-version-is-not-available {
+    SELECT sqlite_version();
+}
+@sqlstate 42883
+expect error {}
+
+test subtype-is-not-available {
+    SELECT subtype(1);
+}
+@sqlstate 42883
+expect error {}
+
+test total-changes-is-not-available {
+    SELECT total_changes();
+}
+@sqlstate 42883
+expect error {}
+
+test trim-is-not-available {
+    SELECT "trim"(' a ');
+}
+@sqlstate 42883
+expect error {}
+
+test typeof-is-not-available {
+    SELECT typeof(1);
+}
+@sqlstate 42883
+expect error {}
+
+test typeof-with-two-arguments-is-not-available {
+    SELECT typeof(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test typeof-as-window-function-is-not-available {
+    SELECT typeof(1) OVER ();
+}
+@sqlstate 42883
+expect error {}
+
+test unhex-is-not-available {
+    SELECT unhex('61');
+}
+@sqlstate 42883
+expect error {}
+
+test unicode-is-not-available {
+    SELECT unicode('a');
+}
+@sqlstate 42883
+expect error {}
+
+test unistr-quote-is-not-available {
+    SELECT unistr_quote('a');
+}
+@sqlstate 42883
+expect error {}
+
+test unlikely-is-not-available {
+    SELECT unlikely(true);
+}
+@sqlstate 42883
+expect error {}
+
+test zeroblob-is-not-available {
+    SELECT zeroblob(2) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+# SQLite's scalar max and min take two or more arguments. PostgreSQL
+# has GREATEST and LEAST instead.
+
+test max-of-two-arguments-is-not-available {
+    SELECT max(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test max-of-three-arguments-is-not-available {
+    SELECT max(1, 2, 3);
+}
+@sqlstate 42883
+expect error {}
+
+test min-of-two-arguments-is-not-available {
+    SELECT min(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test min-of-column-and-argument-is-not-available {
+    SELECT min(x, 0) FROM (VALUES (1)) AS t(x);
+}
+@sqlstate 42883
+expect error {}
+
+# SQLite's aggregate functions.
+
+test group-concat-is-not-available {
+    SELECT group_concat('a');
+}
+@sqlstate 42883
+expect error {}
+
+test group-concat-as-window-function-is-not-available {
+    SELECT group_concat('a') OVER ();
+}
+@sqlstate 42883
+expect error {}
+
+test group-concat-with-three-arguments-is-not-available {
+    SELECT group_concat('a', ',', 'b');
+}
+@sqlstate 42883
+expect error {}
+
+test total-is-not-available {
+    SELECT total(1);
+}
+@sqlstate 42883
+expect error {}
+
+# SQLite's date and time functions.
+
+test datetime-is-not-available {
+    SELECT datetime('2020-01-02 03:04:05');
+}
+@sqlstate 42883
+expect error {}
+
+test julianday-is-not-available {
+    SELECT julianday('2020-01-02');
+}
+@sqlstate 42883
+expect error {}
+
+test strftime-is-not-available {
+    SELECT strftime('%Y', '2020-01-02');
+}
+@sqlstate 42883
+expect error {}
+
+test timediff-is-not-available {
+    SELECT timediff('2020-01-03', '2020-01-02');
+}
+@sqlstate 42883
+expect error {}
+
+test unixepoch-is-not-available {
+    SELECT unixepoch('2020-01-02');
+}
+@sqlstate 42883
+expect error {}
+
+# SQLite's JSON functions. PostgreSQL reads json(...) and
+# json_array(...) as syntax, and casts a text literal with jsonb(...), so
+# these tests call json and json_array by their quoted names and give
+# json and jsonb an integer, which PostgreSQL cannot cast.
+
+test json-is-not-available {
+    SELECT "json"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test json-array-is-not-available {
+    SELECT "json_array"(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test json-error-position-is-not-available {
+    SELECT json_error_position('[1');
+}
+@sqlstate 42883
+expect error {}
+
+test json-extract-is-not-available {
+    SELECT json_extract('{"a": 1}', '$.a');
+}
+@sqlstate 42883
+expect error {}
+
+test json-group-array-is-not-available {
+    SELECT json_group_array(1);
+}
+@sqlstate 42883
+expect error {}
+
+test json-group-object-is-not-available {
+    SELECT json_group_object('a', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test json-insert-is-not-available {
+    SELECT json_insert('{}', '$.a', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test json-patch-is-not-available {
+    SELECT json_patch('{}', '{"a": 1}');
+}
+@sqlstate 42883
+expect error {}
+
+test json-pretty-is-not-available {
+    SELECT json_pretty('{}');
+}
+@sqlstate 42883
+expect error {}
+
+test json-quote-is-not-available {
+    SELECT json_quote('a');
+}
+@sqlstate 42883
+expect error {}
+
+test json-remove-is-not-available {
+    SELECT json_remove('{"a": 1}', '$.a');
+}
+@sqlstate 42883
+expect error {}
+
+test json-replace-is-not-available {
+    SELECT json_replace('{"a": 1}', '$.a', 2);
+}
+@sqlstate 42883
+expect error {}
+
+test json-set-is-not-available {
+    SELECT json_set('{}', '$.a', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test json-type-is-not-available {
+    SELECT json_type('{}');
+}
+@sqlstate 42883
+expect error {}
+
+test json-valid-is-not-available {
+    SELECT json_valid('{}');
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-is-not-available {
+    SELECT jsonb(1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-array-is-not-available {
+    SELECT jsonb_array(1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-extract-is-not-available {
+    SELECT jsonb_extract('{"a": 1}', '$.a');
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-group-array-is-not-available {
+    SELECT jsonb_group_array(1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-group-object-is-not-available {
+    SELECT jsonb_group_object('a', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-patch-is-not-available {
+    SELECT jsonb_patch('{}', '{"a": 1}');
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-remove-is-not-available {
+    SELECT jsonb_remove('{"a": 1}', '$.a');
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-replace-is-not-available {
+    SELECT jsonb_replace('{"a": 1}', '$.a', 2);
+}
+@sqlstate 42883
+expect error {}
+
+# Turso's array functions. The translator writes some of them for
+# array syntax, such as array_element for a subscript.
+
+test array-is-not-available {
+    SELECT "array"(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test array-contains-is-not-available {
+    SELECT array_contains(ARRAY[1, 2], 1);
+}
+@sqlstate 42883
+expect error {}
+
+test array-contains-all-is-not-available {
+    SELECT array_contains_all(ARRAY[1, 2], ARRAY[1]);
+}
+@sqlstate 42883
+expect error {}
+
+test array-element-is-not-available {
+    SELECT array_element(ARRAY[1, 2], 1);
+}
+@sqlstate 42883
+expect error {}
+
+test array-overlap-is-not-available {
+    SELECT array_overlap(ARRAY[1, 2], ARRAY[2]);
+}
+@sqlstate 42883
+expect error {}
+
+test array-overlaps-is-not-available {
+    SELECT array_overlaps(ARRAY[1, 2], ARRAY[2]);
+}
+@sqlstate 42883
+expect error {}
+
+test array-set-element-is-not-available {
+    SELECT array_set_element(ARRAY[1, 2], 1, 3);
+}
+@sqlstate 42883
+expect error {}
+
+test array-slice-is-not-available {
+    SELECT array_slice(ARRAY[1, 2, 3], 1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+# Turso's vector functions.
+
+test vector-is-not-available {
+    SELECT vector('[1, 2]') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test vector1bit-is-not-available {
+    SELECT vector1bit('[1, 2]') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test vector32-is-not-available {
+    SELECT vector32('[1, 2]') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test vector32-sparse-is-not-available {
+    SELECT vector32_sparse('[1, 2]') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test vector64-is-not-available {
+    SELECT vector64('[1, 2]') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test vector8-is-not-available {
+    SELECT vector8('[1, 2]') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test vector-concat-is-not-available {
+    SELECT vector_concat('[1]', '[2]');
+}
+@sqlstate 42883
+expect error {}
+
+test vector-distance-cos-is-not-available {
+    SELECT vector_distance_cos('[1, 2]', '[1, 2]');
+}
+@sqlstate 42883
+expect error {}
+
+test vector-distance-dot-is-not-available {
+    SELECT vector_distance_dot('[1, 2]', '[1, 2]');
+}
+@sqlstate 42883
+expect error {}
+
+test vector-distance-jaccard-is-not-available {
+    SELECT vector_distance_jaccard('[1, 2]', '[1, 2]');
+}
+@sqlstate 42883
+expect error {}
+
+test vector-distance-l2-is-not-available {
+    SELECT vector_distance_l2('[1, 2]', '[1, 2]');
+}
+@sqlstate 42883
+expect error {}
+
+test vector-extract-is-not-available {
+    SELECT vector_extract('[1, 2]');
+}
+@sqlstate 42883
+expect error {}
+
+test vector-slice-is-not-available {
+    SELECT vector_slice('[1, 2]', 0, 1);
+}
+@sqlstate 42883
+expect error {}
+
+# Turso's full-text search functions.
+
+test fts-highlight-is-not-available {
+    SELECT fts_highlight('a b', '<', '>', 'a');
+}
+@sqlstate 42883
+expect error {}
+
+test fts-match-is-not-available {
+    SELECT fts_match('a b', 'a');
+}
+@sqlstate 42883
+expect error {}
+
+test fts-score-is-not-available {
+    SELECT fts_score('a b', 'a');
+}
+@sqlstate 42883
+expect error {}
+
+# Turso's struct and union functions.
+
+test struct-extract-is-not-available {
+    SELECT struct_extract(NULL, 'a');
+}
+@sqlstate 42883
+expect error {}
+
+test struct-pack-is-not-available {
+    SELECT struct_pack(1) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test union-extract-is-not-available {
+    SELECT union_extract(NULL, 'a');
+}
+@sqlstate 42883
+expect error {}
+
+test union-tag-is-not-available {
+    SELECT union_tag(NULL);
+}
+@sqlstate 42883
+expect error {}
+
+test union-value-is-not-available {
+    SELECT union_value('a', 1);
+}
+@sqlstate 42883
+expect error {}
+
+# Functions of Turso's built-in types, such as the functions that
+# store a numeric value.
+
+test boolean-to-int-is-not-available {
+    SELECT boolean_to_int(true);
+}
+@sqlstate 42883
+expect error {}
+
+test date-diff-is-not-available {
+    SELECT date_diff('2020-01-03', '2020-01-02');
+}
+@sqlstate 42883
+expect error {}
+
+test date-minus-is-not-available {
+    SELECT date_minus('2020-01-03', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test date-plus-is-not-available {
+    SELECT date_plus('2020-01-02', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test int-to-boolean-is-not-available {
+    SELECT int_to_boolean(1);
+}
+@sqlstate 42883
+expect error {}
+
+test numeric-decode-is-not-available {
+    SELECT numeric_decode(1);
+}
+@sqlstate 42883
+expect error {}
+
+test numeric-encode-is-not-available {
+    SELECT numeric_encode(1) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test numeric-fit-is-not-available {
+    SELECT numeric_fit(1, 5, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test numeric-neg-is-not-available {
+    SELECT numeric_neg(1);
+}
+@sqlstate 42883
+expect error {}
+
+test string-reverse-is-not-available {
+    SELECT string_reverse('abc');
+}
+@sqlstate 42883
+expect error {}
+
+test test-uint-decode-is-not-available {
+    SELECT test_uint_decode('1');
+}
+@sqlstate 42883
+expect error {}
+
+test test-uint-encode-is-not-available {
+    SELECT test_uint_encode(1);
+}
+@sqlstate 42883
+expect error {}
+
+test validate-ipaddr-is-not-available {
+    SELECT validate_ipaddr('127.0.0.1');
+}
+@sqlstate 42883
+expect error {}
+
+# Turso's internal functions.
+
+test bin-record-json-object-is-not-available {
+    SELECT bin_record_json_object('["a"]', NULL);
+}
+@sqlstate 42883
+expect error {}
+
+test conn-txn-id-is-not-available {
+    SELECT conn_txn_id(1);
+}
+@sqlstate 42883
+expect error {}
+
+test is-autocommit-is-not-available {
+    SELECT is_autocommit();
+}
+@sqlstate 42883
+expect error {}
+
+test sequence-watermark-experimental-is-not-available {
+    SELECT sequence_watermark_experimental('s');
+}
+@sqlstate 42883
+expect error {}
+
+test table-columns-json-array-is-not-available {
+    SELECT table_columns_json_array('t');
+}
+@sqlstate 42883
+expect error {}
+
+test turso-version-is-not-available {
+    SELECT turso_version();
+}
+@sqlstate 42883
+expect error {}
+
+# Functions of the extensions that Turso has built in: uuid, time,
+# percentile and regexp. PostgreSQL also has gen_random_uuid, make_date,
+# make_timestamp, to_timestamp, percentile_cont, percentile_disc and stddev.
+
+test uuid4-is-not-available {
+    SELECT uuid4() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid4-str-is-not-available {
+    SELECT uuid4_str() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid7-is-not-available {
+    SELECT uuid7() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid7-str-is-not-available {
+    SELECT uuid7_str() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid7-timestamp-ms-is-not-available {
+    SELECT uuid7_timestamp_ms('0190163d-8f2c-7b3c-8e4f-1a2b3c4d5e6f');
+}
+@sqlstate 42883
+expect error {}
+
+test uuid-blob-is-not-available {
+    SELECT uuid_blob('0190163d-8f2c-7b3c-8e4f-1a2b3c4d5e6f') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid-str-is-not-available {
+    SELECT uuid_str('0190163d-8f2c-7b3c-8e4f-1a2b3c4d5e6f');
+}
+@sqlstate 42883
+expect error {}
+
+test dur-h-is-not-available {
+    SELECT dur_h();
+}
+@sqlstate 42883
+expect error {}
+
+test dur-m-is-not-available {
+    SELECT dur_m();
+}
+@sqlstate 42883
+expect error {}
+
+test dur-ms-is-not-available {
+    SELECT dur_ms();
+}
+@sqlstate 42883
+expect error {}
+
+test dur-ns-is-not-available {
+    SELECT dur_ns();
+}
+@sqlstate 42883
+expect error {}
+
+test dur-s-is-not-available {
+    SELECT dur_s();
+}
+@sqlstate 42883
+expect error {}
+
+test dur-us-is-not-available {
+    SELECT dur_us();
+}
+@sqlstate 42883
+expect error {}
+
+test time-add-is-not-available {
+    SELECT time_add('2020-01-02T03:04:05Z', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test time-add-date-is-not-available {
+    SELECT time_add_date('2020-01-02T03:04:05Z', 1, 0, 0);
+}
+@sqlstate 42883
+expect error {}
+
+test time-after-is-not-available {
+    SELECT time_after('2020-01-02T03:04:05Z', '2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-before-is-not-available {
+    SELECT time_before('2020-01-02T03:04:05Z', '2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-compare-is-not-available {
+    SELECT time_compare('2020-01-02T03:04:05Z', '2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-date-is-not-available {
+    SELECT time_date(2020, 1, 2) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-equal-is-not-available {
+    SELECT time_equal('2020-01-02T03:04:05Z', '2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-fmt-date-is-not-available {
+    SELECT time_fmt_date('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-fmt-datetime-is-not-available {
+    SELECT time_fmt_datetime('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-fmt-iso-is-not-available {
+    SELECT time_fmt_iso('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-fmt-time-is-not-available {
+    SELECT time_fmt_time('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-is-not-available {
+    SELECT time_get('2020-01-02T03:04:05Z', 'year');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-day-is-not-available {
+    SELECT time_get_day('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-hour-is-not-available {
+    SELECT time_get_hour('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-isoweek-is-not-available {
+    SELECT time_get_isoweek('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-isoyear-is-not-available {
+    SELECT time_get_isoyear('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-minute-is-not-available {
+    SELECT time_get_minute('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-month-is-not-available {
+    SELECT time_get_month('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-nano-is-not-available {
+    SELECT time_get_nano('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-second-is-not-available {
+    SELECT time_get_second('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-weekday-is-not-available {
+    SELECT time_get_weekday('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-year-is-not-available {
+    SELECT time_get_year('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-get-yearday-is-not-available {
+    SELECT time_get_yearday('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-micro-is-not-available {
+    SELECT time_micro(0) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-milli-is-not-available {
+    SELECT time_milli(0) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-nano-is-not-available {
+    SELECT time_nano(0) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-now-is-not-available {
+    SELECT time_now() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-parse-is-not-available {
+    SELECT time_parse('2020-01-02T03:04:05Z') IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-round-is-not-available {
+    SELECT time_round('2020-01-02T03:04:05Z', 1);
+}
+@sqlstate 42883
+expect error {}
+
+test time-since-is-not-available {
+    SELECT time_since('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-sub-is-not-available {
+    SELECT time_sub('2020-01-02T03:04:05Z', '2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-to-micro-is-not-available {
+    SELECT time_to_micro('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-to-milli-is-not-available {
+    SELECT time_to_milli('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-to-nano-is-not-available {
+    SELECT time_to_nano('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-to-unix-is-not-available {
+    SELECT time_to_unix('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test time-trunc-is-not-available {
+    SELECT time_trunc('2020-01-02T03:04:05Z', 'hour');
+}
+@sqlstate 42883
+expect error {}
+
+test time-unix-is-not-available {
+    SELECT time_unix(0) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test time-until-is-not-available {
+    SELECT time_until('2020-01-02T03:04:05Z');
+}
+@sqlstate 42883
+expect error {}
+
+test median-is-not-available {
+    SELECT median(1);
+}
+@sqlstate 42883
+expect error {}
+
+test percentile-is-not-available {
+    SELECT percentile(1, 50);
+}
+@sqlstate 42883
+expect error {}
+
+test regexp-is-not-available {
+    SELECT regexp('a', 'abc');
+}
+@sqlstate 42883
+expect error {}
+
+# The frontend's own functions that PostgreSQL has only as keywords, such
+# as USER, or that only the translator calls, such as pg_limit_value for a
+# LIMIT expression, are not available either. select.sqltest tests
+# int8_out_of_range.
+
+test current-role-is-not-available {
+    SELECT "current_role"();
+}
+@sqlstate 42883
+expect error {}
+
+test pg-limit-value-is-not-available {
+    SELECT pg_limit_value(1, 'LIMIT');
+}
+@sqlstate 42883
+expect error {}
+
+test pg-lock-access-share-is-not-available {
+    SELECT pg_lock_access_share();
+}
+@sqlstate 42883
+expect error {}
+
+test user-is-not-available {
+    SELECT "user"();
+}
+@sqlstate 42883
+expect error {}

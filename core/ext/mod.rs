@@ -31,6 +31,7 @@ use crate::{vtab::VirtualTable, SymbolTable};
 use crate::{LimboError, IO};
 #[cfg(feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
+use rustc_hash::FxHashSet as HashSet;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     sync::Arc,
@@ -206,6 +207,9 @@ pub(crate) unsafe extern "C" fn unregister_function(
         if (*ext_ctx.syms).functions.remove(&name_str).is_none() {
             return ResultCode::NotFound;
         }
+        (*ext_ctx.syms)
+            .builtin_extension_functions
+            .remove(&name_str);
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
@@ -292,6 +296,8 @@ impl Database {
     /// Register any built-in extensions that can be stored on the Database so we do not have
     /// to register these once-per-connection, and the connection can just extend its symbol table
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
+        let functions_before: HashSet<String> =
+            self.builtin_syms.read().functions.keys().cloned().collect();
         {
             let mut syms = self.builtin_syms.write();
             syms.index_methods.insert(
@@ -347,6 +353,14 @@ impl Database {
             }
         }
         let _ = unsafe { Box::from_raw(ctx) };
+        let mut syms = self.builtin_syms.write();
+        let added: Vec<String> = syms
+            .functions
+            .keys()
+            .filter(|name| !functions_before.contains(*name))
+            .cloned()
+            .collect();
+        syms.builtin_extension_functions.extend(added);
         Ok(())
     }
 }

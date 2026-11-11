@@ -70,7 +70,9 @@ pub(super) fn translate_like_base(
             if escape.is_some() {
                 crate::bail_parse_error!("wrong number of arguments to function regexp()");
             }
-            let func = resolver.resolve_function("regexp", 2)?;
+            // The operator calls the engine's regexp(), also where the
+            // dialect does not let user SQL call it by name.
+            let func = resolver.catalog.resolve_engine_function("regexp", 2)?;
             let Some(func) = func else {
                 crate::bail_parse_error!("no such function: regexp");
             };

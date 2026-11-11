@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
@@ -26,6 +26,9 @@ pub(crate) struct CatalogContext<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub dialect: Arc<dyn crate::dialect::Dialect>,
+    /// Whether a function name resolves to the engine's function of that
+    /// name even if the dialect does not have it.
+    resolves_engine_functions: Cell<bool>,
     pub(super) database_scope: RefCell<Option<DatabaseScopeContext>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
@@ -91,6 +94,7 @@ impl<'a> CatalogContext<'a> {
             symbol_table,
             enable_custom_types,
             dialect,
+            resolves_engine_functions: Cell::new(false),
             database_scope: RefCell::new(None),
             has_temp_schema,
             search_order: qualifiers
@@ -112,6 +116,7 @@ impl<'a> CatalogContext<'a> {
             symbol_table: self.symbol_table,
             enable_custom_types: self.enable_custom_types,
             dialect: self.dialect.clone(),
+            resolves_engine_functions: Cell::new(self.resolves_engine_functions.get()),
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             search_order: self.search_order.clone(),
@@ -175,9 +180,53 @@ impl<'a> CatalogContext<'a> {
         func_name: &str,
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
+        if self.resolves_engine_functions.get() {
+            return self.resolve_engine_function(func_name, arg_count);
+        }
         // The dialect owns the function name surface of user SQL; extension
-        // functions resolve after it.
-        match self.dialect.resolve_function(func_name, arg_count)? {
+        // functions resolve after it. A built-in function that the dialect
+        // does not have is an error, not an unknown name: the planner looks
+        // for aggregates among the engine's functions, so it would still
+        // run an unknown name that is the engine's aggregate. A wrong number
+        // of arguments to such a function gives the same error.
+        match self.dialect.resolve_function(func_name, arg_count) {
+            Ok(Some(func @ Func::Dialect(_))) => return Ok(Some(func)),
+            Ok(Some(_)) | Err(_) if !self.dialect.has_builtin_function(func_name) => {
+                crate::bail_parse_error!("no such function: {}", func_name);
+            }
+            Ok(Some(func)) => return Ok(Some(func)),
+            Err(err) => return Err(err),
+            Ok(None) => {}
+        }
+        let Some(func) = self.symbol_table.resolve_function(func_name, arg_count) else {
+            return Ok(None);
+        };
+        if self.symbol_table.is_builtin_extension_function(func_name)
+            && !self.dialect.has_builtin_function(func_name)
+        {
+            crate::bail_parse_error!("no such function: {}", func_name);
+        }
+        Ok(Some(Func::External(func)))
+    }
+
+    /// Runs `f` with function names resolved as the engine's functions. The
+    /// SQL that the engine defines, such as the ENCODE of a built-in type,
+    /// can call built-in functions that the dialect does not have.
+    pub(crate) fn with_engine_functions<T>(&self, f: impl FnOnce() -> T) -> T {
+        let previous = self.resolves_engine_functions.replace(true);
+        let result = f();
+        self.resolves_engine_functions.set(previous);
+        result
+    }
+
+    /// The engine's function `func_name`, whatever the dialect has: a
+    /// built-in function, or a function of the symbol table.
+    pub(crate) fn resolve_engine_function(
+        &self,
+        func_name: &str,
+        arg_count: usize,
+    ) -> Result<Option<Func>, LimboError> {
+        match crate::dialect::engine::resolve_builtin_function(func_name, arg_count)? {
             Some(func) => Ok(Some(func)),
             None => Ok(self
                 .symbol_table

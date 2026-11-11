@@ -55,6 +55,7 @@ impl NativeExtensions {
         for function in &self.functions {
             syms.functions
                 .insert(function.name.clone(), function.clone());
+            syms.builtin_extension_functions.remove(&function.name);
         }
         for (name, module) in &self.modules {
             syms.vtab_modules.insert(name.clone(), module.clone());

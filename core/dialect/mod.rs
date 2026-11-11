@@ -234,6 +234,13 @@ pub trait Dialect: Send + Sync + 'static {
         engine::resolve_builtin_function(name, arg_count)
     }
 
+    /// Whether the dialect has the engine's built-in function `name`, or the
+    /// function `name` of one of the engine's built-in extensions, such as
+    /// `uuid4`. SQL cannot call a built-in function that the dialect does not
+    /// have. The SQL that the engine defines itself, such as the ENCODE of a
+    /// built-in type, can call every built-in function.
+    fn has_builtin_function(&self, name: &str) -> bool;
+
     /// Run built-in scalar function `func` on the registers that hold its
     /// arguments.
     ///
@@ -615,6 +622,10 @@ mod tests {
             engine::resolve_builtin_function(name, arg_count)
         }
 
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            true
+        }
+
         fn exec_scalar_function(
             &self,
             _conn: &Connection,
@@ -690,6 +701,10 @@ mod tests {
 
         fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
             engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            true
         }
     }
 
@@ -1044,6 +1059,10 @@ mod tests {
         fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
             Ok(None)
         }
+
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            false
+        }
     }
 
     /// A dialect that resolves the built-in names but runs `upper` its own
@@ -1087,6 +1106,10 @@ mod tests {
 
         fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
             engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn has_builtin_function(&self, _name: &str) -> bool {
+            true
         }
 
         fn call_scalar(
@@ -1203,6 +1226,107 @@ mod tests {
             "unexpected error: {err}"
         );
         conn.close().unwrap();
+    }
+
+    /// A dialect that has only two of the engine's built-in functions.
+    struct FewBuiltinsDialect;
+
+    impl Dialect for FewBuiltinsDialect {
+        fn name(&self) -> &'static str {
+            "fewbuiltins"
+        }
+
+        fn has_builtin_function(&self, name: &str) -> bool {
+            matches!(name, "abs" | "count")
+        }
+    }
+
+    #[test]
+    fn user_sql_calls_only_the_builtin_functions_of_its_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-few-builtins.db", Arc::new(FewBuiltinsDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (-7)").unwrap();
+
+        let rows = conn
+            .prepare("SELECT abs(x), count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(7), Value::from_i64(1)]]);
+
+        // A scalar, a scalar with OVER, an aggregate, a window function's
+        // aggregate and a function of a built-in extension that the dialect
+        // does not have, also with a wrong number of arguments.
+        for sql in [
+            "SELECT typeof(x) FROM t",
+            "SELECT typeof(x, x) FROM t",
+            "SELECT typeof(x) OVER () FROM t",
+            "SELECT group_concat(x) FROM t",
+            "SELECT group_concat(x, x, x) FROM t",
+            "SELECT total(x) OVER () FROM t",
+            "SELECT uuid4()",
+            "SELECT regexp('a', 'a')",
+        ] {
+            let err = conn.prepare(sql).map(|_| ()).expect_err(sql);
+            assert!(err.to_string().contains("no such function"), "{sql}: {err}");
+        }
+        conn.close().unwrap();
+    }
+
+    /// The ENCODE, DECODE and operators of a built-in type, and the REGEXP
+    /// operator, are the engine's SQL. They call functions such as
+    /// `boolean_to_int`, `uuid_blob`, `numeric_add` and `regexp`, which work
+    /// also where the dialect does not have them.
+    #[test]
+    fn engine_sql_calls_builtin_functions_that_the_dialect_does_not_have() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let results = |path: &str, dialect: Arc<dyn Dialect>| {
+            let db = open_db_with_custom_types(&io, path, dialect);
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute(
+                "CREATE TABLE t (b boolean, d date, ts timestamp, n numeric(10, 2), u uuid) STRICT",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (1, '2020-01-02', '2020-01-02 03:04:05.5', 1.5, \
+                 '0190163d-8f2c-7b3c-8e4f-1a2b3c4d5e6f')",
+            )
+            .unwrap();
+            let rows = conn
+                .prepare("SELECT b, d, d + 1, d - '2020-01-01', ts, n, n + n, -n, u, 'abc' REGEXP 'b' FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            conn.close().unwrap();
+            rows
+        };
+        let expected = results("dialect-engine-types.db", Arc::new(EngineDialect));
+        assert_eq!(
+            results(
+                "dialect-few-builtins-types.db",
+                Arc::new(FewBuiltinsDialect)
+            ),
+            expected
+        );
+        assert_eq!(expected.len(), 1);
+    }
+
+    fn open_db_with_custom_types(
+        io: &Arc<dyn IO>,
+        path: &str,
+        dialect: Arc<dyn Dialect>,
+    ) -> Arc<Database> {
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(dialect)
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .db_opts(DatabaseOpts::new().with_custom_types(true)),
+        )
+        .unwrap()
     }
 
     #[test]

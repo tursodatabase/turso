@@ -654,8 +654,11 @@ pub(crate) fn validate_function_tail(
     }
     let func = match resolver.resolve_function(name, arg_count) {
         Ok(func) => func,
-        // SQLite reports OVER on a scalar function before a wrong argument count.
-        Err(err) if filter_over.over_clause.is_some() => {
+        // SQLite reports OVER on a scalar function before a wrong argument
+        // count. A built-in that the dialect does not have is not a function.
+        Err(err)
+            if filter_over.over_clause.is_some() && resolver.dialect.has_builtin_function(name) =>
+        {
             match crate::dialect::engine::resolve_builtin_function_name(name, arg_count) {
                 Ok(Some(Func::Scalar(_))) => {
                     crate::bail_parse_error!("{} may not be used as a window function", name)

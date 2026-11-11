@@ -5365,6 +5365,9 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    /// The names in `functions` of the functions of the engine's built-in
+    /// extensions, such as `uuid4`.
+    pub builtin_extension_functions: HashSet<String>,
     /// Custom collations by normalized name.
     pub collations: HashMap<String, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
@@ -5407,6 +5410,7 @@ impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::default(),
+            builtin_extension_functions: HashSet::default(),
             collations: HashMap::default(),
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
@@ -5429,6 +5433,14 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
+    /// Whether `name` is a function of the engine's built-in extensions.
+    pub fn is_builtin_extension_function(&self, name: &str) -> bool {
+        self.builtin_extension_functions.contains(name)
+            || self
+                .builtin_extension_functions
+                .contains(&crate::util::normalize_ident(name))
+    }
+
     pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
         self.collations
             .get(&crate::util::normalize_ident(name))
@@ -5438,6 +5450,11 @@ impl SymbolTable {
     pub fn extend(&mut self, other: &SymbolTable) {
         for (name, func) in &other.functions {
             self.functions.insert(name.clone(), func.clone());
+            if other.builtin_extension_functions.contains(name) {
+                self.builtin_extension_functions.insert(name.clone());
+            } else {
+                self.builtin_extension_functions.remove(name);
+            }
         }
         for (name, collation) in &other.collations {
             self.collations.insert(name.clone(), collation.clone());

@@ -15,4 +15,8 @@ impl Dialect for SqliteDialect {
     fn name(&self) -> &'static str {
         "sqlite"
     }
+
+    fn has_builtin_function(&self, _name: &str) -> bool {
+        true
+    }
 }

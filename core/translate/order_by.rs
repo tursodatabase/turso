@@ -345,6 +345,7 @@ impl EmitOrderBy {
                         });
                         super::expr::emit_type_expr(
                             program,
+                            &type_def,
                             decode_expr,
                             reg,
                             reg,

@@ -864,6 +864,10 @@ impl Dialect for SecretTableDialect {
         "secret-table-test"
     }
 
+    fn has_builtin_function(&self, _name: &str) -> bool {
+        true
+    }
+
     fn supports_roles(&self) -> bool {
         true
     }

@@ -295,7 +295,12 @@ fn call_for(
     let Some(func) = &signature.func else {
         return Ok(None);
     };
-    let Some(function) = env.resolve_function(func, signature.args.len())? else {
+    let function = if ty.type_def.is_builtin {
+        env.resolve_engine_function(func, signature.args.len())?
+    } else {
+        env.resolve_function(func, signature.args.len())?
+    };
+    let Some(function) = function else {
         return Err(LimboError::InternalError(format!(
             "function {func} for operator {} on type {} does not exist",
             signature.op, ty.type_def.name
