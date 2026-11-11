@@ -36,5 +36,15 @@ fn test_autovacuum_readonly_behavior() {
             expected_readonly,
             "autovacuum={autovacuum_mode}: expected readonly={expected_readonly}"
         );
+        if expected_readonly {
+            // The file format version bytes stay at 1 (rollback journal): a
+            // read-only open must not switch the file to WAL.
+            let file = std::fs::read(&db_path).unwrap();
+            assert_eq!(
+                file[18..20],
+                [1, 1],
+                "autovacuum={autovacuum_mode}: read-only open rewrote the header"
+            );
+        }
     }
 }

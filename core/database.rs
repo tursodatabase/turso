@@ -2230,7 +2230,7 @@ impl Database {
                     // Track if header was modified so we can write it to disk
                     let header_modified = match read_version {
                         Version::Legacy => {
-                            if is_readonly {
+                            if is_readonly || is_autovacuumed_db {
                                 tracing::warn!(
                                     "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
                                     self.path
