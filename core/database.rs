@@ -330,7 +330,7 @@ pub fn is_memory_like(path: &str) -> bool {
 
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
-fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
+pub(crate) fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
     let expected = buf.len();
     Completion::new_read(buf, move |res| {
         let Ok((_buf, bytes_read)) = res else {
@@ -939,6 +939,7 @@ impl Database {
             None
         };
 
+        let multiprocess_wal = opts.enable_multiprocess_wal;
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
         let encryption_key = encryption_opts
             .as_ref()
@@ -978,11 +979,14 @@ impl Database {
                 NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
 
-            pager_state: Arc::new(SharedPagerState::with_encryption(
-                init_page_1,
-                encryption_cipher_mode.unwrap_or(CipherMode::None),
-                encryption_key.as_ref(),
-            )?),
+            pager_state: Arc::new(
+                SharedPagerState::with_encryption(
+                    init_page_1,
+                    encryption_cipher_mode.unwrap_or(CipherMode::None),
+                    encryption_key.as_ref(),
+                )?
+                .with_multiprocess_wal(multiprocess_wal),
+            ),
             registry_key: OnceLock::new(),
 
             page_codec_id,
@@ -3761,7 +3765,10 @@ impl Database {
     /// The magic bytes are not judged here: an encrypted database carries the
     /// Turso prefix instead. The magic is checked at open validation, where
     /// the key is known.
-    fn plain_header_page_info(header: &DbHeaderRead, encrypted: bool) -> Result<(u8, PageSize)> {
+    pub(crate) fn plain_header_page_info(
+        header: &DbHeaderRead,
+        encrypted: bool,
+    ) -> Result<(u8, PageSize)> {
         // SQLite zero-fills a file shorter than a page before judging its
         // header (btree.c lockBtree), so a short file is judged the same way.
         let mut bytes = [0u8; DatabaseHeader::SIZE];
