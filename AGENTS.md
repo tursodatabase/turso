@@ -35,8 +35,8 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `make test-single TEST=foo.test` - single legacy TCL test
 - `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
 - `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
-- `make -C postgres/conformance run` - run the PostgreSQL `.sqltest` corpus against tursopg
-- `make -C postgres/conformance run-postgres` - run the PostgreSQL `.sqltest` corpus against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
+- `make -C postgres/conformance run` - run the PostgreSQL and shared `.sqltest` corpora against tursopg
+- `make -C postgres/conformance run-postgres` - run the PostgreSQL and shared `.sqltest` corpora against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
 
 ### Test Organization
 
@@ -46,6 +46,7 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. They are fixed compatibility coverage, so a Turso behavior change should be fixed in Turso rather than by editing them; edits here are for upstream syncs or harness maintenance.
 - `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend. Tests are meant to pass on both tursopg (`run`) and real PostgreSQL (`run-postgres`).
+- `testing/shared-sqltests/` - `.sqltest` coverage for SQL that both frontends run. The run targets of `sqlite/conformance` and `postgres/conformance` run these files on every backend, real SQLite and real PostgreSQL included. Where backends give different results, such as error messages and SQLSTATEs, use `expect @<backend>` blocks. See its `README.md`.
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
@@ -132,7 +133,7 @@ Before opening a PR, read the "PR Workflow" document linked above.
 ## Benchmark Naming
 
 - Criterion benchmark functions use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
-- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior.
+- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior. Their bencher parameter is `turso_benches::Bencher`, also in helpers it is passed to. In CodSpeed builds it makes each measurement call the benchmarked closure 100 times, because one call of a small function is too sensitive to cache misses. It offers only `bench_local` and `with_inputs(..).bench_local_values`. Benchmarks where one call is already a large workload (memory benchmarks, `prepare_benchmark`) use `#[turso_macros::divan_bench_single_call]` instead, which keeps divan's own `Bencher` and measures one call; 100 calls of those would make the CodSpeed CI jobs many times slower.
 
 ## Core Principles
 

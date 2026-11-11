@@ -420,6 +420,10 @@ fn translate_subquery_result_expr(
                         )?;
                     }
                 }
+            }
+            // The NULL checks come after every column is loaded, because the
+            // scan at label_null_rewind compares all of them.
+            for i in 0..lhs_column_count {
                 // If LHS is NULL, we need to check if ephemeral is empty first.
                 // - If empty: IN returns FALSE, NOT IN returns TRUE
                 // - If not empty: result is NULL (unknown)
@@ -553,12 +557,25 @@ fn translate_subquery_result_expr(
         SubqueryType::RowValue {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
-            assert_register_range_allocated(program, target_register, *num_regs)?;
+            if *num_regs != 1 {
+                crate::bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+            }
+            if let Some(row_count_reg) = *row_count_reg {
+                program.emit_insn(Insn::HaltIfNull {
+                    constraint_info: None,
+                    target_reg: row_count_reg,
+                    err_code: SQLITE_ERROR,
+                    description: "more than one row returned by a subquery used as an expression"
+                        .to_string(),
+                    on_error: None,
+                });
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: *result_reg_start,
                 dst_reg: target_register,
-                extra_amount: num_regs - 1,
+                extra_amount: 0,
             });
             Ok(target_register)
         }
@@ -3194,20 +3211,16 @@ fn translate_parenthesized_expr(
     let ast::Expr::Parenthesized(exprs) = expr else {
         unreachable!("translate_parenthesized_expr expects Expr::Parenthesized");
     };
-    if exprs.is_empty() {
-        crate::bail_parse_error!("parenthesized expression with no arguments");
-    }
-    assert_register_range_allocated(program, target_register, exprs.len())?;
-    for (i, expr) in exprs.iter().enumerate() {
-        translate_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register + i,
-            resolver,
-        )?;
-    }
-    Ok(target_register)
+    // Comparisons, IN and BETWEEN read a row value one component at a time
+    // with translate_row_value. Anywhere else a row value would need more
+    // than the one register it is given.
+    let [expr] = exprs.as_slice() else {
+        if exprs.is_empty() {
+            crate::bail_parse_error!("parenthesized expression with no arguments");
+        }
+        crate::bail_parse_error!("row value misused");
+    };
+    translate_expr(program, referenced_tables, expr, target_register, resolver)
 }
 
 #[inline(never)]

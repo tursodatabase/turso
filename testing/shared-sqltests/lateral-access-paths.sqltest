@@ -1,9 +1,11 @@
 @database :memory:
+@skip-file-if sqlite "SQLite does not support LATERAL"
 
 # Access paths of the tables on both sides of a LATERAL subquery: rowid
 # and index seeks, covering and multi-column indexes, IN lists, OR terms,
 # range scans, and larger tables where the planner picks hash joins and
 # automatic indexes inside the subquery.
+# The statements run through both frontends.
 # PostgreSQL 16 gave every expected result.
 
 setup data {

@@ -347,6 +347,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: 1,
+                    ..
                 },
             ..
         } => {
@@ -1575,6 +1576,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             Arc::new(crate::EngineDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         );
         let env = TypeEnv::new(None, &resolver);
         let mismatches: Vec<String> = cases

@@ -760,6 +760,10 @@ pub enum SubqueryType {
     RowValue {
         result_reg_start: usize,
         num_regs: usize,
+        /// When a second row is an error, the register that counts the
+        /// subquery's rows: 0, 1, or NULL for more than one. Reading the
+        /// result raises the error if it is NULL.
+        row_count_reg: Option<usize>,
     },
     /// IN subquery; result is stored in an ephemeral index.
     /// Example: `x <NOT> IN (SELECT ...)`
@@ -1503,6 +1507,10 @@ pub enum AlterTableBody {
         /// `IF EXISTS`: a missing relation is not an error.
         if_exists: bool,
     },
+    /// `ENABLE ROW LEVEL SECURITY`
+    EnableRowSecurity,
+    /// `DISABLE ROW LEVEL SECURITY`
+    DisableRowSecurity,
 }
 
 /// What kind of relation a schema object is. `ALTER ... OWNER TO` names

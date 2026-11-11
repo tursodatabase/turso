@@ -69,22 +69,37 @@ pub(crate) fn translate_compared_operand(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    if let ast::Expr::Parenthesized(elements) = unwrap_parens(operand)? {
-        if elements.len() > 1 && !resolver.schema().type_registry.is_empty() {
-            for (i, element) in elements.iter().enumerate() {
-                let other_element = row_value_component_expr(other, i)?;
-                translate_compared_operand(
-                    program,
-                    referenced_tables,
-                    element,
-                    &other_element,
-                    reg + i,
-                    resolver,
-                )?;
-            }
-            return Ok(reg);
-        }
+    let len = row_value_len(operand)?;
+    if len <= 1 {
+        return translate_compared_value(program, referenced_tables, operand, other, reg, resolver);
     }
+    // Each component is translated as one value, so a row value nested
+    // inside another is "row value misused", as in SQLite.
+    for i in 0..len {
+        let component = row_value_component_expr(operand, i)?;
+        let other_component = row_value_component_expr(other, i)?;
+        translate_compared_value(
+            program,
+            referenced_tables,
+            &component,
+            &other_component,
+            reg + i,
+            resolver,
+        )?;
+    }
+    Ok(reg)
+}
+
+/// Translates `operand`, one value compared with `other`, into `reg`. See
+/// [translate_compared_operand].
+fn translate_compared_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
     match untyped_operand_type(operand, other, referenced_tables, resolver)? {
         Some(resolved) => translate_untyped_operand_as(
             program,
@@ -464,14 +479,7 @@ pub(crate) fn emit_untyped_operand_store(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let skip_null = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg,
-        target_pc: skip_null,
-    });
-    emit_store_value(program, resolved, reg, Coerce::Skip, resolver)?;
-    program.preassign_label_to_next_insn(skip_null);
-    Ok(())
+    emit_store_value(program, resolved, reg, Coerce::Skip, resolver)
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT)
@@ -664,7 +672,9 @@ pub(crate) enum Coerce<'a> {
 /// result is converted to the kind of the type's BASE as a STRICT column of
 /// the BASE converts it, so a type BASE integer whose ENCODE gives '5' stores
 /// 5, and one whose ENCODE gives 'abc' is an error. COERCE sees the converted
-/// value too. A CAST runs the same.
+/// value too. A CAST runs the same. NULL is left as it is, without running
+/// ENCODE; a domain's NOT NULL is checked afterwards, by the column's NOT NULL
+/// constraint or by the CAST.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
@@ -681,6 +691,11 @@ pub(crate) fn emit_store_value(
             resolved.primitive.to_uppercase()
         ),
     };
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
@@ -695,6 +710,7 @@ pub(crate) fn emit_store_value(
         }
     }
     program.emit_insn(convert);
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 

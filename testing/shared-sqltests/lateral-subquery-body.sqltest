@@ -1,7 +1,8 @@
 @database :memory:
+@skip-file-if sqlite "SQLite does not support LATERAL"
 
 # Clauses inside a LATERAL subquery that read columns of the left side.
-# The statements run through the PostgreSQL frontend (tursopg).
+# The statements run through both frontends.
 # PostgreSQL 16 gave every expected result.
 
 setup data {

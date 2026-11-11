@@ -2544,6 +2544,9 @@ impl ProgramBuilder {
         self.parameters.list.dedup();
 
         self.explain.build_ephemeral_cursors(&self.insns);
+        let destroys_btree = self.insns.iter().any(|(insn, _)| {
+            matches!(insn, Insn::Destroy { .. } | Insn::IndexMethodDestroy { .. })
+        });
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
@@ -2583,6 +2586,7 @@ impl ProgramBuilder {
             custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            destroys_btree,
         };
         Ok(prepared)
     }

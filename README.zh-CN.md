@@ -6,7 +6,7 @@
 <p align="center">
   一个进程内 SQL 数据库，兼容 SQLite，现在还支持 Postgres 前端。
 </p>
-<p align="center"><a href="./README.md"><b>English</b></a> | <b>简体中文</b></p>
+<p align="center"><a href="./README.md"><b>English</b></a> | <b>简体中文</b> | <a href="./README.fi.md">Suomi</a></p>
 
 <p align="center">
   <a title="构建状态" target="_blank" href="https://github.com/tursodatabase/turso/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/tursodatabase/turso/rust.yml?style=flat-square"></a>

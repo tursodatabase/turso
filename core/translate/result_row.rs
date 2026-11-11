@@ -432,12 +432,33 @@ pub fn emit_columns_to_destination(
         QueryDestination::RowValueSubqueryResult {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
             turso_assert_eq!(
                 num_columns,
                 *num_regs,
                 "Row value subqueries should have the same number of result columns as the number of registers"
             );
+            if let Some(row_count_reg) = *row_count_reg {
+                let first_row = program.allocate_label();
+                let counted = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: row_count_reg,
+                    target_pc: first_row,
+                    jump_if_null: false,
+                });
+                program.emit_insn(Insn::Null {
+                    dest: row_count_reg,
+                    dest_end: None,
+                });
+                program.emit_insn(Insn::Goto { target_pc: counted });
+                program.preassign_label_to_next_insn(first_row);
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: row_count_reg,
+                });
+                program.preassign_label_to_next_insn(counted);
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: start_reg,
                 dst_reg: *result_reg_start,

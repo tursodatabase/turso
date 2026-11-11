@@ -18,7 +18,8 @@ use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{
-    CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
+    RoleId, CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME,
+    ROLES_TABLE_NAME,
 };
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
@@ -307,16 +308,13 @@ pub(crate) fn check_read_privilege(
     if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
         return Ok(());
     }
-    let dialect = &resolver.catalog.dialect;
     let schema = resolver.schema();
-    let reader = match resolver.catalog.enclosing_view() {
-        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => dialect
-            .relation_owner(schema, view_namespace.id, &view_name)
-            .unwrap_or_else(|| connection.current_role()),
-        _ => connection.current_role(),
-    };
+    let reader = table_reader(resolver, connection.current_role());
     if schema.roles.is_superuser(reader)
-        || dialect.role_may_read(schema, namespace.id, name, reader)
+        || resolver
+            .catalog
+            .dialect
+            .role_may_read(schema, namespace.id, name, reader)
     {
         return Ok(());
     }
@@ -324,6 +322,22 @@ pub(crate) fn check_read_privilege(
         Action::Read,
         object,
     )))
+}
+
+/// The role that reads the tables of a statement compiled for `role`. Inside
+/// a view of the main database it is the view's owner, as in PostgreSQL, so
+/// a view shows its readers what its owner may see: the tables its owner may
+/// read, and their rows that row-level security shows its owner. A view
+/// without a known owner is read as `role`.
+pub(crate) fn table_reader(resolver: &Resolver, role: RoleId) -> RoleId {
+    match resolver.catalog.enclosing_view() {
+        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => resolver
+            .catalog
+            .dialect
+            .relation_owner(resolver.schema(), view_namespace.id, &view_name)
+            .unwrap_or(role),
+        _ => role,
+    }
 }
 
 /// Fails if the statement is compiled for a role that is not a superuser,
