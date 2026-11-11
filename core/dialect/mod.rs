@@ -426,17 +426,18 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
-    /// Whether `role` may read relation `name` of `namespace`, from the
-    /// privileges the dialect stores. A dialect without privileges lets
-    /// every role read.
-    fn role_may_read(
+    /// Whether `role` has `privilege` on relation `name` of `namespace`,
+    /// from the privileges the dialect stores. A dialect without privileges
+    /// gives every role every privilege.
+    fn role_has_privilege(
         &self,
         schema: &Schema,
         namespace: NamespaceId,
         name: &str,
         role: RoleId,
+        privilege: Privilege,
     ) -> bool {
-        let _ = (schema, namespace, name, role);
+        let _ = (schema, namespace, name, role, privilege);
         true
     }
 

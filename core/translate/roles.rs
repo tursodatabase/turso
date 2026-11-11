@@ -311,10 +311,13 @@ pub(crate) fn check_read_privilege(
     let schema = resolver.schema();
     let reader = table_reader(resolver, connection.current_role());
     if schema.roles.is_superuser(reader)
-        || resolver
-            .catalog
-            .dialect
-            .role_may_read(schema, namespace.id, name, reader)
+        || resolver.catalog.dialect.role_has_privilege(
+            schema,
+            namespace.id,
+            name,
+            reader,
+            ast::Privilege::Select,
+        )
     {
         return Ok(());
     }
