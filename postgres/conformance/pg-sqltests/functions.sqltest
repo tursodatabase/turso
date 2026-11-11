@@ -381,6 +381,22 @@ expect {
     null
 }
 
+test unmarked-functions-return-null-for-a-null-argument {
+    CREATE TABLE ct (a int CHECK (a > 0));
+    SELECT CASE WHEN pg_get_constraintdef(oid, NULL) IS NULL THEN 'null' ELSE 'not null' END
+    FROM pg_constraint WHERE conname = 'ct_a_check';
+}
+expect {
+    null
+}
+
+test functions-called-on-null-input-run-with-a-null-argument {
+    SELECT format_type(23, NULL);
+}
+expect {
+    integer
+}
+
 test to-char-integer-format-errors {
     SELECT to_char(1, 5);
 }
@@ -395,6 +411,29 @@ test pg-input-is-valid-integer-type-name-errors {
 @sqlstate 42883
 expect error {
     function pg_input_is_valid\(.*, integer\) does not exist
+}
+
+test to-char-integer-format-errors-with-a-null-value {
+    SELECT to_char(NULL, 5);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(.*, integer\) does not exist
+}
+
+test current-setting-numeric-parameter-name-errors-with-a-null-missing-ok {
+    SELECT current_setting(5.5, NULL);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(numeric, .*\) does not exist
+}
+
+test age-integer-errors-with-a-null-argument {
+    SELECT age(5, NULL);
+}
+expect error {
+    function age\(integer, unknown\) does not exist
 }
 
 test current-setting-numeric-parameter-name-errors {
