@@ -11,7 +11,7 @@ use turso_core::{
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
-    Result, Statement, Value, WalkControl,
+    Result, ScalarFunc, Statement, Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
@@ -211,6 +211,19 @@ impl Dialect for PostgresDialect {
         // be found.
         if name.eq_ignore_ascii_case("random") {
             return Ok(None);
+        }
+        // PostgreSQL's clock functions besides now(), which the engine has for
+        // both dialects.
+        let clock_functions = [
+            ("transaction_timestamp", ScalarFunc::Now),
+            ("statement_timestamp", ScalarFunc::StatementTimestamp),
+            ("clock_timestamp", ScalarFunc::ClockTimestamp),
+        ];
+        for (clock_name, func) in clock_functions {
+            if name.eq_ignore_ascii_case(clock_name) {
+                turso_core::dialect::engine::check_scalar_arity(&func, name, arg_count)?;
+                return Ok(Some(Func::Scalar(func)));
+            }
         }
         turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
     }

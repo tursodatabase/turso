@@ -1634,6 +1634,169 @@ expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }
 
+# The tests below cast comparisons to int, because tursopg prints a comparison
+# as 1 or 0 where PostgreSQL prints t or f.
+test now-is-the-same-on-every-row-of-a-statement {
+    SELECT count(DISTINCT now()), count(DISTINCT statement_timestamp()), count(DISTINCT transaction_timestamp())
+    FROM generate_series(1, 20000);
+}
+expect {
+    1|1|1
+}
+
+test clock-timestamp-changes-within-a-statement {
+    SELECT (count(DISTINCT clock_timestamp()) > 1)::int FROM generate_series(1, 20000);
+}
+expect {
+    1
+}
+
+test now-stored-in-a-row-is-not-after-current-timestamp {
+    CREATE TABLE stamps (ts timestamptz);
+    INSERT INTO stamps VALUES (now());
+    SELECT (ts <= current_timestamp)::int FROM stamps;
+}
+expect {
+    1
+}
+
+test clock-timestamp-first-in-the-select-list-is-not-before-the-statement-time {
+    SELECT (clock_timestamp() >= statement_timestamp())::int,
+           (statement_timestamp() >= now())::int,
+           (statement_timestamp() >= transaction_timestamp())::int;
+}
+expect {
+    1|1|1
+}
+
+test clock-timestamp-first-in-a-transaction-is-not-before-the-statement-time {
+    BEGIN;
+    SELECT (clock_timestamp() >= statement_timestamp())::int, (statement_timestamp() >= now())::int;
+    COMMIT;
+}
+expect {
+    1|1
+}
+
+test statements-in-a-transaction-see-the-time-the-transaction-began {
+    CREATE TABLE stamps (ts timestamptz);
+    CREATE TABLE filler (n int);
+    BEGIN;
+    INSERT INTO stamps VALUES (now());
+    INSERT INTO filler SELECT * FROM generate_series(1, 20000);
+    INSERT INTO stamps VALUES (now());
+    SELECT (now() = transaction_timestamp())::int,
+           (now() = current_timestamp)::int,
+           (now() < statement_timestamp())::int;
+    COMMIT;
+    SELECT count(DISTINCT ts) FROM stamps;
+}
+expect {
+    1|1|1
+    1
+}
+
+test time-keywords-are-casts-of-now {
+    SELECT (current_timestamp = now())::int,
+           (current_date = now()::date)::int,
+           (localtimestamp = now()::timestamp)::int,
+           (localtime = now()::time)::int;
+}
+expect {
+    1|1|1|1
+}
+
+test current-date-is-a-date {
+    SELECT (current_date + 1 > current_date)::int,
+           (current_date - date '2024-01-01' > 0)::int,
+           (current_date = date '2024-01-05')::int;
+}
+expect {
+    1|1|0
+}
+
+test time-keywords-as-column-defaults {
+    CREATE TABLE stamped (id int,
+                          d date DEFAULT current_date,
+                          t timestamp DEFAULT localtimestamp,
+                          z timestamptz DEFAULT now());
+    INSERT INTO stamped (id) VALUES (1);
+    SELECT (d = current_date)::int, (t <= localtimestamp)::int, (z <= now())::int FROM stamped;
+}
+expect {
+    1|1|1
+}
+
+# PostgreSQL returns the time of day with its zone. tursopg refuses
+# CURRENT_TIME because it has no `time with time zone` type.
+test current-time-is-not-supported {
+    SELECT (CURRENT_TIME IS NOT NULL)::int;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    CURRENT_TIME, of type time with time zone, is not supported
+}
+
+# PostgreSQL rounds the time to the precision, here whole seconds. tursopg
+# refuses a precision instead of returning the unrounded time.
+test current-timestamp-precision-is-not-supported {
+    SELECT (CURRENT_TIMESTAMP(0) = date_trunc('second', CURRENT_TIMESTAMP(0)))::int;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+test now-with-an-argument-errors {
+    SELECT now(1);
+}
+expect error {
+    wrong number of arguments to function now\(\)
+}
+@sqlstate 42883
+expect @postgres error {
+    function now\(integer\) does not exist
+}
+
+test transaction-timestamp-with-arguments-errors {
+    SELECT transaction_timestamp(1, 2, 3);
+}
+expect error {
+    wrong number of arguments to function transaction_timestamp\(\)
+}
+@sqlstate 42883
+expect @postgres error {
+    function transaction_timestamp\(integer, integer, integer\) does not exist
+}
+
+test statement-timestamp-with-an-argument-errors {
+    SELECT statement_timestamp(1);
+}
+expect error {
+    wrong number of arguments to function statement_timestamp\(\)
+}
+@sqlstate 42883
+expect @postgres error {
+    function statement_timestamp\(integer\) does not exist
+}
+
+test clock-timestamp-with-an-argument-errors {
+    SELECT clock_timestamp(1);
+}
+expect error {
+    wrong number of arguments to function clock_timestamp\(\)
+}
+@sqlstate 42883
+expect @postgres error {
+    function clock_timestamp\(integer\) does not exist
+}
+
 # tursopg ignores FM, so the test trims the padding instead.
 test to-char-of-a-number-or-null {
     CREATE TABLE m (x numeric(30, 2));

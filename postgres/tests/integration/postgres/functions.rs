@@ -616,7 +616,6 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
             Value::build_text("x + 7"),
         ),
         ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
-        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
     ] {
         assert_eq!(
             conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
@@ -637,7 +636,8 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     let rows = conn
         .prepare_internal(
             "SELECT name, narg, flags FROM pragma_function_list WHERE name IN \
-         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now') ORDER BY name, narg",
+         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now', \
+         'statement_timestamp', 'clock_timestamp') ORDER BY name, narg",
         )
         .unwrap()
         .run_collect_rows()
@@ -645,12 +645,14 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     assert_eq!(
         rows,
         [
+            ("clock_timestamp", 0, 2097152),
             ("format_type", 1, 2048),
             ("format_type", 2, 2048),
-            ("now", -1, 0),
+            ("now", 0, 2097152),
             ("pg_get_constraintdef", 1, 0),
             ("pg_get_constraintdef", 2, 0),
             ("quote_ident", 1, 2048),
+            ("statement_timestamp", 0, 2097152),
         ]
         .into_iter()
         .map(|(name, count, flags)| vec![
@@ -663,7 +665,8 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     let rows = conn
         .prepare(
             "SELECT proname, pronargs, provolatile FROM pg_proc WHERE proname IN \
-         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now') ORDER BY proname, pronargs",
+         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now', \
+         'statement_timestamp', 'clock_timestamp') ORDER BY proname, pronargs",
         )
         .unwrap()
         .run_collect_rows()
@@ -671,12 +674,14 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     assert_eq!(
         rows,
         [
+            ("clock_timestamp", 0, "v"),
             ("format_type", 1, "i"),
             ("format_type", 2, "i"),
-            ("now", -1, "v"),
+            ("now", 0, "v"),
             ("pg_get_constraintdef", 1, "v"),
             ("pg_get_constraintdef", 2, "v"),
             ("quote_ident", 1, "i"),
+            ("statement_timestamp", 0, "v"),
         ]
         .into_iter()
         .map(|(name, count, volatility)| vec![
@@ -689,7 +694,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempDatabase) {
+fn test_pg_clocks_work_on_a_connection_without_a_session(db: TempDatabase) {
     let conn = db.connect_limbo();
     for name in [
         "now",
@@ -697,30 +702,31 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         "transaction_timestamp",
         "statement_timestamp",
     ] {
-        assert!(conn.get_syms_functions().iter().any(
-            |(registered, is_agg, argc, deterministic)| registered == name
-                && !is_agg
-                && *argc == -1
-                && !deterministic
-        ));
         let rows = conn
             .prepare(format!("SELECT {name}()"))
             .unwrap()
             .run_collect_rows()
             .unwrap();
         let Value::Text(timestamp) = &rows[0][0] else {
-            panic!("expected timestamp text for {name}")
+            panic!("expected timestamp text for {name}, got {:?}", rows[0][0])
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
+        // `2024-01-05 10:00:00`, then `.` and 1 to 6 digits unless the
+        // microseconds are 0.
+        let timestamp = timestamp.as_str().as_bytes();
+        let (whole_seconds, fraction) = timestamp.split_at(19);
+        for (index, byte) in whole_seconds.iter().enumerate() {
+            match index {
+                4 | 7 => assert_eq!(*byte, b'-', "{name}"),
+                10 => assert_eq!(*byte, b' ', "{name}"),
+                13 | 16 => assert_eq!(*byte, b':', "{name}"),
+                _ => assert!(byte.is_ascii_digit(), "{name}"),
+            }
+        }
+        if let [b'.', digits @ ..] = fraction {
+            assert!((1..=6).contains(&digits.len()), "{name}");
+            assert!(digits.iter().all(u8::is_ascii_digit), "{name}");
+        } else {
+            assert!(fraction.is_empty(), "{name}");
         }
     }
 }

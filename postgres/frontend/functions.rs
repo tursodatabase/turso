@@ -133,9 +133,6 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
     })
 }
 
@@ -182,19 +179,6 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
 
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
         Ok(IOResult::Done((self.step)(connection, args)?))
-    }
-}
-
-/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
-/// Returning one gives the function the type `timestamptz`, so `now() + 1` is
-/// an error as in PostgreSQL instead of adding 1 to text.
-struct Timestamptz(String);
-
-impl ScalarReturn for Timestamptz {
-    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
-
-    fn into_value(self) -> Value {
-        Value::build_text(self.0)
     }
 }
 

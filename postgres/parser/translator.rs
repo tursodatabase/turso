@@ -3348,34 +3348,27 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::SqlvalueFunction(svf)) => {
                 use pg_query::protobuf::SqlValueFunctionOp;
-                if matches!(
-                    SqlValueFunctionOp::try_from(svf.op),
-                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimeN
-                        | SqlValueFunctionOp::SvfopLocaltimestampN)
-                ) && svf.typmod != 0
-                {
-                    return Err(not_supported(
-                        "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
-                    ));
-                }
+                // PostgreSQL defines these keywords by now(), the time the
+                // transaction began, in the session's time zone, UTC.
                 match SqlValueFunctionOp::try_from(svf.op) {
-                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestamp) => {
+                        Ok(function_call("now", vec![]))
                     }
+                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(cast_of_now("date")),
+                    Ok(SqlValueFunctionOp::SvfopLocaltimestamp) => Ok(cast_of_now("timestamp")),
+                    Ok(SqlValueFunctionOp::SvfopLocaltime) => Ok(cast_of_now("time")),
+                    // A precision rounds the time: `CURRENT_TIMESTAMP(0)` is in whole seconds.
+                    Ok(
+                        SqlValueFunctionOp::SvfopCurrentTimestampN
+                        | SqlValueFunctionOp::SvfopLocaltimestampN
+                        | SqlValueFunctionOp::SvfopLocaltimeN,
+                    ) => Err(not_supported(
+                        "a fractional-second precision on CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
+                    )),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
-                        | SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopLocaltime
-                        | SqlValueFunctionOp::SvfopLocaltimeN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
-                    Ok(
-                        SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
-                        | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                        | SqlValueFunctionOp::SvfopCurrentTimeN,
+                    ) => Err(not_supported("CURRENT_TIME, of type time with time zone,")),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
                     // keyword that was written.
@@ -6596,8 +6589,18 @@ fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
+    let array_dimensions = type_name.array_bounds.len() as u32;
+    check_array_dimensions(array_dimensions)?;
+    Ok(ast::Type {
+        name: cast_type_name(&pg_type).to_string(),
+        size: None,
+        array_dimensions,
+    })
+}
 
-    let name = match pg_type.to_uppercase().as_str() {
+/// The name a PostgreSQL type has in a CAST in the engine's AST.
+fn cast_type_name(pg_type: &str) -> &str {
+    match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
         | "REGCLASS" | "REGTYPE" => "INTEGER",
         // Casts like INTEGER; the name types the result as int8.
@@ -6617,16 +6620,8 @@ fn pg_type_name_to_ast_type(
             "TEXT"
         }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => &pg_type,
-    };
-
-    let array_dimensions = type_name.array_bounds.len() as u32;
-    check_array_dimensions(array_dimensions)?;
-    Ok(ast::Type {
-        name: name.to_string(),
-        size: None,
-        array_dimensions,
-    })
+        _ => pg_type,
+    }
 }
 
 fn extract_type_name_from_typename(
@@ -7969,6 +7964,18 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
             type_cast.arg.as_deref().and_then(deparse_default_expr)
         }
         _ => None,
+    }
+}
+
+/// `CAST(now() AS type_name)`.
+fn cast_of_now(pg_type: &str) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(function_call("now", vec![])),
+        type_name: Some(ast::Type {
+            name: cast_type_name(pg_type).to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 
@@ -10243,33 +10250,33 @@ mod tests {
 
     #[test]
     fn test_current_timestamp_translation() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME FROM t";
+        // PostgreSQL defines each keyword by now(), so each translates the
+        // same as the cast written out.
+        let keywords = selected_expressions(
+            "SELECT CURRENT_TIMESTAMP, CURRENT_DATE, LOCALTIMESTAMP, LOCALTIME FROM t",
+        );
+        let casts = selected_expressions(
+            "SELECT now(), CAST(now() AS date), CAST(now() AS timestamp), CAST(now() AS time) FROM t",
+        );
+        assert_eq!(keywords, casts);
+    }
+
+    fn selected_expressions(sql: &str) -> Vec<ast::Expr> {
         let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        let ast::Stmt::Select(selected) = translated else {
-            panic!("Expected SELECT statement");
+        let ast::Stmt::Select(selected) = PostgreSQLTranslator::new().translate(&parsed).unwrap()
+        else {
+            panic!("{sql}: expected a SELECT statement");
         };
-
-        let ast::OneSelect::Select { columns, .. } = &selected.body.select else {
-            panic!("Expected SELECT body");
+        let ast::OneSelect::Select { columns, .. } = selected.body.select else {
+            panic!("{sql}: expected a SELECT body");
         };
-
-        let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
-            ast::Expr::Literal(ast::Literal::CurrentDate),
-            ast::Expr::Literal(ast::Literal::CurrentTime),
-        ];
-
-        assert_eq!(columns.len(), expected.len());
-
-        for (col, expected_expr) in columns.iter().zip(&expected) {
-            let ast::ResultColumn::Expr(expr, _) = col else {
-                panic!("Expected column expression");
-            };
-            assert_eq!(expr.as_ref(), expected_expr);
-        }
+        columns
+            .into_iter()
+            .map(|column| match column {
+                ast::ResultColumn::Expr(expr, _) => *expr,
+                other => panic!("{sql}: expected an expression, got {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -12327,9 +12334,22 @@ mod tests {
 
     #[test]
     fn fail_closed_current_timestamp_precision() {
-        assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
-        assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
-        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        for sql in [
+            "SELECT CURRENT_TIMESTAMP(0)",
+            "SELECT CURRENT_TIMESTAMP(3)",
+            "SELECT LOCALTIMESTAMP(0)",
+            "SELECT LOCALTIME(0)",
+            "SELECT LOCALTIME(6)",
+        ] {
+            assert_not_supported(sql, "fractional-second precision");
+        }
+        assert_translates("SELECT CURRENT_TIMESTAMP, LOCALTIMESTAMP, LOCALTIME");
+    }
+
+    #[test]
+    fn fail_closed_current_time() {
+        assert_not_supported("SELECT CURRENT_TIME", "CURRENT_TIME");
+        assert_not_supported("SELECT CURRENT_TIME(0)", "CURRENT_TIME");
     }
 
     #[test]
