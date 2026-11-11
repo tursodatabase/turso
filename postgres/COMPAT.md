@@ -13,6 +13,15 @@ Status legend:
 | 🟡 Partial | Feature works with limitations (see notes) |
 | ❌ Not supported | Feature is not implemented |
 
+## PostgreSQL version
+
+The reference version is PostgreSQL 18. The PostgreSQL conformance tests, the
+SQLSTATE fuzzer and the `pg_dump` differential fuzzer compare Turso against a
+PostgreSQL 18 server, and CI uses PostgreSQL 18 clients. The version is set in
+`postgres/version`. Behavior that differs between PostgreSQL versions follows
+PostgreSQL 18, and a newer release is supported only after the version there
+is changed and the tests pass against it.
+
 ## Architecture
 
 The frontend parses SQL with `pg_query` (libpg_query, the real PostgreSQL
