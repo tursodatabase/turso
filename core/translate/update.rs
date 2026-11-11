@@ -9,7 +9,7 @@ use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::row_security;
+use crate::translate::{roles, row_security};
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -196,6 +196,18 @@ fn prepare_and_optimize_update_plan(
         resolver,
         connection,
     )?;
+    // An ALTER that rewrites the schema table has had its own privileges
+    // checked already.
+    if !is_internal_schema_change {
+        check_update_privileges(&update_plan, resolver, connection)?;
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            update_plan.target_table.namespace,
+            update_plan.target_table.table.get_name(),
+        );
+    }
     mark_shared_cte_materialization_requirements(
         &mut read_scope_tables,
         &mut update_plan.non_from_clause_subqueries,
@@ -206,6 +218,35 @@ fn prepare_and_optimize_update_plan(
     let mut plan = Plan::Update(Box::new(update_plan));
     optimize_plan(program, &mut plan, resolver, connection)?;
     Ok(plan)
+}
+
+/// Checks the privileges on the target table: UPDATE, and SELECT too when
+/// SET, WHERE or RETURNING reads the table's columns, as in PostgreSQL.
+/// Subqueries must be planned first, so that only a subquery that refers to
+/// the target table counts as reading it.
+fn check_update_privileges(
+    plan: &UpdatePlan,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    let target = &plan.target_table;
+    let reads_target_columns = roles::reads_columns_of(
+        target.internal_id,
+        plan.where_clause
+            .iter()
+            .map(|term| &term.expr)
+            .chain(plan.set_clauses.iter().map(|set| set.expr.as_ref()))
+            .chain(plan.returning.iter().flatten().map(|column| &column.expr)),
+        &plan.non_from_clause_subqueries,
+    )?;
+    roles::check_write_privileges(
+        resolver,
+        connection,
+        target.namespace,
+        target.table.get_name(),
+        ast::Privilege::Update,
+        reads_target_columns,
+    )
 }
 
 fn validate_update(

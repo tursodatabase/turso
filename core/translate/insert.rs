@@ -1,11 +1,14 @@
 use crate::alloc::TursoFromIterator;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
+use crate::security::permission::Object;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::plan::NonFromClauseSubquery;
+use crate::translate::{roles, row_security};
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
@@ -303,6 +306,21 @@ pub fn translate_insert(
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate(table_name.as_str(), resolver, &table, namespace, connection)?;
+    roles::check_write_privileges(
+        resolver,
+        connection,
+        namespace,
+        table.get_name(),
+        ast::Privilege::Insert,
+        false,
+    )?;
+    roles::hide_constraint_values_from_role_without_select(
+        program,
+        resolver,
+        connection,
+        namespace,
+        table.get_name(),
+    );
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -326,7 +344,7 @@ pub fn translate_insert(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    crate::translate::row_security::check_insert(&btree_table, namespace, resolver)?;
+    row_security::check_insert(&btree_table, namespace, resolver)?;
 
     let BoundInsertResult {
         mut values,
@@ -408,6 +426,14 @@ pub fn translate_insert(
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    check_upsert_and_returning_privileges(
+        &table_references,
+        &result_columns,
+        &returning_subqueries,
+        &upsert_actions,
+        resolver,
+        connection,
+    )?;
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| {
             s.has_child_fks(namespace.id, table_name.as_str())
@@ -2016,6 +2042,56 @@ fn emit_notnulls(
             });
             program.preassign_label_to_next_insn(value_not_null);
         }
+    }
+    Ok(())
+}
+
+/// Checks the privileges an INSERT needs besides INSERT, as in PostgreSQL:
+/// UPDATE for ON CONFLICT DO UPDATE, and SELECT when RETURNING reads the
+/// table's columns or ON CONFLICT names the columns that conflict. DO UPDATE
+/// also needs SELECT, because its SET and WHERE read the row that conflicts.
+fn check_upsert_and_returning_privileges(
+    table_references: &TableReferences,
+    result_columns: &[ResultSetColumn],
+    returning_subqueries: &[NonFromClauseSubquery],
+    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let target = &table_references.joined_tables()[0];
+    let name = target.table.get_name();
+    let object = || Object::Table(name.to_string());
+    let updates = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    if updates {
+        roles::check_privilege(
+            resolver,
+            connection,
+            target.namespace,
+            name,
+            ast::Privilege::Update,
+            object(),
+        )?;
+    }
+    let reads_columns = updates
+        || upsert_actions
+            .iter()
+            .any(|(_, _, upsert)| upsert.index.is_some())
+        || roles::reads_columns_of(
+            target.internal_id,
+            result_columns.iter().map(|column| &column.expr),
+            returning_subqueries,
+        )?;
+    if reads_columns {
+        roles::check_privilege(
+            resolver,
+            connection,
+            target.namespace,
+            name,
+            ast::Privilege::Select,
+            object(),
+        )?;
     }
     Ok(())
 }

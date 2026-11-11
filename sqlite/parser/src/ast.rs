@@ -237,6 +237,9 @@ pub enum Stmt {
         where_clause: Option<Box<Expr>>,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
+        /// Whether the statement is PostgreSQL's `TRUNCATE`, which deletes
+        /// every row and needs the TRUNCATE privilege rather than DELETE.
+        truncate: bool,
     },
     /// `DETACH DATABASE`: db name
     Detach {
@@ -1544,6 +1547,9 @@ pub enum RoleSpec {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Grant {
     pub privileges: Vec<Privilege>,
+    /// Whether the statement grants on `SEQUENCE`s rather than on tables,
+    /// which names any relation.
+    pub on_sequences: bool,
     pub relations: Vec<QualifiedName>,
     pub grantees: Vec<Grantee>,
 }
@@ -1553,6 +1559,16 @@ pub struct Grant {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Privilege {
     Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Maintain,
+    Usage,
+    /// `ALL [PRIVILEGES]`: every privilege that the kind of relation has.
+    All,
 }
 
 /// Whom a `GRANT` gives privileges to.

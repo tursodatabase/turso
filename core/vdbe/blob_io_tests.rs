@@ -15,6 +15,7 @@ use crate::{
     ConnectOpts, Connection, Database, DatabaseOpts, EngineDialect, LimboError, MemoryIO,
     OpenFlags, Statement, Value, IO,
 };
+use turso_parser::ast::Privilege;
 
 fn fresh_db() -> Arc<Connection> {
     fresh_db_with_dialect(Arc::new(EngineDialect))
@@ -867,12 +868,13 @@ impl Dialect for SecretTableDialect {
         true
     }
 
-    fn role_may_read(
+    fn role_has_privilege(
         &self,
         _schema: &Schema,
         _namespace: NamespaceId,
         name: &str,
         _role: RoleId,
+        _privilege: Privilege,
     ) -> bool {
         !name.eq_ignore_ascii_case("secret")
     }

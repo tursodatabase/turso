@@ -422,7 +422,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT SELECT ON ALL TABLES IN SCHEMA` stores the privilege in each table's `pg_class.relacl` and lets the roles read the tables; other privileges, sequences, functions and REVOKE are not supported |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT ... ON ALL TABLES IN SCHEMA` and `GRANT ... ON ALL SEQUENCES IN SCHEMA` store the privileges in each relation's `pg_class.relacl`; functions and REVOKE are not supported |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -436,7 +436,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read the tables they own or were granted `SELECT` on, but not write rows, use sequences, or change the schema they do not own; `GRANT SELECT` on tables is the only `GRANT` accepted and is stored in `pg_class.relacl`; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
+| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read and write the tables they own or were granted `SELECT`, `INSERT`, `UPDATE` and `DELETE` on, with SELECT also needed when a write reads the table's columns, and call `nextval` with `USAGE` or `UPDATE` and `setval` with `UPDATE` on the sequence, but not change the schema they do not own; `GRANT` of privileges on whole tables and sequences, `ALL` included, is stored in `pg_class.relacl`; `TRUNCATE` needs the `TRUNCATE` privilege, and the `REFERENCES`, `TRIGGER` and `MAINTAIN` privileges let a role do nothing yet; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
 | Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; a table with it shows no rows to roles other than superusers and the table's owner, as with no policies in PostgreSQL; policies, `CREATE POLICY` and `FORCE ROW LEVEL SECURITY` are not supported; views apply it as the view's owner, except that a superuser reading a view sees every row, and `RIGHT`/`FULL JOIN` with such a table is rejected for roles |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |

@@ -30,7 +30,7 @@ use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgGrantSelectStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
+    PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
     PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
@@ -1111,11 +1111,11 @@ impl DeferredOperation {
                         }
                         return Ok(None);
                     }
-                    FrontendStmt::GrantSelect(stmt) => {
+                    FrontendStmt::Grant(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        grant_select_commands(conn, stmt)?
+                        grant_commands(conn, stmt)?
                     }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
@@ -1714,7 +1714,7 @@ fn try_prepare_special(
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
         | FrontendStmt::CommentOn(_)
-        | FrontendStmt::GrantSelect(_)) => crate::Statement::with_deferred(
+        | FrontendStmt::Grant(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1776,7 +1776,7 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::CopyTo(_) => return Ok(()),
         // Who may grant on each table is decided from its stored privileges
         // when the engine's GRANT runs.
-        FrontendStmt::GrantSelect(_) => return Ok(()),
+        FrontendStmt::Grant(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),
@@ -1804,14 +1804,12 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
     Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
-/// The engine GRANT that stores a GRANT SELECT. The engine checks the
+/// The engine GRANT that stores a GRANT. The engine checks the
 /// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
-/// schema, and no statement when there are none.
-fn grant_select_commands(
-    conn: &Arc<Connection>,
-    stmt: &PgGrantSelectStmt,
-) -> Result<Vec<DeferredStatement>> {
+/// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
+/// there are none.
+fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<DeferredStatement>> {
     let relations = match &stmt.tables {
         PgGrantTables::Named(tables) => tables.clone(),
         PgGrantTables::AllInSchemas(schemas) => {
@@ -1823,8 +1821,10 @@ fn grant_select_commands(
                     schema_objects(conn, &schema)
                         .into_iter()
                         .filter_map(|object| match object {
-                            SchemaObject::Table(name) | SchemaObject::View(name) => Some(name),
-                            SchemaObject::Sequence(_) => None,
+                            SchemaObject::Table(name) | SchemaObject::View(name) => {
+                                (!stmt.on_sequences).then_some(name)
+                            }
+                            SchemaObject::Sequence(name) => stmt.on_sequences.then_some(name),
                         })
                         .map(|name| {
                             ast::QualifiedName::fullname(
@@ -1855,7 +1855,8 @@ fn grant_select_commands(
     }
     Ok(vec![DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
-            privileges: vec![ast::Privilege::Select],
+            privileges: stmt.privileges.clone(),
+            on_sequences: stmt.on_sequences,
             relations,
             grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
         })),

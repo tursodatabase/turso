@@ -194,6 +194,8 @@ fn policy_for(
     // no policy for the command hides every row, as in PostgreSQL.
     match command {
         Command::Select | Command::Insert | Command::Update | Command::Delete => Policy::Deny,
+        // As in PostgreSQL, row-level security does not apply to TRUNCATE.
+        Command::Truncate => Policy::Allow,
     }
 }
 

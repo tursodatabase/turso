@@ -10,8 +10,8 @@ use turso_core::{
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
     security::roles::{Role, RoleCatalog, RoleId},
-    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
-    Result, Statement, Value, WalkControl,
+    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
+    OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
@@ -271,14 +271,15 @@ impl Dialect for PostgresDialect {
         crate::classes::relation_owner(schema, namespace, name)
     }
 
-    fn role_may_read(
+    fn role_has_privilege(
         &self,
         schema: &Schema,
         namespace: NamespaceId,
         name: &str,
         role: RoleId,
+        privilege: ast::Privilege,
     ) -> bool {
-        crate::classes::role_may_read(schema, namespace, name, role)
+        crate::classes::role_has_privilege(schema, namespace, name, role, privilege)
     }
 
     fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
@@ -2432,12 +2433,21 @@ impl SnapshotRows for PgSequencesTable {
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
                 let last_val = conn
-                    .get_sequence_currval(
-                        turso_core::MAIN_DB_ID,
-                        &mangle_name(namespace, &seq_name),
-                    )
+                    .get_sequence_currval(MAIN_DB_ID, &mangle_name(namespace, &seq_name))
                     .unwrap_or(seq.start_value);
                 let owner_name = relation_owner_name(conn, &schema, namespace, &seq_name);
+                let may_read = conn.may_read_sequence(
+                    NamespaceRef {
+                        database_id: MAIN_DB_ID,
+                        id: namespace,
+                    },
+                    &seq_name,
+                );
+                let last_value = if may_read {
+                    Value::from_i64(last_val)
+                } else {
+                    Value::Null
+                };
                 rows.push(vec![
                     Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                     Value::build_text(seq_name),           // sequencename
@@ -2449,7 +2459,7 @@ impl SnapshotRows for PgSequencesTable {
                     Value::from_i64(seq.increment_by),     // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    last_value,
                 ]);
             }
         }

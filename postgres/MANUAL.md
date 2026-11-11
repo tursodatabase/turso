@@ -124,13 +124,19 @@ SELECT rolname FROM pg_roles;
 (2 rows)
 ```
 
-### `GRANT SELECT` — let roles read tables
+### `GRANT` — give roles privileges on tables
 
 **Synopsis:**
 
 ```sql
-GRANT SELECT ON [ TABLE ] table_name [, ...] TO role_specification [, ...]
-GRANT SELECT ON ALL TABLES IN SCHEMA schema_name [, ...] TO role_specification [, ...]
+GRANT { { SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN }
+        [, ...] | ALL [ PRIVILEGES ] }
+    ON { [ TABLE ] table_name [, ...] | ALL TABLES IN SCHEMA schema_name [, ...] }
+    TO role_specification [, ...]
+
+GRANT { { USAGE | SELECT | UPDATE } [, ...] | ALL [ PRIVILEGES ] }
+    ON { SEQUENCE sequence_name [, ...] | ALL SEQUENCES IN SCHEMA schema_name [, ...] }
+    TO role_specification [, ...]
 
 where role_specification is:
     role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
@@ -138,15 +144,16 @@ where role_specification is:
 
 **Description:**
 
-`GRANT SELECT` lets roles read tables. A role that is not a superuser reads
+`GRANT` gives roles privileges on tables and sequences. `GRANT SELECT`
+lets roles read tables. A role that is not a superuser reads
 a table, view or materialized view only when it owns it or `SELECT` on it
 was granted to it or to `PUBLIC`; otherwise reading it, directly or through
 a join, subquery or CTE, fails with `permission denied for table` (SQLSTATE
 42501). As in PostgreSQL, a view's tables are read as the view's owner, so
 `SELECT` on a view is enough when its owner may read its tables.
 
-The privilege is stored in the database file, in the table's access control
-list, which `pg_class.relacl` shows in PostgreSQL's form: after
+The privileges are stored in the database file, in the table's access
+control list, which `pg_class.relacl` shows in PostgreSQL's form: after
 `GRANT SELECT ON accounts TO reader` by the owner `postgres`, it reads
 `{postgres=arwdDxtm/postgres,reader=r/postgres}`. The list is `NULL` until
 the first `GRANT`, when the owner has every privilege and nobody else has
@@ -158,15 +165,26 @@ is stored but not shown.
 - `table_name`: The name of an existing table, view, materialized view or
   sequence, optionally qualified with its schema. Catalog tables such as
   `pg_catalog.pg_class` can be named too.
+- `sequence_name`: The name of an existing sequence, optionally qualified
+  with its schema. A relation that is not a sequence fails with `is not a
+  sequence` (SQLSTATE 42809).
 - `schema_name`: The name of an existing schema. `ALL TABLES IN SCHEMA` names
-  every table in it.
+  every table in it, and `ALL SEQUENCES IN SCHEMA` every sequence.
+- `ALL [ PRIVILEGES ]`: Every privilege of the relation's kind: `arwdDxtm`
+  for a table, and `rwU` (`SELECT`, `UPDATE`, `USAGE`) for a sequence. As in
+  PostgreSQL, a privilege that a sequence does not have, such as `INSERT`, is
+  left out when it is granted on one.
 - `role_name`: The name of an existing role.
 
 **Notes:**
 
-`GRANT SELECT` fails if a table, schema or role does not exist, if a name is
-an index, or if a name refers to another database, with the same errors as
-PostgreSQL. The tables are checked before the roles.
+`GRANT` fails if a table, schema or role does not exist, if a name is an
+index, or if a name refers to another database, with the same errors as
+PostgreSQL. The tables are checked before the roles. A privilege that tables
+do not have, `USAGE`, fails with `invalid privilege type` (SQLSTATE 0LP01)
+on a table, though `GRANT USAGE ON s`, without `SEQUENCE`, works for a
+sequence `s`, as in PostgreSQL. A privilege that sequences do not have, such
+as `INSERT`, fails the same way with `SEQUENCE`.
 
 As in PostgreSQL, the table's owner may grant, and a superuser grants as the
 owner, so the owner is the grantor in the list either way. Any other role
@@ -174,15 +192,39 @@ gets `permission denied for table` (SQLSTATE 42501), unless the list gives
 it a privilege on the table, when the statement succeeds and stores
 nothing, as in PostgreSQL, which warns. `ALL TABLES IN SCHEMA` grants
 on the tables, views and materialized views of the schema, not on its
-sequences. A catalog table such as `pg_catalog.pg_class` can be named, but
+sequences, and `ALL SEQUENCES IN SCHEMA` only on its sequences. A catalog table such as `pg_catalog.pg_class` can be named, but
 nothing is stored for it. `ALTER ... OWNER TO` puts the new owner in the
 new owner's place in the list, and a rename keeps it.
 
-Only `SELECT` on tables is accepted. Other privileges, column privileges,
-`WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of objects, and
-`REVOKE` fail as not supported, so that a script never believes it changed
-what a role may do when it did not. `GRANT role_name TO role_name` is not
-supported either.
+`SELECT`, `INSERT`, `UPDATE` and `DELETE` let a role read and write the
+table, as in PostgreSQL. A statement that reads the table's columns also
+needs `SELECT`: an `UPDATE` or `DELETE` with a `WHERE` that reads them or a
+`SET` that reads them, `RETURNING` that returns them, and `INSERT ... ON
+CONFLICT` with a conflict target or `DO UPDATE`. `INSERT ... ON CONFLICT DO
+UPDATE` also needs `UPDATE`. A subquery in these places needs `SELECT` only
+when it reads a column of the table that is written, as in PostgreSQL.
+Foreign-key checks and
+actions need no privileges on the other table. `TRUNCATE` needs the
+`TRUNCATE` privilege, not `DELETE`, as in PostgreSQL. The `REFERENCES`,
+`TRIGGER` and `MAINTAIN` privileges are stored but let a role do nothing
+yet. On a sequence, `nextval` needs `USAGE`
+or `UPDATE`, `setval` needs `UPDATE`, and `currval` needs `SELECT` or
+`USAGE`, as in PostgreSQL, so a role that inserts into a table with a
+`serial` column needs `USAGE` on the column's sequence too. A `serial
+PRIMARY KEY` column is the exception: its value comes from the row's rowid,
+not from the sequence, so the insert needs no privilege on the sequence.
+`pg_sequences.last_value` is null for a role with neither `SELECT` nor
+`USAGE` on the sequence. A table with row-level security still
+refuses writes by a role that does not own it: `INSERT` fails, and
+`UPDATE` and `DELETE` change no rows. As in PostgreSQL, row-level security
+does not apply to `TRUNCATE`, which removes every row. A constraint error
+shows the values of the row or key (`Failing row contains ...`, `Key ...
+already exists`) only to a role with `SELECT` on the table; PostgreSQL also
+shows the values that the statement itself gave. Column
+privileges, `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of
+objects, and `REVOKE` fail as not supported, so that a script never believes
+it changed what a role may do when it did not. `GRANT role_name TO
+role_name` is not supported either.
 
 **Examples:**
 
@@ -227,13 +269,13 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT SELECT`
-on tables is the only `GRANT` accepted (see `GRANT SELECT`). A role that is
-not a superuser may read the tables it owns or was granted `SELECT` on, and
-it may alter and drop the relations it owns, except that renaming a
-relation or creating an index on it also needs CREATE on the schema, which
-only a superuser has; it cannot insert, update, delete or truncate rows,
-call `nextval` or `setval`, create objects or roles, or `COPY FROM` a file.
+Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT` on
+tables (see `GRANT`). A role that is not a superuser may read and write the
+tables it owns or was granted privileges on, and it may alter and drop the
+relations it owns, except that renaming a relation or creating an index on
+it also needs CREATE on the schema, which only a superuser has; it may call
+`nextval` and `setval` on the sequences it owns or was granted privileges
+on; it cannot create objects or roles, or `COPY FROM` a file.
 Creating objects stays superuser-only because PostgreSQL gates it on the
 schema's CREATE privilege, which does not exist yet. Catalog tables and
 sequences read as tables are not checked.

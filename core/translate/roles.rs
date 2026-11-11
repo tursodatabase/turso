@@ -6,10 +6,9 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! Privileges other than ownership are not checked yet, so a role that is
-//! not a superuser may not write to any table, use a sequence or change the
-//! schema it does not own. It may read tables, which row-level security
-//! limits, and switch roles.
+//! A role that is not a superuser reads and writes the tables it owns or was
+//! granted privileges on, which row-level security limits, and switches
+//! roles. It may not use a sequence or change the schema it does not own.
 
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
@@ -22,6 +21,8 @@ use crate::security::roles::{
     ROLES_TABLE_NAME,
 };
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -41,11 +42,12 @@ pub fn check_statement_privileges(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let denial = match stmt {
-        ast::Stmt::Select(_) => return Ok(()),
-        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
-            write_denial(tbl_name)
-        }
-        ast::Stmt::Update(update) => write_denial(&update.tbl_name),
+        // The privileges on the tables a statement reads and writes are
+        // checked when it resolves them, with check_privilege.
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. } => return Ok(()),
         ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }
         | ast::Stmt::Rollback { .. }
@@ -273,17 +275,29 @@ fn role_spec_name(role: &ast::RoleSpec) -> String {
     }
 }
 
-fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
-    PermissionDenied::privilege(
-        Action::Write,
-        Object::Table(tbl_name.name.as_str().to_string()),
-    )
-}
-
-/// Fails if the statement is compiled for a role that is not a superuser,
-/// which may not change `sequence` with `nextval()` or `setval()`.
-pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Result<()> {
-    if !resolver.role_is_not_superuser {
+/// Fails if the statement is compiled for a role that may not change
+/// `sequence` of `namespace`, as in PostgreSQL: `nextval()` needs USAGE or
+/// UPDATE on it, and `setval()` needs UPDATE. Unlike a table, a sequence
+/// that a view uses is checked for the role that reads the view, because
+/// PostgreSQL checks a function's privileges for the role that calls it.
+pub(crate) fn check_sequence_change(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    sequence: &str,
+    is_nextval: bool,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let schema = resolver.schema();
+    let role = resolver.row_security_role;
+    let has = |privilege| {
+        resolver
+            .catalog
+            .dialect
+            .role_has_privilege(schema, namespace.id, sequence, role, privilege)
+    };
+    if has(ast::Privilege::Update) || (is_nextval && has(ast::Privilege::Usage)) {
         return Ok(());
     }
     Err(permission_denied(PermissionDenied::privilege(
@@ -292,36 +306,163 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     )))
 }
 
-/// Fails if the statement is compiled for a role that may not read relation
-/// `name` of `namespace`, a table, view or materialized view, which `object`
-/// names in the error. Inside a view, the view's owner is the reader, as in
-/// PostgreSQL, so a view shows its readers the tables its owner may read.
-/// Relations outside the main database, temp among them, have no
-/// privileges, and everyone reads them.
-pub(crate) fn check_read_privilege(
+/// Fails if the current role of `connection` may not read the value of
+/// `sequence` of `namespace` with `currval()`. `currval()` checks this when
+/// it runs, because its argument may be a sequence name that is only known
+/// then.
+pub(crate) fn check_sequence_read(
+    connection: &Connection,
+    namespace: NamespaceRef,
+    sequence: &str,
+) -> Result<()> {
+    if connection.may_read_sequence(namespace, sequence) {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        Object::Sequence(sequence.to_string()),
+    )))
+}
+
+/// Fails if the statement is compiled for a role that does not have
+/// `privilege` on relation `name` of `namespace`, a table, view or
+/// materialized view, which `object` names in the error. Inside a view, the
+/// view's owner is the reader, as in PostgreSQL, so a view shows its readers
+/// the tables its owner may read. Relations outside the main database, temp
+/// among them, have no privileges, and everyone uses them.
+pub(crate) fn check_privilege(
     resolver: &Resolver,
     connection: &Arc<Connection>,
     namespace: NamespaceRef,
     name: &str,
+    privilege: ast::Privilege,
     object: Object,
 ) -> Result<()> {
     if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
         return Ok(());
     }
     let schema = resolver.schema();
-    let reader = table_reader(resolver, connection.current_role());
-    if schema.roles.is_superuser(reader)
+    let role = table_reader(resolver, connection.current_role());
+    if schema.roles.is_superuser(role)
         || resolver
             .catalog
             .dialect
-            .role_may_read(schema, namespace.id, name, reader)
+            .role_has_privilege(schema, namespace.id, name, role, privilege)
     {
         return Ok(());
     }
+    let action = match privilege {
+        ast::Privilege::Select => Action::Read,
+        _ => Action::Write,
+    };
     Err(permission_denied(PermissionDenied::privilege(
-        Action::Read,
-        object,
+        action, object,
     )))
+}
+
+/// Checks the privileges that a write to table `name` of `namespace` needs:
+/// `privilege`, and SELECT too when `reads_columns` says that the statement
+/// reads the table's columns, as in PostgreSQL.
+pub(crate) fn check_write_privileges(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    privilege: ast::Privilege,
+    reads_columns: bool,
+) -> Result<()> {
+    let object = || Object::Table(name.to_string());
+    check_privilege(resolver, connection, namespace, name, privilege, object())?;
+    if reads_columns {
+        check_privilege(
+            resolver,
+            connection,
+            namespace,
+            name,
+            ast::Privilege::Select,
+            object(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Makes the constraint errors of a statement that writes table `name` of
+/// `namespace` leave out the values of the row or key that broke the
+/// constraint, when the statement is compiled for a role without SELECT on
+/// the table. As in PostgreSQL, only a role that may read the table sees
+/// them; otherwise a role that may only write the table could read it from
+/// the writes that fail.
+pub(crate) fn hide_constraint_values_from_role_without_select(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+) {
+    let may_read = check_privilege(
+        resolver,
+        connection,
+        namespace,
+        name,
+        ast::Privilege::Select,
+        Object::Table(name.to_string()),
+    )
+    .is_ok();
+    if !may_read {
+        program.flags.set_hides_constraint_values(true);
+    }
+}
+
+/// Whether any of `exprs` reads a column of table `table`, directly or from
+/// one of the planned `subqueries` that it refers to.
+pub(crate) fn reads_columns_of<'a>(
+    table: ast::TableInternalId,
+    exprs: impl IntoIterator<Item = &'a ast::Expr>,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let mut reads = false;
+    for expr in exprs {
+        walk_expr(expr, &mut |expr| {
+            reads |= match expr {
+                ast::Expr::Column { table: read, .. } | ast::Expr::RowId { table: read, .. } => {
+                    *read == table
+                }
+                ast::Expr::SubqueryResult { subquery_id, .. } => {
+                    subquery_reads_columns_of(table, *subquery_id, subqueries)?
+                }
+                ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_) => {
+                    return Err(LimboError::InternalError(
+                        "subquery is not planned before its privileges are checked".to_string(),
+                    ));
+                }
+                _ => false,
+            };
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(reads)
+}
+
+fn subquery_reads_columns_of(
+    table: ast::TableInternalId,
+    subquery_id: ast::TableInternalId,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let Some(subquery) = subqueries.iter().find(|s| s.internal_id == subquery_id) else {
+        return Err(LimboError::InternalError(format!(
+            "subquery {subquery_id} not found"
+        )));
+    };
+    let outer_ref_ids = match &subquery.state {
+        SubqueryState::Unevaluated { plan: Some(plan) } => plan.used_outer_query_ref_ids(),
+        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids.clone(),
+        SubqueryState::Unevaluated { plan: None } => {
+            return Err(LimboError::InternalError(format!(
+                "subquery {subquery_id} has no plan"
+            )));
+        }
+    };
+    Ok(outer_ref_ids.contains(&table))
 }
 
 /// The role that reads the tables of a statement compiled for `role`. Inside
@@ -396,6 +537,9 @@ pub fn translate_grant(
         };
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
+        }
+        if grant.on_sequences && kind != ast::RelationKind::Sequence {
+            bail_parse_error!("\"{normalized_name}\" is not a sequence");
         }
         // Only the main database has dialect schema state to store the
         // privileges in; a temp table has none, and nothing to store.

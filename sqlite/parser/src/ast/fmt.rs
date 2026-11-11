@@ -486,6 +486,9 @@ impl ToTokens for Stmt {
                 indexed,
                 where_clause,
                 returning,
+                // Written as the DELETE it runs as: this is SQLite's syntax,
+                // which has no TRUNCATE.
+                truncate: _,
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -1767,6 +1770,9 @@ impl ToTokens for Grant {
         s.append(TK_ID, Some("GRANT"))?;
         s.comma(&self.privileges, context)?;
         s.append(TK_ON, None)?;
+        if self.on_sequences {
+            s.append(TK_ID, Some("SEQUENCE"))?;
+        }
         s.comma(&self.relations, context)?;
         s.append(TK_TO, None)?;
         s.comma(&self.grantees, context)
@@ -1782,6 +1788,15 @@ impl ToTokens for Privilege {
     ) -> Result<(), S::Error> {
         match self {
             Self::Select => s.append(TK_SELECT, None),
+            Self::Insert => s.append(TK_INSERT, None),
+            Self::Update => s.append(TK_UPDATE, None),
+            Self::Delete => s.append(TK_DELETE, None),
+            Self::Truncate => s.append(TK_ID, Some("TRUNCATE")),
+            Self::References => s.append(TK_REFERENCES, None),
+            Self::Trigger => s.append(TK_TRIGGER, None),
+            Self::Maintain => s.append(TK_ID, Some("MAINTAIN")),
+            Self::Usage => s.append(TK_ID, Some("USAGE")),
+            Self::All => s.append(TK_ALL, None),
         }
     }
 }

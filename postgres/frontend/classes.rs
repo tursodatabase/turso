@@ -46,10 +46,12 @@ use turso_core::{
 use turso_parser::ast;
 
 use turso_core::MAIN_DB_ID;
+use turso_pg_parser::sqlstate::SQLSTATE_INVALID_GRANT_OPERATION;
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
-use crate::acl::{Acl, PUBLIC_OID};
+use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
+use crate::error::sqlstate_error;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -457,26 +459,32 @@ pub(crate) fn relation_owner(
     )
 }
 
-/// [`turso_core::Dialect::role_may_read`] for the PostgreSQL frontend: the
-/// owner may, and so may a role the list gives SELECT, by oid or through
-/// PUBLIC. A relation without a class row is the engine's, such as a catalog
-/// table, and everyone reads it.
-pub(crate) fn role_may_read(
+/// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
+/// the owner has every privilege, and another role has the ones the list
+/// gives it, by oid or through PUBLIC. A relation without a class row is the
+/// engine's, such as a catalog table, and every role reads it, but only a
+/// superuser writes it.
+pub(crate) fn role_has_privilege(
     schema: &Schema,
     namespace: NamespaceId,
     name: &str,
     role: RoleId,
+    privilege: ast::Privilege,
 ) -> bool {
     let Some(class) =
         class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
     else {
-        return true;
+        return privilege == ast::Privilege::Select;
     };
-    class.relowner == role
-        || class
+    if class.relowner == role {
+        return true;
+    }
+    let wanted = Privileges::granted_on(class.relkind, &[privilege]);
+    !wanted.is_empty()
+        && class
             .relacl
             .as_ref()
-            .is_some_and(|acl| acl.grants(role_oid(role), ast::Privilege::Select))
+            .is_some_and(|acl| acl.grants(role_oid(role), wanted))
 }
 
 /// The access control list of relation `name` of `namespace`, or None when
@@ -727,6 +735,16 @@ pub(crate) fn translate_relation_changes(
                 else {
                     continue;
                 };
+                // `ON TABLE` may name a sequence, so USAGE is refused here,
+                // for a relation that is not one, as in PostgreSQL.
+                if class.relkind != RelationKind::Sequence
+                    && privileges.contains(&ast::Privilege::Usage)
+                {
+                    return Err(sqlstate_error(
+                        SQLSTATE_INVALID_GRANT_OPERATION,
+                        "invalid privilege type USAGE for table",
+                    ));
+                }
                 let owner = role_oid(class.relowner);
                 let mut acl = class
                     .relacl
@@ -746,8 +764,15 @@ pub(crate) fn translate_relation_changes(
                         PermissionDenied::privilege(Action::Read, relation_object(class)),
                     )));
                 }
+                // As in PostgreSQL, a GRANT that gives nothing on the
+                // relation, such as INSERT on a sequence, leaves its list
+                // as it is, even when it has none yet.
+                let granted = Privileges::granted_on(class.relkind, privileges);
+                if granted.is_empty() {
+                    continue;
+                }
                 for grantee in &grantees {
-                    acl.grant(*grantee, privileges, owner);
+                    acl.grant(*grantee, granted, owner);
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;
