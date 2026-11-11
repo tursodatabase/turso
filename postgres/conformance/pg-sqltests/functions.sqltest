@@ -193,6 +193,14 @@ expect error {
     unrecognized format\(\) type specifier "x"
 }
 
+test format-unterminated-width-position {
+    SELECT format('%*2');
+}
+@sqlstate 22023
+expect error {
+    unterminated format\(\) type specifier
+}
+
 test current-schema-default {
     SELECT current_schema();
 }
