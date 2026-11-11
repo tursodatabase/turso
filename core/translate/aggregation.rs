@@ -39,13 +39,7 @@ pub fn emit_ungrouped_aggregation<'a>(
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
 
-    emit_saved_distinct_aggregate_steps(
-        program,
-        &plan.table_references,
-        &plan.aggregates,
-        agg_start_reg,
-        &t_ctx.resolver,
-    )?;
+    emit_saved_distinct_aggregate_steps(program, &plan.aggregates, agg_start_reg);
 
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
@@ -226,20 +220,20 @@ pub fn emit_ungrouped_aggregation<'a>(
     Ok(())
 }
 
-/// Send values saved after a spill to the aggregate that needs them.
+/// Send the values saved after a spill to COUNT(DISTINCT).
 ///
-/// COUNT gets one total. Other aggregates get one bytecode step for each value.
+/// Only COUNT saves values after a spill, and it gets them as one total. Every
+/// other DISTINCT aggregate sees each new value at once, because saved values
+/// come back in a different order and without their subtype.
 pub fn emit_saved_distinct_aggregate_steps(
     program: &mut ProgramBuilder,
-    referenced_tables: &TableReferences,
     aggregates: &[Aggregate],
     first_aggregate_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
+) {
     for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
         // An aggregate with ORDER BY sends its values through a sorter, so
         // handle_distinct never saves them for it.
-        if aggregate.order_cursor.is_some() {
+        if aggregate.order_cursor.is_some() || !matches!(aggregate.func, AggFunc::Count) {
             continue;
         }
         let Distinctness::Distinct { ctx } = &aggregate.distinctness else {
@@ -248,47 +242,20 @@ pub fn emit_saved_distinct_aggregate_steps(
         let distinct_context = ctx
             .as_ref()
             .expect("distinct aggregate context not populated");
-        if matches!(aggregate.func, AggFunc::Count) {
-            program.emit_insn(Insn::HashDistinctCount {
-                hash_table_id: distinct_context.hash_table_id,
-                acc_reg: first_aggregate_register + aggregate_index,
-            });
-            continue;
-        }
-        let value_register = program.alloc_register();
-        let read_label = program.allocate_label();
-        let done_label = program.allocate_label();
-
-        program.preassign_label_to_next_insn(read_label);
-        program.emit_insn(Insn::HashDistinctNext {
+        program.emit_insn(Insn::HashDistinctCount {
             hash_table_id: distinct_context.hash_table_id,
-            dest_reg: value_register,
-            target_pc: done_label,
+            acc_reg: first_aggregate_register + aggregate_index,
         });
-        translate_aggregation_step(
-            program,
-            referenced_tables,
-            AggArgumentSource::from_saved_distinct_value(value_register, aggregate),
-            first_aggregate_register + aggregate_index,
-            resolver,
-            aggregate.fraction_reg,
-        )?;
-        program.emit_insn(Insn::Goto {
-            target_pc: read_label,
-        });
-        program.preassign_label_to_next_insn(done_label);
     }
-    Ok(())
 }
 
 /// Write the instruction that removes repeated aggregate values.
 ///
 /// With `save_after_spill`, values that arrive after the first spill are saved
-/// and sent to the aggregate at the end (see `emit_saved_distinct_aggregate_steps`).
-/// `is_count` then lets COUNT(DISTINCT) use its integer bitmap. Other
-/// aggregates need each saved value and use the normal value set. An aggregate
-/// whose values go through a sorter must not save them, because the saved
-/// values would skip the sorter.
+/// and counted at the end (see `emit_saved_distinct_aggregate_steps`). Only
+/// COUNT(DISTINCT) does this, and `is_count` lets it use its integer bitmap.
+/// An aggregate whose values go through a sorter must not save them, because
+/// the saved values would skip the sorter.
 pub fn handle_distinct(
     program: &mut ProgramBuilder,
     distinctness: &Distinctness,
@@ -319,16 +286,10 @@ pub fn handle_distinct(
 /// Says where an aggregate instruction gets its input values.
 ///
 /// `Register` reads values that the main query already placed in registers.
-/// `SavedDistinctValue` reads one value from a spill part. `Expression` runs the
-/// SQL expression when the aggregate step runs.
+/// `Expression` runs the SQL expression when the aggregate step runs.
 pub enum AggArgumentSource<'a> {
     Register {
         src_reg_start: usize,
-        aggregate: &'a Aggregate,
-    },
-    /// One value read back from an aggregate DISTINCT spill part.
-    SavedDistinctValue {
-        value_register: usize,
         aggregate: &'a Aggregate,
     },
     Expression {
@@ -358,24 +319,20 @@ impl<'a> AggArgumentSource<'a> {
         }
     }
 
-    /// Build an argument source for one value read from a DISTINCT spill part.
-    pub fn from_saved_distinct_value(value_register: usize, aggregate: &'a Aggregate) -> Self {
-        Self::SavedDistinctValue {
-            value_register,
-            aggregate,
-        }
-    }
-
     /// Write the DISTINCT check for argument register `reg`, if the aggregate is DISTINCT.
     ///
-    /// An aggregate with ORDER BY gets its values from a sorter and so never
-    /// saves them after a spill.
+    /// Only COUNT saves values after a spill, and not when it has ORDER BY
+    /// (its values come from a sorter).
     pub fn emit_distinct(&self, program: &mut ProgramBuilder, reg: usize, is_count: bool) {
-        let save_after_spill = match self {
-            AggArgumentSource::Register { aggregate, .. } => aggregate.order_cursor.is_none(),
-            AggArgumentSource::SavedDistinctValue { .. } => false,
-            AggArgumentSource::Expression { .. } => true,
-        };
+        // Saved values come back in partition order and without their
+        // subtype, which changes the result of order-dependent aggregates (sum
+        // overflow, group_concat order) and of subtype-aware ones
+        // (json_group_array). So only COUNT saves them.
+        let save_after_spill = is_count
+            && match self {
+                AggArgumentSource::Register { aggregate, .. } => aggregate.order_cursor.is_none(),
+                AggArgumentSource::Expression { .. } => true,
+            };
         handle_distinct(
             program,
             self.distinctness(),
@@ -388,31 +345,27 @@ impl<'a> AggArgumentSource<'a> {
     pub fn distinctness(&self) -> &Distinctness {
         match self {
             AggArgumentSource::Register { aggregate, .. } => &aggregate.distinctness,
-            AggArgumentSource::SavedDistinctValue { .. } => &Distinctness::NonDistinct,
             AggArgumentSource::Expression { distinctness, .. } => distinctness,
         }
     }
 
     pub fn agg_func(&self) -> &AggFunc {
         match self {
-            AggArgumentSource::Register { aggregate, .. }
-            | AggArgumentSource::SavedDistinctValue { aggregate, .. } => &aggregate.func,
+            AggArgumentSource::Register { aggregate, .. } => &aggregate.func,
             AggArgumentSource::Expression { func, .. } => func,
         }
     }
 
     pub fn arg_at(&self, idx: usize) -> &ast::Expr {
         match self {
-            AggArgumentSource::Register { aggregate, .. }
-            | AggArgumentSource::SavedDistinctValue { aggregate, .. } => &aggregate.args[idx],
+            AggArgumentSource::Register { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Expression { args, .. } => &args[idx],
         }
     }
 
     pub fn num_args(&self) -> usize {
         match self {
-            AggArgumentSource::Register { aggregate, .. }
-            | AggArgumentSource::SavedDistinctValue { aggregate, .. } => aggregate.args.len(),
+            AggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
             AggArgumentSource::Expression { args, .. } => args.len(),
         }
     }
@@ -430,10 +383,6 @@ impl<'a> AggArgumentSource<'a> {
                 src_reg_start: start_reg,
                 ..
             } => Ok(*start_reg + arg_idx),
-            AggArgumentSource::SavedDistinctValue { value_register, .. } => {
-                crate::turso_assert_eq!(arg_idx, 0, "DISTINCT aggregate has one argument");
-                Ok(*value_register)
-            }
             AggArgumentSource::Expression { args, .. } => {
                 resolve_expr(program, Some(referenced_tables), &args[arg_idx], resolver)
             }

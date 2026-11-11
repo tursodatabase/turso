@@ -431,3 +431,34 @@ expect {
     a|1|1
     b|0|NULL
 }
+
+# After a spill, SUM/TOTAL/AVG must still add each value as it arrives. Replaying
+# saved values in partition order sums the big values of one sign first and
+# raises a spurious integer overflow.
+test distinct-spilled-sum-does-not-overflow {
+    WITH RECURSIVE s(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<500)
+    SELECT sum(DISTINCT v), total(DISTINCT v), avg(DISTINCT v)
+    FROM (SELECT CASE WHEN i%2=0 THEN 9223372036854770000-i ELSE -9223372036854770000+i END v FROM s);
+}
+expect {
+    -250|-250.0|-0.5
+}
+
+# A DISTINCT value must keep its JSON subtype after a spill, so the elements are
+# arrays and not JSON strings.
+test distinct-spilled-json-group-array-keeps-subtype {
+    WITH RECURSIVE s(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<500)
+    SELECT length(json_group_array(DISTINCT json_array(i))) FROM s;
+}
+expect {
+    2893
+}
+
+# Two large values spill at once: the second element must still be an array.
+test distinct-spilled-json-group-array-large-values {
+    WITH t(x) AS (VALUES(1),(2))
+    SELECT json_type(json_group_array(DISTINCT json_array(printf('%016000d',x))), '$[1]') FROM t;
+}
+expect {
+    array
+}

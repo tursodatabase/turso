@@ -1704,15 +1704,7 @@ struct GraceState {
     load_state: GracePartitionLoadState,
 }
 
-/// Selects how one aggregate handles its DISTINCT values.
-enum AggregateDistinctMode {
-    /// Return saved values to SUM, AVG, or another aggregate.
-    ReturnValues,
-    /// Count saved values, with a bitmap for close integer values.
-    Count { bitmap: CountDistinctBitmap },
-}
-
-/// Keeps the work needed to finish one aggregate DISTINCT operation.
+/// Keeps the work needed to finish one COUNT(DISTINCT) operation.
 struct AggregateDistinctState {
     /// Next entry to read from the current spill part.
     next_entry: usize,
@@ -1724,56 +1716,21 @@ struct AggregateDistinctState {
     write_each_row_to_parts: bool,
     /// Number of saved values counted before an I/O wait.
     saved_value_count: u64,
-    /// Work mode for this aggregate.
-    mode: AggregateDistinctMode,
+    /// Bitmap for close integer values.
+    bitmap: CountDistinctBitmap,
 }
 
 impl AggregateDistinctState {
-    /// Make state for an aggregate that must receive each saved value.
-    fn for_values(initial_slots: usize) -> Result<Self> {
-        Ok(Self {
-            next_entry: 0,
-            current_values: DistinctValueSet::new(initial_slots)?,
-            rows_in_current_set: 0,
-            write_each_row_to_parts: false,
-            saved_value_count: 0,
-            mode: AggregateDistinctMode::ReturnValues,
-        })
-    }
-
     /// Make state for COUNT(DISTINCT), including its integer bitmap.
-    fn for_count(initial_slots: usize) -> Result<Self> {
+    fn new(initial_slots: usize) -> Result<Self> {
         Ok(Self {
             next_entry: 0,
             current_values: DistinctValueSet::new(initial_slots)?,
             rows_in_current_set: 0,
             write_each_row_to_parts: false,
             saved_value_count: 0,
-            mode: AggregateDistinctMode::Count {
-                bitmap: CountDistinctBitmap::new(),
-            },
+            bitmap: CountDistinctBitmap::new(),
         })
-    }
-
-    /// Return true when this state belongs to COUNT(DISTINCT).
-    const fn is_count(&self) -> bool {
-        matches!(self.mode, AggregateDistinctMode::Count { .. })
-    }
-
-    /// Return the integer bitmap for COUNT(DISTINCT).
-    fn count_bitmap(&self) -> &CountDistinctBitmap {
-        let AggregateDistinctMode::Count { bitmap } = &self.mode else {
-            unreachable!("COUNT bitmap requested from a value DISTINCT table")
-        };
-        bitmap
-    }
-
-    /// Return the integer bitmap so a new value can be added.
-    fn count_bitmap_mut(&mut self) -> &mut CountDistinctBitmap {
-        let AggregateDistinctMode::Count { bitmap } = &mut self.mode else {
-            unreachable!("COUNT bitmap requested from a value DISTINCT table")
-        };
-        bitmap
     }
 }
 
@@ -2145,33 +2102,6 @@ impl HashTable {
         self.insert_select_distinct(key_values, key_refs, metrics)
     }
 
-    /// Add one value for SUM(DISTINCT), AVG(DISTINCT), or a similar aggregate.
-    ///
-    /// Before the first spill, a new value goes to the aggregate at once. After
-    /// a spill, values are saved in small sets. `next_saved_distinct_value`
-    /// returns them after all input rows have been read. This keeps disk reads
-    /// out of the input loop.
-    pub fn insert_aggregate_distinct(
-        &mut self,
-        key_values: &[Value],
-        key_refs: &[ValueRef],
-        metrics: Option<&mut HashJoinMetrics>,
-    ) -> IOResultOr<bool> {
-        if self.aggregate_distinct.is_none() {
-            self.aggregate_distinct =
-                Some(AggregateDistinctState::for_values(self.initial_buckets)?);
-        }
-        turso_assert!(
-            !self
-                .aggregate_distinct
-                .as_ref()
-                .expect("aggregate DISTINCT state exists")
-                .is_count(),
-            "value DISTINCT and COUNT DISTINCT cannot share a hash table"
-        );
-        self.insert_aggregate_distinct_value(key_values, key_refs, metrics)
-    }
-
     /// Add one value for COUNT(DISTINCT).
     ///
     /// Exact integer values use a bitmap with a fixed memory limit. Other values
@@ -2187,16 +2117,8 @@ impl HashTable {
             "COUNT(DISTINCT) has one key"
         );
         if self.aggregate_distinct.is_none() {
-            self.aggregate_distinct =
-                Some(AggregateDistinctState::for_count(self.initial_buckets)?);
+            self.aggregate_distinct = Some(AggregateDistinctState::new(self.initial_buckets)?);
         }
-        turso_assert!(
-            self.aggregate_distinct
-                .as_ref()
-                .expect("aggregate DISTINCT state exists")
-                .is_count(),
-            "value DISTINCT and COUNT DISTINCT cannot share a hash table"
-        );
 
         if matches!(key_refs[0], ValueRef::Null) {
             return Ok(IOResult::Done(false));
@@ -2226,7 +2148,7 @@ impl HashTable {
             .aggregate_distinct
             .as_ref()
             .expect("aggregate DISTINCT state exists")
-            .count_bitmap()
+            .bitmap
             .memory_bytes();
         turso_assert!(
             self.mem_used >= old_bitmap_bytes,
@@ -2244,13 +2166,13 @@ impl HashTable {
             .aggregate_distinct
             .as_mut()
             .expect("aggregate DISTINCT state exists")
-            .count_bitmap_mut()
+            .bitmap
             .insert(value, bitmap_limit)?;
         let new_bitmap_bytes = self
             .aggregate_distinct
             .as_ref()
             .expect("aggregate DISTINCT state exists")
-            .count_bitmap()
+            .bitmap
             .memory_bytes();
         self.mem_used = other_mem.saturating_add(new_bitmap_bytes);
         if matches!(result, BitmapInsertResult::Stored { is_new: true }) {
@@ -2348,18 +2270,12 @@ impl HashTable {
             return self.save_distinct_value_in_spill_part(hash, key_values, metrics);
         }
 
-        let sent_now = self.spill_state.is_none()
-            && !self
-                .aggregate_distinct
-                .as_ref()
-                .expect("aggregate DISTINCT state exists")
-                .is_count();
-        let kind = if sent_now {
-            HashEntryKind::DistinctSent
-        } else {
-            HashEntryKind::DistinctWaiting
-        };
-        let entry = HashEntry::new_distinct(hash, key_values.iter().cloned().try_collect()?, kind);
+        // COUNT adds every saved value at the end, so the entry waits.
+        let entry = HashEntry::new_distinct(
+            hash,
+            key_values.iter().cloned().try_collect()?,
+            HashEntryKind::DistinctWaiting,
+        );
         self.aggregate_distinct
             .as_mut()
             .expect("aggregate DISTINCT state exists")
@@ -2371,7 +2287,7 @@ impl HashTable {
             .rows_in_current_set += 1;
         self.num_entries += 1;
         self.mem_used += entry_size;
-        Ok(IOResult::Done(sent_now))
+        Ok(IOResult::Done(false))
     }
 
     /// Save one value in its spill part without first checking the local set.
@@ -3375,8 +3291,8 @@ impl HashTable {
         Ok(IOResult::Done(()))
     }
 
-    /// Return the next saved DISTINCT value that its aggregate has not seen.
-    pub fn next_saved_distinct_value(
+    /// Return the next saved DISTINCT value that COUNT has not seen.
+    fn next_saved_distinct_value(
         &mut self,
         mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<Option<Value>>> {
@@ -3512,21 +3428,13 @@ impl HashTable {
             return_if_io!(self.finalize_build(metrics.as_deref_mut()));
         }
 
-        let count_mode = self
+        let bitmap_count = self
             .aggregate_distinct
             .as_ref()
             .expect("aggregate DISTINCT state exists")
-            .is_count();
-        let bitmap_count = if count_mode {
-            self.aggregate_distinct
-                .as_ref()
-                .expect("aggregate DISTINCT state exists")
-                .count_bitmap()
-                .count()
-        } else {
-            0
-        };
-        if count_mode && self.spill_state.is_none() {
+            .bitmap
+            .count();
+        if self.spill_state.is_none() {
             let saved_count = self
                 .aggregate_distinct
                 .as_ref()
@@ -5204,7 +5112,7 @@ mod hashtests {
     }
 
     #[test]
-    fn aggregate_distinct_does_not_read_spill_files_while_rows_are_added() {
+    fn count_distinct_does_not_read_spill_files_while_rows_are_added() {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -5217,20 +5125,18 @@ mod hashtests {
         };
         let mut hash_table = HashTable::new(config, io).unwrap();
         let mut metrics = HashJoinMetrics::default();
-        let mut sent_to_aggregate = std::collections::BTreeSet::new();
+        let mut sent_to_aggregate = 0u64;
 
         for value in (0..400).chain(0..400).chain(200..600) {
-            let key = vec![Value::from_i64(value)];
+            let key = vec![Value::build_text(format!("value {value}"))];
             let key_refs = vec![key[0].as_ref()];
             loop {
                 match hash_table
-                    .insert_aggregate_distinct(&key, &key_refs, Some(&mut metrics))
+                    .insert_count_distinct(&key, &key_refs, Some(&mut metrics))
                     .unwrap()
                 {
                     IOResult::Done(send_now) => {
-                        if send_now {
-                            sent_to_aggregate.insert(value);
-                        }
+                        sent_to_aggregate += u64::from(send_now);
                         assert!(hash_table.mem_used <= hash_table.mem_budget);
                         break;
                     }
@@ -5250,33 +5156,21 @@ mod hashtests {
             "mostly new input must write each row to its spill part"
         );
 
-        let mut read_after_spill = std::collections::BTreeSet::new();
-        loop {
+        let saved_value_count = loop {
             match hash_table
-                .next_saved_distinct_value(Some(&mut metrics))
+                .count_saved_distinct_values(Some(&mut metrics))
                 .unwrap()
             {
-                IOResult::Done(Some(Value::Numeric(Numeric::Integer(value)))) => {
-                    assert!(read_after_spill.insert(value), "saved value returned twice");
-                    assert!(
-                        hash_table.mem_used + hash_table.loaded_partitions_mem
-                            <= hash_table.mem_budget
-                    );
-                }
-                IOResult::Done(Some(value)) => panic!("wrong saved value: {value:?}"),
-                IOResult::Done(None) => break,
+                IOResult::Done(count) => break count,
                 IOResult::IO(_) => continue,
             }
-        }
-
+        };
         assert!(metrics.load_bytes_read > 0);
-        assert!(sent_to_aggregate.is_disjoint(&read_after_spill));
-        sent_to_aggregate.append(&mut read_after_spill);
-        assert_eq!(sent_to_aggregate, (0..600).collect());
+        assert_eq!(sent_to_aggregate + saved_value_count, 600);
     }
 
     #[test]
-    fn aggregate_distinct_keeps_a_local_set_when_rows_repeat() {
+    fn count_distinct_keeps_a_local_set_when_rows_repeat() {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -5292,11 +5186,11 @@ mod hashtests {
 
         for value in 0..200 {
             for _ in 0..2 {
-                let key = vec![Value::from_i64(value)];
+                let key = vec![Value::build_text(format!("value {value}"))];
                 let key_refs = [key[0].as_ref()];
                 loop {
                     match hash_table
-                        .insert_aggregate_distinct(&key, &key_refs, None)
+                        .insert_count_distinct(&key, &key_refs, None)
                         .unwrap()
                     {
                         IOResult::Done(send_now) => {
@@ -5446,11 +5340,11 @@ mod hashtests {
         let IOResult::Done(count) = hash_table.count_saved_distinct_values(None).unwrap() else {
             panic!("integer bitmap final count must not perform I/O");
         };
-        let bitmap = hash_table
+        let bitmap = &hash_table
             .aggregate_distinct
             .as_ref()
             .expect("aggregate DISTINCT state exists")
-            .count_bitmap();
+            .bitmap;
         assert_eq!(count, 100_000);
         assert_eq!(bitmap.count(), 100_000);
         assert!(!bitmap.stopped_growing());
@@ -5515,11 +5409,11 @@ mod hashtests {
                 IOResult::IO(_) => continue,
             }
         };
-        let bitmap = hash_table
+        let bitmap = &hash_table
             .aggregate_distinct
             .as_ref()
             .expect("aggregate DISTINCT state exists")
-            .count_bitmap();
+            .bitmap;
         assert_eq!(bitmap.count(), 201);
         assert!(bitmap.stopped_growing());
         assert_eq!(count, 404);
@@ -5528,7 +5422,7 @@ mod hashtests {
 
     #[cfg(feature = "io_memory_yield")]
     #[test]
-    fn aggregate_distinct_resumes_every_spill_read_and_write() {
+    fn count_distinct_values_resume_every_spill_read_and_write() {
         let io = Arc::new(MemoryYieldIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -5545,11 +5439,11 @@ mod hashtests {
         let mut io_waits = 0;
 
         for value in (0..300).chain(0..300) {
-            let key = vec![Value::from_i64(value)];
+            let key = vec![Value::build_text(format!("value {value}"))];
             let key_refs = [key[0].as_ref()];
             loop {
                 match hash_table
-                    .insert_aggregate_distinct(&key, &key_refs, None)
+                    .insert_count_distinct(&key, &key_refs, None)
                     .unwrap()
                 {
                     IOResult::Done(send_now) => {
@@ -5633,7 +5527,7 @@ mod hashtests {
     }
 
     #[test]
-    fn aggregate_distinct_merges_null_numbers_text_and_blob_after_spill() {
+    fn count_distinct_merges_null_numbers_text_and_blob_after_spill() {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -5661,7 +5555,7 @@ mod hashtests {
                 let key_refs = vec![key[0].as_ref()];
                 loop {
                     match hash_table
-                        .insert_aggregate_distinct(&key, &key_refs, None)
+                        .insert_count_distinct(&key, &key_refs, None)
                         .unwrap()
                     {
                         IOResult::Done(send_now) => {
@@ -5675,13 +5569,16 @@ mod hashtests {
         }
 
         loop {
-            match hash_table.next_saved_distinct_value(None).unwrap() {
-                IOResult::Done(Some(_)) => count += 1,
-                IOResult::Done(None) => break,
+            match hash_table.count_saved_distinct_values(None).unwrap() {
+                IOResult::Done(saved) => {
+                    count += saved as usize;
+                    break;
+                }
                 IOResult::IO(_) => continue,
             }
         }
-        assert_eq!(count, 4);
+        // NULL is not counted; 10 and 10.0 are one value, as are Hello and hello.
+        assert_eq!(count, 3);
     }
 
     #[test]

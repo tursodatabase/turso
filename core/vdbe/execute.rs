@@ -17724,12 +17724,6 @@ pub fn op_hash_distinct(
             &key_refs,
             Some(&mut state.metrics.hash_join),
         )?
-    } else if data.save_after_spill {
-        hash_table.insert_aggregate_distinct(
-            key_values,
-            &key_refs,
-            Some(&mut state.metrics.hash_join),
-        )?
     } else {
         hash_table.insert_distinct(key_values, &key_refs, Some(&mut state.metrics.hash_join))?
     };
@@ -17741,40 +17735,6 @@ pub fn op_hash_distinct(
             } else {
                 data.target_pc.as_offset_int()
             };
-            Ok(InsnFunctionStepResult::Step)
-        }
-        IOResult::IO(io) => Ok(state.suspend_on_io(io)),
-    }
-}
-
-/// Run `HashDistinctNext` and wait safely when the next spill read needs I/O.
-pub fn op_hash_distinct_next(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        HashDistinctNext {
-            hash_table_id,
-            dest_reg,
-            target_pc
-        },
-        insn
-    );
-    let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) else {
-        state.pc = target_pc.as_offset_int();
-        return Ok(InsnFunctionStepResult::Step);
-    };
-
-    match hash_table.next_saved_distinct_value(Some(&mut state.metrics.hash_join))? {
-        IOResult::Done(Some(value)) => {
-            state.registers[*dest_reg].set_value(value);
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
-        IOResult::Done(None) => {
-            state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
         IOResult::IO(io) => Ok(state.suspend_on_io(io)),

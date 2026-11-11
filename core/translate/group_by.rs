@@ -1062,13 +1062,7 @@ pub fn group_by_emit_row_phase<'a>(
         let agg_start_reg = t_ctx
             .reg_agg_start
             .expect("aggregate registers must be initialized");
-        emit_saved_distinct_aggregate_steps(
-            program,
-            &plan.table_references,
-            &plan.aggregates,
-            agg_start_reg,
-            &t_ctx.resolver,
-        )?;
+        emit_saved_distinct_aggregate_steps(program, &plan.aggregates, agg_start_reg);
     }
     // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
