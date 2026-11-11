@@ -1519,7 +1519,7 @@ impl Connection {
         // with a new clean schema that has the same header cookie.
         self.install_schema_keeping_catalogs(&fresh)?;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1821,11 +1821,12 @@ impl Connection {
     }
 
     /// Prepares a read of an engine table that holds state the schema is
-    /// built from: the roles, or the dialect's own schema state. The table
-    /// belongs to the engine, so its name is looked up in every database,
-    /// whatever the search path says. The read is a top-level statement, so
-    /// it runs in its own read transaction when the schema is read outside
-    /// a transaction.
+    /// built from: the schema table, the roles, or the dialect's own schema
+    /// state. The table belongs to the engine, so its name is looked up in
+    /// every database, whatever the search path says, and no role's
+    /// privileges limit the read. The read is a top-level statement, so it
+    /// runs in its own read transaction when the schema is read outside a
+    /// transaction.
     pub(crate) fn prepare_engine_metadata_read(
         self: &Arc<Connection>,
         sql: &str,
@@ -3089,9 +3090,7 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            let mut rows = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();

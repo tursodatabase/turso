@@ -653,3 +653,45 @@ fn a_catalog_made_before_relrowsecurity_opens_read_only_without_the_column() {
         .to_string();
     assert!(error.contains("readonly"), "{error}");
 }
+
+/// A table without a class row is one the engine made for itself. Nobody
+/// granted a role anything on it.
+#[test]
+fn a_table_without_a_class_row_is_only_readable_by_superusers() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.inner()
+        .prepare_engine_schema_statement("CREATE TABLE engine_state (x INTEGER)")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SELECT x FROM pg_catalog.engine_state")
+        .unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+    let error = conn
+        .execute("SELECT x FROM pg_catalog.engine_state")
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "permission denied for table engine_state"
+    );
+}
+
+/// Reading the schema again scans `sqlite_schema`, which has no class row.
+/// The scan is the engine's, so the role that is set does not limit it.
+#[test]
+fn schema_is_read_again_while_a_role_is_set() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("GRANT SELECT ON t TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+
+    conn.execute("SELECT x FROM t").unwrap();
+}
