@@ -688,7 +688,8 @@ impl TursoMcpServer {
                                     "NULL"
                                 },
                                 default_str,
-                                if matches!(pk, DbValue::Numeric(Numeric::Integer(1))) {
+                                if matches!(pk, DbValue::Numeric(Numeric::Integer(position)) if *position > 0)
+                                {
                                     "PRIMARY KEY"
                                 } else {
                                     ""
@@ -1139,6 +1140,22 @@ mod tests {
         assert_eq!(
             server.describe_table(&Some(json!({ "table_name": "plain" }))),
             Ok("Table 'plain' columns:\ny TEXT NULL".to_string())
+        );
+    }
+
+    #[test]
+    fn describe_table_marks_every_column_of_a_composite_primary_key() {
+        let server = memory_server();
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, c TEXT, PRIMARY KEY (a, b))")
+            .unwrap();
+
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "t" }))),
+            Ok(
+                "Table 't' columns:\na INTEGER NULL  PRIMARY KEY\nb INTEGER NULL  PRIMARY KEY\nc TEXT NULL"
+                    .to_string()
+            )
         );
     }
 }
