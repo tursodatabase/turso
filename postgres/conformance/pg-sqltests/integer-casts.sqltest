@@ -1,0 +1,172 @@
+@database :memory:
+
+test cast-prefixed-text-to-integer {
+    SELECT '0x10'::int8;
+    SELECT '0o17'::int4;
+    SELECT '0b1010'::int2;
+}
+expect {
+    16
+    15
+    10
+}
+
+test cast-runtime-text-to-integer {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('0x10'), ('0o17'), ('0b1010');
+    SELECT value::int8 FROM integer_cast_values ORDER BY value;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    10
+    15
+    16
+}
+
+test cast-runtime-text-to-all-integer-types {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('123'), ('456'), ('789');
+
+    SELECT value::int2 FROM integer_cast_values ORDER BY value;
+    SELECT value::int4 FROM integer_cast_values ORDER BY value;
+    SELECT value::int8 FROM integer_cast_values ORDER BY value;
+
+    DROP TABLE integer_cast_values;
+}
+expect {
+    123
+    456
+    789
+    123
+    456
+    789
+    123
+    456
+    789
+}
+
+test cast-runtime-prefixed-text-to-all-integer-types {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('0x10'), ('0o17'), ('0b1010');
+
+    SELECT value::int2 FROM integer_cast_values ORDER BY value;
+    SELECT value::int4 FROM integer_cast_values ORDER BY value;
+    SELECT value::int8 FROM integer_cast_values ORDER BY value;
+
+    DROP TABLE integer_cast_values;
+}
+expect {
+    10
+    15
+    16
+    10
+    15
+    16
+    10
+    15
+    16
+}
+
+test cast-function-style-integer {
+    SELECT int2('123');
+    SELECT int4('456');
+    SELECT int8('789');
+}
+expect {
+    123
+    456
+    789
+}
+
+test cast-integer-range-boundaries {
+    SELECT '32767'::int2;
+    SELECT '-32768'::int2;
+    SELECT '2147483647'::int4;
+    SELECT '-2147483648'::int4;
+    SELECT '9223372036854775807'::int8;
+    SELECT '-9223372036854775808'::int8;
+}
+expect {
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
+}
+
+test cast-prefixed-integer-range-boundaries {
+    SELECT '0x7fff'::int2;
+    SELECT '0x7fffffff'::int4;
+    SELECT '0x7fffffffffffffff'::int8;
+}
+expect {
+    32767
+    2147483647
+    9223372036854775807
+}
+
+test cast-int2-positive-decimal-overflow {
+    SELECT '32768'::int2;
+}
+expect error {
+}
+
+test cast-int2-negative-decimal-overflow {
+    SELECT '-32769'::int2;
+}
+expect error {
+}
+
+test cast-int2-positive-hex-overflow {
+    SELECT '0x8000'::int2;
+}
+expect error {
+}
+
+test cast-int4-positive-decimal-overflow {
+    SELECT '2147483648'::int4;
+}
+expect error {
+}
+
+test cast-int4-negative-decimal-overflow {
+    SELECT '-2147483649'::int4;
+}
+expect error {
+}
+
+test cast-int4-positive-hex-overflow {
+    SELECT '0x80000000'::int4;
+}
+expect error {
+}
+
+test cast-int8-positive-decimal-overflow {
+    SELECT '9223372036854775808'::int8;
+}
+expect error {
+}
+
+test cast-int8-negative-decimal-overflow {
+    SELECT '-9223372036854775809'::int8;
+}
+expect error {
+}
+
+test cast-int8-positive-hex-overflow {
+    SELECT '0x8000000000000000'::int8;
+}
+expect error {
+}
+
+test cast-runtime-text-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('32768');
+
+    SELECT value::int2 FROM integer_cast_values;
+
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
