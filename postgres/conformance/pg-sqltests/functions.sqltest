@@ -370,6 +370,17 @@ expect {
     null
 }
 
+test pg-encoding-to-char-booleq-and-boolne-return-null-for-a-null-argument {
+    SELECT CASE WHEN pg_encoding_to_char(NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN booleq(NULL, true) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN boolne(true, NULL) IS NULL THEN 'null' ELSE 'not null' END;
+}
+expect {
+    null
+    null
+    null
+}
+
 test to-char-integer-format-errors {
     SELECT to_char(1, 5);
 }

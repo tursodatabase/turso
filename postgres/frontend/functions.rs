@@ -70,7 +70,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true
         ) => oid_arg(args, 0)?.map(exec_pg_is_visible),
-        "pg_encoding_to_char"(FunctionArity::Exact(1), true) => {
+        "pg_encoding_to_char"(FunctionArity::Exact(1), true, strict) => {
             exec_pg_encoding_to_char(int_arg(args, 0, 0))
         },
         "pg_get_function_result"
@@ -110,8 +110,8 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true, strict) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true, strict) => exec_similar_to_escape(args)?,
-        "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
-        "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
+        "booleq"(FunctionArity::Exact(2), true, strict) => Boolean(args[0].get_value() == args[1].get_value()),
+        "boolne"(FunctionArity::Exact(2), true, strict) => Boolean(args[0].get_value() != args[1].get_value()),
         "col_description"(FunctionArity::Exact(2), true) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
         "current_setting"(FunctionArity::OneOf(&[1, 2]), false, strict) => {
