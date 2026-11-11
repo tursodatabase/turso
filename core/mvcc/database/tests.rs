@@ -5494,6 +5494,34 @@ fn test_checkpoint_empties_mv_store_after_interrupted_checkpoint() {
     assert_eq!(rows[0][1].as_int().unwrap(), 10);
 }
 
+/// A pager reader at an older WAL position than the checkpoint cannot find the checkpointed
+/// rows in the B-tree. The checkpoint must not clear the MV store while that reader exists.
+#[test]
+fn test_checkpoint_keeps_row_versions_for_reader_at_older_wal_position() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let reader = db.connect();
+    reader.pager.load().begin_read_tx().unwrap();
+
+    writer.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let result = writer.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(matches!(result, Err(LimboError::Busy)), "{result:?}");
+
+    let rows = get_rows(&reader, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+}
+
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
