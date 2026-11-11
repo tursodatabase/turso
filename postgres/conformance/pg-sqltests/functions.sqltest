@@ -351,6 +351,41 @@ expect {
     invalid
 }
 
+test strict-functions-return-null-for-a-null-argument {
+    CREATE TABLE formats (f text);
+    INSERT INTO formats VALUES (NULL);
+    SELECT CASE WHEN to_char(1, NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN to_char(NULL::integer, '999') IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN to_char(1, f) IS NULL THEN 'null' ELSE 'not null' END FROM formats;
+    SELECT CASE WHEN pg_input_is_valid('1', NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN pg_input_is_valid(NULL, 'int4') IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN pg_input_is_valid('1', f) IS NULL THEN 'null' ELSE 'not null' END FROM formats;
+}
+expect {
+    null
+    null
+    null
+    null
+    null
+    null
+}
+
+test to-char-integer-format-errors {
+    SELECT to_char(1, 5);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, integer\) does not exist
+}
+
+test pg-input-is-valid-integer-type-name-errors {
+    SELECT pg_input_is_valid('1', 5);
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(.*, integer\) does not exist
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }

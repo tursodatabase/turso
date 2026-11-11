@@ -96,12 +96,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
         "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
-        "to_char"(FunctionArity::Exact(2), true) => {
-            exec_to_char(args[0].get_value(), &text_arg(args, 1))
+        "to_char"(FunctionArity::Exact(2), true, strict) => {
+            exec_to_char(args[0].get_value(), typed_text_arg("to_char", args, 1)?)
         },
         "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
-        "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
-            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
+        "pg_input_is_valid"(FunctionArity::Exact(2), true, strict) => {
+            exec_pg_input_is_valid(args[0].get_value(), typed_text_arg("pg_input_is_valid", args, 1)?)
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -1040,7 +1040,6 @@ fn format_type(type_oid: i64, typemod: i64) -> String {
 /// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
 fn exec_to_char(value: &Value, format: &str) -> Option<String> {
     let num = match value {
-        Value::Null => return None,
         Value::Numeric(_) => value.as_float(),
         Value::Text(t) => t.as_str().parse::<f64>().ok()?,
         _ => return None,
@@ -1167,13 +1166,27 @@ fn format_interval(months: i64, days: i64, micros: i64) -> String {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
+fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Boolean {
     let s = match input {
         Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return None,
         v => v.to_string(),
     };
-    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
+    Boolean(validate_pg_input(&s, type_name).is_none())
+}
+
+/// The text argument at `i`. Any other type gets PostgreSQL's error for a
+/// call that matches no declared argument types.
+fn typed_text_arg<'a>(function: &str, args: &'a [Register], i: usize) -> Result<&'a str> {
+    match args[i].get_value() {
+        Value::Text(text) => Ok(text.as_str()),
+        _ => {
+            let arg_types: Vec<_> = args
+                .iter()
+                .map(|arg| pg_type_name(arg.get_value()))
+                .collect();
+            Err(undefined_function(function, &arg_types))
+        }
+    }
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
