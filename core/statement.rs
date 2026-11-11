@@ -2177,6 +2177,59 @@ mod tests {
         );
     }
 
+    /// A build far larger than the memory budget leaves every grace partition over
+    /// it, so grace re-splits them. A LEFT JOIN must return what the same join
+    /// returns when nothing spills. (The planner does not hash FULL OUTER joins.)
+    #[test]
+    fn test_outer_hash_join_with_oversized_partitions_matches_unspilled() {
+        let conn = open_test_connection().unwrap();
+        for sql in [
+            "CREATE TABLE l(k INT, a INT)",
+            "CREATE TABLE r(k INT, b INT)",
+            "INSERT INTO l SELECT value, value FROM generate_series(1, 20000)",
+            "INSERT INTO r SELECT value * 2, value FROM generate_series(1, 20000)",
+            "INSERT INTO r SELECT value * 4, -value FROM generate_series(1, 2000)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        for join in ["LEFT JOIN"] {
+            let sql = format!("SELECT l.k, l.a, r.k, r.b FROM l {join} r ON l.k = r.k");
+            let run = |mem_budget: usize| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let mut hash_builds = 0;
+                for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
+                    if let vdbe::insn::Insn::HashBuild { data } = insn {
+                        data.mem_budget = mem_budget;
+                        hash_builds += 1;
+                    }
+                }
+                assert!(hash_builds >= 1, "{sql} must use a hash join");
+                let mut rows: Vec<String> = stmt
+                    .run_collect_rows()
+                    .unwrap()
+                    .iter()
+                    .map(|row| format!("{row:?}"))
+                    .collect();
+                rows.sort();
+                (rows, stmt.metrics().hash_join)
+            };
+
+            let (expected, unspilled) = run(usize::MAX);
+            assert_eq!(unspilled.spill_chunks, 0, "{sql}: {unspilled:?}");
+            let (rows, metrics) = run(16 * 1024);
+            assert!(metrics.spill_chunks > 0, "{sql}: build did not spill");
+            assert!(
+                metrics.grace_partitions_split > 0,
+                "{sql}: no partition was re-split: {metrics:?}"
+            );
+            assert_eq!(rows.len(), expected.len(), "{sql}");
+            assert!(
+                rows == expected,
+                "{sql}: rows differ from the unspilled join"
+            );
+        }
+    }
+
     #[test]
     fn test_expanded_sql() {
         let conn = open_test_connection().unwrap();

@@ -4663,6 +4663,7 @@ mod hashtests {
                 .try_collect()
                 .unwrap(),
             distinct_key_read: None,
+            next_sub_partition_id: partitioning.count,
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -4718,6 +4719,7 @@ mod hashtests {
                 .try_collect()
                 .unwrap(),
             distinct_key_read: None,
+            next_sub_partition_id: partitioning.count,
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -6186,5 +6188,362 @@ mod hashtests {
         expected_unmatched.sort_unstable();
         actual_unmatched.sort_unstable();
         assert_eq!(actual_unmatched, expected_unmatched);
+    }
+
+    // ── Grace re-split of oversized partitions ─────────────────────
+
+    /// Added to a key to make the rowid of its probe row.
+    const PROBE_ROWID_BASE: i64 = 1_000_000;
+
+    /// A spilled hash table with 16 partitions over int keys, given as
+    /// (rowid, key).
+    fn make_partitioned_ht(
+        mem_budget: usize,
+        track_matched: bool,
+        rows: impl Iterator<Item = (i64, i64)>,
+    ) -> HashTable {
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget,
+            num_keys: 1,
+            collations: vec![CollationSeq::BINARY],
+            temp_store: crate::TempStore::Default,
+            track_matched,
+            partition_count: Some(16),
+        };
+        let mut ht = HashTable::new(config, Arc::new(MemoryIO::new())).unwrap();
+        for (rowid, key) in rows {
+            let inserted = ht
+                .insert(vec![Value::from_i64(key)], rowid, vec![], None)
+                .unwrap();
+            assert!(matches!(inserted, IOResult::Done(())));
+        }
+        let _ = ht.finalize_build(None).unwrap();
+        assert!(ht.has_spilled(), "should have spilled");
+        ht
+    }
+
+    /// Buffer a probe row for every key whose build partition is on disk, like the
+    /// main probe loop does. Returns those keys.
+    fn buffer_probe_rows(ht: &mut HashTable, keys: impl Iterator<Item = i64>) -> Vec<i64> {
+        let mut buffered = vec![];
+        for key in keys {
+            let values = vec![Value::from_i64(key)];
+            let partition_idx = ht.partition_for_keys(&values).unwrap();
+            if !ht.is_partition_loaded(partition_idx) {
+                let _ = ht
+                    .buffer_probe_row(values, key + PROBE_ROWID_BASE, None)
+                    .unwrap();
+                buffered.push(key);
+            }
+        }
+        buffered
+    }
+
+    /// Whether a top-level partition has been replaced by sub-partitions.
+    fn has_subpartitions(ht: &HashTable) -> bool {
+        let spill_state = ht.spill_state.as_ref().expect("spill state");
+        spill_state
+            .partitions
+            .iter()
+            .any(|p| p.partition_idx >= spill_state.partitioning.count)
+    }
+
+    /// Memory of a loaded partition: its entries and its bucket array.
+    fn loaded_partition_mem(ht: &HashTable, partition_idx: usize) -> usize {
+        let partition = ht
+            .spill_state
+            .as_ref()
+            .expect("spill state")
+            .find_partition(partition_idx)
+            .expect("partition");
+        partition.buckets.len() * std::mem::size_of::<HashBucket>()
+            + HashTable::partition_bucket_mem(&partition.buckets)
+    }
+
+    struct GraceRun {
+        /// (build rowid, probe rowid) of every match.
+        matches: Vec<(i64, i64)>,
+        /// Probe rows grace handed out.
+        probe_rows: usize,
+        /// Build rowids of the unmatched scan of every partition, in order.
+        unmatched: Vec<i64>,
+        /// Largest memory of a partition while it was the loaded grace partition.
+        max_loaded_mem: usize,
+        /// Partitions grace went through, sub-partitions included.
+        partitions: usize,
+    }
+
+    /// Run grace the way the VDBE does: the probe uses the partition grace is
+    /// processing, and the unmatched scan of each partition follows its probes.
+    fn drive_grace(ht: &mut HashTable, track_matched: bool) -> GraceRun {
+        let _ = ht.finalize_probe_spill(None).unwrap();
+        let mut run = GraceRun {
+            matches: vec![],
+            probe_rows: 0,
+            unmatched: vec![],
+            max_loaded_mem: 0,
+            partitions: 0,
+        };
+        if !ht.grace_begin().unwrap() {
+            return run;
+        }
+        loop {
+            match ht.grace_load_current_partition(None).unwrap() {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => break,
+                _ => panic!("unexpected IO"),
+            }
+            run.partitions += 1;
+            assert!(run.partitions < 10_000, "grace does not terminate");
+            let partition_idx = current_grace_partition(ht);
+            run.max_loaded_mem = run
+                .max_loaded_mem
+                .max(loaded_partition_mem(ht, partition_idx));
+
+            loop {
+                let entry = match ht.grace_next_probe_entry().unwrap() {
+                    IOResult::Done(entry) => entry,
+                    IOResult::IO(_) => panic!("unexpected IO"),
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                run.probe_rows += 1;
+                let first = ht
+                    .probe_partition(partition_idx, &entry.key_values, None)
+                    .unwrap()
+                    .map(|build_entry| build_entry.rowid);
+                let Some(mut rowid) = first else {
+                    continue;
+                };
+                loop {
+                    run.matches.push((rowid, entry.probe_rowid));
+                    if track_matched {
+                        ht.mark_current_matched();
+                    }
+                    match ht
+                        .next_match()
+                        .unwrap()
+                        .map(|build_entry| build_entry.rowid)
+                    {
+                        Some(next) => rowid = next,
+                        None => break,
+                    }
+                }
+            }
+
+            if track_matched {
+                ht.begin_unmatched_scan();
+                while let Some(entry) = ht.next_unmatched() {
+                    run.unmatched.push(entry.rowid);
+                }
+            }
+            if !ht.grace_advance_partition() {
+                break;
+            }
+        }
+        run
+    }
+
+    /// Every partition of a large build is far over the memory budget. Grace has to
+    /// split them instead of loading each whole.
+    #[test]
+    fn test_grace_resplits_partitions_over_budget() {
+        const KEYS: i64 = 32_000;
+        let mem_budget = 16 * 1024;
+        let mut ht = make_partitioned_ht(mem_budget, false, (0..KEYS).map(|k| (k, k)));
+        let buffered = buffer_probe_rows(&mut ht, 0..KEYS);
+
+        // The premise: each spilled partition is over the budget when loaded whole.
+        let spill_state = ht.spill_state.as_ref().expect("spill state");
+        for partition in spill_state
+            .partitions
+            .iter()
+            .filter(|p| !p.chunks.is_empty())
+        {
+            assert!(
+                partition.resident_estimate() > mem_budget,
+                "partition {} is not oversized",
+                partition.partition_idx
+            );
+        }
+
+        let run = drive_grace(&mut ht, false);
+
+        let mut expected: Vec<(i64, i64)> = buffered
+            .iter()
+            .map(|key| (*key, key + PROBE_ROWID_BASE))
+            .collect();
+        expected.sort_unstable();
+        let mut matches = run.matches.clone();
+        matches.sort_unstable();
+        assert_eq!(matches, expected, "every probe row matches its build row");
+        assert_eq!(run.probe_rows, buffered.len());
+        assert!(has_subpartitions(&ht), "no partition was re-split");
+        assert!(
+            run.max_loaded_mem <= mem_budget,
+            "a partition of {} bytes was loaded with a budget of {mem_budget}",
+            run.max_loaded_mem
+        );
+    }
+
+    /// Unmatched build rows of an outer join are reported once, from the
+    /// sub-partitions, after a re-split.
+    #[test]
+    fn test_grace_resplit_reports_unmatched_build_rows_once() {
+        const KEYS: i64 = 16_000;
+        let mem_budget = 16 * 1024;
+        let mut ht = make_partitioned_ht(mem_budget, true, (0..KEYS).map(|k| (k, k)));
+
+        // Only even keys are probed; the odd keys on disk stay unmatched.
+        let mut expected_unmatched: Vec<i64> = (0..KEYS)
+            .filter(|key| key % 2 == 1)
+            .filter(|key| {
+                let partition_idx = ht.partition_for_keys(&[Value::from_i64(*key)]).unwrap();
+                !ht.is_partition_loaded(partition_idx)
+            })
+            .collect();
+        expected_unmatched.sort_unstable();
+        let buffered = buffer_probe_rows(&mut ht, (0..KEYS).filter(|key| key % 2 == 0));
+
+        let run = drive_grace(&mut ht, true);
+
+        assert!(has_subpartitions(&ht), "no partition was re-split");
+        let mut matches = run.matches.clone();
+        matches.sort_unstable();
+        let mut expected_matches: Vec<(i64, i64)> = buffered
+            .iter()
+            .map(|key| (*key, key + PROBE_ROWID_BASE))
+            .collect();
+        expected_matches.sort_unstable();
+        assert_eq!(matches, expected_matches);
+        let mut unmatched = run.unmatched;
+        unmatched.sort_unstable();
+        assert_eq!(
+            unmatched, expected_unmatched,
+            "each unmatched build row is reported exactly once"
+        );
+    }
+
+    /// Many entries with one key cannot be separated by their hash. Splitting has
+    /// to stop, load the hot partition whole, and still find every match. Probe
+    /// rows whose sub-partition has no build rows are still handed out, as an
+    /// outer join needs them.
+    #[test]
+    fn test_grace_resplit_stops_on_skewed_partition() {
+        const HOT_KEY: i64 = 7;
+        const HOT_ROWS: i64 = 3_000;
+        let mem_budget = 16 * 1024;
+        let rows = (0..HOT_ROWS)
+            .map(|rowid| (rowid, HOT_KEY))
+            .chain((0..20).map(|i| (10_000 + i, 1_000 + i)));
+        let mut ht = make_partitioned_ht(mem_budget, false, rows);
+
+        let hot_partition = ht.partition_for_keys(&[Value::from_i64(HOT_KEY)]).unwrap();
+        assert!(!ht.is_partition_loaded(hot_partition));
+        // Probe the hot key, and keys that are not in the build but land in the
+        // hot partition.
+        let mut probe_keys = vec![HOT_KEY];
+        probe_keys.extend(
+            (100_000i64..)
+                .filter(|key| {
+                    ht.partition_for_keys(&[Value::from_i64(*key)]).unwrap() == hot_partition
+                })
+                .take(1_500),
+        );
+        let buffered = buffer_probe_rows(&mut ht, probe_keys.into_iter());
+        assert_eq!(buffered.len(), 1_501);
+
+        let run = drive_grace(&mut ht, false);
+
+        assert!(has_subpartitions(&ht), "the hot partition was not re-split");
+        assert!(
+            run.partitions < 100,
+            "too many partitions: {}",
+            run.partitions
+        );
+        assert_eq!(run.probe_rows, buffered.len());
+        let mut matches = run.matches;
+        matches.sort_unstable();
+        let expected: Vec<(i64, i64)> = (0..HOT_ROWS)
+            .map(|rowid| (rowid, HOT_KEY + PROBE_ROWID_BASE))
+            .collect();
+        assert_eq!(matches, expected);
+    }
+
+    /// Probe the same re-split build in several passes, each with different probe
+    /// rows. The build is split once: later passes route their probe rows to the
+    /// kept sub-partitions and do not write to the build temp file again.
+    fn check_resplit_across_probe_passes(track_matched: bool) {
+        const KEYS: i64 = 16_000;
+        const PASSES: i64 = 4;
+        let mem_budget = 16 * 1024;
+        let mut ht = make_partitioned_ht(mem_budget, track_matched, (0..KEYS).map(|k| (k, k)));
+        let keys_on_disk: Vec<i64> = (0..KEYS)
+            .filter(|key| {
+                let partition_idx = ht.partition_for_keys(&[Value::from_i64(*key)]).unwrap();
+                !ht.is_partition_loaded(partition_idx)
+            })
+            .collect();
+        let offset_before_grace = ht.spill_state.as_ref().unwrap().next_spill_offset;
+        let mut offset_after_first_pass = 0;
+
+        for pass in 0..PASSES {
+            if pass > 0 {
+                ht.begin_probe_pass();
+            }
+            // Pass n probes the keys that are n modulo PASSES.
+            let buffered = buffer_probe_rows(&mut ht, (0..KEYS).filter(|key| key % PASSES == pass));
+            let run = drive_grace(&mut ht, track_matched);
+
+            assert!(
+                has_subpartitions(&ht),
+                "pass {pass}: no partition was re-split"
+            );
+            let mut matches = run.matches.clone();
+            matches.sort_unstable();
+            let mut expected_matches: Vec<(i64, i64)> = buffered
+                .iter()
+                .map(|key| (*key, key + PROBE_ROWID_BASE))
+                .collect();
+            expected_matches.sort_unstable();
+            assert_eq!(matches, expected_matches, "pass {pass}");
+            assert_eq!(run.probe_rows, buffered.len(), "pass {pass}");
+            if track_matched {
+                let mut unmatched = run.unmatched.clone();
+                unmatched.sort_unstable();
+                let expected_unmatched: Vec<i64> = keys_on_disk
+                    .iter()
+                    .copied()
+                    .filter(|key| key % PASSES != pass)
+                    .collect();
+                assert_eq!(unmatched, expected_unmatched, "pass {pass}");
+            }
+
+            let offset = ht.spill_state.as_ref().unwrap().next_spill_offset;
+            if pass == 0 {
+                assert!(
+                    offset > offset_before_grace,
+                    "the first pass splits the build"
+                );
+                offset_after_first_pass = offset;
+            } else {
+                assert_eq!(
+                    offset, offset_after_first_pass,
+                    "pass {pass} wrote to the build temp file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_grace_resplit_build_is_split_once_across_probe_passes() {
+        check_resplit_across_probe_passes(false);
+    }
+
+    #[test]
+    fn test_grace_resplit_build_is_split_once_across_probe_passes_with_matched_tracking() {
+        check_resplit_across_probe_passes(true);
     }
 }
