@@ -46,10 +46,12 @@ use turso_core::{
 use turso_parser::ast;
 
 use turso_core::MAIN_DB_ID;
+use turso_pg_parser::sqlstate::SQLSTATE_INVALID_GRANT_OPERATION;
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
+use crate::error::sqlstate_error;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -733,6 +735,16 @@ pub(crate) fn translate_relation_changes(
                 else {
                     continue;
                 };
+                // `ON TABLE` may name a sequence, so USAGE is refused here,
+                // for a relation that is not one, as in PostgreSQL.
+                if class.relkind != RelationKind::Sequence
+                    && privileges.contains(&ast::Privilege::Usage)
+                {
+                    return Err(sqlstate_error(
+                        SQLSTATE_INVALID_GRANT_OPERATION,
+                        "invalid privilege type USAGE for table",
+                    ));
+                }
                 let owner = role_oid(class.relowner);
                 let mut acl = class
                     .relacl
@@ -752,12 +764,15 @@ pub(crate) fn translate_relation_changes(
                         PermissionDenied::privilege(Action::Read, relation_object(class)),
                     )));
                 }
+                // As in PostgreSQL, a GRANT that gives nothing on the
+                // relation, such as INSERT on a sequence, leaves its list
+                // as it is, even when it has none yet.
+                let granted = Privileges::granted_on(class.relkind, privileges);
+                if granted.is_empty() {
+                    continue;
+                }
                 for grantee in &grantees {
-                    acl.grant(
-                        *grantee,
-                        Privileges::granted_on(class.relkind, privileges),
-                        owner,
-                    );
+                    acl.grant(*grantee, granted, owner);
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;

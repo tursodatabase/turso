@@ -1544,6 +1544,9 @@ pub enum RoleSpec {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Grant {
     pub privileges: Vec<Privilege>,
+    /// Whether the statement grants on `SEQUENCE`s rather than on tables,
+    /// which names any relation.
+    pub on_sequences: bool,
     pub relations: Vec<QualifiedName>,
     pub grantees: Vec<Grantee>,
 }
@@ -1560,6 +1563,7 @@ pub enum Privilege {
     References,
     Trigger,
     Maintain,
+    Usage,
     /// `ALL [PRIVILEGES]`: every privilege that the kind of relation has.
     All,
 }

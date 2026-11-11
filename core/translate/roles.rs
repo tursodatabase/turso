@@ -275,10 +275,29 @@ fn role_spec_name(role: &ast::RoleSpec) -> String {
     }
 }
 
-/// Fails if the statement is compiled for a role that is not a superuser,
-/// which may not change `sequence` with `nextval()` or `setval()`.
-pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Result<()> {
-    if !resolver.role_is_not_superuser {
+/// Fails if the statement is compiled for a role that may not change
+/// `sequence` of `namespace`, as in PostgreSQL: `nextval()` needs USAGE or
+/// UPDATE on it, and `setval()` needs UPDATE. Unlike a table, a sequence
+/// that a view uses is checked for the role that reads the view, because
+/// PostgreSQL checks a function's privileges for the role that calls it.
+pub(crate) fn check_sequence_change(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    sequence: &str,
+    is_nextval: bool,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let schema = resolver.schema();
+    let role = resolver.row_security_role;
+    let has = |privilege| {
+        resolver
+            .catalog
+            .dialect
+            .role_has_privilege(schema, namespace.id, sequence, role, privilege)
+    };
+    if has(ast::Privilege::Update) || (is_nextval && has(ast::Privilege::Usage)) {
         return Ok(());
     }
     Err(permission_denied(PermissionDenied::privilege(
@@ -473,6 +492,9 @@ pub fn translate_grant(
         };
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
+        }
+        if grant.on_sequences && kind != ast::RelationKind::Sequence {
+            bail_parse_error!("\"{normalized_name}\" is not a sequence");
         }
         // Only the main database has dialect schema state to store the
         // privileges in; a temp table has none, and nothing to store.

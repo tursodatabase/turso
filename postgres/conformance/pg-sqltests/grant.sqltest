@@ -424,10 +424,10 @@ test grant-insert-on-sequence-stores-nothing-for-the-role {
     CREATE ROLE gs_acl_seq_insert;
     CREATE SEQUENCE gs_acl_seq_insert_s;
     GRANT INSERT ON gs_acl_seq_insert_s TO gs_acl_seq_insert;
-    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_seq_insert_s';
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'gs_acl_seq_insert_s';
 }
 expect {
-    {postgres=rwU/postgres}
+    null
 }
 
 test grant-of-a-privilege-tables-do-not-have-fails {
@@ -1108,3 +1108,161 @@ expect {
     1
 }
 
+# Sequences. As in PostgreSQL, nextval() needs USAGE or UPDATE on the
+# sequence, and setval() needs UPDATE, so a role that inserts into a table
+# with a serial column needs USAGE on the column's sequence too. Turso does
+# not use the sequence for a serial PRIMARY KEY column, so the tests below
+# use serial columns that are not the primary key.
+
+test grant-on-sequence-is-stored-in-relacl {
+    CREATE ROLE gq_stored;
+    CREATE SEQUENCE gq_stored_s;
+    GRANT USAGE, UPDATE ON SEQUENCE gq_stored_s TO gq_stored;
+    SELECT relacl FROM pg_class WHERE relname = 'gq_stored_s';
+}
+expect {
+    {postgres=rwU/postgres,gq_stored=wU/postgres}
+}
+
+test grant-usage-on-a-sequence-named-as-a-table-is-stored {
+    CREATE ROLE gq_usage_as_table;
+    CREATE SEQUENCE gq_usage_as_table_s;
+    GRANT USAGE ON gq_usage_as_table_s TO gq_usage_as_table;
+    SELECT relacl FROM pg_class WHERE relname = 'gq_usage_as_table_s';
+}
+expect {
+    {postgres=rwU/postgres,gq_usage_as_table=U/postgres}
+}
+
+test grant-usage-on-a-sequence-and-a-table-fails {
+    CREATE ROLE gq_usage_mixed;
+    CREATE SEQUENCE gq_usage_mixed_s;
+    CREATE TABLE gq_usage_mixed_t (id INT);
+    GRANT USAGE ON gq_usage_mixed_s, gq_usage_mixed_t TO gq_usage_mixed;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type USAGE for table
+}
+
+test grant-all-on-all-sequences-in-schema-is-stored-on-each-sequence-but-not-tables {
+    CREATE ROLE gq_all;
+    CREATE SCHEMA gq_all_schema;
+    CREATE SEQUENCE gq_all_schema.s;
+    CREATE TABLE gq_all_schema.t (id INT);
+    GRANT ALL ON ALL SEQUENCES IN SCHEMA gq_all_schema TO gq_all;
+    SELECT c.relname, coalesce(c.relacl::text, 'null') FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'gq_all_schema' ORDER BY c.relname;
+}
+expect {
+    s|{postgres=rwU/postgres,gq_all=rwU/postgres}
+    t|null
+}
+
+test grant-on-sequence-of-a-table-fails {
+    CREATE ROLE gq_not_a_sequence;
+    CREATE TABLE gq_not_a_sequence_t (id INT);
+    GRANT USAGE ON SEQUENCE gq_not_a_sequence_t TO gq_not_a_sequence;
+}
+@sqlstate 42809
+expect error {
+    "gq_not_a_sequence_t" is not a sequence
+}
+
+test grant-of-a-privilege-sequences-do-not-have-fails {
+    CREATE ROLE gq_insert;
+    CREATE SEQUENCE gq_insert_s;
+    GRANT INSERT ON SEQUENCE gq_insert_s TO gq_insert;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type INSERT for sequence
+}
+
+test role-without-usage-cannot-call-nextval {
+    CREATE ROLE gq_no_usage;
+    CREATE SEQUENCE gq_no_usage_s;
+    SET ROLE gq_no_usage;
+    SELECT nextval('gq_no_usage_s');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_no_usage_s
+}
+
+test grant-usage-lets-a-role-call-nextval {
+    CREATE ROLE gq_usage;
+    CREATE SEQUENCE gq_usage_s;
+    GRANT USAGE ON SEQUENCE gq_usage_s TO gq_usage;
+    SET ROLE gq_usage;
+    SELECT nextval('gq_usage_s');
+    SELECT nextval('gq_usage_s');
+}
+expect {
+    1
+    2
+}
+
+test grant-update-lets-a-role-call-nextval {
+    CREATE ROLE gq_update;
+    CREATE SEQUENCE gq_update_s;
+    GRANT UPDATE ON SEQUENCE gq_update_s TO gq_update;
+    SET ROLE gq_update;
+    SELECT nextval('gq_update_s');
+}
+expect {
+    1
+}
+
+test setval-needs-update {
+    CREATE ROLE gq_setval;
+    CREATE SEQUENCE gq_setval_s;
+    GRANT USAGE ON SEQUENCE gq_setval_s TO gq_setval;
+    SET ROLE gq_setval;
+    SELECT setval('gq_setval_s', 10);
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_setval_s
+}
+
+test grant-update-lets-a-role-call-setval {
+    CREATE ROLE gq_setval_update;
+    CREATE SEQUENCE gq_setval_update_s;
+    GRANT UPDATE ON SEQUENCE gq_setval_update_s TO gq_setval_update;
+    SET ROLE gq_setval_update;
+    SELECT setval('gq_setval_update_s', 10);
+    SELECT nextval('gq_setval_update_s');
+}
+expect {
+    10
+    11
+}
+
+test insert-into-a-serial-column-needs-usage-on-its-sequence {
+    CREATE ROLE gq_serial_no_usage;
+    CREATE TABLE gq_serial_no_usage_t (id SERIAL, body TEXT);
+    GRANT INSERT ON gq_serial_no_usage_t TO gq_serial_no_usage;
+    SET ROLE gq_serial_no_usage;
+    INSERT INTO gq_serial_no_usage_t (body) VALUES ('a');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_serial_no_usage_t_id_seq
+}
+
+test insert-into-a-serial-column-with-usage-on-its-sequence {
+    CREATE ROLE gq_serial;
+    CREATE TABLE gq_serial_t (id SERIAL, body TEXT);
+    GRANT INSERT ON gq_serial_t TO gq_serial;
+    GRANT USAGE ON SEQUENCE gq_serial_t_id_seq TO gq_serial;
+    SET ROLE gq_serial;
+    INSERT INTO gq_serial_t (body) VALUES ('a'), ('b');
+    RESET ROLE;
+    SELECT id, body FROM gq_serial_t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}

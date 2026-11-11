@@ -100,6 +100,7 @@ impl Privileges {
                     ast::Privilege::References => Self::REFERENCES,
                     ast::Privilege::Trigger => Self::TRIGGER,
                     ast::Privilege::Maintain => Self::MAINTAIN,
+                    ast::Privilege::Usage => Self::USAGE,
                     ast::Privilege::All => all,
                 }
         });

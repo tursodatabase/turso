@@ -1807,7 +1807,8 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
 /// The engine GRANT that stores a GRANT. The engine checks the
 /// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
-/// schema, and no statement when there are none.
+/// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
+/// there are none.
 fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<DeferredStatement>> {
     let relations = match &stmt.tables {
         PgGrantTables::Named(tables) => tables.clone(),
@@ -1820,8 +1821,10 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
                     schema_objects(conn, &schema)
                         .into_iter()
                         .filter_map(|object| match object {
-                            SchemaObject::Table(name) | SchemaObject::View(name) => Some(name),
-                            SchemaObject::Sequence(_) => None,
+                            SchemaObject::Table(name) | SchemaObject::View(name) => {
+                                (!stmt.on_sequences).then_some(name)
+                            }
+                            SchemaObject::Sequence(name) => stmt.on_sequences.then_some(name),
                         })
                         .map(|name| {
                             ast::QualifiedName::fullname(
@@ -1853,6 +1856,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
     Ok(vec![DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
             privileges: stmt.privileges.clone(),
+            on_sequences: stmt.on_sequences,
             relations,
             grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
         })),

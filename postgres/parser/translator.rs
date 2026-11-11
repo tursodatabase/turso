@@ -7426,17 +7426,20 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// A GRANT statement on tables. The frontend checks that its tables and
-/// roles exist, expands `ALL TABLES IN SCHEMA`, and hands the engine a GRANT
-/// statement that stores the privileges with each table.
+/// A GRANT statement on tables or sequences. The frontend checks that its
+/// relations and roles exist, expands `ALL TABLES IN SCHEMA` and `ALL
+/// SEQUENCES IN SCHEMA`, and hands the engine a GRANT statement that stores
+/// the privileges with each relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgGrantStmt {
     pub privileges: Vec<ast::Privilege>,
+    /// `ON SEQUENCE` or `ON ALL SEQUENCES IN SCHEMA` rather than tables.
+    pub on_sequences: bool,
     pub tables: PgGrantTables,
     pub roles: Vec<PgGrantee>,
 }
 
-/// The tables of a GRANT statement.
+/// The relations of a GRANT statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgGrantTables {
     /// `ON [TABLE] t, s.u`: the names the tables have in the engine, as for
@@ -7472,9 +7475,9 @@ impl PgGrantee {
     }
 }
 
-/// Extracts a GRANT statement on tables. Only privileges on whole tables are
-/// stored, so column privileges, GRANT on other objects, and REVOKE are
-/// rejected rather than reported as done.
+/// Extracts a GRANT statement on tables or sequences. Only privileges on
+/// whole relations are stored, so column privileges, GRANT on other objects,
+/// and REVOKE are rejected rather than reported as done.
 pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStmt>, ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
@@ -7487,9 +7490,15 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
     if !grant.is_grant {
         return Err(not_supported("REVOKE"));
     }
-    if grant.objtype != ObjectType::ObjectTable as i32 {
-        return Err(not_supported("GRANT on objects other than tables"));
-    }
+    let on_sequences = if grant.objtype == ObjectType::ObjectSequence as i32 {
+        true
+    } else if grant.objtype == ObjectType::ObjectTable as i32 {
+        false
+    } else {
+        return Err(not_supported(
+            "GRANT on objects other than tables and sequences",
+        ));
+    };
     // pg_query gives `ALL [PRIVILEGES]` as no privileges.
     let privileges = if grant.privileges.is_empty() {
         vec![ast::Privilege::All]
@@ -7506,7 +7515,7 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
                 if !privilege.cols.is_empty() {
                     return Err(not_supported("GRANT of column privileges"));
                 }
-                table_privilege(&privilege.priv_name)
+                relation_privilege(&privilege.priv_name, on_sequences)
             })
             .collect::<Result<_, _>>()?
     };
@@ -7543,7 +7552,11 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
                 })
                 .collect::<Result<_, _>>()?,
         ),
-        _ => return Err(not_supported("GRANT on objects other than tables")),
+        _ => {
+            return Err(not_supported(
+                "GRANT on objects other than tables and sequences",
+            ))
+        }
     };
     let roles = grant
         .grantees
@@ -7565,29 +7578,36 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
         .collect::<Result<_, _>>()?;
     Ok(Some(PgGrantStmt {
         privileges,
+        on_sequences,
         tables,
         roles,
     }))
 }
 
-/// The privilege on tables that `name` names, which pg_query gives in lower
-/// case.
-fn table_privilege(name: &str) -> Result<ast::Privilege, ParseError> {
-    Ok(match name {
-        "select" => ast::Privilege::Select,
-        "insert" => ast::Privilege::Insert,
-        "update" => ast::Privilege::Update,
-        "delete" => ast::Privilege::Delete,
-        "truncate" => ast::Privilege::Truncate,
-        "references" => ast::Privilege::References,
-        "trigger" => ast::Privilege::Trigger,
-        "maintain" => ast::Privilege::Maintain,
-        _ => {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
-                message: format!("invalid privilege type {} for table", name.to_uppercase()),
-            })
-        }
+/// The privilege on tables, or on sequences when `on_sequences` is set, that
+/// `name` names, which pg_query gives in lower case. USAGE is accepted on
+/// tables too, since `ON TABLE` can name a sequence; the frontend refuses it
+/// for each relation that is not one.
+fn relation_privilege(name: &str, on_sequences: bool) -> Result<ast::Privilege, ParseError> {
+    let privilege = match (name, on_sequences) {
+        ("select", _) => Some(ast::Privilege::Select),
+        ("update", _) => Some(ast::Privilege::Update),
+        ("usage", _) => Some(ast::Privilege::Usage),
+        ("insert", false) => Some(ast::Privilege::Insert),
+        ("delete", false) => Some(ast::Privilege::Delete),
+        ("truncate", false) => Some(ast::Privilege::Truncate),
+        ("references", false) => Some(ast::Privilege::References),
+        ("trigger", false) => Some(ast::Privilege::Trigger),
+        ("maintain", false) => Some(ast::Privilege::Maintain),
+        _ => None,
+    };
+    privilege.ok_or_else(|| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
+        message: format!(
+            "invalid privilege type {} for {}",
+            name.to_uppercase(),
+            if on_sequences { "sequence" } else { "table" }
+        ),
     })
 }
 
@@ -12605,6 +12625,7 @@ mod tests {
             .unwrap(),
             Some(PgGrantStmt {
                 privileges: vec![ast::Privilege::Select],
+                on_sequences: false,
                 tables: PgGrantTables::Named(vec![
                     ast::QualifiedName::single(exact_name("t")),
                     ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
@@ -12622,6 +12643,7 @@ mod tests {
             grant("GRANT SELECT ON ALL TABLES IN SCHEMA public, app TO anon").unwrap(),
             Some(PgGrantStmt {
                 privileges: vec![ast::Privilege::Select],
+                on_sequences: false,
                 tables: PgGrantTables::AllInSchemas(vec!["public".to_string(), "app".to_string()]),
                 roles: vec![PgGrantee::Role("anon".to_string())],
             })
@@ -12651,6 +12673,26 @@ mod tests {
         ] {
             assert_eq!(privileges(sql), vec![ast::Privilege::All], "{sql}");
         }
+        let on_sequences = |sql: &str| grant(sql).unwrap().unwrap().on_sequences;
+        assert!(!on_sequences("GRANT SELECT ON t TO alice"));
+        assert_eq!(
+            privileges("GRANT USAGE ON s TO alice"),
+            vec![ast::Privilege::Usage]
+        );
+        assert!(on_sequences(
+            "GRANT USAGE, SELECT, UPDATE ON SEQUENCE s TO alice"
+        ));
+        assert!(on_sequences(
+            "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO alice"
+        ));
+        assert_eq!(
+            privileges("GRANT USAGE, SELECT, UPDATE ON SEQUENCE s TO alice"),
+            vec![
+                ast::Privilege::Usage,
+                ast::Privilege::Select,
+                ast::Privilege::Update,
+            ]
+        );
     }
 
     #[test]
@@ -12689,16 +12731,12 @@ mod tests {
                 "GRANT of column privileges is not supported",
             ),
             (
-                "GRANT USAGE ON t TO alice",
-                "invalid privilege type USAGE for table",
-            ),
-            (
-                "GRANT SELECT ON SEQUENCE s TO alice",
-                "GRANT on objects other than tables is not supported",
+                "GRANT INSERT ON SEQUENCE s TO alice",
+                "invalid privilege type INSERT for sequence",
             ),
             (
                 "GRANT USAGE ON SCHEMA public TO alice",
-                "GRANT on objects other than tables is not supported",
+                "GRANT on objects other than tables and sequences is not supported",
             ),
             (
                 "GRANT SELECT ON t TO alice WITH GRANT OPTION",
