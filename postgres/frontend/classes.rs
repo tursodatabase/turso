@@ -48,7 +48,7 @@ use turso_parser::ast;
 use turso_core::MAIN_DB_ID;
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
-use crate::acl::{Acl, PUBLIC_OID};
+use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
@@ -476,7 +476,7 @@ pub(crate) fn role_may_read(
         || class
             .relacl
             .as_ref()
-            .is_some_and(|acl| acl.grants(role_oid(role), ast::Privilege::Select))
+            .is_some_and(|acl| acl.grants(role_oid(role), Privileges::SELECT))
 }
 
 /// The access control list of relation `name` of `namespace`, or None when
@@ -747,7 +747,11 @@ pub(crate) fn translate_relation_changes(
                     )));
                 }
                 for grantee in &grantees {
-                    acl.grant(*grantee, privileges, owner);
+                    acl.grant(
+                        *grantee,
+                        Privileges::granted_on(class.relkind, privileges),
+                        owner,
+                    );
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;

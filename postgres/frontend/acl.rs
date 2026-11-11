@@ -72,10 +72,27 @@ impl Privileges {
     /// `ACL_ALL_RIGHTS_SEQUENCE`.
     pub(crate) const SEQUENCE: Self = Self::SELECT.union(Self::UPDATE).union(Self::USAGE);
 
-    fn of(privilege: ast::Privilege) -> Self {
-        match privilege {
-            ast::Privilege::Select => Self::SELECT,
+    /// Every privilege that a relation of `kind` has.
+    fn all_on(kind: RelationKind) -> Self {
+        match kind {
+            RelationKind::Sequence => Self::SEQUENCE,
+            RelationKind::Table
+            | RelationKind::View
+            | RelationKind::MaterializedView
+            | RelationKind::Index => Self::RELATION,
         }
+    }
+
+    /// The privileges that `GRANT privileges` gives on a relation of `kind`.
+    pub(crate) fn granted_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
+        let all = Self::all_on(kind);
+        let granted = privileges.iter().fold(Self::empty(), |granted, privilege| {
+            granted
+                | match privilege {
+                    ast::Privilege::Select => Self::SELECT,
+                }
+        });
+        granted & all
     }
 
     /// Reads the letters of an `aclitem`, such as `arwdDxtm`. A `*` after a
@@ -158,17 +175,10 @@ impl Acl {
     /// The list a relation has before any `GRANT`, which PostgreSQL's
     /// `acldefault` gives: the owner holds every privilege of the kind.
     pub(crate) fn default_for(kind: RelationKind, owner: i64) -> Self {
-        let privileges = match kind {
-            RelationKind::Sequence => Privileges::SEQUENCE,
-            RelationKind::Table
-            | RelationKind::View
-            | RelationKind::MaterializedView
-            | RelationKind::Index => Privileges::RELATION,
-        };
         Self {
             items: vec![AclItem {
                 grantee: owner,
-                privileges,
+                privileges: Privileges::all_on(kind),
                 grantor: owner,
             }],
         }
@@ -202,15 +212,13 @@ impl Acl {
         text_array_literal(items.iter().map(String::as_str))
     }
 
-    /// Adds `privileges` from `grantor` for `grantee`, into the entry the two
+    /// Adds `granted` from `grantor` for `grantee`, into the entry the two
     /// already share or a new one at the end, as PostgreSQL's
     /// `merge_acl_with_grant` does.
-    pub(crate) fn grant(&mut self, grantee: i64, privileges: &[ast::Privilege], grantor: i64) {
-        let granted = privileges
-            .iter()
-            .fold(Privileges::empty(), |all, privilege| {
-                all | Privileges::of(*privilege)
-            });
+    pub(crate) fn grant(&mut self, grantee: i64, granted: Privileges, grantor: i64) {
+        if granted.is_empty() {
+            return;
+        }
         let item = self
             .items
             .iter_mut()
@@ -225,13 +233,14 @@ impl Acl {
         }
     }
 
-    /// Whether the list gives `role`, by oid or through `PUBLIC`,
-    /// `privilege`.
-    pub(crate) fn grants(&self, role: i64, privilege: ast::Privilege) -> bool {
-        let wanted = Privileges::of(privilege);
-        self.items.iter().any(|item| {
-            (item.grantee == role || item.grantee == PUBLIC_OID) && item.privileges.contains(wanted)
-        })
+    /// Whether the list gives `role`, by oid or through `PUBLIC`, every
+    /// privilege of `wanted`.
+    pub(crate) fn grants(&self, role: i64, wanted: Privileges) -> bool {
+        self.items
+            .iter()
+            .filter(|item| item.grantee == role || item.grantee == PUBLIC_OID)
+            .fold(Privileges::empty(), |given, item| given | item.privileges)
+            .contains(wanted)
     }
 
     /// Whether the list gives `role`, by oid or through `PUBLIC`, any
@@ -300,10 +309,10 @@ mod tests {
     #[test]
     fn a_grant_adds_an_entry_once() {
         let mut acl = Acl::default_for(RelationKind::Table, OWNER);
-        acl.grant(READER, &[ast::Privilege::Select], OWNER);
-        acl.grant(READER, &[ast::Privilege::Select], OWNER);
-        acl.grant(PUBLIC_OID, &[ast::Privilege::Select], OWNER);
-        acl.grant(OWNER, &[ast::Privilege::Select], OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(PUBLIC_OID, Privileges::SELECT, OWNER);
+        acl.grant(OWNER, Privileges::SELECT, OWNER);
         assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10,=r/10}");
         assert_eq!(
             acl.display_text(&names),
@@ -312,26 +321,37 @@ mod tests {
     }
 
     #[test]
+    fn the_list_gives_a_role_its_own_privileges_and_those_of_public() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(PUBLIC_OID, Privileges::INSERT, OWNER);
+        assert!(acl.grants(READER, Privileges::SELECT | Privileges::INSERT));
+        assert!(!acl.grants(READER, Privileges::SELECT | Privileges::UPDATE));
+        assert!(acl.grants(STRANGER, Privileges::INSERT));
+        assert!(!acl.grants(STRANGER, Privileges::SELECT));
+    }
+
+    #[test]
     fn the_list_says_whom_it_gives_privileges() {
         let mut acl = Acl::default_for(RelationKind::Table, OWNER);
         assert!(acl.gives_anything_to(OWNER));
-        assert!(acl.grants(OWNER, ast::Privilege::Select));
+        assert!(acl.grants(OWNER, Privileges::SELECT));
         assert!(!acl.gives_anything_to(READER));
-        assert!(!acl.grants(READER, ast::Privilege::Select));
-        acl.grant(READER, &[ast::Privilege::Select], OWNER);
+        assert!(!acl.grants(READER, Privileges::SELECT));
+        acl.grant(READER, Privileges::SELECT, OWNER);
         assert!(acl.gives_anything_to(READER));
-        assert!(acl.grants(READER, ast::Privilege::Select));
+        assert!(acl.grants(READER, Privileges::SELECT));
         assert!(!acl.gives_anything_to(STRANGER));
-        acl.grant(PUBLIC_OID, &[ast::Privilege::Select], OWNER);
+        acl.grant(PUBLIC_OID, Privileges::SELECT, OWNER);
         assert!(acl.gives_anything_to(STRANGER));
-        assert!(acl.grants(STRANGER, ast::Privilege::Select));
+        assert!(acl.grants(STRANGER, Privileges::SELECT));
     }
 
     #[test]
     fn a_new_owner_takes_the_old_owners_place() {
         let mut acl = Acl::default_for(RelationKind::Table, OWNER);
-        acl.grant(READER, &[ast::Privilege::Select], OWNER);
-        acl.grant(STRANGER, &[ast::Privilege::Select], OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(STRANGER, Privileges::SELECT, OWNER);
         acl.change_owner(OWNER, STRANGER);
         assert_eq!(acl.stored_text(), "{16386=arwdDxtm/16386,16385=r/16386}");
     }
@@ -352,7 +372,7 @@ mod tests {
     #[test]
     fn names_are_quoted_as_postgresql_quotes_them() {
         let mut acl = Acl::default_for(RelationKind::Table, STRANGER);
-        acl.grant(READER, &[ast::Privilege::Select], STRANGER);
+        acl.grant(READER, Privileges::SELECT, STRANGER);
         assert_eq!(
             acl.display_text(&names),
             "{\"\\\"my role\\\"=arwdDxtm/\\\"my role\\\"\",\"reader=r/\\\"my role\\\"\"}"
