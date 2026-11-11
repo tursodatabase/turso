@@ -386,6 +386,33 @@ pub(crate) fn check_write_privileges(
     Ok(())
 }
 
+/// Makes the constraint errors of a statement that writes table `name` of
+/// `namespace` leave out the values of the row or key that broke the
+/// constraint, when the statement is compiled for a role without SELECT on
+/// the table. As in PostgreSQL, only a role that may read the table sees
+/// them; otherwise a role that may only write the table could read it from
+/// the writes that fail.
+pub(crate) fn hide_constraint_values_from_role_without_select(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+) {
+    let may_read = check_privilege(
+        resolver,
+        connection,
+        namespace,
+        name,
+        ast::Privilege::Select,
+        Object::Table(name.to_string()),
+    )
+    .is_ok();
+    if !may_read {
+        program.flags.set_hides_constraint_values(true);
+    }
+}
+
 /// Whether any of `exprs` reads a column of table `table`, directly or from
 /// one of the planned `subqueries` that it refers to.
 pub(crate) fn reads_columns_of<'a>(

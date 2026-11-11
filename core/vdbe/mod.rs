@@ -2168,6 +2168,10 @@ pub struct PreparedProgram {
     /// Whether the statement may write more than one row; see
     /// `crate::vdbe::builder::ProgramBuilder::is_multi_write`.
     pub is_multi_write: bool,
+    /// Whether the errors of the statement's constraints leave out the
+    /// values of the row or key that broke them; see
+    /// `crate::vdbe::builder::ProgramBuilderFlags::hides_constraint_values`.
+    pub hides_constraint_values: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.

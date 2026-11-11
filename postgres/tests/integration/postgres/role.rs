@@ -1,5 +1,5 @@
 use crate::common::TempDatabase;
-use turso_pg::PgConnection;
+use turso_pg::{ErrorReport, PgConnection};
 
 #[test]
 fn created_role_is_visible_to_another_connection() {
@@ -217,6 +217,44 @@ fn foreign_key_checks_and_actions_need_no_privileges_on_the_other_table() {
     assert_eq!(
         count.run_collect_rows().unwrap(),
         vec![vec![turso_core::Value::from_i64(0)]]
+    );
+}
+
+/// As in PostgreSQL, a constraint error shows the values of a row only to a
+/// role that may read the table. Otherwise a role with UPDATE but not SELECT
+/// could read the rows from the errors of updates that fail.
+#[test]
+fn constraint_errors_show_values_only_to_a_role_with_select() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute(
+        "CREATE TABLE docs (id int PRIMARY KEY, secret text, n int CHECK (n < 1000), \
+         a int, b int, UNIQUE (a, b))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'alpha', 0, 1, 10), (2, 'bravo', 0, 2, 10)")
+        .unwrap();
+    conn.execute("GRANT INSERT, UPDATE ON docs TO alice")
+        .unwrap();
+    let detail = |sql: &str| ErrorReport::from(conn.execute(sql).unwrap_err().core_error()).detail;
+
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(detail("UPDATE docs SET n = 5000"), None);
+    assert_eq!(detail("UPDATE docs SET a = 1"), None);
+    assert_eq!(detail("INSERT INTO docs VALUES (1, 'x', 0, 3, 3)"), None);
+    assert_eq!(detail("INSERT INTO docs VALUES (3, 'x', 5000, 3, 3)"), None);
+
+    conn.execute("RESET ROLE").unwrap();
+    conn.execute("GRANT SELECT ON docs TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(
+        detail("UPDATE docs SET n = 5000").as_deref(),
+        Some("Failing row contains (1, alpha, 5000, 1, 10).")
+    );
+    assert_eq!(
+        detail("UPDATE docs SET a = 1").as_deref(),
+        Some("Key (a, b)=(1, 10) already exists.")
     );
 }
 

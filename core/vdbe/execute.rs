@@ -3646,6 +3646,7 @@ pub fn halt(
         | SQLITE_CONSTRAINT_NOTNULL
         | SQLITE_CONSTRAINT_FOREIGNKEY
         | SQLITE_CONSTRAINT_TRIGGER => Some(build_constraint_violation_error(
+            program,
             state,
             constraint_info,
             err_code,
@@ -3864,6 +3865,7 @@ pub fn halt(
 }
 
 fn build_constraint_violation_error(
+    program: &Program,
     state: &ProgramState,
     info: Option<&ConstraintInfo>,
     err_code: usize,
@@ -3897,12 +3899,14 @@ fn build_constraint_violation_error(
         violation.constraint_name.clone_from(&info.constraint_name);
         violation.index_name.clone_from(&info.index_name);
         violation.column_names.clone_from(&info.column_names);
-        violation.values = info
-            .violation_regs
-            .iter()
-            .map(|&reg| state.registers[reg].get_value().clone())
-            .collect();
-        violation.row_values = !info.row_col_names.is_empty();
+        if !program.hides_constraint_values {
+            violation.values = info
+                .violation_regs
+                .iter()
+                .map(|&reg| state.registers[reg].get_value().clone())
+                .collect();
+            violation.row_values = !info.row_col_names.is_empty();
+        }
         violation.parent_table.clone_from(&info.parent_table);
     }
     LimboError::ConstraintViolation(Box::new(violation))
@@ -17445,6 +17449,7 @@ pub fn op_fk_counter(
         } else if *increment_value > 0 {
             if let Some(info) = constraint_info.as_deref() {
                 state.fk_immediate_violation = Some(build_constraint_violation_error(
+                    program,
                     state,
                     Some(info),
                     SQLITE_CONSTRAINT_FOREIGNKEY,

@@ -200,6 +200,13 @@ fn prepare_and_optimize_update_plan(
     // checked already.
     if !is_internal_schema_change {
         check_update_privileges(&update_plan, resolver, connection)?;
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            update_plan.target_table.namespace,
+            update_plan.target_table.table.get_name(),
+        );
     }
     mark_shared_cte_materialization_requirements(
         &mut read_scope_tables,

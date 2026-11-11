@@ -314,6 +314,13 @@ pub fn translate_insert(
         ast::Privilege::Insert,
         false,
     )?;
+    roles::hide_constraint_values_from_role_without_select(
+        program,
+        resolver,
+        connection,
+        namespace,
+        table.get_name(),
+    );
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {

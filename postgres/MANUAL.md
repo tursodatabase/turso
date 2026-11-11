@@ -217,7 +217,10 @@ not from the sequence, so the insert needs no privilege on the sequence.
 `USAGE` on the sequence. A table with row-level security still
 refuses writes by a role that does not own it: `INSERT` fails, and
 `UPDATE` and `DELETE` change no rows. As in PostgreSQL, row-level security
-does not apply to `TRUNCATE`, which removes every row. Column
+does not apply to `TRUNCATE`, which removes every row. A constraint error
+shows the values of the row or key (`Failing row contains ...`, `Key ...
+already exists`) only to a role with `SELECT` on the table; PostgreSQL also
+shows the values that the statement itself gave. Column
 privileges, `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of
 objects, and `REVOKE` fail as not supported, so that a script never believes
 it changed what a role may do when it did not. `GRANT role_name TO

@@ -409,6 +409,7 @@ impl ProgramBuilderFlags {
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const READS_STORED_VALUES: u16 = 1 << 9;
     const WRITES_STORED_VALUES: u16 = 1 << 10;
+    const HIDES_CONSTRAINT_VALUES: u16 = 1 << 11;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -526,6 +527,18 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_reads_stored_values(&mut self, v: bool) {
         self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// When set, the errors of the statement's constraints do not show the
+    /// values of the row that broke them. Set for a statement that writes a
+    /// table for a role that may not read it.
+    pub const fn hides_constraint_values(self) -> bool {
+        self.get(Self::HIDES_CONSTRAINT_VALUES)
+    }
+    #[inline]
+    pub const fn set_hides_constraint_values(&mut self, v: bool) {
+        self.set(Self::HIDES_CONSTRAINT_VALUES, v)
     }
 
     #[inline]
@@ -2578,6 +2591,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             is_multi_write: self.flags.is_multi_write(),
+            hides_constraint_values: self.flags.hides_constraint_values(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,

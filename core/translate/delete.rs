@@ -147,6 +147,14 @@ pub fn translate_delete(
             )?;
         }
         check_delete_privileges(delete_plan_inner, privilege, resolver, connection)?;
+        let target = &delete_plan_inner.table_references.joined_tables()[0];
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+        );
     }
 
     optimize_plan(program, &mut delete_plan, resolver, connection)?;
