@@ -1291,6 +1291,27 @@ test max-with-null {
 expect {
 }
 
+test nullif-no-arguments {
+    SELECT nullif();
+}
+expect error {
+    wrong number of arguments to function nullif()
+}
+
+test nullif-one-argument {
+    SELECT nullif(1);
+}
+expect error {
+    wrong number of arguments to function nullif()
+}
+
+test nullif-three-arguments {
+    SELECT nullif(1, 2, 3);
+}
+expect error {
+    wrong number of arguments to function nullif()
+}
+
 test nullif {
     select nullif(1, 2)
 }

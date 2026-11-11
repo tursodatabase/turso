@@ -330,6 +330,8 @@ The multi-argument `max()` and `min()` are scalar functions. When called with a 
 
 Returns NULL if X equals Y, otherwise returns X. This is useful for converting sentinel values to NULL.
 
+The function requires exactly two arguments. Other argument counts produce a wrong-number-of-arguments error.
+
 ```sql
 SELECT nullif(0, 0);        -- NULL
 SELECT nullif(5, 0);        -- 5

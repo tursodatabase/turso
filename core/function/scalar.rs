@@ -175,14 +175,7 @@ impl<'a> FunctionArgs<'a> {
 
 #[derive(Default)]
 pub(crate) struct FunctionCatalog {
-    by_name: HashMap<&'static str, CatalogEntry>,
-    functions: Vec<&'static dyn ScalarFunction>,
-}
-
-struct CatalogEntry {
-    function: &'static dyn ScalarFunction,
-    /// Argument counts that select this scalar when resolving its name.
-    resolution_arity: FunctionArity,
+    by_name: HashMap<&'static str, &'static dyn ScalarFunction>,
 }
 
 impl FunctionCatalog {
@@ -191,19 +184,6 @@ impl FunctionCatalog {
         function: &'static dyn ScalarFunction,
         aliases: &[&'static str],
     ) {
-        self.register_with_arity(function, aliases, FunctionArity::Variadic);
-    }
-
-    fn register_overload(&mut self, function: &'static dyn ScalarFunction) {
-        self.register_with_arity(function, &[], function.metadata().arity);
-    }
-
-    fn register_with_arity(
-        &mut self,
-        function: &'static dyn ScalarFunction,
-        aliases: &[&'static str],
-        arity: FunctionArity,
-    ) {
         function
             .metadata()
             .arity
@@ -211,20 +191,8 @@ impl FunctionCatalog {
             .expect("invalid built-in function arity");
         for name in std::iter::once(function.metadata().name).chain(aliases.iter().copied()) {
             assert_eq!(name, crate::util::normalize_ident(name));
-            assert!(
-                self.by_name
-                    .insert(
-                        name,
-                        CatalogEntry {
-                            function,
-                            resolution_arity: arity
-                        }
-                    )
-                    .is_none(),
-                "duplicate function: {name}"
-            );
+            self.by_name.insert(name, function);
         }
-        self.functions.push(function);
     }
 
     pub(crate) fn lookup(
@@ -232,15 +200,19 @@ impl FunctionCatalog {
         normalized_name: &str,
         arg_count: usize,
     ) -> Option<&'static dyn ScalarFunction> {
-        let entry = self.by_name.get(normalized_name)?;
-        entry
-            .resolution_arity
-            .accepts(arg_count)
-            .then_some(entry.function)
+        self.get(normalized_name)
+            .filter(|function| function.metadata().arity.accepts(arg_count))
+    }
+
+    pub(crate) fn get(&self, normalized_name: &str) -> Option<&'static dyn ScalarFunction> {
+        self.by_name.get(normalized_name).copied()
     }
 
     pub(crate) fn functions(&self) -> impl Iterator<Item = &'static dyn ScalarFunction> + '_ {
-        self.functions.iter().copied()
+        self.by_name
+            .iter()
+            .filter(|(name, function)| **name == function.metadata().name)
+            .map(|(_, function)| *function)
     }
 }
 
@@ -325,9 +297,9 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&datetime::DateDiff, &[]);
     catalog.register(&pattern::Glob, &[]);
     catalog.register(&pattern::Like, &[]);
-    catalog.register_overload(&comparison::Min);
-    catalog.register_overload(&comparison::Max);
-    catalog.register_overload(&comparison::Nullif);
+    catalog.register(&comparison::Min, &[]);
+    catalog.register(&comparison::Max, &[]);
+    catalog.register(&comparison::Nullif, &[]);
     catalog.register(&control::Coalesce, &[]);
     catalog.register(&control::IfNull, &[]);
     catalog.register(&control::Iif, &["if"]);
@@ -780,6 +752,52 @@ mod tests {
     use crate::Func;
 
     #[test]
+    fn catalog_registration_replaces_functions_and_aliases() {
+        let mut catalog = super::FunctionCatalog::default();
+        catalog.register(&super::Abs, &["absolute"]);
+        catalog.register(&ReplacementAbs, &["absolute"]);
+        for name in ["abs", "absolute"] {
+            assert!(catalog.lookup(name, 1).is_none());
+            assert!(matches!(
+                catalog.lookup(name, 2).unwrap().metadata().arity,
+                super::FunctionArity::Exact(2)
+            ));
+        }
+        let functions: Vec<_> = catalog.functions().collect();
+        assert_eq!(functions.len(), 1);
+        assert!(matches!(
+            functions[0].metadata().arity,
+            super::FunctionArity::Exact(2)
+        ));
+    }
+
+    #[test]
+    fn catalog_lookup_uses_the_function_arity() {
+        let mut catalog = super::FunctionCatalog::default();
+        catalog.register(&super::Abs, &["absolute"]);
+        for name in ["abs", "absolute"] {
+            assert!(catalog.lookup(name, 0).is_none());
+            assert!(catalog.lookup(name, 1).is_some());
+            assert!(catalog.lookup(name, 2).is_none());
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReplacementAbs;
+
+    impl super::ScalarFunction for ReplacementAbs {
+        fn metadata(&self) -> &super::ScalarFunctionMetadata {
+            &super::ScalarFunctionMetadata {
+                name: "abs",
+                arity: super::FunctionArity::Exact(2),
+                deterministic: true,
+                can_mask_nulls: false,
+                result_type: super::ResultType::Unknown,
+            }
+        }
+    }
+
+    #[test]
     fn scalar_and_aggregate_overloads_resolve_by_argument_count() {
         use crate::function::AggFunc;
         for (name, aggregate) in [("min", AggFunc::Min), ("max", AggFunc::Max)] {
@@ -801,7 +819,8 @@ mod tests {
         for count in [0, 1, 3] {
             assert!(resolve_builtin_function_name("nullif", count)
                 .unwrap()
-                .is_none());
+                .is_some());
+            assert!(resolve_builtin_function("nullif", count).is_err());
         }
         let functions = Func::builtin_function_list();
         for name in ["min", "max"] {

@@ -232,13 +232,13 @@ pub(crate) fn resolve_builtin_function_name(
             Ok(Some(Func::Agg(AggFunc::GroupConcat)))
         }
         "max" => {
-            if arg_count < 1 {
+            if arg_count != 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Max)))
         }
         "min" => {
-            if arg_count < 1 {
+            if arg_count != 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Min)))
@@ -439,6 +439,8 @@ pub(crate) fn resolve_builtin_function_name(
         // Array functions
         // Struct/Union functions
         // Sequence functions
-        _ => Ok(None),
+        _ => Ok(crate::scalar::BUILTIN_SCALAR_FUNCTIONS
+            .get(&normalized_name)
+            .map(Func::RegisteredScalar)),
     }
 }
