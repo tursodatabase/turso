@@ -239,12 +239,7 @@ impl PostgreSQLTranslator {
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
             NodeRef::AlterSeqStmt(alter) => self.translate_alter_sequence(alter)?,
-            _ => {
-                return Err(ParseError::ParseError(format!(
-                    "{} is not supported",
-                    node_ref_name(&node)
-                )))
-            }
+            _ => return Err(ParseError::not_supported(node_ref_name(&node))),
         })
     }
 
