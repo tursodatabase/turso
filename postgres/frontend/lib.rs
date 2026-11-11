@@ -6,6 +6,7 @@ mod copy;
 mod error;
 mod functions;
 mod options;
+mod pg_type;
 mod policies;
 mod roles;
 mod schema_state;
