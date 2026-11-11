@@ -2409,7 +2409,7 @@ fn vacuum_in_place_step(
                 // durable so there is nothing to roll back; restoring here
                 // means the connection is never left poisoned even if the
                 // checkpoint or schema reload below fails.
-                connection.auto_commit.store(true, Ordering::SeqCst);
+                connection.end_transaction();
                 connection.set_tx_state(crate::connection::TransactionState::None);
 
                 // Invalidate page cache and schema cookie so fresh reads see
@@ -2575,7 +2575,7 @@ fn vacuum_in_place_cleanup(
         }
     }
 
-    connection.auto_commit.store(true, Ordering::SeqCst);
+    connection.end_transaction();
     connection.set_tx_state(crate::connection::TransactionState::None);
     drop(cleanup_state.mvcc_guard.take());
     Ok(())

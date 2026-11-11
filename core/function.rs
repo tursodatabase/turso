@@ -989,6 +989,10 @@ pub enum ScalarFunc {
     SqliteSourceId,
     UnixEpoch,
     JulianDay,
+    /// PostgreSQL's `now()` and `transaction_timestamp()`.
+    Now,
+    StatementTimestamp,
+    ClockTimestamp,
     Hex,
     Unhex,
     GetByte,
@@ -1125,6 +1129,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::SqliteSourceId => false,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
+            ScalarFunc::Now | ScalarFunc::StatementTimestamp | ScalarFunc::ClockTimestamp => false,
             ScalarFunc::Hex => true,
             ScalarFunc::Unhex => true,
             ScalarFunc::GetByte => true,
@@ -1265,6 +1270,9 @@ impl ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
             Self::JulianDay => ResultType::Declared(ReturnType::Real),
+            Self::Now | Self::StatementTimestamp | Self::ClockTimestamp => {
+                ResultType::Declared(ReturnType::Custom("timestamptz"))
+            }
             Self::Char
             | Self::Concat
             | Self::ConcatWs
@@ -1390,6 +1398,9 @@ impl Display for ScalarFunc {
             Self::SqliteSourceId => "sqlite_source_id",
             Self::JulianDay => "julianday",
             Self::UnixEpoch => "unixepoch",
+            Self::Now => "now",
+            Self::StatementTimestamp => "statement_timestamp",
+            Self::ClockTimestamp => "clock_timestamp",
             Self::Hex => "hex",
             Self::Unhex => "unhex",
             Self::GetByte => "get_byte",
@@ -1504,7 +1515,10 @@ impl ScalarFunc {
             | Self::SqliteVersion
             | Self::TursoVersion
             | Self::SqliteSourceId
-            | Self::TotalChanges => &[0],
+            | Self::TotalChanges
+            | Self::Now
+            | Self::StatementTimestamp
+            | Self::ClockTimestamp => &[0],
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg

@@ -264,6 +264,30 @@ SELECT timediff('2024-01-01', '2025-06-15');
 -- '-0001-05-14 00:00:00.000'
 ```
 
+---
+
+### now()
+
+Returns the time the current transaction began, in UTC, as TEXT in the format `YYYY-MM-DD HH:MM:SS.SSSSSS`, without trailing zeros in the fraction. Outside `BEGIN ... COMMIT`, each statement is its own transaction, and `now()` is the time of its first call in the statement. In PostgreSQL it is the time the statement began, which is earlier when the statement reads many rows before that call. SQLite has no `now()`; it is PostgreSQL's function.
+
+```sql
+now()
+```
+
+**Returns:** TEXT. Every call in a statement returns the same time. So does every call in the statements of one transaction, including the triggers they fire.
+
+```sql
+SELECT now();
+-- '2025-06-15 14:30:00.123456'
+
+BEGIN;
+SELECT now();
+-- '2025-06-15 14:30:01.5'
+SELECT now();
+-- '2025-06-15 14:30:01.5', the same time
+COMMIT;
+```
+
 ## Time Value Formats
 
 All date and time functions accept time values in the following formats.

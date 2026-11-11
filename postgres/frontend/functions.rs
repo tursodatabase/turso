@@ -12,11 +12,12 @@ use turso_core::{
     Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -80,7 +81,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
         "to_char"(FunctionArity::Exact(2), true) => {
-            exec_to_char(args[0].get_value(), &text_arg(args, 1))
+            exec_to_char(args[0].get_value(), &text_arg(args, 1))?
         },
         "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
@@ -132,9 +133,6 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
     })
 }
 
@@ -181,19 +179,6 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
 
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
         Ok(IOResult::Done((self.step)(connection, args)?))
-    }
-}
-
-/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
-/// Returning one gives the function the type `timestamptz`, so `now() + 1` is
-/// an error as in PostgreSQL instead of adding 1 to text.
-struct Timestamptz(String);
-
-impl ScalarReturn for Timestamptz {
-    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
-
-    fn into_value(self) -> Value {
-        Value::build_text(self.0)
     }
 }
 
@@ -1042,14 +1027,26 @@ fn exec_pg_format_type(type_oid: i64, typemod: i64) -> String {
 
 /// Simplified to_char: formats a number with the given format pattern.
 /// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
-fn exec_to_char(value: &Value, format: &str) -> Option<String> {
+/// Dates and times are not supported, so a value that is not a number is an
+/// error instead of a wrong result.
+fn exec_to_char(value: &Value, format: &str) -> Result<Option<String>> {
     let num = match value {
-        Value::Null => return None,
+        Value::Null => return Ok(None),
         Value::Numeric(_) => value.as_float(),
-        Value::Text(t) => t.as_str().parse::<f64>().ok()?,
-        _ => return None,
+        Value::Text(t) => t
+            .as_str()
+            .parse::<f64>()
+            .map_err(|_| to_char_not_supported())?,
+        Value::Blob(_) => return Err(to_char_not_supported()),
     };
-    Some(pg_to_char_numeric(num, format))
+    Ok(Some(pg_to_char_numeric(num, format)))
+}
+
+fn to_char_not_supported() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "to_char of a value that is not a number is not supported",
+    )
 }
 
 /// age(end, start) the way PostgreSQL's timestamp_age computes it: subtract the

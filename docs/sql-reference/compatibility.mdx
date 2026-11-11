@@ -26,6 +26,7 @@ These features extend Turso beyond SQLite compatibility:
 | [Custom index methods](/docs/sql-reference/statements/create-index#using-method) | CREATE INDEX ... USING for FTS and custom access methods |
 | [NULL ordering in indexes](/docs/sql-reference/statements/create-index#nulls-first-last) | NULLS FIRST/LAST in CREATE INDEX and in table PRIMARY KEY and UNIQUE constraints. A schema using it cannot be opened by stock SQLite |
 | stddev() | Standard deviation aggregate function |
+| [now()](/docs/sql-reference/functions/date-time#now) | The time the current transaction began, as in PostgreSQL |
 | [DEFAULT in VALUES](/docs/sql-reference/statements/insert#default-keyword-in-values) | SQL-standard DEFAULT keyword in INSERT VALUES lists |
 
 ## PostgreSQL schema metadata
@@ -93,3 +94,25 @@ remains unsupported. These settings do not add timeout enforcement, row-level
 security, function-body validation, synchronized scans, or additional diagnostic
 message levels. Previously accepted no-op requests for unsupported modes now
 raise an error rather than reporting that those modes took effect.
+
+## PostgreSQL date and time functions
+
+In the PostgreSQL frontend, as in PostgreSQL, `now()` and
+`transaction_timestamp()` return the time the transaction began,
+`statement_timestamp()` a time fixed for the whole statement, and
+`clock_timestamp()` the time of the call. PostgreSQL fixes the statement's
+time when the statement begins; Turso fixes it at the statement's first call
+to one of these functions, which is later when the statement reads many rows
+before that call. Outside `BEGIN ... COMMIT`, the transaction time is the
+statement's time. `CURRENT_TIMESTAMP` is `now()`, and `CURRENT_DATE`,
+`LOCALTIMESTAMP` and `LOCALTIME` are `now()` cast to `date`, `timestamp` and
+`time`. The session time zone is UTC.
+
+These raise an error:
+
+| Expression | Why |
+|------------|-----|
+| `CURRENT_TIME` | Its type, `time with time zone`, is not supported |
+| A precision, as in `CURRENT_TIMESTAMP(0)` | Rounding the time is not supported |
+| `to_char` of a date or time | Formatting dates and times is not supported |
+| `make_date`, `make_timestamp`, `to_timestamp` | The [time extension](/docs/sql-reference/extensions#time-extension) is not loaded |

@@ -143,7 +143,7 @@ LIMIT 5;
 
 ## Time Extension
 
-The time extension is compatible with [sqlean-time](https://github.com/nalgeon/sqlean/blob/main/docs/time.md) and provides advanced time manipulation functions.
+The time extension is compatible with [sqlean-time](https://github.com/nalgeon/sqlean/blob/main/docs/time.md) and provides advanced time manipulation functions. The PostgreSQL frontend does not load it, because its `make_date`, `make_timestamp` and `to_timestamp` take other arguments than PostgreSQL's functions of the same names.
 
 <Info>
 A **time value** (`t` in the tables below) is an opaque 13-byte **BLOB**, not an integer — this matches sqlean-time byte-for-byte (`version(1) + seconds(8) + nanoseconds(4)`, with seconds counted from year 0001). Any function that produces a time (`time_now`, `time_date`, `time_add`, …) returns a BLOB, and `typeof(time_now())` is `blob`. Use `time_to_unix` / `time_to_nano` to get an INTEGER, and the `time_fmt_*` functions to get TEXT.

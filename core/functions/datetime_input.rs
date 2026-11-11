@@ -11,7 +11,7 @@
 //! 9999, years not written with 4 digits and `infinity`.
 
 use crate::types::Value;
-use crate::{LimboError, Result};
+use crate::{LimboError, Result, WallClockInstant};
 use chrono::{Datelike, Duration, Month, NaiveDate, NaiveDateTime, Timelike};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +63,18 @@ pub fn exec_temporal_encode(value: &Value, type_name: &Value) -> Result<Value> {
     };
     let fields = Fields::read(input, ty)?;
     Ok(Value::build_text(fields.format(input, ty)?))
+}
+
+/// A point in time as a `timestamptz` value, in the text the type stores, so
+/// that it compares and sorts with the values of `timestamptz` columns.
+pub fn format_timestamptz(instant: WallClockInstant) -> Result<Value> {
+    let Some(timestamp) = chrono::DateTime::from_timestamp(instant.secs, instant.micros * 1000)
+    else {
+        return Err(range_error("now"));
+    };
+    let timestamp = timestamp.naive_utc();
+    check_year(timestamp.year(), "now", TemporalType::Timestamptz)?;
+    Ok(Value::build_text(format_timestamp(timestamp)))
 }
 
 /// PostgreSQL's frontend reports these as `invalid_datetime_format`. Values
@@ -242,12 +254,18 @@ impl Fields {
             timestamp -= Duration::seconds(offset);
         }
         check_year(timestamp.year(), input, ty)?;
-        let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
-            + i64::from(timestamp.nanosecond() / 1000);
-        let mut out = timestamp.format("%Y-%m-%d ").to_string();
-        push_time(&mut out, time);
-        Ok(out)
+        Ok(format_timestamp(timestamp))
     }
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.fraction]`, the fixed text form of `timestamp` and
+/// `timestamptz`.
+fn format_timestamp(timestamp: NaiveDateTime) -> String {
+    let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
+        + i64::from(timestamp.nanosecond() / 1000);
+    let mut out = timestamp.format("%Y-%m-%d ").to_string();
+    push_time(&mut out, time);
+    out
 }
 
 /// What a field of the input says about the date and time. A field can be

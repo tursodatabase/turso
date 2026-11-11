@@ -407,6 +407,9 @@ pub struct Connection {
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
+    /// When the open user transaction began: PostgreSQL's `now()`. `None` when
+    /// no user transaction is open.
+    pub(super) transaction_time: RwLock<Option<crate::WallClockInstant>>,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
@@ -2484,7 +2487,7 @@ impl Connection {
         self.set_tx_state(TransactionState::Write {
             schema_did_change: false,
         });
-        self.auto_commit.store(false, Ordering::SeqCst);
+        self.begin_user_transaction(pager.io.current_time_wall_clock());
 
         Ok(())
     }
@@ -2533,7 +2536,7 @@ impl Connection {
                 None
             };
 
-            self.auto_commit.store(true, Ordering::SeqCst);
+            self.end_transaction();
             self.set_tx_state(TransactionState::None);
 
             if !force_commit {
@@ -3041,6 +3044,33 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    /// Leaves autocommit for a transaction the user began at `start`: `BEGIN`,
+    /// a `SAVEPOINT` outside a transaction, `wal_insert_begin`, or a
+    /// transaction that the failure of a sequence's inner transaction ended
+    /// too early.
+    pub(crate) fn begin_user_transaction(&self, start: crate::WallClockInstant) {
+        *self.transaction_time.write() = Some(start);
+        self.auto_commit.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns to autocommit at the end of a transaction.
+    pub(crate) fn end_transaction(&self) {
+        *self.transaction_time.write() = None;
+        self.auto_commit.store(true, Ordering::SeqCst);
+    }
+
+    /// When the open user transaction began. `None` in autocommit, where each
+    /// statement is its own transaction, and in the transactions the engine
+    /// runs for itself, such as reading the schema back or `VACUUM`.
+    pub(crate) fn transaction_time(&self) -> Option<crate::WallClockInstant> {
+        let start = *self.transaction_time.read();
+        turso_assert!(
+            start.is_none() || !self.get_auto_commit(),
+            "a transaction returned to autocommit without clearing its start time"
+        );
+        start
     }
 
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
@@ -5172,7 +5202,7 @@ impl Connection {
     ) {
         if let Some(mv_store) = self.mv_store().as_ref() {
             if let Some(tx_id) = self.get_mv_tx_id() {
-                self.auto_commit.store(true, Ordering::SeqCst);
+                self.end_transaction();
                 if mv_store.is_tx_rollbackable(tx_id) {
                     mv_store.rollback_tx(tx_id, pager.clone(), self, crate::MAIN_DB_ID);
                 } else {
@@ -5183,7 +5213,7 @@ impl Connection {
             self.rollback_attached_mvcc_txs(clear_attached_schemas);
         } else {
             pager.rollback_tx(self);
-            self.auto_commit.store(true, Ordering::SeqCst);
+            self.end_transaction();
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
@@ -5221,7 +5251,7 @@ impl Connection {
             self.rollback_attached_wal_txns();
             self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
-            self.auto_commit.store(true, Ordering::SeqCst);
+            self.end_transaction();
             self.set_tx_read_only(false);
         }
 

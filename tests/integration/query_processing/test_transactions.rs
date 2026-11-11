@@ -2665,3 +2665,210 @@ fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempData
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
     assert_eq!(rows, vec![(1,)]);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_now_is_the_same_on_every_row_of_a_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT count(DISTINCT now()) FROM generate_series(1, 20000)");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_now_is_the_time_the_transaction_began(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("BEGIN").unwrap();
+    let first = now(&conn);
+    wait_for_the_clock_to_move();
+    // A schema change reads the new schema back, and the transaction must keep
+    // its start time through that.
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    let second = now(&conn);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(first, second);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_now_moves_on_when_a_statement_runs_again(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare("SELECT now()").unwrap();
+    let first = stmt.run_collect_rows().unwrap();
+    stmt.reset().unwrap();
+    wait_for_the_clock_to_move();
+    let second = stmt.run_collect_rows().unwrap();
+    assert!(
+        second > first,
+        "the second run read {second:?}, not later than {first:?}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_now_moves_on_after_commit_and_rollback(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    assert_now_moves_on_when_the_transaction_ends(&conn, "BEGIN", "COMMIT", "COMMIT");
+    assert_now_moves_on_when_the_transaction_ends(&conn, "BEGIN", "ROLLBACK", "COMMIT");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_now_moves_on_after_the_outermost_release(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    assert_now_moves_on_when_the_transaction_ends(&conn, "SAVEPOINT s", "RELEASE s", "RELEASE s");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_now_moves_on_after_an_error_ends_the_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let in_transaction = now(&conn);
+    wait_for_the_clock_to_move();
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1)");
+    assert!(
+        matches!(result, Err(LimboError::Constraint(_))),
+        "expected a constraint error, got {result:?}"
+    );
+    assert!(conn.get_auto_commit(), "OR ROLLBACK ends the transaction");
+    let after = now(&conn);
+    assert!(
+        after > in_transaction,
+        "{after} is not later than {in_transaction}"
+    );
+
+    wait_for_the_clock_to_move();
+    conn.execute("BEGIN").unwrap();
+    let in_next_transaction = now(&conn);
+    conn.execute("COMMIT").unwrap();
+    assert!(
+        in_next_transaction > after,
+        "{in_next_transaction} is not later than {after}"
+    );
+}
+
+/// The engine rolls back the failed statement and keeps the transaction, so the
+/// transaction keeps its `now()`.
+#[test]
+fn test_now_stays_after_a_sequence_runs_out_in_begin_concurrent() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_now_after_a_sequence_runs_out.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE SEQUENCE tiny MAXVALUE 2").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER DEFAULT (nextval('tiny')))")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let values: Vec<(i64,)> = conn.exec_rows("SELECT nextval('tiny') FROM generate_series(1, 2)");
+    assert_eq!(values, vec![(1,), (2,)]);
+    let in_transaction = now(&conn);
+    wait_for_the_clock_to_move();
+    let result = conn.execute("INSERT INTO t DEFAULT VALUES");
+    assert!(result.is_err(), "the sequence has run out, got {result:?}");
+    assert!(!conn.get_auto_commit(), "the transaction is still open");
+    assert_eq!(now(&conn), in_transaction);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn test_now_stays_the_same_when_a_transaction_begins_or_ends_during_a_statement(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let mut in_autocommit = conn.query("SELECT now() FROM t").unwrap().unwrap();
+    let first = next_text(&mut in_autocommit);
+    wait_for_the_clock_to_move();
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(next_text(&mut in_autocommit), first);
+    assert_eq!(next_text(&mut in_autocommit), first);
+    finish(&mut in_autocommit);
+    assert!(!conn.get_auto_commit(), "BEGIN opened a transaction");
+
+    let mut in_transaction = conn.query("SELECT now() FROM t").unwrap().unwrap();
+    let first = next_text(&mut in_transaction);
+    wait_for_the_clock_to_move();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(next_text(&mut in_transaction), first);
+    assert_eq!(next_text(&mut in_transaction), first);
+    finish(&mut in_transaction);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_sees_the_time_of_the_statement_that_fired_it(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE a (ts TEXT)").unwrap();
+    conn.execute("CREATE TABLE log (ts TEXT)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER log_a AFTER INSERT ON a BEGIN INSERT INTO log VALUES (now()); END",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO a SELECT now() FROM generate_series(1, 1000)")
+        .unwrap();
+    let rows: Vec<(i64, i64)> = conn.exec_rows(
+        "SELECT count(*), count(DISTINCT ts) FROM (SELECT ts FROM a UNION ALL SELECT ts FROM log)",
+    );
+    assert_eq!(rows, vec![(2000, 1)]);
+}
+
+/// Checks that `now()` inside a transaction is earlier than `now()` after it
+/// ends, and that a new transaction gets a later `now()` again.
+fn assert_now_moves_on_when_the_transaction_ends(
+    conn: &Arc<Connection>,
+    begin: &str,
+    end: &str,
+    end_next: &str,
+) {
+    conn.execute(begin).unwrap();
+    let in_transaction = now(conn);
+    wait_for_the_clock_to_move();
+    conn.execute(end).unwrap();
+    let after = now(conn);
+    assert!(
+        after > in_transaction,
+        "after {end}: {after} is not later than {in_transaction}"
+    );
+
+    wait_for_the_clock_to_move();
+    conn.execute(begin).unwrap();
+    let in_next_transaction = now(conn);
+    conn.execute(end_next).unwrap();
+    assert!(
+        in_next_transaction > after,
+        "{begin} after {end}: {in_next_transaction} is not later than {after}"
+    );
+}
+
+/// `now()` as text. The text of later times sorts later.
+fn now(conn: &Arc<Connection>) -> String {
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT now()");
+    let [(time,)] = <[(String,); 1]>::try_from(rows).unwrap();
+    time
+}
+
+fn next_text(stmt: &mut Statement) -> String {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => return stmt.row().unwrap().get::<&Value>(0).unwrap().to_string(),
+            StepResult::IO => stmt._io().step().unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+}
+
+fn finish(stmt: &mut Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::IO => stmt._io().step().unwrap(),
+            other => panic!("expected the statement to end, got {other:?}"),
+        }
+    }
+}
+
+/// Sleeps long enough that the clock, read in microseconds, gives a later time.
+fn wait_for_the_clock_to_move() {
+    std::thread::sleep(Duration::from_millis(2));
+}

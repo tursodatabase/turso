@@ -799,6 +799,12 @@ impl Statement {
         self.state.current_time = Some(now);
     }
 
+    /// Makes a trigger or foreign key action see the same
+    /// `statement_timestamp()` and `now()` as the statement that runs it.
+    pub(crate) fn set_statement_times(&mut self, times: crate::dialect::StatementTimes) {
+        self.state.statement_times = Some(times);
+    }
+
     /// Makes a trigger or foreign key action stop at the deadline of the
     /// statement that runs it.
     pub(crate) fn set_query_deadline(&mut self, deadline: Option<crate::MonotonicInstant>) {
@@ -1458,7 +1464,17 @@ impl Statement {
         // but mv_tx points to a live outer tx, which causes subsequent BEGINs
         // to silently no-op and pins the caller to the outer's stale snapshot.
         if pending.saved_outer.is_some() {
-            conn.auto_commit.store(false, Ordering::SeqCst);
+            if let Some(start) = pending.saved_transaction_time {
+                conn.begin_user_transaction(start);
+            } else {
+                // The outer transaction is the statement's own, which an
+                // attached database's sequence wraps while another statement
+                // reads. The connection was in autocommit then and still is.
+                turso_assert!(
+                    conn.get_auto_commit(),
+                    "a sequence's inner transaction left autocommit without a user transaction"
+                );
+            }
         }
         // The commit-state-machine, if any was in flight, is now dead:
         // the inner tx it was committing is gone.

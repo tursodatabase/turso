@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, LimboError, OpenFlags, StepResult};
 use turso_sqlite::SqliteDialect;
 
 const PAGE_SIZE_OFFSET: u64 = 16;
@@ -957,5 +957,58 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
             vec![rusqlite::types::Value::Integer(12)],
         ]
     );
+    Ok(())
+}
+
+/// While another statement reads, a statement's transaction on an attached
+/// MVCC database is not exclusive, so `nextval` there runs in a transaction of
+/// its own. When the sequence has run out, the connection stays in autocommit.
+#[test]
+fn test_attached_sequence_that_runs_out_while_a_statement_reads_leaves_autocommit(
+) -> anyhow::Result<()> {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_attach(true))
+        .with_mvcc(true)
+        .build();
+    let aux_path = db.path.with_extension("attached_sequence_runs_out.db");
+    let aux_path = aux_path.to_str().unwrap();
+    {
+        let aux = Database::open_file(db.io.clone(), aux_path, Arc::new(SqliteDialect))?;
+        let aux = aux.connect(ConnectOpts::new())?;
+        aux.pragma_update("journal_mode", "'mvcc'")?;
+        aux.execute("CREATE SEQUENCE tiny MAXVALUE 2")?;
+        aux.execute("SELECT nextval('tiny')")?;
+        aux.execute("SELECT nextval('tiny')")?;
+        aux.execute("CREATE TABLE v (x INTEGER)")?;
+        aux.close()?;
+    }
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    conn.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+
+    let mut reader = conn.query("SELECT x FROM t")?.unwrap();
+    loop {
+        match reader.step()? {
+            StepResult::Row => break,
+            StepResult::IO => db.io.step()?,
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+    let result = conn.execute("SELECT nextval('aux.tiny')");
+    assert!(
+        matches!(result, Err(LimboError::SequenceExhausted { .. })),
+        "the sequence has run out, got {result:?}"
+    );
+    assert!(conn.get_auto_commit(), "nextval left a transaction open");
+    drop(reader);
+
+    conn.execute("INSERT INTO t VALUES (4)")?;
+    conn.execute("INSERT INTO aux.v VALUES (1)")?;
+    let other = db.connect_limbo();
+    other.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    let rows: Vec<(i64, i64)> =
+        other.exec_rows("SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM aux.v)");
+    assert_eq!(rows, vec![(4, 1)]);
     Ok(())
 }
