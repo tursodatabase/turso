@@ -1,4 +1,5 @@
 pub(crate) mod arity;
+pub mod intrinsic;
 pub mod scalar;
 
 use crate::sync::Arc;
@@ -1116,6 +1117,7 @@ pub enum Func {
     Agg(AggFunc),
     Window(WindowFunc),
     Scalar(&'static dyn scalar::ScalarFunction),
+    Intrinsic(&'static dyn intrinsic::IntrinsicFunction),
     Math(MathFunc),
     Vector(VectorFunc),
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1136,6 +1138,7 @@ impl Display for Func {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
             Self::Window(window_func) => write!(f, "{window_func}"),
             Self::Scalar(func) => f.write_str(func.metadata().name),
+            Self::Intrinsic(func) => f.write_str(func.metadata().name),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1164,6 +1167,7 @@ impl Deterministic for Func {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
             Self::Window(window_func) => window_func.is_deterministic(),
             Self::Scalar(func) => func.metadata().deterministic,
+            Self::Intrinsic(func) => func.metadata().deterministic,
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1251,6 +1255,7 @@ impl Func {
         };
         match self {
             Self::Scalar(func) => func.metadata().result_type,
+            Self::Intrinsic(func) => func.metadata().result_type,
             Self::Math(func) => func.result_type(),
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
@@ -1271,6 +1276,22 @@ impl Func {
         match self.result_type() {
             ResultType::Declared(return_type) => Some(return_type),
             _ => None,
+        }
+    }
+
+    pub(crate) fn catalog_metadata(&self) -> Option<&scalar::ScalarFunctionMetadata> {
+        match self {
+            Self::Scalar(function) => Some(function.metadata()),
+            Self::Intrinsic(function) => Some(function.metadata()),
+            _ => None,
+        }
+    }
+
+    fn is_internal(&self) -> bool {
+        match self {
+            Self::Scalar(function) => function.is_internal(),
+            Self::Intrinsic(function) => function.is_internal(),
+            _ => false,
         }
     }
 
@@ -1299,9 +1320,14 @@ impl Func {
             return true;
         }
         match self {
-            Self::Scalar(function) => {
-                !function.is_internal()
-                    && matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
+            Self::Scalar(_) | Self::Intrinsic(_) => {
+                !self.is_internal()
+                    && matches!(
+                        self.catalog_metadata()
+                            .expect("catalog function metadata")
+                            .arity,
+                        arity::FunctionArity::Exact(0)
+                    )
             }
             Self::Math(math_func) => {
                 matches!(math_func.arity(), MathFuncArity::Nullary)
@@ -1319,6 +1345,7 @@ impl Func {
     pub fn can_mask_nulls(&self) -> bool {
         match self {
             Self::Scalar(func) => func.metadata().can_mask_nulls,
+            Self::Intrinsic(func) => func.metadata().can_mask_nulls,
             _ => false,
         }
     }
@@ -1373,7 +1400,9 @@ impl Func {
             if function.is_internal() {
                 continue;
             }
-            let metadata = function.metadata();
+            let metadata = function
+                .catalog_metadata()
+                .expect("catalog function metadata");
             push(
                 metadata.name.to_owned(),
                 "s",

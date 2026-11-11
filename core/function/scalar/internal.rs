@@ -1,9 +1,9 @@
-use super::FunctionCompileContext;
 use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::function::intrinsic::{FunctionCompileContext, IntrinsicFunction};
 use crate::numeric::Numeric;
 use crate::stats::StatAccum;
 use crate::IOResult;
@@ -21,12 +21,6 @@ impl ScalarFunction for StatInit {
         true
     }
 
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!(
-            "{} is an internal function used by ANALYZE",
-            self.metadata().name
-        );
-    }
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "stat_init",
@@ -61,12 +55,6 @@ impl ScalarFunction for StatPush {
         true
     }
 
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!(
-            "{} is an internal function used by ANALYZE",
-            self.metadata().name
-        );
-    }
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "stat_push",
@@ -113,12 +101,6 @@ impl ScalarFunction for StatGet {
         true
     }
 
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!(
-            "{} is an internal function used by ANALYZE",
-            self.metadata().name
-        );
-    }
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "stat_get",
@@ -159,17 +141,26 @@ impl ScalarFunction for StatGet {
 #[derive(Debug)]
 pub(crate) struct ConnTxnId;
 
+impl IntrinsicFunction for ConnTxnId {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        ScalarFunction::metadata(self)
+    }
+    fn is_internal(&self) -> bool {
+        ScalarFunction::is_internal(self)
+    }
+    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+        crate::bail_parse_error!(
+            "{} is an internal function used by CDC",
+            ScalarFunction::metadata(self).name
+        );
+    }
+}
+
 impl ScalarFunction for ConnTxnId {
     fn is_internal(&self) -> bool {
         true
     }
 
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!(
-            "{} is an internal function used by CDC",
-            self.metadata().name
-        );
-    }
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "conn_txn_id",
@@ -205,17 +196,26 @@ impl ScalarFunction for ConnTxnId {
 #[derive(Debug)]
 pub(crate) struct IsAutocommit;
 
+impl IntrinsicFunction for IsAutocommit {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        ScalarFunction::metadata(self)
+    }
+    fn is_internal(&self) -> bool {
+        ScalarFunction::is_internal(self)
+    }
+    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+        crate::bail_parse_error!(
+            "{} is an internal function used by CDC",
+            ScalarFunction::metadata(self).name
+        );
+    }
+}
+
 impl ScalarFunction for IsAutocommit {
     fn is_internal(&self) -> bool {
         true
     }
 
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!(
-            "{} is an internal function used by CDC",
-            self.metadata().name
-        );
-    }
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "is_autocommit",

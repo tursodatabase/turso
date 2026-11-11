@@ -1,13 +1,11 @@
-use super::{
-    FunctionArity, FunctionCompileContext, ResultType, ReturnType, ScalarFunction,
-    ScalarFunctionMetadata,
-};
+use super::{FunctionCompileContext, IntrinsicFunction};
+use crate::scalar::{FunctionArity, ResultType, ReturnType, ScalarFunctionMetadata};
 use crate::Result;
 
 #[derive(Debug)]
 pub(crate) struct Array;
 
-impl ScalarFunction for Array {
+impl IntrinsicFunction for Array {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.array()
     }
@@ -29,7 +27,7 @@ impl ScalarFunction for Array {
 #[derive(Debug)]
 pub(crate) struct ArrayElement;
 
-impl ScalarFunction for ArrayElement {
+impl IntrinsicFunction for ArrayElement {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.array_element()
     }
@@ -51,7 +49,7 @@ impl ScalarFunction for ArrayElement {
 #[derive(Debug)]
 pub(crate) struct ArraySetElement;
 
-impl ScalarFunction for ArraySetElement {
+impl IntrinsicFunction for ArraySetElement {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.array_set_element()
     }
@@ -73,7 +71,7 @@ impl ScalarFunction for ArraySetElement {
 #[derive(Debug)]
 pub(crate) struct StructPack;
 
-impl ScalarFunction for StructPack {
+impl IntrinsicFunction for StructPack {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.struct_pack()
     }
@@ -92,7 +90,7 @@ impl ScalarFunction for StructPack {
 #[derive(Debug)]
 pub(crate) struct StructExtractFunc;
 
-impl ScalarFunction for StructExtractFunc {
+impl IntrinsicFunction for StructExtractFunc {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.struct_extract()
     }
@@ -111,7 +109,7 @@ impl ScalarFunction for StructExtractFunc {
 #[derive(Debug)]
 pub(crate) struct UnionValueFunc;
 
-impl ScalarFunction for UnionValueFunc {
+impl IntrinsicFunction for UnionValueFunc {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.union_value()
     }
@@ -130,7 +128,7 @@ impl ScalarFunction for UnionValueFunc {
 #[derive(Debug)]
 pub(crate) struct UnionTagFunc;
 
-impl ScalarFunction for UnionTagFunc {
+impl IntrinsicFunction for UnionTagFunc {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.union_tag()
     }
@@ -149,7 +147,7 @@ impl ScalarFunction for UnionTagFunc {
 #[derive(Debug)]
 pub(crate) struct UnionExtractFunc;
 
-impl ScalarFunction for UnionExtractFunc {
+impl IntrinsicFunction for UnionExtractFunc {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.union_extract()
     }

@@ -1,12 +1,11 @@
-use super::{
-    FunctionArity, FunctionCompileContext, ResultType, ScalarFunction, ScalarFunctionMetadata,
-};
+use super::{FunctionCompileContext, IntrinsicFunction};
+use crate::scalar::{FunctionArity, ResultType, ScalarFunctionMetadata};
 use crate::Result;
 
 #[derive(Debug)]
 pub(crate) struct Coalesce;
 
-impl ScalarFunction for Coalesce {
+impl IntrinsicFunction for Coalesce {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.coalesce()
     }
@@ -25,7 +24,7 @@ impl ScalarFunction for Coalesce {
 #[derive(Debug)]
 pub(crate) struct IfNull;
 
-impl ScalarFunction for IfNull {
+impl IntrinsicFunction for IfNull {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.ifnull()
     }
@@ -44,7 +43,7 @@ impl ScalarFunction for IfNull {
 #[derive(Debug)]
 pub(crate) struct Iif;
 
-impl ScalarFunction for Iif {
+impl IntrinsicFunction for Iif {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.iif()
     }
@@ -63,7 +62,7 @@ impl ScalarFunction for Iif {
 #[derive(Debug)]
 pub(crate) struct Likely;
 
-impl ScalarFunction for Likely {
+impl IntrinsicFunction for Likely {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.likely()
     }
@@ -82,7 +81,7 @@ impl ScalarFunction for Likely {
 #[derive(Debug)]
 pub(crate) struct Unlikely;
 
-impl ScalarFunction for Unlikely {
+impl IntrinsicFunction for Unlikely {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.unlikely()
     }
@@ -101,7 +100,7 @@ impl ScalarFunction for Unlikely {
 #[derive(Debug)]
 pub(crate) struct Likelihood;
 
-impl ScalarFunction for Likelihood {
+impl IntrinsicFunction for Likelihood {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.likelihood()
     }

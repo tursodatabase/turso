@@ -1,7 +1,9 @@
 use super::{
-    FunctionArgs, FunctionArity, FunctionCompileContext, FunctionContext, ResultType, ReturnType,
-    ScalarFunction, ScalarFunctionMetadata, ScalarState,
+    FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
+    ScalarFunctionMetadata, ScalarState,
 };
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
+use crate::function::intrinsic::{FunctionCompileContext, IntrinsicFunction};
 use crate::{IOResult, LimboError, Result, Value};
 
 #[derive(Debug)]
@@ -41,6 +43,24 @@ impl ScalarFunction for TursoVersion {
 pub(crate) struct LoadExtension;
 
 #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+impl IntrinsicFunction for LoadExtension {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        ScalarFunction::metadata(self)
+    }
+    fn compile(&self, mut context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+        context.func_ctx.func = crate::Func::Scalar(&LoadExtension);
+        // Keep the existing arity errors and variadic function_list entry.
+        if context.args.is_empty() {
+            crate::bail_parse_error!("load_extension function with no arguments");
+        }
+        if context.args.len() != 1 {
+            crate::bail_parse_error!("load_extension function called with not exactly 1 arguments");
+        }
+        context.compile_default()
+    }
+}
+
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
 impl ScalarFunction for LoadExtension {
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
@@ -50,17 +70,6 @@ impl ScalarFunction for LoadExtension {
             can_mask_nulls: false,
             result_type: ResultType::Unknown,
         }
-    }
-
-    fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        // Keep the existing arity errors and variadic function_list entry.
-        if context.args.is_empty() {
-            crate::bail_parse_error!("load_extension function with no arguments");
-        }
-        if context.args.len() != 1 {
-            crate::bail_parse_error!("load_extension function called with not exactly 1 arguments");
-        }
-        context.compile_default()
     }
 
     fn execute(
@@ -103,9 +112,7 @@ impl ScalarFunction for Attach {
             result_type: ResultType::Unknown,
         }
     }
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!("ATTACH should be handled at statement level, not as expression");
-    }
+
     fn execute(
         &self,
         context: &FunctionContext<'_>,
@@ -148,9 +155,7 @@ impl ScalarFunction for Detach {
             result_type: ResultType::Unknown,
         }
     }
-    fn compile(&self, _context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        crate::bail_parse_error!("DETACH should be handled at statement level, not as expression");
-    }
+
     fn execute(
         &self,
         context: &FunctionContext<'_>,

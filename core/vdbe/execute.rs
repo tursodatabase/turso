@@ -10300,6 +10300,9 @@ pub fn op_function(
                 }
             }
         },
+        crate::function::Func::Intrinsic(_) => {
+            unreachable!("intrinsic function must be compiled before execution");
+        }
         crate::function::Func::Scalar(function) => {
             let args = crate::function::scalar::FunctionArgs::new(
                 &state.registers[*start_reg..*start_reg + arg_count],

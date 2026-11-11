@@ -1,9 +1,9 @@
-use super::FunctionCompileContext;
 use super::ScalarState;
 use super::{
     FunctionArgs, FunctionArity, FunctionContext, ResultType, ReturnType, ScalarFunction,
     ScalarFunctionMetadata,
 };
+use crate::function::intrinsic::{FunctionCompileContext, IntrinsicFunction};
 use crate::IOResult;
 use crate::{namespace::mangle_name, LimboError};
 use crate::{Result, Value};
@@ -11,7 +11,7 @@ use crate::{Result, Value};
 #[derive(Debug)]
 pub(crate) struct NextVal;
 
-impl ScalarFunction for NextVal {
+impl IntrinsicFunction for NextVal {
     fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
         context.nextval()
     }
@@ -30,11 +30,17 @@ impl ScalarFunction for NextVal {
 #[derive(Debug)]
 pub(crate) struct CurrVal;
 
-impl ScalarFunction for CurrVal {
-    fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+impl IntrinsicFunction for CurrVal {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        ScalarFunction::metadata(self)
+    }
+    fn compile(&self, mut context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+        context.func_ctx.func = crate::Func::Scalar(&CurrVal);
         context.currval()
     }
+}
 
+impl ScalarFunction for CurrVal {
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "currval",
@@ -80,11 +86,17 @@ impl ScalarFunction for CurrVal {
 #[derive(Debug)]
 pub(crate) struct SetVal;
 
-impl ScalarFunction for SetVal {
-    fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+impl IntrinsicFunction for SetVal {
+    fn metadata(&self) -> &ScalarFunctionMetadata {
+        ScalarFunction::metadata(self)
+    }
+    fn compile(&self, mut context: FunctionCompileContext<'_, '_>) -> Result<usize> {
+        context.func_ctx.func = crate::Func::Scalar(&SetVal);
         context.setval()
     }
+}
 
+impl ScalarFunction for SetVal {
     fn metadata(&self) -> &ScalarFunctionMetadata {
         &ScalarFunctionMetadata {
             name: "setval",

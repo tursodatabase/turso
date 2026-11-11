@@ -1103,7 +1103,20 @@ fn translate_function_call_expr(
             function
                 .metadata()
                 .validate_arg_count(name.as_str(), args_count)?;
-            function.compile(crate::scalar::FunctionCompileContext {
+            translate_function(
+                program,
+                args,
+                referenced_tables,
+                resolver,
+                target_register,
+                func_ctx,
+            )
+        }
+        Func::Intrinsic(function) => {
+            function
+                .metadata()
+                .validate_arg_count(name.as_str(), args_count)?;
+            function.compile(crate::function::intrinsic::FunctionCompileContext {
                 program,
                 args,
                 referenced_tables,

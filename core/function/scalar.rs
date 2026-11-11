@@ -1,9 +1,9 @@
+use super::intrinsic::{constructors, control, IntrinsicFunction};
+use super::Func;
 use crate::IOResult;
 pub(crate) mod arrays;
 pub(crate) mod comparison;
-pub(crate) mod constructors;
 pub(crate) mod context;
-pub(crate) mod control;
 pub(crate) mod datetime;
 pub(crate) mod internal;
 pub(crate) mod numeric;
@@ -20,7 +20,6 @@ use std::sync::LazyLock;
 
 pub use super::arity::FunctionArity;
 pub use super::{ResultType, ReturnType};
-pub use crate::translate::expr::scalar::FunctionCompileContext;
 use crate::vdbe::Register;
 use crate::{Connection, Result, Value};
 
@@ -28,9 +27,6 @@ pub trait ScalarFunction: Debug + Send + Sync {
     fn metadata(&self) -> &ScalarFunctionMetadata;
     fn is_internal(&self) -> bool {
         false
-    }
-    fn compile(&self, context: FunctionCompileContext<'_, '_>) -> Result<usize> {
-        context.compile_default()
     }
     fn argument_translation(&self) -> ArgumentTranslation {
         ArgumentTranslation::Values
@@ -55,12 +51,7 @@ pub trait ScalarFunction: Debug + Send + Sync {
         _context: &FunctionContext<'_>,
         _args: FunctionArgs<'_>,
         _state: &mut ScalarState,
-    ) -> Result<IOResult<Value>> {
-        Err(crate::LimboError::InternalError(format!(
-            "{} must be compiled to dedicated instructions",
-            self.metadata().name
-        )))
-    }
+    ) -> Result<IOResult<Value>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +174,7 @@ impl<'a> FunctionArgs<'a> {
 
 #[derive(Default)]
 pub(crate) struct FunctionCatalog {
-    by_name: HashMap<&'static str, &'static dyn ScalarFunction>,
+    by_name: HashMap<&'static str, Func>,
 }
 
 impl FunctionCatalog {
@@ -192,35 +183,58 @@ impl FunctionCatalog {
         function: &'static dyn ScalarFunction,
         aliases: &[&'static str],
     ) {
-        function
-            .metadata()
+        self.insert(Func::Scalar(function), function.metadata(), aliases);
+    }
+
+    pub(crate) fn register_intrinsic(
+        &mut self,
+        function: &'static dyn IntrinsicFunction,
+        aliases: &[&'static str],
+    ) {
+        self.insert(Func::Intrinsic(function), function.metadata(), aliases);
+    }
+
+    fn insert(
+        &mut self,
+        function: Func,
+        metadata: &ScalarFunctionMetadata,
+        aliases: &[&'static str],
+    ) {
+        metadata
             .arity
             .validate()
             .expect("invalid built-in function arity");
-        for name in std::iter::once(function.metadata().name).chain(aliases.iter().copied()) {
+        for name in std::iter::once(metadata.name).chain(aliases.iter().copied()) {
             assert_eq!(name, crate::util::normalize_ident(name));
-            self.by_name.insert(name, function);
+            self.by_name.insert(name, function.clone());
         }
     }
 
-    pub(crate) fn lookup(
-        &self,
-        normalized_name: &str,
-        arg_count: usize,
-    ) -> Option<&'static dyn ScalarFunction> {
-        self.get(normalized_name)
-            .filter(|function| function.metadata().arity.accepts(arg_count))
+    pub(crate) fn lookup(&self, normalized_name: &str, arg_count: usize) -> Option<&Func> {
+        self.get(normalized_name).filter(|function| {
+            function
+                .catalog_metadata()
+                .expect("catalog function metadata")
+                .arity
+                .accepts(arg_count)
+        })
     }
 
-    pub(crate) fn get(&self, normalized_name: &str) -> Option<&'static dyn ScalarFunction> {
-        self.by_name.get(normalized_name).copied()
+    pub(crate) fn get(&self, normalized_name: &str) -> Option<&Func> {
+        self.by_name.get(normalized_name)
     }
 
-    pub(crate) fn functions(&self) -> impl Iterator<Item = &'static dyn ScalarFunction> + '_ {
+    pub(crate) fn functions(&self) -> impl Iterator<Item = &Func> + '_ {
         self.by_name
             .iter()
-            .filter(|(name, function)| **name == function.metadata().name)
-            .map(|(_, function)| *function)
+            .filter(|(name, function)| {
+                **name
+                    == function
+                        .catalog_metadata()
+                        .expect("catalog function metadata")
+                        .name
+            })
+            .map(|(_, function)| function)
     }
 }
 
@@ -308,35 +322,35 @@ pub(crate) static BUILTIN_SCALAR_FUNCTIONS: LazyLock<FunctionCatalog> = LazyLock
     catalog.register(&comparison::Min, &[]);
     catalog.register(&comparison::Max, &[]);
     catalog.register(&comparison::Nullif, &[]);
-    catalog.register(&control::Coalesce, &[]);
-    catalog.register(&control::IfNull, &[]);
-    catalog.register(&control::Iif, &["if"]);
-    catalog.register(&control::Likely, &[]);
-    catalog.register(&control::Unlikely, &[]);
-    catalog.register(&control::Likelihood, &[]);
-    catalog.register(&constructors::Array, &[]);
-    catalog.register(&constructors::ArrayElement, &[]);
-    catalog.register(&constructors::ArraySetElement, &[]);
-    catalog.register(&constructors::StructPack, &[]);
-    catalog.register(&constructors::StructExtractFunc, &[]);
-    catalog.register(&constructors::UnionValueFunc, &[]);
-    catalog.register(&constructors::UnionTagFunc, &[]);
-    catalog.register(&constructors::UnionExtractFunc, &[]);
-    catalog.register(&internal::ConnTxnId, &[]);
-    catalog.register(&internal::IsAutocommit, &[]);
+    catalog.register_intrinsic(&control::Coalesce, &[]);
+    catalog.register_intrinsic(&control::IfNull, &[]);
+    catalog.register_intrinsic(&control::Iif, &["if"]);
+    catalog.register_intrinsic(&control::Likely, &[]);
+    catalog.register_intrinsic(&control::Unlikely, &[]);
+    catalog.register_intrinsic(&control::Likelihood, &[]);
+    catalog.register_intrinsic(&constructors::Array, &[]);
+    catalog.register_intrinsic(&constructors::ArrayElement, &[]);
+    catalog.register_intrinsic(&constructors::ArraySetElement, &[]);
+    catalog.register_intrinsic(&constructors::StructPack, &[]);
+    catalog.register_intrinsic(&constructors::StructExtractFunc, &[]);
+    catalog.register_intrinsic(&constructors::UnionValueFunc, &[]);
+    catalog.register_intrinsic(&constructors::UnionTagFunc, &[]);
+    catalog.register_intrinsic(&constructors::UnionExtractFunc, &[]);
+    catalog.register_intrinsic(&internal::ConnTxnId, &[]);
+    catalog.register_intrinsic(&internal::IsAutocommit, &[]);
     catalog.register(&internal::TableColumnsJsonArray, &[]);
     catalog.register(&internal::BinRecordJsonObject, &[]);
     catalog.register(&internal::TestUintEncode, &[]);
     catalog.register(&internal::TestUintDecode, &[]);
     #[cfg(feature = "test_helper")]
     catalog.register(&internal::TestNondetCounter, &[]);
-    catalog.register(&sequence::NextVal, &[]);
-    catalog.register(&sequence::CurrVal, &[]);
-    catalog.register(&sequence::SetVal, &[]);
+    catalog.register_intrinsic(&sequence::NextVal, &[]);
+    catalog.register_intrinsic(&sequence::CurrVal, &[]);
+    catalog.register_intrinsic(&sequence::SetVal, &[]);
     catalog.register(&sequence::SequenceWatermark, &[]);
     catalog.register(&system::TursoVersion, &[]);
     #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    catalog.register(&system::LoadExtension, &[]);
+    catalog.register_intrinsic(&system::LoadExtension, &[]);
     catalog
 });
 
@@ -767,16 +781,39 @@ mod tests {
         for name in ["abs", "absolute"] {
             assert!(catalog.lookup(name, 1).is_none());
             assert!(matches!(
-                catalog.lookup(name, 2).unwrap().metadata().arity,
+                catalog
+                    .lookup(name, 2)
+                    .unwrap()
+                    .catalog_metadata()
+                    .unwrap()
+                    .arity,
                 super::FunctionArity::Exact(2)
             ));
         }
         let functions: Vec<_> = catalog.functions().collect();
         assert_eq!(functions.len(), 1);
         assert!(matches!(
-            functions[0].metadata().arity,
+            functions[0].catalog_metadata().unwrap().arity,
             super::FunctionArity::Exact(2)
         ));
+    }
+
+    #[test]
+    fn catalog_replacements_can_change_function_kind() {
+        let mut catalog = super::FunctionCatalog::default();
+        catalog.register(&super::Abs, &["coalesce"]);
+        catalog.register_intrinsic(&super::control::Coalesce, &["fallback"]);
+        assert!(matches!(catalog.lookup("abs", 1), Some(Func::Scalar(_))));
+        for name in ["coalesce", "fallback"] {
+            assert!(matches!(catalog.lookup(name, 2), Some(Func::Intrinsic(_))));
+        }
+        assert_eq!(catalog.functions().count(), 2);
+        catalog.register(&super::Abs, &["coalesce", "fallback"]);
+        for name in ["coalesce", "fallback"] {
+            assert!(matches!(catalog.lookup(name, 1), Some(Func::Scalar(_))));
+            assert!(catalog.lookup(name, 2).is_none());
+        }
+        assert_eq!(catalog.functions().count(), 1);
     }
 
     #[test]
@@ -802,6 +839,14 @@ mod tests {
                 can_mask_nulls: false,
                 result_type: super::ResultType::Unknown,
             }
+        }
+        fn execute(
+            &self,
+            _context: &super::FunctionContext<'_>,
+            _args: super::FunctionArgs<'_>,
+            _state: &mut super::ScalarState,
+        ) -> crate::Result<crate::IOResult<crate::Value>> {
+            Ok(crate::IOResult::Done(crate::Value::Null))
         }
     }
 
