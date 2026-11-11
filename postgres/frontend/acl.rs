@@ -84,12 +84,23 @@ impl Privileges {
     }
 
     /// The privileges that `GRANT privileges` gives on a relation of `kind`.
+    /// As in PostgreSQL, `ALL` is every privilege of the kind, and a
+    /// privilege the kind does not have, such as INSERT on a sequence, is
+    /// left out.
     pub(crate) fn granted_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
         let all = Self::all_on(kind);
         let granted = privileges.iter().fold(Self::empty(), |granted, privilege| {
             granted
                 | match privilege {
                     ast::Privilege::Select => Self::SELECT,
+                    ast::Privilege::Insert => Self::INSERT,
+                    ast::Privilege::Update => Self::UPDATE,
+                    ast::Privilege::Delete => Self::DELETE,
+                    ast::Privilege::Truncate => Self::TRUNCATE,
+                    ast::Privilege::References => Self::REFERENCES,
+                    ast::Privilege::Trigger => Self::TRIGGER,
+                    ast::Privilege::Maintain => Self::MAINTAIN,
+                    ast::Privilege::All => all,
                 }
         });
         granted & all
@@ -317,6 +328,35 @@ mod tests {
         assert_eq!(
             acl.display_text(&names),
             "{postgres=arwdDxtm/postgres,reader=r/postgres,=r/postgres}"
+        );
+    }
+
+    #[test]
+    fn grant_gives_the_privileges_that_the_kind_of_relation_has() {
+        let letters = |kind, privileges: &[ast::Privilege]| {
+            Privileges::granted_on(kind, privileges).to_string()
+        };
+        assert_eq!(
+            letters(RelationKind::Table, &[ast::Privilege::All]),
+            "arwdDxtm"
+        );
+        assert_eq!(
+            letters(RelationKind::Sequence, &[ast::Privilege::All]),
+            "rwU"
+        );
+        assert_eq!(
+            letters(
+                RelationKind::Table,
+                &[ast::Privilege::Update, ast::Privilege::Select]
+            ),
+            "rw"
+        );
+        assert_eq!(
+            letters(
+                RelationKind::Sequence,
+                &[ast::Privilege::Insert, ast::Privilege::Update]
+            ),
+            "w"
         );
     }
 

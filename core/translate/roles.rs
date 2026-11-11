@@ -321,6 +321,7 @@ pub(crate) fn check_privilege(
     }
     let action = match privilege {
         ast::Privilege::Select => Action::Read,
+        _ => Action::Write,
     };
     Err(permission_denied(PermissionDenied::privilege(
         action, object,

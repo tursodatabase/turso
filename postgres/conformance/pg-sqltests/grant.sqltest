@@ -1,4 +1,4 @@
-# GRANT SELECT on tables through the PostgreSQL frontend.
+# GRANT on tables through the PostgreSQL frontend.
 # PostgreSQL roles belong to the whole server, not to one database, so every
 # test uses its own role names.
 #
@@ -357,6 +357,98 @@ test grant-select-on-sequence-is-stored-with-sequence-privileges {
 }
 expect {
     {postgres=rwU/postgres,gs_acl_seq_reader=r/postgres}
+}
+
+test grant-insert-update-delete-is-stored-in-relacl {
+    CREATE ROLE gs_acl_writer;
+    CREATE TABLE gs_acl_written (id INT);
+    GRANT INSERT, UPDATE, DELETE ON gs_acl_written TO gs_acl_writer;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_written';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_writer=awd/postgres}
+}
+
+test grant-of-more-privileges-adds-them-to-the-entry {
+    CREATE ROLE gs_acl_more;
+    CREATE TABLE gs_acl_more_docs (id INT);
+    GRANT SELECT ON gs_acl_more_docs TO gs_acl_more;
+    GRANT TRUNCATE, INSERT ON gs_acl_more_docs TO gs_acl_more;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_more_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_more=arD/postgres}
+}
+
+test grant-all-is-stored-as-every-table-privilege {
+    CREATE ROLE gs_acl_everything;
+    CREATE TABLE gs_acl_all_docs (id INT);
+    CREATE TABLE gs_acl_all_privileges_docs (id INT);
+    GRANT ALL ON gs_acl_all_docs TO gs_acl_everything;
+    GRANT ALL PRIVILEGES ON TABLE gs_acl_all_privileges_docs TO gs_acl_everything;
+    SELECT relname, relacl FROM pg_class
+        WHERE relname IN ('gs_acl_all_docs', 'gs_acl_all_privileges_docs') ORDER BY relname;
+}
+expect {
+    gs_acl_all_docs|{postgres=arwdDxtm/postgres,gs_acl_everything=arwdDxtm/postgres}
+    gs_acl_all_privileges_docs|{postgres=arwdDxtm/postgres,gs_acl_everything=arwdDxtm/postgres}
+}
+
+test grant-all-on-all-tables-in-schema-is-stored-on-each-table {
+    CREATE ROLE gs_acl_all_schema;
+    CREATE SCHEMA gs_acl_all_schema_s;
+    CREATE TABLE gs_acl_all_schema_s.a (id INT);
+    CREATE TABLE gs_acl_all_schema_s.b (id INT);
+    GRANT ALL ON ALL TABLES IN SCHEMA gs_acl_all_schema_s TO gs_acl_all_schema;
+    SELECT c.relname, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'gs_acl_all_schema_s' ORDER BY c.relname;
+}
+expect {
+    a|{postgres=arwdDxtm/postgres,gs_acl_all_schema=arwdDxtm/postgres}
+    b|{postgres=arwdDxtm/postgres,gs_acl_all_schema=arwdDxtm/postgres}
+}
+
+# A sequence has only SELECT, UPDATE and USAGE, and PostgreSQL leaves out
+# the others with a warning.
+test grant-all-on-sequence-is-stored-with-sequence-privileges {
+    CREATE ROLE gs_acl_seq_all;
+    CREATE SEQUENCE gs_acl_seq_all_s;
+    GRANT ALL ON gs_acl_seq_all_s TO gs_acl_seq_all;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_seq_all_s';
+}
+expect {
+    {postgres=rwU/postgres,gs_acl_seq_all=rwU/postgres}
+}
+
+test grant-insert-on-sequence-stores-nothing-for-the-role {
+    CREATE ROLE gs_acl_seq_insert;
+    CREATE SEQUENCE gs_acl_seq_insert_s;
+    GRANT INSERT ON gs_acl_seq_insert_s TO gs_acl_seq_insert;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_seq_insert_s';
+}
+expect {
+    {postgres=rwU/postgres}
+}
+
+test grant-of-a-privilege-tables-do-not-have-fails {
+    CREATE ROLE gs_acl_usage;
+    CREATE TABLE gs_acl_usage_docs (id INT);
+    GRANT USAGE ON gs_acl_usage_docs TO gs_acl_usage;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type USAGE for table
+}
+
+@skip-if postgres "PostgreSQL supports column privileges"
+test grant-of-column-privileges-is-not-supported {
+    CREATE ROLE gs_acl_columns;
+    CREATE TABLE gs_acl_columns_docs (id INT, body TEXT);
+    GRANT UPDATE (body) ON gs_acl_columns_docs TO gs_acl_columns;
+}
+@sqlstate 0A000
+expect error {
+    GRANT of column privileges is not supported
 }
 
 # Views are granted on too, which the Rust integration tests cover, because

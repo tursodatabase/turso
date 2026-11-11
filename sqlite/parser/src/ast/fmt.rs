@@ -1782,6 +1782,14 @@ impl ToTokens for Privilege {
     ) -> Result<(), S::Error> {
         match self {
             Self::Select => s.append(TK_SELECT, None),
+            Self::Insert => s.append(TK_INSERT, None),
+            Self::Update => s.append(TK_UPDATE, None),
+            Self::Delete => s.append(TK_DELETE, None),
+            Self::Truncate => s.append(TK_ID, Some("TRUNCATE")),
+            Self::References => s.append(TK_REFERENCES, None),
+            Self::Trigger => s.append(TK_TRIGGER, None),
+            Self::Maintain => s.append(TK_ID, Some("MAINTAIN")),
+            Self::All => s.append(TK_ALL, None),
         }
     }
 }

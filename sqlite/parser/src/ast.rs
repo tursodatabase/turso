@@ -1553,6 +1553,15 @@ pub struct Grant {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Privilege {
     Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Maintain,
+    /// `ALL [PRIVILEGES]`: every privilege that the kind of relation has.
+    All,
 }
 
 /// Whom a `GRANT` gives privileges to.
