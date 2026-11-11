@@ -111,7 +111,7 @@ pub(crate) fn check_insert(
     match policy(resolver, namespace, &table.declared_name, Command::Insert) {
         Policy::Allow => Ok(()),
         Policy::Deny | Policy::Filter(_) => Err(LimboError::PermissionDenied(Box::new(
-            PermissionDenied::policy(Object::Table(table.declared_name.clone())),
+            PermissionDenied::policy(Object::Table(table.declared_name.clone()), None, false),
         ))),
     }
 }

@@ -414,10 +414,26 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
 }
 
 fn permission_denied_message(denial: &PermissionDenied) -> String {
-    match (denial.reason, &denial.object) {
+    match (&denial.reason, &denial.object) {
         (Reason::Owner, object) => return format!("must be owner of {}", object_name(object)),
-        (Reason::Policy, Object::Table(name)) => {
-            return format!("new row violates row-level security policy for table \"{name}\"")
+        (
+            Reason::Policy {
+                policy,
+                using_condition,
+            },
+            Object::Table(name),
+        ) => {
+            let policy = policy
+                .as_ref()
+                .map_or(String::new(), |policy| format!(" \"{policy}\""));
+            let condition = if *using_condition {
+                " (USING expression)"
+            } else {
+                ""
+            };
+            return format!(
+                "new row violates row-level security policy{policy}{condition} for table \"{name}\""
+            );
         }
         _ => {}
     }

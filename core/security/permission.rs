@@ -32,27 +32,33 @@ impl PermissionDenied {
         }
     }
 
-    /// The row-level security policy of `table` does not let the role write
-    /// a row to it.
-    pub fn policy(table: Object) -> Self {
+    /// A row that the role writes to `table` fails a condition of the
+    /// table's row-level security policies: of restrictive policy `policy`,
+    /// or of the permissive policies together when it is None. The condition
+    /// is a USING condition checked on the existing row when
+    /// `using_condition` is set, and otherwise one checked on the new row.
+    pub fn policy(table: Object, policy: Option<String>, using_condition: bool) -> Self {
         Self {
             action: Action::Write,
             object: table,
-            reason: Reason::Policy,
+            reason: Reason::Policy {
+                policy,
+                using_condition,
+            },
         }
     }
 }
 
 impl fmt::Display for PermissionDenied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.reason {
+        match &self.reason {
             Reason::Privilege => write!(f, "permission denied: {} on {}", self.action, self.object),
             Reason::Owner => write!(
                 f,
                 "permission denied: {} on {} needs its owner",
                 self.action, self.object
             ),
-            Reason::Policy => write!(
+            Reason::Policy { .. } => write!(
                 f,
                 "permission denied: {} on {} violates its row-level security policy",
                 self.action, self.object
@@ -61,11 +67,15 @@ impl fmt::Display for PermissionDenied {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
     Privilege,
     Owner,
-    Policy,
+    /// See [`PermissionDenied::policy`].
+    Policy {
+        policy: Option<String>,
+        using_condition: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

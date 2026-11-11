@@ -1038,6 +1038,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::RowSecurityViolation { denial } => (
+                "RowSecurityViolation",
+                0,
+                0,
+                0,
+                Value::build_text(denial.to_string()),
+                0,
+                "".to_string(),
+            ),
             Insn::Transaction { db, tx_mode, schema_cookie} => (
                 "Transaction",
                 *db as i64,
