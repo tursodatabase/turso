@@ -874,6 +874,46 @@ expect @tursopg error {
     a VARIADIC function argument is not supported
 }
 
+# Statements on functions. No function can exist, so PostgreSQL rejects them
+# too. To give PostgreSQL's errors, tursopg would have to look the functions
+# up.
+
+test drop-function {
+    DROP FUNCTION nosuch;
+}
+@sqlstate 42883
+expect error {
+    could not find a function named "nosuch"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP FUNCTION is not supported
+}
+
+test drop-procedure {
+    DROP PROCEDURE nosuch;
+}
+@sqlstate 42883
+expect error {
+    could not find a procedure named "nosuch"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP PROCEDURE is not supported
+}
+
+test drop-routine {
+    DROP ROUTINE nosuch;
+}
+@sqlstate 42883
+expect error {
+    could not find a function named "nosuch"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP ROUTINE is not supported
+}
+
 # Added coverage for the type and body checks.
 
 test empty-function-body {
