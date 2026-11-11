@@ -24,16 +24,15 @@ pub enum Command {
     Truncate,
 }
 
-/// Which rows of a table a role may access.
+/// Whether row-level security limits which rows of a table a role may
+/// access for a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
-    /// Every row.
+    /// It does not: the role may access every row.
     Allow,
-    /// No row.
-    Deny,
-    /// The rows that pass the `USING` conditions of these policies. At least
-    /// one of them is permissive.
-    Filter(Vec<RowPolicy>),
+    /// These policies of the command, the ones that apply to the role,
+    /// decide. Without a permissive one among them, no row passes.
+    Apply(Vec<RowPolicy>),
 }
 
 /// A policy of a table, as `CREATE POLICY` defines it.

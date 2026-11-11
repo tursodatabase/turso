@@ -42,7 +42,8 @@ use crate::{
 };
 
 /// Limits the rows of the tables in `table_references` that the statement
-/// reads, updates or deletes to the rows the role may access.
+/// reads, updates or deletes to the rows the role may access, which the
+/// policies of all of `commands` decide.
 ///
 /// Each such table gets the condition its rows must pass as
 /// [`JoinedTable::row_filter`], which the loop over the table checks before
@@ -57,7 +58,7 @@ use crate::{
 /// NULLs, because there they would also remove the NULL-extended rows that the
 /// join keeps.
 pub(crate) fn filter_rows(
-    command: Command,
+    commands: &[Command],
     table_references: &mut TableReferences,
     where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
@@ -69,11 +70,22 @@ pub(crate) fn filter_rows(
         let Table::BTree(btree) = &table.table else {
             continue;
         };
-        let filter = match policy(resolver, table.namespace, &btree.declared_name, command) {
-            Policy::Allow => continue,
-            Policy::Deny => no_rows(),
-            Policy::Filter(policies) => policy_filter(&policies, table, btree, resolver, program)?,
+        let mut conditions = Vec::new();
+        for command in commands {
+            match policy(resolver, table.namespace, &btree.declared_name, *command) {
+                Policy::Allow => break,
+                Policy::Apply(policies) => {
+                    conditions.extend(conditions_of(&policies, using_condition));
+                }
+            }
+        }
+        let Some(filter) = conditions
+            .into_iter()
+            .reduce(|all, expr| combine(Some(all), ast::Operator::And, expr))
+        else {
+            continue;
         };
+        let filter = bind_policy_expr(&filter, table, btree, resolver, program)?;
         let join_info = table.join_info.as_ref();
         let extended_with_nulls_by_right_join = join_info.is_some_and(JoinInfo::keeps_right_rows)
             || table_references.is_left_of_right_or_full_join(table.internal_id);
@@ -110,7 +122,7 @@ pub(crate) fn check_insert(
 ) -> Result<()> {
     match policy(resolver, namespace, &table.declared_name, Command::Insert) {
         Policy::Allow => Ok(()),
-        Policy::Deny | Policy::Filter(_) => Err(LimboError::PermissionDenied(Box::new(
+        Policy::Apply(_) => Err(LimboError::PermissionDenied(Box::new(
             PermissionDenied::policy(Object::Table(table.declared_name.clone()), None, false),
         ))),
     }
@@ -159,7 +171,7 @@ pub(crate) fn check_blob_open(
     });
     match policy {
         Policy::Allow => Ok(()),
-        Policy::Deny | Policy::Filter(_) => Err(LimboError::PermissionDenied(Box::new(
+        Policy::Apply(_) => Err(LimboError::PermissionDenied(Box::new(
             PermissionDenied::privilege(action, Object::Table(table_name.to_string())),
         ))),
     }
@@ -198,14 +210,10 @@ fn policy(
     })
 }
 
-/// Which rows of table `table_name` of `namespace` in `schema` `role` may
-/// access for `command`. As in PostgreSQL's `check_enable_rls`, row-level
-/// security does not apply to superusers or to the table's owner.
-///
-/// A role reads the rows that pass at least one permissive policy and every
-/// restrictive policy for SELECT that apply to it. Writes by roles are not
-/// supported yet, so a table with row-level security refuses them, whatever
-/// its policies say.
+/// Whether row-level security limits the rows of table `table_name` of
+/// `namespace` in `schema` that `role` may access for `command`, and the
+/// policies that then decide. As in PostgreSQL's `check_enable_rls`,
+/// row-level security does not limit superusers or the table's owner.
 fn policy_for(
     dialect: &dyn Dialect,
     roles: &RoleCatalog,
@@ -222,54 +230,54 @@ fn policy_for(
     {
         return Policy::Allow;
     }
-    match command {
-        Command::Select => {}
-        Command::Insert | Command::Update | Command::Delete => return Policy::Deny,
-        // As in PostgreSQL, row-level security does not apply to TRUNCATE.
-        Command::Truncate => return Policy::Allow,
+    // As in PostgreSQL, row-level security does not apply to TRUNCATE.
+    if command == Command::Truncate {
+        return Policy::Allow;
     }
-    // A policy without USING says nothing about which rows a role may read.
-    let policies: Vec<RowPolicy> = dialect
-        .row_security_policies(schema, namespace, &table_name)
-        .iter()
-        .filter(|policy| policy.applies_to(command, role) && policy.using_expr.is_some())
-        .cloned()
-        .collect();
-    if !policies.iter().any(|policy| policy.permissive) {
-        return Policy::Deny;
+    // Writes do not check the policies yet, so a write is limited as if no
+    // policy applied to the role, which lets no row pass.
+    if command != Command::Select {
+        return Policy::Apply(Vec::new());
     }
-    Policy::Filter(policies)
+    Policy::Apply(
+        dialect
+            .row_security_policies(schema, namespace, &table_name)
+            .iter()
+            .filter(|policy| policy.applies_to(command, role))
+            .cloned()
+            .collect(),
+    )
 }
 
-/// The condition that the rows of `table` must pass under `policies`: the
-/// USING conditions of the permissive policies combined with OR, and of the
-/// restrictive ones with AND.
-fn policy_filter(
+/// The conditions that `policies`, the policies of one command that apply
+/// to a role, put on rows, as PostgreSQL builds them: the conditions of the
+/// permissive policies combined with OR, and the condition of each
+/// restrictive policy. Without a permissive policy that has a condition, no
+/// row passes. `condition_of` gives a policy's condition, if it has one.
+fn conditions_of(
     policies: &[RowPolicy],
-    table: &JoinedTable,
-    btree: &BTreeTable,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-) -> Result<ast::Expr> {
-    let mut permissive = None;
-    let mut restrictive = None;
-    for policy in policies {
-        let using_expr = policy
-            .using_expr
-            .as_ref()
-            .expect("policy_for keeps only policies with USING");
-        let condition = bind_policy_expr(using_expr, table, btree, resolver, program)?;
-        if policy.permissive {
-            permissive = Some(combine(permissive, ast::Operator::Or, condition));
-        } else {
-            restrictive = Some(combine(restrictive, ast::Operator::And, condition));
-        }
-    }
-    let permissive = permissive.expect("policy_for keeps a permissive policy");
-    Ok(match restrictive {
-        None => permissive,
-        Some(restrictive) => combine(Some(permissive), ast::Operator::And, restrictive),
-    })
+    condition_of: fn(&RowPolicy) -> Option<&ast::Expr>,
+) -> Vec<ast::Expr> {
+    let permissive = policies
+        .iter()
+        .filter(|policy| policy.permissive)
+        .filter_map(condition_of)
+        .cloned()
+        .reduce(|any, expr| combine(Some(any), ast::Operator::Or, expr));
+    let Some(permissive) = permissive else {
+        return vec![no_rows()];
+    };
+    let restrictive = policies
+        .iter()
+        .filter(|policy| !policy.permissive)
+        .filter_map(condition_of)
+        .cloned();
+    std::iter::once(permissive).chain(restrictive).collect()
+}
+
+/// Which existing rows a policy lets a role access.
+fn using_condition(policy: &RowPolicy) -> Option<&ast::Expr> {
+    policy.using_expr.as_ref()
 }
 
 fn combine(left: Option<ast::Expr>, operator: ast::Operator, right: ast::Expr) -> ast::Expr {
@@ -742,7 +750,7 @@ mod tests {
     use rustc_hash::FxHashMap;
     use turso_parser::ast;
 
-    use super::{check_insert, policy, Command, Policy};
+    use super::{check_insert, conditions_of, policy, using_condition, Command, Policy};
     use crate::dialect::{Dialect, EngineDialect};
     use crate::function::Func;
     use crate::namespace::{NamespaceId, NamespaceRef};
@@ -828,21 +836,90 @@ mod tests {
         }
     }
 
-    /// Roles cannot write to tables yet, so no statement reaches the checks
-    /// for writes. A table with row-level security must still refuse every
-    /// write by a role, whatever its policies say, until writes check them.
+    /// The permissive policies' conditions are one condition, combined with
+    /// OR, and each restrictive policy's condition is one more, named after
+    /// the policy, as in PostgreSQL.
+    #[test]
+    fn conditions_combine_permissive_policies_and_keep_restrictive_ones_apart() {
+        let policies = [
+            row_policy("a", true, Some("a = 1"), None),
+            row_policy("b", true, Some("b = 1"), Some("b = 2")),
+            row_policy("r", false, Some("r = 1"), None),
+        ];
+
+        assert_eq!(
+            texts(&conditions_of(&policies, using_condition)),
+            vec!["(a = 1) OR (b = 1)".to_string(), "r = 1".to_string()]
+        );
+    }
+
+    /// Without a permissive policy that has the condition, no row passes,
+    /// whatever the restrictive policies say.
+    #[test]
+    fn conditions_without_a_permissive_policy_pass_no_row() {
+        let policies = [
+            row_policy("insert_only", true, None, Some("a = 1")),
+            row_policy("r", false, Some("r = 1"), None),
+        ];
+
+        assert_eq!(
+            texts(&conditions_of(&policies, using_condition)),
+            vec!["0".to_string()]
+        );
+    }
+
+    fn row_policy(
+        name: &str,
+        permissive: bool,
+        using_expr: Option<&str>,
+        check_expr: Option<&str>,
+    ) -> RowPolicy {
+        let expr = |sql: &str| {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
+                EngineDialect.parse(&format!("SELECT {sql}")).unwrap().0
+            else {
+                panic!("{sql} is not an expression");
+            };
+            let ast::OneSelect::Select { columns, .. } = select.body.select else {
+                panic!("{sql} is not an expression");
+            };
+            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+                panic!("{sql} is not an expression");
+            };
+            *expr.clone()
+        };
+        RowPolicy {
+            name: name.to_string(),
+            permissive,
+            command: ast::PolicyCommand::All,
+            roles: vec![RoleId::PUBLIC],
+            using_expr: using_expr.map(expr),
+            check_expr: check_expr.map(expr),
+        }
+    }
+
+    fn texts(conditions: &[ast::Expr]) -> Vec<String> {
+        conditions.iter().map(ToString::to_string).collect()
+    }
+
+    /// Writes do not check the policies yet, so a table with row-level
+    /// security must refuse every write by a role, whatever its policies
+    /// say, until writes check them.
     #[test]
     fn table_with_row_security_denies_every_write_by_a_role() {
         let (main, alice) = main_schema_with_role_alice();
         with_resolver(&main, FxHashMap::default(), alice, |resolver| {
             let root = NamespaceRef::root_of(crate::MAIN_DB_ID);
 
-            assert!(matches!(
+            assert_eq!(
                 policy(resolver, root, "documents", Command::Select),
-                Policy::Filter(_)
-            ));
+                Policy::Apply(ACCESS_EVERY_ROW.clone())
+            );
             for command in [Command::Insert, Command::Update, Command::Delete] {
-                assert_eq!(policy(resolver, root, "documents", command), Policy::Deny);
+                assert_eq!(
+                    policy(resolver, root, "documents", command),
+                    Policy::Apply(Vec::new())
+                );
             }
             let documents = BTreeTable::from_sql("CREATE TABLE documents (id INTEGER)", 2).unwrap();
             let error = check_insert(&documents, root, resolver).unwrap_err();
@@ -867,7 +944,7 @@ mod tests {
             assert_eq!(inside, Policy::Allow);
             assert_eq!(
                 policy(resolver, root, "documents", Command::Delete),
-                Policy::Deny
+                Policy::Apply(Vec::new())
             );
         });
     }
@@ -893,7 +970,7 @@ mod tests {
             )
         });
 
-        assert_eq!(policy, Policy::Deny);
+        assert_eq!(policy, Policy::Apply(Vec::new()));
     }
 
     /// A main database whose tables have row-level security, and the role

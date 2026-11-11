@@ -376,7 +376,7 @@ fn prepare_update_plan(
         connection,
     )?;
     row_security::filter_rows(
-        Command::Select,
+        &[Command::Select],
         &mut from_tables,
         &mut where_clause,
         resolver,
@@ -427,7 +427,7 @@ fn prepare_update_plan(
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
     row_security::filter_rows(
-        Command::Update,
+        &[Command::Update],
         &mut read_scope_tables,
         &mut where_clause,
         resolver,

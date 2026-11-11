@@ -317,7 +317,7 @@ pub fn prepare_delete_plan(
         resolver,
     )?;
     row_security::filter_rows(
-        command,
+        &[command],
         &mut table_references,
         &mut where_predicates,
         resolver,

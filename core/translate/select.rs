@@ -362,7 +362,7 @@ fn prepare_one_select_plan(
                     connection,
                 )?;
                 row_security::filter_rows(
-                    Command::Select,
+                    &[Command::Select],
                     &mut table_references,
                     &mut where_predicates,
                     resolver,
