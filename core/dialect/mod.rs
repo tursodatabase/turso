@@ -99,6 +99,17 @@ pub struct ScalarFuncContext<'a> {
     pub collation: CollationSeq,
 }
 
+/// An extension compiled into Turso whose functions every database gets,
+/// unless its dialect leaves them out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinExtension {
+    Uuid,
+    Series,
+    Time,
+    Percentile,
+    Regexp,
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -218,6 +229,11 @@ pub trait Dialect: Send + Sync + 'static {
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         options
+    }
+
+    /// Whether the database gets the functions of a built-in extension.
+    fn has_builtin_extension(&self, _extension: BuiltinExtension) -> bool {
+        true
     }
 
     /// Resolve a function name in user SQL to the engine's function IR.
