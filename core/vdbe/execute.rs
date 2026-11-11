@@ -16330,13 +16330,10 @@ pub fn op_integrity_check(
                 )?;
             }
 
-            #[cfg(feature = "autovacuum")]
             let skip_page_never_used = !matches!(
                 target_pager.get_auto_vacuum_mode(),
                 crate::storage::pager::AutoVacuumMode::None
             );
-            #[cfg(not(feature = "autovacuum"))]
-            let skip_page_never_used = false;
 
             if !skip_page_never_used {
                 for page_number in 2..=integrity_check_state.db_size {

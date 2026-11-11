@@ -28,7 +28,6 @@ baseline = [
     "series",
     "encryption",
     "percentile",
-    "autovacuum",
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
@@ -44,7 +43,6 @@ io_uring = ["dep:io-uring", "rustix/io_uring"]
 experimental_win_iocp = []
 time = []
 fuzz = []
-autovacuum = []
 simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
 allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
