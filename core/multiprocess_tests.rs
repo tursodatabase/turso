@@ -2,7 +2,8 @@ use super::*;
 use crate::database::remove_file_from_database_registry;
 use crate::security::roles::SessionRole;
 use crate::storage::database::DatabaseFile;
-use crate::sync::atomic::Ordering;
+use crate::storage::shared_wal_coordination::MappedSharedWalCoordination;
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::process::Command;
 use std::time::Duration;
 
@@ -598,17 +599,16 @@ fn multiprocess_paused_creator_child_process() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let wal_path = format!("{}-wal", db_path.to_str().unwrap());
     let shm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
-    let _authority =
-        storage::shared_wal_coordination::MappedSharedWalCoordination::create_or_open_paused_for_tests(
-            &io,
-            std::path::Path::new(&shm_path),
-            64,
-            &|| {
-                std::fs::write(&ready_file, b"ready").unwrap();
-                wait_for_file(&release_file);
-            },
-        )
-        .unwrap();
+    let _authority = MappedSharedWalCoordination::create_or_open_paused_for_tests(
+        &io,
+        std::path::Path::new(&shm_path),
+        64,
+        &|| {
+            std::fs::write(&ready_file, b"ready").unwrap();
+            wait_for_file(&release_file);
+        },
+    )
+    .unwrap();
 }
 
 /// A read-only open that finds another process creating the coordination file
@@ -658,6 +658,95 @@ fn readonly_multiprocess_open_waits_for_concurrent_creator() {
     );
     assert_eq!(rows, 1);
     assert!(creator.wait().unwrap().success());
+}
+
+/// The real IO, except that every `sleep` moves the monotonic clock forward by
+/// an hour instead of blocking, so bounded waits expire at once.
+struct FastForwardIO {
+    inner: Arc<dyn IO>,
+    skipped_nanos: AtomicU64,
+    sleeps: AtomicUsize,
+}
+
+impl Clock for FastForwardIO {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+            + Duration::from_nanos(self.skipped_nanos.load(Ordering::Acquire))
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for FastForwardIO {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.inner.open_shared_wal_file(path)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        self.inner.supports_shared_wal_coordination()
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        self.sleeps.fetch_add(1, Ordering::AcqRel);
+        self.skipped_nanos.fetch_add(
+            Duration::from_secs(3600).as_nanos() as u64,
+            Ordering::AcqRel,
+        );
+    }
+}
+
+/// An opener that finds a creator stalled past the bounded wait gets the
+/// retryable `Busy`, not `Corrupt`, for the writable and the read-only path,
+/// and the wait runs on the IO's clock and sleep. A retry succeeds once the
+/// creator finishes.
+#[test]
+fn stalled_creator_makes_openers_return_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("stalled-creator.db");
+    let wal_path = format!("{}-wal", db_path.to_str().unwrap());
+    let shm_path =
+        std::path::PathBuf::from(storage::wal::coordination_path_for_wal_path(&wal_path));
+    let ready_file = dir.path().join("creator-ready");
+    let release_file = dir.path().join("creator-release");
+    let mut creator = spawn_paused_creator(&db_path, &ready_file, &release_file);
+
+    let fast_forward = Arc::new(FastForwardIO {
+        inner: multiprocess_test_io(),
+        skipped_nanos: AtomicU64::new(0),
+        sleeps: AtomicUsize::new(0),
+    });
+    let io: Arc<dyn IO> = fast_forward.clone();
+    let writable_err = MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).err();
+    let readonly_err = MappedSharedWalCoordination::open_existing(&io, &shm_path, 64).err();
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        matches!(writable_err, Some(LimboError::Busy)),
+        "writable open: {writable_err:?}"
+    );
+    assert!(
+        matches!(readonly_err, Some(LimboError::Busy)),
+        "read-only open: {readonly_err:?}"
+    );
+    assert!(
+        fast_forward.sleeps.load(Ordering::Acquire) >= 2,
+        "each open must wait through the IO's sleep"
+    );
+
+    assert!(creator.wait().unwrap().success());
+    let io = multiprocess_test_io();
+    MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64)
+        .map(drop)
+        .expect("a retry after the creator finished must succeed");
 }
 
 /// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:

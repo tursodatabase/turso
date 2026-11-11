@@ -34,7 +34,7 @@ use crate::{
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
@@ -985,7 +985,7 @@ impl MappedSharedWalCoordination {
             metadata_len,
             initialize,
             base_mapping,
-        } = Self::lock_and_map_header(&file, lock_kind, base_len, Some(initial_file_len))?;
+        } = Self::lock_and_map_header(io, &file, lock_kind, base_len, Some(initial_file_len))?;
         let base_ptr = base_mapping.ptr();
 
         let mut region = Self::new_region(
@@ -1057,7 +1057,7 @@ impl MappedSharedWalCoordination {
             metadata_len,
             base_mapping,
             ..
-        } = Self::lock_and_map_header(&file, lock_kind, base_len, None)?;
+        } = Self::lock_and_map_header(io, &file, lock_kind, base_len, None)?;
         let base_ptr = base_mapping.ptr();
         let mut region = Self::new_region(
             file,
@@ -1098,7 +1098,9 @@ impl MappedSharedWalCoordination {
     /// process that holds the lifetime lock throughout, and publishes the magic
     /// last. An opener that finds the lock held by someone else while the file
     /// is short or unpublished treats that as creation in flight: it releases
-    /// its own lock and probes again until the creator is done (bounded wait).
+    /// its own lock and probes again until the creator is done. If the creator
+    /// is still not done after `CREATOR_INIT_WAIT` the open fails with `Busy`,
+    /// which callers may retry.
     /// A creator that died leaves no lock holder, so the next opener becomes
     /// the exclusive owner.
     ///
@@ -1106,12 +1108,13 @@ impl MappedSharedWalCoordination {
     /// `None` the file is never resized or initialized, and a short file with
     /// no live creator is reported as corrupt.
     fn lock_and_map_header(
+        io: &Arc<dyn IO>,
         file: &Arc<dyn File>,
         lock_kind: SharedWalLockKind,
         base_len: usize,
         initial_file_len: Option<usize>,
     ) -> Result<OpenedHeader> {
-        let deadline = Instant::now() + CREATOR_INIT_WAIT;
+        let deadline = io.current_time_monotonic() + CREATOR_INIT_WAIT;
         loop {
             let open_mode = Self::detect_open_mode(file, lock_kind, base_len)?;
             let metadata_len = file.size()? as usize;
@@ -1140,12 +1143,10 @@ impl MappedSharedWalCoordination {
             }
             // Unlock while waiting so a dead creator's file gets re-initialized.
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            if Instant::now() >= deadline {
-                return Err(LimboError::Corrupt(format!(
-                    "shared WAL coordination file was not initialized in time: got {metadata_len}, minimum {base_len}"
-                )));
+            if io.current_time_monotonic() >= deadline {
+                return Err(LimboError::Busy);
             }
-            std::thread::sleep(CREATOR_INIT_POLL);
+            io.sleep(CREATOR_INIT_POLL);
         }
     }
 
