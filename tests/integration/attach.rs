@@ -281,6 +281,33 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_attached_ddl_does_not_write_main(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("ddl_main_lock_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE main_t(x)")?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    b.execute("BEGIN")?;
+    assert_that!(limbo_exec_rows(&b, "SELECT count(*) FROM main_t")).is_equal_to(vec![row![0]]);
+    a.execute("INSERT INTO main_t VALUES (1)")?;
+    b.execute("CREATE INDEX aux.i ON t(x)")?;
+    b.execute("ALTER TABLE aux.t ADD COLUMN y")?;
+    b.execute("CREATE TABLE aux.new_t(x)")?;
+    b.execute("DROP TABLE aux.new_t")?;
+    b.execute("DROP INDEX aux.i")?;
+    b.execute("ROLLBACK")?;
+
+    b.execute("BEGIN")?;
+    b.execute("ALTER TABLE aux.t ADD COLUMN y")?;
+    a.execute("INSERT INTO main_t VALUES (2)")?;
+    b.execute("COMMIT")?;
+    Ok(())
+}
+
 /// VACUUM INTO an empty file that is attached on the same connection must
 /// leave the attached schema usable, with or without tables in the copy.
 #[turso_macros::test]

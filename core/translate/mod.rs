@@ -266,6 +266,14 @@ fn translate_statement(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
+    let is_db_scoped_ddl = matches!(
+        stmt,
+        ast::Stmt::AlterTable { .. }
+            | ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::CreateTable { .. }
+            | ast::Stmt::DropIndex { .. }
+            | ast::Stmt::DropTable { .. }
+    );
 
     // PRAGMA count_changes: top-level INSERT/UPDATE/DELETE statements return one row
     // with the number of rows they changed. Trigger bodies, foreign key actions and
@@ -579,8 +587,8 @@ fn translate_statement(
     };
 
     if is_write {
-        if is_dml {
-            // DML translators register their actual write database. Keep a
+        if is_dml || is_db_scoped_ddl {
+            // These translators register their actual write database. Keep a
             // main read transaction to coordinate connection-level autocommit,
             // without upgrading an unrelated main snapshot for attached-only
             // writes.
