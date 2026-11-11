@@ -6,7 +6,7 @@ use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
 use crate::schema::{BTreeTable, Schema, SequencesByNamespace, TypeDef};
 use crate::security::roles::SessionRole;
-use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
+use crate::storage::pager::{Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
 };
@@ -218,15 +218,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
-}
-
-pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
-    if matches!(mode, AutoVacuumMode::Incremental) {
-        return Err(LimboError::InternalError(
-            "Incremental auto-vacuum is not supported".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Database header metadata that the target build must finalize before commit.
@@ -470,8 +461,6 @@ pub(crate) struct VacuumTargetBuildConfig {
     pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
     /// Whether the target database should be placed in MVCC journal mode.
     pub target_mvcc_enabled: bool,
-    /// Auto-vacuum mode to use while rebuilding the target image.
-    pub target_auto_vacuum_mode: AutoVacuumMode,
     /// Whether to copy the source MVCC metadata table into the target image.
     pub copy_mvcc_metadata_table: bool,
 }
@@ -615,15 +604,6 @@ pub(crate) fn vacuum_target_build_step(
                         }
                     })?;
                 }
-
-                // Auto-vacuum must be installed before MVCC bootstrap creates
-                // internal tables, otherwise full auto-vacuum can reserve page
-                // 2 as a ptrmap page after MVCC has already used it as a root.
-                state
-                    .target_conn
-                    .pager
-                    .load()
-                    .persist_auto_vacuum_mode(config.target_auto_vacuum_mode)?;
 
                 // Enable MVCC on targets that should persist as MVCC.
                 if config.target_mvcc_enabled {
@@ -1906,7 +1886,6 @@ fn vacuum_in_place_step(
                     )
                     .into());
                 }
-                reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
                 // 6. Reject non-WAL pagers.
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
@@ -2028,7 +2007,6 @@ fn vacuum_in_place_step(
                     header_meta,
                     source_custom_types,
                     target_mvcc_enabled: false,
-                    target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
                     copy_mvcc_metadata_table: source_db.mvcc_enabled(),
                 };
 
@@ -3174,7 +3152,6 @@ mod tests {
             header_meta,
             source_custom_types: capture_custom_types(&source_conn, crate::MAIN_DB_ID),
             target_mvcc_enabled: source_db.mvcc_enabled(),
-            target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
             copy_mvcc_metadata_table: false,
         };
 

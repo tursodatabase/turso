@@ -160,9 +160,8 @@ use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
-    capture_custom_types, mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode,
-    vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
-    VacuumTargetBuildConfig, VacuumTargetBuildContext,
+    capture_custom_types, mirror_symbols, vacuum_target_build_step, vacuum_target_opts_from_source,
+    VacuumDbHeaderMeta, VacuumTargetBuildConfig, VacuumTargetBuildContext,
 };
 
 #[cfg(feature = "json")]
@@ -19260,8 +19259,6 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 let source_pager = program
                     .connection
                     .get_pager_from_database_index(&source_db_id)?;
-                let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
-                reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
                 let header_meta = if let Some(mv_store) =
                     program.connection.mv_store_for_db(source_db_id)
                 {
@@ -19366,7 +19363,6 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     header_meta,
                     source_custom_types,
                     target_mvcc_enabled: source_db.mvcc_enabled(),
-                    target_auto_vacuum_mode: source_auto_vacuum_mode,
                     copy_mvcc_metadata_table: false,
                 };
 

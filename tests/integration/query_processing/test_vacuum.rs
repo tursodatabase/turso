@@ -376,80 +376,30 @@ fn assert_plain_vacuum_preserves_content_hash(
     Ok(())
 }
 
-fn assert_plain_vacuum_preserves_autovacuum_mode(
-    pragma_value: &str,
-    expected_mode: i64,
-) -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db(pragma_value, opts)?;
-    let conn = tmp_db.connect_limbo();
+/// Auto-vacuum is not supported, so a database that has it opens read-only.
+/// VACUUM INTO must still be able to copy it, into a database without
+/// auto-vacuum. The copy is checked with SQLite because only SQLite's
+/// integrity_check looks at pointer-map pages.
+#[test]
+fn test_vacuum_into_from_autovacuum_db_writes_copy_without_autovacuum() -> anyhow::Result<()> {
+    for pragma_value in ["full", "incremental"] {
+        let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db(pragma_value, DatabaseOpts::new())?;
+        let conn = tmp_db.connect_limbo();
 
-    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), expected_mode);
+        let dest_dir = TempDir::new()?;
+        let dest_path = dest_dir.path().join("vacuum-into.db");
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
 
-    checkpoint_if_mvcc(&tmp_db, &conn)?;
-    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
-    conn.execute("VACUUM")?;
-
-    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), expected_mode);
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 120);
-    assert_plain_vacuum_integrity_and_hash(&tmp_db, &conn, &before_hash);
-    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
-
-    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
-    let reopened_conn = reopened.connect_limbo();
-    assert_eq!(
-        scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"),
-        expected_mode
-    );
-    assert_eq!(run_integrity_check(&reopened_conn), "ok");
-
-    Ok(())
-}
-
-fn assert_vacuum_into_preserves_autovacuum_mode(
-    pragma_value: &str,
-    expected_mode: i64,
-) -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db(pragma_value, opts)?;
-    let conn = tmp_db.connect_limbo();
-
-    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), expected_mode);
-
-    let hash_opts = turso_dbhash::DbHashOptions {
-        table_filter: Some("t".to_string()),
-        without_schema: true,
-        ..Default::default()
-    };
-    let source_hash = compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, opts);
-
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vacuum-into-autovacuum.db");
-    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
-
-    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
-    let dest_conn = dest_db.connect_limbo();
-    assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(scalar_i64(&dest_conn, "PRAGMA auto_vacuum"), expected_mode);
-    assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 120);
-    assert_eq!(
-        compute_dbhash_with_options_and_database_opts(&dest_db, &hash_opts, opts).hash,
-        source_hash.hash,
-        "VACUUM INTO should preserve logical table content for auto-vacuum databases"
-    );
-
-    let reopened = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
-    let reopened_conn = reopened.connect_limbo();
-    assert_eq!(
-        scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"),
-        expected_mode
-    );
-    assert_eq!(run_integrity_check(&reopened_conn), "ok");
-
+        let sqlite_conn = SqliteConnection::open(&dest_path)?;
+        assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 0);
+        let integrity: String =
+            sqlite_conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        assert_eq!(integrity, "ok", "auto_vacuum={pragma_value}");
+        assert_eq!(
+            sqlite_scalar_i64(&sqlite_conn, "SELECT COUNT(*) FROM t"),
+            120
+        );
+    }
     Ok(())
 }
 
@@ -5865,129 +5815,6 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
     post_vacuum_conn.execute("PRAGMA cipher = 'aegis256'")?;
     assert_eq!(run_integrity_check(&post_vacuum_conn), "ok");
     assert_eq!(scalar_i64(&post_vacuum_conn, "SELECT COUNT(*) FROM t"), 30);
-
-    Ok(())
-}
-
-#[test]
-fn test_plain_vacuum_preserves_full_autovacuum() -> anyhow::Result<()> {
-    assert_plain_vacuum_preserves_autovacuum_mode("full", 1)
-}
-
-#[test]
-fn test_mvcc_plain_vacuum_preserves_full_autovacuum_after_reopen() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new().with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("full", opts)?;
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
-
-    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
-    conn.execute("VACUUM")?;
-    let journal_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
-    assert_eq!(journal_mode, vec![("mvcc".to_string(),)]);
-    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 120);
-    assert_plain_vacuum_integrity_and_hash(&tmp_db, &conn, &before_hash);
-    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
-
-    let path = tmp_db.path.clone();
-    drop(conn);
-    drop(tmp_db);
-
-    let reopened = TempDatabase::new_with_existent_with_opts(&path, opts);
-    let reopened_conn = reopened.connect_limbo();
-    let journal_mode: Vec<(String,)> = reopened_conn.exec_rows("PRAGMA journal_mode");
-    assert_eq!(journal_mode, vec![("mvcc".to_string(),)]);
-    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
-    assert_eq!(run_integrity_check(&reopened_conn), "ok");
-    assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 120);
-
-    Ok(())
-}
-
-#[test]
-fn test_vacuum_into_preserves_full_autovacuum() -> anyhow::Result<()> {
-    assert_vacuum_into_preserves_autovacuum_mode("full", 1)
-}
-
-#[test]
-fn test_mvcc_vacuum_into_preserves_full_autovacuum_after_reopen() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new().with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("full", opts)?;
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
-
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("mvcc-vacuum-into-full-autovacuum.db");
-    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
-
-    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
-    let dest_conn = dest_db.connect_limbo();
-    let journal_mode: Vec<(String,)> = dest_conn.exec_rows("PRAGMA journal_mode");
-    assert_eq!(journal_mode, vec![("mvcc".to_string(),)]);
-    assert_eq!(scalar_i64(&dest_conn, "PRAGMA auto_vacuum"), 1);
-    assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 120);
-
-    drop(dest_conn);
-    drop(dest_db);
-
-    let reopened = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
-    let reopened_conn = reopened.connect_limbo();
-    let journal_mode: Vec<(String,)> = reopened_conn.exec_rows("PRAGMA journal_mode");
-    assert_eq!(journal_mode, vec![("mvcc".to_string(),)]);
-    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
-    assert_eq!(run_integrity_check(&reopened_conn), "ok");
-
-    Ok(())
-}
-
-#[test]
-fn test_plain_vacuum_incremental_autovacuum_still_unsupported() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("incremental", opts)?;
-    let conn = tmp_db.connect_limbo();
-
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Internal error: Incremental auto-vacuum is not supported",
-        "unexpected error: {err}"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_vacuum_into_incremental_autovacuum_still_unsupported() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("incremental", opts)?;
-    let conn = tmp_db.connect_limbo();
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vacuum-into.db");
-
-    let err = conn
-        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
-        .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Internal error: Incremental auto-vacuum is not supported",
-        "unexpected error: {err}"
-    );
-    assert!(
-        !dest_path.exists(),
-        "unsupported VACUUM INTO should not leave an output file behind"
-    );
 
     Ok(())
 }
