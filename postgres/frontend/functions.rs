@@ -21,31 +21,49 @@ use turso_pg_parser::sqlstate::{
 /// Registers one native scalar function per name. Each body is a Rust
 /// expression that can use `?`. The planner reads the SQL return type from the
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
-/// the body returns.
+/// the body returns. A function marked `strict` returns NULL when any argument
+/// is NULL, without running its body, like a PostgreSQL STRICT function.
 macro_rules! scalar_functions {
     ($options:expr, |$connection:ident, $args:ident| {
-        $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
+        $($($name:literal)|+ ($arity:expr, $deterministic:expr $(, $strict:ident)?) => $body:expr,)*
     }) => {{
         let mut options = $options;
-        $($(
+        $(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
-                Ok($body)
-            };
-            options = options.extension_function(pg_scalar_function(
-                $name,
-                $arity,
-                $deterministic,
-                step,
-            ));
-        )+)*
+            let step = scalar_step!($connection, $args, $body $(, $strict)?);
+            $(
+                options = options.extension_function(pg_scalar_function(
+                    $name,
+                    $arity,
+                    $deterministic,
+                    step,
+                ));
+            )+
+        )*
         options
     }};
 }
 
+macro_rules! scalar_step {
+    ($connection:ident, $args:ident, $body:expr) => {
+        |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> { Ok($body) }
+    };
+    ($connection:ident, $args:ident, $body:expr, strict) => {
+        |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            if $args
+                .iter()
+                .any(|arg| matches!(arg.get_value(), Value::Null))
+            {
+                return Ok(None);
+            }
+            Ok(Some($body))
+        }
+    };
+}
+
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
-        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
+        "acldefault"(FunctionArity::Exact(2), true, strict) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
@@ -90,13 +108,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "bigint out of range",
         ))?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
-        "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
-        "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
+        "like_escape"(FunctionArity::Exact(2), true, strict) => exec_like_escape(args)?,
+        "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true, strict) => exec_similar_to_escape(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "col_description"(FunctionArity::Exact(2), true) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
-        "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
+        "current_setting"(FunctionArity::OneOf(&[1, 2]), false, strict) => {
             exec_current_setting(connection, args)?
         },
         "version"(FunctionArity::Exact(0), true) => exec_version(),
@@ -273,11 +291,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
     Ok(Some(result))
 }
 
-fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
-    if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
-        return Ok(None);
-    }
-
+fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<String> {
     let kind_code = match args[0].get_value() {
         Value::Text(value) => value.as_str(),
         _ => "",
@@ -314,9 +328,9 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
         let grantee = if owner == 0 { "" } else { &role };
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
-    Ok(Some(turso_core::text_array_literal(
+    Ok(turso_core::text_array_literal(
         entries.iter().map(String::as_str),
-    )))
+    ))
 }
 
 #[derive(strum::EnumString)]
@@ -481,12 +495,6 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
 }
 
 fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Null))
-    {
-        return Ok(None);
-    }
     let Value::Text(name) = args[0].get_value() else {
         let mut arg_types = vec![pg_type_name(args[0].get_value())];
         arg_types.extend(args[1..].iter().map(|_| "boolean"));
@@ -914,13 +922,7 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
 
 /// Rewrites a `LIKE ... ESCAPE` pattern to use `\` as the escape character,
 /// as PostgreSQL's like_escape() does.
-fn exec_like_escape(args: &[Register]) -> Result<Option<String>> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Null))
-    {
-        return Ok(None);
-    }
+fn exec_like_escape(args: &[Register]) -> Result<String> {
     let pattern = args[0].get_value().to_string();
     let escape = args[1].get_value().to_string();
     let mut escape_chars = escape.chars();
@@ -951,24 +953,18 @@ fn exec_like_escape(args: &[Register]) -> Result<Option<String>> {
             ));
         }
     };
-    Ok(Some(result))
+    Ok(result)
 }
 
 /// Converts a SIMILAR TO pattern to a regular expression, as PostgreSQL's
 /// similar_to_escape() does. Without an ESCAPE argument, `\` is the escape.
-fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Null))
-    {
-        return Ok(None);
-    }
+fn exec_similar_to_escape(args: &[Register]) -> Result<String> {
     let pattern = args[0].get_value().to_string();
     let escape = args
         .get(1)
         .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
     match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
-        Ok(regex) => Ok(Some(regex)),
+        Ok(regex) => Ok(regex),
         Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
             Err(sqlstate_error(sqlstate, message))
         }
