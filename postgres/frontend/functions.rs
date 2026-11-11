@@ -11,7 +11,7 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
@@ -1433,22 +1433,13 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "bytea" => {
-            // Accept \x hex format
-            if let Some(hex) = trimmed.strip_prefix("\\x") {
-                if hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    None
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bytea: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            } else {
-                // Plain text is valid bytea input (escape format)
-                None
-            }
-        }
+        "bytea" => turso_core::bytea_from_text(input).err().map(|e| {
+            let sqlstate = match e {
+                turso_core::ByteaInputError::InvalidEscape => SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                _ => SQLSTATE_INVALID_PARAMETER_VALUE,
+            };
+            (e.to_string(), sqlstate.to_string())
+        }),
         "inet" | "cidr" => {
             // Accept IP address with optional /prefix
             let addr_part = trimmed.split('/').next().unwrap_or(trimmed);

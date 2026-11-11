@@ -6616,7 +6616,9 @@ fn pg_type_name_to_ast_type(
         | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
             "TEXT"
         }
-        "BYTEA" | "BLOB" => "BLOB",
+        // bytea reads PostgreSQL input such as `\x0aff` through its ENCODE.
+        "BYTEA" => "bytea",
+        "BLOB" => "BLOB",
         _ => &pg_type,
     };
 

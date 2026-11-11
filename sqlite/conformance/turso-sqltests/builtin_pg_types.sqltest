@@ -700,3 +700,64 @@ test timestamp-compare-with-other-text-with-and-without-index {
 expect {
     1|1|1|1
 }
+
+# bytea reads text as PostgreSQL bytea input: `\x` starts the hex format, and
+# other text is the escape format, where `\\` is a backslash and `\nnn` an
+# octal byte. A blob keeps its bytes, and a number is refused as before.
+@requires strict "uses STRICT tables"
+test bytea-reads-text-as-bytea-input {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, data bytea) STRICT;
+    INSERT INTO t1 VALUES (1, '\x0aff'), (2, 'a\\\\b'), (3, '\101B'), (4, 'ab'), (5, x'5c78');
+    SELECT id, hex(data) FROM t1 ORDER BY id;
+    SELECT hex(CAST('\x de AD' AS bytea)), typeof(CAST('ab' AS bytea));
+}
+expect {
+    1|0AFF
+    2|615C62
+    3|4142
+    4|6162
+    5|5C78
+    DEAD|blob
+}
+
+@requires strict "uses STRICT tables"
+test bytea-refuses-invalid-input {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, data bytea) STRICT;
+    INSERT INTO t1 VALUES (1, '\x0g');
+}
+expect error {
+    invalid hexadecimal digit: "g"
+}
+
+@requires strict "uses STRICT tables"
+test bytea-refuses-a-number {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, data bytea) STRICT;
+    INSERT INTO t1 VALUES (1, 5);
+}
+expect error {
+    cannot store INT value as type bytea \(BASE BLOB\)
+}
+
+# A CAST reads text the same way: text with a backslash is bytea input, and
+# text without one is its bytes. A number is refused, as in PostgreSQL, where
+# there is no cast from a number to bytea.
+test bytea-cast-reads-text-as-bytea-input {
+    SELECT hex(CAST('\\x41' AS bytea)), hex(CAST('\\101' AS bytea)), hex(CAST('a\\\\b' AS bytea)), hex(CAST('ab' AS bytea)), CAST(NULL AS bytea) IS NULL;
+}
+expect {
+    41|41|615C62|6162|1
+}
+
+test bytea-cast-refuses-an-invalid-escape {
+    SELECT CAST('C:\\dir' AS bytea);
+}
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-cast-refuses-a-number {
+    SELECT CAST(5 AS bytea);
+}
+expect error {
+    cannot store INT value as type bytea \(BASE BLOB\)
+}

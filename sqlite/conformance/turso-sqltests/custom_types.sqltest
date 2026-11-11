@@ -344,7 +344,7 @@ expect {
     ANY||||||
     bigint(value integer)|integer|||||
     boolean(value any)|integer|boolean_to_int (value)||CASE WHEN value THEN 1 ELSE 0 END||'<'
-    bytea(value blob)|blob|||||'<'
+    bytea(value any)|blob|bytea_encode (value)||||'<'
     cidr(value text)|text|value||value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
@@ -377,7 +377,7 @@ expect {
     ANY||||||
     bigint(value integer)|integer|||||
     boolean(value any)|integer|boolean_to_int (value)||CASE WHEN value THEN 1 ELSE 0 END||'<'
-    bytea(value blob)|blob|||||'<'
+    bytea(value any)|blob|bytea_encode (value)||||'<'
     cidr(value text)|text|value||value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||

@@ -369,6 +369,10 @@ fn is_duplicate_object_error(msg: &str) -> bool {
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("no such database") {
         SQLSTATE_INVALID_SCHEMA_NAME
+    } else if msg.starts_with("invalid hexadecimal ") {
+        SQLSTATE_INVALID_PARAMETER_VALUE
+    } else if msg.starts_with("invalid input syntax for type ") {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else {
         SQLSTATE_DATA_EXCEPTION
     }

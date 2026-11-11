@@ -304,11 +304,23 @@ expect {
 test cast-converts-to-the-plain-type-a-custom-value-type-takes {
     CREATE TYPE ev(value date) BASE text ENCODE value DECODE value;
     CREATE TYPE jv(value json) BASE text ENCODE value DECODE value;
-    CREATE TYPE bv(value bytea) BASE blob ENCODE value DECODE value;
+    CREATE TYPE rb(value blob) BASE blob;
+    CREATE TYPE bv(value rb) BASE blob ENCODE value DECODE value;
     SELECT CAST('2024-01-01' AS ev), CAST('[1]' AS jv), hex(CAST(x'ab' AS bv)), typeof(CAST('ab' AS bv));
 }
 expect {
     2024-01-01|[1]|AB|blob
+}
+
+# bytea takes any value and reads text in its ENCODE, so a type whose value
+# is bytea converts nothing, and bytea's ENCODE does not run for it: a text
+# reaches the type as text. (A CAST to bytea itself reads the text.)
+test cast-to-a-type-over-bytea-does-not-read-text-as-bytea {
+    CREATE TYPE bv(value bytea) BASE blob ENCODE value DECODE value;
+    SELECT CAST('ab' AS bv);
+}
+expect error {
+    cannot store TEXT value as type bv \(BASE BLOB\)
 }
 
 test cast-and-insert-convert-to-each-plain-value-type {

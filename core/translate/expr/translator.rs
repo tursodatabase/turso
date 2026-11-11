@@ -2121,6 +2121,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::BooleanToInt
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
+                | ScalarFunc::ByteaEncode
                 | ScalarFunc::NumericEncode
                 | ScalarFunc::NumericFit
                 | ScalarFunc::NumericDecode
