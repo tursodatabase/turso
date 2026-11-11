@@ -1834,7 +1834,11 @@ pub async fn wal_apply_from_file<Ctx>(
     session: &mut DatabaseWalSession,
 ) -> Result<u32> {
     let size = frames_file.size()?;
-    assert!(size % WAL_FRAME_SIZE as u64 == 0);
+    if size % WAL_FRAME_SIZE as u64 != 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "changes file size is not a whole number of WAL frames".to_string(),
+        ));
+    }
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
     tracing::info!("wal_apply_from_file: size={}", size);
@@ -1857,7 +1861,11 @@ pub async fn wal_apply_from_file<Ctx>(
         db_size = info.db_size;
         session.append_page(info.page_no, &buffer.as_slice()[WAL_FRAME_HEADER..])?;
     }
-    assert!(db_size > 0);
+    if db_size == 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "changes file does not end with a commit frame".to_string(),
+        ));
+    }
     Ok(db_size)
 }
 
