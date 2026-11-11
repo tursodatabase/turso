@@ -4259,8 +4259,13 @@ pub fn op_halt_if_null(
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,
-    AttachedBeginWriteTx,
-    BeginNamedSavepoints,
+    AttachedBeginWriteTx {
+        release_read_on_busy: bool,
+        mirrored_savepoints: bool,
+    },
+    BeginNamedSavepoints {
+        release_read_on_busy: bool,
+    },
     CheckSchemaCookie,
     BeginStatement,
 }
@@ -4918,7 +4923,10 @@ pub fn op_transaction_inner(
                                 && !pager.holds_write_lock()
                             {
                                 *state.active_op_state.transaction() =
-                                    OpTransactionState::AttachedBeginWriteTx;
+                                    OpTransactionState::AttachedBeginWriteTx {
+                                        release_read_on_busy: false,
+                                        mirrored_savepoints: false,
+                                    };
                                 continue;
                             }
                             *state.active_op_state.transaction() =
@@ -4933,10 +4941,15 @@ pub fn op_transaction_inner(
                             // on re-entry.
                             if conn.with_named_savepoints(|savepoints| savepoints.is_empty()) {
                                 *state.active_op_state.transaction() =
-                                    OpTransactionState::AttachedBeginWriteTx;
+                                    OpTransactionState::AttachedBeginWriteTx {
+                                        release_read_on_busy: true,
+                                        mirrored_savepoints: false,
+                                    };
                             } else {
                                 *state.active_op_state.transaction() =
-                                    OpTransactionState::BeginNamedSavepoints;
+                                    OpTransactionState::BeginNamedSavepoints {
+                                        release_read_on_busy: true,
+                                    };
                             }
                             continue;
                         }
@@ -5012,7 +5025,10 @@ pub fn op_transaction_inner(
                     && started_secondary_tx
                     && !conn.with_named_savepoints(|s| s.is_empty())
                 {
-                    *state.active_op_state.transaction() = OpTransactionState::BeginNamedSavepoints;
+                    *state.active_op_state.transaction() =
+                        OpTransactionState::BeginNamedSavepoints {
+                            release_read_on_busy: false,
+                        };
                     continue;
                 }
                 *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
@@ -5020,34 +5036,52 @@ pub fn op_transaction_inner(
             }
             // 3b. For attached databases, begin the write transaction after
             // begin_read_tx has already completed in the Start state.
-            OpTransactionState::AttachedBeginWriteTx => {
+            OpTransactionState::AttachedBeginWriteTx {
+                release_read_on_busy,
+                mirrored_savepoints,
+            } => {
                 let conn = program.connection.clone();
-                let res = pager.begin_write_tx(conn.wal_auto_actions())?;
+                let res = pager.begin_write_tx(conn.wal_auto_actions());
+                if release_read_on_busy
+                    && matches!(&res, Err(err) if matches!(**err, LimboError::Busy | LimboError::BusySnapshot))
+                {
+                    // This pager was opened by this attempt. Recreate its mirrored
+                    // savepoints after acquiring a fresh snapshot on the retry.
+                    if mirrored_savepoints {
+                        pager.clear_savepoints()?;
+                    }
+                    pager.end_read_tx();
+                    *state.active_op_state.transaction() = OpTransactionState::Start;
+                }
+                let res = res?;
                 if let IOResult::IO(io) = res {
                     return Ok(state.suspend_on_io(io));
                 }
                 *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
-            OpTransactionState::BeginNamedSavepoints => {
-                match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
-                    IOResult::Done(()) => {
-                        if is_secondary_db
-                            && mv_store.is_none()
-                            && matches!(tx_mode, TransactionMode::Write)
-                            && !pager.holds_write_lock()
-                        {
-                            *state.active_op_state.transaction() =
-                                OpTransactionState::AttachedBeginWriteTx;
-                        } else {
-                            *state.active_op_state.transaction() =
-                                OpTransactionState::CheckSchemaCookie;
-                        }
-                        continue;
+            OpTransactionState::BeginNamedSavepoints {
+                release_read_on_busy,
+            } => match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
+                IOResult::Done(()) => {
+                    if is_secondary_db
+                        && mv_store.is_none()
+                        && matches!(tx_mode, TransactionMode::Write)
+                        && !pager.holds_write_lock()
+                    {
+                        *state.active_op_state.transaction() =
+                            OpTransactionState::AttachedBeginWriteTx {
+                                release_read_on_busy,
+                                mirrored_savepoints: true,
+                            };
+                    } else {
+                        *state.active_op_state.transaction() =
+                            OpTransactionState::CheckSchemaCookie;
                     }
-                    IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+                    continue;
                 }
-            }
+                IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+            },
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx

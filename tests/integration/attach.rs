@@ -281,6 +281,96 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_attached_write_retries_after_busy(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    use turso_core::vdbe::StepResult;
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("retry_busy_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    a.execute("BEGIN")?;
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    let mut stmt = b.prepare("INSERT INTO aux.t VALUES (2)")?;
+    let step = |stmt: &mut turso_core::Statement| loop {
+        match stmt.step() {
+            Ok(StepResult::IO) => stmt._io().step()?,
+            Ok(StepResult::Yield) => continue,
+            result => break result,
+        }
+    };
+    assert!(matches!(step(&mut stmt)?, StepResult::Busy));
+    a.execute("COMMIT")?;
+    assert!(matches!(step(&mut stmt)?, StepResult::Done));
+    drop(stmt);
+    assert_that!(limbo_exec_rows(&b, "SELECT count(*) FROM aux.t")).is_equal_to(vec![row![2]]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_busy_preserves_existing_read_snapshot(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("existing_snapshot_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    b.execute("BEGIN")?;
+    assert_that!(limbo_exec_rows(&b, "SELECT count(*) FROM aux.t")).is_equal_to(vec![row![0]]);
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+    let result = b.execute("INSERT INTO aux.t VALUES (2)");
+    assert!(
+        matches!(
+            result,
+            Err(turso_core::LimboError::Busy | turso_core::LimboError::BusySnapshot)
+        ),
+        "unexpected write result: {result:?}"
+    );
+    assert_that!(limbo_exec_rows(&b, "SELECT count(*) FROM aux.t")).is_equal_to(vec![row![0]]);
+    b.execute("ROLLBACK")?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_write_retries_after_busy_with_savepoint(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    use turso_core::vdbe::StepResult;
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("retry_busy_savepoint_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    a.execute("BEGIN")?;
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+    b.execute("SAVEPOINT s")?;
+    let mut stmt = b.prepare("INSERT INTO aux.t VALUES (2)")?;
+    let step = |stmt: &mut turso_core::Statement| loop {
+        match stmt.step() {
+            Ok(StepResult::IO) => stmt._io().step()?,
+            Ok(StepResult::Yield) => continue,
+            result => break result,
+        }
+    };
+    assert!(matches!(step(&mut stmt)?, StepResult::Busy));
+    a.execute("COMMIT")?;
+    assert!(matches!(step(&mut stmt)?, StepResult::Done));
+    drop(stmt);
+    b.execute("ROLLBACK TO s")?;
+    b.execute("RELEASE s")?;
+    assert_that!(limbo_exec_rows(&b, "SELECT count(*) FROM aux.t")).is_equal_to(vec![row![1]]);
+    Ok(())
+}
+
 /// VACUUM INTO an empty file that is attached on the same connection must
 /// leave the attached schema usable, with or without tables in the copy.
 #[turso_macros::test]
