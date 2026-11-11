@@ -1335,6 +1335,44 @@ mod tests {
     }
 
     #[test]
+    fn untyped_number_parameters_are_text_arguments_of_text_functions() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        for (sql, parameter, expected) in [
+            (
+                "SELECT pg_input_is_valid($1, 'int4')",
+                "12",
+                Value::from_i64(1),
+            ),
+            (
+                "SELECT pg_input_is_valid($1, 'int4')",
+                "1.5",
+                Value::from_i64(0),
+            ),
+            (
+                "SELECT pg_input_is_valid($1, 'bool')",
+                "t",
+                Value::from_i64(1),
+            ),
+            ("SELECT quote_ident($1)", "12", Value::from_text("\"12\"")),
+            ("SELECT to_char(5, $1)", "999", Value::from_text("   5")),
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let value = pg_bytes_to_value(parameter.as_bytes(), &Type::UNKNOWN).unwrap();
+            assert!(matches!(value, Value::Numeric(_)), "{sql}: {value:?}");
+            stmt.bind_at(NonZero::new(1).unwrap(), value).unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(rows, vec![vec![expected]], "{sql}");
+        }
+    }
+
+    #[test]
     fn test_pg_is_in_recovery_returns_true_text_on_wire() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
