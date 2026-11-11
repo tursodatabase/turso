@@ -525,6 +525,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a CAST to a name that is neither a STRICT type nor a custom
+    /// type is an error, as a STRICT column of that type is.
+    ///
+    /// PostgreSQL refuses `CAST(x AS nosuch)` with `type "nosuch" does not
+    /// exist`. SQLite gives the value the affinity the name implies.
+    fn refuses_cast_to_unknown_type(&self) -> bool {
+        false
+    }
+
     /// Whether constraint errors report the values that broke the constraint.
     ///
     /// PostgreSQL shows them in the error DETAIL, so custom type and array

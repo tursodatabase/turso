@@ -6597,6 +6597,7 @@ fn pg_type_name_to_ast_type(
 ) -> Result<ast::Type, ParseError> {
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
+    let column_type;
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
         | "REGCLASS" | "REGTYPE" => "INTEGER",
@@ -6617,7 +6618,15 @@ fn pg_type_name_to_ast_type(
             "TEXT"
         }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => &pg_type,
+        // Other PostgreSQL types cast as a column of the type stores them, so
+        // `'(1,2)'::point` is text. A name neither table knows is kept as
+        // written, for enums and domains.
+        _ => {
+            column_type = map_pg_type(&pg_type, &[])
+                .filter(|m| m.array_dimensions == 0 && m.type_name != pg_type.to_lowercase())
+                .map(|m| m.type_name);
+            column_type.as_deref().unwrap_or(&pg_type)
+        }
     };
 
     let array_dimensions = type_name.array_bounds.len() as u32;

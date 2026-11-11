@@ -2589,3 +2589,24 @@ expect {
     in|1
     subquery|2
 }
+
+# A cast to a PostgreSQL type that tursopg stores as a plainer type, and a
+# cast to an enum or a domain, still work where a cast to a name that is no
+# type is refused.
+test cast-to-known-types-still-works {
+    SELECT '(1,2)'::point, '1'::INT4, 'x'::"text", '<a/>'::xml;
+}
+expect {
+    (1,2)|1|x|<a/>
+}
+
+test cast-to-enum-and-domain {
+    CREATE TYPE cast_mood AS ENUM ('happy', 'sad');
+    CREATE DOMAIN cast_pos AS int CHECK (VALUE > 0);
+    SELECT 'sad'::cast_mood, CAST('3' AS cast_pos);
+    DROP DOMAIN cast_pos;
+    DROP TYPE cast_mood;
+}
+expect {
+    sad|3
+}

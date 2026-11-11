@@ -2241,3 +2241,12 @@ test virtual-custom-type-column-through-a-hash-join {
 expect {
     3
 }
+
+# In the SQLite dialect a CAST to a name that is not a type gives the value
+# the affinity the name implies, as SQLite does. (tursopg refuses it.)
+test cast-to-unknown-type-name-uses-its-affinity {
+    SELECT CAST('12abc' AS nosuch), typeof(CAST('12' AS nosuch)), typeof(CAST(3 AS mytext));
+}
+expect {
+    12|integer|text
+}

@@ -879,6 +879,15 @@ fn translate_cast_expr(
         }
     }
 
+    if let Some(name) = &cast_type_name {
+        if resolver.catalog.dialect.refuses_cast_to_unknown_type()
+            && StrictType::named(name).is_none()
+            && resolver.schema().get_type_def_unchecked(name).is_none()
+        {
+            crate::bail_parse_error!("type \"{name}\" does not exist");
+        }
+    }
+
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
     let type_affinity = cast_type_name
         .map(|name| Affinity::of_written_type(&name))

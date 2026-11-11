@@ -318,7 +318,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         && msg.ends_with("\" does not exist")
     {
         SQLSTATE_UNDEFINED_TABLE
-    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
+    } else if (msg.starts_with("role \"") || msg.starts_with("type \""))
+        && msg.ends_with("\" does not exist")
+    {
         SQLSTATE_UNDEFINED_OBJECT
     } else if msg.starts_with('"')
         && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
@@ -553,6 +555,7 @@ mod tests {
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
+            ("type \"nosuch\" does not exist", SQLSTATE_UNDEFINED_OBJECT),
             (
                 "no schema has been selected to create in",
                 SQLSTATE_INVALID_SCHEMA_NAME,
