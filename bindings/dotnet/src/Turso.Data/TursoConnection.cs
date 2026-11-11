@@ -586,8 +586,9 @@ public class TursoConnection : DbConnection
             || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
         {
             throw new InvalidOperationException(
-                "Encryption Cipher and Encryption Key are local database options. "
-                + "Use Remote Encryption Cipher and Remote Encryption Key for embedded replicas.");
+                "Encryption Cipher and Encryption Key are standalone database options. "
+                + "Use Remote Encryption Cipher for the shared cipher, Local Encryption Key for the local replica, "
+                + "and Remote Encryption Key for the cloud database.");
         }
 
         TursoPartialSyncOptions? partialSync = null;
@@ -622,8 +623,7 @@ public class TursoConnection : DbConnection
             BootstrapIfEmpty = _connectionOptions.BootstrapIfEmpty,
             PartialSync = partialSync,
             RemoteEncryption = _connectionOptions.GetRemoteEncryption(),
-            LocalEncryptionKey = string.IsNullOrWhiteSpace(_connectionOptions.LocalEncryptionKey)
-                ? null : _connectionOptions.LocalEncryptionKey,
+            LocalEncryptionKey = _connectionOptions["Local Encryption Key"],
             PushOperationsThreshold = _connectionOptions.PushOperationsThreshold == 0
                 ? null
                 : _connectionOptions.PushOperationsThreshold,

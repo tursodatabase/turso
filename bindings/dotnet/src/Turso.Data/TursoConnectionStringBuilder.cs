@@ -8,6 +8,9 @@ namespace Turso;
 
 public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
 {
+    private bool _parsingConnectionString;
+    private bool _parsedEmptyCloudKey;
+
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
     {
         ["Data Source"] = "Data Source",
@@ -81,6 +84,27 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     public TursoConnectionStringBuilder(string? connectionString)
     {
         ConnectionString = connectionString ?? string.Empty;
+    }
+
+    [AllowNull]
+    public new string ConnectionString
+    {
+        get => base.ConnectionString;
+        set
+        {
+            _parsingConnectionString = true;
+            _parsedEmptyCloudKey = false;
+            try
+            {
+                base.ConnectionString = value;
+                if (_parsedEmptyCloudKey && !base.ContainsKey("Local Encryption Key"))
+                    base.Remove("Remote Encryption Key");
+            }
+            finally
+            {
+                _parsingConnectionString = false;
+            }
+        }
     }
 
     public string DataSource
@@ -309,6 +333,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set
         {
             var normalizedKeyword = NormalizeKeyword(keyword);
+            if (normalizedKeyword == "Remote Encryption Key")
+                _parsedEmptyCloudKey = false;
             if (value is null)
             {
                 Remove(normalizedKeyword);
@@ -321,7 +347,20 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
 
     public override bool ContainsKey(string keyword) => base.ContainsKey(NormalizeKeyword(keyword));
 
-    public override bool Remove(string keyword) => base.Remove(NormalizeKeyword(keyword));
+    public override bool Remove(string keyword)
+    {
+        var normalizedKeyword = NormalizeKeyword(keyword);
+        // The base parser removes unquoted empty values. Keep explicit keys so
+        // validation can distinguish a blank credential from an omitted one.
+        if (_parsingConnectionString && normalizedKeyword is "Local Encryption Key" or "Remote Encryption Key")
+        {
+            if (normalizedKeyword == "Remote Encryption Key")
+                _parsedEmptyCloudKey = true;
+            base[normalizedKeyword] = string.Empty;
+            return true;
+        }
+        return base.Remove(normalizedKeyword);
+    }
 
     public override bool TryGetValue(string keyword, out object value)
     {
