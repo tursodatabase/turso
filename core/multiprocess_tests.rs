@@ -50,6 +50,8 @@ const MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_paused_creator_child_process";
 const MULTIPROCESS_FIRST_OPENER_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_first_opener_child_process";
+const MULTIPROCESS_NEW_DB_CREATOR_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_new_db_creator_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -859,6 +861,63 @@ fn multiprocess_first_opener_child_process() {
     authority.release_writer(owner);
     std::fs::write(&opened_file, b"opened").unwrap();
     wait_for_file(&done_file);
+}
+
+/// A process that opened a new database and has not written yet must notice
+/// that another process created it. Its in-memory page 1 describes an empty
+/// database; building the first write on it would write a second page 1 and a
+/// second sqlite_schema over the other process's committed table.
+#[test]
+fn process_holding_an_empty_database_adopts_one_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("created-by-other-process.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+
+    let child_output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_NEW_DB_CREATOR_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    // Prepared while this process still believes the database is empty.
+    conn.execute("create table if not exists t(x)").unwrap();
+    conn.execute("insert into t values (2)").unwrap();
+
+    let xs = |conn: &Arc<Connection>| {
+        get_rows(conn, "select x from t order by x")
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![Value::from_i64(1), Value::from_i64(2)];
+    assert_eq!(xs(&conn), expected);
+    let fresh = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(xs(&fresh), expected);
+}
+
+/// Child half of `process_holding_an_empty_database_adopts_one_created_by_another_process`.
+#[test]
+fn multiprocess_new_db_creator_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table t(x)").unwrap();
+    conn.execute("insert into t values (1)").unwrap();
+    conn.close().unwrap();
 }
 
 /// A read-only open never creates or initializes the coordination file: a
