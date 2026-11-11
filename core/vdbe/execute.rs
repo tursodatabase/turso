@@ -17811,13 +17811,15 @@ pub fn op_hash_distinct_count(
                 let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
                     return Err(LimboError::InternalError(
                         "COUNT(DISTINCT) accumulator is not an aggregate".to_string(),
-                    ));
+                    )
+                    .into());
                 };
                 let payload = agg.payload_vec_mut();
                 let Value::Numeric(Numeric::Integer(old_count)) = &mut payload[0] else {
                     return Err(LimboError::InternalError(
                         "COUNT(DISTINCT) accumulator is not an integer".to_string(),
-                    ));
+                    )
+                    .into());
                 };
                 let count = i64::try_from(count).map_err(|_| LimboError::IntegerOverflow)?;
                 *old_count = old_count

@@ -146,7 +146,7 @@ fn owned_distinct_keys_equal(key1: &[Value], key2: &[Value], collations: &[Colla
     }
     for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
         let collation = collations.get(idx).copied().unwrap_or(CollationSeq::BINARY);
-        if !values_equal_distinct(v1.as_ref(), v2.as_ref(), collation) {
+        if !collation.compare(v1.as_ref(), v2.as_ref()).is_eq() {
             return false;
         }
     }
@@ -2137,7 +2137,7 @@ impl HashTable {
         key_values: &[Value],
         key_refs: &[ValueRef],
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         turso_assert!(
             self.aggregate_distinct.is_none(),
             "cannot mix SELECT DISTINCT and aggregate DISTINCT"
@@ -2156,7 +2156,7 @@ impl HashTable {
         key_values: &[Value],
         key_refs: &[ValueRef],
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         if self.aggregate_distinct.is_none() {
             self.aggregate_distinct =
                 Some(AggregateDistinctState::for_values(self.initial_buckets)?);
@@ -2181,7 +2181,7 @@ impl HashTable {
         key_values: &[Value],
         key_refs: &[ValueRef],
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         turso_assert!(
             key_values.len() == 1 && key_refs.len() == 1,
             "COUNT(DISTINCT) has one key"
@@ -2380,7 +2380,7 @@ impl HashTable {
         hash: u64,
         key_values: &[Value],
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         turso_assert!(
             key_values.len() == 1,
             "aggregate DISTINCT spill records have one key"
@@ -2413,7 +2413,7 @@ impl HashTable {
         key_values: &[Value],
         key_refs: &[ValueRef],
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
             "cannot add a DISTINCT key in this state",
