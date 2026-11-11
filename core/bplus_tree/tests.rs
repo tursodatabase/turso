@@ -582,3 +582,80 @@ fn prefixes_with_many_ties_match_btreemap() {
     let keys: Vec<i64> = map.iter().map(|e| e.key().0).collect();
     assert_eq!(keys, model.keys().copied().collect::<Vec<_>>());
 }
+
+/// An index key compares only the columns that both keys have, so a seek key with fewer
+/// columns is equal to every key that starts with its columns. The bounds of a range
+/// must include all of those keys, also when they fill several leaves.
+#[test]
+fn a_shorter_seek_key_bounds_every_key_that_starts_with_it() {
+    const SECOND_VALUES: i64 = 300;
+    let map: BPlusTreeMap<Arc<ColumnsKey>, Arc<i64>> = BPlusTreeMap::new();
+    for first in 0..4 {
+        for second in 0..SECOND_VALUES {
+            map.insert(Arc::new(ColumnsKey(vec![first, second])), Arc::new(second));
+        }
+    }
+    let columns = |entry: Entry<'_, Arc<ColumnsKey>, Arc<i64>>| entry.key().0.clone();
+    for first in 0..4 {
+        let seek_key = ColumnsKey(vec![first]);
+        let expected: Vec<Vec<i64>> = (0..SECOND_VALUES)
+            .map(|second| vec![first, second])
+            .collect();
+        let both = (Bound::Included(&seek_key), Bound::Included(&seek_key));
+        let forward: Vec<Vec<i64>> = map.range::<ColumnsKey, _>(both).map(columns).collect();
+        assert_eq!(forward, expected);
+        let backward: Vec<Vec<i64>> = map
+            .range::<ColumnsKey, _>(both)
+            .rev()
+            .map(columns)
+            .collect();
+        assert_eq!(backward, expected.iter().rev().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            map.lower_bound(Bound::Included(&seek_key)).map(columns),
+            Some(vec![first, 0])
+        );
+        assert_eq!(
+            map.upper_bound(Bound::Included(&seek_key)).map(columns),
+            Some(vec![first, SECOND_VALUES - 1])
+        );
+        assert_eq!(
+            map.lower_bound(Bound::Excluded(&seek_key)).map(columns),
+            (first < 3).then(|| vec![first + 1, 0])
+        );
+        assert_eq!(
+            map.upper_bound(Bound::Excluded(&seek_key)).map(columns),
+            (first > 0).then(|| vec![first - 1, SECOND_VALUES - 1])
+        );
+    }
+}
+
+/// Compares the columns that both keys have, like [`crate::mvcc::database::SortableIndexKey`].
+#[derive(Debug)]
+struct ColumnsKey(Vec<i64>);
+
+impl Ord for ColumnsKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .map(|(a, b)| a.cmp(b))
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for ColumnsKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ColumnsKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for ColumnsKey {}
+
+impl KeyPrefix for ColumnsKey {}

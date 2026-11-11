@@ -334,6 +334,10 @@ struct Inner<K: TreeKey> {
 /// A separator in an inner node is the largest key of the child on its left. Forward
 /// targets pick the first key that is not before the target. Backward targets pick the
 /// last key before the target.
+///
+/// `q` can be equal to more than one key: an index key compares only the columns that
+/// both keys have, so a seek key with fewer columns is equal to every key that starts
+/// with its columns.
 #[derive(Clone, Copy)]
 enum Target<'q, Q: ?Sized> {
     First,
@@ -342,8 +346,12 @@ enum Target<'q, Q: ?Sized> {
     AtOrAfter(&'q Q),
     /// First key `> q`.
     After(&'q Q),
-    /// Last key `<= q`.
+    /// Last key `<= q`. The search goes down past every separator `<= q`, so it finds
+    /// the last of the keys that are equal to `q`.
     UpTo(&'q Q),
+    /// Last key `<= q`, where `q` is a separator. The search goes down to the child on
+    /// the left of `q`, which holds `q` as its largest key.
+    UpToSeparator(&'q Q),
     /// Last key `< q`.
     Before(&'q Q),
 }
@@ -352,9 +360,11 @@ impl<Q: Ord + KeyPrefix + ?Sized> Target<'_, Q> {
     fn prefix(&self) -> Option<u64> {
         match self {
             Target::First | Target::Last => None,
-            Target::AtOrAfter(q) | Target::After(q) | Target::UpTo(q) | Target::Before(q) => {
-                q.prefix()
-            }
+            Target::AtOrAfter(q)
+            | Target::After(q)
+            | Target::UpTo(q)
+            | Target::UpToSeparator(q)
+            | Target::Before(q) => q.prefix(),
         }
     }
 
@@ -376,10 +386,12 @@ impl<Q: Ord + KeyPrefix + ?Sized> Target<'_, Q> {
         match self {
             Target::First => Some(0),
             Target::Last => Some(count),
-            Target::AtOrAfter(q) | Target::UpTo(q) | Target::Before(q) => {
+            Target::AtOrAfter(q) | Target::UpToSeparator(q) | Target::Before(q) => {
                 partition::<K>(keys, count, prefix, |k| k.borrow() < *q)
             }
-            Target::After(q) => partition::<K>(keys, count, prefix, |k| k.borrow() <= *q),
+            Target::After(q) | Target::UpTo(q) => {
+                partition::<K>(keys, count, prefix, |k| k.borrow() <= *q)
+            }
         }
     }
 
@@ -398,7 +410,7 @@ impl<Q: Ord + KeyPrefix + ?Sized> Target<'_, Q> {
             Target::AtOrAfter(q) | Target::Before(q) => {
                 partition::<K>(keys, count, prefix, |k| k.borrow() < *q)
             }
-            Target::After(q) | Target::UpTo(q) => {
+            Target::After(q) | Target::UpTo(q) | Target::UpToSeparator(q) => {
                 partition::<K>(keys, count, prefix, |k| k.borrow() <= *q)
             }
         }
@@ -785,7 +797,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
             let attempt = match (&fence, target.is_forward()) {
                 (None, _) => self.try_seek(&target, prefix),
                 (Some((f, p)), true) => self.try_seek::<K>(&Target::After(f), *p),
-                (Some((f, p)), false) => self.try_seek::<K>(&Target::UpTo(f), *p),
+                (Some((f, p)), false) => self.try_seek::<K>(&Target::UpToSeparator(f), *p),
             };
             match attempt {
                 Ok(Seek::Found(pos)) => return Some(pos),
