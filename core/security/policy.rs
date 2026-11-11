@@ -6,10 +6,9 @@
 //! [`crate::Dialect::table_rls_enabled`] says which tables have it, and
 //! [`crate::Dialect::row_security_policies`] gives the policies.
 //!
-//! The policies are stored but do not decide which rows a role may access
-//! yet, so a table with row-level security hides every row from every role
-//! it applies to, as a PostgreSQL table with row-level security and no
-//! policies does.
+//! A role reads the rows that pass at least one of the permissive policies
+//! and every restrictive policy that apply to it, as in PostgreSQL. Without
+//! a permissive policy no row passes.
 
 use turso_parser::ast;
 
@@ -26,12 +25,15 @@ pub enum Command {
 }
 
 /// Which rows of a table a role may access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
     /// Every row.
     Allow,
     /// No row.
     Deny,
+    /// The rows that pass the `USING` conditions of these policies. At least
+    /// one of them is permissive.
+    Filter(Vec<RowPolicy>),
 }
 
 /// A policy of a table, as `CREATE POLICY` defines it.
@@ -49,4 +51,22 @@ pub struct RowPolicy {
     pub using_expr: Option<ast::Expr>,
     /// Which new rows the policy lets the roles write.
     pub check_expr: Option<ast::Expr>,
+}
+
+impl RowPolicy {
+    /// Whether the policy decides which rows `role` may access for `command`.
+    pub fn applies_to(&self, command: Command, role: RoleId) -> bool {
+        let command_matches = match self.command {
+            ast::PolicyCommand::All => true,
+            ast::PolicyCommand::Select => command == Command::Select,
+            ast::PolicyCommand::Insert => command == Command::Insert,
+            ast::PolicyCommand::Update => command == Command::Update,
+            ast::PolicyCommand::Delete => command == Command::Delete,
+        };
+        command_matches
+            && self
+                .roles
+                .iter()
+                .any(|policy_role| *policy_role == RoleId::PUBLIC || *policy_role == role)
+    }
 }

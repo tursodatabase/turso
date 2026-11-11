@@ -17,11 +17,12 @@ ALTER TABLE name DISABLE ROW LEVEL SECURITY
 `DISABLE ROW LEVEL SECURITY` turns it off. The `relrowsecurity` column of
 `pg_class` shows which tables have it.
 
-A table with row-level security shows no rows to a role that is neither a
-superuser nor the table's owner, as a PostgreSQL table with row-level security
-and no policies does. Queries return no rows from it, wherever the table
-appears in them: in joins, subqueries, common table expressions, views and
-`COPY ... TO STDOUT`. In a `LEFT JOIN`, the table's columns read as NULL.
+A table with row-level security shows a role that is neither a superuser nor
+the table's owner only the rows that the table's policies allow it, which
+`CREATE POLICY` defines. Without policies, the role sees no rows, as in
+PostgreSQL. The policies apply wherever the table appears in a query: in
+joins, subqueries, common table expressions, views and `COPY ... TO STDOUT`.
+In a `LEFT JOIN`, the columns of a row the role may not see read as NULL.
 Superusers and the table's owner see every row.
 
 **Parameters:**
@@ -30,13 +31,10 @@ Superusers and the table's owner see every row.
 
 **Notes:**
 
-Policies and `CREATE POLICY` are not supported yet, so a role that is neither
-a superuser nor the table's owner cannot see any row of a table with row-level
-security.
-
 A view reads its tables as the view's owner, as in PostgreSQL, so it shows its
 readers the rows its owner sees. A view that a superuser or the table's owner
-owns shows every row; a view that another role owns shows none. Unlike
+owns shows every row; a view that another role owns shows the rows the
+policies allow that role. Unlike
 PostgreSQL, a superuser reading a view sees every row, whoever owns the
 view.
 
@@ -89,11 +87,18 @@ CREATE POLICY name ON table_name
 
 **Description:**
 
-`CREATE POLICY` defines which rows of a table the roles it names may read
-and write, once `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is on for the
-table. The policies are stored with the table, but they do not change what
-a role reads or writes yet: a table with row-level security still shows no
-rows to a role that is neither a superuser nor the table's owner.
+`CREATE POLICY` defines which rows of a table the roles it names may read.
+It matters once `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is on for the
+table.
+
+A role reads the rows for which the `USING` expression of at least one
+permissive policy is true and the `USING` expressions of all restrictive
+policies are true, counting only the policies `FOR ALL` and `FOR SELECT` that
+name the role or `PUBLIC`. Without a permissive policy, it reads no rows.
+
+The policies are checked on each row before the other conditions of a query,
+so a condition of the query, or a function it calls, never sees a row the
+role may not read.
 
 **Parameters:**
 
@@ -111,11 +116,16 @@ rows to a role that is neither a superuser nor the table's owner.
   schema and table names, and call
   scalar functions such as `current_user`. A subquery without `FROM`, such as
   `(SELECT current_user)`, stands for its value.
-- `check_expression`: Which new rows the policy lets a role write.
+- `check_expression`: Which new rows the policy lets a role write. It is
+  stored but has no effect yet, because roles cannot write to tables.
 
 **Notes:**
 
 Only the owner of the table or a superuser may create its policies.
+
+Roles that are not superusers cannot write to tables yet, so the policies
+`FOR INSERT`, `FOR UPDATE` and `FOR DELETE` and the `WITH CHECK` expressions
+are stored but do not change what any role can do.
 
 Policies cannot use subqueries with `FROM`, parameters, aggregate or window
 functions, or generated columns that are computed when they are read. A
@@ -125,6 +135,10 @@ policies, and dropping the table drops them.
 
 A policy whose expression is nested too deeply, such as a hundred conditions
 joined with `OR`, is rejected; write it with `IN` instead.
+
+A function that a policy calls, such as `current_user`, runs for each row
+that the policy checks, unlike in PostgreSQL, where `(SELECT current_user)`
+runs once per query.
 
 `pg_policy` and `pg_policies` do not show the policies yet.
 

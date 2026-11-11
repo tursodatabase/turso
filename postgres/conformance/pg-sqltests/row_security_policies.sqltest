@@ -1,10 +1,279 @@
 # Row-level security policies through the PostgreSQL frontend: CREATE
-# POLICY and DROP POLICY.
+# POLICY and DROP POLICY, and the rows that each role then reads.
 #
-# PostgreSQL roles belong to the whole server, so every test uses its own
-# role and table names.
+# Each test reads as the superuser or the owner where that helps, then as
+# roles that are not superusers. Roles are granted SELECT, because without
+# it PostgreSQL refuses to read the table at all. PostgreSQL roles belong to
+# the whole server, so every test uses its own role and table names.
 
 @database :memory:
+
+test policy-shows-each-role-its-own-rows {
+    CREATE ROLE rp_alice_1;
+    CREATE ROLE rp_bob_1;
+    CREATE TABLE rp_docs_1 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO rp_docs_1 VALUES (1, 'rp_alice_1', 'a'), (2, 'rp_bob_1', 'b'), (3, 'rp_alice_1', 'c');
+    ALTER TABLE rp_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_1 FOR SELECT USING (owner = current_user);
+    GRANT SELECT ON rp_docs_1 TO rp_alice_1, rp_bob_1;
+    SELECT count(*) FROM rp_docs_1;
+    SET ROLE rp_alice_1;
+    SELECT id FROM rp_docs_1 ORDER BY id;
+    SELECT count(*) FROM rp_docs_1;
+    SET ROLE rp_bob_1;
+    SELECT id FROM rp_docs_1 ORDER BY id;
+    SELECT max(id) FROM rp_docs_1;
+}
+expect {
+    3
+    1
+    3
+    2
+    2
+    2
+}
+
+test policy-with-scalar-subquery-of-current-user {
+    CREATE ROLE rp_alice_2;
+    CREATE TABLE rp_docs_2 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_2 VALUES (1, 'rp_alice_2'), (2, 'someone else');
+    ALTER TABLE rp_docs_2 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_2 USING (rp_docs_2.owner = (SELECT current_user));
+    GRANT SELECT ON rp_docs_2 TO rp_alice_2;
+    SET ROLE rp_alice_2;
+    SELECT id FROM rp_docs_2;
+}
+expect {
+    1
+}
+
+test policy-applies-only-to-the-roles-it-names {
+    CREATE ROLE rp_alice_3;
+    CREATE ROLE rp_bob_3;
+    CREATE TABLE rp_docs_3 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_3 VALUES (1), (2);
+    ALTER TABLE rp_docs_3 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_3 TO rp_alice_3 USING (true);
+    GRANT SELECT ON rp_docs_3 TO rp_alice_3, rp_bob_3;
+    SET ROLE rp_alice_3;
+    SELECT count(*) FROM rp_docs_3;
+    SET ROLE rp_bob_3;
+    SELECT count(*) FROM rp_docs_3;
+}
+expect {
+    2
+    0
+}
+
+test restrictive-policy-limits-permissive-ones {
+    CREATE ROLE rp_alice_4;
+    CREATE TABLE rp_docs_4 (id INT PRIMARY KEY, published BOOLEAN);
+    INSERT INTO rp_docs_4 VALUES (1, true), (2, false), (3, true);
+    ALTER TABLE rp_docs_4 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY some_rows ON rp_docs_4 USING (id < 3);
+    CREATE POLICY other_rows ON rp_docs_4 USING (id = 3);
+    CREATE POLICY only_published ON rp_docs_4 AS RESTRICTIVE USING (published);
+    GRANT SELECT ON rp_docs_4 TO rp_alice_4;
+    SET ROLE rp_alice_4;
+    SELECT id FROM rp_docs_4 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test restrictive-policy-alone-shows-no-rows {
+    CREATE ROLE rp_alice_5;
+    CREATE TABLE rp_docs_5 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_5 VALUES (1);
+    ALTER TABLE rp_docs_5 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_5 AS RESTRICTIVE USING (true);
+    GRANT SELECT ON rp_docs_5 TO rp_alice_5;
+    SET ROLE rp_alice_5;
+    SELECT count(*) FROM rp_docs_5;
+}
+expect {
+    0
+}
+
+test policies-for-other-commands-show-no-rows {
+    CREATE ROLE rp_alice_6;
+    CREATE TABLE rp_docs_6 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_6 VALUES (1);
+    ALTER TABLE rp_docs_6 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY ins ON rp_docs_6 FOR INSERT WITH CHECK (true);
+    CREATE POLICY upd ON rp_docs_6 FOR UPDATE USING (true) WITH CHECK (true);
+    CREATE POLICY del ON rp_docs_6 FOR DELETE USING (true);
+    GRANT SELECT ON rp_docs_6 TO rp_alice_6;
+    SET ROLE rp_alice_6;
+    SELECT count(*) FROM rp_docs_6;
+}
+expect {
+    0
+}
+
+test drop-policy-hides-the-rows-again {
+    CREATE ROLE rp_alice_7;
+    CREATE TABLE rp_docs_7 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_7 VALUES (1);
+    ALTER TABLE rp_docs_7 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_7 USING (true);
+    GRANT SELECT ON rp_docs_7 TO rp_alice_7;
+    SET ROLE rp_alice_7;
+    SELECT count(*) FROM rp_docs_7;
+    RESET ROLE;
+    DROP POLICY everything ON rp_docs_7;
+    SET ROLE rp_alice_7;
+    SELECT count(*) FROM rp_docs_7;
+}
+expect {
+    1
+    0
+}
+
+test policy-keeps-hidden-rows-from-left-join {
+    CREATE ROLE rp_alice_8;
+    CREATE TABLE rp_users_8 (id INT PRIMARY KEY);
+    CREATE TABLE rp_docs_8 (id INT PRIMARY KEY, user_id INT, owner TEXT);
+    INSERT INTO rp_users_8 VALUES (1), (2);
+    INSERT INTO rp_docs_8 VALUES (10, 1, 'rp_alice_8'), (20, 2, 'someone else');
+    ALTER TABLE rp_docs_8 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_8 USING (owner = current_user);
+    GRANT SELECT ON rp_users_8, rp_docs_8 TO rp_alice_8;
+    SET ROLE rp_alice_8;
+    SELECT u.id, d.id FROM rp_users_8 u LEFT JOIN rp_docs_8 d ON d.user_id = u.id ORDER BY u.id;
+}
+expect {
+    1|10
+    2|
+}
+
+test policy-applies-in-subqueries-and-joins {
+    CREATE ROLE rp_alice_9;
+    CREATE TABLE rp_users_9 (id INT PRIMARY KEY);
+    CREATE TABLE rp_docs_9 (id INT PRIMARY KEY, user_id INT, owner TEXT);
+    INSERT INTO rp_users_9 VALUES (1), (2), (3);
+    INSERT INTO rp_docs_9 VALUES (10, 1, 'rp_alice_9'), (20, 2, 'someone else');
+    ALTER TABLE rp_docs_9 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_9 USING (owner = current_user);
+    GRANT SELECT ON rp_users_9, rp_docs_9 TO rp_alice_9;
+    SET ROLE rp_alice_9;
+    SELECT u.id FROM rp_users_9 u JOIN rp_docs_9 d ON d.user_id = u.id ORDER BY u.id;
+    SELECT id FROM rp_users_9 WHERE id IN (SELECT user_id FROM rp_docs_9) ORDER BY id;
+    SELECT id FROM rp_users_9 u WHERE NOT EXISTS (SELECT 1 FROM rp_docs_9 d WHERE d.user_id = u.id) ORDER BY id;
+    SELECT (SELECT count(*) FROM rp_docs_9);
+}
+expect {
+    1
+    1
+    2
+    3
+    1
+}
+
+# The filter of the policies is checked before the conditions of the query,
+# so a condition that fails on a hidden row never sees it.
+test query-conditions-do-not-see-hidden-rows {
+    CREATE ROLE rp_alice_10;
+    CREATE TABLE rp_docs_10 (id INT PRIMARY KEY, owner TEXT, status TEXT, n INT);
+    INSERT INTO rp_docs_10 VALUES (1, 'rp_alice_10', 'published', 1), (2, 'someone else', 'published', 0);
+    ALTER TABLE rp_docs_10 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_10 USING (owner = current_user);
+    CREATE POLICY own_published ON rp_docs_10 USING (owner = current_user AND status = 'published');
+    GRANT SELECT ON rp_docs_10 TO rp_alice_10;
+    SET ROLE rp_alice_10;
+    SELECT id FROM rp_docs_10 WHERE 1 / n = 1;
+}
+expect {
+    1
+}
+
+test join-keys-do-not-see-hidden-rows {
+    CREATE ROLE rp_alice_11;
+    CREATE TABLE rp_items_11 (x INT);
+    CREATE TABLE rp_docs_11 (id INT PRIMARY KEY, owner TEXT, k INT);
+    INSERT INTO rp_items_11 VALUES (5), (7);
+    INSERT INTO rp_docs_11 VALUES (1, 'rp_alice_11', 2), (2, 'someone else', 0);
+    ALTER TABLE rp_docs_11 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_11 USING (owner = 'rp_alice_11');
+    GRANT SELECT ON rp_items_11, rp_docs_11 TO rp_alice_11;
+    SET ROLE rp_alice_11;
+    SELECT x FROM rp_items_11 i WHERE NOT EXISTS (SELECT 1 FROM rp_docs_11 d WHERE i.x = 10 / d.k) ORDER BY x;
+    SELECT i.x FROM rp_items_11 i JOIN rp_docs_11 d ON i.x = 10 / d.k;
+}
+expect {
+    7
+    5
+}
+
+test policy-uses-columns-of-a-renamed-table {
+    CREATE ROLE rp_alice_12;
+    CREATE TABLE rp_docs_12 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_12 VALUES (1, 'rp_alice_12'), (2, 'someone else');
+    ALTER TABLE rp_docs_12 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_12 USING (rp_docs_12.owner = current_user);
+    ALTER TABLE rp_docs_12 RENAME TO rp_renamed_12;
+    GRANT SELECT ON rp_renamed_12 TO rp_alice_12;
+    SET ROLE rp_alice_12;
+    SELECT id FROM rp_renamed_12;
+}
+expect {
+    1
+}
+
+test policy-uses-columns-named-with-schema-and-table {
+    CREATE ROLE rp_alice_qualified;
+    CREATE TABLE rp_docs_qualified (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_qualified VALUES (1, 'rp_alice_qualified'), (2, 'someone else');
+    ALTER TABLE rp_docs_qualified ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_qualified
+        USING (public.rp_docs_qualified.owner = current_user);
+    GRANT SELECT ON rp_docs_qualified TO rp_alice_qualified;
+    SET ROLE rp_alice_qualified;
+    SELECT id FROM rp_docs_qualified;
+}
+expect {
+    1
+}
+
+test view-reads-with-the-policies-of-its-owner {
+    CREATE ROLE rp_alice_13;
+    CREATE TABLE rp_docs_13 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_13 VALUES (1, 'rp_alice_13'), (2, 'someone else');
+    ALTER TABLE rp_docs_13 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_13 USING (owner = current_user);
+    CREATE VIEW rp_view_13 AS SELECT id FROM rp_docs_13;
+    GRANT SELECT ON rp_view_13 TO rp_alice_13;
+    SET ROLE rp_alice_13;
+    SELECT id FROM rp_view_13;
+}
+expect {
+    1
+    2
+}
+
+test policy-to-current-user {
+    CREATE ROLE rp_alice_14;
+    CREATE TABLE rp_docs_14 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_14 VALUES (1);
+    ALTER TABLE rp_docs_14 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON rp_docs_14 TO rp_alice_14;
+    SET ROLE rp_alice_14;
+    SELECT count(*) FROM rp_docs_14;
+    RESET ROLE;
+    ALTER TABLE rp_docs_14 OWNER TO rp_alice_14;
+    SET ROLE rp_alice_14;
+    CREATE POLICY mine ON rp_docs_14 TO CURRENT_USER USING (true);
+    RESET ROLE;
+    ALTER TABLE rp_docs_14 OWNER TO postgres;
+    GRANT SELECT ON rp_docs_14 TO rp_alice_14;
+    SET ROLE rp_alice_14;
+    SELECT count(*) FROM rp_docs_14;
+}
+expect {
+    0
+    1
+}
 
 test role-that-does-not-own-the-table-cannot-create-a-policy {
     CREATE ROLE rp_alice_15;
@@ -162,6 +431,42 @@ test drop-of-column-a-policy-uses-is-rejected {
 @sqlstate 2BP01
 expect error {}
 
+test drop-table-drops-its-policies {
+    CREATE ROLE rp_alice_31;
+    CREATE TABLE rp_docs_31 (id INT PRIMARY KEY);
+    ALTER TABLE rp_docs_31 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_31 USING (true);
+    DROP TABLE rp_docs_31;
+    CREATE TABLE rp_docs_31 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_31 VALUES (1);
+    ALTER TABLE rp_docs_31 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON rp_docs_31 TO rp_alice_31;
+    SET ROLE rp_alice_31;
+    SELECT count(*) FROM rp_docs_31;
+}
+expect {
+    0
+}
+
+test or-over-two-indexes-does-not-see-hidden-rows {
+    CREATE ROLE rp_alice_32;
+    CREATE TABLE rp_docs_32 (id INT PRIMARY KEY, owner TEXT, k INT, j INT, n INT);
+    CREATE INDEX rp_docs_32_k ON rp_docs_32 (k);
+    CREATE INDEX rp_docs_32_j ON rp_docs_32 (j);
+    INSERT INTO rp_docs_32 SELECT g, 'someone else', g, g, 1 FROM generate_series(10, 2000) g;
+    INSERT INTO rp_docs_32 VALUES (1, 'rp_alice_32', 1, 1, 1), (2, 'someone else', 2, 2, 0);
+    ALTER TABLE rp_docs_32 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_32 USING (owner = 'rp_alice_32');
+    GRANT SELECT ON rp_docs_32 TO rp_alice_32;
+    SET ROLE rp_alice_32;
+    SELECT id FROM rp_docs_32 WHERE k = 1 OR (j = 2 AND 1 / n = 1);
+    SELECT (SELECT count(*) FROM rp_docs_32 WHERE k = 1 OR (j = 2 AND 1 / n = 1));
+}
+expect {
+    1
+    1
+}
+
 @skip-if postgres "PostgreSQL stores conditions of any depth"
 test policy-too-deep-to-store-is-rejected {
     CREATE TABLE rp_docs_33 (id INT PRIMARY KEY);
@@ -169,6 +474,20 @@ test policy-too-deep-to-store-is-rejected {
 }
 expect error {
     the conditions of policy "many" cannot be stored
+}
+
+test policy-on-column-named-true {
+    CREATE ROLE rp_alice_34;
+    CREATE TABLE rp_docs_34 (id INT PRIMARY KEY, "true" BOOLEAN);
+    INSERT INTO rp_docs_34 VALUES (1, true), (2, false);
+    ALTER TABLE rp_docs_34 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY p ON rp_docs_34 USING ("true");
+    GRANT SELECT ON rp_docs_34 TO rp_alice_34;
+    SET ROLE rp_alice_34;
+    SELECT id FROM rp_docs_34;
+}
+expect {
+    1
 }
 
 test policy-with-parameter-is-rejected {

@@ -665,6 +665,20 @@ fn a_catalog_made_before_relrowsecurity_opens_read_only_without_the_column() {
     assert!(error.contains("readonly"), "{error}");
 }
 
+/// The ids of `app.t` that role alice reads.
+fn ids_alice_reads(pg: &turso_pg::Connection) -> Vec<String> {
+    pg.execute("SET ROLE alice").unwrap();
+    let mut stmt = pg.query("SELECT x FROM app.t ORDER BY x").unwrap().unwrap();
+    let ids = stmt
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].to_string())
+        .collect();
+    pg.execute("RESET ROLE").unwrap();
+    ids
+}
+
 #[test]
 fn a_catalog_made_before_relpolicies_gets_the_column_when_opened() {
     let dir = tempfile::tempdir().unwrap();
@@ -674,19 +688,26 @@ fn a_catalog_made_before_relpolicies_gets_the_column_when_opened() {
 
     let db = open_pg_database(path, turso_core::OpenFlags::default());
     let pg = turso_pg::Connection::connect(&db).unwrap();
+    for sql in [
+        "CREATE ROLE alice",
+        "INSERT INTO app.t VALUES (1), (2)",
+        "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY",
+        "GRANT SELECT ON app.t TO alice",
+    ] {
+        pg.execute(sql).unwrap();
+    }
+    assert!(ids_alice_reads(&pg).is_empty());
+
     pg.execute("CREATE POLICY one ON app.t USING (x = 1)")
         .unwrap();
+    assert_eq!(ids_alice_reads(&pg), vec!["1"]);
     pg.close().unwrap();
     drop(pg);
     drop(db);
 
     let db = open_pg_database(path, turso_core::OpenFlags::default());
     let pg = turso_pg::Connection::connect(&db).unwrap();
-    let error = pg
-        .execute("CREATE POLICY one ON app.t USING (x = 1)")
-        .unwrap_err()
-        .to_string();
-    assert_eq!(error, "policy \"one\" for table \"t\" already exists");
+    assert_eq!(ids_alice_reads(&pg), vec!["1"]);
 }
 
 #[test]
