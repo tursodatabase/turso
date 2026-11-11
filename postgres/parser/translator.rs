@@ -7,7 +7,8 @@ use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
 };
 use crate::ParseError;
@@ -5210,17 +5211,6 @@ impl PostgreSQLTranslator {
         let mut as_type = None;
         for opt_node in &seq.options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
-                if matches!(
-                    elem.defname.as_str(),
-                    "start" | "increment" | "minvalue" | "maxvalue"
-                ) && elem.arg.is_some()
-                    && extract_def_elem_int(elem).is_none()
-                {
-                    return Err(not_supported(format!(
-                        "this {} value in CREATE SEQUENCE",
-                        elem.defname.to_uppercase()
-                    )));
-                }
                 match elem.defname.as_str() {
                     "as" => {
                         let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
@@ -5233,22 +5223,22 @@ impl PostgreSQLTranslator {
                         as_type = Some(extract_type_name_from_typename(tn)?);
                     }
                     "start" => {
-                        start = extract_def_elem_int(elem);
+                        start = sequence_option_int(elem)?;
                     }
                     "increment" => {
-                        increment = extract_def_elem_int(elem);
+                        increment = sequence_option_int(elem)?;
                     }
                     "minvalue" => {
-                        min_value = extract_def_elem_int(elem);
+                        min_value = sequence_option_int(elem)?;
                     }
                     "maxvalue" => {
-                        max_value = extract_def_elem_int(elem);
+                        max_value = sequence_option_int(elem)?;
                     }
                     "cycle" => {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    "cache" => match extract_def_elem_int(elem) {
+                    "cache" => match sequence_option_int(elem)? {
                         Some(1) => {}
                         Some(cache) if cache < 1 => {
                             return Err(ParseError::Sqlstate {
@@ -6648,12 +6638,43 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
     use pg_query::protobuf::node::Node;
     match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
         Some(Node::Integer(i)) => Some(i.ival as i64),
+        // A decimal past int4, such as `3_000_000_000`, is a Float, and may hold
+        // underscores between its digits.
         Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
-            .unwrap_or_else(|| f.fval.clone())
+            .unwrap_or_else(|| f.fval.replace('_', ""))
             .parse::<i64>()
             .ok(),
         _ => None,
     }
+}
+
+/// The integer value of a sequence option, read as PostgreSQL reads it into a
+/// bigint: a number with a fraction or an exponent, such as `1.5` or `1e3`, is
+/// invalid input (22P02), and an integer past the bigint range is out of range
+/// (22003). The message quotes the number as written. The grammar gives these
+/// options only numbers; None for an option without one.
+fn sequence_option_int(elem: &pg_query::protobuf::DefElem) -> Result<Option<i64>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::Float(f)) = elem.arg.as_ref().and_then(|n| n.node.as_ref()) else {
+        return Ok(extract_def_elem_int(elem));
+    };
+    if let Some(value) = extract_def_elem_int(elem) {
+        return Ok(Some(value));
+    }
+    let digits = non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.replace('_', ""));
+    let unsigned = digits.strip_prefix('-').unwrap_or(&digits);
+    let is_integer = !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit());
+    Err(if is_integer {
+        ParseError::Sqlstate {
+            sqlstate: SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            message: format!("value \"{}\" is out of range for type bigint", f.fval),
+        }
+    } else {
+        ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            message: format!("invalid input syntax for type bigint: \"{}\"", f.fval),
+        }
+    })
 }
 
 fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {
@@ -12494,13 +12515,36 @@ mod tests {
         assert_not_supported("CREATE TEMP SEQUENCE s", "TEMPORARY SEQUENCE");
         assert_not_supported("CREATE SEQUENCE s OWNED BY t.id", "OWNED BY");
         assert_not_supported("CREATE SEQUENCE s AS numeric", "AS numeric");
-        assert_not_supported(
-            "CREATE SEQUENCE s MAXVALUE 99999999999999999999",
-            "MAXVALUE value",
-        );
         assert_not_supported("CREATE SEQUENCE s CACHE 10", "CACHE 10");
         assert_not_supported("CREATE SEQUENCE s CACHE 9999999999", "CACHE 9999999999");
-        assert_not_supported("CREATE SEQUENCE s CACHE 1.5", "CACHE value");
+        // A number that does not read as a bigint is refused as PostgreSQL refuses it.
+        for (sql, expected) in [
+            ("CREATE SEQUENCE s MAXVALUE 99999999999999999999", "22003"),
+            ("CREATE SEQUENCE s START -99999999999999999999", "22003"),
+            ("CREATE SEQUENCE s CACHE 1.5", "22P02"),
+            ("CREATE SEQUENCE s INCREMENT 1e3", "22P02"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            match PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
+                Err(ParseError::Sqlstate { sqlstate, .. }) => {
+                    assert_eq!(sqlstate, expected, "{sql}")
+                }
+                Err(err) => panic!("{sql}: expected SQLSTATE {expected}, got: {err}"),
+                Ok(_) => panic!("{sql}: expected SQLSTATE {expected}"),
+            }
+        }
+        // The message quotes the number as written.
+        let parsed = crate::parse("CREATE SEQUENCE s MAXVALUE 0xFFFF_FFFF_FFFF_FFFF_F").unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err("MAXVALUE past bigint");
+        assert!(
+            err.to_string()
+                .contains("value \"0xFFFF_FFFF_FFFF_FFFF_F\" is out of range for type bigint"),
+            "{err}"
+        );
+        // A bigint past the int4 range with underscores reads as its value.
+        assert_translates("CREATE SEQUENCE s START 3_000_000_000 MAXVALUE 4_000_000_000");
         assert_translates("CREATE SEQUENCE s OWNED BY NONE NO MINVALUE NO MAXVALUE CACHE 1");
 
         let parsed = crate::parse("CREATE SEQUENCE s AS integer START WITH 1").unwrap();

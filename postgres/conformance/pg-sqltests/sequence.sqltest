@@ -65,10 +65,6 @@ test create-sequence-with-fractional-cache {
 expect error {
     invalid input syntax for type bigint: "1.5"
 }
-@sqlstate 0A000
-expect @tursopg error {
-    this CACHE value in CREATE SEQUENCE is not supported
-}
 
 test create-sequence-with-cache-too-large-for-bigint {
     CREATE SEQUENCE cache_huge CACHE 99999999999999999999;
@@ -77,7 +73,61 @@ test create-sequence-with-cache-too-large-for-bigint {
 expect error {
     value "99999999999999999999" is out of range for type bigint
 }
-@sqlstate 0A000
-expect @tursopg error {
-    this CACHE value in CREATE SEQUENCE is not supported
+
+# The other options read their value as a bigint the same way.
+test create-sequence-with-fractional-start {
+    CREATE SEQUENCE start_fraction START 1.5;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "1.5"
+}
+
+test create-sequence-with-exponent-increment {
+    CREATE SEQUENCE increment_exponent INCREMENT 1e3;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "1e3"
+}
+
+test create-sequence-with-maxvalue-too-large-for-bigint {
+    CREATE SEQUENCE maxvalue_huge MAXVALUE 99999999999999999999;
+}
+@sqlstate 22003
+expect error {
+    value "99999999999999999999" is out of range for type bigint
+}
+
+test create-sequence-with-negative-fractional-start {
+    CREATE SEQUENCE start_negative_fraction START -1.5;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "-1.5"
+}
+
+test create-sequence-with-hex-maxvalue-too-large-for-bigint {
+    CREATE SEQUENCE maxvalue_hex MAXVALUE 0xFFFFFFFFFFFFFFFFF;
+}
+@sqlstate 22003
+expect error {
+    value "0xFFFFFFFFFFFFFFFFF" is out of range for type bigint
+}
+
+# A bigint past the int4 range may be written with underscores.
+test create-sequence-with-underscored-bigint-start {
+    CREATE SEQUENCE start_underscored START 3_000_000_000 MAXVALUE 4_000_000_000;
+    SELECT nextval('start_underscored');
+}
+expect {
+    3000000000
+}
+
+test create-sequence-with-minvalue-too-small-for-bigint {
+    CREATE SEQUENCE minvalue_huge MINVALUE -99999999999999999999;
+}
+@sqlstate 22003
+expect error {
+    value "-99999999999999999999" is out of range for type bigint
 }
