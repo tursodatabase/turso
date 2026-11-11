@@ -460,6 +460,54 @@ expect error {
     function quote_ident\(integer\) does not exist
 }
 
+test like-escape-integer-pattern-errors {
+    SELECT like_escape(5, '\');
+}
+@sqlstate 42883
+expect error {
+    function like_escape\(integer, .*\) does not exist
+}
+
+test similar-to-escape-integer-pattern-errors {
+    SELECT similar_to_escape(5);
+}
+@sqlstate 42883
+expect error {
+    function similar_to_escape\(integer\) does not exist
+}
+
+test acldefault-integer-object-kind-errors {
+    SELECT acldefault(5, 10);
+}
+@sqlstate 42883
+expect error {
+    function acldefault\(integer, integer\) does not exist
+}
+
+test oid-argument-type-errors-with-a-null-argument {
+    SELECT pg_get_constraintdef(1.5, NULL);
+}
+@sqlstate 42883
+expect error {
+    function pg_get_constraintdef\(numeric, unknown\) does not exist
+}
+
+test boolean-argument-type-errors-with-a-null-argument {
+    SELECT current_setting(NULL, 1.5);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(unknown, numeric\) does not exist
+}
+
+test booleq-and-boolne-read-boolean-text {
+    SELECT CASE WHEN booleq('t', true) THEN 'equal' ELSE 'different' END,
+           CASE WHEN boolne('f', true) THEN 'different' ELSE 'equal' END;
+}
+expect {
+    equal|different
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }

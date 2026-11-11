@@ -21,24 +21,33 @@ use turso_pg_parser::sqlstate::{
 /// Registers one native scalar function per name. Each body is a Rust
 /// expression that can use `?`. The planner reads the SQL return type from the
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
-/// the body returns. A function returns NULL when any argument is NULL, without
-/// running its body, like a PostgreSQL STRICT function, unless it is marked
-/// `called_on_null_input`. PostgreSQL checks argument types before it calls a
-/// function, so a function that checks its argument types itself is marked
-/// `called_on_null_input` and checks them before it returns NULL.
+/// the body returns.
+///
+/// An entry can list the types of its arguments (`[Text, Any]`). A call whose
+/// arguments do not have those types fails with PostgreSQL's "function ... does
+/// not exist" error, also when another argument is NULL, because PostgreSQL
+/// picks the function by its argument types before it runs it. Then the
+/// function returns NULL when any argument is NULL, without running its body,
+/// like a PostgreSQL STRICT function, unless it is marked `called_on_null_input`.
 macro_rules! scalar_functions {
     ($options:expr, |$connection:ident, $args:ident| {
-        $($($name:literal)|+ ($arity:expr, $deterministic:expr $(, $called_on_null_input:ident)?) => $body:expr,)*
+        $($($name:literal)|+ (
+            $arity:expr, $deterministic:expr
+            $(, [$($arg_type:ident),*])?
+            $(, $called_on_null_input:ident)?
+        ) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $(
             #[allow(unused_variables)]
             let step = scalar_step!($connection, $args, $body $(, $called_on_null_input)?);
+            let arg_types: &'static [ArgType] = &[$($(ArgType::$arg_type),*)?];
             $(
                 options = options.extension_function(pg_scalar_function(
                     $name,
                     $arity,
                     $deterministic,
+                    arg_types,
                     step,
                 ));
             )+
@@ -66,22 +75,22 @@ macro_rules! scalar_step {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
-        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
-        "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
+        "acldefault"(FunctionArity::Exact(2), true, [Text, Oid]) => exec_acl_default(connection, args)?,
+        "pg_get_userbyid"(FunctionArity::Exact(1), false, [Oid]) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
-            FunctionArity::Exact(1), true
+            FunctionArity::Exact(1), true, [Oid]
         ) => oid_arg(args, 0)?.map(exec_pg_is_visible),
-        "pg_encoding_to_char"(FunctionArity::Exact(1), true) => {
+        "pg_encoding_to_char"(FunctionArity::Exact(1), true, [Integer]) => {
             exec_pg_encoding_to_char(int_arg(args, 0, 0))
         },
         "pg_get_function_result"
         | "pg_get_function_arguments"
-        | "pg_get_statisticsobjdef_columns"(FunctionArity::Exact(1), true) => None::<String>,
+        | "pg_get_statisticsobjdef_columns"(FunctionArity::Exact(1), true, [Oid]) => None::<String>,
         "pg_relation_is_publishable"(FunctionArity::Exact(1), true) => None::<Boolean>,
-        "quote_ident"(FunctionArity::Exact(1), true) => {
-            typed_text_arg("quote_ident", args, 0)?.map(turso_pg_parser::quote_identifier)
+        "quote_ident"(FunctionArity::Exact(1), true, [Text]) => {
+            turso_pg_parser::quote_identifier(text_value(args, 0))
         },
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
@@ -89,39 +98,37 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
-        "format_type"(FunctionArity::OneOf(&[1, 2]), true, called_on_null_input) => oid_arg(args, 0)?
+        "format_type"(FunctionArity::OneOf(&[1, 2]), true, [Oid, Integer], called_on_null_input) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
-        "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
+        "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Boolean]) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
-        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
+        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Any]) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
-        "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
-        "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
-        "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true, called_on_null_input) => exec_pg_get_expr(args)?,
-        "to_char"(FunctionArity::Exact(2), true, called_on_null_input) => {
-            typed_text_arg("to_char", args, 1)?
-                .and_then(|format| exec_to_char(args[0].get_value(), format))
+        "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false, [Oid, Boolean]) => None::<String>,
+        "obj_description"(FunctionArity::OneOf(&[1, 2]), true, [Oid, Text]) => None::<String>,
+        "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true, [Text, Oid, Boolean]) => {
+            // TursoPG stores adbin and conbin as rendered SQL, so the relation OID and pretty flag do not change the output.
+            text_value(args, 0).to_string()
         },
-        "age"(FunctionArity::OneOf(&[1, 2]), false, called_on_null_input) => exec_age(args)?,
-        "pg_input_is_valid"(FunctionArity::Exact(2), true, called_on_null_input) => {
-            let input = typed_text_arg("pg_input_is_valid", args, 0)?;
-            let type_name = typed_text_arg("pg_input_is_valid", args, 1)?;
-            input
-                .zip(type_name)
-                .map(|(input, type_name)| exec_pg_input_is_valid(input, type_name))
+        "to_char"(FunctionArity::Exact(2), true, [Any, Text]) => {
+            exec_to_char(args[0].get_value(), text_value(args, 1))
+        },
+        "age"(FunctionArity::OneOf(&[1, 2]), false, [Timestamp, Timestamp]) => exec_age(args)?,
+        "pg_input_is_valid"(FunctionArity::Exact(2), true, [Text, Text]) => {
+            exec_pg_input_is_valid(text_value(args, 0), text_value(args, 1))
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",
         ))?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
-        "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
-        "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
-        "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
-        "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
-        "col_description"(FunctionArity::Exact(2), true) => None::<String>,
+        "like_escape"(FunctionArity::Exact(2), true, [TextOrBytea, TextOrBytea]) => exec_like_escape(args)?,
+        "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true, [Text, Text]) => exec_similar_to_escape(args)?,
+        "booleq"(FunctionArity::Exact(2), true, [Boolean, Boolean]) => Boolean(bool_value(args, 0) == bool_value(args, 1)),
+        "boolne"(FunctionArity::Exact(2), true, [Boolean, Boolean]) => Boolean(bool_value(args, 0) != bool_value(args, 1)),
+        "col_description"(FunctionArity::Exact(2), true, [Oid, Integer]) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false, called_on_null_input) => exec_set_config(connection, args)?,
-        "current_setting"(FunctionArity::OneOf(&[1, 2]), false, called_on_null_input) => {
+        "current_setting"(FunctionArity::OneOf(&[1, 2]), false, [Text, Boolean]) => {
             exec_current_setting(connection, args)?
         },
         "version"(FunctionArity::Exact(0), true) => exec_version(),
@@ -131,7 +138,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "current_schema"(FunctionArity::Exact(0), true) => {
             crate::session::current_schema(connection)
         },
-        "current_schemas"(FunctionArity::Exact(1), false) => {
+        "current_schemas"(FunctionArity::Exact(1), false, [Boolean]) => {
             exec_current_schemas(connection, args[0].get_value())?
         },
         "current_user" | "current_role" | "user"(FunctionArity::Exact(0), false) => {
@@ -156,8 +163,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
+        // PostgreSQL's now() takes no arguments, and these ignore theirs.
         "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
+            FunctionArity::Variadic, false, called_on_null_input
         ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
     })
 }
@@ -166,13 +174,18 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
+    arg_types: &'static [ArgType],
     step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
         arity,
         deterministic,
-        PgScalarFunction { name, step },
+        PgScalarFunction {
+            name,
+            arg_types,
+            step,
+        },
     )
     .expect("PostgreSQL function declarations have valid argument counts")
 }
@@ -180,6 +193,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
+    arg_types: &'static [ArgType],
     step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
 }
 
@@ -195,6 +209,7 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
     fn create_call(&self) -> Result<Self::Call> {
         Ok(Self {
             name: self.name,
+            arg_types: self.arg_types,
             step: self.step,
         })
     }
@@ -204,6 +219,7 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
+        check_arg_types(self.name, self.arg_types, args)?;
         Ok(IOResult::Done((self.step)(connection, args)?))
     }
 }
@@ -299,10 +315,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
 }
 
 fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<String> {
-    let kind_code = match args[0].get_value() {
-        Value::Text(value) => value.as_str(),
-        _ => "",
-    };
+    let kind_code = text_value(args, 0);
     let owner = args[1].get_value().as_int().ok_or_else(|| {
         LimboError::InvalidArgument("acldefault owner must be an OID".to_string())
     })?;
@@ -502,18 +515,9 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
 }
 
 fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
-    let name = match args[0].get_value() {
-        Value::Text(name) => name.as_str(),
-        Value::Null => return Ok(None),
-        other => {
-            let mut arg_types = vec![pg_type_name(other)];
-            arg_types.extend(args[1..].iter().map(|_| "boolean"));
-            return Err(undefined_function("current_setting", &arg_types));
-        }
-    };
+    let name = text_value(args, 0);
     let missing_ok = match args.get(1).map(Register::get_value) {
         None => false,
-        Some(Value::Null) => return Ok(None),
         Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
             sqlstate_error(
                 SQLSTATE_INVALID_TEXT_REPRESENTATION,
@@ -1063,31 +1067,9 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
 /// borrowed month is as long as the earlier timestamp's month. age(start)
 /// measures from midnight of the current date.
 fn exec_age(args: &[Register]) -> Result<Value> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Numeric(_) | Value::Blob(_)))
-    {
-        let argument_types = args
-            .iter()
-            .map(|arg| match arg.get_value() {
-                Value::Null => "unknown",
-                Value::Numeric(Numeric::Integer(_)) => "integer",
-                Value::Numeric(Numeric::Float(_)) => "numeric",
-                Value::Text(_) => "timestamp",
-                Value::Blob(_) => "bytea",
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(LimboError::InvalidArgument(format!(
-            "function age({argument_types}) does not exist"
-        )));
-    }
     let mut timestamps = Vec::with_capacity(args.len());
-    for arg in args {
-        match arg.get_value() {
-            Value::Text(text) => timestamps.push(parse_timestamp(text.as_str())?),
-            _ => return Ok(Value::Null),
-        }
+    for i in 0..args.len() {
+        timestamps.push(parse_timestamp(text_value(args, i))?);
     }
     let (end, start) = match timestamps[..] {
         [start] => (Utc::now().date_naive().and_time(NaiveTime::MIN), start),
@@ -1181,41 +1163,86 @@ fn exec_pg_input_is_valid(input: &str, type_name: &str) -> Boolean {
     Boolean(validate_pg_input(input, type_name).is_none())
 }
 
-/// The text argument at `i`, or None if it is NULL. Any other type gets
-/// PostgreSQL's error for a call that matches no declared argument types.
-fn typed_text_arg<'a>(function: &str, args: &'a [Register], i: usize) -> Result<Option<&'a str>> {
-    match args[i].get_value() {
-        Value::Text(text) => Ok(Some(text.as_str())),
-        Value::Null => Ok(None),
-        _ => {
-            let arg_types: Vec<_> = args
+/// The type a native function declares for one argument. Text where the
+/// declared type is not text stands for an untyped literal, which PostgreSQL
+/// converts to the declared type before the call.
+#[derive(Clone, Copy)]
+pub(crate) enum ArgType {
+    Any,
+    Text,
+    TextOrBytea,
+    Timestamp,
+    Oid,
+    Integer,
+    Boolean,
+}
+
+/// PostgreSQL picks a function by its argument types and converts untyped
+/// literals before it runs the function, so a value of another type fails even
+/// when another argument is NULL. NULL matches every type.
+fn check_arg_types(name: &str, arg_types: &[ArgType], args: &[Register]) -> Result<()> {
+    for (arg_type, arg) in arg_types.iter().zip(args) {
+        let accepted = match (arg_type, arg.get_value()) {
+            (_, Value::Null)
+            | (ArgType::Any, _)
+            | (ArgType::Text | ArgType::TextOrBytea, Value::Text(_))
+            | (ArgType::TextOrBytea, Value::Blob(_)) => true,
+            (ArgType::Timestamp, Value::Text(text)) => {
+                parse_timestamp(text.as_str()).map(|_| true)?
+            }
+            (ArgType::Oid, Value::Text(text)) => parse_oid(text.as_str()).map(|_| true)?,
+            (ArgType::Integer, Value::Text(text)) => {
+                text.as_str()
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| invalid_text_representation("integer", text.as_str()))?;
+                true
+            }
+            (ArgType::Boolean, Value::Text(text)) => {
+                parse_pg_bool(text.as_str())
+                    .ok_or_else(|| invalid_text_representation("boolean", text.as_str()))?;
+                true
+            }
+            (ArgType::Oid | ArgType::Integer, Value::Numeric(Numeric::Integer(_))) => true,
+            // Booleans are stored as the integers 0 and 1.
+            (ArgType::Boolean, Value::Numeric(Numeric::Integer(0 | 1))) => true,
+            _ => false,
+        };
+        if !accepted {
+            let actual: Vec<_> = args
                 .iter()
                 .map(|arg| pg_type_name(arg.get_value()))
                 .collect();
-            Err(undefined_function(function, &arg_types))
+            return Err(undefined_function(name, &actual));
         }
+    }
+    Ok(())
+}
+
+fn invalid_text_representation(type_name: &str, input: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        format!("invalid input syntax for type {type_name}: \"{input}\""),
+    )
+}
+
+/// The argument at `i` of a function that declares it as boolean and does
+/// not run on NULL input.
+fn bool_value(args: &[Register], i: usize) -> bool {
+    match args[i].get_value() {
+        Value::Numeric(Numeric::Integer(value)) => *value != 0,
+        Value::Text(text) => parse_pg_bool(text.as_str())
+            .expect("check_arg_types accepts only boolean text for a boolean argument"),
+        other => unreachable!("argument {i} is declared boolean, got {other:?}"),
     }
 }
 
-fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
-    match args.first().map(Register::get_value) {
-        Some(Value::Text(expression)) => {
-            if args[1..]
-                .iter()
-                .any(|arg| matches!(arg.get_value(), Value::Null))
-            {
-                return Ok(None);
-            }
-
-            // TursoPG stores adbin and conbin as rendered SQL, so the relation OID and pretty flag do not change the output.
-            Ok(Some(expression.as_str().to_string()))
-        }
-        Some(Value::Null) => Ok(None),
-        Some(expression) => {
-            let arg_types = [pg_type_name(expression), "oid", "boolean"];
-            Err(undefined_function("pg_get_expr", &arg_types[..args.len()]))
-        }
-        None => unreachable!("pg_get_expr takes 2 or 3 arguments"),
+/// The argument at `i` of a function that declares it as text and does not
+/// run on NULL input.
+fn text_value(args: &[Register], i: usize) -> &str {
+    match args[i].get_value() {
+        Value::Text(text) => text.as_str(),
+        other => unreachable!("argument {i} is declared text, got {other:?}"),
     }
 }
 
