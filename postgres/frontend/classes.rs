@@ -851,23 +851,24 @@ fn resolve_new_owner(
             "permission denied: \"{name}\" is a system catalog"
         )));
     }
-    Ok(match new_owner {
+    resolve_role(schema, connection, new_owner)
+}
+
+/// The role that `role` names. A named role must exist.
+fn resolve_role(
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    role: &ast::RoleSpec,
+) -> turso_core::Result<RoleId> {
+    Ok(match role {
         ast::RoleSpec::CurrentRole => connection.current_role(),
         ast::RoleSpec::SessionUser => connection.session_role(),
-        ast::RoleSpec::Name(role_name) => {
-            if role_name == BOOTSTRAP_SUPERUSER_NAME {
-                RoleId::SUPERUSER
-            } else {
-                match schema.roles.get_by_name(role_name) {
-                    Some(role) => role.id,
-                    None => {
-                        return Err(LimboError::ParseError(format!(
-                            "role \"{role_name}\" does not exist"
-                        )))
-                    }
-                }
-            }
-        }
+        ast::RoleSpec::Name(name) if name == BOOTSTRAP_SUPERUSER_NAME => RoleId::SUPERUSER,
+        ast::RoleSpec::Name(name) => schema
+            .roles
+            .get_by_name(name)
+            .map(|role| role.id)
+            .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
     })
 }
 
