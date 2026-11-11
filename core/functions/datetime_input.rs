@@ -151,7 +151,9 @@ fn split_fields(input: &str) -> Option<Vec<Field<'_>>> {
     Some(fields)
 }
 
-/// The words of PostgreSQL's keyword table that this parser reads.
+/// The words of PostgreSQL's keyword table that this parser reads when a
+/// digit or `+` follows them. `z` is not one: PostgreSQL reads `z10` as a
+/// POSIX time zone 10 hours behind UTC, not as UTC followed by `10`.
 fn is_keyword(word: &str) -> bool {
     let word = word.to_ascii_lowercase();
     matches!(word.as_str(), "am" | "pm" | "t" | "bc") || word.parse::<Month>().is_ok()

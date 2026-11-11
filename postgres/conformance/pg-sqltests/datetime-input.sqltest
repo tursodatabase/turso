@@ -230,6 +230,19 @@ expect error {
     the timestamp value "infinity" is not supported
 }
 
+# PostgreSQL reads `z10` as a POSIX time zone 10 hours behind UTC, so this is
+# midnight in that zone: 2024-01-05 00:00:00 as a timestamp. Time zones are not
+# supported yet; reading `z` as UTC followed by 10:00 would give 10:00:00.
+
+@skip-if postgres "PostgreSQL reads z10 as a time zone"
+test datetime-input-rejects-posix-time-zone {
+    CREATE TABLE t (ts timestamp);
+    INSERT INTO t VALUES ('2024-01-05 z10:00');
+}
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 z10:00"
+}
+
 # A string compared with a date or time column is read as a value of the
 # column's type, in any input form, whether the query scans the table or
 # seeks an index.
