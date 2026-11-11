@@ -6,11 +6,11 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
-use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
-use turso_core::SqliteDialect;
 use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
+use turso_sqlite::SqliteDialect;
+use turso_sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -209,7 +209,7 @@ struct sqlite3Inner {
     pub(crate) err_mask: ffi::c_int,
     pub(crate) malloc_failed: bool,
     pub(crate) e_open_state: u8,
-    pub(crate) p_err: *mut ffi::c_void,
+    pub(crate) p_err: Option<CString>,
     pub(crate) filename: CString,
     pub(crate) stmt_list: *mut sqlite3_stmt,
     /// Set when the caller opened "" and we created a private on-disk
@@ -250,7 +250,7 @@ impl sqlite3 {
             err_mask: 0xff,
             malloc_failed: false,
             e_open_state: SQLITE_STATE_OPEN,
-            p_err: std::ptr::null_mut(),
+            p_err: None,
             filename,
             stmt_list: std::ptr::null_mut(),
             temp_path: None,
@@ -288,9 +288,9 @@ pub struct sqlite3_stmt {
     )>,
     pub(crate) next: *mut sqlite3_stmt,
     pub(crate) text_cache: Vec<Vec<u8>>,
-    /// Cached ExtValue instances for sqlite3_column_value().
+    /// Cached values for sqlite3_column_value().
     /// Populated lazily per column; cleared on each step/reset.
-    pub(crate) value_cache: Vec<Option<ExtValue>>,
+    pub(crate) value_cache: Vec<Option<sqlite3_value>>,
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
@@ -328,7 +328,7 @@ impl sqlite3_stmt {
         for r in &mut self.text_cache {
             r.clear();
         }
-        // Drop cached ExtValues for the previous row
+        // Drop cached values for the previous row
         for v in &mut self.value_cache {
             *v = None;
         }
@@ -376,10 +376,13 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
         }
     };
 
-    // Build array of *mut c_void each pointing into the argv slice.
     // The C callback reads these via sqlite3_value_* functions.
-    let mut arg_ptrs: Vec<*mut ffi::c_void> = (0..argc as usize)
-        .map(|i| argv.add(i) as *mut ffi::c_void)
+    let mut args: Vec<sqlite3_value> = (0..argc as usize)
+        .map(|i| sqlite3_value::new(Value::from_ffi_ref(&*argv.add(i)).unwrap_or(Value::Null)))
+        .collect();
+    let mut arg_ptrs: Vec<*mut ffi::c_void> = args
+        .iter_mut()
+        .map(|arg| arg as *mut sqlite3_value as *mut ffi::c_void)
         .collect();
 
     let mut ctx = SqliteContext {
@@ -975,13 +978,34 @@ pub unsafe extern "C" fn sqlite3_busy_handler(
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_readonly(
     db: *mut sqlite3,
-    _db_name: *const ffi::c_char,
+    db_name: *const ffi::c_char,
 ) -> ffi::c_int {
     if db.is_null() {
         return -1;
     }
+    let name = if db_name.is_null() {
+        "main"
+    } else {
+        match CStr::from_ptr(db_name).to_str() {
+            Ok(name) => name,
+            Err(_) => return -1,
+        }
+    };
     let inner = (*db).inner.lock().unwrap();
-    inner._db.is_readonly() as ffi::c_int
+    database_readonly(&inner.conn, name)
+}
+
+/// Returns 1 if the named database is read-only, 0 if it is writable, and -1
+/// if the connection has no database with that name.
+fn database_readonly(conn: &turso_core::Connection, name: &str) -> ffi::c_int {
+    let Ok(database_id) = conn.get_database_id_by_name(name) else {
+        return -1;
+    };
+    // Like SQLite, temp is not a database until something creates it.
+    if database_id == turso_core::TEMP_DB_ID && !conn.has_temp_database() {
+        return -1;
+    }
+    conn.is_readonly(database_id) as ffi::c_int
 }
 
 #[no_mangle]
@@ -1058,8 +1082,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     let db_handle = sqlite3::clone_from_raw(raw_db);
     let mut db = db_handle.inner.lock().unwrap();
     if db.e_open_state == SQLITE_STATE_ZOMBIE {
-        db.err_code = SQLITE_MISUSE;
-        return SQLITE_MISUSE;
+        return set_db_err_code(&mut db, SQLITE_MISUSE);
     }
     // SQLite C-API contract (https://www.sqlite.org/c3ref/prepare.html):
     //   If nByte is negative, zSql is read up to the first zero terminator.
@@ -1070,7 +1093,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     let sql_bytes: &[u8] = if n_byte < 0 {
         CStr::from_ptr(sql).to_bytes()
     } else {
-        let bounded = std::slice::from_raw_parts(sql as *const u8, n_byte as usize);
+        let bounded = std::slice::from_raw_parts(sql.cast::<u8>(), n_byte as usize);
         bounded
             .iter()
             .position(|&b| b == 0)
@@ -1079,8 +1102,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     let sql_str = match std::str::from_utf8(sql_bytes) {
         Ok(s) => s,
         Err(_) => {
-            db.err_code = SQLITE_MISUSE;
-            return SQLITE_MISUSE;
+            return set_db_err_code(&mut db, SQLITE_MISUSE);
         }
     };
     let stmt = match db.conn.prepare(sql_str) {
@@ -1111,10 +1133,10 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         // follows a ';'.
         let mut off = stmt.tail_offset();
         let mut p = off;
-        while p > 0 && (*(sql.add(p - 1) as *const u8)).is_ascii_whitespace() {
+        while p > 0 && (*(sql.add(p - 1).cast::<u8>())).is_ascii_whitespace() {
             p -= 1;
         }
-        if p > 0 && *(sql.add(p - 1) as *const u8) == b';' {
+        if p > 0 && *(sql.add(p - 1).cast::<u8>()) == b';' {
             off = p;
         }
         *tail = sql.add(off);
@@ -1216,8 +1238,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
             stmt.clear_text_cache();
             SQLITE_DONE
         }
-        Err(LimboError::Busy) => SQLITE_BUSY,
-        Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
+        Err(LimboError::Busy) => set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_BUSY),
+        Err(LimboError::Interrupt) => {
+            set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_INTERRUPT)
+        }
         Err(err) => {
             let mut db_inner = db.inner.lock().unwrap();
             set_db_err(&mut db_inner, err)
@@ -1239,6 +1263,10 @@ type exec_callback = Option<
     ) -> ffi::c_int,
 >;
 
+/// Runs each statement of `sql` in turn, as SQLite's sqlite3_exec does:
+/// every statement is prepared with sqlite3_prepare_v2 and the next one
+/// starts at the tail it returns, so comments, quoted text and trigger
+/// bodies are split by the parser, never by a semicolon search.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_exec(
     db: *mut sqlite3,
@@ -1250,271 +1278,76 @@ pub unsafe extern "C" fn sqlite3_exec(
     if db.is_null() || sql.is_null() {
         return SQLITE_MISUSE;
     }
+    trace!("sqlite3_exec(sql={:?})", CStr::from_ptr(sql));
+    set_db_err_code(&mut (*db).inner.lock().unwrap(), SQLITE_OK);
 
-    let db_ref: &sqlite3 = &*db;
-    let sql_cstr = CStr::from_ptr(sql);
-    let sql_str = match sql_cstr.to_str() {
-        Ok(s) => s,
-        Err(_) => return SQLITE_MISUSE,
-    };
-    trace!("sqlite3_exec(sql={})", sql_str);
-    if !err.is_null() {
-        *err = std::ptr::null_mut();
-    }
-    let statements = split_sql_statements(sql_str);
-    for stmt_sql in statements {
-        let trimmed = stmt_sql.trim();
-        if trimmed.is_empty() {
+    let mut rc = SQLITE_OK;
+    let mut sql = sql;
+    while *sql != 0 {
+        let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
+        let mut tail: *const ffi::c_char = std::ptr::null();
+        rc = sqlite3_prepare_v2(db, sql, -1, &mut stmt, &mut tail);
+        if rc != SQLITE_OK {
+            break;
+        }
+        sql = tail;
+        // A null statement means only whitespace or comments were left.
+        if stmt.is_null() {
             continue;
         }
-
-        let is_dql = is_query_statement(trimmed);
-        if !is_dql {
-            // For DML/DDL, use normal execute path
-            let db_inner = db_ref.inner.lock().unwrap();
-            match db_inner.conn.execute(trimmed) {
-                Ok(_) => continue,
-                Err(e) => {
-                    return handle_limbo_err(e, err);
-                }
-            }
-        } else if callback.is_none() {
-            // DQL without callback provided, still execute but discard any result rows
-            let mut stmt_ptr: *mut sqlite3_stmt = std::ptr::null_mut();
-            let rc = sqlite3_prepare_v2(
-                db,
-                CString::new(trimmed).unwrap().as_ptr(),
-                -1,
-                &mut stmt_ptr,
-                std::ptr::null_mut(),
-            );
-            if rc != SQLITE_OK {
-                if !err.is_null() {
-                    let err_msg = format!("Prepare failed: {rc}");
-                    *err = CString::new(err_msg).unwrap().into_raw();
-                }
-                return rc;
-            }
-            loop {
-                let step_rc = sqlite3_step(stmt_ptr);
-                match step_rc {
-                    SQLITE_ROW => continue,
-                    SQLITE_DONE => break,
-                    _ => {
-                        sqlite3_finalize(stmt_ptr);
-                        if !err.is_null() {
-                            let err_msg = format!("Step failed: {step_rc}");
-                            *err = CString::new(err_msg).unwrap().into_raw();
-                        }
-                        return step_rc;
-                    }
-                }
-            }
-            sqlite3_finalize(stmt_ptr);
-        } else {
-            // DQL with callback
-            let rc = execute_query_with_callback(db, trimmed, callback, context, err);
-            if rc != SQLITE_OK {
-                return rc;
-            }
-        }
-    }
-    SQLITE_OK
-}
-
-/// Detect if a SQL statement is DQL
-fn is_query_statement(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let bytes = trimmed.as_bytes();
-
-    let starts_with_ignore_case = |keyword: &[u8]| -> bool {
-        if bytes.len() < keyword.len() {
-            return false;
-        }
-        // Check keyword matches
-        if !bytes[..keyword.len()].eq_ignore_ascii_case(keyword) {
-            return false;
-        }
-        // Ensure keyword is followed by whitespace or EOF
-        bytes.len() == keyword.len() || bytes[keyword.len()].is_ascii_whitespace()
-    };
-
-    // Check DQL keywords
-    if starts_with_ignore_case(b"SELECT")
-        || starts_with_ignore_case(b"VALUES")
-        || starts_with_ignore_case(b"WITH")
-        || starts_with_ignore_case(b"PRAGMA")
-        || starts_with_ignore_case(b"EXPLAIN")
-    {
-        return true;
-    }
-
-    // Look for RETURNING as a whole word, that's not part of another identifier
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 9 <= bytes.len() && bytes[i..i + 9].eq_ignore_ascii_case(b"RETURNING") {
-            // Check it's a word boundary before and after
-            let is_word_start =
-                i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
-            let is_word_end = i + 9 == bytes.len()
-                || !bytes[i + 9].is_ascii_alphanumeric() && bytes[i + 9] != b'_';
-            if is_word_start && is_word_end {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Execute a query statement with callback for each row
-/// Only called when we know callback is Some
-unsafe fn execute_query_with_callback(
-    db: *mut sqlite3,
-    sql: &str,
-    callback: exec_callback,
-    context: *mut ffi::c_void,
-    err: *mut *mut ffi::c_char,
-) -> ffi::c_int {
-    let sql_cstring = match CString::new(sql) {
-        Ok(s) => s,
-        Err(_) => return SQLITE_MISUSE,
-    };
-
-    let mut stmt_ptr: *mut sqlite3_stmt = std::ptr::null_mut();
-    let rc = sqlite3_prepare_v2(
-        db,
-        sql_cstring.as_ptr(),
-        -1,
-        &mut stmt_ptr,
-        std::ptr::null_mut(),
-    );
-
-    if rc != SQLITE_OK {
-        if !err.is_null() {
-            let err_msg = format!("Prepare failed: {rc}");
-            *err = CString::new(err_msg).unwrap().into_raw();
-        }
-        return rc;
-    }
-
-    let stmt_ref = &*stmt_ptr;
-    let n_cols = stmt_ref.stmt.num_columns() as ffi::c_int;
-    let mut column_names: Vec<CString> = Vec::with_capacity(n_cols as usize);
-
-    for i in 0..n_cols {
-        let name = stmt_ref.stmt.get_column_name(i as usize);
-        column_names.push(CString::new(name.as_bytes()).unwrap());
-    }
-
-    loop {
-        let step_rc = sqlite3_step(stmt_ptr);
-
-        match step_rc {
-            SQLITE_ROW => {
-                // Safety: checked earlier
-                let callback = callback.unwrap();
-
-                let mut values: Vec<Option<CString>> = Vec::with_capacity(n_cols as usize);
-                let mut value_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
-                let mut col_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
-
-                for i in 0..n_cols {
-                    let val = stmt_ref.stmt.row().unwrap().get_value(i as usize);
-                    // SQL NULL is passed to the callback as a NULL pointer,
-                    // as in SQLite, not as an empty string.
-                    if matches!(val, Value::Null) {
-                        values.push(None);
-                    } else {
-                        values.push(Some(CString::new(val.to_string().as_bytes()).unwrap()));
-                    }
-                }
-
-                for value in &values {
-                    value_ptrs.push(
-                        value
-                            .as_ref()
-                            .map_or(std::ptr::null_mut(), |v| v.as_ptr() as *mut ffi::c_char),
-                    );
-                }
-                for name in &column_names {
-                    col_ptrs.push(name.as_ptr() as *mut ffi::c_char);
-                }
-
-                let cb_rc = callback(
-                    context,
-                    n_cols,
-                    value_ptrs.as_mut_ptr(),
-                    col_ptrs.as_mut_ptr(),
-                );
-
-                if cb_rc != 0 {
-                    sqlite3_finalize(stmt_ptr);
-                    return SQLITE_ABORT;
-                }
-            }
-            SQLITE_DONE => {
+        let mut column_names: Vec<CString> = Vec::new();
+        loop {
+            let step_rc = sqlite3_step(stmt);
+            if step_rc != SQLITE_ROW {
+                let finalize_rc = sqlite3_finalize(stmt);
+                rc = if step_rc == SQLITE_DONE {
+                    finalize_rc
+                } else {
+                    step_rc
+                };
                 break;
             }
-            _ => {
-                sqlite3_finalize(stmt_ptr);
-                if !err.is_null() {
-                    let err_msg = format!("Step failed: {step_rc}");
-                    *err = CString::new(err_msg).unwrap().into_raw();
-                }
-                return step_rc;
+            let Some(callback) = callback else {
+                continue;
+            };
+            let n_cols = sqlite3_column_count(stmt);
+            if column_names.is_empty() {
+                column_names = (0..n_cols as usize)
+                    .map(|i| CString::new((*stmt).stmt.get_column_name(i).as_bytes()).unwrap())
+                    .collect();
             }
+            let mut col_ptrs: Vec<*mut ffi::c_char> = column_names
+                .iter()
+                .map(|name| name.as_ptr() as *mut ffi::c_char)
+                .collect();
+            let mut value_ptrs: Vec<*mut ffi::c_char> = (0..n_cols)
+                .map(|i| sqlite3_column_text(stmt, i) as *mut ffi::c_char)
+                .collect();
+            if callback(
+                context,
+                n_cols,
+                value_ptrs.as_mut_ptr(),
+                col_ptrs.as_mut_ptr(),
+            ) != 0
+            {
+                sqlite3_finalize(stmt);
+                rc = set_db_err_code(&mut (*db).inner.lock().unwrap(), SQLITE_ABORT);
+                break;
+            }
+        }
+        if rc != SQLITE_OK {
+            break;
         }
     }
 
-    sqlite3_finalize(stmt_ptr)
-}
-
-/// Split SQL string into individual statements
-/// Handles quoted strings properly and skips comments
-fn split_sql_statements(sql: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let mut current_start = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            // Check for escaped quotes first
-            b'\'' if !in_double_quote => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single_quote = !in_single_quote;
-            }
-            b'"' if !in_single_quote => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                in_double_quote = !in_double_quote;
-            }
-            b';' if !in_single_quote && !in_double_quote => {
-                // we found the statement boundary
-                statements.push(&sql[current_start..i]);
-                current_start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
+    if !err.is_null() {
+        *err = if rc == SQLITE_OK {
+            std::ptr::null_mut()
+        } else {
+            CStr::from_ptr(sqlite3_errmsg(db)).to_owned().into_raw()
+        };
     }
-
-    if current_start < sql.len() {
-        statements.push(&sql[current_start..]);
-    }
-
-    statements
+    rc
 }
 
 #[no_mangle]
@@ -1588,10 +1421,10 @@ pub unsafe extern "C" fn sqlite3_stmt_status(
         SQLITE_STMTSTATUS_SORT => turso_core::StatementStatusCounter::Sort,
         SQLITE_STMTSTATUS_VM_STEP => turso_core::StatementStatusCounter::VmStep,
         SQLITE_STMTSTATUS_REPREPARE => turso_core::StatementStatusCounter::Reprepare,
+        SQLITE_STMTSTATUS_RUN => turso_core::StatementStatusCounter::Run,
         LIBSQL_STMTSTATUS_ROWS_READ => turso_core::StatementStatusCounter::RowsRead,
         LIBSQL_STMTSTATUS_ROWS_WRITTEN => turso_core::StatementStatusCounter::RowsWritten,
         SQLITE_STMTSTATUS_AUTOINDEX
-        | SQLITE_STMTSTATUS_RUN
         | SQLITE_STMTSTATUS_FILTER_MISS
         | SQLITE_STMTSTATUS_FILTER_HIT
         | SQLITE_STMTSTATUS_MEMUSED => return 0,
@@ -1814,7 +1647,7 @@ pub unsafe extern "C" fn turso_printf_va(
         if buf.is_null() {
             return std::ptr::null_mut();
         }
-        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buf as *mut u8, n);
+        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buf.cast::<u8>(), n);
         *buf.add(n) = 0;
         buf
     }
@@ -2037,7 +1870,7 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut f
     }
     // SAFETY: buf is a fresh allocation of n + 1 bytes; expanded is n bytes.
     unsafe {
-        std::ptr::copy_nonoverlapping(expanded.as_ptr(), buf as *mut u8, n);
+        std::ptr::copy_nonoverlapping(expanded.as_ptr(), buf.cast::<u8>(), n);
         *buf.add(n) = 0;
     }
     buf
@@ -2232,7 +2065,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             Err(_) => return SQLITE_ERROR,
         }
     } else {
-        let slice = std::slice::from_raw_parts(text as *const u8, len as usize);
+        let slice = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
         match std::str::from_utf8(slice) {
             Ok(s) => s.to_owned(),
             Err(_) => return SQLITE_ERROR,
@@ -2247,7 +2080,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             return rc;
         }
     } else if ptr_val == static_ptr {
-        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
+        let slice = std::slice::from_raw_parts(text.cast::<u8>(), str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
         let result = stmt_ref.stmt.bind_at(index, val);
         let rc = sqlite3_bind_result(stmt_ref, result);
@@ -2255,7 +2088,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             return rc;
         }
     } else {
-        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
+        let slice = std::slice::from_raw_parts(text.cast::<u8>(), str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
         let result = stmt_ref.stmt.bind_at(index, val);
         let rc = sqlite3_bind_result(stmt_ref, result);
@@ -2290,8 +2123,13 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         let result = stmt_ref.stmt.bind_at(index, Value::Null);
         return sqlite3_bind_result(stmt_ref, result);
     }
+    // Negative n is undefined. SQLITE_ENABLE_API_ARMOR returns SQLITE_MISUSE.
+    // Casting the signed length to usize builds a huge slice.
+    if len < 0 {
+        return SQLITE_MISUSE;
+    }
 
-    let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
+    let slice_blob = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
 
     let val_blob = Value::from_blob(slice_blob);
 
@@ -2358,8 +2196,11 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
-    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
@@ -2372,8 +2213,10 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
     let val = binding.as_str();
@@ -2391,8 +2234,10 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt
         .stmt
@@ -2407,6 +2252,14 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
 
     let c_string = CString::new(val).expect("CString::new failed");
     c_string.into_raw()
+}
+
+/// Converts a C column index to `usize`, or returns None when it is outside
+/// the statement's result columns, as SQLite does for an out-of-range index.
+fn result_column_index(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<usize> {
+    usize::try_from(idx)
+        .ok()
+        .filter(|&idx| idx < stmt.stmt.num_columns())
 }
 
 /// Returns the value at column `idx` of the current row, or None when there
@@ -2427,14 +2280,7 @@ unsafe fn column_value(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<&'sta
 /// fail on a legal call.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
-    match column_value(stmt, idx) {
-        Some(Value::Numeric(turso_core::Numeric::Integer(i))) => *i,
-        Some(v) => match v.exec_cast("INTEGER") {
-            Ok(Value::Numeric(turso_core::Numeric::Integer(i))) => i,
-            _ => 0,
-        },
-        None => 0,
-    }
+    column_value(stmt, idx).map_or(0, value_to_int64)
 }
 
 #[no_mangle]
@@ -2447,22 +2293,36 @@ pub unsafe extern "C" fn sqlite3_column_int(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> f64 {
-    match column_value(stmt, idx) {
-        Some(Value::Numeric(turso_core::Numeric::Float(f))) => f64::from(*f),
-        Some(v) => match v.exec_cast("REAL") {
+    column_value(stmt, idx).map_or(0.0, value_to_double)
+}
+
+/// Reads a value as an integer: text and blobs parse like CAST(x AS INTEGER).
+fn value_to_int64(value: &Value) -> i64 {
+    match value {
+        Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
+        v => match v.exec_cast("INTEGER") {
+            Ok(Value::Numeric(turso_core::Numeric::Integer(i))) => i,
+            _ => 0,
+        },
+    }
+}
+
+/// Reads a value as a float: text and blobs parse like CAST(x AS REAL).
+fn value_to_double(value: &Value) -> f64 {
+    match value {
+        Value::Numeric(turso_core::Numeric::Float(f)) => f64::from(*f),
+        v => match v.exec_cast("REAL") {
             Ok(Value::Numeric(n)) => match n {
                 turso_core::Numeric::Float(f) => f64::from(f),
                 turso_core::Numeric::Integer(i) => i as f64,
             },
             _ => 0.0,
         },
-        None => 0.0,
     }
 }
 
 /// Fills (when not yet done for this row) and returns the per-column cache
-/// holding the column's text conversion, NUL-terminated: text bytes as-is,
-/// raw blob bytes, or the decimal rendering of a number. None for NULL.
+/// holding the column's text conversion. None for NULL.
 unsafe fn column_text_cache(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<&'static Vec<u8>> {
     let value = column_value(stmt, idx)?;
     let stmt = &mut *stmt;
@@ -2471,16 +2331,22 @@ unsafe fn column_text_cache(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<
         return None;
     }
     if stmt.text_cache[i].is_empty() {
-        let buf = &mut stmt.text_cache[i];
-        match value {
-            Value::Null => return None,
-            Value::Text(t) => buf.extend(t.as_str().as_bytes()),
-            Value::Blob(b) => buf.extend(b.iter()),
-            numeric => buf.extend(numeric.to_string().as_bytes()),
-        }
-        buf.push(0);
+        stmt.text_cache[i] = text_with_nul(value)?;
     }
     Some(&stmt.text_cache[i])
+}
+
+/// The value as NUL-terminated text: text bytes as-is, raw blob bytes, or
+/// the decimal rendering of a number. None for NULL.
+fn text_with_nul(value: &Value) -> Option<Vec<u8>> {
+    let mut buf = match value {
+        Value::Null => return None,
+        Value::Text(t) => t.as_str().as_bytes().to_vec(),
+        Value::Blob(b) => b.clone(),
+        numeric => numeric.to_string().into_bytes(),
+    };
+    buf.push(0);
+    Some(buf)
 }
 
 #[no_mangle]
@@ -2510,21 +2376,53 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     }
 }
 
-// sqlite3_value_* functions interpret the void* as a pointer to turso_ext::Value,
-// which is what the function bridge passes for custom scalar function arguments.
+/// The struct behind an `sqlite3_value*`. Like SQLite's `Mem`, it keeps the
+/// text form that `sqlite3_value_text` makes next to the original value, so
+/// the pointer stays valid while the value lives and a number keeps its type.
+#[derive(Clone)]
+pub struct sqlite3_value {
+    value: Value,
+    /// NUL-terminated text form of the value.
+    text: Option<Vec<u8>>,
+}
+
+impl sqlite3_value {
+    fn new(value: Value) -> Self {
+        Self { value, text: None }
+    }
+
+    /// The value as text, without the NUL that follows it in memory, or None
+    /// for NULL.
+    fn text(&mut self) -> Option<&[u8]> {
+        if self.text.is_none() {
+            self.text = text_with_nul(&self.value);
+        }
+        self.text.as_deref().map(|text| &text[..text.len() - 1])
+    }
+
+    /// The blob bytes, or the text form for any other value.
+    fn bytes(&mut self) -> Option<&[u8]> {
+        match self.value {
+            Value::Blob(ref b) => Some(b),
+            _ => self.text(),
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_int {
     if value.is_null() {
         return SQLITE_NULL;
     }
-    let v = &*(value as *const ExtValue);
-    match v.value_type() {
-        turso_ext::ValueType::Null => SQLITE_NULL,
-        turso_ext::ValueType::Integer => SQLITE_INTEGER,
-        turso_ext::ValueType::Float => SQLITE_FLOAT,
-        turso_ext::ValueType::Text => SQLITE_TEXT,
-        turso_ext::ValueType::Blob => SQLITE_BLOB,
-        turso_ext::ValueType::Error => SQLITE_NULL,
+    let v = &*(value as *const sqlite3_value);
+    match v.value {
+        Value::Null => SQLITE_NULL,
+        Value::Numeric(turso_core::Numeric::Integer(_)) => SQLITE_INTEGER,
+        Value::Numeric(turso_core::Numeric::Float(_)) => SQLITE_FLOAT,
+        Value::Text(_) => SQLITE_TEXT,
+        // SQLite reports a blob that sqlite3_value_text has read as TEXT.
+        Value::Blob(_) if v.text.is_some() => SQLITE_TEXT,
+        Value::Blob(_) => SQLITE_BLOB,
     }
 }
 
@@ -2533,8 +2431,8 @@ pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     if value.is_null() {
         return 0;
     }
-    let v = &*(value as *const ExtValue);
-    v.to_integer().unwrap_or(0)
+    let v = &*(value as *const sqlite3_value);
+    value_to_int64(&v.value)
 }
 
 #[no_mangle]
@@ -2547,8 +2445,8 @@ pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
     if value.is_null() {
         return 0.0;
     }
-    let v = &*(value as *const ExtValue);
-    v.to_float().unwrap_or(0.0)
+    let v = &*(value as *const sqlite3_value);
+    value_to_double(&v.value)
 }
 
 #[no_mangle]
@@ -2556,22 +2454,24 @@ pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const f
     if value.is_null() {
         return std::ptr::null();
     }
-    let v = &*(value as *const ExtValue);
-    match v.to_text() {
-        Some(s) => s.as_ptr() as *const ffi::c_uchar,
+    let v = &mut *(value as *mut sqlite3_value);
+    match v.text() {
+        Some(s) => s.as_ptr(),
         None => std::ptr::null(),
     }
 }
 
+/// Returns the blob bytes, or the text form for any other value. Zero bytes
+/// report NULL, as in SQLite.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const ffi::c_void {
     if value.is_null() {
         return std::ptr::null();
     }
-    let v = &*(value as *const ExtValue);
-    match v.blob_ref() {
-        Some(b) => b.as_ptr() as *const ffi::c_void,
-        None => std::ptr::null(),
+    let v = &mut *(value as *mut sqlite3_value);
+    match v.bytes() {
+        Some(b) if !b.is_empty() => b.as_ptr() as *const ffi::c_void,
+        _ => std::ptr::null(),
     }
 }
 
@@ -2580,37 +2480,19 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
     if value.is_null() {
         return 0;
     }
-    let v = &*(value as *const ExtValue);
-    match v.value_type() {
-        turso_ext::ValueType::Text => v.to_text().map(|s| s.len()).unwrap_or(0) as ffi::c_int,
-        turso_ext::ValueType::Blob => v.blob_ref().map(|b| b.len()).unwrap_or(0) as ffi::c_int,
-        _ => 0,
-    }
+    let v = &mut *(value as *mut sqlite3_value);
+    v.bytes().map_or(0, |b| b.len()) as ffi::c_int
 }
 
 /// Deep-copies an `sqlite3_value`.  Returns a heap-allocated copy that must
-/// be freed with `sqlite3_value_free`.  Diesel uses this to create
-/// `OwnedSqliteValue` instances.
+/// be freed with `sqlite3_value_free`.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_dup(value: *mut ffi::c_void) -> *mut ffi::c_void {
     if value.is_null() {
         return std::ptr::null_mut();
     }
-    let v = &*(value as *const ExtValue);
-    let copy = match v.value_type() {
-        turso_ext::ValueType::Integer => ExtValue::from_integer(v.to_integer().unwrap_or(0)),
-        turso_ext::ValueType::Float => ExtValue::from_float(v.to_float().unwrap_or(0.0)),
-        turso_ext::ValueType::Text => {
-            let s = v.to_text().unwrap_or("");
-            ExtValue::from_text(s.to_owned())
-        }
-        turso_ext::ValueType::Blob => {
-            let b = v.to_blob().unwrap_or_default();
-            ExtValue::from_blob(b.to_vec())
-        }
-        _ => ExtValue::null(),
-    };
-    Box::into_raw(Box::new(copy)) as *mut ffi::c_void
+    let v = &*(value as *const sqlite3_value);
+    Box::into_raw(Box::new(v.clone())) as *mut ffi::c_void
 }
 
 /// Frees a value previously allocated by `sqlite3_value_dup`.
@@ -2619,7 +2501,7 @@ pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
     if value.is_null() {
         return;
     }
-    let _ = Box::from_raw(value as *mut ExtValue);
+    let _ = Box::from_raw(value as *mut sqlite3_value);
 }
 
 #[no_mangle]
@@ -2633,7 +2515,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
     }
 }
 
-/// Returns an `sqlite3_value*` (ExtValue pointer) for a column in the current
+/// Returns an `sqlite3_value*` for a column in the current
 /// result row.  The pointer remains valid until the next `sqlite3_step()`,
 /// `sqlite3_reset()`, or `sqlite3_finalize()`.  Diesel uses this via
 /// `sqlite3_column_value` → `sqlite3_value_dup` to read all column types.
@@ -2652,26 +2534,16 @@ pub unsafe extern "C" fn sqlite3_column_value(
     }
     // Return cached value if we already built one for this column.
     if stmt.value_cache[i].is_some() {
-        return stmt.value_cache[i].as_mut().unwrap() as *mut ExtValue as *mut ffi::c_void;
+        return stmt.value_cache[i].as_mut().unwrap() as *mut sqlite3_value as *mut ffi::c_void;
     }
     let binding = stmt.stmt.row();
     let row = match binding.as_ref() {
         Some(row) => row,
         None => return std::ptr::null_mut(),
     };
-    let ext = match row.get::<&Value>(i) {
-        Ok(turso_core::Value::Numeric(turso_core::Numeric::Integer(n))) => {
-            ExtValue::from_integer(*n)
-        }
-        Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(f))) => {
-            ExtValue::from_float(f64::from(*f))
-        }
-        Ok(turso_core::Value::Text(t)) => ExtValue::from_text(t.value.to_string()),
-        Ok(turso_core::Value::Blob(b)) => ExtValue::from_blob(b.clone()),
-        _ => ExtValue::null(),
-    };
-    stmt.value_cache[i] = Some(ext);
-    stmt.value_cache[i].as_mut().unwrap() as *mut ExtValue as *mut ffi::c_void
+    let value = row.get::<&Value>(i).map_or(Value::Null, Value::clone);
+    stmt.value_cache[i] = Some(sqlite3_value::new(value));
+    stmt.value_cache[i].as_mut().unwrap() as *mut sqlite3_value as *mut ffi::c_void
 }
 
 pub struct TabResult {
@@ -2764,6 +2636,16 @@ pub unsafe extern "C" fn sqlite3_get_table(
     if db.is_null() || sql.is_null() || paz_result.is_null() {
         return SQLITE_ERROR;
     }
+    *paz_result = std::ptr::null_mut();
+    if !pn_row.is_null() {
+        *pn_row = 0;
+    }
+    if !pn_column.is_null() {
+        *pn_column = 0;
+    }
+    if !pz_err_msg.is_null() {
+        *pz_err_msg = std::ptr::null_mut();
+    }
 
     let mut res = TabResult::new(20);
 
@@ -2775,13 +2657,23 @@ pub unsafe extern "C" fn sqlite3_get_table(
         pz_err_msg,
     );
 
-    if rc != SQLITE_OK {
+    // SQLITE_ABORT means the row callback stopped sqlite3_exec; report the
+    // callback's own error instead, as SQLite does.
+    if (rc & 0xff) == SQLITE_ABORT {
         res.free();
         if let Some(err_msg) = res.z_err_msg {
             if !pz_err_msg.is_null() {
+                if !(*pz_err_msg).is_null() {
+                    let _ = CString::from_raw(*pz_err_msg);
+                }
                 *pz_err_msg = err_msg.into_raw();
             }
         }
+        set_db_err_code(&mut (*db).inner.lock().unwrap(), res.rc);
+        return res.rc;
+    }
+    if rc != SQLITE_OK {
+        res.free();
         return rc;
     }
 
@@ -2806,8 +2698,12 @@ pub unsafe extern "C" fn sqlite3_get_table(
 
     // Return pointer past the count slot
     *paz_result = array.add(1);
-    *pn_row = res.n_row as ffi::c_int;
-    *pn_column = res.n_column as ffi::c_int;
+    if !pn_row.is_null() {
+        *pn_row = res.n_row as ffi::c_int;
+    }
+    if !pn_column.is_null() {
+        *pn_column = res.n_column as ffi::c_int;
+    }
 
     // Drop res without freeing the strings -- they are now owned by the raw array.
     // Vec<*mut c_char> drop just deallocates the Vec buffer, not the pointed-to strings.
@@ -2872,19 +2768,28 @@ pub unsafe extern "C" fn sqlite3_result_text(
     context: *mut ffi::c_void,
     text: *const ffi::c_char,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destructor: Option<extern "C" fn(*mut ffi::c_void)>,
 ) {
-    if context.is_null() || text.is_null() {
+    if text.is_null() {
+        sqlite3_result_null(context);
         return;
     }
-    let ctx = &mut *(context as *mut SqliteContext);
-    let s = if len < 0 {
-        CStr::from_ptr(text).to_string_lossy().into_owned()
-    } else {
-        let bytes = std::slice::from_raw_parts(text as *const u8, len as usize);
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    ctx.result = ExtValue::from_text(s);
+    if !context.is_null() {
+        let ctx = &mut *(context as *mut SqliteContext);
+        let s = if len < 0 {
+            CStr::from_ptr(text).to_string_lossy().into_owned()
+        } else {
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        ctx.result = ExtValue::from_text(s);
+    }
+    // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).
+    if let Some(destructor_fn) = destructor {
+        if destructor_fn as usize != usize::MAX {
+            destructor_fn(text as *mut _);
+        }
+    }
 }
 
 #[no_mangle]
@@ -2892,14 +2797,23 @@ pub unsafe extern "C" fn sqlite3_result_blob(
     context: *mut ffi::c_void,
     blob: *const ffi::c_void,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destructor: Option<extern "C" fn(*mut ffi::c_void)>,
 ) {
-    if context.is_null() || blob.is_null() || len < 0 {
+    if blob.is_null() {
+        sqlite3_result_null(context);
         return;
     }
-    let ctx = &mut *(context as *mut SqliteContext);
-    let bytes = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
-    ctx.result = ExtValue::from_blob(bytes);
+    if !context.is_null() && len >= 0 {
+        let ctx = &mut *(context as *mut SqliteContext);
+        let bytes = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
+        ctx.result = ExtValue::from_blob(bytes);
+    }
+    // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).
+    if let Some(destructor_fn) = destructor {
+        if destructor_fn as usize != usize::MAX {
+            destructor_fn(blob as *mut _);
+        }
+    }
 }
 
 #[no_mangle]
@@ -2935,7 +2849,7 @@ pub unsafe extern "C" fn sqlite3_result_error(
     } else if len < 0 {
         CStr::from_ptr(err).to_string_lossy().into_owned()
     } else {
-        let bytes = std::slice::from_raw_parts(err as *const u8, len as usize);
+        let bytes = std::slice::from_raw_parts(err.cast::<u8>(), len as usize);
         String::from_utf8_lossy(bytes).into_owned()
     };
     ctx.result = ExtValue::error_with_message(msg);
@@ -3088,7 +3002,7 @@ pub unsafe extern "C" fn sqlite3_blob_write(
     }
     // SAFETY: data checked non-null and n > 0 and non-negative; the caller
     // guarantees data points to at least n readable bytes.
-    let buf = unsafe { std::slice::from_raw_parts(data as *const u8, n as usize) };
+    let buf = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), n as usize) };
     match blob.write(offset as usize, buf) {
         Ok(()) => SQLITE_OK,
         Err(err) => limbo_err_code(&err),
@@ -3152,8 +3066,8 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
         return 0;
     }
 
-    let mut p_a = a as *const u8;
-    let mut p_b = b as *const u8;
+    let mut p_a = a.cast::<u8>();
+    let mut p_b = b.cast::<u8>();
     let mut rem = n;
 
     while rem > 0 && *p_a != 0 && p_a.read().eq_ignore_ascii_case(&p_b.read()) {
@@ -3373,11 +3287,9 @@ pub unsafe extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const ffi::c_char 
         return sqlite3_errstr(SQLITE_NOMEM);
     }
     let err_msg = if db.err_code != SQLITE_OK {
-        if !db.p_err.is_null() {
-            db.p_err as *const ffi::c_char
-        } else {
-            std::ptr::null()
-        }
+        db.p_err
+            .as_ref()
+            .map_or(std::ptr::null(), |msg| msg.as_ptr())
     } else {
         std::ptr::null()
     };
@@ -3841,9 +3753,12 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
+        // A Raise is a constraint error that carries its own conflict
+        // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
         LimboError::Constraint(_)
         | LimboError::ConstraintViolation(_)
-        | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+        | LimboError::ForeignKeyConstraint(_)
+        | LimboError::Raise(..) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
@@ -3874,10 +3789,15 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {
-    if !db.p_err.is_null() {
-        let _ = CString::from_raw(db.p_err as *mut ffi::c_char);
-    }
-    db.p_err = CString::new(err_msg).unwrap().into_raw() as *mut ffi::c_void;
+    db.p_err = Some(CString::new(err_msg).unwrap());
+    db.err_code = code;
+    code
+}
+
+/// Store an error code with no message of its own, so sqlite3_errmsg
+/// reports the standard text for `code`.
+fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
+    db.p_err = None;
     db.err_code = code;
     code
 }
@@ -3893,6 +3813,8 @@ mod tests {
             turso_core::ConstraintKind::ForeignKey,
             turso_core::ConstraintKind::NotNull,
             turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Trigger,
+            turso_core::ConstraintKind::Datatype,
             turso_core::ConstraintKind::Other,
         ] {
             let error = turso_core::LimboError::ConstraintViolation(Box::new(
@@ -3943,6 +3865,55 @@ mod tests {
             assert_eq!(msg, "UNIQUE constraint failed: u.a");
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    /// A constraint failure in an UPSERT's DO UPDATE arm, or in a trigger
+    /// fired under an explicit OR ABORT, carries its own conflict resolution.
+    /// It is still a constraint failure, so SQLite returns SQLITE_CONSTRAINT.
+    #[test]
+    fn test_constraint_failure_with_its_own_conflict_resolution_is_sqlite_constraint() {
+        let cases: [(&[&CStr], &CStr); 2] = [
+            (
+                &[
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT UNIQUE)",
+                    c"INSERT INTO t VALUES (1,1,10), (2,2,20)",
+                ],
+                c"INSERT OR FAIL INTO t VALUES (10,5,50), (11,1,60) \
+                  ON CONFLICT(u) DO UPDATE SET c = 20",
+            ),
+            (
+                &[
+                    c"CREATE TABLE p(a INTEGER PRIMARY KEY, b INT)",
+                    c"CREATE TABLE log(x INT UNIQUE)",
+                    c"INSERT INTO log VALUES (7)",
+                    c"CREATE TRIGGER tp AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (NEW.b); END",
+                    c"INSERT INTO p VALUES (1,1)",
+                ],
+                c"UPDATE OR ABORT p SET b = 7",
+            ),
+        ];
+        for (setup, failing) in cases {
+            unsafe {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+                for sql in setup.iter().chain([&failing]) {
+                    let mut stmt = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                        SQLITE_OK,
+                        "{sql:?}"
+                    );
+                    let expected = if *sql == failing {
+                        SQLITE_CONSTRAINT
+                    } else {
+                        SQLITE_DONE
+                    };
+                    assert_eq!(sqlite3_step(stmt), expected, "{sql:?}");
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            }
         }
     }
 
@@ -4133,7 +4104,7 @@ mod tests {
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
-                0
+                1
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0),
@@ -4568,5 +4539,44 @@ mod tests {
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn test_database_readonly_reports_each_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            let path = dir.path().join(name);
+            let database = turso_core::Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
+                DatabaseOpts::new().with_attach(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            (path, database.connect(ConnectOpts::new()).unwrap())
+        };
+        let (ro_path, ro_conn) = open("ro.db");
+        ro_conn.execute("CREATE TABLE t(x)").unwrap();
+        ro_conn.close().unwrap();
+        drop(ro_conn);
+        let (_, conn) = open("main.db");
+
+        conn.execute(format!("ATTACH 'file:{}?mode=ro' AS ro", ro_path.display()))
+            .unwrap();
+        conn.execute(format!(
+            "ATTACH '{}' AS rw",
+            dir.path().join("rw.db").display()
+        ))
+        .unwrap();
+        assert_eq!(database_readonly(&conn, "ro"), 1);
+        assert_eq!(database_readonly(&conn, "RO"), 1);
+        assert_eq!(database_readonly(&conn, "rw"), 0);
+        assert_eq!(database_readonly(&conn, "main"), 0);
+
+        conn.execute("DETACH ro").unwrap();
+        assert_eq!(database_readonly(&conn, "ro"), -1);
     }
 }

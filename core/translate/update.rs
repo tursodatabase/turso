@@ -3,11 +3,13 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::security::policy::Command;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::row_security;
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -111,6 +113,7 @@ fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } => {
             if num_regs != target_count {
@@ -124,6 +127,7 @@ fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result
                     query_type: ast::SubqueryType::RowValue {
                         result_reg_start: result_reg_start + offset,
                         num_regs: 1,
+                        row_count_reg,
                     },
                 })
                 .collect())
@@ -200,7 +204,7 @@ fn prepare_and_optimize_update_plan(
     update_plan.from_tables = read_scope_tables;
 
     let mut plan = Plan::Update(Box::new(update_plan));
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     Ok(plan)
 }
 
@@ -299,7 +303,7 @@ fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     };
@@ -329,6 +333,7 @@ fn prepare_update_plan(
         &mut from_tables,
         connection,
     )?;
+    row_security::filter_rows(Command::Select, &from_tables, &mut where_clause, resolver)?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
     // a column name that already appears in another FROM-side table without being
@@ -346,7 +351,7 @@ fn prepare_update_plan(
     let mut non_from_clause_subqueries = vec![];
     // Reject fairly specific cases like UPDATE t SET x=5 FROM t.
     let illegal_target_reference = from_tables.joined_tables().iter().any(|joined| {
-        joined.database_id == database_id
+        joined.namespace == namespace
             && normalize_ident(joined.identifier.as_str()) == target_identifier
             && normalize_ident(joined.table.get_name()) == target_table_name
     });
@@ -373,6 +378,12 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
+    row_security::filter_rows(
+        Command::Update,
+        &read_scope_tables,
+        &mut where_clause,
+        resolver,
+    )?;
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
@@ -429,17 +440,18 @@ fn prepare_update_plan(
     };
 
     let columns = table.columns();
+    // As in SQLite, WHERE cannot name a RETURNING alias.
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
-        Some(&result_columns),
+        None,
         &mut where_clause,
         resolver,
     )?;
     append_vtab_predicates_to_where_clause(
         &mut vtab_predicates,
         &mut read_scope_tables,
-        &result_columns,
+        &[],
         &mut where_clause,
         resolver,
     )?;
@@ -682,7 +694,7 @@ fn check_update_from_column_ambiguity(
             .any(|preceding| preceding.identifier == table.identifier)
         {
             let db_name = connection
-                .namespace_name(table.database_id)
+                .namespace_name(table.namespace.database_id)
                 .unwrap_or_else(|| "main".to_string());
             bail_parse_error!(
                 "ambiguous column name: {db_name}.{}._ROWID_",

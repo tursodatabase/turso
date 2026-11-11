@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO};
+use turso_sqlite::SqliteDialect;
 use turso_sync_engine::Result;
 
 use super::replica::Replica;

@@ -16,42 +16,45 @@ To start Turso in MCP server mode, use the `--mcp` flag:
 /path/to/tursodb --mcp
 ```
 
-This will start an MCP server that listens on stdio for commands. The server starts without a database connection, allowing you to select or create databases using MCP commands.
+This will start an MCP server that listens on stdio for JSON-RPC requests. Without a database path the server uses an in-memory database. Pass a path to open a file instead (`/path/to/tursodb app.db --mcp`), or switch databases later with the `open_database` tool.
 
 ## Available Tools
 
-The MCP server exposes the following tools:
+The MCP server exposes the following tools. Clients call a tool with a JSON-RPC `tools/call` request that gives the tool name and its arguments:
 
-### `query`
-Execute a SQL query and get results.
-
-**Parameters:**
-- `sql` (string, required): The SQL query to execute
-
-**Example:**
 ```json
 {
-  "tool": "query",
-  "arguments": {
-    "sql": "SELECT * FROM users WHERE age > 21"
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "execute_query",
+    "arguments": {
+      "query": "SELECT * FROM users WHERE age > 21"
+    }
   }
 }
 ```
 
-### `execute`
-Execute a SQL statement that modifies data (INSERT, UPDATE, DELETE).
+The examples below show the `arguments` object for each tool.
+
+### `open_database`
+Open or create a database file. Creates parent directories if needed.
 
 **Parameters:**
-- `sql` (string, required): The SQL statement to execute
+- `path` (string, required): Path to the database file (absolute or relative). Use `:memory:` for an in-memory database.
 
 **Example:**
 ```json
-{
-  "tool": "execute",
-  "arguments": {
-    "sql": "INSERT INTO users (name, age) VALUES ('Alice', 30)"
-  }
-}
+{ "path": "./data/app.db" }
+```
+
+### `current_database`
+Get the path of the currently open database.
+
+**Example:**
+```json
+{}
 ```
 
 ### `list_tables`
@@ -59,26 +62,73 @@ List all tables in the database.
 
 **Example:**
 ```json
-{
-  "tool": "list_tables",
-  "arguments": {}
-}
+{}
 ```
 
 ### `describe_table`
-Get the schema of a specific table.
+Describe the columns of a table.
 
 **Parameters:**
-- `table` (string, required): The name of the table to describe
+- `table_name` (string, required): Name of the table to describe
 
 **Example:**
 ```json
-{
-  "tool": "describe_table",
-  "arguments": {
-    "table": "users"
-  }
-}
+{ "table_name": "users" }
+```
+
+### `execute_query`
+Execute a single read-only SELECT query.
+
+**Parameters:**
+- `query` (string, required): The SELECT query to execute
+
+**Example:**
+```json
+{ "query": "SELECT * FROM users WHERE age > 21" }
+```
+
+### `insert_data`
+Execute a single INSERT statement.
+
+**Parameters:**
+- `query` (string, required): The INSERT statement to execute
+
+**Example:**
+```json
+{ "query": "INSERT INTO users (name, age) VALUES ('Alice', 30)" }
+```
+
+### `update_data`
+Execute a single UPDATE statement.
+
+**Parameters:**
+- `query` (string, required): The UPDATE statement to execute
+
+**Example:**
+```json
+{ "query": "UPDATE users SET age = 31 WHERE name = 'Alice'" }
+```
+
+### `delete_data`
+Execute a single DELETE statement.
+
+**Parameters:**
+- `query` (string, required): The DELETE statement to execute
+
+**Example:**
+```json
+{ "query": "DELETE FROM users WHERE age < 18" }
+```
+
+### `schema_change`
+Execute a single schema modification statement (CREATE TABLE, ALTER TABLE, DROP TABLE).
+
+**Parameters:**
+- `query` (string, required): The schema modification statement to execute
+
+**Example:**
+```json
+{ "query": "CREATE TABLE users (name TEXT, age INTEGER)" }
 ```
 
 ## Integration with AI Assistants
@@ -119,13 +169,13 @@ Here's an example of using the MCP server:
    [Uses list_tables tool]
 
    > Show me all users older than 25
-   [Uses query tool with "SELECT * FROM users WHERE age > 25"]
+   [Uses execute_query tool with "SELECT * FROM users WHERE age > 25"]
    ```
 
 3. **Modify data:**
    ```
    > Add a new user named Bob who is 28 years old
-   [Uses execute tool with INSERT statement]
+   [Uses insert_data tool with an INSERT statement]
    ```
 
 ## Troubleshooting

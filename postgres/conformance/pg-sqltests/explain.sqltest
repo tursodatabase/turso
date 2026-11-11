@@ -101,7 +101,7 @@ test explain-order-by-primary-key-uses-index {
     EXPLAIN SELECT code FROM k3 ORDER BY code LIMIT 3;
 }
 expect {
-    1|0|0|SCAN k USING COVERING INDEX sqlite_autoindex_k_1
-    1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex_k2_1
+    1|0|0|SCAN k USING COVERING INDEX sqlite_autoindex___turso_ns1_k_1
+    1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex___turso_ns1_k2_1
     1|0|0|SCAN k3 USING COVERING INDEX k3_code
 }

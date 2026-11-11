@@ -122,6 +122,10 @@ pub enum Token {
     #[token("custom_types")]
     CustomTypes,
 
+    /// `index_method` capability keyword
+    #[token("index_method")]
+    IndexMethod,
+
     /// `@backend`
     #[token("@backend")]
     AtBackend,
@@ -265,6 +269,7 @@ impl fmt::Display for Token {
             Token::Strict => write!(f, "strict"),
             Token::MaterializedViews => write!(f, "materialized_views"),
             Token::CustomTypes => write!(f, "custom_types"),
+            Token::IndexMethod => write!(f, "index_method"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtCrossCheckIntegrity => write!(f, "@cross-check-integrity"),
             Token::AtSqliteReference => write!(f, "@sqlite-reference"),

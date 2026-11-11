@@ -57,6 +57,8 @@ FOREIGN KEY (column-name [, column-name ...]) REFERENCES foreign-table [(column-
 | `table-name` | The name of the table to create. |
 | `STRICT` | Enables strict type checking on the table. See [STRICT Tables](#strict-tables). |
 
+When several table options are given (for example `STRICT, WITHOUT ROWID`), they are separated by commas, and a comma must be followed by another option.
+
 ## Column Definitions
 
 Each column definition specifies a column name, an optional type, and zero or more column constraints.
@@ -86,6 +88,8 @@ CREATE TABLE users (
 ```
 
 When a column is declared as `INTEGER PRIMARY KEY`, it becomes an alias for the internal `rowid`, and inserted integer values are used as the row identifier directly. This is the most efficient primary key form.
+
+The PostgreSQL frontend exposes primary keys through its system catalogs, including an index entry for `INTEGER PRIMARY KEY`. This lets `pg_dump` include the primary key constraint without creating a separate physical index for the rowid. These catalog-only indexes use `__turso_internal_pk_index_<table>` names, adding leading underscores when a name is taken. Primary-key constraint names are independent of these internal index names. The PostgreSQL frontend rejects databases containing `WITHOUT ROWID` tables with an error when loading their schema.
 
 #### AUTOINCREMENT
 
@@ -117,6 +121,8 @@ Note also that MVCC autoincrement does **not** un-burn rolled-back rowids — a 
 </Warning>
 
 ### NOT NULL
+
+The PostgreSQL catalogs report `INTEGER PRIMARY KEY` columns as non-nullable, along with explicitly declared `NOT NULL` columns, so `pg_dump` preserves those constraints.
 
 Prevents the column from containing NULL values. Any INSERT or UPDATE that would set the column to NULL raises a constraint error.
 
@@ -209,7 +215,7 @@ CREATE TABLE contacts (
 
 ### GENERATED ALWAYS AS
 
-A generated column gets its value from an expression over the other columns of the same row. Turso calculates the value each time a query reads the column, so the value is not stored in the row.
+A generated column gets its value from an expression over the other columns of the same row. A `VIRTUAL` generated column is calculated each time a query reads the column, so its value is not stored in the row. A `STORED` generated column is calculated each time a row is inserted or updated, and its value is stored in the row.
 
 ```sql
 CREATE TABLE order_lines (
@@ -219,9 +225,17 @@ CREATE TABLE order_lines (
 );
 ```
 
-The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (price * qty)` defines the same column. `INSERT` and `UPDATE` cannot write a generated column. You can create an index on a generated column. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does.
+The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (price * qty)` defines the same column. Write `STORED` after the expression to store the value:
 
-Turso supports only virtual generated columns. A `STORED` generated column gives an error.
+```sql
+CREATE TABLE order_lines (
+    price REAL,
+    qty INTEGER,
+    total REAL GENERATED ALWAYS AS (price * qty) STORED
+);
+```
+
+`INSERT` and `UPDATE` cannot write a generated column. A generated column can read other generated columns, virtual or stored, as long as no column depends on itself. You can create an index on a generated column. A generated column cannot be part of the `PRIMARY KEY`. A stored generated column cannot have a [custom type](/docs/sql-reference/statements/create-type) or an [array type](/docs/sql-reference/data-types#array-types), and its expression cannot read a column that has one. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does, with `hidden` set to 2 for a virtual column and 3 for a stored column.
 
 ## Table Constraints
 
@@ -409,7 +423,6 @@ The following CREATE TABLE features are not yet supported:
 | `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
-| `GENERATED ALWAYS AS (...) STORED` | Stored generated columns are not supported. Use [virtual generated columns](#generated-always-as) instead |
 
 ### Experimental Features
 

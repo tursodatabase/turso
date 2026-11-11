@@ -672,8 +672,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::Capability::CustomTypes)
             }
+            Some(Token::IndexMethod) => {
+                self.advance();
+                Ok(ast::Capability::IndexMethod)
+            }
             Some(token) => Err(self.error(format!(
-                "expected capability (trigger, strict, materialized_views, custom_types), got {token}"
+                "expected capability (trigger, strict, materialized_views, custom_types, index_method), got {token}"
             ))),
             None => Err(self.error("expected capability, got EOF".to_string())),
         }
@@ -1186,7 +1190,7 @@ test expr-depth {
     SELECT 1{{repeat:expr_depth_limit-1: OR 1}};
 }
 expect error {
-    Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+    Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
 }
 "#;
 
@@ -1202,7 +1206,7 @@ expect error {
             Expectation::Error {
                 sqlstate: None,
                 pattern: Some(format!(
-                    "Parse error: Expression tree is too large \\(maximum depth {}\\)",
+                    "Expression tree is too large \\(maximum depth {}\\)",
                     turso_parser::MAX_EXPR_DEPTH
                 )),
             }

@@ -324,7 +324,7 @@ func TestConnectionError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected error, got nil")
 	}
-	expectedErr := "turso: error: Parse error: no such function: notafunction"
+	expectedErr := "turso: error: no such function: notafunction"
 	if err.Error() != expectedErr {
 		t.Fatalf("Error test failed, expected: %s, found: %v", expectedErr, err)
 	}

@@ -1,3 +1,4 @@
+use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
@@ -27,6 +28,8 @@ pub struct ExplainInfo {
     /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
     pub cte_materializations: Vec<EqpCteMaterialization>,
+    /// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+    pub ephemeral_cursors: HashSet<usize>,
 }
 
 impl ExplainInfo {
@@ -35,6 +38,24 @@ impl ExplainInfo {
             .iter()
             .find(|(offset, _)| *offset == insn_index)
             .map(|(_, comment)| *comment)
+    }
+
+    pub(crate) fn build_ephemeral_cursors(&mut self, insns: &[(Insn, usize)]) {
+        self.ephemeral_cursors.clear();
+        for (insn, _) in insns {
+            match insn {
+                Insn::OpenEphemeral { cursor_id, .. } => {
+                    self.ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenAutoindex { cursor_id } => {
+                    self.ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenDup { new_cursor_id, .. } => {
+                    self.ephemeral_cursors.insert(*new_cursor_id);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
@@ -53,22 +74,7 @@ pub fn insn_to_row(
     program: &PreparedProgram,
     insn: &Insn,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
-    let mut ephemeral_cursors = HashSet::default();
-    for (insn, _) in &program.insns {
-        match insn {
-            Insn::OpenEphemeral { cursor_id, .. } => {
-                ephemeral_cursors.insert(*cursor_id);
-            }
-            Insn::OpenAutoindex { cursor_id } => {
-                ephemeral_cursors.insert(*cursor_id);
-            }
-            Insn::OpenDup { new_cursor_id, .. } => {
-                // Note: relies on invariant that OpenDup is only for ephemeral cursors
-                ephemeral_cursors.insert(*new_cursor_id);
-            }
-            _ => {}
-        }
-    }
+    let ephemeral_cursors = &program.explain.ephemeral_cursors;
 
     let get_table_or_index_name = |cursor_id: usize| -> String {
         let cursor_type = &program.cursor_ref[cursor_id].1;
@@ -310,7 +316,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]==r[{}] goto {}",
@@ -330,7 +336,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]!=r[{}] goto {}",
@@ -350,7 +356,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
@@ -365,7 +371,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]<=r[{}] goto {}",
@@ -385,7 +391,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
@@ -400,7 +406,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]>=r[{}] goto {}",
@@ -748,6 +754,19 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ConvertToType {
+                reg,
+                storage_class,
+                description,
+            } => (
+                "ConvertToType",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(crate::types::StrictType::Stores(*storage_class).name()),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,
@@ -755,10 +774,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                format!("{} ({})", data.target, data.element_type),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -799,19 +815,6 @@ pub fn insn_to_row(
                 "MakeArray",
                 *start_reg as i64,
                 *count as i64,
-                *dest as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::MakeArrayDynamic {
-                start_reg,
-                count_reg,
-                dest,
-            } => (
-                "MakeArrayDynamic",
-                *start_reg as i64,
-                *count_reg as i64,
                 *dest as i64,
                 Value::build_text(""),
                 0,
@@ -865,19 +868,6 @@ pub fn insn_to_row(
                 *src_reg as i64,
                 *dest as i64,
                 *expected_tag as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::RegCopyOffset {
-                src,
-                base,
-                offset_reg,
-            } => (
-                "RegCopyOffset",
-                *src as i64,
-                *base as i64,
-                *offset_reg as i64,
                 Value::build_text(""),
                 0,
                 String::new(),
@@ -1381,9 +1371,10 @@ pub fn insn_to_row(
                 0,
                 data.col as i64,
                 data.acc_reg as i64,
-                Value::build_text(match &data.collation {
-                    Some(collation) => format!("{}({collation})", data.func.as_str()),
-                    None => data.func.as_str().to_string(),
+                Value::build_text(if data.func.compares_values() {
+                    format!("{}({})", data.func.as_str(), data.collation)
+                } else {
+                    data.func.as_str().to_string()
                 }),
                 0,
                 format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
@@ -1393,7 +1384,6 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
-                comparator: _,
             } => (
                 "AggInverse",
                 0,
@@ -1485,10 +1475,9 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        let coll_str = if let Some(coll) = collation {
-                            format!("{sign}{coll}")
-                        } else {
-                            format!("{sign}B")
+                        let coll_str = match *collation {
+                            CollationSeq::BINARY => format!("{sign}B"),
+                            coll => format!("{sign}{coll}"),
                         };
                         match nulls {
                             Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
@@ -1916,6 +1905,7 @@ pub fn insn_to_row(
             ),
             Insn::DropTable {
                 db,
+                namespace: _,
                 _p2,
                 _p3,
                 table_name,
@@ -1928,7 +1918,11 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TABLE {table_name}"),
             ),
-            Insn::DropTrigger { db, trigger_name } => (
+            Insn::DropTrigger {
+                db,
+                namespace: _,
+                trigger_name,
+            } => (
                 "DropTrigger",
                 *db as i64,
                 0,
@@ -1955,7 +1949,11 @@ pub fn insn_to_row(
                 0,
                 format!("ADD SEQUENCE {}", data.name),
             ),
-            Insn::DropSequence { db, seq_name } => (
+            Insn::DropSequence {
+                db,
+                namespace: _,
+                seq_name,
+            } => (
                 "DropSequence",
                 *db as i64,
                 0,
@@ -1964,8 +1962,31 @@ pub fn insn_to_row(
                 0,
                 format!("DROP SEQUENCE {seq_name}"),
             ),
+            Insn::AddNamespace {
+                db,
+                namespace,
+                name,
+            } => (
+                "AddNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("CREATE SCHEMA {name} id={}", namespace.as_u32()),
+            ),
+            Insn::DropNamespace { db, namespace } => (
+                "DropNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::Null,
+                0,
+                format!("DROP SCHEMA id={}", namespace.as_u32()),
+            ),
             Insn::SequenceComputeNext {
                 db,
+                namespace: _,
                 seq_name,
                 in_value_reg,
                 in_is_called_reg,
@@ -1984,6 +2005,7 @@ pub fn insn_to_row(
             ),
             Insn::SetSequenceCurrval {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
             } => (
@@ -1997,6 +2019,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceTrackAllocation {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
             } => (
@@ -2010,6 +2033,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceRegisterAllocation {
                 db,
+                namespace: _,
                 seq_name,
                 value_reg,
                 saved_outer_reg,
@@ -2065,7 +2089,38 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
-            Insn::DropView { db, view_name } => (
+            Insn::AddRole {
+                db,
+                id_reg,
+                name,
+                superuser,
+            } => (
+                "AddRole",
+                *db as i64,
+                *id_reg as i64,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
+            ),
+            Insn::RelationChange {
+                db,
+                change,
+                value_regs,
+            } => (
+                "RelationChange",
+                *db as i64,
+                value_regs.first().map_or(0, |reg| *reg as i64),
+                0,
+                Value::build_text(format!("{change:?}")),
+                0,
+                "tell the dialect a relation changed".to_string(),
+            ),
+            Insn::DropView {
+                db,
+                namespace: _,
+                view_name,
+            } => (
                 "DropView",
                 *db as i64,
                 0,
@@ -2074,7 +2129,11 @@ pub fn insn_to_row(
                 0,
                 format!("DROP VIEW {view_name}"),
             ),
-            Insn::DropIndex { db: _, index } => (
+            Insn::DropIndex {
+                db: _,
+                namespace: _,
+                index,
+            } => (
                 "DropIndex",
                 0,
                 0,
@@ -2296,6 +2355,7 @@ pub fn insn_to_row(
                 auto_commit,
                 rollback,
                 concurrent,
+                read_only: _,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,
@@ -2500,7 +2560,12 @@ pub fn insn_to_row(
                 0,
                 format!("affinity(r[{}]={:?})", *reg, affinity),
             ),
-            Insn::RenameTable { db: _, from, to } => (
+            Insn::RenameTable {
+                db: _,
+                namespace: _,
+                from,
+                to,
+            } => (
                 "RenameTable",
                 0,
                 0,
@@ -2509,7 +2574,12 @@ pub fn insn_to_row(
                 0,
                 format!("rename_table({from}, {to})"),
             ),
-            Insn::DropColumn { db: _, table, column_index } => (
+            Insn::DropColumn {
+                db: _,
+                namespace: _,
+                table,
+                column_index,
+            } => (
                 "DropColumn",
                 0,
                 0,

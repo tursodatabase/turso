@@ -6,8 +6,9 @@ use std::sync::{
 use crate::common::ExecRows;
 use turso_core::{
     Clock, Completion, ConnectOpts, Database, File, MemoryIO, MonotonicInstant, OpenFlags,
-    SqliteDialect, WallClockInstant, IO,
+    WallClockInstant, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 struct TestClockIo {
     inner: MemoryIO,

@@ -16,7 +16,10 @@ Three things keep that work honest:
 - **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
   that CI runs against the front-end and against a real PostgreSQL server
   (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
-  behavior have `@skip-if postgres "reason"`.
+  behavior have `@skip-if postgres "reason"`. Tests for SQL that the SQLite
+  frontend also runs are in
+  [`testing/shared-sqltests/`](../testing/shared-sqltests/), which CI runs on
+  every backend.
 
 ## Verification workflow
 
@@ -25,8 +28,9 @@ When changing the parser, translator, or query behavior:
 1. Check the relevant page of the PostgreSQL documentation.
 2. Confirm the behavior against a real PostgreSQL server.
 3. Encode the observed behavior in a test — an upstream regression script that
-   now passes, a `.sqltest` in `conformance/pg-sqltests/`, or a Rust test (see
-   below) — so it can't regress.
+   now passes, a `.sqltest` in `conformance/pg-sqltests/` (or in
+   `testing/shared-sqltests/` when the SQLite frontend must give the same
+   result), or a Rust test (see below) — so it can't regress.
 
 If Turso intentionally diverges from PostgreSQL, document that in
 [`COMPAT.md`](COMPAT.md). Pay particular attention to clauses that parse but
@@ -56,28 +60,26 @@ cargo run -p tursopg -- --server 127.0.0.1:5432 /tmp/regress.db &
 cargo run -p turso_pg_regress -- --dsn 'postgres://127.0.0.1:5432/regression'
 ```
 
-## Compare pg_dump files
+## Differential dump fuzzing
 
-Install Python 3 and PostgreSQL clients that support `pg_dump --restrict-key`.
-Use Docker for a disposable PostgreSQL server, or set `PG_DSN` to a disposable server whose role can create databases.
-Run all fixtures, or select one SQL file:
+The Rust crate [`dump-fuzzer/`](dump-fuzzer/) uses Hegel to generate SQL, load it
+into fresh PostgreSQL and Turso databases, and compare their `pg_dump` output.
+It compares PostgreSQL ASTs and decoded COPY rows rather than dump bytes.
+
+Install PostgreSQL clients that support `pg_dump --restrict-key`. Use Docker,
+or set `PG_DSN` to a disposable PostgreSQL 18 server using a `turso` role with
+LOGIN and CREATEDB. Matching role names avoids default-privilege differences:
 
 ```bash
 make -C postgres/conformance test-pgdump
 make -C postgres/conformance test-pgdump FILE=pgdump/tables.sql
+make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 1000 --seed 42'
 ```
 
-The runner loads each SQL file in `conformance/pgdump/` into fresh Turso and PostgreSQL databases.
-It uses the same `pg_dump` client for both databases and compares the output files byte for byte.
-The client uses a fixed restriction key, which replaces its random token.
-The runner does not remove headers, owner names, privileges, or other differences.
-Different server versions and row orders can therefore fail this comparison.
-
-Each run saves `postgres.sql`, `turso.sql`, command logs, and a `dump.diff` file for unequal dumps under `conformance/pgdump/results/`.
-Failed commands return a nonzero status and keep their logs and any partial dump files.
-The runner stops its Turso processes and drops only the PostgreSQL databases that it creates.
-It does not restore the dumps or treat known compatibility failures as passes.
-Add a `.sql` file to `conformance/pgdump/` to test another fixture.
+The Rust binary also supports direct fixture replay and offline comparison.
+See the [fuzzer README](dump-fuzzer/README.md) for commands, comparison rules,
+generator coverage, and failure artifacts. The previous Python byte comparator
+has been replaced by this binary.
 
 ## The corpus is pristine
 

@@ -4,18 +4,25 @@
 //! whole faithful pager-backed path is exercised, including persistence.
 
 use crate::namespace::NamespaceId;
+use crate::schema::Schema;
+use crate::security::roles::RoleId;
+use crate::Dialect;
 use std::sync::Arc;
 
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Insn, RegisterOrLiteral};
 use crate::{
-    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags,
-    SqliteDialect, Statement, Value, IO,
+    ConnectOpts, Connection, Database, DatabaseOpts, EngineDialect, LimboError, MemoryIO,
+    OpenFlags, Statement, Value, IO,
 };
 
 fn fresh_db() -> Arc<Connection> {
+    fresh_db_with_dialect(Arc::new(EngineDialect))
+}
+
+fn fresh_db_with_dialect(dialect: Arc<dyn Dialect>) -> Arc<Connection> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", dialect).unwrap();
     db.connect(ConnectOpts::new()).unwrap()
 }
 
@@ -27,7 +34,7 @@ fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
         OpenFlags::Create,
         opts,
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     db.connect(ConnectOpts::new()).unwrap()
@@ -844,5 +851,65 @@ fn blob_boundary_read_write_sweep() {
             "boundary write off={off} len={len}"
         );
     }
+    blob.close().unwrap();
+}
+
+/// A dialect with roles whose privileges let no role read the table `secret`.
+/// Every other table may be read by every role, as with the default dialect.
+struct SecretTableDialect;
+
+impl Dialect for SecretTableDialect {
+    fn name(&self) -> &'static str {
+        "secret-table-test"
+    }
+
+    fn supports_roles(&self) -> bool {
+        true
+    }
+
+    fn role_may_read(
+        &self,
+        _schema: &Schema,
+        _namespace: NamespaceId,
+        name: &str,
+        _role: RoleId,
+    ) -> bool {
+        !name.eq_ignore_ascii_case("secret")
+    }
+}
+
+#[test]
+fn blob_open_checks_the_privileges_of_the_current_role() {
+    let conn = fresh_db_with_dialect(Arc::new(SecretTableDialect));
+    exec(
+        &conn,
+        "CREATE TABLE secret(id INTEGER PRIMARY KEY, data BLOB)",
+    );
+    exec(
+        &conn,
+        "CREATE TABLE shared(id INTEGER PRIMARY KEY, data BLOB)",
+    );
+    exec(&conn, "INSERT INTO secret VALUES (1, zeroblob(8))");
+    exec(&conn, "INSERT INTO shared VALUES (1, zeroblob(8))");
+
+    // The role catalog has no entry for this role, and a role it does not
+    // know is not a superuser.
+    conn.set_current_role(RoleId::from_stored(7));
+
+    let err = conn.blob_open("secret", "data", 1, false).unwrap_err();
+    assert!(matches!(err, LimboError::PermissionDenied(_)), "{err:?}");
+    assert_eq!(err.to_string(), "permission denied: read on table secret");
+
+    let err = conn.blob_open("shared", "data", 1, true).unwrap_err();
+    assert!(matches!(err, LimboError::PermissionDenied(_)), "{err:?}");
+    assert_eq!(err.to_string(), "permission denied: write on table shared");
+
+    let blob = conn.blob_open("shared", "data", 1, false).unwrap();
+    assert_eq!(blob.bytes(), 8);
+    blob.close().unwrap();
+
+    conn.set_current_role(RoleId::SUPERUSER);
+    let mut blob = conn.blob_open("secret", "data", 1, true).unwrap();
+    blob.write(0, &[1, 2, 3]).unwrap();
     blob.close().unwrap();
 }

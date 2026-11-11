@@ -835,6 +835,42 @@ test update-from-returning-may-not-reference-target-alias {
 expect error {
 }
 
+test update-where-may-not-reference-returning-alias {
+    CREATE TABLE t (c1 INT, c2 INT, c3 INT, PRIMARY KEY (c1, c2));
+    INSERT INTO t VALUES (1, 2, 2);
+    UPDATE t SET c3 = 6 WHERE a5 = 2 RETURNING c3 AS a5;
+}
+expect error {
+    no such column: a5
+}
+
+test update-pk-where-may-not-reference-returning-alias {
+    CREATE TABLE t (c1 INT, c2 INT, c3 INT, PRIMARY KEY (c1, c2));
+    INSERT INTO t VALUES (1, 2, 2);
+    UPDATE t SET c1 = 6 WHERE a5 = 2 RETURNING c3 AS a5;
+}
+expect error {
+    no such column: a5
+}
+
+test update-from-where-may-not-reference-returning-alias {
+    CREATE TABLE t (c1 INT, c2 INT, c3 INT, PRIMARY KEY (c1, c2));
+    INSERT INTO t VALUES (1, 2, 2);
+    UPDATE t SET c3 = 6 FROM (SELECT 2 AS k) AS s WHERE a5 = s.k RETURNING c3 AS a5;
+}
+expect error {
+    no such column: a5
+}
+
+test update-from-table-function-may-not-reference-returning-alias {
+    CREATE TABLE t (c1 INT, c2 INT, c3 INT, PRIMARY KEY (c1, c2));
+    INSERT INTO t VALUES (1, 2, 2);
+    UPDATE t SET c3 = 6 FROM json_each(a5) AS j RETURNING c3 AS a5;
+}
+expect error {
+    no such column: a5
+}
+
 @cross-check-integrity
 test update-returning-correlated-in-selfread {
     CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, val INTEGER, note TEXT);
@@ -2685,5 +2721,28 @@ expect {
     id|id|id
     1|1|1
     rowid
+    1
+}
+
+# A trigger body is compiled into a program of its own, whose subqueries are
+# numbered from the start again. Its scalar subquery must not take the place of
+# the RETURNING clause's, which would lose the TEXT affinity of `a` and compare
+# '1' with 1 as different.
+@cross-check-integrity
+test returning-subquery-affinity-with-trigger-subquery {
+    CREATE TABLE t(a TEXT, i INTEGER);
+    CREATE TABLE log(m);
+    INSERT INTO t VALUES ('1', 1);
+    CREATE TRIGGER tr_update BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES ((SELECT a FROM t));
+    END;
+    CREATE TRIGGER tr_insert AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES ((SELECT a FROM t LIMIT 1));
+    END;
+    UPDATE t SET i = 2 RETURNING (SELECT a FROM t) = 1;
+    INSERT INTO t VALUES ('2', 2) RETURNING (SELECT a FROM t WHERE i = 2 LIMIT 1) = 1;
+}
+expect {
+    1
     1
 }

@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, StepResult,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
+use turso_sqlite::SqliteDialect;
 
 use crate::runner::memory::io::MemorySimIO;
 

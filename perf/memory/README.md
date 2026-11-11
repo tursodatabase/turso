@@ -242,3 +242,35 @@ warm-up outside the measured closure. Each input is used for one measured query
 or transaction sequence and dropped after measurement. The same boundaries apply
 under CodSpeed instrumentation.
 Existing Criterion profiles retain their separate harness and measurement rules.
+
+# MVCC memory per row
+
+`mvcc-row-memory` measures how much heap one MVCC transaction keeps for each
+row that it writes. The transaction runs one statement over every row of table
+`t(id INTEGER PRIMARY KEY, v BLOB)`. `update` and `delete` change rows that a
+checkpoint already wrote to the B-tree.
+
+```bash
+cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement insert --rows 100000
+cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement update --rows 100000
+cargo run -p memory-benchmark --bin mvcc-row-memory -- --statement delete --rows 100000
+python3 perf/memory/analyze-dhat.py dhat-heap.json --sort-by eb --top 10
+```
+
+The JSON report gives bytes per row at four points:
+
+| Field | Live heap |
+|-------|-----------|
+| `uncommitted_bytes_per_row` | After the statement, before `COMMIT` |
+| `statement_peak_bytes_per_row` | Highest value during the statement |
+| `commit_peak_bytes_per_row` | Highest value from the statement to the end of `COMMIT` |
+| `committed_bytes_per_row` | After `COMMIT`, with automatic checkpoints and GC turned off |
+
+Setup, which writes and checkpoints the rows for `update` and `delete`, is not
+measured. Before the committed measurement, the tool runs 1000 small read transactions.
+The MVCC skip maps free removed entries only after later transactions, so without
+these reads the measurement also counts the write set of the finished transaction.
+The dhat file shows the live allocations at the committed measurement as "At exit".
+The values count the bytes that the code requests, so they are the same for debug
+and optimized builds. The process RSS is higher because the allocator rounds sizes.
+`--mode wal` runs the same statements in WAL mode for comparison.

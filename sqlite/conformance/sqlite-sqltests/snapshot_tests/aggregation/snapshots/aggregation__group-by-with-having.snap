@@ -28,7 +28,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode             p1  p2  p3  p4                  p5  comment
    0  Init                0  54   0                       0  Start at 54
-   1  SorterOpen          0   1   0  k(1,-Binary)         0  cursor=0
+   1  SorterOpen          0   1   0  k(1,-B)              0  cursor=0
    2  Null                0  10  11                       0  r[10..11]=NULL
    3  Integer             0   7   0                       0  r[7]=0; clear group by abort flag
    4  Null                0   8   0                       0  r[8]=NULL; initialize group by comparison registers to NULL
@@ -62,7 +62,7 @@ addr  opcode             p1  p2  p3  p4                  p5  comment
   32  AggFinal            0  11   0  avg                  0  accum=r[11]
   33  Copy               10  18   0                       0  r[18]=r[10]
   34  Integer         10000  19   0                       0  r[19]=10000
-  35  Le                 18  19  30                       0  if r[18]<=r[19] goto 30
+  35  Le                 18  19  30  Binary               0  if r[18]<=r[19] goto 30
   36  Copy               10  20   0                       0  r[20]=r[10]
   37  Copy                9  21   0                       0  r[21]=r[9]
   38  Copy               11  22   0                       0  r[22]=r[11]

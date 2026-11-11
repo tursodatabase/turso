@@ -53,11 +53,22 @@ type StepResult = vdbe::StepResult;
 /// already compiled into a parent statement and entered through `OP_Program`,
 /// such as trigger or foreign-key actions. This is not separately prepared SQL;
 /// it is embedded child bytecode execution inside the parent statement.
+///
+/// Use [`StatementOrigin::EngineMetadataRead`] when the engine reads its own
+/// tables, such as the roles table or `sqlite_stat1`, to load the schema.
+/// Such a statement is a top-level statement like a root statement, so it
+/// runs in its own read transaction, but its names are looked up like in a
+/// helper statement: in every database, whatever the search path says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementOrigin {
     Root,
     InternalHelper,
     Subprogram,
+    EngineMetadataRead,
+    /// A schema write of the engine's own, such as a frontend creating its
+    /// internal tables at open: engine SQL semantics like
+    /// [`StatementOrigin::EngineMetadataRead`], run as a top-level statement.
+    EngineSchemaWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +77,7 @@ pub enum StatementStatusCounter {
     Sort,
     VmStep,
     Reprepare,
+    Run,
     RowsRead,
     RowsWritten,
 }
@@ -73,6 +85,15 @@ pub enum StatementStatusCounter {
 impl StatementOrigin {
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
+    }
+
+    /// Whether the statement counts toward
+    /// `Connection::n_active_root_statements`.
+    pub(crate) const fn is_top_level(self) -> bool {
+        matches!(
+            self,
+            Self::Root | Self::EngineMetadataRead | Self::EngineSchemaWrite
+        )
     }
 }
 
@@ -94,7 +115,11 @@ impl StatementOrigin {
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. An expression whose
+/// type is a custom type (`CAST(x AS cents)`, `coalesce(cents_col, 0)`, a
+/// function declared to return one) is reported exactly like a column of
+/// that type: `declared_name` is the type's name, `base_type` the primitive
+/// it is stored as, and `kind` its kind. When none of these paths
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
 /// declared return affinity), `get_column_type_info` returns `Ok(None)`
@@ -202,6 +227,9 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// The command the statement was prepared from, when its SQL text cannot
+    /// be parsed again, so that preparing it again translates the command.
+    reprepare_cmd: Option<Cmd>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -283,6 +311,7 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
+            reprepare_cmd: None,
         }
     }
 
@@ -373,6 +402,7 @@ impl Statement {
             StatementStatusCounter::Sort => metrics.sort_operations,
             StatementStatusCounter::VmStep => metrics.insn_executed,
             StatementStatusCounter::Reprepare => metrics.reprepares,
+            StatementStatusCounter::Run => metrics.runs,
             StatementStatusCounter::RowsRead => metrics.rows_read,
             StatementStatusCounter::RowsWritten => metrics.rows_written,
         }
@@ -391,6 +421,14 @@ impl Statement {
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
         self.state.io_completions.take()
+    }
+
+    /// Clone the pending completion handle without removing it from the statement.
+    pub fn io_completions(&self) -> Option<crate::types::IOCompletions> {
+        self.state
+            .io_completions
+            .as_ref()
+            .map(|io| crate::types::IOCompletions(io.0.clone()))
     }
 
     fn arm_query_timeout_if_needed(&mut self) {
@@ -428,6 +466,7 @@ impl Statement {
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
+            self.state.stop_counting_as_reader(conn);
             let previous = self
                 .program
                 .connection
@@ -514,7 +553,7 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+        if !self.counted_as_active_root && self.origin.is_top_level() {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
@@ -707,6 +746,7 @@ impl Statement {
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
                 }
+                self.state.stop_counting_as_reader(&self.program.connection);
                 self.state.reset(None, None);
             }
         }
@@ -723,6 +763,14 @@ impl Statement {
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
         self._step(None).map_err(|error| self.format_error(error))
+    }
+
+    /// Like [`Self::step`], but a constraint violation stays a
+    /// [`LimboError::ConstraintViolation`] that names its kind in every
+    /// dialect, so the caller can report its extended result code.
+    #[inline]
+    pub fn step_with_structured_errors(&mut self) -> Result<StepResult> {
+        self._step(None)
     }
 
     #[inline]
@@ -749,6 +797,12 @@ impl Statement {
     /// the statement that runs it, as SQLite does.
     pub(crate) fn set_current_time(&mut self, now: crate::WallClockInstant) {
         self.state.current_time = Some(now);
+    }
+
+    /// Makes a trigger or foreign key action stop at the deadline of the
+    /// statement that runs it.
+    pub(crate) fn set_query_deadline(&mut self, deadline: Option<crate::MonotonicInstant>) {
+        self.state.query_deadline = deadline;
     }
 
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
@@ -950,6 +1004,12 @@ impl Statement {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    /// Makes preparing the statement again translate `cmd`, the command it
+    /// was prepared from, instead of parsing its SQL text.
+    pub(crate) fn reprepare_from(&mut self, cmd: Cmd) {
+        self.reprepare_cmd = Some(cmd);
+    }
+
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
@@ -963,8 +1023,13 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+            let cmd = match &self.reprepare_cmd {
+                Some(cmd) => cmd.clone(),
+                None => {
+                    let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+                    cmd.expect("Same SQL string should be able to be parsed")
+                }
+            };
 
             let syms = conn.syms.read();
             let mode = self.query_mode;
@@ -1272,8 +1337,7 @@ impl Statement {
         let column = &self.program.result_columns.get(idx)?;
         let affinity = translate::expr::get_expr_affinity(
             &column.expr,
-            Some(&self.program.table_references),
-            None,
+            &translate::expr_context::TableMetadata::new(Some(&self.program.table_references)),
         );
         affinity_to_primitive(affinity).map(str::to_string)
     }
@@ -1513,7 +1577,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Interrupt) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(
@@ -1593,6 +1658,7 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted(statement_failed);
         }
+        self.state.stop_counting_as_reader(&self.program.connection);
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
@@ -1616,6 +1682,11 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    /// True once [Self::step] has returned a [StepResult::Row] since the last reset.
+    pub fn has_returned_row(&self) -> bool {
+        self.has_returned_row
     }
 
     /// Internal method to get IO from a statement.
@@ -1694,7 +1765,7 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     #[test]
@@ -1798,11 +1869,11 @@ mod tests {
 
     #[test]
     fn internal_constraint_errors_are_structured() {
-        for (sql, kind, message, foreign_key) in constraint_error_cases() {
+        for (sql, kind, message, foreign_key, extended_code) in constraint_error_cases() {
             let conn = constraint_test_connection();
             let mut stmt = conn.prepare(sql).unwrap();
             let error = loop {
-                match stmt._step(None) {
+                match stmt.step_with_structured_errors() {
                     Err(error) => break error,
                     Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
                         stmt.pager.io.step().unwrap();
@@ -1817,12 +1888,13 @@ mod tests {
             assert_eq!(error.to_string(), message, "{sql}");
             assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
             assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
         }
     }
 
     #[test]
     fn public_constraint_errors_preserve_sqlite_variants() {
-        for (sql, _, message, foreign_key) in constraint_error_cases() {
+        for (sql, _, message, foreign_key, _) in constraint_error_cases() {
             for with_waker in [false, true] {
                 let conn = constraint_test_connection();
                 let mut stmt = conn.prepare(sql).unwrap();
@@ -1893,57 +1965,131 @@ mod tests {
         assert_eq!(error.sqlite_result_code(), 19);
     }
 
-    fn constraint_error_cases() -> [(&'static str, crate::ConstraintKind, &'static str, bool); 8] {
+    fn constraint_error_cases(
+    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
         [
             (
                 "INSERT INTO parent VALUES (1, 'b', 1)",
                 crate::ConstraintKind::PrimaryKey,
                 "UNIQUE constraint failed: parent.id",
                 false,
+                1555,
             ),
             (
                 "INSERT INTO parent VALUES (2, 'a', 1)",
                 crate::ConstraintKind::Unique,
                 "UNIQUE constraint failed: parent.code",
                 false,
+                2067,
             ),
             (
                 "INSERT INTO parent VALUES (2, NULL, 1)",
                 crate::ConstraintKind::NotNull,
                 "NOT NULL constraint failed: parent.code",
                 false,
+                1299,
             ),
             (
                 "INSERT INTO parent VALUES (2, 'b', -1)",
                 crate::ConstraintKind::Check,
                 "CHECK constraint failed: positive",
                 false,
+                275,
             ),
             (
                 "INSERT INTO child VALUES (99)",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "DELETE FROM parent",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "INSERT INTO deferred_child VALUES (99)",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "INSERT INTO trigger_source VALUES (1)",
                 crate::ConstraintKind::PrimaryKey,
                 "UNIQUE constraint failed: parent.id",
                 false,
+                1555,
+            ),
+            (
+                "INSERT INTO text_key VALUES ('k')",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: text_key.k",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO pair_key VALUES (1, 1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "UPDATE pair_key SET b = 1 WHERE b = 2",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO pair_key VALUES (1, 2) ON CONFLICT DO UPDATE SET b = 1",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO strict_int VALUES ('x')",
+                crate::ConstraintKind::Datatype,
+                "cannot store TEXT value in INTEGER column strict_int.a",
+                false,
+                3091,
             ),
         ]
+    }
+
+    /// RAISE and a constraint's own ON CONFLICT clause halt with their own
+    /// resolve type, and the error still reports the halt's result code.
+    #[test]
+    fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
+        for (sql, message, extended_code) in [
+            ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
+            (
+                "INSERT INTO unique_rollback VALUES (1)",
+                "UNIQUE constraint failed: unique_rollback.a",
+                2067,
+            ),
+        ] {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                match stmt.step_with_structured_errors() {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt.pager.io.step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+        }
     }
 
     fn constraint_test_connection() -> Arc<crate::Connection> {
@@ -1957,6 +2103,15 @@ mod tests {
             "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
             "INSERT INTO parent VALUES (1, 'a', 1)",
             "INSERT INTO child VALUES (1)",
+            "CREATE TABLE text_key (k TEXT PRIMARY KEY)",
+            "INSERT INTO text_key VALUES ('k')",
+            "CREATE TABLE pair_key (a, b, PRIMARY KEY (a, b))",
+            "INSERT INTO pair_key VALUES (1, 1), (1, 2)",
+            "CREATE TABLE strict_int (a INTEGER) STRICT",
+            "CREATE TABLE raise_abort (a)",
+            "CREATE TRIGGER raise_abort_trigger BEFORE INSERT ON raise_abort BEGIN SELECT RAISE(ABORT, 'nope'); END",
+            "CREATE TABLE unique_rollback (a UNIQUE ON CONFLICT ROLLBACK)",
+            "INSERT INTO unique_rollback VALUES (1)",
         ] {
             conn.execute(sql).unwrap();
         }
@@ -1971,7 +2126,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         db.connect(ConnectOpts::new())
     }
@@ -2240,6 +2395,80 @@ mod tests {
             }
         }
         assert_eq!(stmt.metrics().rows_written, 2);
+    }
+
+    #[test]
+    fn stmt_status_run_counts_each_run() {
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn.prepare("SELECT 1").unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 0);
+
+        // A run is counted on its first step, not when it finishes.
+        assert!(stmt
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 1);
+        assert!(stmt
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_none());
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 1);
+
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 2);
+        stmt.reset_stmt_status(StatementStatusCounter::Run);
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 0);
+
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 1);
+    }
+
+    /// Like SQLite, each trigger or foreign key action program that a
+    /// statement starts counts as a run of that statement.
+    #[test]
+    fn stmt_status_run_counts_trigger_and_foreign_key_action_programs() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute("CREATE TABLE log2(x)").unwrap();
+        // A trigger program with two statements is still one run.
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+             INSERT INTO log VALUES (NEW.x); INSERT INTO log VALUES (NEW.x); END",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr_log AFTER INSERT ON log BEGIN INSERT INTO log2 VALUES (NEW.x); END",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE p(a PRIMARY KEY)").unwrap();
+        conn.execute("CREATE TABLE c(b REFERENCES p(a) ON DELETE CASCADE)")
+            .unwrap();
+        conn.execute("INSERT INTO p VALUES (1), (2)").unwrap();
+        conn.execute("INSERT INTO c VALUES (1), (2)").unwrap();
+
+        let mut insert = conn.prepare("INSERT INTO t VALUES (1), (2)").unwrap();
+        insert.run_ignore_rows().unwrap();
+        // 1 for the INSERT, 2 for `tr`, 4 for `tr_log`.
+        assert_eq!(insert.stmt_status(StatementStatusCounter::Run), 7);
+        let vm_steps_one_run = insert.stmt_status(StatementStatusCounter::VmStep);
+
+        // Resetting the statement keeps the counts of the trigger programs.
+        insert.reset().unwrap();
+        insert.run_ignore_rows().unwrap();
+        assert_eq!(insert.stmt_status(StatementStatusCounter::Run), 14);
+        assert_eq!(
+            insert.stmt_status(StatementStatusCounter::VmStep),
+            2 * vm_steps_one_run
+        );
+
+        let mut delete = conn.prepare("DELETE FROM p").unwrap();
+        delete.run_ignore_rows().unwrap();
+        assert_eq!(delete.stmt_status(StatementStatusCounter::Run), 3);
     }
 
     #[test]

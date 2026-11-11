@@ -631,6 +631,10 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
         order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode>;
     fn sql(&self) -> String;
+    /// Whether only a superuser may read the table. True for tables that
+    /// show the database file, because they show the rows row-level
+    /// security hides. There is no default, so a new table must say.
+    fn superuser_only(&self) -> bool;
 }
 
 pub trait InternalVirtualTableCursor: Send + Sync {
@@ -649,7 +653,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
@@ -666,6 +670,9 @@ mod tests {
         }
         fn sql(&self) -> String {
             format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+        }
+        fn superuser_only(&self) -> bool {
+            false
         }
         fn open(
             &self,
@@ -741,7 +748,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let name = db
@@ -785,7 +792,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let name = db

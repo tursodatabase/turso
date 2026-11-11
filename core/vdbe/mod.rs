@@ -18,7 +18,6 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
-use crate::namespace::NamespaceId;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -163,13 +162,11 @@ pub(crate) fn step_view_delta_batch(
 
                 let schema = connection.schema.read();
                 let views = schema.materialized_view_maintenance_order(
-                    NamespaceId::ROOT,
                     connection.transaction_changes.get_view_names()?,
                 )?;
                 for view_name in &views {
-                    if let Some(view_mutex) =
-                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
-                    {
+                    let (namespace, name) = schema.demangle_name(view_name);
+                    if let Some(view_mutex) = schema.get_materialized_view(namespace, name) {
                         let view = view_mutex.lock();
                         turso_assert_ne!(
                             view.get_root_page(),
@@ -212,9 +209,8 @@ pub(crate) fn step_view_delta_batch(
                     }
 
                     let schema = connection.schema.read();
-                    let Some(view_mutex) =
-                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
-                    else {
+                    let (namespace, name) = schema.demangle_name(view_name);
+                    let Some(view_mutex) = schema.get_materialized_view(namespace, name) else {
                         *current_index += 1;
                         continue;
                     };
@@ -1031,6 +1027,50 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// What a write statement's activity is measured against to tell whether it
+/// wrote anything before failing. In WAL mode the pager's dirty counter
+/// works: the pager and its counter are per-connection, so nothing else —
+/// not even a parallel passive checkpoint — advances it under a statement.
+/// In MVCC mode statements write to the transaction's own row store and the
+/// pager is only written by checkpoint work, so the baseline is the
+/// transaction's write-set size instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteBaseline {
+    None,
+    PagerDirties(u64),
+    MvccWriteSet(usize),
+}
+
+impl WriteBaseline {
+    /// The main database's write activity right now, as seen by the
+    /// statement's connection.
+    pub(crate) fn capture(
+        mv_store: Option<&MvStore>,
+        connection: &Connection,
+        pager: &Pager,
+    ) -> WriteBaseline {
+        match mv_store {
+            Some(mv_store) => connection
+                .get_mv_tx_id()
+                .and_then(|tx_id| mv_store.tx_write_set_len(tx_id))
+                .map_or(WriteBaseline::None, WriteBaseline::MvccWriteSet),
+            None => WriteBaseline::PagerDirties(pager.pages_dirtied_count()),
+        }
+    }
+
+    /// Whether the statement wrote anything since this baseline was captured.
+    fn advanced(self, mv_store: Option<&MvStore>, connection: &Connection, pager: &Pager) -> bool {
+        match self {
+            WriteBaseline::None => false,
+            WriteBaseline::PagerDirties(at_start) => pager.pages_dirtied_count() != at_start,
+            WriteBaseline::MvccWriteSet(at_start) => mv_store
+                .zip(connection.get_mv_tx_id())
+                .and_then(|(mv_store, tx_id)| mv_store.tx_write_set_len(tx_id))
+                .is_some_and(|now| now > at_start),
+        }
+    }
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1178,6 +1218,22 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// Whether this statement has passed a `Transaction` instruction and is
+    /// counted in `Connection::n_active_read_statements`.
+    pub(crate) is_active_read: bool,
+    /// Whether this statement is a DROP that has passed a `Transaction`
+    /// instruction and is counted in `Connection::n_active_destroy_statements`.
+    pub(crate) is_active_destroy: bool,
+    /// Write activity on the main database when this statement became an
+    /// active write; abort() compares against it to tell whether the
+    /// statement wrote anything before failing.
+    pub(crate) write_baseline: WriteBaseline,
+    /// Whether the transaction was READ ONLY when this statement started
+    /// writing. The write opcodes reject database writes under it, the
+    /// backstop behind the compile-time and sequence read-only checks. A
+    /// statement already writing when the transaction turns read-only keeps
+    /// its mode, as in PostgreSQL, which checks when a command starts.
+    pub(crate) tx_read_only_at_start: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1279,6 +1335,10 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            is_active_read: false,
+            is_active_destroy: false,
+            tx_read_only_at_start: false,
+            write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -1349,6 +1409,10 @@ impl ProgramState {
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        turso_assert!(
+            !self.is_active_read && !self.is_active_destroy,
+            "resetting a statement still counted as an active reader"
+        );
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -1451,6 +1515,8 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.is_active_write = false;
+        self.tx_read_only_at_start = false;
+        self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -1464,6 +1530,23 @@ impl ProgramState {
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
         self.pending_fresh_tx = None;
+    }
+
+    /// Removes this statement from the connection's counts of reading and
+    /// dropping statements. The next `Transaction` instruction counts it again.
+    pub(crate) fn stop_counting_as_reader(&mut self, connection: &Connection) {
+        if self.is_active_read {
+            connection
+                .n_active_read_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_read = false;
+        }
+        if self.is_active_destroy {
+            connection
+                .n_active_destroy_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_destroy = false;
+        }
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -1622,14 +1705,14 @@ impl ProgramState {
             .expect("an instruction that reports IO leaves its completion in the state")
     }
 
-    /// Runs `f` on the metrics of this statement including its active and
-    /// cached subprograms, without copying them when there is no subprogram.
+    /// Runs `f` on the metrics of this statement including its active
+    /// subprogram, without copying them when there is no active subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
+        let has_active_subprogram = matches!(
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
+        );
+        if has_active_subprogram {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1641,18 +1724,12 @@ impl ProgramState {
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
-        for statement in self.subprogram_stmt_cache.values() {
-            metrics.merge(&statement.metrics());
-        }
         metrics
     }
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_metrics();
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_metrics();
         }
     }
@@ -1665,13 +1742,11 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
             crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::Run => self.metrics.runs = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_stmt_status(counter);
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_stmt_status(counter);
         }
     }
@@ -2090,6 +2165,9 @@ pub struct PreparedProgram {
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
+    /// Whether the statement may write more than one row; see
+    /// `crate::vdbe::builder::ProgramBuilder::is_multi_write`.
+    pub is_multi_write: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
@@ -2104,10 +2182,17 @@ pub struct PreparedProgram {
     pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    /// The custom collations of the connection that prepared the program. The
+    /// program keeps them alive because its `CollationSeq::Custom` values
+    /// call their callbacks.
+    pub custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
     /// Set of attached database indices that need write transactions.
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Whether the program frees a b-tree (`Insn::Destroy`) or the storage of an
+    /// index method (`Insn::IndexMethodDestroy`), as DROP TABLE and DROP INDEX do.
+    pub destroys_btree: bool,
 }
 
 #[derive(Clone)]
@@ -2678,6 +2763,10 @@ impl Program {
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
+                    Ok(InsnFunctionStepResult::Interrupt) => {
+                        state.interrupt();
+                        program.interrupted_during_step(state, pager)
+                    }
                     Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
@@ -2785,7 +2874,7 @@ impl Program {
                 // its own rows, so roll back the whole transaction while
                 // returning the real preparation error to the caller.
                 let rollback_error =
-                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.clone());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
                     tracing::error!(
                         "Abort also failed after FAIL index-method preparation: \
@@ -3474,6 +3563,33 @@ impl Program {
             }
         }
 
+        /// Whether this failed statement, which has no statement savepoint,
+        /// forces the whole transaction to roll back. Ordinary runtime errors
+        /// (overflow, type errors, constraint checks, ...) are raised before
+        /// such a statement writes anything, so the transaction survives
+        /// them. The listed errors can strike mid-write, leaving partial
+        /// writes only a full rollback can undo; an I/O error rolls back even
+        /// from a read-only statement, because it may have hit a cache spill
+        /// of pages dirtied by earlier statements in the transaction. SQLite
+        /// applies the same rules to its "special errors" (sqlite3VdbeHalt),
+        /// with one deliberate difference: an interrupted statement that has
+        /// a statement savepoint is undone by the savepoint and keeps the
+        /// transaction here, where SQLite's interrupts bypass the statement
+        /// journal and roll back everything. Interrupts normally surface as
+        /// a clean stop rather than as this error, and the dropped-writer
+        /// poison rule applies instead.
+        fn error_forces_txn_rollback(err: &LimboError, unfinished_writer: bool) -> bool {
+            match err {
+                LimboError::CompletionError(_) => true,
+                LimboError::DatabaseFull
+                | LimboError::OutOfMemory
+                | LimboError::CacheError(_)
+                | LimboError::Corrupt(_)
+                | LimboError::Interrupt => unfinished_writer,
+                _ => false,
+            }
+        }
+
         let mut abort_error: Option<LimboError> = None;
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
@@ -3828,6 +3944,13 @@ impl Program {
                         _ => 0,
                     };
                     self.connection.set_changes(last_change);
+                    // The rows FAIL keeps also count in total_changes(). An
+                    // autocommit statement added them when it committed; one
+                    // inside an open transaction adds them here.
+                    if matches!(effective_resolve, ResolveType::Fail) && !can_autocommit_now {
+                        self.connection
+                            .add_total_changes(state.n_total_change.swap(0, Ordering::SeqCst));
+                    }
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
@@ -3845,7 +3968,13 @@ impl Program {
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if can_autocommit_now {
+                        // An I/O error invalidates more than the failing
+                        // statement — it may have hit a spill of pages other
+                        // statements dirtied — so the statement savepoint is
+                        // not enough: roll back the whole transaction, like
+                        // SQLite on SQLITE_IOERR.
+                        let io_error = matches!(err, Some(LimboError::CompletionError(_)));
+                        if can_autocommit_now || io_error {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -3862,9 +3991,50 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
-                        {
+                        // An ordinary error, or a clean drop (err == None),
+                        // keeps the transaction. A single-row writer raises
+                        // ordinary errors before it writes its row; a
+                        // multi-row statement that the analysis in
+                        // translate/stmt_journal.rs left without a statement
+                        // savepoint keeps the rows written before the error,
+                        // like SQLite, which opens no statement journal for
+                        // statements its may-abort analysis clears. A dropped
+                        // unfinished writer was poisoned above and the caller
+                        // must ROLLBACK explicitly.
+                        let forces_rollback = err
+                            .is_some_and(|err| error_forces_txn_rollback(err, unfinished_writer));
+                        // A single-row writer must not have written anything
+                        // when an ordinary error is raised. A violation means
+                        // a statement shape whose expressions run after the
+                        // write is missing from the savepoint analysis — like
+                        // RETURNING or materialized-view maintenance were —
+                        // or an error is missing from
+                        // error_forces_txn_rollback: fail loudly in debug
+                        // builds, and roll the transaction back rather than
+                        // keep the row. SQLite asserts the same invariant
+                        // (sqlite3VdbeAssertAbortable).
+                        let wrote_without_savepoint = !can_autocommit_now
+                            && unfinished_writer
+                            && !self.is_multi_write
+                            && err.is_some()
+                            && !forces_rollback
+                            && {
+                                let baseline = state.write_baseline;
+                                let mv_store = state.mv_store(&self.connection).cloned();
+                                baseline.advanced(mv_store.as_deref(), &self.connection, pager)
+                            };
+                        if wrote_without_savepoint {
+                            tracing::error!(
+                                "statement wrote, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                            debug_assert!(
+                                false,
+                                "statement wrote, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                        }
+                        if can_autocommit_now || forces_rollback || wrote_without_savepoint {
                             self.rollback_current_txn(pager);
                         }
                     }
@@ -4393,7 +4563,7 @@ mod tests {
         for trace in [false, true] {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
-                crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+                crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();

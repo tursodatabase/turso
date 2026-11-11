@@ -32,6 +32,7 @@ sqltest run <PATHS>... [OPTIONS]
 |--------|-------|---------|-------------|
 | `--backend <NAME>` | | `rust` | Where the tests run: `rust`, `cli`, `js`, `tursopg`, or `postgres` (see [Backends](#backends)) |
 | `--binary <PATH>` | | `tursodb` | Path to the tursodb CLI binary |
+| `--fail-fast` | | | Stop at the first failed test or error |
 | `--filter <PATTERN>` | `-f` | | Filter tests by name (glob pattern) |
 | `--jobs <N>` | `-j` | CPU count | Maximum concurrent test jobs |
 | `--output <FORMAT>` | `-o` | `pretty` | Output format: `pretty` or `json` |
@@ -206,7 +207,13 @@ The `--filter` option supports simple glob patterns:
 
 ### Exit on First Failure
 
-Currently, all tests run to completion. A `--fail-fast` option may be added in the future.
+By default, all tests run to completion. Use `--fail-fast` to stop at the first failed test or
+error. Tests that are still running are cancelled, and tests that have not started are not run. The
+summary only counts the tests that finished.
+
+```bash
+sqltest run sqlite/conformance/sqlite-sqltests/ --fail-fast
+```
 
 ## Performance Tips
 

@@ -33,6 +33,13 @@ internal enum TursoNativeValueType : uint
     Null = 5,
 }
 
+[Flags]
+internal enum TursoDatabaseOpenFlags : uint
+{
+    None = 0,
+    ReadOnly = 1,
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal struct TursoDatabaseConfig
 {

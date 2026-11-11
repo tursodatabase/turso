@@ -1,121 +1,5 @@
 use super::*;
-
-/// Map an AST operator to the string representation used in custom type operator definitions.
-pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
-    match op {
-        ast::Operator::Add => Some("+"),
-        ast::Operator::Subtract => Some("-"),
-        ast::Operator::Multiply => Some("*"),
-        ast::Operator::Divide => Some("/"),
-        ast::Operator::Modulus => Some("%"),
-        ast::Operator::Less => Some("<"),
-        ast::Operator::LessEquals => Some("<="),
-        ast::Operator::Greater => Some(">"),
-        ast::Operator::GreaterEquals => Some(">="),
-        ast::Operator::Equals => Some("="),
-        ast::Operator::NotEquals => Some("!="),
-        _ => None,
-    }
-}
-
-/// Emit bytecode for a resolved custom type operator call.
-/// Handles argument swapping, literal encoding, and result negation.
-pub(super) fn emit_custom_type_operator(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    resolved: &ResolvedOperator,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let func = resolver
-        .resolve_function(&resolved.func_name, 2)?
-        .ok_or_else(|| {
-            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
-        })?;
-    let (first, second) = if resolved.swap_args {
-        (e2, e1)
-    } else {
-        (e1, e2)
-    };
-
-    // When encoding a literal operand, we must use separate registers for the
-    // function call arguments. translate_expr may place literals in preamble
-    // registers (constant optimization), and encoding in-place would clobber
-    // that register — breaking subsequent loop iterations.
-    let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
-            // Translate operands into temporary registers first.
-            let tmp1 = program.alloc_register();
-            let tmp2 = program.alloc_register();
-            translate_expr(program, referenced_tables, first, tmp1, resolver)?;
-            translate_expr(program, referenced_tables, second, tmp2, resolver)?;
-
-            // Determine which tmp holds the literal and which holds the column.
-            let (lit_tmp, col_tmp) = match encode_info.which {
-                EncodeArg::First if resolved.swap_args => (tmp2, tmp1),
-                EncodeArg::First => (tmp1, tmp2),
-                EncodeArg::Second if resolved.swap_args => (tmp1, tmp2),
-                EncodeArg::Second => (tmp2, tmp1),
-            };
-
-            // Allocate fresh contiguous registers for the function call.
-            let func_args = program.alloc_registers(2);
-            // The literal goes in the same position it occupied in arg layout.
-            let (lit_dst, col_dst) = match encode_info.which {
-                EncodeArg::First if resolved.swap_args => (func_args + 1, func_args),
-                EncodeArg::First => (func_args, func_args + 1),
-                EncodeArg::Second if resolved.swap_args => (func_args, func_args + 1),
-                EncodeArg::Second => (func_args + 1, func_args),
-            };
-
-            // Copy column value as-is.
-            program.emit_insn(Insn::Copy {
-                src_reg: col_tmp,
-                dst_reg: col_dst,
-                extra_amount: 0,
-            });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(
-                program,
-                encode_expr,
-                lit_tmp,
-                lit_dst,
-                &encode_info.type_params,
-                &encode_info.type_def,
-                resolver,
-            )?;
-            func_args
-        } else {
-            // Type has no encode expression; translate directly into arg slots.
-            let arg_reg = program.alloc_registers(2);
-            translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-            translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-            arg_reg
-        }
-    } else {
-        // No encoding needed; translate directly into arg slots.
-        let arg_reg = program.alloc_registers(2);
-        translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-        translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-        arg_reg
-    };
-
-    let result_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: func_start,
-        dest: result_reg,
-        func: FuncCtx { func, arg_count: 2 },
-    });
-    if resolved.negate {
-        program.emit_insn(Insn::Not {
-            reg: result_reg,
-            dest: result_reg,
-        });
-    }
-    Ok(result_reg)
-}
+use crate::schema::ResolvedType;
 
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
@@ -137,218 +21,485 @@ pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     }
 }
 
-/// Check if a literal type is compatible with a custom type's value input type.
-/// "any" matches everything; otherwise exact match (case-insensitive).
-pub(super) fn literal_compatible_with_value_type(
-    literal_type: &str,
-    value_input_type: &str,
-) -> bool {
-    value_input_type.eq_ignore_ascii_case("any")
-        || literal_type.eq_ignore_ascii_case(value_input_type)
+/// Whether a custom type takes values of the SQL type `type_name` as input,
+/// such as `integer` for a type based on integer. A type whose input type is
+/// `any` takes every value. A comparison of the type's values with such a
+/// value is well typed, as it is for an operator of the type.
+pub(crate) fn takes_input_of_type(type_def: &TypeDef, type_name: &str) -> bool {
+    let value_input_type = type_def.value_input_type();
+    value_input_type.eq_ignore_ascii_case("any") || type_name.eq_ignore_ascii_case(value_input_type)
 }
 
-/// Which operand of a binary expression needs encoding before the operator call.
-pub(super) enum EncodeArg {
-    /// Encode the first argument (e1 is a literal, e2 is the custom type column)
-    First,
-    /// Encode the second argument (e1 is the custom type column, e2 is a literal)
-    Second,
+/// Whether a custom type's function runs the operator expression `expr`, such
+/// as `a < b` or `-a`. An operator that does not exist, such as `date * 2`,
+/// counts too: emitting it fails.
+pub(crate) fn runs_custom_type_function(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    !matches!(custom_operator_call(expr, env), Ok(None))
 }
 
-/// Info needed to encode a literal argument for an operator call.
-#[allow(clippy::vec_box)]
-pub(super) struct OperatorEncodeInfo {
-    type_def: Arc<TypeDef>,
-    type_params: Vec<Box<ast::Expr>>,
-    which: EncodeArg,
-}
-
-/// Result of resolving a custom type operator. May be a direct match or derived
-/// from `<` and `=` operators (e.g. `>` is derived as swap_args + `<`).
-pub(super) struct ResolvedOperator {
-    func_name: String,
-    swap_args: bool,
-    negate: bool,
-    /// If a literal operand needs encoding before the operator call.
-    encode_info: Option<OperatorEncodeInfo>,
-}
-
-/// Find a custom type operator function for a binary expression.
-///
-/// Operators fire when:
-/// 1. Both operands are columns of the same custom type, OR
-/// 2. One operand is a custom type column and the other is a literal whose type
-///    is compatible with the custom type's `value` input type, OR
-/// 3. One operand is a column of the type, the other is anything except a column
-///    of a different custom type, and either the operator is arithmetic and the
-///    type reads stored values back unchanged, or the operator is a comparison and
-///    the type's `value` input type is `any`. This lets `date + 1`,
-///    `date + int_col` and `date + ?` add days, and `numeric_col = 1.5 + 0`
-///    compare as numeric, while `int_col = '10'` still uses the standard operator.
-///
-/// When case 2 applies, the literal is encoded before being passed to the operator
-/// function so both arguments are in the same (encoded) representation. In case 3
-/// the other operand is passed as is. For arithmetic that is only safe when encoded
-/// and decoded values look the same. For a comparison the column is passed decoded,
-/// so both arguments are values as the user sees them, and the value is not rounded
-/// to the column's type parameters. The operator function checks its type.
-pub(super) fn find_custom_type_operator(
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    op: &ast::Operator,
+/// Emits the operator expression `expr` with a custom type's function, if one
+/// runs it, and returns the register holding the result. `None` means SQLite's
+/// operator runs.
+pub(super) fn emit_custom_type_operator(
+    program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
     resolver: &Resolver,
-) -> Option<ResolvedOperator> {
-    let op_str = operator_to_str(op)?;
+) -> Result<Option<usize>> {
     let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = operand_custom_type(e1, &env, resolver);
-    let rhs_info = operand_custom_type(e2, &env, resolver);
+    let Some(call) = custom_operator_call(expr, &env)? else {
+        return Ok(None);
+    };
+    let result_reg = emit_operator_call(program, referenced_tables, expr, &call, resolver)?;
+    Ok(Some(result_reg))
+}
 
-    // Try to find a direct or derived operator match on a type definition.
-    let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
-        // Direct match: just check op symbol (no right_type constraint)
-        for op_def in type_def.operators() {
-            if op_def.op == op_str {
-                // Naked operator (func_name = None): fall through to standard comparison
-                let func_name = op_def.func_name.as_ref()?;
-                return Some((func_name.clone(), false, false));
+/// Translates `operand`, which is compared with `other`, into `reg`. A string
+/// literal or parameter compared with a value of a custom type is read as a
+/// value of the type, as PostgreSQL reads it: it is stored as a column of the
+/// type stores it, then read back. So `ts = '2024-01-05T09:31'` compares ts
+/// with '2024-01-05 09:31:00', and a text the type does not accept is an
+/// error. In a row value such as `(tm, id) = ('10:00', 2)`, each element is
+/// compared with the element of `other` at its position.
+pub(crate) fn translate_compared_operand(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let len = row_value_len(operand)?;
+    if len <= 1 {
+        return translate_compared_value(program, referenced_tables, operand, other, reg, resolver);
+    }
+    // Each component is translated as one value, so a row value nested
+    // inside another is "row value misused", as in SQLite.
+    for i in 0..len {
+        let component = row_value_component_expr(operand, i)?;
+        let other_component = row_value_component_expr(other, i)?;
+        translate_compared_value(
+            program,
+            referenced_tables,
+            &component,
+            &other_component,
+            reg + i,
+            resolver,
+        )?;
+    }
+    Ok(reg)
+}
+
+/// Translates `operand`, one value compared with `other`, into `reg`. See
+/// [translate_compared_operand].
+fn translate_compared_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+        Some(resolved) => translate_untyped_operand_as(
+            program,
+            referenced_tables,
+            operand,
+            &resolved,
+            reg,
+            resolver,
+        ),
+        None => translate_expr(program, referenced_tables, operand, reg, resolver),
+    }
+}
+
+/// Translates the two operands of a comparison into `lhs_reg` and `rhs_reg`.
+/// See [translate_compared_operand].
+pub(crate) fn translate_compared_pair(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    lhs_reg: usize,
+    rhs_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    translate_compared_operand(program, referenced_tables, lhs, rhs, lhs_reg, resolver)?;
+    translate_compared_operand(program, referenced_tables, rhs, lhs, rhs_reg, resolver)?;
+    Ok(())
+}
+
+/// The registers holding `lhs` as it is compared with `element`, an element of
+/// the list on the right of IN. PostgreSQL reads `x IN (a, b)` as
+/// `x = a OR x = b`, so a string literal or parameter in `lhs` is read as the
+/// type of each element it is compared with. `lhs_reg` holds `lhs` as written
+/// in `lhs_arity` registers; it is returned when nothing in `lhs` is read as a
+/// custom type, and otherwise a copy with those components converted.
+pub(crate) fn translate_in_lhs_for_element(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    lhs_reg: usize,
+    lhs_arity: usize,
+    element: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(lhs_reg);
+    }
+    let mut converted = Vec::new();
+    match unwrap_parens(lhs)? {
+        ast::Expr::Parenthesized(components) if components.len() > 1 => {
+            for (i, component) in components.iter().enumerate() {
+                let other = row_value_component_expr(element, i)?;
+                if let Some(resolved) =
+                    untyped_operand_type(component, &other, referenced_tables, resolver)?
+                {
+                    converted.push((i, component.as_ref(), resolved));
+                }
             }
         }
-
-        // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
-
-        match *op {
-            // a > b  →  lt(b, a)
-            ast::Operator::Greater => find_op("<").map(|f| (f, true, false)),
-            // a >= b  →  NOT lt(a, b)
-            ast::Operator::GreaterEquals => find_op("<").map(|f| (f, false, true)),
-            // a <= b  →  NOT lt(b, a)
-            ast::Operator::LessEquals => find_op("<").map(|f| (f, true, true)),
-            // a != b  →  NOT eq(a, b)
-            ast::Operator::NotEquals => find_op("=").map(|f| (f, false, true)),
-            _ => None,
+        _ => {
+            if let Some(resolved) = untyped_operand_type(lhs, element, referenced_tables, resolver)?
+            {
+                converted.push((0, lhs, resolved));
+            }
         }
-    };
-
-    // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
-        if same_type_def(&lhs.type_def, &rhs.type_def) {
-            if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                return Some(ResolvedOperator {
-                    func_name,
-                    swap_args,
-                    negate,
-                    encode_info: None,
+    }
+    if converted.is_empty() {
+        return Ok(lhs_reg);
+    }
+    let reg = program.alloc_registers(lhs_arity);
+    // A converted component is translated from its expression instead of being
+    // copied from `lhs_reg` first: its conversion is a constant, which runs
+    // before the copy would.
+    for i in 0..lhs_arity {
+        match converted.iter().find(|(index, _, _)| *index == i) {
+            Some((_, component, resolved)) => {
+                translate_untyped_operand_as(
+                    program,
+                    referenced_tables,
+                    component,
+                    resolved,
+                    reg + i,
+                    resolver,
+                )?;
+            }
+            None => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs_reg + i,
+                    dst_reg: reg + i,
+                    extra_amount: 0,
                 });
             }
         }
-        // Different custom types: fall through to standard operator.
-        return None;
     }
-
-    let resolve_one_custom_operand =
-        |info: &ColumnCustomType, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
-            let pass_other_unencoded = if op.is_comparison() {
-                info.type_def.value_input_type().eq_ignore_ascii_case("any")
-            } else {
-                info.type_def.decode_returns_value_unchanged()
-            };
-            if !encode_other && !pass_other_unencoded {
-                return None;
-            }
-            let (func_name, swap_args, negate) = find_in_type_def(&info.type_def)?;
-            Some(ResolvedOperator {
-                func_name,
-                swap_args,
-                negate,
-                encode_info: encode_other.then(|| OperatorEncodeInfo {
-                    type_def: info.type_def.clone(),
-                    type_params: info.params.clone(),
-                    which,
-                }),
-            })
-        };
-
-    match (&lhs_info, &rhs_info) {
-        (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
-        (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
-        _ => None,
-    }
+    Ok(reg)
 }
 
-/// The custom type whose operators apply to an operand. Generated column
-/// expressions use the standard operators, see `SelfTableContext::ForDML`.
-fn operand_custom_type(
-    expr: &ast::Expr,
-    env: &TypeEnv,
+/// Translates the arguments of a scalar min or max into `start_reg..`. Their
+/// string literals and parameters are read as described in
+/// [untyped_values_type].
+pub(crate) fn translate_compared_args(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    args: &[Box<ast::Expr>],
+    start_reg: usize,
     resolver: &Resolver,
-) -> Option<ColumnCustomType> {
-    if let ast::Expr::Column { table, .. } = expr {
-        if table.is_self_table() && resolver.self_table_with_custom_type_operators().is_none() {
-            return None;
+) -> Result<()> {
+    let values_type = untyped_values_type(
+        args.iter().map(|arg| arg.as_ref()),
+        referenced_tables,
+        resolver,
+    )?;
+    for (i, arg) in args.iter().enumerate() {
+        let reg = start_reg + i;
+        if !translate_untyped_value(
+            program,
+            referenced_tables,
+            arg,
+            values_type.as_ref(),
+            reg,
+            resolver,
+        )? {
+            translate_expr(program, referenced_tables, arg, reg, resolver)?;
         }
     }
-    column_custom_type(expr, env)
+    Ok(())
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
-///
-/// Shared logic: decode custom-type column registers into temps (so the
-/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
-/// and translate the expression.
-///
-/// The caller must:
-/// 1. Clone the expression from `idx_col.expr`
-/// 2. Build the initial `column_regs` mapping (before decode)
-///
-/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
-/// columns are decoded in-place in `column_regs`.
-///
-/// `uses_custom_type_operators` must be false when `expr` is the expression of a
-/// virtual generated column, see `SelfTableContext::ForDML`.
-#[allow(clippy::too_many_arguments)]
+/// The type the string literals and parameters among `values` are read as,
+/// where `values` are what an expression returns one of or compares with each
+/// other: the arguments of coalesce, ifnull, min and max, the values of iif,
+/// and the results of CASE. As in PostgreSQL, a string literal or parameter
+/// is read as a value of the values' common type when that is a custom type:
+/// in `coalesce(tm, '00:00')` on a time column, '00:00' is the time 00:00:00.
+/// Values of two custom types leave no single type to read a string literal
+/// as, which is an error. None when nothing is read as a custom type.
+pub(crate) fn untyped_values_type<'e>(
+    values: impl Iterator<Item = &'e ast::Expr> + Clone,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    let schema = resolver.schema();
+    if schema.type_registry.is_empty() {
+        return Ok(None);
+    }
+    let mut has_untyped_value = false;
+    for value in values.clone() {
+        has_untyped_value |= is_untyped_operand(value)?;
+    }
+    if !has_untyped_value {
+        return Ok(None);
+    }
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let common = common_type(values.clone(), &env);
+    match common {
+        ExprType::Custom { .. } => untyped_operands_read_as(schema, common),
+        ExprType::Array { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        | ExprType::NotKnownYet => {
+            refuse_two_custom_types(values, &env)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Fails when `values` have two different custom types. Called when string
+/// literals or parameters among them would be read as their common type.
+fn refuse_two_custom_types<'e>(
+    values: impl Iterator<Item = &'e ast::Expr>,
+    env: &TypeEnv,
+) -> Result<()> {
+    let mut seen: Option<Arc<TypeDef>> = None;
+    for value in values {
+        let type_def = match type_of(value, env) {
+            ExprType::Custom { type_def, .. } => type_def,
+            ExprType::Array { .. }
+            | ExprType::Builtin(_)
+            | ExprType::Untyped
+            | ExprType::Null
+            | ExprType::Unknown
+            | ExprType::RowValue
+            | ExprType::NotKnownYet => continue,
+        };
+        match &seen {
+            None => seen = Some(type_def),
+            Some(seen) if seen.name == type_def.name => {}
+            Some(seen) => crate::bail_parse_error!(
+                "cannot tell which type to read a string literal or parameter as: \
+                 it is compared with type {} and type {}",
+                seen.name,
+                type_def.name
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Translates `value`, one of the values an expression returns one of (see
+/// [untyped_values_type]), into `reg`, which the other values write too.
+pub(crate) fn translate_returned_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value: &ast::Expr,
+    values_type: Option<&ResolvedType>,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if translate_untyped_value(
+        program,
+        referenced_tables,
+        value,
+        values_type,
+        reg,
+        resolver,
+    )? {
+        return Ok(reg);
+    }
+    translate_expr_no_constant_opt(
+        program,
+        referenced_tables,
+        value,
+        reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )
+}
+
+/// Translates `value` into `reg` if it is a string literal or parameter read
+/// as `values_type` (see [untyped_values_type]), and returns whether it did.
+/// The conversion is computed once in a register of its own and copied into
+/// `reg`, so the other values may write `reg` too.
+pub(crate) fn translate_untyped_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    value: &ast::Expr,
+    values_type: Option<&ResolvedType>,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let Some(resolved) = values_type else {
+        return Ok(false);
+    };
+    if !is_untyped_operand(value)? {
+        return Ok(false);
+    }
+    let value_reg = program.alloc_register();
+    translate_untyped_operand_as(
+        program,
+        referenced_tables,
+        value,
+        resolved,
+        value_reg,
+        resolver,
+    )?;
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    Ok(true)
+}
+
+/// Translates the string literal or parameter `operand` into `reg` as a value
+/// of `resolved`: stored as a column of the type stores it, then read back.
+pub(crate) fn translate_untyped_operand_as(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    // The operand is a constant, so its conversion is computed once with it.
+    let constant_span = (!program.constant_span_is_open()).then(|| program.constant_span_start());
+    translate_expr(program, referenced_tables, operand, reg, resolver)?;
+    emit_untyped_operand_store(program, resolved, reg, resolver)?;
+    emit_decode(program, resolved, reg, resolver)?;
+    if let Some(span) = constant_span {
+        program.constant_span_end(span);
+    }
+    Ok(reg)
+}
+
+/// The type a string literal or parameter compared with `other` is read as,
+/// or None when it is compared as written.
+pub(crate) fn untyped_operand_type(
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    read_untyped_operand_as(operand, resolver.schema(), || {
+        Ok(type_of(other, &TypeEnv::new(referenced_tables, resolver)))
+    })
+}
+
+/// The type a string literal or parameter compared with a value of
+/// `other_type` is read as, or None when it is compared as written. Scans and
+/// index seeks both decide here, so they read the same rows.
+pub(crate) fn read_untyped_operand_as(
+    operand: &ast::Expr,
+    schema: &crate::schema::Schema,
+    other_type: impl FnOnce() -> Result<ExprType>,
+) -> Result<Option<ResolvedType>> {
+    if schema.type_registry.is_empty() || !is_untyped_operand(operand)? {
+        return Ok(None);
+    }
+    untyped_operands_read_as(schema, other_type()?)
+}
+
+/// The type a string literal or parameter compared with a value of
+/// `other_type` is read as, if it is a string literal or parameter.
+fn untyped_operands_read_as(
+    schema: &crate::schema::Schema,
+    other_type: ExprType,
+) -> Result<Option<ResolvedType>> {
+    let type_def = match other_type {
+        ExprType::Custom { type_def, .. } => type_def,
+        // An array compares in its own order, which converts the other operand.
+        ExprType::Array { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        // `value` in a type's ENCODE, DECODE or CHECK, which is compiled
+        // without its type.
+        | ExprType::NotKnownYet => return Ok(None),
+    };
+    let resolved = schema
+        .resolve_type_unchecked(&type_def.name)?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("type {} does not resolve", type_def.name))
+        })?;
+    Ok(converts_untyped_operands(&resolved).then_some(resolved))
+}
+
+/// Whether `expr` takes its type from the value it is compared with: a string
+/// literal, or a parameter. A parameter that stands for a column, such as a
+/// foreign key's parent key, carries the column's type or collation and holds
+/// the column's value. Parentheses don't change this: `('10:00')` is a string
+/// literal too.
+fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
+    Ok(match unwrap_parens(expr)? {
+        ast::Expr::Literal(ast::Literal::String(_)) => true,
+        ast::Expr::Variable(variable) => {
+            variable.custom_type.is_none() && variable.col_collation.is_none()
+        }
+        _ => false,
+    })
+}
+
+/// Whether a string literal or parameter compared with a value of `resolved`
+/// is converted to the type. A type with its own order, such as numeric,
+/// converts the other operand when it compares instead, and a type without
+/// ENCODE or DECODE reads a value as it is written.
+fn converts_untyped_operands(resolved: &ResolvedType) -> bool {
+    resolved.ordering().is_none()
+        && (resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.encode().is_some())
+            || !resolved.decode_returns_value_unchanged())
+}
+
+/// Stores the string literal or parameter in `reg` as a value of `resolved`,
+/// as INSERT stores it in a column of the type, but without COERCE: as in
+/// PostgreSQL, a column's limits, such as the scale of `numeric(10,1)`, do not
+/// apply to the value it is compared with. NULL is left as it is.
+pub(crate) fn emit_untyped_operand_store(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    emit_store_value(program, resolved, reg, Coerce::Skip, resolver)
+}
+
+/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT)
+/// from the row's stored values in `column_regs`. Reading a custom-type column
+/// in the expression decodes it, so the expression sees the user's values.
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut expr: ast::Expr,
     columns: &[Column],
-    column_regs: &mut [usize],
+    column_regs: &[usize],
     table: &Arc<BTreeTable>,
     dest_reg: usize,
-    uses_custom_type_operators: bool,
 ) -> Result<()> {
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
-    let is_strict = table.is_strict;
-    for (i, col) in columns.iter().enumerate() {
-        if col.is_rowid_alias() {
-            continue;
-        }
-        if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-            if resolved.chain.iter().any(|td| td.decode().is_some()) {
-                let src_reg = column_regs[i];
-                let tmp = program.alloc_register();
-                emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
-                column_regs[i] = tmp;
-            }
-        }
-    }
-
     let pairs = columns.iter().zip(column_regs.iter().copied());
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, DmlRowForm::Stored),
         table: Arc::clone(table),
-        uses_custom_type_operators,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;
@@ -383,38 +534,43 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
-    // Array columns: pass through raw record blob. ArrayDecode is emitted
-    // at display time (ResultRow) so that functions/subscripts see raw blobs.
+    // An array stays a record blob, holding the values its elements read as.
+    // It is turned into text only for output.
     if column.is_array() {
-        return Ok(());
+        return emit_array_decode(program, dest_reg, column, resolver);
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if resolved.chain.iter().all(|td| td.decode().is_none()) {
-            return Ok(());
-        }
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(
-                    program,
-                    decode_expr,
-                    dest_reg,
-                    dest_reg,
-                    &column.ty_params,
-                    td,
-                    resolver,
-                )?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+        emit_decode(program, &resolved, dest_reg, resolver)?;
     }
+    Ok(())
+}
+
+/// Emits the DECODE of each of `resolved`'s types on the stored value in
+/// `reg`, which turns it into the value a column of the type reads back. NULL
+/// is left as it is.
+pub(crate) fn emit_decode(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if !resolved.has_decode() {
+        return Ok(());
+    }
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+
+    // Apply decode in reverse order (parent/ancestor first, then child)
+    for td in resolved.chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, resolver)?;
+        }
+    }
+
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -422,43 +578,53 @@ pub(crate) fn emit_user_facing_column_value(
 /// Validates NOT NULL and CHECK constraints from the domain type chain.
 pub(super) fn emit_domain_cast_constraints(
     program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
+    resolved: &ResolvedType,
+    cast_type: &ast::Type,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
 
-    let any_not_null = chain.iter().any(|td| td.not_null);
-
-    if any_not_null {
+    if resolved.not_null() {
         program.emit_insn(Insn::HaltIfNull {
             constraint_info: None,
             target_reg: reg,
             err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: format!(
-                "domain {} does not allow null values",
-                chain.first().map(|td| td.name.as_str()).unwrap_or("?")
-            ),
+            description: format!("domain {} does not allow null values", resolved.leaf().name),
             on_error: None,
         });
     }
 
-    for td in chain {
+    for td in &resolved.chain {
         for (i, dc) in td.domain_checks.iter().enumerate() {
             let constraint_name = dc
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("{}_{}", td.name, i));
 
-            // Bind `value` → reg, translate check expr, verify truthy
-            program
-                .id_register_overrides
-                .insert("value".to_string(), reg);
+            // `value` reads the CAST's result with the CAST's type, as a
+            // column of the domain does, so `value < 100` on a domain over
+            // numeric compares numbers, not numeric's decoded text.
+            let mut check = dc.check.as_ref().clone();
+            walk_expr_mut(&mut check, &mut |e| {
+                if matches!(e, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")) {
+                    *e = ast::Expr::Register {
+                        register: reg,
+                        custom_type: Some(Box::new(cast_type.clone())),
+                    };
+                }
+                Ok(WalkControl::Continue)
+            })?;
 
             let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
-
-            program.id_register_overrides.remove("value");
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &check,
+                expr_result_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
 
             let passed_label = program.allocate_label();
 
@@ -491,46 +657,169 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
-/// Emit bytecode for a custom type encode/decode expression.
-/// Sets up `value` to reference `value_reg`, and binds the type's parameters to
-/// `type_params`, the arguments written after the type name, by position.
-/// The expression result is written to `dest_reg`.
+/// Whether storing a value runs the type's COERCE.
+#[derive(Clone, Copy)]
+pub(crate) enum Coerce<'a> {
+    /// Run COERCE with these arguments, the ones written after the type name,
+    /// such as `10, 2` in `numeric(10, 2)`.
+    WithArgs(&'a [Box<ast::Expr>]),
+    /// Don't run COERCE: the value is only compared with values of the type.
+    Skip,
+}
+
+/// Emits what storing the value in `reg` as a value of `resolved` runs: each
+/// type's ENCODE, then its COERCE unless `coerce` is [Coerce::Skip]. The
+/// result is converted to the kind of the type's BASE as a STRICT column of
+/// the BASE converts it, so a type BASE integer whose ENCODE gives '5' stores
+/// 5, and one whose ENCODE gives 'abc' is an error. COERCE sees the converted
+/// value too. A CAST runs the same. NULL is left as it is, without running
+/// ENCODE; a domain's NOT NULL is checked afterwards, by the column's NOT NULL
+/// constraint or by the CAST.
+pub(crate) fn emit_store_value(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    reg: usize,
+    coerce: Coerce,
+    resolver: &Resolver,
+) -> Result<()> {
+    let convert = Insn::ConvertToType {
+        reg,
+        storage_class: resolved.storage_class()?,
+        description: format!(
+            "as type {} (BASE {})",
+            resolved.leaf().name,
+            resolved.primitive.to_uppercase()
+        ),
+    };
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    for type_def in &resolved.chain {
+        if let Some(encode) = type_def.encode() {
+            emit_type_expr(program, encode, reg, reg, resolver)?;
+        }
+        let type_params = match coerce {
+            Coerce::WithArgs(type_params) => type_params,
+            Coerce::Skip => continue,
+        };
+        if let Some(coerce_expr) = coerce_to_run(type_def, type_params) {
+            program.emit_insn(convert.clone());
+            emit_coerce(program, type_def, coerce_expr, reg, type_params, resolver)?;
+        }
+    }
+    program.emit_insn(convert);
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
+}
+
+/// Emits what comparing the value in `reg` with stored values of `chain`'s
+/// types runs: each type's ENCODE, then the affinity of `storage_class`, so
+/// the value has the kind the stored values have. COERCE does not run, and a
+/// value that doesn't convert is kept as it is.
+pub(crate) fn emit_encode_for_comparison(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    storage_class: crate::types::StorageClass,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for type_def in chain {
+        if let Some(encode) = type_def.encode() {
+            emit_type_expr(program, encode, reg, reg, resolver)?;
+        }
+    }
+    program.emit_insn(Insn::Affinity {
+        start_reg: reg,
+        count: std::num::NonZeroUsize::MIN,
+        affinities: storage_class.affinity().aff_mask().to_string(),
+    });
+    Ok(())
+}
+
+/// Emit bytecode for a custom type ENCODE or DECODE expression, with `value`
+/// referencing `value_reg`. The result is written to `dest_reg`.
 pub(crate) fn emit_type_expr(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
     value_reg: usize,
     dest_reg: usize,
-    type_params: &[Box<ast::Expr>],
-    type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<usize> {
-    // Set up value override
+    emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
+}
+
+/// The type's COERCE, unless the type has parameters and is used without
+/// arguments, as a column declared `numeric`: it then has no limits.
+fn coerce_to_run<'a>(
+    type_def: &'a TypeDef,
+    type_params: &[Box<ast::Expr>],
+) -> Option<&'a ast::Expr> {
+    let coerce = type_def.coerce()?;
+    if type_params.is_empty() && type_def.user_params().next().is_some() {
+        return None;
+    }
+    Some(coerce)
+}
+
+/// Emits `coerce`, the type's COERCE, on the value in `reg`, with the type's
+/// parameters bound to `type_params` by position. NULL is left as it is.
+fn emit_coerce(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    coerce: &ast::Expr,
+    reg: usize,
+    type_params: &[Box<ast::Expr>],
+    resolver: &Resolver,
+) -> Result<()> {
+    // A parameter without an argument, as scale in numeric(10), is NULL.
+    let null = ast::Expr::Literal(ast::Literal::Null);
+    let bindings: Vec<(&str, &ast::Expr)> = type_def
+        .user_params()
+        .enumerate()
+        .map(|(i, param)| {
+            let arg = type_params.get(i).map_or(&null, |arg| arg.as_ref());
+            (param.name.as_str(), arg)
+        })
+        .collect();
+    let skip_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_null,
+    });
+    emit_expr_with_bindings(program, coerce, reg, reg, &bindings, resolver)?;
+    program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
+/// Translates `expr` with `value` referencing `value_reg` and each name in
+/// `bindings` referencing its expression's value.
+fn emit_expr_with_bindings(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    value_reg: usize,
+    dest_reg: usize,
+    bindings: &[(&str, &ast::Expr)],
+    resolver: &Resolver,
+) -> Result<usize> {
     program
         .id_register_overrides
         .insert("value".to_string(), value_reg);
 
-    // Set up type parameter overrides. Capture the result so we can
-    // clean up overrides even if param translation fails.
-    let param_result: Result<()> = (|| {
-        // Skip `value` param (already handled above); match remaining params
-        // against the user-provided ty_params by position.
-        let user_params: Vec<_> = type_def.user_params().collect();
-        for (i, param) in user_params.iter().enumerate() {
-            if let Some(param_expr) = type_params.get(i) {
-                let reg = program.alloc_register();
-                translate_expr(program, None, param_expr, reg, resolver)?;
-                program
-                    .id_register_overrides
-                    .insert(param.name.clone(), reg);
-            }
+    // Capture the result so the overrides are cleared even on error.
+    let bind_result: Result<()> = (|| {
+        for (name, bound_expr) in bindings {
+            let reg = program.alloc_register();
+            translate_expr(program, None, bound_expr, reg, resolver)?;
+            program.id_register_overrides.insert(name.to_string(), reg);
         }
         Ok(())
     })();
 
-    // Translate body expression only if param setup succeeded
-    let result = param_result.and_then(|()| {
-        // Translate the expression, disabling constant optimization since
-        // the `value` placeholder refers to a register that changes per row.
+    let result = bind_result.and_then(|()| {
+        // The `value` placeholder refers to a register that changes per row,
+        // so the expression must not be hoisted as a constant.
         translate_expr_no_constant_opt(
             program,
             None,
@@ -541,22 +830,23 @@ pub(crate) fn emit_type_expr(
         )
     });
 
-    // Always clean up overrides, even on error
     program.id_register_overrides.clear();
 
     result
 }
 
-/// Decode custom type columns for AFTER trigger NEW registers.
+/// Decode the custom type columns of a trigger's NEW or OLD row.
 ///
-/// For each column with a custom type decode expression, copies the encoded register
-/// to a new register and emits the decode expression. NULL values are skipped.
-/// Returns a Vec of registers: one per column (decoded or original) plus the rowid at the end.
+/// For each column that `holds_stored_value` and has a custom type decode
+/// expression, copies the encoded register to a new register and emits the
+/// decode expression. NULL values are skipped. Returns a Vec of registers: one
+/// per column (decoded or original) plus the rowid at the end.
 pub(crate) fn emit_trigger_decode_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     columns: &[Column],
     source_regs: &dyn Fn(usize) -> usize,
+    holds_stored_value: &dyn Fn(usize) -> bool,
     rowid_reg: usize,
     is_strict: bool,
 ) -> Result<Vec<usize>> {
@@ -564,22 +854,63 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                if resolved.chain.iter().any(|td| td.decode().is_some()) {
-                    let decoded_reg = program.alloc_register();
-                    emit_user_facing_column_value(
-                        program,
-                        source_regs(i),
-                        decoded_reg,
-                        col,
-                        is_strict,
-                        resolver,
-                    )?;
-                    return Ok(decoded_reg);
-                }
+            if !holds_stored_value(i) || !resolver.schema().column_has_decode(col, is_strict) {
+                return Ok(source_regs(i));
             }
-            Ok(source_regs(i))
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                source_regs(i),
+                decoded_reg,
+                col,
+                is_strict,
+                resolver,
+            )?;
+            Ok(decoded_reg)
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
+}
+
+/// Decode the custom type and array values a constraint error reports, so the
+/// error shows the values the user wrote instead of their stored encoding.
+///
+/// Emit this right before the instruction that raises the error, so only rows
+/// that fail the constraint run the decode.
+pub(crate) fn emit_constraint_values_decode(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &BTreeTable,
+    info: &mut ConstraintInfo,
+) -> Result<()> {
+    if !resolver.catalog.dialect.constraint_errors_show_values() {
+        return Ok(());
+    }
+    let names = if info.row_col_names.is_empty() {
+        &info.column_names
+    } else {
+        &info.row_col_names
+    };
+    for (i, name) in names.iter().enumerate() {
+        let Some((_, column)) = table.get_column(name) else {
+            continue;
+        };
+        if !column.is_array() && !resolver.schema().column_has_decode(column, table.is_strict) {
+            continue;
+        }
+        let decoded_reg = program.alloc_register();
+        emit_user_facing_column_value(
+            program,
+            info.violation_regs[i],
+            decoded_reg,
+            column,
+            table.is_strict,
+            resolver,
+        )?;
+        if column.is_array() {
+            program.emit_insn(Insn::ArrayDecode { reg: decoded_reg });
+        }
+        info.violation_regs[i] = decoded_reg;
+    }
+    Ok(())
 }

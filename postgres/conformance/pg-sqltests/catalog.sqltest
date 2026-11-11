@@ -266,6 +266,8 @@ test pg-function-support-catalogs-are-empty {
 expect {}
 
 test pg-init-privs-is-read-only {
+    CREATE ROLE reader_of_init_privs_is_read_only_role;
+    SET ROLE reader_of_init_privs_is_read_only_role;
     DELETE FROM pg_init_privs;
 }
 @sqlstate 42501
@@ -274,6 +276,8 @@ expect error {permission denied for table pg_init_privs}
 expect @tursopg error {cannot delete from pg_catalog table "pg_init_privs"}
 
 test pg-cast-is-read-only {
+    CREATE ROLE reader_of_cast_is_read_only_role;
+    SET ROLE reader_of_cast_is_read_only_role;
     DELETE FROM pg_cast;
 }
 @sqlstate 42501
@@ -282,6 +286,8 @@ expect error {permission denied for table pg_cast}
 expect @tursopg error {cannot delete from pg_catalog table "pg_cast"}
 
 test pg-transform-is-read-only {
+    CREATE ROLE reader_of_transform_is_read_only_role;
+    SET ROLE reader_of_transform_is_read_only_role;
     DELETE FROM pg_transform;
 }
 @sqlstate 42501
@@ -411,6 +417,8 @@ test pg-object-unsupported-catalogs-are-empty {
 expect {}
 
 test pg-object-operator-is-read-only {
+    CREATE ROLE reader_of_object_operator_is_read_only_role;
+    SET ROLE reader_of_object_operator_is_read_only_role;
     DELETE FROM pg_operator;
 }
 @sqlstate 42501
@@ -419,6 +427,8 @@ expect error {permission denied for table pg_operator}
 expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 
 test pg-object-opclass-is-read-only {
+    CREATE ROLE reader_of_object_opclass_is_read_only_role;
+    SET ROLE reader_of_object_opclass_is_read_only_role;
     DELETE FROM pg_opclass;
 }
 @sqlstate 42501
@@ -427,6 +437,8 @@ expect error {permission denied for table pg_opclass}
 expect @tursopg error {cannot delete from pg_catalog table "pg_opclass"}
 
 test pg-object-opfamily-is-read-only {
+    CREATE ROLE reader_of_object_opfamily_is_read_only_role;
+    SET ROLE reader_of_object_opfamily_is_read_only_role;
     DELETE FROM pg_opfamily;
 }
 @sqlstate 42501
@@ -435,6 +447,8 @@ expect error {permission denied for table pg_opfamily}
 expect @tursopg error {cannot delete from pg_catalog table "pg_opfamily"}
 
 test pg-object-ts-parser-is-read-only {
+    CREATE ROLE reader_of_object_ts_parser_is_read_only_role;
+    SET ROLE reader_of_object_ts_parser_is_read_only_role;
     DELETE FROM pg_ts_parser;
 }
 @sqlstate 42501
@@ -443,6 +457,8 @@ expect error {permission denied for table pg_ts_parser}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_parser"}
 
 test pg-object-ts-template-is-read-only {
+    CREATE ROLE reader_of_object_ts_template_is_read_only_role;
+    SET ROLE reader_of_object_ts_template_is_read_only_role;
     DELETE FROM pg_ts_template;
 }
 @sqlstate 42501
@@ -451,6 +467,8 @@ expect error {permission denied for table pg_ts_template}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_template"}
 
 test pg-object-ts-dict-is-read-only {
+    CREATE ROLE reader_of_object_ts_dict_is_read_only_role;
+    SET ROLE reader_of_object_ts_dict_is_read_only_role;
     DELETE FROM pg_ts_dict;
 }
 @sqlstate 42501
@@ -459,6 +477,8 @@ expect error {permission denied for table pg_ts_dict}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_dict"}
 
 test pg-object-ts-config-is-read-only {
+    CREATE ROLE reader_of_object_ts_config_is_read_only_role;
+    SET ROLE reader_of_object_ts_config_is_read_only_role;
     DELETE FROM pg_ts_config;
 }
 @sqlstate 42501
@@ -467,6 +487,8 @@ expect error {permission denied for table pg_ts_config}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_config"}
 
 test pg-object-foreign-data-wrapper-is-read-only {
+    CREATE ROLE reader_of_object_foreign_data_wrapper_is_read_only_role;
+    SET ROLE reader_of_object_foreign_data_wrapper_is_read_only_role;
     DELETE FROM pg_foreign_data_wrapper;
 }
 @sqlstate 42501
@@ -475,6 +497,8 @@ expect error {permission denied for table pg_foreign_data_wrapper}
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
 
 test pg-object-foreign-server-is-read-only {
+    CREATE ROLE reader_of_object_foreign_server_is_read_only_role;
+    SET ROLE reader_of_object_foreign_server_is_read_only_role;
     DELETE FROM pg_foreign_server;
 }
 @sqlstate 42501
@@ -483,6 +507,8 @@ expect error {permission denied for table pg_foreign_server}
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_server"}
 
 test pg-object-default-acl-is-read-only {
+    CREATE ROLE reader_of_object_default_acl_is_read_only_role;
+    SET ROLE reader_of_object_default_acl_is_read_only_role;
     DELETE FROM pg_default_acl;
 }
 @sqlstate 42501
@@ -491,6 +517,8 @@ expect error {permission denied for table pg_default_acl}
 expect @tursopg error {cannot delete from pg_catalog table "pg_default_acl"}
 
 test pg-object-conversion-is-read-only {
+    CREATE ROLE reader_of_object_conversion_is_read_only_role;
+    SET ROLE reader_of_object_conversion_is_read_only_role;
     DELETE FROM pg_conversion;
 }
 @sqlstate 42501
@@ -499,6 +527,8 @@ expect error {permission denied for table pg_conversion}
 expect @tursopg error {cannot delete from pg_catalog table "pg_conversion"}
 
 test pg-object-range-is-read-only {
+    CREATE ROLE reader_of_object_range_is_read_only_role;
+    SET ROLE reader_of_object_range_is_read_only_role;
     DELETE FROM pg_range;
 }
 @sqlstate 42501
@@ -507,6 +537,8 @@ expect error {permission denied for table pg_range}
 expect @tursopg error {cannot delete from pg_catalog table "pg_range"}
 
 test pg-object-event-trigger-is-read-only {
+    CREATE ROLE reader_of_object_event_trigger_is_read_only_role;
+    SET ROLE reader_of_object_event_trigger_is_read_only_role;
     DELETE FROM pg_event_trigger;
 }
 @sqlstate 42501
@@ -515,6 +547,8 @@ expect error {permission denied for table pg_event_trigger}
 expect @tursopg error {cannot delete from pg_catalog table "pg_event_trigger"}
 
 test pg-object-subscription-is-read-only {
+    CREATE ROLE reader_of_object_subscription_is_read_only_role;
+    SET ROLE reader_of_object_subscription_is_read_only_role;
     DELETE FROM pg_subscription;
 }
 @sqlstate 42501
@@ -523,6 +557,8 @@ expect error {permission denied for table pg_subscription}
 expect @tursopg error {cannot delete from pg_catalog table "pg_subscription"}
 
 test pg-object-largeobject-metadata-is-read-only {
+    CREATE ROLE reader_of_object_largeobject_metadata_is_read_only_role;
+    SET ROLE reader_of_object_largeobject_metadata_is_read_only_role;
     DELETE FROM pg_largeobject_metadata;
 }
 @sqlstate 42501
@@ -531,6 +567,8 @@ expect error {permission denied for table pg_largeobject_metadata}
 expect @tursopg error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
 
 test pg-object-amop-is-read-only {
+    CREATE ROLE reader_of_object_amop_is_read_only_role;
+    SET ROLE reader_of_object_amop_is_read_only_role;
     DELETE FROM pg_amop;
 }
 @sqlstate 42501
@@ -539,6 +577,8 @@ expect error {permission denied for table pg_amop}
 expect @tursopg error {cannot delete from pg_catalog table "pg_amop"}
 
 test pg-object-amproc-is-read-only {
+    CREATE ROLE reader_of_object_amproc_is_read_only_role;
+    SET ROLE reader_of_object_amproc_is_read_only_role;
     DELETE FROM pg_amproc;
 }
 @sqlstate 42501
@@ -603,7 +643,6 @@ expect {
     2608
 }
 
-@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test pg-depend-for-dump-table-query {
     CREATE TABLE dump_indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE);
     CREATE TABLE dump_plain (value TEXT);
@@ -646,8 +685,8 @@ test pg-depend-for-dump-table-query {
     ORDER BY relname;
 }
 expect {
-    1259|dump_indexed|1|{owner=arwdDxt/owner}||||heap
-    1259|dump_plain|0|{owner=arwdDxt/owner}||||heap
+    1259|dump_indexed|1|{owner=arwdDxtm/owner}||||heap
+    1259|dump_plain|0|{owner=arwdDxtm/owner}||||heap
 }
 
 test physical-catalog-tableoid {
@@ -1145,4 +1184,448 @@ test pg-class-removes-dropped-sequences {
 expect {
     catalog quoted seq
     catalog_serial_id_seq
+}
+
+test pg-sequence-empty-pgdump-query {
+    SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+           seqmax, seqmin, seqcache, seqcycle, NULL, 'f'
+    FROM pg_catalog.pg_sequence ORDER BY seqrelid;
+}
+expect {}
+
+test pg-sequence-metadata-matches-pg-class {
+    CREATE TABLE seq_items (id bigint PRIMARY KEY, label text);
+    CREATE INDEX seq_items_label ON seq_items (label);
+    CREATE SEQUENCE ascending_seq START 7 INCREMENT 3 MINVALUE 1 MAXVALUE 100 CYCLE;
+    CREATE SEQUENCE descending_seq START -5 INCREMENT -2 MINVALUE -99 MAXVALUE -1;
+    SELECT c.relname, format_type(s.seqtypid, NULL), s.seqstart,
+           s.seqincrement, s.seqmax, s.seqmin, s.seqcache, s.seqcycle
+    FROM pg_catalog.pg_sequence AS s
+    JOIN pg_catalog.pg_class AS c ON c.oid = s.seqrelid
+    WHERE c.relkind = 'S' ORDER BY c.relname;
+}
+expect {
+    ascending_seq|bigint|7|3|100|1|1|t
+    descending_seq|bigint|-5|-2|-1|-99|1|f
+}
+
+test pg-sequence-reflects-drop {
+    CREATE SEQUENCE removed_seq;
+    CREATE SEQUENCE kept_seq;
+    DROP SEQUENCE removed_seq;
+    SELECT c.relname FROM pg_sequence AS s
+    JOIN pg_class AS c ON c.oid = s.seqrelid ORDER BY c.relname;
+}
+expect {
+    kept_seq
+}
+
+test pg-primary-key-dump-catalogs {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE SEQUENCE after_indexes;
+    SELECT t.relname, c.conname, i.indkey,
+           CASE WHEN t.relhasindex AND i.indisprimary AND i.indisunique THEN 1 ELSE 0 END,
+           x.relkind, pg_get_constraintdef(c.oid), pg_get_indexdef(i.indexrelid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    JOIN pg_class x ON x.oid = i.indexrelid
+    WHERE t.relname = 'items' AND c.contype = 'p';
+    SELECT count(*) FROM pg_depend d
+    JOIN pg_constraint c ON d.refobjid = c.oid AND d.refclassid = 2606
+    WHERE c.conname = 'items_pkey' AND d.classid = 1259
+      AND d.objid = c.conindid AND d.deptype = 'i';
+    SELECT CASE WHEN count(*) = count(DISTINCT oid) THEN 1 ELSE 0 END FROM pg_class;
+}
+expect {
+    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)
+    1
+    1
+}
+
+expect @tursopg {
+    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX __turso_internal_pk_index_items ON public.items USING btree (id)
+    1
+    1
+}
+
+test pg-primary-key-with-other-unique-constraint {
+    CREATE TABLE keys (a TEXT UNIQUE, b TEXT, c TEXT, PRIMARY KEY (b, c));
+    SELECT c.contype, i.indkey, CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
+           pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname = 'keys' ORDER BY c.contype;
+}
+expect {
+    p|2 3|1|PRIMARY KEY (b, c)
+    u|1|0|UNIQUE (a)
+}
+
+test pg-primary-key-named-and-quoted {
+    CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
+    SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname = 'quoted table' AND c.contype = 'p';
+    SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'quoted table';
+}
+expect {
+    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
+    custom key|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
+}
+
+expect @tursopg {
+    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
+    __turso_internal_pk_index_quoted table|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
+}
+
+test pg-primary-key-after-identical-unique {
+    CREATE TABLE t(a TEXT, UNIQUE(a), PRIMARY KEY(a));
+    CREATE TABLE composite(a TEXT, b TEXT, UNIQUE(a, b), CONSTRAINT named_pk PRIMARY KEY(a, b));
+    SELECT t.relname, c.conname, c.contype, pg_get_constraintdef(c.oid),
+           CASE WHEN i.indisprimary THEN 1 ELSE 0 END
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname IN ('t', 'composite') ORDER BY t.relname;
+}
+expect {
+    composite|named_pk|p|PRIMARY KEY (a, b)|1
+    t|t_pkey|p|PRIMARY KEY (a)|1
+}
+
+test pg-primary-key-index-name-collisions {
+    CREATE TABLE t_pkey(x INTEGER);
+    CREATE INDEX t_pkey1 ON t_pkey(x);
+    CREATE SEQUENCE t_pkey2;
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    SELECT c.conname, x.relname, pg_get_indexdef(c.conindid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_class x ON x.oid = c.conindid WHERE t.relname = 't';
+    SELECT CASE WHEN count(*) = count(DISTINCT relname) THEN 1 ELSE 0 END
+    FROM pg_class WHERE relnamespace = 2200;
+    DROP TABLE t_pkey;
+    DROP SEQUENCE t_pkey2;
+    SELECT c.conname, x.relname FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid JOIN pg_class x ON x.oid = c.conindid
+    WHERE t.relname = 't';
+}
+expect {
+    t_pkey3|t_pkey3|CREATE UNIQUE INDEX t_pkey3 ON public.t USING btree (id)
+    1
+    t_pkey3|t_pkey3
+}
+expect @tursopg {
+    t_pkey|__turso_internal_pk_index_t|CREATE UNIQUE INDEX __turso_internal_pk_index_t ON public.t USING btree (id)
+    1
+    t_pkey|__turso_internal_pk_index_t
+}
+
+test pg-attribute-not-null-dump {
+    CREATE TABLE dump_nulls (id INTEGER PRIMARY KEY, required TEXT NOT NULL, optional TEXT);
+    SELECT a.attname, a.attnotnull,
+           CASE WHEN a.attislocal THEN true
+                WHEN a.attnotnull AND NOT a.attislocal THEN true
+                ELSE false END AS notnull_islocal
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'dump_nulls' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id|t|t
+    required|t|t
+    optional|f|t
+}
+
+test pg-boolean-case-results {
+    SELECT true, false, CASE WHEN true THEN true ELSE false END,
+           CASE WHEN false THEN true ELSE false END,
+           CASE WHEN false THEN true END,
+           CASE WHEN true THEN 1 ELSE 0 END;
+    CREATE TABLE bools (value BOOLEAN);
+    INSERT INTO bools VALUES (true), (false);
+    SELECT CASE WHEN true THEN value ELSE false END FROM bools ORDER BY value;
+    SELECT CASE WHEN true THEN (CASE WHEN false THEN false ELSE true END) ELSE NULL END,
+           CASE WHEN true THEN NULL ELSE NULL END,
+           CASE WHEN true THEN 1 ELSE NULL END;
+}
+expect {
+    t|f|t|f||1
+    f
+    t
+    t||1
+}
+
+test pg-public-schema-owner-and-acl {
+    SELECT n.nspowner, r.rolname, pg_get_userbyid(n.nspowner), n.nspacl::text,
+           acldefault('n', n.nspowner)::text
+    FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
+    WHERE n.nspname = 'public';
+    SELECT oid, rolname, CAST(rolsuper AS INTEGER), CAST(rolinherit AS INTEGER),
+           CAST(rolcreaterole AS INTEGER), CAST(rolcreatedb AS INTEGER),
+           CAST(rolcanlogin AS INTEGER), CAST(rolreplication AS INTEGER),
+           rolconnlimit, CAST(rolbypassrls AS INTEGER)
+    FROM pg_roles WHERE rolname = 'pg_database_owner';
+}
+expect {
+    6171|pg_database_owner|pg_database_owner|{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}|{pg_database_owner=UC/pg_database_owner}
+    6171|pg_database_owner|0|1|0|0|0|0|-1|0
+}
+
+test pg-description-public-schema-default {
+    SELECT d.objoid, d.classoid, d.objsubid, d.description
+    FROM pg_catalog.pg_description d
+    JOIN pg_catalog.pg_namespace n ON n.oid = d.objoid
+    WHERE n.nspname = 'public' AND d.classoid = 2615 AND d.objsubid = 0;
+}
+expect {
+    2200|2615|0|standard public schema
+}
+
+test pg-attribute-default-storage {
+    CREATE TABLE storage_types (
+        id INTEGER PRIMARY KEY, body TEXT, label VARCHAR(40), data BYTEA,
+        amount NUMERIC(10,2), enabled BOOLEAN, identifier UUID, document JSONB,
+        numbers INTEGER[]
+    );
+    SELECT a.attname, a.attstorage
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'storage_types' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id|p
+    body|x
+    label|x
+    data|x
+    amount|m
+    enabled|p
+    identifier|p
+    document|x
+    numbers|x
+}
+
+test pg-attribute-domain-storage {
+    CREATE DOMAIN text_value AS TEXT;
+    CREATE DOMAIN nested_text_value AS text_value;
+    CREATE DOMAIN number_value AS INTEGER;
+    CREATE TYPE mood_storage AS ENUM ('happy', 'sad');
+    CREATE TABLE domain_storage (a text_value, b nested_text_value, c number_value, d mood_storage);
+    SELECT a.attname, a.attstorage, t.typstorage
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE c.relname = 'domain_storage' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    a|x|x
+    b|x|x
+    c|p|p
+    d|p|p
+}
+
+test pg-dump-mixed-case-primary-key-and-reference {
+    CREATE TABLE "Parent" ("Mixed Key" TEXT PRIMARY KEY);
+    CREATE TABLE child ("Child Key" TEXT CONSTRAINT "Fk X" REFERENCES "Parent" ON UPDATE CASCADE ON DELETE SET NULL,
+                        "Code" INTEGER CONSTRAINT "U q" UNIQUE);
+    SELECT conname FROM pg_constraint JOIN pg_class ON conrelid = pg_class.oid
+    WHERE contype = 'p' AND relname = 'Parent';
+    SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' ON ') + 4) FROM pg_index JOIN pg_class ON indrelid = pg_class.oid
+    WHERE indisprimary AND relname = 'Parent';
+    SELECT relname FROM pg_class JOIN pg_constraint ON confrelid = pg_class.oid
+    WHERE contype = 'f';
+    SELECT conname, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class r ON c.conrelid = r.oid
+    WHERE r.relname = 'child' AND contype IN ('f', 'u') ORDER BY conname;
+    SET search_path TO '';
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    Parent_pkey
+    public."Parent" USING btree ("Mixed Key")
+    Parent
+    Fk X|FOREIGN KEY ("Child Key") REFERENCES "Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
+    U q|UNIQUE ("Code")
+    FOREIGN KEY ("Child Key") REFERENCES public."Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
+}
+
+test pg-mixed-case-names-in-separate-schemas {
+    CREATE SCHEMA other;
+    CREATE TABLE public."Mixed Table" ("Mixed Id" INTEGER CONSTRAINT "Inline PK" PRIMARY KEY);
+    CREATE TABLE other."Mixed Table" ("Mixed Key" TEXT, CONSTRAINT "Table PK" PRIMARY KEY ("Mixed Key"));
+    CREATE TABLE child (key TEXT REFERENCES other."Mixed Table" ("Mixed Key"));
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'Mixed Table' ORDER BY schemaname;
+    SELECT n.nspname, r.relname, c.conname, pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'p' AND r.relname = 'Mixed Table' ORDER BY n.nspname;
+    SELECT n.nspname, r.relname FROM pg_class r JOIN pg_constraint c ON c.confrelid = r.oid
+    JOIN pg_namespace n ON n.oid = r.relnamespace WHERE c.contype = 'f';
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    SET search_path TO other, public;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    SET search_path TO public, other;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    CREATE SCHEMA shadow;
+    CREATE SEQUENCE shadow."Mixed Table";
+    SET search_path TO shadow, other;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+    DROP SEQUENCE shadow."Mixed Table";
+    CREATE TABLE shadow.holder(id INTEGER);
+    CREATE INDEX "Mixed Table" ON shadow.holder(id);
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    other|Mixed Table
+    public|Mixed Table
+    other|Mixed Table|Table PK|PRIMARY KEY ("Mixed Key")
+    public|Mixed Table|Inline PK|PRIMARY KEY ("Mixed Id")
+    other|Mixed Table
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES "Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+    FOREIGN KEY (key) REFERENCES other."Mixed Table"("Mixed Key")
+}
+
+test pg-dump-descending-index-keys {
+    CREATE TABLE indexed (first INTEGER, second BIGINT, third TEXT);
+    CREATE INDEX idx ON indexed (first DESC, second ASC, third DESC);
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'idx';
+}
+expect {
+    CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
+}
+
+# A relation's oid is stable: it comes from a stored catalog row, not from
+# the relation's position among sorted names. Raw oid values differ between
+# engines, so the tests compare through joins.
+
+test pg-class-oid-survives-an-earlier-sorting-table-appearing {
+    CREATE TABLE zz_stable (x int);
+    CREATE TABLE zz_oid_memo (memo oid);
+    INSERT INTO zz_oid_memo SELECT oid FROM pg_class WHERE relname = 'zz_stable';
+    CREATE TABLE aa_sorts_first (x int);
+    SELECT count(*) FROM pg_class c JOIN zz_oid_memo m ON c.oid = m.memo
+    WHERE c.relname = 'zz_stable';
+}
+expect {
+    1
+}
+
+test pg-attribute-keeps-joining-to-pg-class-after-an-earlier-table-appears {
+    CREATE TABLE zz_attrs (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE zz_attrs_memo (memo oid);
+    INSERT INTO zz_attrs_memo SELECT oid FROM pg_class WHERE relname = 'zz_attrs';
+    CREATE TABLE aa_appears (x int);
+    SELECT a.attname FROM pg_attribute a JOIN zz_attrs_memo m ON a.attrelid = m.memo
+    WHERE a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id
+    v
+}
+
+test pg-index-keeps-joining-to-pg-class-after-an-earlier-table-appears {
+    CREATE TABLE zz_indexed (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE zz_indexed_memo (memo oid);
+    INSERT INTO zz_indexed_memo SELECT oid FROM pg_class WHERE relname = 'zz_indexed';
+    CREATE TABLE aa_appears2 (x int);
+    SELECT count(*) FROM pg_index i JOIN zz_indexed_memo m ON i.indrelid = m.memo;
+}
+expect {
+    2
+}
+
+test pg-constraint-keeps-joining-to-pg-class-after-an-earlier-table-appears {
+    CREATE TABLE zz_constrained (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE zz_constrained_memo (memo oid);
+    INSERT INTO zz_constrained_memo SELECT oid FROM pg_class WHERE relname = 'zz_constrained';
+    CREATE TABLE aa_appears3 (x int);
+    SELECT count(*) FROM pg_constraint con JOIN zz_constrained_memo m ON con.conrelid = m.memo
+    WHERE con.contype IN ('p', 'u');
+}
+expect {
+    2
+}
+
+test rename-keeps-the-oid {
+    CREATE TABLE zz_before_rename (x int);
+    CREATE TABLE zz_rename_memo (memo oid);
+    INSERT INTO zz_rename_memo SELECT oid FROM pg_class WHERE relname = 'zz_before_rename';
+    ALTER TABLE zz_before_rename RENAME TO zz_after_rename;
+    SELECT count(*) FROM pg_class c JOIN zz_rename_memo m ON c.oid = m.memo
+    WHERE c.relname = 'zz_after_rename';
+}
+expect {
+    1
+}
+
+test a-table-may-not-share-its-name-with-a-sequence {
+    CREATE SEQUENCE zz_shared_name;
+    CREATE TABLE zz_shared_name (a int);
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_shared_name" already exists
+}
+
+test an-index-may-not-share-its-name-with-its-table {
+    CREATE TABLE zz_named_alike (a int);
+    CREATE INDEX zz_named_alike ON zz_named_alike (a);
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_named_alike" already exists
+}
+
+test create-table-if-not-exists-skips-a-sequence-of-that-name {
+    CREATE SEQUENCE zz_taken_by_seq;
+    CREATE TABLE IF NOT EXISTS zz_taken_by_seq (a int);
+    SELECT relkind FROM pg_class WHERE relname = 'zz_taken_by_seq';
+}
+expect {
+    S
+}
+
+test create-sequence-if-not-exists-skips-a-table-of-that-name {
+    CREATE TABLE zz_taken_by_table (a int);
+    CREATE SEQUENCE IF NOT EXISTS zz_taken_by_table;
+    SELECT relkind FROM pg_class WHERE relname = 'zz_taken_by_table';
+}
+expect {
+    r
+}
+
+test create-index-if-not-exists-skips-its-tables-name {
+    CREATE TABLE zz_taken_by_index (a int);
+    CREATE INDEX IF NOT EXISTS zz_taken_by_index ON zz_taken_by_index (a);
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_taken_by_index';
+}
+expect {
+    1
+}
+
+test rename-onto-a-sequences-name-is-an-error {
+    CREATE TABLE zz_rn_table (a int);
+    CREATE SEQUENCE zz_rn_seq;
+    ALTER TABLE zz_rn_table RENAME TO zz_rn_seq;
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_rn_seq" already exists
+}
+
+test rename-onto-a-views-name-is-an-error {
+    CREATE TABLE zz_rn_table2 (a int);
+    CREATE VIEW zz_rn_view AS SELECT 1 AS a;
+    ALTER TABLE zz_rn_table2 RENAME TO zz_rn_view;
+}
+@sqlstate 42P07
+expect error {
+    relation "zz_rn_view" already exists
+}
+
+test constraint-oids-are-not-relation-oids {
+    CREATE TABLE zz_con_t (a int PRIMARY KEY, b int UNIQUE);
+    CREATE TABLE zz_con_u (a int);
+    SELECT count(*) FROM pg_constraint con JOIN pg_class c ON con.oid = c.oid;
+}
+expect {
+    0
 }

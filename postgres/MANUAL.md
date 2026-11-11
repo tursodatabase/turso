@@ -1,0 +1,334 @@
+# Turso Postgres Manual
+
+## The SQL language
+
+### `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` — turn on row-level security
+
+**Synopsis:**
+
+```sql
+ALTER TABLE name ENABLE ROW LEVEL SECURITY
+ALTER TABLE name DISABLE ROW LEVEL SECURITY
+```
+
+**Description:**
+
+`ENABLE ROW LEVEL SECURITY` turns on row-level security for a table, and
+`DISABLE ROW LEVEL SECURITY` turns it off. The `relrowsecurity` column of
+`pg_class` shows which tables have it.
+
+A table with row-level security shows no rows to a role that is neither a
+superuser nor the table's owner, as a PostgreSQL table with row-level security
+and no policies does. Queries return no rows from it, wherever the table
+appears in them: in joins, subqueries, common table expressions, views and
+`COPY ... TO STDOUT`. In a `LEFT JOIN`, the table's columns read as NULL.
+Superusers and the table's owner see every row.
+
+**Parameters:**
+
+- `name`: The name of an existing table, optionally qualified with its schema.
+
+**Notes:**
+
+Policies and `CREATE POLICY` are not supported yet, so a role that is neither
+a superuser nor the table's owner cannot see any row of a table with row-level
+security.
+
+A view reads its tables as the view's owner, as in PostgreSQL, so it shows its
+readers the rows its owner sees. A view that a superuser or the table's owner
+owns shows every row; a view that another role owns shows none. Unlike
+PostgreSQL, a superuser reading a view sees every row, whoever owns the
+view.
+
+A query of a role that joins a table with row-level security with `RIGHT JOIN`
+or `FULL JOIN` fails. Virtual tables that show the database file itself can
+only be read by a superuser.
+
+`SET ROLE` applies to the statements that start after it. A statement that
+is already running, such as a query a superuser started and is still reading
+rows from, keeps the role it started with until it finishes.
+
+Enabling row-level security for a table that already has it, or disabling it
+for a table that does not, does nothing. Renaming a table keeps its row-level
+security, and a new table created with the name of a dropped table starts
+without it.
+
+Only the owner of a table or a superuser may enable or disable its row-level
+security.
+
+`FORCE ROW LEVEL SECURITY` and `NO FORCE ROW LEVEL SECURITY` are not
+supported.
+
+**Examples:**
+
+```sql
+CREATE TABLE accounts (id int, owner text);
+ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
+SELECT relname, relrowsecurity FROM pg_class WHERE relname = 'accounts';
+```
+
+```
+ relname  | relrowsecurity
+----------+----------------
+ accounts | t
+(1 row)
+```
+
+### `CREATE ROLE` — create a role
+
+**Synopsis:**
+
+```sql
+CREATE ROLE name
+```
+
+**Description:**
+
+`CREATE ROLE` adds a new role to the database. A new role is not a superuser
+and cannot log in. Roles are listed in the `pg_roles` catalog.
+
+**Parameters:**
+
+- `name`: The name of the new role. Unquoted names are converted to lowercase,
+  and quoted names keep their case. Names that start with `pg_` are reserved
+  and cannot be used.
+
+**Notes:**
+
+The database always has one superuser role named `postgres`.
+
+`CREATE ROLE` works inside a transaction. If the transaction is rolled back,
+the role is not created.
+
+Options such as `LOGIN`, `PASSWORD`, or `SUPERUSER` are not supported yet.
+
+**Examples:**
+
+Create a role:
+
+```sql
+CREATE ROLE jonathan;
+```
+
+List roles:
+
+```sql
+SELECT rolname FROM pg_roles;
+```
+
+```
+ rolname
+----------
+ postgres
+ jonathan
+(2 rows)
+```
+
+### `GRANT SELECT` — let roles read tables
+
+**Synopsis:**
+
+```sql
+GRANT SELECT ON [ TABLE ] table_name [, ...] TO role_specification [, ...]
+GRANT SELECT ON ALL TABLES IN SCHEMA schema_name [, ...] TO role_specification [, ...]
+
+where role_specification is:
+    role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
+```
+
+**Description:**
+
+`GRANT SELECT` lets roles read tables. A role that is not a superuser reads
+a table, view or materialized view only when it owns it or `SELECT` on it
+was granted to it or to `PUBLIC`; otherwise reading it, directly or through
+a join, subquery or CTE, fails with `permission denied for table` (SQLSTATE
+42501). As in PostgreSQL, a view's tables are read as the view's owner, so
+`SELECT` on a view is enough when its owner may read its tables.
+
+The privilege is stored in the database file, in the table's access control
+list, which `pg_class.relacl` shows in PostgreSQL's form: after
+`GRANT SELECT ON accounts TO reader` by the owner `postgres`, it reads
+`{postgres=arwdDxtm/postgres,reader=r/postgres}`. The list is `NULL` until
+the first `GRANT`, when the owner has every privilege and nobody else has
+any, as in PostgreSQL. `pg_class` does not list views yet, so a view's list
+is stored but not shown.
+
+**Parameters:**
+
+- `table_name`: The name of an existing table, view, materialized view or
+  sequence, optionally qualified with its schema. Catalog tables such as
+  `pg_catalog.pg_class` can be named too.
+- `schema_name`: The name of an existing schema. `ALL TABLES IN SCHEMA` names
+  every table in it.
+- `role_name`: The name of an existing role.
+
+**Notes:**
+
+`GRANT SELECT` fails if a table, schema or role does not exist, if a name is
+an index, or if a name refers to another database, with the same errors as
+PostgreSQL. The tables are checked before the roles.
+
+As in PostgreSQL, the table's owner may grant, and a superuser grants as the
+owner, so the owner is the grantor in the list either way. Any other role
+gets `permission denied for table` (SQLSTATE 42501), unless the list gives
+it a privilege on the table, when the statement succeeds and stores
+nothing, as in PostgreSQL, which warns. `ALL TABLES IN SCHEMA` grants
+on the tables, views and materialized views of the schema, not on its
+sequences. A catalog table such as `pg_catalog.pg_class` can be named, but
+nothing is stored for it. `ALTER ... OWNER TO` puts the new owner in the
+new owner's place in the list, and a rename keeps it.
+
+Only `SELECT` on tables is accepted. Other privileges, column privileges,
+`WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of objects, and
+`REVOKE` fail as not supported, so that a script never believes it changed
+what a role may do when it did not. `GRANT role_name TO role_name` is not
+supported either.
+
+**Examples:**
+
+```sql
+CREATE ROLE reader;
+CREATE TABLE accounts (id int);
+GRANT SELECT ON accounts TO reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+```
+
+### `SET ROLE` — set the current role
+
+**Synopsis:**
+
+```sql
+SET [ SESSION | LOCAL ] ROLE role_name
+SET [ SESSION | LOCAL ] ROLE NONE
+RESET ROLE
+```
+
+**Description:**
+
+`SET ROLE` makes `role_name` the current role of the session. Statements are
+then checked against that role. `current_user` and `current_role` return it,
+and `session_user` keeps returning the role that the session logged in as.
+
+`SET ROLE NONE` and `RESET ROLE` make the session's login role the current
+role again.
+
+The current role is the `role` setting, so it follows the same rules as other
+settings. `SET LOCAL ROLE` lasts until the end of the transaction. A role set
+in a transaction that rolls back, or after a savepoint that is rolled back to,
+is undone. `SHOW role` and `current_setting('role')` return the role, or
+`none` when no role was set, and `set_config('role', ...)` sets it. `RESET ALL`
+keeps the role, and `DISCARD ALL` resets it.
+
+**Parameters:**
+
+- `role_name`: The name of an existing role. A superuser session may switch to
+  any role, including roles that cannot log in. Other sessions may only switch
+  to their own login role.
+
+**Notes:**
+
+Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT SELECT`
+on tables is the only `GRANT` accepted (see `GRANT SELECT`). A role that is
+not a superuser may read the tables it owns or was granted `SELECT` on, and
+it may alter and drop the relations it owns, except that renaming a
+relation or creating an index on it also needs CREATE on the schema, which
+only a superuser has; it cannot insert, update, delete or truncate rows,
+call `nextval` or `setval`, create objects or roles, or `COPY FROM` a file.
+Creating objects stays superuser-only because PostgreSQL gates it on the
+schema's CREATE privilege, which does not exist yet. Catalog tables and
+sequences read as tables are not checked.
+
+**Examples:**
+
+Switch to a role and back:
+
+```sql
+CREATE TABLE accounts (id int);
+CREATE ROLE jonathan;
+SET ROLE jonathan;
+SELECT current_user, session_user;
+```
+
+```
+ current_user | session_user
+--------------+--------------
+ jonathan     | postgres
+(1 row)
+```
+
+```sql
+DROP TABLE accounts;
+```
+
+```
+ERROR:  must be owner of table accounts
+```
+
+```sql
+RESET ROLE;
+SELECT current_user;
+```
+
+```
+ current_user
+--------------
+ postgres
+(1 row)
+```
+
+### `ALTER TABLE ... OWNER TO` — change a relation's owner
+
+**Synopsis:**
+
+```sql
+ALTER TABLE [ IF EXISTS ] name OWNER TO { role_name | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
+ALTER VIEW name OWNER TO role_name
+ALTER MATERIALIZED VIEW name OWNER TO role_name
+ALTER SEQUENCE name OWNER TO role_name
+ALTER INDEX name OWNER TO role_name
+```
+
+**Description:**
+
+`OWNER TO` makes `role_name` the owner of the relation. The owner may alter
+and drop the relation; every other role that is not a superuser gets
+`must be owner of table name` (SQLSTATE `42501`). `pg_class.relowner` stores
+the owner, and `pg_get_userbyid(relowner)` returns its name.
+
+A table's indexes and the sequences of its `serial` columns belong to the
+table, also after the table or the column is renamed, so they change owner
+with it and not on their own. `ALTER SEQUENCE name OWNED BY table.column`
+makes any sequence belong to a table the same way, and `OWNED BY NONE` makes
+it its own again. Dropping a table leaves the sequences it owned as their
+own; PostgreSQL drops them with the table. Otherwise: `ALTER INDEX ...
+OWNER TO` changes nothing, as in PostgreSQL, though without the WARNING
+PostgreSQL prints, and `ALTER SEQUENCE ... OWNER TO` on a `serial` column's
+sequence fails with `cannot change owner of sequence` (SQLSTATE `0A000`)
+unless it names the owner the sequence has, which changes nothing.
+`ALTER TABLE` accepts every relation kind; the other forms refuse a relation
+of another kind, for example `"t" is not a sequence` (SQLSTATE `42809`).
+
+**Parameters:**
+
+- `name`: An existing table, view, materialized view, sequence or index. A
+  missing relation is an error (`42P01`), unless `IF EXISTS` was given.
+- `role_name`: An existing role (`42704` when there is none), or
+  `CURRENT_ROLE`/`CURRENT_USER` for the role the session runs as now, or
+  `SESSION_USER` for the role the session logged in as.
+
+**Notes:**
+
+A superuser may give a relation to any role. The relation's owner may give
+it to itself only, which changes nothing; PostgreSQL also lets the owner give
+it to a role it may `SET ROLE` to, which takes role membership, which Turso
+does not support yet.
+
+**Examples:**
+
+```sql
+CREATE TABLE accounts (id int);
+CREATE ROLE jonathan;
+ALTER TABLE accounts OWNER TO jonathan;
+SET ROLE jonathan;
+DROP TABLE accounts;
+```

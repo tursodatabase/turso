@@ -133,7 +133,7 @@ set test_files {
   collate5             fail
   collate6             fail
   collate7             fail
-  collate8             fail
+  collate8             pass
   collate9             fail
   collateA             pass
   collateB             pass
@@ -310,7 +310,7 @@ set test_files {
   init                 fail
   insert               fail
   insert2              pass
-  insert3              fail
+  insert3              pass
   insert4              fail
   insert5              pass
   instr                pass
@@ -594,7 +594,7 @@ set test_files {
   tkt-5ee23731f        pass
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
-  tkt-78e04e52ea       fail
+  tkt-78e04e52ea       pass
   tkt-7a31705a7e6      pass
   tkt-7bbfb7d442       pass
   tkt-80ba201079       fail
@@ -661,7 +661,7 @@ set test_files {
   tkt2686              pass
   tkt2767              pass
   tkt2817              pass
-  tkt2820              fail
+  tkt2820              pass
   tkt2822              fail
   tkt2832              pass
   tkt2854              fail
@@ -688,7 +688,7 @@ set test_files {
   tkt3541              pass
   tkt3554              pass
   tkt3581              pass
-  tkt35xx              fail
+  tkt35xx              pass
   tkt3630              pass
   tkt3718              fail
   tkt3731              pass

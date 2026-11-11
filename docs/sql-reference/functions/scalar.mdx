@@ -559,3 +559,22 @@ Extension loading must be enabled on the database connection. See the [Extension
 - [Expressions](/docs/sql-reference/expressions) for operator syntax, CAST, CASE, and subqueries
 - [Data Types](/docs/sql-reference/data-types) for storage classes and type affinity
 - [SELECT](/docs/sql-reference/statements/select) for using functions in queries
+
+## PostgreSQL session functions
+
+### current_schemas(include_implicit)
+
+In the PostgreSQL frontend, returns the existing schemas in the session's
+`search_path`, in search order. Missing schemas and duplicate entries are omitted.
+When `include_implicit` is true, `pg_catalog` is added at the beginning unless it
+already appears explicitly in the path. A NULL argument returns NULL.
+
+```sql
+SELECT current_schemas(false); -- {public} with the default search_path
+SELECT current_schemas(true);  -- {pg_catalog,public}
+```
+
+The result uses PostgreSQL array text syntax and can be read with
+`SELECT * FROM unnest(current_schemas(false))`. It follows changes to the session's
+search path, including transaction rollback. Temporary PostgreSQL schemas and
+per-user schema privileges are not currently modeled.

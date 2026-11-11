@@ -15,7 +15,8 @@ use differential_fuzzer::printf_gen::{EDGE_CASE_BATTERY, PrintfGenerator};
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use turso_core::{ConnectOpts, Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database};
+use turso_sqlite::SqliteDialect;
 
 #[derive(Parser, Debug)]
 #[command(

@@ -66,6 +66,9 @@ jobs:
       - name: Bench benchmark
         if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run benchmark
+      - name: Bench checkpoint_n_rows
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run checkpoint_n_rows
       - name: Bench count_benchmark
         if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run count_benchmark
@@ -96,6 +99,9 @@ jobs:
       - name: Bench mvcc_recovery_benchmark
         if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run mvcc_recovery_benchmark
+      - name: Bench overflow_scan_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run overflow_scan_benchmark
       - name: Bench parser_benchmark
         if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run parser_benchmark

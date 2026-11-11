@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
@@ -17,6 +18,7 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
+        expr_contains_function_that_changes_within_statement,
         expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
         BindingBehavior, WalkControl,
     },
@@ -31,6 +33,7 @@ use crate::{
         Table,
     },
     util::{exprs_are_equivalent, normalize_ident},
+    vtab::VirtualTableType,
     Result,
 };
 use crate::{
@@ -639,6 +642,7 @@ pub fn resolve_window_and_aggregate_functions(
                     }
                     None => {
                         if let Some(f) = resolver
+                            .catalog
                             .symbol_table
                             .resolve_function(name.as_str(), args_count)
                         {
@@ -735,7 +739,11 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                     }
                     None => {
-                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                        if let Some(f) = resolver
+                            .catalog
+                            .symbol_table
+                            .resolve_function(name.as_str(), 0)
+                        {
                             let func = AggFunc::External(f.func.clone().into());
                             if f.func.is_aggregate() {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -1246,7 +1254,7 @@ fn plan_cte(
                 has_alias: referenced_cte_table.has_alias,
                 internal_id: referenced_cte_table.internal_id,
                 table: referenced_cte_table.table.clone(),
-                database_id: referenced_cte_table.database_id,
+                namespace: referenced_cte_table.namespace,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 cte_select: None,
@@ -1452,7 +1460,7 @@ fn prepare_recursive_cte_plan(
         has_alias: false,
         internal_id: input_table.internal_id,
         table: input_table.table,
-        database_id: input_table.database_id,
+        namespace: input_table.namespace,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         cte_select: None,
@@ -1628,12 +1636,16 @@ fn parse_from_clause_table(
                 if !ctes_read[cte_definition_index] {
                     continue;
                 }
+                let already_visible = outer_query_refs_for_subquery.iter().any(|reference| {
+                    reference.identifier == cte_definition.name
+                        && reference.cte_id == Some(cte_definition.cte_id)
+                });
+                if already_visible {
+                    continue;
+                }
                 let name_used_by_table_on_the_left = outer_query_refs_for_subquery
                     .iter()
                     .any(|reference| reference.identifier == cte_definition.name);
-                if name_used_by_table_on_the_left && !lateral {
-                    continue;
-                }
                 // This plan only makes the name visible. A later FROM lookup performs
                 // the real CTE use and validates its explicit column list.
                 let cte_table = plan_cte(
@@ -1649,7 +1661,7 @@ fn parse_from_clause_table(
                     identifier: cte_definition.name.clone(),
                     has_alias: false,
                     internal_id: cte_table.internal_id,
-                    database_id: cte_table.database_id,
+                    namespace: cte_table.namespace,
                     table: cte_table.table,
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
@@ -1834,7 +1846,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver)
         };
 
         let database_id = matches!(source_table.table, Table::BTree(_) | Table::Virtual(_))
-            .then_some(source_table.database_id);
+            .then_some(source_table.namespace.database_id);
         let source_join_columns = source_table.table.parenthesized_join_columns();
         for (column_index, column) in source_table.columns().iter().enumerate() {
             let Some(column_name) = column.name.as_deref() else {
@@ -1906,7 +1918,8 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver)
             .mark_column_used(table_id, column_index);
     }
 
-    subquery.columns = query_output_columns(&subquery.plan, None, resolver)?;
+    (subquery.columns, subquery.column_types) =
+        query_output_columns(&subquery.plan, None, resolver)?;
     assert_eq!(subquery.columns.len(), join_columns.len());
     for column_index in 0..subquery.columns.len() {
         let original_name = subquery.columns[column_index]
@@ -2041,8 +2054,13 @@ fn parse_table(
         }
 
         // A non-recursive CTE cannot read its own name, even when a table or view
-        // with that name exists.
-        if program.is_cte_being_defined(&normalized_qualified_name) {
+        // with that name exists. A CTE with that name that is visible here comes
+        // from a WITH clause inside the definition, and it hides the name.
+        if program.is_cte_being_defined(&normalized_qualified_name)
+            && table_references
+                .find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
+                .is_none()
+        {
             crate::bail_parse_error!("circular reference: {}", table_name.as_str());
         }
 
@@ -2132,7 +2150,7 @@ fn parse_table(
                     col_used_mask: ColumnUsedMask::default(),
                     column_use_counts: Vec::new(),
                     expression_index_usages: Vec::new(),
-                    database_id: crate::MAIN_DB_ID,
+                    namespace: NamespaceRef::root_of(crate::MAIN_DB_ID),
                     indexed: None,
                     plan_estimate: None,
                 });
@@ -2152,12 +2170,23 @@ fn parse_table(
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
+            if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
+                crate::translate::roles::check_pragma_function(resolver, &pragma.pragma_name)?;
+            }
+            crate::translate::row_security::check_virtual_table(tbl, resolver)?;
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
+            crate::translate::roles::check_read_privilege(
+                resolver,
+                connection,
+                namespace,
+                &table.name,
+                crate::security::permission::Object::Table(table.name.clone()),
+            )?;
             Table::BTree(table.clone())
         } else {
             return Err(crate::LimboError::InvalidArgument(
@@ -2175,7 +2204,7 @@ fn parse_table(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
+            namespace,
             indexed,
             plan_estimate: None,
         });
@@ -2186,6 +2215,13 @@ fn parse_table(
         schema.get_view(namespace.id, table_name.as_str())
     });
     if let Some(view) = regular_view {
+        crate::translate::roles::check_read_privilege(
+            resolver,
+            connection,
+            namespace,
+            &view.name,
+            crate::security::permission::Object::View(view.name.clone()),
+        )?;
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias
@@ -2256,6 +2292,14 @@ fn parse_table(
             ));
         }
 
+        crate::translate::roles::check_read_privilege(
+            resolver,
+            connection,
+            namespace,
+            view_guard.name(),
+            crate::security::permission::Object::View(view_guard.name().to_string()),
+        )?;
+
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
         let columns = view_guard.column_schema.flat_columns()?;
@@ -2288,7 +2332,7 @@ fn parse_table(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
+            namespace,
             indexed: None,
             plan_estimate: None,
         });
@@ -2315,7 +2359,7 @@ fn parse_table(
                     col_used_mask: ColumnUsedMask::default(),
                     column_use_counts: Vec::new(),
                     expression_index_usages: Vec::new(),
-                    database_id,
+                    namespace,
                     indexed: None,
                     plan_estimate: None,
                 });
@@ -2534,7 +2578,7 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             identifier: cte_definition.name.clone(),
             has_alias: false,
             internal_id: joined_table.internal_id,
-            database_id: joined_table.database_id,
+            namespace: joined_table.namespace,
             table: joined_table.table,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -2600,7 +2644,7 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            rewrite_between_exprs(&mut expr.expr)?;
+            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2641,7 +2685,7 @@ pub fn parse_where(
     }
 }
 
-pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
+pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         if let Expr::Between {
             lhs,
@@ -2650,6 +2694,32 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             end,
         } = e
         {
+            if is_literal_between_bound(start) && is_literal_between_bound(end) {
+                let mut lhs_has_subquery = false;
+                walk_expr(lhs, &mut |expr| {
+                    if matches!(
+                        expr,
+                        Expr::Subquery(_)
+                            | Expr::Exists(_)
+                            | Expr::InSelect { .. }
+                            | Expr::SubqueryResult { .. }
+                    ) {
+                        lhs_has_subquery = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+                let lhs_is_nondeterministic = match resolver {
+                    Some(resolver) => {
+                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
+                    }
+                    None => false,
+                };
+                if lhs_has_subquery || lhs_is_nondeterministic {
+                    return Ok(WalkControl::Continue);
+                }
+            }
+
             let lhs_expr = std::mem::take(lhs.as_mut());
             let start_expr = std::mem::take(start.as_mut());
             let end_expr = std::mem::take(end.as_mut());
@@ -2690,6 +2760,15 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
     Ok(())
 }
 
+fn is_literal_between_bound(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Unary(_, inner) => is_literal_between_bound(inner),
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
+        _ => false,
+    }
+}
+
 /**
   Returns the earliest point at which a WHERE term can be evaluated.
   For expressions referencing tables, this is the innermost loop that contains a row for each
@@ -2702,9 +2781,19 @@ pub fn determine_where_to_eval_term(
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
+    resolver: &Resolver,
 ) -> Result<EvalAt> {
     let mut eval_at =
         determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
+    // A term like `random() < 0` reads no tables but gives a different answer each time, so like
+    // SQLite we run it once per row of the outermost loop instead of once before the loops.
+    // A call with the wrong number of arguments fails to resolve here. Callers drop a term whose
+    // placement fails, so leave that error to the normal translation of the term instead.
+    let changes_per_call =
+        expr_contains_function_that_changes_within_statement(&term.expr, resolver).unwrap_or(false);
+    if changes_per_call && !join_order.is_empty() {
+        eval_at = eval_at.max(EvalAt::Loop(0));
+    }
     if let Some(origin) = term.origin.join_origin() {
         // A materialized hash input can remove an inner join's right table.
         // The ON term then runs when all of its remaining tables are ready.
@@ -2725,7 +2814,8 @@ pub fn determine_where_to_eval_term(
     if term.origin.join_origin().is_none() {
         // A WHERE condition that reads a table to the left of a RIGHT JOIN must
         // run in that join's row body. The unmatched scan enters the same body
-        // with every table on the left set to NULL.
+        // with every table on the left set to NULL. A term that changes per call
+        // must also run there, so that unmatched rows check it too.
         for (right_table_index, right_table) in table_references.joined_tables().iter().enumerate()
         {
             if !right_table
@@ -2735,9 +2825,10 @@ pub fn determine_where_to_eval_term(
             {
                 continue;
             }
-            let reads_left_table = referenced_tables
-                .iter()
-                .any(|table_index| table_index < right_table_index);
+            let reads_left_table = changes_per_call
+                || referenced_tables
+                    .iter()
+                    .any(|table_index| table_index < right_table_index);
             if reads_left_table {
                 let loop_index = join_order
                     .iter()

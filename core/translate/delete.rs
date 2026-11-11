@@ -1,5 +1,6 @@
 use crate::namespace::NamespaceRef;
 use crate::schema::Table;
+use crate::security::policy::Command;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -11,6 +12,7 @@ use crate::translate::plan::{
 use crate::translate::planner::{
     collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
 };
+use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -139,7 +141,7 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver)?;
+    optimize_plan(program, &mut delete_plan, resolver, connection)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -176,13 +178,7 @@ pub fn translate_delete(
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
-    super::stmt_journal::set_delete_stmt_journal_flags(
-        program,
-        delete,
-        resolver,
-        connection,
-        database_id,
-    )?;
+    super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
@@ -229,7 +225,7 @@ pub fn prepare_delete_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     }];
@@ -264,6 +260,12 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         resolver,
     )?;
+    row_security::filter_rows(
+        Command::Delete,
+        &table_references,
+        &mut where_predicates,
+        resolver,
+    )?;
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
@@ -286,7 +288,14 @@ pub fn prepare_delete_plan(
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
         .map(|bt| {
-            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
+            has_triggers_including_temp(
+                resolver,
+                namespace,
+                TriggerEvent::Delete,
+                None,
+                bt,
+                connection,
+            )
         })
         .unwrap_or(false);
 
