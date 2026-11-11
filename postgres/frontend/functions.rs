@@ -100,6 +100,14 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
+        "int2_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "smallint out of range",
+        ))?,
+        "int4_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "integer out of range",
+        ))?,
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",

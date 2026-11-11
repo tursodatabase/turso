@@ -3403,8 +3403,13 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(ParseError::not_supported("a type modifier in a cast"));
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int8_cast_operand(arg, *expr));
+                let type_name = extract_type_name_from_typename(pg_type_name)?;
+                if type_name.eq_ignore_ascii_case("int2") {
+                    expr = Box::new(int_cast_operand(arg, *expr, IntegerType::Int2));
+                } else if type_name.eq_ignore_ascii_case("int4") {
+                    expr = Box::new(int_cast_operand(arg, *expr, IntegerType::Int4));
+                } else if type_name.eq_ignore_ascii_case("int8") {
+                    expr = Box::new(int_cast_operand(arg, *expr, IntegerType::Int8));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -4407,8 +4412,24 @@ impl PostgreSQLTranslator {
                     )));
                 }
                 let mut operand = args.into_iter().next().unwrap();
-                if func_name.eq_ignore_ascii_case("int8") {
-                    operand = Box::new(int8_cast_operand(&func_call.args[0], *operand));
+                if func_name.eq_ignore_ascii_case("int2") {
+                    operand = Box::new(int_cast_operand(
+                        &func_call.args[0],
+                        *operand,
+                        IntegerType::Int2,
+                    ));
+                } else if func_name.eq_ignore_ascii_case("int4") {
+                    operand = Box::new(int_cast_operand(
+                        &func_call.args[0],
+                        *operand,
+                        IntegerType::Int4,
+                    ));
+                } else if func_name.eq_ignore_ascii_case("int8") {
+                    operand = Box::new(int_cast_operand(
+                        &func_call.args[0],
+                        *operand,
+                        IntegerType::Int8,
+                    ));
                 }
                 return Ok(ast::Expr::Cast {
                     expr: operand,
@@ -6741,14 +6762,59 @@ fn json_type_or_raise(
     }
 }
 
-/// The operand of an int8 cast, made to raise "bigint out of range" when it is
-/// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
-/// clamp it. The literal is checked from its text, because a literal just past
-/// the range becomes a REAL equal to i64::MIN or 2^63.
-fn int8_cast_operand(arg: &pg_query::protobuf::Node, operand: ast::Expr) -> ast::Expr {
-    match numeric_literal_text(arg) {
-        Some(literal) if numeric_literal_exceeds_int8(literal) => {
-            function_call("int8_out_of_range", vec![])
+#[derive(Debug, Clone, Copy)]
+enum IntegerType {
+    Int2,
+    Int4,
+    Int8,
+}
+
+impl IntegerType {
+    fn bounds(self) -> (u128, u128) {
+        match self {
+            Self::Int2 => (i16::MIN.unsigned_abs() as u128, i16::MAX as u128),
+            Self::Int4 => (i32::MIN.unsigned_abs() as u128, i32::MAX as u128),
+            Self::Int8 => (i64::MIN.unsigned_abs() as u128, i64::MAX as u128),
+        }
+    }
+
+    fn out_of_range_function(self) -> &'static str {
+        match self {
+            Self::Int2 => "int2_out_of_range",
+            Self::Int4 => "int4_out_of_range",
+            Self::Int8 => "int8_out_of_range",
+        }
+    }
+}
+
+fn string_literal_text(node: &pg_query::protobuf::Node) -> Option<&str> {
+    let pg_query::protobuf::node::Node::AConst(a_const) = node.node.as_ref()? else {
+        return None;
+    };
+
+    match a_const.val.as_ref()? {
+        pg_query::protobuf::a_const::Val::Sval(string) => Some(string.sval.as_str()),
+        _ => None,
+    }
+}
+
+/// Checks whether a literal used as an integer cast operand exceeds the
+/// target integer type's range. If it does, substitutes an internal function
+/// that raises the appropriate PostgreSQL out-of-range error.
+///
+/// The literal is checked from its original text because oversized numeric
+/// literals may lose their original magnitude during translation and become
+/// REAL values before the cast is executed.
+fn int_cast_operand(
+    arg: &pg_query::protobuf::Node,
+    operand: ast::Expr,
+    integer_type: IntegerType,
+) -> ast::Expr {
+    let literal = numeric_literal_text(arg).or_else(|| string_literal_text(arg));
+
+    match literal {
+        Some(literal) if numeric_literal_exceeds_range(literal, integer_type) => {
+            function_call(integer_type.out_of_range_function(), vec![])
         }
         _ => operand,
     }
@@ -6781,16 +6847,16 @@ fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
 
 /// Rounds half away from zero before the range check, like PostgreSQL's
 /// numeric to int8 cast.
-fn numeric_literal_exceeds_int8(literal: &str) -> bool {
+fn numeric_literal_exceeds_range(literal: &str, integer_type: IntegerType) -> bool {
     let literal = literal.replace('_', "");
     let (negative, unsigned) = match literal.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, literal.as_str()),
     };
     let limit = if negative {
-        i64::MIN.unsigned_abs() as u128
+        integer_type.bounds().0
     } else {
-        i64::MAX as u128
+        integer_type.bounds().1
     };
     let radix = match unsigned.get(..2) {
         Some("0x" | "0X") => Some(16),
@@ -6826,7 +6892,7 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     let int_len = (digits.len() as i64)
         .saturating_sub(frac_part.len() as i64)
         .saturating_add(exponent);
-    if int_len > 19 {
+    if int_len > integer_type.bounds().1.to_string().len() as i64 {
         return true;
     }
     if int_len < 0 {
@@ -9358,7 +9424,11 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 }
 
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
-const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
+const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
+    "int2_out_of_range",
+    "int4_out_of_range",
+    "int8_out_of_range",
+];
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
