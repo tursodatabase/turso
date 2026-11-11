@@ -7,6 +7,7 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
+use crate::pg_type::type_exists;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
     SettingScope,
@@ -1733,6 +1734,26 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
             match check_schema_exists(conn, schema) {
                 Err(missing_schema) => missing_schema,
                 Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+            }
+        }
+        ParseError::UnresolvedFunctionType {
+            ref schema,
+            ref name,
+            ref full_name,
+            used_as,
+        } => {
+            if let Some(schema) = schema {
+                if let Err(missing_schema) = check_schema_exists(conn, schema) {
+                    return missing_schema;
+                }
+            }
+            if type_exists(conn, schema.as_deref(), name) {
+                sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
+            } else {
+                sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    used_as.missing_message(full_name),
+                )
             }
         }
     }
