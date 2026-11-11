@@ -396,7 +396,6 @@ impl TursoDatabaseConfig {
                 "views" => opts.with_views(true),
                 "index_method" => opts.with_index_method(true),
                 "custom_types" => opts.with_custom_types(true),
-                "autovacuum" => opts.with_autovacuum(true),
                 "vacuum" => opts.with_vacuum(true),
                 "encryption" => opts.with_encryption(true),
                 "attach" => opts.with_attach(true),
@@ -2125,13 +2124,12 @@ mod tests {
 
         // Each token toggles its corresponding flag.
         let opts = config_with_features(Some(
-            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,multiprocess_wal,without_rowid",
+            "views,index_method,custom_types,vacuum,encryption,attach,multiprocess_wal,without_rowid",
         ))
         .database_opts();
         assert!(opts.enable_views);
         assert!(opts.enable_index_method);
         assert!(opts.enable_custom_types);
-        assert!(opts.enable_autovacuum);
         assert!(opts.enable_vacuum);
         assert!(opts.enable_encryption);
         assert!(opts.enable_attach);

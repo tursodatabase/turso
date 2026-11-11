@@ -354,7 +354,6 @@ pub fn apply_experimental_features(
             "custom_types" => opts.with_custom_types(true),
             "encryption" => opts.with_encryption(true),
             "index_method" => opts.with_index_method(true),
-            "autovacuum" => opts.with_autovacuum(true),
             "vacuum" => opts.with_vacuum(true),
             "attach" => opts.with_attach(true),
             "multiprocess_wal" => opts.with_multiprocess_wal(true),
@@ -1201,7 +1200,6 @@ mod tests {
             "views",
             "index_method",
             "custom_types",
-            "autovacuum",
             "vacuum",
             "encryption",
             "attach",
@@ -1215,7 +1213,6 @@ mod tests {
         assert!(opts.enable_views);
         assert!(opts.enable_index_method);
         assert!(opts.enable_custom_types);
-        assert!(opts.enable_autovacuum);
         assert!(opts.enable_vacuum);
         assert!(opts.enable_encryption);
         assert!(opts.enable_attach);

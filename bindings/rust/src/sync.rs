@@ -127,7 +127,6 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
-    enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
 }
@@ -153,7 +152,6 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
-            enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
         }
@@ -195,13 +193,6 @@ impl Builder {
     /// Mirrors the local [`crate::Builder::experimental_vacuum`].
     pub fn experimental_vacuum(mut self, enable: bool) -> Self {
         self.enable_vacuum = enable;
-        self
-    }
-
-    /// Enable the experimental `autovacuum` engine feature for the synced database.
-    /// Mirrors the local [`crate::Builder::experimental_autovacuum`].
-    pub fn experimental_autovacuum(mut self, enable: bool) -> Self {
-        self.enable_autovacuum = enable;
         self
     }
 
@@ -353,9 +344,6 @@ impl Builder {
         }
         if self.enable_vacuum {
             features.push("vacuum");
-        }
-        if self.enable_autovacuum {
-            features.push("autovacuum");
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
@@ -1428,14 +1416,11 @@ mod tests {
                 .experimental_index_method(true)
                 .experimental_materialized_views(true)
                 .experimental_vacuum(true)
-                .experimental_autovacuum(true)
                 .experimental_multiprocess_wal(true)
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
-            Some(
-                "attach,custom_types,index_method,views,vacuum,autovacuum,multiprocess_wal,without_rowid"
-            )
+            Some("attach,custom_types,index_method,views,vacuum,multiprocess_wal,without_rowid")
         );
     }
 
