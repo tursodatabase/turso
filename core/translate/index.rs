@@ -19,7 +19,8 @@ use crate::translate::{
     expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
-        translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        translate_expr, unwrap_parens, walk_expr, walk_expr_mut, BindingBehavior,
+        ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -1113,15 +1114,16 @@ fn resolve_sorted_columns_with_catalog(
             }
             let ty = expression_type(unwrapped_expr, table, schema, syms)?;
             let collation = key_collation(explicit_collation, &ty, schema)?;
+            let expr = without_table_qualifiers(&sc.expr)?;
             IndexColumn {
-                name: sc.expr.to_string(),
+                name: expr.to_string(),
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: collation.unwrap_or(CollationSeq::BINARY),
                 explicit_collation,
                 default: None,
-                expr: Some(sc.expr.clone()),
+                expr: Some(expr),
             }
         };
         // SQLite reports any other error in the same term instead of this one.
@@ -1133,6 +1135,26 @@ fn resolve_sorted_columns_with_catalog(
             .expect("resolved index columns vector was preallocated to cols.len()");
     }
     Ok(resolved)
+}
+
+/// `expr` with each qualified column name written as the bare column name.
+/// An index expression can only name columns of its own table (see
+/// `validate_index_expression`), and a statement on the table can give the
+/// table another name (`DELETE FROM t AS x`), so the stored expression must
+/// not depend on the table's name. PostgreSQL stores index expressions the
+/// same way.
+fn without_table_qualifiers(expr: &Expr) -> crate::Result<Box<Expr>> {
+    let mut expr = Box::new(expr.clone());
+    walk_expr_mut(
+        &mut expr,
+        &mut |e: &mut Expr| -> crate::Result<WalkControl> {
+            if let Expr::Qualified(_, column) | Expr::DoublyQualified(_, _, column) = e {
+                *e = Expr::Id(column.clone());
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(expr)
 }
 
 /// Returns whether `expr` contains a qualified column name. A qualified name that
