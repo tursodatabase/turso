@@ -1530,6 +1530,15 @@ impl PostgreSQLTranslator {
         if remove_type == ObjectType::ObjectPolicy {
             return translate_drop_policy(drop);
         }
+        if matches!(
+            remove_type,
+            ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine
+        ) {
+            return Err(ParseError::not_supported(format!(
+                "DROP {}",
+                drop_object_type_name(remove_type)
+            )));
+        }
 
         if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
             return Err(ParseError::not_supported(format!(
