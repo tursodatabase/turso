@@ -5319,7 +5319,7 @@ pub fn op_auto_commit(
                     hooks.transaction_rolled_back(&conn);
                 }
                 conn.set_tx_state(TransactionState::None);
-                conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.end_transaction();
                 conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);
             }
@@ -5340,7 +5340,7 @@ pub fn op_auto_commit(
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
-                conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.end_transaction();
                 conn.set_tx_read_only(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -5374,7 +5374,7 @@ pub fn op_auto_commit(
                 // Write: set by Transaction opcode for BEGIN IMMEDIATE/EXCLUSIVE; leave as-is.
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
-                conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.begin_user_transaction(pager.io.current_time_wall_clock());
                 conn.set_tx_read_only(*read_only);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -5602,7 +5602,7 @@ pub fn op_savepoint(
                             !conn.tx_is_poisoned(),
                             "rollback-only marker leaked outside an explicit transaction"
                         );
-                        conn.auto_commit.store(false, Ordering::SeqCst);
+                        conn.begin_user_transaction(pager.io.current_time_wall_clock());
                     }
 
                     state.pc += 1;
@@ -6005,6 +6005,9 @@ pub fn op_program(
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
+                    statement.set_statement_times(*state.statement_times.get_or_insert_with(
+                        || crate::dialect::StatementTimes::new(now, &program.connection),
+                    ));
                     statement.set_query_deadline(state.query_deadline);
                     let res = statement.step_subprogram();
                     match res {
@@ -10383,6 +10386,7 @@ pub fn op_function(
                 connection: &program.connection,
                 io: pager.io.as_ref(),
                 clock: &clock,
+                statement_times: Cell::from_mut(&mut state.statement_times),
                 collation: func.collation,
             };
             let value = program.connection.dialect().call_scalar(
@@ -14391,6 +14395,12 @@ pub fn op_sequence_begin_inner_tx(
         }
     }
 
+    // A failed inner transaction puts back autocommit or the user's
+    // transaction, never a transaction the engine runs for itself.
+    turso_assert!(
+        conn.get_auto_commit() || conn.transaction_time().is_some(),
+        "a sequence's inner transaction inside a transaction the engine runs for itself"
+    );
     let inner_tx_id = mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
         pager.clone(),
         None,
@@ -14415,6 +14425,7 @@ pub fn op_sequence_begin_inner_tx(
         db: *db,
         inner_tx_id,
         saved_outer: outer_tx,
+        saved_transaction_time: conn.transaction_time(),
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

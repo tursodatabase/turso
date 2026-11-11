@@ -18,7 +18,7 @@ use crate::functions::datetime::{
     exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
     exec_strftime, exec_time, exec_timediff, exec_unixepoch,
 };
-use crate::functions::datetime_input::exec_temporal_encode;
+use crate::functions::datetime_input::{exec_temporal_encode, format_timestamptz};
 use crate::functions::math::{exec_gcd, exec_lcm};
 use crate::functions::printf::exec_printf;
 use crate::functions::string::{exec_lpad, exec_repeat, exec_rpad};
@@ -220,14 +220,20 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
     let func = resolve_builtin_function_name(name, arg_count)?;
-    // Reject scalar calls whose argument count is not in `arities()`.
     if let Some(Func::Scalar(srf)) = &func {
-        let arities = srf.arities();
-        if !arities.contains(&-1) && !arities.contains(&(arg_count as i32)) {
-            crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-        }
+        check_scalar_arity(srf, name, arg_count)?;
     }
     Ok(func)
+}
+
+/// Rejects a call of a scalar function whose argument count is not in
+/// `arities()`.
+pub fn check_scalar_arity(func: &ScalarFunc, name: &str, arg_count: usize) -> crate::Result<()> {
+    let arities = func.arities();
+    if !arities.contains(&-1) && !arities.contains(&(arg_count as i32)) {
+        crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+    }
+    Ok(())
 }
 
 /// Resolves a built-in function by name without checking the argument count
@@ -486,6 +492,7 @@ pub(crate) fn resolve_builtin_function_name(
         "json_quote" => Ok(Some(Func::Json(JsonFunc::JsonQuote))),
         "unixepoch" => Ok(Some(Func::Scalar(ScalarFunc::UnixEpoch))),
         "julianday" => Ok(Some(Func::Scalar(ScalarFunc::JulianDay))),
+        "now" => Ok(Some(Func::Scalar(ScalarFunc::Now))),
         "hex" => Ok(Some(Func::Scalar(ScalarFunc::Hex))),
         "unhex" => Ok(Some(Func::Scalar(ScalarFunc::Unhex))),
         "get_byte" => Ok(Some(Func::Scalar(ScalarFunc::GetByte))),
@@ -897,6 +904,9 @@ pub fn call_builtin_scalar(
         )),
         ScalarFunc::JulianDay => Ok(exec_julianday(context.clock, registers_to_ref_values(args))),
         ScalarFunc::UnixEpoch => Ok(exec_unixepoch(context.clock, registers_to_ref_values(args))),
+        ScalarFunc::Now => format_timestamptz(context.transaction_time()),
+        ScalarFunc::StatementTimestamp => format_timestamptz(context.statement_time()),
+        ScalarFunc::ClockTimestamp => format_timestamptz(context.clock_time()),
         ScalarFunc::SqliteVersion => Ok(Value::build_text(execute_sqlite_version())),
         ScalarFunc::SqliteSourceId => Ok(Value::build_text(format!(
             "{} {}",

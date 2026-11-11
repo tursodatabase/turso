@@ -23,9 +23,10 @@ use crate::{
     schema::{BTreeTable, RelationKind, Schema},
     security::roles::RoleId,
     vdbe::{builder::ProgramBuilder, Register},
-    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
+    WallClockInstant, IO,
 };
-use std::{any::Any, sync::Arc};
+use std::{any::Any, cell::Cell, sync::Arc};
 use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -95,8 +96,65 @@ pub struct ScalarFuncContext<'a> {
     pub io: &'a dyn IO,
     /// The statement's clock: every function of one step sees the same time.
     pub clock: &'a dyn Clock,
+    /// The statement's times; `None` until it first asks for PostgreSQL's time.
+    pub statement_times: &'a Cell<Option<StatementTimes>>,
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
+}
+
+impl ScalarFuncContext<'_> {
+    /// PostgreSQL's `now()`: when the transaction began. A statement in
+    /// autocommit is its own transaction.
+    pub fn transaction_time(&self) -> WallClockInstant {
+        self.statement_times().transaction
+    }
+
+    /// PostgreSQL's `clock_timestamp()`: the time of the call. Fixes the
+    /// statement's times first, so `statement_timestamp() <= clock_timestamp()`
+    /// whichever the query calls first.
+    pub fn clock_time(&self) -> WallClockInstant {
+        self.statement_times();
+        self.io.current_time_wall_clock()
+    }
+
+    /// PostgreSQL's `statement_timestamp()`.
+    pub fn statement_time(&self) -> WallClockInstant {
+        self.statement_times().statement
+    }
+
+    fn statement_times(&self) -> StatementTimes {
+        if let Some(times) = self.statement_times.get() {
+            return times;
+        }
+        let times = StatementTimes::new(self.io.current_time_wall_clock(), self.connection);
+        self.statement_times.set(Some(times));
+        times
+    }
+}
+
+/// The times a statement reads on its first request and keeps until it is
+/// reset. `now()` stays the same for the whole statement, even when another
+/// statement begins or ends a transaction on the connection meanwhile.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementTimes {
+    /// PostgreSQL's `statement_timestamp()`.
+    pub statement: WallClockInstant,
+    /// PostgreSQL's `now()`: when the open user transaction began, or
+    /// `statement` in autocommit.
+    pub transaction: WallClockInstant,
+}
+
+impl StatementTimes {
+    pub fn new(statement: WallClockInstant, connection: &Connection) -> Self {
+        let transaction = match connection.transaction_time() {
+            Some(start) => start,
+            None => statement,
+        };
+        Self {
+            statement,
+            transaction,
+        }
+    }
 }
 
 /// An extension compiled into Turso whose functions every database gets,

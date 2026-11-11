@@ -210,7 +210,7 @@ mod tests {
         let db_path = dir.path().join("commit-pwritev-error.db");
         let db_path = db_path.to_str().expect("temporary path must be UTF-8");
         let wal_path = format!("{db_path}-wal");
-        let io = Arc::new(SimulatorIO::new(1, 4096, 0, 1, 1, IoBackend::Default)?);
+        let io = Arc::new(SimulatorIO::new(1, 4096, 0, 1, 2, IoBackend::Default)?);
         let db = Database::open(
             io.clone(),
             db_path,

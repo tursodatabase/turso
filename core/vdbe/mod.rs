@@ -1025,6 +1025,8 @@ pub struct SequenceInnerTxState {
         crate::mvcc::database::TxID,
         crate::translate::emitter::TransactionMode,
     )>,
+    /// When the outer user transaction began; `None` in autocommit.
+    pub saved_transaction_time: Option<crate::WallClockInstant>,
 }
 
 /// What a write statement's activity is measured against to tell whether it
@@ -1150,6 +1152,9 @@ pub struct ProgramState {
     /// The time "now" means for the date and time functions during the
     /// current step. See `StatementClock`.
     pub(crate) current_time: Option<crate::WallClockInstant>,
+    /// PostgreSQL's `statement_timestamp()` and `now()` for this statement;
+    /// `None` until it first asks for the time.
+    pub(crate) statement_times: Option<crate::dialect::StatementTimes>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -1315,6 +1320,7 @@ impl ProgramState {
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
             current_time: None,
+            statement_times: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -1477,6 +1483,7 @@ impl ProgramState {
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
         self.current_time = None;
+        self.statement_times = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -4103,7 +4110,7 @@ impl Program {
         // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
         // generic rollback then has no current tx to inspect, so it will not flip
         // autocommit for us.
-        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        self.connection.end_transaction();
         Ok(())
     }
 

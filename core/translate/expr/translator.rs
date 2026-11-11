@@ -1671,7 +1671,10 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Random => {
+                ScalarFunc::Random
+                | ScalarFunc::Now
+                | ScalarFunc::StatementTimestamp
+                | ScalarFunc::ClockTimestamp => {
                     if !args.is_empty() {
                         crate::bail_parse_error!("{} function with arguments", srf.to_string());
                     }
