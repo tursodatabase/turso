@@ -1,9 +1,8 @@
 @database :memory:
 
-# Auto-vacuum is off unless the experimental flag turns it on, so asking for
-# NONE only restates the state the database is already in. It has to be
-# accepted without the flag, otherwise portable SQL that starts with
-# `PRAGMA auto_vacuum=NONE` cannot run at all.
+# Auto-vacuum is not supported, so asking for NONE only restates the state the
+# database is already in. It has to be accepted, otherwise portable SQL that
+# starts with `PRAGMA auto_vacuum=NONE` cannot run at all.
 
 test auto-vacuum-none-by-name {
     PRAGMA auto_vacuum=NONE;
@@ -83,6 +82,17 @@ expect {
 
 test auto-vacuum-negative-number {
     PRAGMA auto_vacuum=-1;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+# Turso does not support auto-vacuum, so turning it on is accepted and changes
+# nothing. SQLite turns auto-vacuum on in a new database.
+@skip-if sqlite "SQLite turns auto-vacuum on; Turso ignores the request"
+test auto-vacuum-full-does-nothing {
+    PRAGMA auto_vacuum=FULL;
     PRAGMA auto_vacuum;
 }
 expect {

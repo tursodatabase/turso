@@ -492,7 +492,7 @@ set test_files {
   savepoint2           pass
   savepoint4           fail
   savepoint5           pass
-  savepoint6           fail
+  savepoint6           pass
   savepoint7           fail
   scanstatus           fail
   scanstatus2          fail
@@ -574,7 +574,7 @@ set test_files {
   tempdb2              fail
   temptable            fail
   temptable2           fail
-  temptable3           fail
+  temptable3           pass
   temptrigger          fail
   timediff1            pass
   tkt-02a8e81d44       pass
@@ -596,7 +596,7 @@ set test_files {
   tkt-4ef7e3cfca       fail
   tkt-54844eea3f       pass
   tkt-5d863f876e       fail
-  tkt-5e10420e8d       fail
+  tkt-5e10420e8d       pass
   tkt-5ee23731f        pass
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
@@ -611,7 +611,7 @@ set test_files {
   tkt-91e2e8ba6f       pass
   tkt-99378177930f87bd pass
   tkt-9a8b09f8e6       pass
-  tkt-9d68c883         fail
+  tkt-9d68c883         pass
   tkt-9f2eb3abac       pass
   tkt-a7b7803e         fail
   tkt-a7debbe0         pass
@@ -699,8 +699,8 @@ set test_files {
   tkt3718              fail
   tkt3731              pass
   tkt3757              pass
-  tkt3761              fail
-  tkt3762              fail
+  tkt3761              pass
+  tkt3762              pass
   tkt3773              pass
   tkt3791              pass
   tkt3793              pass
@@ -712,7 +712,7 @@ set test_files {
   tkt3871              fail
   tkt3879              pass
   tkt3911              pass
-  tkt3918              fail
+  tkt3918              pass
   tkt3922              pass
   tkt3929              pass
   tkt3935              fail

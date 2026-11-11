@@ -569,78 +569,8 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            // SQLite spells the three modes either by name or by number, and
-            // treats the two spellings as the same thing.
-            let requested_mode = match &value {
-                Expr::Name(name) => {
-                    let name = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name {
-                        b"none" => Some(AutoVacuumMode::None),
-                        b"full" => Some(AutoVacuumMode::Full),
-                        b"incremental" => Some(AutoVacuumMode::Incremental),
-                        _ => Some(AutoVacuumMode::None),
-                    })
-                }
-                _ => match parse_signed_number(&value) {
-                    Ok(Value::Numeric(Numeric::Integer(n @ 0..=2))) => {
-                        Some(AutoVacuumMode::from(n as u8))
-                    }
-                    _ => Some(AutoVacuumMode::None),
-                },
-            };
-
-            // Auto-vacuum is off unless the experimental flag turns it on, so
-            // asking for NONE only restates the state the database is already
-            // in. Requiring the flag to switch the feature off would make every
-            // `PRAGMA auto_vacuum=NONE` in portable SQL fail for no reason.
-            if requested_mode != Some(AutoVacuumMode::None) && !connection.db.opts.enable_autovacuum
-            {
-                return Err(LimboError::InvalidArgument(
-                    "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
-                        .to_string(),
-                ));
-            }
-
-            let pager = connection.get_pager_from_database_index(&database_id)?;
-
-            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
-            // so the pragma is silently ignored after that.
-            if pager.db_initialized() {
-                return Ok(TransactionMode::None);
-            }
-
-            let Some(auto_vacuum_mode) = requested_mode else {
-                return Err(LimboError::InvalidArgument(
-                    "invalid auto vacuum mode".to_string(),
-                ));
-            };
-            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
-            let largest_root_page_number_reg = program.alloc_register();
-            program.emit_insn(Insn::ReadCookie {
-                db: database_id,
-                dest: largest_root_page_number_reg,
-                cookie: Cookie::LargestRootPageNumber,
-            });
-            let set_cookie_label = program.allocate_label();
-            program.emit_insn(Insn::If {
-                reg: largest_root_page_number_reg,
-                target_pc: set_cookie_label,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::Halt {
-                constraint_info: None,
-                err_code: 0,
-                description: "Early halt because auto vacuum mode is not enabled".to_string(),
-                on_error: None,
-                description_reg: None,
-            });
-            program.preassign_label_to_next_insn(set_cookie_label);
-            program.emit_insn(Insn::SetCookie {
-                db: database_id,
-                cookie: Cookie::IncrementalVacuum,
-                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
-                p5: 0,
-            });
+            // Auto-vacuum is not supported, so setting the mode does nothing,
+            // as in SQLite built without auto-vacuum.
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
