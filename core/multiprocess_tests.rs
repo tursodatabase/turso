@@ -2,7 +2,9 @@ use super::*;
 use crate::database::remove_file_from_database_registry;
 use crate::security::roles::SessionRole;
 use crate::storage::database::DatabaseFile;
-use crate::storage::shared_wal_coordination::MappedSharedWalCoordination;
+use crate::storage::shared_wal_coordination::{
+    MappedSharedWalCoordination, SharedWalCoordinationOpenMode,
+};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::process::Command;
 use std::time::Duration;
@@ -46,6 +48,8 @@ const DISABLED_FILE_LOCK_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_open_with_disabled_file_lock_child_process";
 const MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_paused_creator_child_process";
+const MULTIPROCESS_FIRST_OPENER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_first_opener_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -510,23 +514,37 @@ fn multiprocess_open_reinitializes_unpublished_coordination_file() {
         .unwrap();
 }
 
+/// Where a paused creator of the coordination file stalls.
+#[derive(Clone, Copy)]
+enum CreatorPause {
+    /// After probing the lifetime byte, before taking it: the creator has not
+    /// yet been seen by any other process.
+    AfterProbe,
+    /// File sized, lifetime lock held, header not published.
+    BeforeInitialize,
+}
+
 /// Start a child that stalls as the creator of the coordination file of
-/// `db_path` (file sized, lifetime lock held, header not published) and wait
-/// until it has. It finishes creating the file once `release_file` exists.
+/// `db_path` at `pause` and wait until it has. It finishes creating the file
+/// once `release_file` exists.
 fn spawn_paused_creator(
     db_path: &std::path::Path,
     ready_file: &std::path::Path,
     release_file: &std::path::Path,
+    pause: CreatorPause,
 ) -> std::process::Child {
-    let child = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .arg(MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST)
         .arg("--exact")
         .arg("--nocapture")
         .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
         .env("TURSO_MULTIPROCESS_READY_FILE", ready_file)
-        .env("TURSO_MULTIPROCESS_RELEASE_FILE", release_file)
-        .spawn()
-        .unwrap();
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", release_file);
+    if matches!(pause, CreatorPause::AfterProbe) {
+        command.env("TURSO_MULTIPROCESS_PAUSE_AFTER_PROBE", "1");
+    }
+    let child = command.spawn().unwrap();
     wait_for_file(ready_file);
     child
 }
@@ -547,21 +565,32 @@ fn multiprocess_paused_creator_child_process() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let wal_path = format!("{}-wal", db_path.to_str().unwrap());
     let shm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+    let pause = || {
+        std::fs::write(&ready_file, b"ready").unwrap();
+        wait_for_file(&release_file);
+    };
+    let noop = || {};
+    let pause_fn: &dyn Fn() = &pause;
+    let noop_fn: &dyn Fn() = &noop;
+    let (after_probe, before_initialize) =
+        if std::env::var_os("TURSO_MULTIPROCESS_PAUSE_AFTER_PROBE").is_some() {
+            (pause_fn, noop_fn)
+        } else {
+            (noop_fn, pause_fn)
+        };
     let _authority = MappedSharedWalCoordination::create_or_open_paused_for_tests(
         &io,
         std::path::Path::new(&shm_path),
         64,
-        &|| {},
-        &|| {
-            std::fs::write(&ready_file, b"ready").unwrap();
-            wait_for_file(&release_file);
-        },
+        after_probe,
+        before_initialize,
     )
     .unwrap();
 }
 
-/// Open an existing database with `flags` while a child process is paused as
-/// the creator of its coordination file, and return the open's result.
+/// Open an existing database with `flags` while a child process is paused at
+/// `pause` as the creator of its coordination file, and return the open's
+/// result.
 ///
 /// The creator stays paused until the open has had ample time to fail, so the
 /// open cannot finish before the release unless it fails: an opener without
@@ -569,6 +598,7 @@ fn multiprocess_paused_creator_child_process() {
 fn open_while_creator_paused(
     name: &str,
     flags: OpenFlags,
+    pause: CreatorPause,
 ) -> std::thread::Result<Result<(bool, i64)>> {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join(name);
@@ -587,7 +617,7 @@ fn open_while_creator_paused(
     }
     remove_file_from_database_registry(&db_path_str);
 
-    let mut creator = spawn_paused_creator(&db_path, &ready_file, &release_file);
+    let mut creator = spawn_paused_creator(&db_path, &ready_file, &release_file, pause);
     let opener = std::thread::spawn(move || -> Result<(bool, i64)> {
         let db = open_multiprocess_db_with_flags(io, &db_path_str, flags)?;
         let attached = db.shared_wal_coordination()?.is_some();
@@ -599,7 +629,7 @@ fn open_while_creator_paused(
     std::fs::write(&release_file, b"release").unwrap();
     assert!(
         !finished_early,
-        "open must wait for the creator that holds the lifetime lock"
+        "open must wait for the creator that holds the init lock"
     );
     let result = opener.join();
     assert!(creator.wait().unwrap().success());
@@ -608,10 +638,13 @@ fn open_while_creator_paused(
 
 #[test]
 fn readonly_multiprocess_open_waits_for_concurrent_creator() {
-    let (attached, rows) =
-        open_while_creator_paused("readonly-waits-for-creator.db", OpenFlags::ReadOnly)
-            .unwrap()
-            .unwrap();
+    let (attached, rows) = open_while_creator_paused(
+        "readonly-waits-for-creator.db",
+        OpenFlags::ReadOnly,
+        CreatorPause::BeforeInitialize,
+    )
+    .unwrap()
+    .unwrap();
     assert!(
         attached,
         "reader must attach to the published coordination file"
@@ -621,15 +654,211 @@ fn readonly_multiprocess_open_waits_for_concurrent_creator() {
 
 #[test]
 fn writable_multiprocess_open_waits_for_concurrent_creator() {
-    let (attached, rows) =
-        open_while_creator_paused("writable-waits-for-creator.db", OpenFlags::default())
-            .unwrap()
-            .unwrap();
+    let (attached, rows) = open_while_creator_paused(
+        "writable-waits-for-creator.db",
+        OpenFlags::default(),
+        CreatorPause::BeforeInitialize,
+    )
+    .unwrap()
+    .unwrap();
     assert!(
         attached,
         "opener must attach to the published coordination file"
     );
     assert_eq!(rows, 1);
+}
+
+/// A read-only open must wait for a creator that has probed the lifetime byte
+/// but not yet taken it. Without the init lock the reader probes the byte as
+/// free in that window, finds the file still short and reports it as corrupt
+/// because it sees no live creator.
+#[test]
+fn readonly_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
+    let (attached, rows) = open_while_creator_paused(
+        "readonly-waits-for-unlocked-creator.db",
+        OpenFlags::ReadOnly,
+        CreatorPause::AfterProbe,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        attached,
+        "reader must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+}
+
+/// A writable open must not decide the open mode while a creator is between
+/// probing the lifetime byte and taking it. Without the init lock it probes
+/// the byte as free too, decides Exclusive and initializes the file under
+/// the creator.
+#[test]
+fn writable_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
+    let (attached, rows) = open_while_creator_paused(
+        "writable-waits-for-unlocked-creator.db",
+        OpenFlags::default(),
+        CreatorPause::AfterProbe,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        attached,
+        "opener must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+}
+
+/// A child that opens the coordination file as one of two concurrent first
+/// openers, paused after probing the lifetime byte until released, then records
+/// one commit in it and holds the file open until told to exit.
+struct FirstOpener {
+    child: std::process::Child,
+    probe_ready_file: std::path::PathBuf,
+    probe_release_file: std::path::PathBuf,
+    opened_file: std::path::PathBuf,
+    done_file: std::path::PathBuf,
+}
+
+impl FirstOpener {
+    fn spawn(db_path: &std::path::Path, dir: &std::path::Path, role: &str) -> Self {
+        let probe_ready_file = dir.join(format!("{role}-probe-ready"));
+        let probe_release_file = dir.join(format!("{role}-probe-release"));
+        let opened_file = dir.join(format!("{role}-opened"));
+        let done_file = dir.join(format!("{role}-done"));
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg(MULTIPROCESS_FIRST_OPENER_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+            .env("TURSO_MULTIPROCESS_OPENER_ROLE", role)
+            .env("TURSO_MULTIPROCESS_PROBE_READY_FILE", &probe_ready_file)
+            .env("TURSO_MULTIPROCESS_PROBE_RELEASE_FILE", &probe_release_file)
+            .env("TURSO_MULTIPROCESS_OPENED_FILE", &opened_file)
+            .env("TURSO_MULTIPROCESS_DONE_FILE", &done_file)
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            probe_ready_file,
+            probe_release_file,
+            opened_file,
+            done_file,
+        }
+    }
+
+    fn release_probe(&self) {
+        std::fs::write(&self.probe_release_file, b"release").unwrap();
+    }
+}
+
+impl Drop for FirstOpener {
+    /// Unblock and reap the child so a failed assertion leaves none behind.
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.probe_release_file, b"release");
+        let _ = std::fs::write(&self.done_file, b"done");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Two flagged first openers must not both initialize the coordination file.
+/// The first is paused after probing the lifetime byte as free, before taking
+/// it. The second must not get as far as probing: without the init lock it
+/// probes the byte as free too, and both can decide Exclusive and initialize
+/// the file, the later one resetting state the earlier one already uses. With
+/// it the second waits, then opens in MultiProcess mode over the file the
+/// first initialized, and both commits are visible afterwards.
+#[test]
+fn concurrent_first_openers_initialize_the_coordination_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("first-openers.db");
+    let shm_path =
+        storage::wal::coordination_path_for_wal_path(&format!("{}-wal", db_path.to_str().unwrap()));
+
+    let mut first = FirstOpener::spawn(&db_path, dir.path(), "first");
+    wait_for_file(&first.probe_ready_file);
+    let mut second = FirstOpener::spawn(&db_path, dir.path(), "second");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !second.probe_ready_file.exists(),
+        "the second opener probed the lifetime byte while the first was still deciding the open mode"
+    );
+
+    first.release_probe();
+    wait_for_file(&first.opened_file);
+    wait_for_file(&second.probe_ready_file);
+    second.release_probe();
+    wait_for_file(&second.opened_file);
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let observer =
+        MappedSharedWalCoordination::open_existing(&io, std::path::Path::new(&shm_path), 64)
+            .unwrap()
+            .expect("coordination file exists");
+    let snapshot = observer.snapshot();
+    assert_eq!(snapshot.max_frame, 2);
+    assert_eq!(snapshot.transaction_count, 2);
+    assert_eq!(observer.find_frame(7, 0, 2, None), Some(1));
+    assert_eq!(observer.find_frame(9, 0, 2, None), Some(2));
+    drop(observer);
+
+    std::fs::write(&first.done_file, b"done").unwrap();
+    std::fs::write(&second.done_file, b"done").unwrap();
+    assert!(first.child.wait().unwrap().success());
+    assert!(second.child.wait().unwrap().success());
+}
+
+/// Child half of `concurrent_first_openers_initialize_the_coordination_file_once`.
+#[test]
+fn multiprocess_first_opener_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let env_path = |name: &str| std::path::PathBuf::from(std::env::var_os(name).unwrap());
+    let role = std::env::var("TURSO_MULTIPROCESS_OPENER_ROLE").unwrap();
+    let probe_ready_file = env_path("TURSO_MULTIPROCESS_PROBE_READY_FILE");
+    let probe_release_file = env_path("TURSO_MULTIPROCESS_PROBE_RELEASE_FILE");
+    let opened_file = env_path("TURSO_MULTIPROCESS_OPENED_FILE");
+    let done_file = env_path("TURSO_MULTIPROCESS_DONE_FILE");
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let wal_path = format!("{}-wal", db_path.to_str().unwrap());
+    let shm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+    let authority = MappedSharedWalCoordination::create_or_open_paused_for_tests(
+        &io,
+        std::path::Path::new(&shm_path),
+        64,
+        &|| {
+            std::fs::write(&probe_ready_file, b"ready").unwrap();
+            wait_for_file(&probe_release_file);
+        },
+        &|| {},
+    )
+    .unwrap();
+
+    let (page_id, frame_id) = if role == "first" {
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+        (7, 1)
+    } else {
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::MultiProcess
+        );
+        // The first opener's commit must have survived this open.
+        assert_eq!(authority.snapshot().max_frame, 1);
+        assert_eq!(authority.find_frame(7, 0, 1, None), Some(1));
+        (9, 2)
+    };
+    let owner = authority.owner_record();
+    assert!(authority.try_acquire_writer(owner));
+    authority.record_frame(page_id, frame_id);
+    authority.publish_commit(frame_id, 0, 0, frame_id);
+    authority.release_writer(owner);
+    std::fs::write(&opened_file, b"opened").unwrap();
+    wait_for_file(&done_file);
 }
 
 /// A read-only open never creates or initializes the coordination file: a
@@ -799,7 +1028,12 @@ fn stalled_creator_makes_openers_return_busy() {
         std::path::PathBuf::from(storage::wal::coordination_path_for_wal_path(&wal_path));
     let ready_file = dir.path().join("creator-ready");
     let release_file = dir.path().join("creator-release");
-    let mut creator = spawn_paused_creator(&db_path, &ready_file, &release_file);
+    let mut creator = spawn_paused_creator(
+        &db_path,
+        &ready_file,
+        &release_file,
+        CreatorPause::BeforeInitialize,
+    );
 
     let fast_forward = Arc::new(FastForwardIO {
         inner: multiprocess_test_io(),
