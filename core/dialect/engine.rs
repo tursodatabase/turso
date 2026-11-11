@@ -192,8 +192,10 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
     let func = resolve_builtin_function_name(name, arg_count)?;
     // Reject scalar calls whose argument count is not in `arities()`.
     if let Some(Func::Scalar(srf)) = &func {
-        let arities = srf.arities();
-        if !arities.contains(&-1) && !arities.contains(&(arg_count as i32)) {
+        let arg_count = arg_count as i32;
+        let accepts =
+            |narg: i32| narg == arg_count || narg == -1 || (narg <= -2 && arg_count >= -(narg + 2));
+        if !srf.arities().iter().any(|&narg| accepts(narg)) {
             crate::bail_parse_error!("wrong number of arguments to function {}()", name)
         }
     }

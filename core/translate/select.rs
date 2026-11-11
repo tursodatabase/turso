@@ -17,7 +17,7 @@ use crate::translate::expr::{
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
-    plan_is_correlated, GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+    GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
@@ -763,8 +763,7 @@ fn prepare_one_select_plan(
             // This means we truncate the ORDER BY to just the rowid column.
             // We do this for SQLite compatibility - SQLite never generates code for the cut terms,
             // so even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
-            // Like SQLite (wherePathSatisfiesOrderBy() in where.c), the terms are cut only when
-            // each one is constant or reads the table; otherwise the rows are sorted by all terms.
+            // It still resolves their names, so the cut terms are checked for that.
             let mut terms_cut_after_rowid = Vec::new();
             if key.len() > 1 && plan.table_references.joined_tables().len() == 1 {
                 let joined = &plan.table_references.joined_tables()[0];
@@ -781,15 +780,11 @@ fn prepare_one_select_plan(
                     _ => false,
                 };
                 if first_is_rowid {
-                    let mut later_terms_can_be_cut = true;
-                    for (expr, _, _) in key[1..].iter() {
-                        let reads_table = check_order_by_term_without_code(
+                    terms_cut_after_rowid = key.split_off(1);
+                    for (expr, _, _) in terms_cut_after_rowid.iter() {
+                        check_order_by_term_without_code(
                             expr, &plan, resolver, program, connection,
                         )?;
-                        later_terms_can_be_cut &= reads_table || expr.is_constant(resolver);
-                    }
-                    if later_terms_can_be_cut {
-                        terms_cut_after_rowid = key.split_off(1);
                     }
                 }
             }
@@ -1049,64 +1044,34 @@ fn named_windows_in_use(
 }
 
 /// Checks an ORDER BY term that gets no code the way SQLite checks every term:
-/// the names in its subqueries must resolve, and its collation must exist. Returns
-/// whether the term reads a column of `plan`'s tables.
+/// the names in its subqueries must resolve, and its collation must exist.
 ///
 /// An aggregate that a subquery of the term moves up to `plan` is dropped with the term.
 /// SQLite lets these subqueries use the aliases of the result columns, which subqueries
-/// cannot do in Turso yet, so a subquery that names an alias is not planned; it is
-/// taken to read the tables.
+/// cannot do in Turso yet, so a subquery that names an alias is not checked.
 fn check_order_by_term_without_code(
     term: &ast::Expr,
     plan: &SelectPlan,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> Result<bool> {
+) -> Result<()> {
     // SQLite looks up the collation of every term to build the sorter's key, even when
     // it then skips the sort.
     ExprContext::new(Some(&plan.table_references), resolver).expr_collation(term)?;
 
-    let reads_column_of = |expr: &ast::Expr| {
-        let table_id = match expr {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => *table,
-            _ => return false,
-        };
-        plan.table_references
-            .joined_tables()
-            .iter()
-            .any(|t| t.internal_id == table_id)
-    };
-    let names_result_column_alias = |expr: &ast::Expr| -> Result<bool> {
-        let mut found = false;
-        walk_expr_with_subqueries(expr, &mut |expr| {
-            if let ast::Expr::Id(id) = expr {
-                let id = normalize_ident(id.as_str());
-                found |= plan.result_columns.iter().any(|rc| {
-                    rc.alias
-                        .as_ref()
-                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&id))
-                });
-            }
-            Ok(WalkControl::Continue)
-        })?;
-        Ok(found)
-    };
     let outer_query_refs = outer_query_refs_for_correlated_subquery(&plan.table_references)?;
-    let mut reads_table = false;
     resolver.begin_collecting_aggregates_from_subqueries();
     let walked = walk_expr(term, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        reads_table |= reads_column_of(expr);
         if let ast::Expr::Subquery(select)
         | ast::Expr::Exists(select)
         | ast::Expr::InSelect { rhs: select, .. } = expr
         {
-            if names_result_column_alias(expr)? {
-                reads_table = true;
+            if names_result_column_alias(expr, plan)? {
                 return Ok(WalkControl::Continue);
             }
             let collecting_depth = resolver.aggregate_collecting_depth();
-            match prepare_select_plan(
+            if let Err(err) = prepare_select_plan(
                 (**select).clone(),
                 resolver,
                 program,
@@ -1114,43 +1079,56 @@ fn check_order_by_term_without_code(
                 QueryDestination::Unset,
                 connection,
             ) {
-                Ok(subquery_plan) => reads_table |= plan_is_correlated(&subquery_plan),
-                // SQLite reports most wrong column counts only while generating code, which
-                // this term gets only if the subquery does not read the outer query. Planning
-                // it again without the outer tables shows that: a subquery that reads them
-                // fails to resolve a name instead of reaching the same column count error.
-                Err(err) if is_column_count_error(&err) => {
-                    resolver.stop_collecting_aggregates_above(collecting_depth);
-                    let cte_definitions: Vec<_> = outer_query_refs
-                        .iter()
-                        .filter(|outer_ref| outer_ref.cte_definition_only)
-                        .cloned()
-                        .collect();
-                    let replanned = prepare_select_plan(
-                        (**select).clone(),
-                        resolver,
-                        program,
-                        &cte_definitions,
-                        QueryDestination::Unset,
-                        connection,
-                    );
-                    resolver.stop_collecting_aggregates_above(collecting_depth);
-                    reads_table |= !matches!(replanned, Err(err) if is_column_count_error(&err));
+                if is_name_resolution_error(&err) {
+                    return Err(err);
                 }
-                Err(err) => return Err(err),
+                // SQLite reports other errors, such as wrong column counts or a DISTINCT
+                // aggregate with two arguments, only while generating code, which this
+                // term does not get.
+                resolver.stop_collecting_aggregates_above(collecting_depth);
             }
         }
         Ok(WalkControl::Continue)
     });
     resolver.take_aggregates_from_subqueries();
     walked?;
-    Ok(reads_table)
+    Ok(())
 }
 
-fn is_column_count_error(err: &crate::LimboError) -> bool {
+/// Whether a subquery in `expr` names a result-column alias of `plan`.
+fn names_result_column_alias(expr: &ast::Expr, plan: &SelectPlan) -> Result<bool> {
+    let mut found = false;
+    walk_expr_with_subqueries(expr, &mut |expr| {
+        if let ast::Expr::Id(id) = expr {
+            let id = normalize_ident(id.as_str());
+            found |= plan.result_columns.iter().any(|rc| {
+                rc.alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&id))
+            });
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
+}
+
+/// Whether SQLite reports `err` while resolving names, before it decides which
+/// ORDER BY terms get code.
+fn is_name_resolution_error(err: &crate::LimboError) -> bool {
+    const PREFIXES: &[&str] = &[
+        "no such column",
+        "no such table",
+        "no such function",
+        "no such window",
+        "no such collation sequence",
+        "ambiguous column name",
+        "wrong number of arguments to function",
+        "misuse of aggregate",
+        "misuse of window function",
+        "IN(...) element has",
+    ];
     matches!(err, crate::LimboError::ParseError(msg)
-        if msg == "row value misused"
-            || msg.starts_with("sub-select returns "))
+        if PREFIXES.iter().any(|prefix| msg.starts_with(prefix)))
 }
 
 /// Whether a result column calls an aggregate, also one inside a window function

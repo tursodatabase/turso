@@ -410,26 +410,69 @@ expect error {
     misuse of aggregate function max\(\)
 }
 
-# SQLite cuts the terms after the rowid only when each reads the table or is
-# constant. An uncorrelated subquery does neither, so all terms are compiled.
-test orderby_rowid_truncation_keeps_terms_with_uncorrelated_subquery {
+# Terms after a rowid first term never change the order, so they get no code,
+# even a compound subquery that Turso cannot run as a scalar subquery.
+@cross-check-integrity
+test orderby_rowid_truncation_cuts_compound_subquery {
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
-    SELECT d FROM y ORDER BY id, (SELECT 1, 2);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT d FROM y ORDER BY id, (SELECT 1 UNION ALL SELECT 2);
+    UPDATE y SET d = 7 WHERE id IN (SELECT id FROM y ORDER BY id, (SELECT 1 UNION ALL SELECT 2));
+    SELECT d FROM y;
 }
-expect error {
-    (sub-select returns 2 columns - expected 1|row value misused)
+expect {
+    5
+    6
+    7
+    7
 }
 
-# A wrong column count deep inside the subquery does not make the term read the
-# table, so the term is still compiled and the error is reported.
-test orderby_rowid_truncation_keeps_terms_with_uncorrelated_subquery_with_wrong_column_count {
+# SQLite reports these errors only while generating code, which removed terms never
+# get.
+@cross-check-integrity
+test orderby_removed_term_ignores_errors_sqlite_reports_while_generating_code {
     CREATE TABLE z(q, p);
     CREATE TABLE y(id INTEGER PRIMARY KEY, d);
     INSERT INTO y VALUES (1, 5);
-    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q IN (SELECT 1, 2));
+    SELECT count(*) FROM y ORDER BY (SELECT group_concat(DISTINCT q, ',') FROM z);
+    SELECT count(*) FROM y ORDER BY (SELECT value FROM json_each(1, 2, 3));
+    SELECT count(*) FROM y ORDER BY (SELECT value FROM generate_series(1, 2, 3, 4, 5));
+    SELECT d FROM y ORDER BY id, (SELECT group_concat(DISTINCT q, d) FROM z);
+    SELECT d FROM y ORDER BY id, (SELECT group_concat(DISTINCT q, ',') FROM z WHERE q = d);
+    SELECT d FROM y ORDER BY id, (SELECT value FROM json_each(d, 2, 3));
+}
+expect {
+    1
+    1
+    1
+    5
+    5
+    5
+}
+
+# Each nested subquery's ORDER BY terms after the rowid are checked by planning
+# their subqueries once, so preparing the statement takes time linear in the nesting.
+@cross-check-integrity
+test orderby_terms_after_rowid_in_nested_subqueries_are_planned_once {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, 1))))))))))))))))))))));
+    SELECT (SELECT d FROM y AS t11 ORDER BY t11.id, (SELECT (SELECT d FROM y AS t10 ORDER BY t10.id, (SELECT (SELECT d FROM y AS t9 ORDER BY t9.id, (SELECT (SELECT d FROM y AS t8 ORDER BY t8.id, (SELECT (SELECT d FROM y AS t7 ORDER BY t7.id, (SELECT (SELECT d FROM y AS t6 ORDER BY t6.id, (SELECT (SELECT d FROM y AS t5 ORDER BY t5.id, (SELECT (SELECT d FROM y AS t4 ORDER BY t4.id, (SELECT (SELECT d FROM y AS t3 ORDER BY t3.id, (SELECT (SELECT d FROM y AS t2 ORDER BY t2.id, (SELECT (SELECT d FROM y AS t1 ORDER BY t1.id, (SELECT (SELECT d FROM y AS t0 ORDER BY t0.id, (SELECT 1 WHERE t0.d), (SELECT d FROM y)) WHERE t1.d), (SELECT d FROM y)) WHERE t2.d), (SELECT d FROM y)) WHERE t3.d), (SELECT d FROM y)) WHERE t4.d), (SELECT d FROM y)) WHERE t5.d), (SELECT d FROM y)) WHERE t6.d), (SELECT d FROM y)) WHERE t7.d), (SELECT d FROM y)) WHERE t8.d), (SELECT d FROM y)) WHERE t9.d), (SELECT d FROM y)) WHERE t10.d), (SELECT d FROM y)) WHERE t11.d), (SELECT d FROM y));
+}
+expect {
+    5
+    5
+}
+
+@cross-check-integrity
+test orderby_cut_term_in_checked_subquery_reports_name_error {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    CREATE TABLE w(id INTEGER PRIMARY KEY, e);
+    CREATE TABLE z(q, p);
+    SELECT d FROM y ORDER BY id, (SELECT e FROM w ORDER BY w.id, (SELECT q FROM z), (SELECT c0 FROM z));
 }
 expect error {
-    sub-select returns 2 columns - expected 1
+    no such column: c0
 }
 
 @cross-check-integrity
@@ -598,6 +641,24 @@ test update_where_checks_function_argument_counts_in_term_without_code {
 }
 expect error {
     wrong number of arguments to function abs\(\)
+}
+
+test update_where_checks_coalesce_argument_count_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR coalesce(d);
+}
+expect error {
+    wrong number of arguments to function coalesce\(\)
+}
+
+test update_where_checks_iif_argument_count_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR iif(d);
+}
+expect error {
+    wrong number of arguments to function iif\(\)
 }
 
 test join_on_checks_function_names_in_term_without_code {
