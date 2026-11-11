@@ -50,3 +50,41 @@ expect {
     1|2||
     3|4|3|4
 }
+
+@skip-if sqlite "query plan is different in sqlite"
+test pragma-automatic-index-off-subquery-view-cte {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t2 GROUP BY a, b;
+    PRAGMA automatic_index = OFF;
+    EXPLAIN QUERY PLAN SELECT * FROM t1 JOIN (SELECT a, b FROM t2 GROUP BY a, b) s ON t1.a = s.a AND t1.b < s.b;
+    EXPLAIN QUERY PLAN SELECT * FROM t1 JOIN v ON t1.a = v.a AND t1.b < v.b;
+    EXPLAIN QUERY PLAN WITH c AS (SELECT a, b FROM t2 GROUP BY a, b) SELECT * FROM t1 JOIN c ON t1.a = c.a AND t1.b < c.b;
+}
+expect {
+    1|0|0|SCAN s
+    3|1|0|SCAN t2
+    5|1|0|USE SORTER FOR GROUP BY
+    43|0|0|SCAN t1
+    1|0|0|SCAN v
+    3|1|0|SCAN t2
+    5|1|0|USE SORTER FOR GROUP BY
+    43|0|0|SCAN t1
+    1|0|0|SCAN c
+    3|1|0|SCAN t2
+    5|1|0|USE SORTER FOR GROUP BY
+    43|0|0|SCAN t1
+}
+
+test pragma-automatic-index-off-subquery-rows {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 9);
+    INSERT INTO t2 VALUES (1, 5), (2, 6), (3, 7);
+    PRAGMA automatic_index = OFF;
+    SELECT t1.a, s.b FROM t1 JOIN (SELECT a, b FROM t2 GROUP BY a, b) s ON t1.a = s.a AND t1.b < s.b ORDER BY t1.a;
+}
+expect {
+    1|5
+    2|6
+}
