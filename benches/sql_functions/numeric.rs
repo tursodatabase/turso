@@ -1,4 +1,5 @@
-use divan::{black_box, Bencher};
+use divan::black_box;
+use turso_benches::Bencher;
 #[cfg(feature = "nanosecond-bench")]
 use turso_core::numeric::str_to_i64;
 use turso_core::numeric::{format_float, str_to_f64, Numeric};

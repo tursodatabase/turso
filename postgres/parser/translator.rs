@@ -5,9 +5,10 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -1111,6 +1112,14 @@ impl PostgreSQLTranslator {
                     "ALTER TABLE ADD CONSTRAINT is not supported".into(),
                 ));
             }
+            AlterTableType::AtEnableRowSecurity => ast::AlterTableBody::EnableRowSecurity,
+            AlterTableType::AtDisableRowSecurity => ast::AlterTableBody::DisableRowSecurity,
+            AlterTableType::AtForceRowSecurity => {
+                return Err(not_supported("ALTER TABLE ... FORCE ROW LEVEL SECURITY"));
+            }
+            AlterTableType::AtNoForceRowSecurity => {
+                return Err(not_supported("ALTER TABLE ... NO FORCE ROW LEVEL SECURITY"));
+            }
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "ALTER TABLE {} is not supported",
@@ -1943,18 +1952,10 @@ impl PostgreSQLTranslator {
                             "UPDATE of an array element or composite field",
                         ));
                     }
-                    let col_name = exact_name(&res_target.name);
-                    let expr = if let Some(val) = &res_target.val {
-                        Box::new(self.translate_expr(val)?)
-                    } else {
-                        return Err(ParseError::ParseError(
-                            "SET assignment missing value".into(),
-                        ));
-                    };
-                    sets.push(ast::Set {
-                        col_names: vec![col_name],
-                        expr,
-                    });
+                    let val = res_target.val.as_ref().ok_or_else(|| {
+                        ParseError::ParseError("SET assignment missing value".into())
+                    })?;
+                    self.push_set(&mut sets, exact_name(&res_target.name), val)?;
                 }
                 _ => {
                     return Err(ParseError::ParseError(
@@ -3224,17 +3225,41 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
                 self.translate_sublink(sub_link)
             }
+            Some(pg_query::protobuf::node::Node::RowExpr(row)) => {
+                // The engine reads a one-element row value as a parenthesized scalar,
+                // so ROW(1) = 1 would be true where PostgreSQL rejects it.
+                if row.args.len() < 2 {
+                    return Err(not_supported(
+                        "a ROW constructor with fewer than two values",
+                    ));
+                }
+                self.translate_row(row)
+            }
             Some(pg_query::protobuf::node::Node::NullTest(null_test)) => {
                 use pg_query::protobuf::NullTestType;
                 let arg = null_test
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string()))?;
-                let expr = self.translate_operand(arg)?;
-                match null_test.nulltesttype() {
-                    NullTestType::IsNotNull => Ok(ast::Expr::NotNull(Box::new(expr))),
-                    _ => Ok(ast::Expr::IsNull(Box::new(expr))),
+                let null_test_of = |expr: ast::Expr| match null_test.nulltesttype() {
+                    NullTestType::IsNotNull => ast::Expr::NotNull(Box::new(expr)),
+                    _ => ast::Expr::IsNull(Box::new(expr)),
+                };
+                if !matches!(arg.node, Some(pg_query::protobuf::node::Node::RowExpr(_))) {
+                    return Ok(null_test_of(self.translate_operand(arg)?));
                 }
+                // A row IS NULL when every value in it is null, and IS NOT NULL
+                // when every value in it is not null.
+                let ast::Expr::Parenthesized(values) = self.translate_expr(arg)? else {
+                    unreachable!("a ROW constructor translates to a row value");
+                };
+                Ok(values
+                    .into_iter()
+                    .map(|value| null_test_of(ast::Expr::Parenthesized(vec![value])))
+                    .reduce(|result, test| {
+                        ast::Expr::Binary(Box::new(result), ast::Operator::And, Box::new(test))
+                    })
+                    .expect("a ROW constructor has at least two values"))
             }
             Some(pg_query::protobuf::node::Node::ParamRef(param_ref)) => {
                 // $1, $2, etc. — translate to Variable("$N")
@@ -4171,7 +4196,8 @@ impl PostgreSQLTranslator {
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" | "INT8" => Some("INTEGER"),
+            "INT4" | "INT2" => Some("INTEGER"),
+            "INT8" => Some("BIGINT"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
             _ => None,
@@ -4519,7 +4545,9 @@ impl PostgreSQLTranslator {
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
-            SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ExprSublink | SubLinkType::MultiexprSublink => {
+                Ok(ast::Expr::Subquery(select))
+            }
             SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
                 let op = extract_key_columns(&sub_link.oper_name)?;
@@ -4878,18 +4906,10 @@ impl PostgreSQLTranslator {
                                     "ON CONFLICT DO UPDATE of an array element or composite field",
                                 ));
                             }
-                            let col_name = exact_name(&res_target.name);
-                            let expr = if let Some(val) = &res_target.val {
-                                Box::new(self.translate_expr(val)?)
-                            } else {
-                                return Err(ParseError::ParseError(
-                                    "ON CONFLICT SET missing value".into(),
-                                ));
-                            };
-                            sets.push(ast::Set {
-                                col_names: vec![col_name],
-                                expr,
-                            });
+                            let val = res_target.val.as_ref().ok_or_else(|| {
+                                ParseError::ParseError("ON CONFLICT SET missing value".into())
+                            })?;
+                            self.push_set(&mut sets, exact_name(&res_target.name), val)?;
                         }
                         _ => {
                             return Err(ParseError::ParseError(
@@ -4970,6 +4990,64 @@ impl PostgreSQLTranslator {
             do_clause,
             next: None,
         })))
+    }
+
+    /// Adds the assignment of `val` to `col_name` to the SET clause `sets`.
+    /// PostgreSQL splits `SET (a, b) = source` into one target per column, each
+    /// holding a `MultiAssignRef` with the column's position in the list.
+    fn push_set(
+        &self,
+        sets: &mut Vec<ast::Set>,
+        col_name: ast::Name,
+        val: &pg_query::protobuf::Node,
+    ) -> Result<(), ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(Node::MultiAssignRef(multi_assign)) = &val.node else {
+            sets.push(ast::Set {
+                col_names: vec![col_name],
+                expr: Box::new(self.translate_expr(val)?),
+            });
+            return Ok(());
+        };
+        if multi_assign.colno > 1 {
+            let set = sets
+                .last_mut()
+                .filter(|set| set.col_names.len() as i32 + 1 == multi_assign.colno)
+                .ok_or_else(|| {
+                    ParseError::ParseError("MultiAssignRef column out of order".into())
+                })?;
+            set.col_names.push(col_name);
+            return Ok(());
+        }
+        let source = multi_assign
+            .source
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("MultiAssignRef missing source".into()))?;
+        let expr = match &source.node {
+            Some(Node::RowExpr(row)) => self.translate_row(row)?,
+            Some(Node::SubLink(_)) => self.translate_expr(source)?,
+            _ => {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    message: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".into(),
+                })
+            }
+        };
+        sets.push(ast::Set {
+            col_names: vec![col_name],
+            expr: Box::new(expr),
+        });
+        Ok(())
+    }
+
+    fn translate_row(&self, row: &pg_query::protobuf::RowExpr) -> Result<ast::Expr, ParseError> {
+        let values = row
+            .args
+            .iter()
+            .map(|arg| self.translate_expr(arg).map(Box::new))
+            .collect::<Result<_, _>>()?;
+        Ok(ast::Expr::Parenthesized(values))
     }
 
     fn translate_order_by(
@@ -5168,25 +5246,24 @@ impl PostgreSQLTranslator {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    "cache" => {
-                        // Turso's disk-only sequence implementation never
-                        // caches values, so a `CACHE n` clause is otherwise
-                        // a no-op. We still validate the value against the
-                        // PostgreSQL contract (`CACHE` must be >= 1) so
-                        // that `CACHE 0` errors with the same message a
-                        // real PG server would produce. Surfacing the
-                        // requested value through to the runtime would
-                        // require resurrecting per-sequence in-memory
-                        // descriptor state we have intentionally removed
-                        // (see feedback-sequences-disk-only memory).
-                        if let Some(cache) = extract_def_elem_int(elem) {
-                            if cache < 1 {
-                                return Err(ParseError::ParseError(format!(
-                                    "CACHE ({cache}) must be greater than zero"
-                                )));
-                            }
+                    "cache" => match extract_def_elem_int(elem) {
+                        Some(1) => {}
+                        Some(cache) if cache < 1 => {
+                            return Err(ParseError::Sqlstate {
+                                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                                message: format!("CACHE ({cache}) must be greater than zero"),
+                            });
                         }
-                    }
+                        Some(cache) => {
+                            return Err(not_supported(format!(
+                                "CACHE {cache} (Turso sequences do not cache values, \
+                                 so CACHE must be 1)"
+                            )));
+                        }
+                        None => {
+                            return Err(not_supported("this CACHE value in CREATE SEQUENCE"));
+                        }
+                    },
                     "owned_by"
                         if matches!(
                             elem.arg.as_ref().and_then(|n| n.node.as_ref()),
@@ -6253,46 +6330,55 @@ fn translate_create_enum(
 
     let type_name = object_name(&enum_stmt.type_name, is_default_schema, "type")?;
 
-    // Extract enum labels
-    let mut labels = Vec::new();
+    // check_enum_labels checks the labels once the type's name is known to be
+    // free, as PostgreSQL does.
+    let mut labels: Vec<&str> = Vec::new();
     for val_node in &enum_stmt.vals {
-        if let Some(Node::String(s)) = &val_node.node {
-            labels.push(s.sval.clone());
-        } else {
+        let Some(Node::String(s)) = &val_node.node else {
             return Err(ParseError::ParseError(
                 "ENUM label must be a string literal".into(),
             ));
-        }
-    }
-    if labels.is_empty() {
-        return Err(ParseError::ParseError(
-            "ENUM type must have at least one label".into(),
-        ));
+        };
+        labels.push(&s.sval);
     }
 
     // Build: CASE WHEN value IN ('a','b','c') THEN value
-    //        ELSE RAISE(ABORT, 'invalid input value for enum <name>') END
-    let in_list: Vec<Box<ast::Expr>> = labels
-        .iter()
-        .map(|l| Box::new(ast::Expr::Literal(ast::Literal::String(format!("'{l}'")))))
-        .collect();
+    //        ELSE RAISE(ABORT, 'invalid input value for enum <name>: "' || value || '"') END
+    // An enum with no labels gets an empty IN list, which matches no value.
+    let string = |text: &str| {
+        Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+            "'{}'",
+            text.replace('\'', "''")
+        ))))
+    };
+    let in_list: Vec<Box<ast::Expr>> = labels.iter().map(|label| string(label)).collect();
 
-    let error_msg = format!("invalid input value for enum {type_name}");
+    let value = || Box::new(ast::Expr::Id(exact_name("value")));
+    let error_msg = ast::Expr::Binary(
+        Box::new(ast::Expr::Binary(
+            string(&format!(
+                "invalid input value for enum {}: \"",
+                crate::quote_identifier(&type_name)
+            )),
+            ast::Operator::Concat,
+            value(),
+        )),
+        ast::Operator::Concat,
+        string("\""),
+    );
     let encode = ast::Expr::Case {
         base: None,
         when_then_pairs: vec![(
             Box::new(ast::Expr::InList {
-                lhs: Box::new(ast::Expr::Id(exact_name("value"))),
+                lhs: value(),
                 not: false,
                 rhs: in_list,
             }),
-            Box::new(ast::Expr::Id(exact_name("value"))),
+            value(),
         )],
         else_expr: Some(Box::new(ast::Expr::Raise(
             ast::ResolveType::Abort,
-            Some(Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                "'{error_msg}'"
-            ))))),
+            Some(Box::new(error_msg)),
         ))),
     };
 
@@ -6512,8 +6598,10 @@ fn pg_type_name_to_ast_type(
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
+        | "REGCLASS" | "REGTYPE" => "INTEGER",
+        // Casts like INTEGER; the name types the result as int8.
+        "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
@@ -6894,6 +6982,46 @@ fn check_transaction_options(
     Ok(())
 }
 
+/// Refuses a `CREATE TYPE ... AS ENUM` whose labels PostgreSQL's
+/// EnumValuesCreate refuses: a label longer than 63 bytes, then a label given
+/// twice, which breaks pg_enum's unique index on (enumtypid, enumlabel).
+/// PostgreSQL creates the type before its labels, so a taken type name is
+/// reported first; call this after the statement is prepared.
+pub fn check_enum_labels(parse_result: &ParseResult) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::CreateEnumStmt(enum_stmt)) = nodes.first().map(|node| &node.0) else {
+        return Ok(());
+    };
+    let labels: Vec<&str> = enum_stmt
+        .vals
+        .iter()
+        .filter_map(|val_node| match &val_node.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    if let Some(label) = labels
+        .iter()
+        .find(|label| label.len() > MAX_IDENTIFIER_BYTES)
+    {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_NAME,
+            message: format!("invalid enum label \"{label}\""),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !labels.iter().all(|label| seen.insert(label)) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_UNIQUE_VIOLATION,
+            message: "duplicate key value violates unique constraint \"pg_enum_typid_label_index\""
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseError> {
     use pg_query::{protobuf::VariableSetKind, NodeRef};
 
@@ -7071,7 +7199,7 @@ pub fn unnamed_index_name<E>(
 }
 
 /// PostgreSQL keeps only the first 63 bytes (NAMEDATALEN - 1) of an
-/// identifier.
+/// identifier, and refuses an enum label longer than that.
 const MAX_IDENTIFIER_BYTES: usize = 63;
 
 /// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
@@ -8567,6 +8695,28 @@ mod tests {
             ),
         ] {
             assert_eq!(translate(sql).unwrap_err().to_string(), error, "{sql}");
+        }
+    }
+
+    #[test]
+    fn row_constructors_become_row_values() {
+        let translate = |sql: &str| {
+            PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .map(|stmt| stmt.to_string())
+        };
+        for (sql, expected) in [
+            ("SELECT (1, 2) = (1, 2)", "SELECT (1, 2) = (1, 2)"),
+            ("SELECT ROW(1, 2) = ROW(1, 2)", "SELECT (1, 2) = (1, 2)"),
+        ] {
+            assert_eq!(translate(sql).unwrap(), expected, "{sql}");
+        }
+        for sql in ["SELECT ROW(1) = 1", "SELECT ROW() = ROW()"] {
+            assert_eq!(
+                translate(sql).unwrap_err().to_string(),
+                "a ROW constructor with fewer than two values is not supported",
+                "{sql}"
+            );
         }
     }
 
@@ -12289,6 +12439,9 @@ mod tests {
             "CREATE SEQUENCE s MAXVALUE 99999999999999999999",
             "MAXVALUE value",
         );
+        assert_not_supported("CREATE SEQUENCE s CACHE 10", "CACHE 10");
+        assert_not_supported("CREATE SEQUENCE s CACHE 9999999999", "CACHE 9999999999");
+        assert_not_supported("CREATE SEQUENCE s CACHE 1.5", "CACHE value");
         assert_translates("CREATE SEQUENCE s OWNED BY NONE NO MINVALUE NO MAXVALUE CACHE 1");
 
         let parsed = crate::parse("CREATE SEQUENCE s AS integer START WITH 1").unwrap();

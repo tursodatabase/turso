@@ -377,7 +377,9 @@ fn invalid_argument_sqlstate(msg: &str) -> &'static str {
 
 /// The SQLSTATE of an error that a statement of the engine raised when it ran.
 fn sql_error_sqlstate(msg: &str) -> &'static str {
-    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time") {
+    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time")
+        || msg.contains("more than one row returned by a subquery used as an expression")
+    {
         SQLSTATE_CARDINALITY_VIOLATION
     } else {
         SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
@@ -405,8 +407,12 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
 }
 
 fn permission_denied_message(denial: &PermissionDenied) -> String {
-    if denial.reason == Reason::Owner {
-        return format!("must be owner of {}", object_name(&denial.object));
+    match (denial.reason, &denial.object) {
+        (Reason::Owner, object) => return format!("must be owner of {}", object_name(object)),
+        (Reason::Policy, Object::Table(name)) => {
+            return format!("new row violates row-level security policy for table \"{name}\"")
+        }
+        _ => {}
     }
     match (denial.action, &denial.object) {
         (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),

@@ -1,8 +1,11 @@
 @database :memory:
+@skip-file-if sqlite "SQLite does not support LATERAL"
 
 # LATERAL statements that PostgreSQL 16 also rejects, and a few edge
-# cases that it accepts.
-# The statements run through the PostgreSQL frontend (tursopg).
+# cases that it accepts. The default expect block of an error test has
+# the message of the SQLite frontend. The @tursopg and @postgres blocks
+# also have the SQLSTATE, which only these two backends report.
+# The statements run through both frontends.
 # PostgreSQL 16 gave every expected result.
 
 setup data {
@@ -18,151 +21,191 @@ setup data {
 test lateral-first-cannot-read-a-table-on-its-right {
     SELECT * FROM LATERAL (SELECT t1.a) AS s, t1;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "t1"
+    no such table: t1
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t1
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "t1"
 }
 
 @setup data
 test lateral-cannot-read-a-table-after-it-in-a-comma-list {
     SELECT * FROM t1, LATERAL (SELECT t2.c) AS s, t2;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "t2"
+    no such table: t2
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t2
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "t2"
 }
 
 @setup data
 test lateral-cannot-read-a-table-joined-after-it {
     SELECT * FROM t1 JOIN LATERAL (SELECT t2.c) AS s ON true JOIN t2 ON t2.a = t1.a;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "t2"
+    no such table: t2
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t2
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "t2"
 }
 
 @setup data
 test lateral-cannot-read-a-later-lateral {
     SELECT * FROM t1, LATERAL (SELECT u.v AS w) AS s, LATERAL (SELECT 1 AS v) AS u;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "u"
+    no such table: u
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: u
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "u"
 }
 
 @setup data
 test lateral-cannot-read-its-own-alias {
     SELECT * FROM t1, LATERAL (SELECT s.x AS x) AS s;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "s"
+    no such table: s
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: s
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "s"
 }
 
 @setup data
 test lateral-in-a-where-subquery-cannot-read-a-later-table {
     SELECT * FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c = t3.c) AS s, t3;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "t3"
+    no such table: t3
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t3
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "t3"
 }
 
 @setup data
 test nested-lateral-cannot-read-a-table-on-the-right-of-the-outer-lateral {
     SELECT * FROM t1, LATERAL (SELECT u.v FROM LATERAL (SELECT t3.c AS v) AS u) AS s, t3;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "t3"
+    no such table: t3
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t3
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "t3"
 }
 
 @setup data
 test lateral-cannot-read-a-table-name-hidden-by-an-alias {
     SELECT * FROM t1 AS x, LATERAL (SELECT t1.a AS v) AS s;
 }
-@sqlstate 42P01
 expect error {
-    invalid reference to FROM-clause entry for table "t1"
+    no such table: t1
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t1
+}
+@sqlstate 42P01
+expect @postgres error {
+    invalid reference to FROM-clause entry for table "t1"
 }
 
 @setup data
 test lateral-cannot-read-an-unknown-column-of-the-left-table {
     SELECT * FROM t1, LATERAL (SELECT t1.z AS v) AS s;
 }
-@sqlstate 42703
 expect error {
-    column t1\.z does not exist
+    no such column: t1\.z
 }
 @sqlstate 42703
 expect @tursopg error {
     no such column: t1\.z
+}
+@sqlstate 42703
+expect @postgres error {
+    column t1\.z does not exist
 }
 
 @setup data
 test lateral-cannot-read-an-unknown-table {
     SELECT * FROM t1, LATERAL (SELECT t9.a AS v) AS s;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "t9"
+    no such table: t9
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t9
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "t9"
 }
 
 @setup data
 test lateral-ambiguous-unqualified-column {
     SELECT * FROM t1, t2, LATERAL (SELECT a AS v) AS s;
 }
-@sqlstate 42702
 expect error {
-    column reference "a" is ambiguous
+    ambiguous column name: a
 }
 @sqlstate 42702
 expect @tursopg error {
     ambiguous column name: a
+}
+@sqlstate 42702
+expect @postgres error {
+    column reference "a" is ambiguous
 }
 
 @setup data
 test right-join-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT t1.a AS v) AS s ON true;
 }
-@sqlstate 42P10
 expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+@sqlstate 42P10
+expect @tursopg error {
+    invalid reference to FROM-clause entry for table "t1"
+}
+@sqlstate 42P10
+expect @postgres error {
     invalid reference to FROM-clause entry for table "t1"
 }
 
@@ -170,8 +213,15 @@ expect error {
 test right-outer-join-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 RIGHT OUTER JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
 }
-@sqlstate 42P10
 expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+@sqlstate 42P10
+expect @tursopg error {
+    invalid reference to FROM-clause entry for table "t1"
+}
+@sqlstate 42P10
+expect @postgres error {
     invalid reference to FROM-clause entry for table "t1"
 }
 
@@ -179,8 +229,15 @@ expect error {
 test full-join-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 FULL JOIN LATERAL (SELECT t1.a AS v) AS s ON true;
 }
-@sqlstate 42P10
 expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+@sqlstate 42P10
+expect @tursopg error {
+    invalid reference to FROM-clause entry for table "t1"
+}
+@sqlstate 42P10
+expect @postgres error {
     invalid reference to FROM-clause entry for table "t1"
 }
 
@@ -188,8 +245,15 @@ expect error {
 test full-outer-join-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 FULL OUTER JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
 }
-@sqlstate 42P10
 expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+@sqlstate 42P10
+expect @tursopg error {
+    invalid reference to FROM-clause entry for table "t1"
+}
+@sqlstate 42P10
+expect @postgres error {
     invalid reference to FROM-clause entry for table "t1"
 }
 
@@ -197,8 +261,15 @@ expect error {
 test right-join-lateral-cannot-read-the-left-table-in-a-nested-subquery {
     SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT (SELECT t1.a) AS v) AS s ON true;
 }
-@sqlstate 42P10
 expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+@sqlstate 42P10
+expect @tursopg error {
+    invalid reference to FROM-clause entry for table "t1"
+}
+@sqlstate 42P10
+expect @postgres error {
     invalid reference to FROM-clause entry for table "t1"
 }
 
@@ -206,8 +277,15 @@ expect error {
 test sum-of-only-left-columns-is-not-allowed {
     SELECT * FROM t1, LATERAL (SELECT sum(t1.a) AS v) AS s;
 }
-@sqlstate 42803
 expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @tursopg error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @postgres error {
     aggregate functions are not allowed in FROM clause of their own query level
 }
 
@@ -215,8 +293,15 @@ expect error {
 test count-of-only-left-columns-is-not-allowed {
     SELECT * FROM t1, LATERAL (SELECT count(t1.a) AS v FROM t2) AS s;
 }
-@sqlstate 42803
 expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @tursopg error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @postgres error {
     aggregate functions are not allowed in FROM clause of their own query level
 }
 
@@ -224,8 +309,15 @@ expect error {
 test max-of-only-left-columns-is-not-allowed {
     SELECT * FROM t1, LATERAL (SELECT max(t1.b) AS v FROM t2 WHERE t2.a = t1.a) AS s;
 }
-@sqlstate 42803
 expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @tursopg error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @postgres error {
     aggregate functions are not allowed in FROM clause of their own query level
 }
 
@@ -233,8 +325,15 @@ expect error {
 test aggregate-of-left-columns-in-left-join-lateral-is-not-allowed {
     SELECT * FROM t1 LEFT JOIN LATERAL (SELECT min(t1.a) AS v) AS s ON true;
 }
-@sqlstate 42803
 expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @tursopg error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+@sqlstate 42803
+expect @postgres error {
     aggregate functions are not allowed in FROM clause of their own query level
 }
 
@@ -242,86 +341,111 @@ expect error {
 test aggregate-in-where-of-lateral-is-not-allowed {
     SELECT * FROM t1, LATERAL (SELECT c FROM t2 WHERE count(*) > 1) AS s;
 }
-@sqlstate 42803
 expect error {
-    aggregate functions are not allowed in WHERE
+    misuse of aggregate function count\(\*\)
 }
 @sqlstate 42803
 expect @tursopg error {
     misuse of aggregate function count\(\*\)
+}
+@sqlstate 42803
+expect @postgres error {
+    aggregate functions are not allowed in WHERE
 }
 
 @setup data
 test subquery-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1, (SELECT t1.a AS v) AS s;
 }
-@sqlstate 42P01
 expect error {
-    invalid reference to FROM-clause entry for table "t1"
+    no such table: t1
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t1
+}
+@sqlstate 42P01
+expect @postgres error {
+    invalid reference to FROM-clause entry for table "t1"
 }
 
 @setup data
 test joined-subquery-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 JOIN (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
 }
-@sqlstate 42P01
 expect error {
-    invalid reference to FROM-clause entry for table "t1"
+    no such table: t1
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t1
+}
+@sqlstate 42P01
+expect @postgres error {
+    invalid reference to FROM-clause entry for table "t1"
 }
 
 @setup data
 test left-joined-subquery-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 LEFT JOIN (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
 }
-@sqlstate 42P01
 expect error {
-    invalid reference to FROM-clause entry for table "t1"
+    no such table: t1
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t1
+}
+@sqlstate 42P01
+expect @postgres error {
+    invalid reference to FROM-clause entry for table "t1"
 }
 
 @setup data
 test subquery-without-lateral-cannot-read-an-earlier-lateral {
     SELECT * FROM t1, LATERAL (SELECT t1.a AS v) AS x, (SELECT x.v AS w) AS y;
 }
-@sqlstate 42P01
 expect error {
-    invalid reference to FROM-clause entry for table "x"
+    no such table: x
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: x
+}
+@sqlstate 42P01
+expect @postgres error {
+    invalid reference to FROM-clause entry for table "x"
 }
 
 @setup data
 test values-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1, (VALUES (t1.a)) AS s;
 }
-@sqlstate 42P01
 expect error {
-    invalid reference to FROM-clause entry for table "t1"
+    no such table: t1
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: t1
+}
+@sqlstate 42P01
+expect @postgres error {
+    invalid reference to FROM-clause entry for table "t1"
 }
 
 @setup data
 test lateral-before-a-table-name-is-a-syntax-error {
     SELECT * FROM t1, LATERAL t2;
 }
-@sqlstate 42601
 expect error {
+    no such table: LATERAL
+}
+@sqlstate 42601
+expect @tursopg error {
+    syntax error at or near ";"
+}
+@sqlstate 42601
+expect @postgres error {
     syntax error at or near ";"
 }
 
@@ -329,8 +453,15 @@ expect error {
 test lateral-without-a-subquery-is-a-syntax-error {
     SELECT * FROM t1, LATERAL;
 }
-@sqlstate 42601
 expect error {
+    no such table: LATERAL
+}
+@sqlstate 42601
+expect @tursopg error {
+    syntax error at or near ";"
+}
+@sqlstate 42601
+expect @postgres error {
     syntax error at or near ";"
 }
 
@@ -338,8 +469,15 @@ expect error {
 test lateral-before-a-select-without-parentheses-is-a-syntax-error {
     SELECT * FROM t1, LATERAL SELECT 1;
 }
-@sqlstate 42601
 expect error {
+    near "SELECT": syntax error
+}
+@sqlstate 42601
+expect @tursopg error {
+    syntax error at or near "SELECT"
+}
+@sqlstate 42601
+expect @postgres error {
     syntax error at or near "SELECT"
 }
 
@@ -347,13 +485,16 @@ expect error {
 test on-clause-cannot-read-a-later-lateral {
     SELECT * FROM t1 JOIN t2 ON t2.c = s.v, LATERAL (SELECT t1.a * 10 AS v) AS s;
 }
-@sqlstate 42P01
 expect error {
-    missing FROM-clause entry for table "s"
+    no such table: s
 }
 @sqlstate 42P01
 expect @tursopg error {
     no such table: s
+}
+@sqlstate 42P01
+expect @postgres error {
+    missing FROM-clause entry for table "s"
 }
 
 @setup data

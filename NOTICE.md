@@ -8,6 +8,15 @@ Please visit our GitHub for more information:
 Dependencies
 ============
 
+This project depends on rustls, rustls-native-certs, and tokio-rustls, distributed by the rustls project:
+
+* License: licenses/bindings/rust/rustls-mit-license.md (MIT License)
+* License: licenses/bindings/rust/rustls-native-certs-mit-license.md (MIT License)
+* License: licenses/bindings/rust/tokio-rustls-mit-license.md (MIT License)
+* Homepage: https://github.com/rustls/rustls
+* Homepage: https://github.com/rustls/rustls-native-certs
+* Homepage: https://github.com/rustls/tokio-rustls
+
 This product depends on Error Prone, distributed by the Error Prone project:
 
 * License: licenses/bindings/java/assertj-license.md (Apache License v2.0)

@@ -18,11 +18,12 @@ pub mod engine;
 pub(crate) use engine::EngineDialect;
 
 use crate::{
+    function::ScalarFunc,
     namespace::NamespaceId,
     schema::{BTreeTable, RelationKind, Schema},
     security::roles::RoleId,
-    vdbe::builder::ProgramBuilder,
-    Connection, Func, LimboError, OpenOptions, Result, Value,
+    vdbe::{builder::ProgramBuilder, Register},
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
@@ -68,6 +69,13 @@ pub enum RelationChange {
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
+    /// `enabled` is false.
+    SetRowSecurity {
+        namespace: NamespaceId,
+        name: String,
+        enabled: bool,
+    },
 }
 
 /// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
@@ -79,6 +87,16 @@ pub enum NewOwner {
     Table(Option<String>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// What a built-in scalar function may read besides its arguments.
+pub struct ScalarFuncContext<'a> {
+    pub connection: &'a Connection,
+    pub io: &'a dyn IO,
+    /// The statement's clock: every function of one step sees the same time.
+    pub clock: &'a dyn Clock,
+    /// The collation of the call site, for functions that compare arguments.
+    pub collation: CollationSeq,
 }
 
 /// SQL dialect layered on top of the engine.
@@ -216,6 +234,21 @@ pub trait Dialect: Send + Sync + 'static {
         engine::resolve_builtin_function(name, arg_count)
     }
 
+    /// Run built-in scalar function `func` on the registers that hold its
+    /// arguments.
+    ///
+    /// The default runs the shared implementation in
+    /// [`engine::call_builtin_scalar`]; a dialect overrides it for the
+    /// functions whose behavior differs and delegates the rest.
+    fn call_scalar(
+        &self,
+        context: &ScalarFuncContext<'_>,
+        func: &ScalarFunc,
+        args: &[Register],
+    ) -> Result<Value> {
+        engine::call_builtin_scalar(context, func, args)
+    }
+
     /// Execute a dialect scalar function at runtime.
     ///
     /// Receives the connection — unlike extension functions — because
@@ -315,8 +348,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership or privileges and refuses `ALTER ... OWNER TO`,
-    /// `ALTER SEQUENCE ... OWNED BY` and `GRANT`.
+    /// has no ownership, privileges or row-level security and refuses
+    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT` and
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`.
     fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -345,6 +379,11 @@ pub trait Dialect: Send + Sync + 'static {
                 }
                 RelationChange::Grant { .. } => {
                     return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                }
+                RelationChange::SetRowSecurity { .. } => {
+                    return Err(LimboError::ParseError(
+                        "row-level security is not supported".to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -401,6 +440,13 @@ pub trait Dialect: Send + Sync + 'static {
         true
     }
 
+    /// Whether table `name` of `namespace` has row-level security enabled.
+    /// A dialect without row-level security never has it enabled.
+    fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        let _ = (schema, namespace, name);
+        false
+    }
+
     /// Whether `PRAGMA capture_data_changes_conn` may create its change
     /// tables in a database of this dialect.
     ///
@@ -428,6 +474,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL raises an error so that the result does not depend on the
     /// order of the proposed rows. SQLite updates the row again.
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
+
+    /// Whether a subquery used as an expression, such as `x = (SELECT ...)`,
+    /// raises an error when it returns more than one row.
+    ///
+    /// PostgreSQL raises SQLSTATE 21000. SQLite uses the first row.
+    fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
         false
     }
 
@@ -989,6 +1043,87 @@ mod tests {
         fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
             Ok(None)
         }
+    }
+
+    /// A dialect that resolves the built-in names but runs `upper` its own
+    /// way, as a frontend does for a built-in whose behavior differs in its
+    /// dialect.
+    struct ShoutingUpperDialect;
+
+    impl Dialect for ShoutingUpperDialect {
+        fn name(&self) -> &'static str {
+            "shouting"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            engine::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+            engine::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            engine::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            _input: &str,
+            tbl_name: &QualifiedName,
+            body: &CreateTableBody,
+        ) -> Result<String> {
+            engine::format_table_sql(tbl_name, body)
+        }
+
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
+            engine::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+            engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn call_scalar(
+            &self,
+            context: &ScalarFuncContext<'_>,
+            func: &ScalarFunc,
+            args: &[Register],
+        ) -> Result<Value> {
+            let value = engine::call_builtin_scalar(context, func, args)?;
+            if !matches!(func, ScalarFunc::Upper) {
+                return Ok(value);
+            }
+            Ok(Value::build_text(format!("{value}!")))
+        }
+    }
+
+    #[test]
+    fn dialect_owns_builtin_scalar_function_behavior() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-shouting.db", Arc::new(ShoutingUpperDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+
+        conn.execute("CREATE TABLE t (s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('hi')").unwrap();
+        let rows = conn
+            .prepare("SELECT upper(s), lower('ABC'), abs(-7) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::build_text("HI!"),
+                Value::build_text("abc"),
+                Value::from_i64(7),
+            ]]
+        );
+        conn.close().unwrap();
     }
 
     #[test]

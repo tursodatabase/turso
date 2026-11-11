@@ -442,6 +442,7 @@ pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } if *num_regs > 1 && idx < *num_regs => Ok(Cow::Owned(Expr::SubqueryResult {
             subquery_id: *subquery_id,
@@ -450,10 +451,35 @@ pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_
             query_type: ast::SubqueryType::RowValue {
                 result_reg_start: result_reg_start + idx,
                 num_regs: 1,
+                row_count_reg: *row_count_reg,
             },
         })),
         _ => Ok(Cow::Borrowed(expr)),
     }
+}
+
+/// Writes the `len` components of the row value `expr` into the registers
+/// starting at `start_reg`. Each component is translated as one value, so a
+/// row value nested inside another is "row value misused", as in SQLite.
+pub(super) fn translate_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &Expr,
+    len: usize,
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for idx in 0..len {
+        let component = row_value_component_expr(expr, idx)?;
+        translate_expr(
+            program,
+            referenced_tables,
+            &component,
+            start_reg + idx,
+            resolver,
+        )?;
+    }
+    Ok(())
 }
 
 /// The number of components [row_value_component_expr] splits `expr` into.

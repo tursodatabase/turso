@@ -39,6 +39,7 @@ pub mod operations;
 pub mod properties;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod protocol;
+pub mod swarm;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod worker;
 pub mod workloads;

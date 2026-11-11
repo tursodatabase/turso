@@ -1,7 +1,9 @@
 @database :memory:
+@skip-file-if sqlite "SQLite does not support LATERAL"
 
 # NULL values in the left side, in join keys and in IN lists of LATERAL
 # subqueries.
+# The statements run through both frontends.
 # PostgreSQL 16 gave every expected result.
 
 setup data {

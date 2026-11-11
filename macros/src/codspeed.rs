@@ -3,9 +3,26 @@ use quote::quote;
 use syn::visit_mut::{self, VisitMut};
 use syn::{parse_macro_input, Expr, ExprCall, ExprMethodCall, ItemFn, LitStr};
 
-pub(crate) fn divan_bench_attribute(attr: TokenStream, input: TokenStream) -> TokenStream {
+pub(crate) enum DivanCalls {
+    Batched,
+    Single,
+}
+
+pub(crate) fn divan_bench_attribute(
+    attr: TokenStream,
+    input: TokenStream,
+    calls: DivanCalls,
+) -> TokenStream {
     let attr = proc_macro2::TokenStream::from(attr);
-    let function = parse_macro_input!(input as ItemFn);
+    let mut function = parse_macro_input!(input as ItemFn);
+    match calls {
+        DivanCalls::Batched => {
+            if let Err(error) = pass_turso_bencher(&mut function) {
+                return error.to_compile_error().into();
+            }
+        }
+        DivanCalls::Single => {}
+    }
     let nightly_name = LitStr::new(
         &format!("{} nightly", function.sig.ident),
         function.sig.ident.span(),
@@ -29,6 +46,35 @@ pub(crate) fn divan_bench_attribute(attr: TokenStream, input: TokenStream) -> To
         #function
     }
     .into()
+}
+
+/// divan calls the function with a `divan::Bencher`. This makes the function take
+/// that type and hand its body a `turso_benches::Bencher` instead, which measures
+/// many calls at once in CodSpeed builds. Helpers that the body passes the bencher
+/// to get the same type, so they can't measure a single call by accident.
+fn pass_turso_bencher(function: &mut ItemFn) -> syn::Result<()> {
+    let Some(syn::FnArg::Typed(param)) = function.sig.inputs.first_mut() else {
+        return Err(syn::Error::new_spanned(
+            &function.sig,
+            "divan_bench functions take a `turso_benches::Bencher` as their first parameter",
+        ));
+    };
+    let syn::Pat::Ident(name) = param.pat.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &param.pat,
+            "expected a plain name for the bencher parameter",
+        ));
+    };
+    let name = name.ident.clone();
+    let ty = std::mem::replace(
+        param.ty.as_mut(),
+        syn::parse_quote!(::divan::Bencher<'_, '_>),
+    );
+    function.block.stmts.insert(
+        0,
+        syn::parse_quote!(let #name: #ty = ::turso_benches::Bencher::new(#name);),
+    );
+    Ok(())
 }
 
 pub(crate) fn criterion_benchmark_attribute(attr: TokenStream, input: TokenStream) -> TokenStream {
