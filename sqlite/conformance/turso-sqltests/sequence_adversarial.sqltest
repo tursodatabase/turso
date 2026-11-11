@@ -14,6 +14,7 @@
 # `__turso_internal_seq___turso_internal_autoincrement_<table>` survived
 # DROP TABLE and the new table resumed nextval from the old watermark).
 test drop-table-removes-autoincrement-backing-table {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
     INSERT INTO t(v) VALUES('a'),('b'),('c');
     DROP TABLE t;
@@ -102,6 +103,7 @@ expect {
 # session); covered separately for MVCC where the in-memory rename is
 # load-bearing.
 test alter-rename-autoincrement-table-preserves-watermark {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
     INSERT INTO old(v) VALUES('a'),('b');
     ALTER TABLE old RENAME TO new;

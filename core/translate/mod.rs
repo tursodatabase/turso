@@ -128,6 +128,12 @@ pub fn translate(
             | crate::statement::StatementOrigin::EngineMetadataRead
             | crate::statement::StatementOrigin::EngineSchemaWrite
     );
+    // Ordinary statements must not see Turso's internal bookkeeping tables when they
+    // scan sqlite_schema; engine statements (schema reparse, recovery, …) still do, as
+    // does a connection that opted in with PRAGMA show_internal_schema.
+    program.set_hide_internal_schema_rows(
+        !is_engine_statement && !connection.get_show_internal_schema(),
+    );
     let search_path = if is_engine_statement {
         None
     } else {
