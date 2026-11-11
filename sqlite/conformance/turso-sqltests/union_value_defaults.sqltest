@@ -1,0 +1,25 @@
+@database :memory:
+@requires-file custom_types "UNION defaults require custom types support"
+
+test union-value-column-default-insert-read-integrity {
+    CREATE TYPE number AS UNION(i INTEGER, label TEXT);
+    CREATE TABLE tagged(id INTEGER PRIMARY KEY, val number DEFAULT (union_value('i', 42))) STRICT;
+    SELECT * FROM tagged;
+    INSERT INTO tagged(id) VALUES (1);
+    SELECT id, union_tag(val), val.i FROM tagged;
+    PRAGMA integrity_check;
+}
+expect {
+    1|i|42
+    ok
+}
+
+test union-value-column-default-on-replace {
+    CREATE TYPE number AS UNION(i INTEGER, label TEXT);
+    CREATE TABLE tagged(id INTEGER PRIMARY KEY, val number NOT NULL ON CONFLICT REPLACE DEFAULT (union_value('i', 7))) STRICT;
+    INSERT INTO tagged VALUES (1, NULL);
+    SELECT id, union_tag(val), val.i FROM tagged;
+}
+expect {
+    1|i|7
+}
