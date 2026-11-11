@@ -1558,3 +1558,17 @@ test omitted-nullable-uuid-column-stays-null {
 expect {
     1|t
 }
+
+test table-drop-missing-column-from-table-without-columns {
+    CREATE TABLE t_no_columns (CONSTRAINT x CHECK (1 > 0));
+    ALTER TABLE t_no_columns DROP c;
+}
+@sqlstate 42703
+expect error {}
+
+test table-drop-missing-column-from-one-column-table {
+    CREATE TABLE t_one_column (a int);
+    ALTER TABLE t_one_column DROP c;
+}
+@sqlstate 42703
+expect error {}
