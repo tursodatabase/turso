@@ -150,7 +150,12 @@ a table, view or materialized view only when it owns it or `SELECT` on it
 was granted to it or to `PUBLIC`; otherwise reading it, directly or through
 a join, subquery or CTE, fails with `permission denied for table` (SQLSTATE
 42501). As in PostgreSQL, a view's tables are read as the view's owner, so
-`SELECT` on a view is enough when its owner may read its tables.
+`SELECT` on a view is enough when its owner may read its tables. The
+engine's own tables, which have no row in `pg_class`, can only be read and
+written by a superuser: the `__turso_internal_*` tables, which hold catalogs
+such as the roles and the privileges of each table, and `sqlite_sequence`.
+Roles read the catalogs through `pg_class`, `pg_roles` and the other
+`pg_catalog` views.
 
 The privileges are stored in the database file, in the table's access
 control list, which `pg_class.relacl` shows in PostgreSQL's form: after
@@ -192,8 +197,10 @@ gets `permission denied for table` (SQLSTATE 42501), unless the list gives
 it a privilege on the table, when the statement succeeds and stores
 nothing, as in PostgreSQL, which warns. `ALL TABLES IN SCHEMA` grants
 on the tables, views and materialized views of the schema, not on its
-sequences, and `ALL SEQUENCES IN SCHEMA` only on its sequences. A catalog table such as `pg_catalog.pg_class` can be named, but
-nothing is stored for it. `ALTER ... OWNER TO` puts the new owner in the
+sequences, and `ALL SEQUENCES IN SCHEMA` only on its sequences. A catalog view such as `pg_catalog.pg_class` can be named, but
+nothing is stored for it, since every role reads it already. `GRANT` on one
+of the engine's own tables, such as `pg_catalog.__turso_internal_roles`,
+fails as not supported (SQLSTATE 0A000). `ALTER ... OWNER TO` puts the new owner in the
 new owner's place in the list, and a rename keeps it.
 
 `SELECT`, `INSERT`, `UPDATE` and `DELETE` let a role read and write the

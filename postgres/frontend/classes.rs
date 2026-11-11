@@ -46,7 +46,7 @@ use turso_core::{
 use turso_parser::ast;
 
 use turso_core::MAIN_DB_ID;
-use turso_pg_parser::sqlstate::SQLSTATE_INVALID_GRANT_OPERATION;
+use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_GRANT_OPERATION};
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
@@ -461,9 +461,9 @@ pub(crate) fn relation_owner(
 
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// the owner has every privilege, and another role has the ones the list
-/// gives it, by oid or through PUBLIC. A relation without a class row is the
-/// engine's, such as a catalog table, and every role reads it, but only a
-/// superuser writes it.
+/// gives it, by oid or through PUBLIC. A table without a class row is one of
+/// the engine's own, such as `__turso_internal_roles` or `sqlite_sequence`,
+/// and only a superuser uses it, because nothing says who else may.
 pub(crate) fn role_has_privilege(
     schema: &Schema,
     namespace: NamespaceId,
@@ -474,7 +474,7 @@ pub(crate) fn role_has_privilege(
     let Some(class) =
         class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
     else {
-        return privilege == ast::Privilege::Select;
+        return false;
     };
     if class.relowner == role {
         return true;
@@ -728,11 +728,20 @@ pub(crate) fn translate_relation_changes(
                     .iter()
                     .map(|grantee| resolve_grantee(schema, connection, grantee))
                     .collect::<turso_core::Result<Vec<_>>>()?;
-                // A relation without a class row is the engine's, such as a
-                // catalog table, and every role may read it already.
+                // A relation without a class row has no list to store the
+                // privileges in. Every role reads the pg_catalog views
+                // already, so a GRANT on one changes nothing. Only a
+                // superuser uses the engine's own tables, so a GRANT on one
+                // would claim access it does not give, and is refused.
                 let Some(class) =
                     class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
                 else {
+                    if schema.get_btree_table(*namespace, name).is_some() {
+                        return Err(sqlstate_error(
+                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            format!("GRANT on internal table {name} is not supported"),
+                        ));
+                    }
                     continue;
                 };
                 // `ON TABLE` may name a sequence, so USAGE is refused here,
