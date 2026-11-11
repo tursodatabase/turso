@@ -1,4 +1,5 @@
 using System.Net;
+using System.Data.Common;
 using AwesomeAssertions;
 
 namespace Turso.Tests;
@@ -70,6 +71,52 @@ public sealed class TursoSyncEncryptionTests
         connection.Invoking(c => c.CreateReplicaOptions().Validate()).Should().Throw<ArgumentException>();
     }
 
+    [TestCase(false, "Local Encryption Key", "")]
+    [TestCase(false, "LocalEncryptionKey", " ")]
+    [TestCase(false, "Local Encryption Key", "\"\"")]
+    [TestCase(true, "Local Encryption Key", "")]
+    [TestCase(true, "LocalEncryptionKey", " ")]
+    [TestCase(true, "Local Encryption Key", "\"\"")]
+    public void ProviderFactoryRejectsBlankLocalEncryptionKeys(bool sqlite, string keyword, string value)
+    {
+        DbProviderFactory factory = sqlite ? Turso.Data.Sqlite.SqliteFactory.Instance : TursoFactory.Instance;
+        var builder = factory.CreateConnectionStringBuilder()!;
+        var connectionString = ConnectionString("replica.db", "cloud-key", null) + $";{keyword}={value}";
+        Action parse = () =>
+        {
+            builder.ConnectionString = connectionString;
+            using var connection = new TursoConnection(builder.ConnectionString);
+            connection.CreateReplicaOptions().Validate();
+        };
+
+        parse.Should().Throw<Exception>();
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ProviderFactoryCanExplicitlyOmitLocalEncryptionKey(bool sqlite)
+    {
+        DbProviderFactory factory = sqlite ? Turso.Data.Sqlite.SqliteFactory.Instance : TursoFactory.Instance;
+        var builder = factory.CreateConnectionStringBuilder()!;
+        builder.ConnectionString = ConnectionString("replica.db", "cloud-key", new string('1', 64));
+
+        using (var encrypted = new TursoConnection(builder.ConnectionString))
+        {
+            var options = encrypted.CreateReplicaOptions();
+            options.Validate();
+            options.LocalEncryptionKey.Should().Be(new string('1', 64));
+        }
+
+        Action remove = () => builder.Remove("LocalEncryptionKey");
+        remove.Should().Throw<InvalidOperationException>();
+        builder["LocalEncryptionKey"] = null;
+
+        using var plaintext = new TursoConnection(builder.ConnectionString);
+        var plaintextOptions = plaintext.CreateReplicaOptions();
+        plaintextOptions.Validate();
+        plaintextOptions.LocalEncryptionKey.Should().BeNull();
+    }
+
     [Test]
     public void OmittedLocalKeyKeepsPlaintextConfiguration()
     {
@@ -87,6 +134,52 @@ public sealed class TursoSyncEncryptionTests
         using var connection = new TursoConnection($"Data Source=:memory:;{keyword}=");
         connection.Open();
         connection.State.Should().Be(System.Data.ConnectionState.Open);
+    }
+
+    [TestCase("Local Encryption Key")]
+    [TestCase("LocalEncryptionKey")]
+    public async Task SqliteProviderForwardsLocalEncryptionKey(string keyword)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "turso-encryption-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "replica.db");
+        var key = new string('1', 64);
+        var cloudKey = Convert.ToBase64String(Enumerable.Repeat((byte)11, 32).ToArray());
+        using var handler = new EmptyEncryptedSource(cloudKey);
+        using var http = new HttpClient(handler);
+        TursoConnection.SyncHttpClientFactory = () => http;
+        try
+        {
+            var builder = new Turso.Data.Sqlite.SqliteConnectionStringBuilder(
+                ConnectionString(path, cloudKey, null));
+            builder[keyword] = key;
+            using var connection = new Turso.Data.Sqlite.SqliteConnection(builder.ConnectionString);
+            await connection.OpenAsync();
+            File.ReadAllBytes(path + "-info").Take(8).Should().Equal("TSYNMETA"u8.ToArray());
+        }
+        finally
+        {
+            TursoConnection.SyncHttpClientFactory = null;
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [TestCase("")]
+    [TestCase(" ")]
+    [TestCase("1111111111111111111111111111111111111111111111111111111111111111")]
+    public void SqliteProviderRejectsReplicaKeyForStandaloneDatabase(string key)
+    {
+        var builder = new System.Data.Common.DbConnectionStringBuilder
+        {
+            ["Data Source"] = ":memory:",
+            ["Local Encryption Key"] = key,
+        };
+        Action open = () =>
+        {
+            using var connection = new Turso.Data.Sqlite.SqliteConnection(builder.ConnectionString);
+            connection.Open();
+        };
+        open.Should().Throw<Exception>();
     }
 
     private static string ConnectionString(string path, string cloudKey, string? localKey)
