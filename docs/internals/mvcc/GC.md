@@ -75,10 +75,10 @@ Finalize, and its mode is always TRUNCATE. When it gets to Finalize:
 - No pager reader is at an older WAL position. Such a reader makes the WAL
   truncation return `Busy`, and the checkpoint stops before Finalize.
 
-No reader needs the store then, so Finalize does not apply the chain rules. It
-removes every version and every slot with `clear_row_versions`. This includes
-versions that the chain rules never remove: a version stays unstamped when an
-earlier checkpoint stopped after its pager commit and before `GcTableRows`.
+No reader needs the store then. The checkpoint skips `GcTableRows` and
+`GcIndexRows`, so it sets no stamp and applies no chain rule. Finalize removes
+every version and every slot with `clear_row_versions`. This includes the
+versions of an earlier checkpoint that stopped after its pager commit.
 
 ## Materialization stamps
 
@@ -86,7 +86,9 @@ Stamps are **not** applied when a row is handed to the pager. They run in
 `GcTableRows` / `GcIndexRows` after `CommitPagerTxn`, and only for keys whose
 pager write or delete finished (`written_table_rowids` /
 `written_index_slots`). Skip-writes stay `ORIGIN`, so a high `ckpt_max` alone
-never means "this leaf was written."
+never means "this leaf was written." A checkpoint without
+`experimental_mvcc_passive_checkpoint` skips both states, so its versions stay
+`ORIGIN` until Finalize removes them.
 
 ## Lock order
 
@@ -99,7 +101,7 @@ clock while holding a chain lock. Passive publish takes the clock then
 
 1. **Incremental** (`gc_incremental` on commit): bounded table + index sweeps.
 2. **Checkpoint write-set** (`gc_checkpointed_*`): stamp then GC keys this
-   checkpoint wrote.
+   checkpoint wrote. Only with `experimental_mvcc_passive_checkpoint`.
 3. **Finalize**: without `experimental_mvcc_passive_checkpoint`, the checkpoint
    clears the store with `clear_row_versions`. With the flag, an explicit
    TRUNCATE uses `drop_unused_row_versions_and_slots` and Passive uses
@@ -109,8 +111,10 @@ clock while holding a chain lock. Passive publish takes the clock then
 
 `chain_is_write_buffer_for` is false only for a sole stamped current inside
 the durable bound. Truncate may fall through to the B-tree for that shape
-when no checkpoint is in progress. Passive never falls through for live
-readers; it keeps SkipMap cover until idle Rule 3 clears the chain.
+when no checkpoint is in progress. A blocking checkpoint sets no stamp, so a
+store without `experimental_mvcc_passive_checkpoint` does not have that shape.
+Passive never falls through for live readers; it keeps SkipMap cover until
+idle Rule 3 clears the chain.
 
 Hazards still guarded by Rule 2:
 
