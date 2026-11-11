@@ -472,27 +472,38 @@ fn a_rolled_back_grant_leaves_the_list_as_it_was(db: TempDatabase) {
 /// one made it: six columns, no `relacl`, and a class row for the table
 /// `app.t`, written by hand.
 fn write_catalog_without_relacl(path: &str) {
-    write_old_catalog(path, false);
+    write_old_catalog(path, "");
 }
 
 /// Writes a database at `path` with the catalog as tursopg made it before
 /// row-level security: `relacl` but no `relrowsecurity`.
 fn write_catalog_without_relrowsecurity(path: &str) {
-    write_old_catalog(path, true);
+    write_old_catalog(path, "relacl");
 }
 
-/// Writes a database at `path` with a catalog that has no `relrowsecurity`,
-/// and no `relacl` either unless `with_relacl`, and a class row for the
+/// Writes a database at `path` with the catalog as tursopg made it before
+/// policies: `relacl` and `relrowsecurity` but no `relpolicies`.
+fn write_catalog_without_relpolicies(path: &str) {
+    write_old_catalog(path, "relrowsecurity");
+}
+
+/// Writes a database at `path` with a catalog that has the columns of the
+/// first catalog and the later ones up to `last_column`: none for "",
+/// `relacl`, or `relacl` and `relrowsecurity`. It has a class row for the
 /// table `app.t`, written by hand.
-fn write_old_catalog(path: &str, with_relacl: bool) {
+fn write_old_catalog(path: &str, last_column: &str) {
     let db = open_without_catalog(path);
     let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
     conn.create_namespace("app").unwrap();
     let app = conn.qualifier("app").unwrap().target.id.as_u32();
-    let (relacl_column, relacl_value) = if with_relacl {
-        (", relacl TEXT", ", NULL")
-    } else {
-        ("", "")
+    let (relacl_column, relacl_value) = match last_column {
+        "" => ("", ""),
+        "relacl" => (", relacl TEXT", ", NULL"),
+        "relrowsecurity" => (
+            ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0",
+            ", NULL, 0",
+        ),
+        _ => unreachable!("unknown catalog column {last_column}"),
     };
     for sql in [
         format!(
@@ -649,6 +660,51 @@ fn a_catalog_made_before_relrowsecurity_opens_read_only_without_the_column() {
     assert!(!relrowsecurity(&pg, "t"));
     let error = pg
         .execute("ALTER TABLE app.t ENABLE ROW LEVEL SECURITY")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("readonly"), "{error}");
+}
+
+#[test]
+fn a_catalog_made_before_relpolicies_gets_the_column_when_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relpolicies.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relpolicies(path);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    pg.execute("CREATE POLICY one ON app.t USING (x = 1)")
+        .unwrap();
+    pg.close().unwrap();
+    drop(pg);
+    drop(db);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    let error = pg
+        .execute("CREATE POLICY one ON app.t USING (x = 1)")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "policy \"one\" for table \"t\" already exists");
+}
+
+#[test]
+fn a_catalog_made_before_relpolicies_opens_read_only_without_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relpolicies-read-only.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relpolicies(path);
+
+    let db = open_pg_database(
+        path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+
+    assert!(!relrowsecurity(&pg, "t"));
+    let error = pg
+        .execute("CREATE POLICY one ON app.t USING (x = 1)")
         .unwrap_err()
         .to_string();
     assert!(error.contains("readonly"), "{error}");

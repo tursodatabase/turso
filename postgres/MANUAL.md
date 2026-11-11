@@ -74,6 +74,96 @@ SELECT relname, relrowsecurity FROM pg_class WHERE relname = 'accounts';
 (1 row)
 ```
 
+### `CREATE POLICY` — define a row-level security policy for a table
+
+**Synopsis:**
+
+```sql
+CREATE POLICY name ON table_name
+    [ AS { PERMISSIVE | RESTRICTIVE } ]
+    [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+    [ TO { role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER } [, ...] ]
+    [ USING ( using_expression ) ]
+    [ WITH CHECK ( check_expression ) ]
+```
+
+**Description:**
+
+`CREATE POLICY` defines which rows of a table the roles it names may read
+and write, once `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is on for the
+table. The policies are stored with the table, but they do not change what
+a role reads or writes yet: a table with row-level security still shows no
+rows to a role that is neither a superuser nor the table's owner.
+
+**Parameters:**
+
+- `name`: The name of the policy, unique among the policies of the table.
+- `table_name`: The name of an existing table, optionally qualified with its
+  schema. Views and materialized views cannot have policies.
+- `PERMISSIVE`, `RESTRICTIVE`: How the policy combines with the others, as
+  described above. The default is `PERMISSIVE`.
+- `FOR`: The command the policy applies to. The default is `ALL`.
+- `TO`: The roles the policy applies to. The default is `PUBLIC`, every role.
+  `CURRENT_ROLE`, `CURRENT_USER` and `SESSION_USER` name the role at the time
+  the policy is created.
+- `using_expression`: Which existing rows the policy shows. It can use the
+  columns of the table, written alone, with the table's name, or with the
+  schema and table names, and call
+  scalar functions such as `current_user`. A subquery without `FROM`, such as
+  `(SELECT current_user)`, stands for its value.
+- `check_expression`: Which new rows the policy lets a role write.
+
+**Notes:**
+
+Only the owner of the table or a superuser may create its policies.
+
+Policies cannot use subqueries with `FROM`, parameters, aggregate or window
+functions, or generated columns that are computed when they are read. A
+column that a policy uses cannot be renamed, dropped or changed, unlike in
+PostgreSQL, which renames it in the policy too. Renaming the table keeps its
+policies, and dropping the table drops them.
+
+A policy whose expression is nested too deeply, such as a hundred conditions
+joined with `OR`, is rejected; write it with `IN` instead.
+
+`pg_policy` and `pg_policies` do not show the policies yet.
+
+Materialized views store the rows of their query when they are refreshed, so
+a role that reads a materialized view built on a table with row-level
+security sees the rows that were stored, as in PostgreSQL.
+
+**Examples:**
+
+```sql
+CREATE TABLE docs (id int, owner text, title text);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_docs ON docs FOR SELECT USING (owner = (SELECT current_user));
+GRANT SELECT ON docs TO alice;
+```
+
+### `DROP POLICY` — remove a row-level security policy from a table
+
+**Synopsis:**
+
+```sql
+DROP POLICY [ IF EXISTS ] name ON table_name
+```
+
+**Description:**
+
+`DROP POLICY` removes the policy `name` from the table. With `IF EXISTS`, a
+policy or table that does not exist is not an error.
+
+Only the owner of the table or a superuser may drop its policies.
+
+`CASCADE` and `RESTRICT` are not supported.
+
+**Examples:**
+
+```sql
+DROP POLICY own_docs ON docs;
+```
+
 ### `CREATE ROLE` — create a role
 
 **Synopsis:**

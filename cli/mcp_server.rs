@@ -87,6 +87,8 @@ impl StmtClass {
             | Stmt::CreateSequence { .. }
             | Stmt::CreateSchema { .. }
             | Stmt::DropSchema { .. }
+            | Stmt::CreatePolicy(_)
+            | Stmt::DropPolicy { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
             | Stmt::DropTrigger { .. }
