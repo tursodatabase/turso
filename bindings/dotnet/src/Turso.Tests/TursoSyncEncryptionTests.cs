@@ -3,8 +3,107 @@ using AwesomeAssertions;
 
 namespace Turso.Tests;
 
+[NonParallelizable]
 public sealed class TursoSyncEncryptionTests
 {
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
+    public async Task PooledReplicaRejectsDifferentOrBlankLocalKeys(bool openAsync, bool encrypted)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "turso-encryption-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "replica.db");
+        var localKey = encrypted ? string.Concat(Enumerable.Repeat("16", 32)) : null;
+        var cloudKey = Convert.ToBase64String(Enumerable.Repeat((byte)11, 32).ToArray());
+        using var handler = new EmptyEncryptedSource(cloudKey);
+        using var http = new HttpClient(handler);
+        TursoConnection.SyncHttpClientFactory = () => http;
+        try
+        {
+            using var first = new TursoConnection(ConnectionString(path, cloudKey, localKey));
+            await Open(first);
+            first.ExecuteNonQuery("CREATE TABLE t(value TEXT)");
+            first.ExecuteNonQuery("INSERT INTO t VALUES ('pooled marker')");
+
+            using var matching = new TursoConnection(ConnectionString(path, cloudKey, localKey));
+            await Open(matching);
+            using var query = new TursoCommand(matching, "SELECT value FROM t");
+            query.ExecuteScalar().Should().Be("pooled marker");
+
+            var rejectedKeys = encrypted
+                ? new[] { new string('7', 64), null, "", " " }
+                : new[] { "", " ", new string('7', 64) };
+            foreach (var key in rejectedKeys)
+            {
+                using var rejected = new TursoConnection(ConnectionString(path, cloudKey, key));
+                Func<Task> open = () => Open(rejected);
+                await open.Should().ThrowAsync<Exception>();
+                rejected.State.Should().Be(System.Data.ConnectionState.Closed);
+            }
+        }
+        finally
+        {
+            TursoConnection.SyncHttpClientFactory = null;
+            Directory.Delete(directory, true);
+        }
+
+        Task Open(TursoConnection connection)
+        {
+            if (openAsync)
+                return connection.OpenAsync();
+            connection.Open();
+            return Task.CompletedTask;
+        }
+    }
+
+    [TestCase("Local Encryption Key", "")]
+    [TestCase("LocalEncryptionKey", " ")]
+    [TestCase("Remote Encryption Key", "")]
+    [TestCase("RemoteEncryptionKey", " ")]
+    public void ExplicitBlankEncryptionKeysAreRejected(string keyword, string value)
+    {
+        var builder = new TursoConnectionStringBuilder(ConnectionString("replica.db", "cloud-key", new string('1', 64)));
+        builder[keyword] = value;
+        using var connection = new TursoConnection(builder.ConnectionString);
+        connection.Invoking(c => c.CreateReplicaOptions().Validate()).Should().Throw<ArgumentException>();
+    }
+
+    [Test]
+    public void OmittedLocalKeyKeepsPlaintextConfiguration()
+    {
+        using var connection = new TursoConnection(ConnectionString("replica.db", "cloud-key", null));
+        var options = connection.CreateReplicaOptions();
+        options.Validate();
+        options.LocalEncryptionKey.Should().BeNull();
+        options.RemoteEncryption!.Key.Should().Be("cloud-key");
+    }
+
+    [TestCase("Remote Encryption Key")]
+    [TestCase("RemoteEncryptionKey")]
+    public void EmptyCloudKeyKeepsExistingStandaloneBehavior(string keyword)
+    {
+        using var connection = new TursoConnection($"Data Source=:memory:;{keyword}=");
+        connection.Open();
+        connection.State.Should().Be(System.Data.ConnectionState.Open);
+    }
+
+    private static string ConnectionString(string path, string cloudKey, string? localKey)
+    {
+        var builder = new TursoConnectionStringBuilder
+        {
+            DataSource = "turso://example.test",
+            ReplicaPath = path,
+            Pooling = true,
+            RemoteEncryptionCipher = "aes256gcm",
+            RemoteEncryptionKey = cloudKey,
+        };
+        if (localKey is not null)
+            builder.LocalEncryptionKey = localKey;
+        return builder.ConnectionString;
+    }
+
     [Test]
     public void ReplicaConnectionStringMapsIndependentLocalKey()
     {

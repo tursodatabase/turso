@@ -126,7 +126,7 @@ public class TursoConnectionOptions
         return new TursoRemoteEncryptionOptions
         {
             Cipher = TursoRemoteEncryptionOptions.ParseCipher(cipher),
-            Key = string.IsNullOrWhiteSpace(key) ? null : key,
+            Key = _builder.GetOption("Remote Encryption Key"),
         };
     }
 
