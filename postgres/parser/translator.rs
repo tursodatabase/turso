@@ -3697,6 +3697,9 @@ impl PostgreSQLTranslator {
                 }
                 Ok(expr)
             }
+            Some(pg_query::protobuf::node::Node::NamedArgExpr(_)) => Err(
+                ParseError::not_supported("a named argument in a function call"),
+            ),
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
                 Err(ParseError::ParseError(

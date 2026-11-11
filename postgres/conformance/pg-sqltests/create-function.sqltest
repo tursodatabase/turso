@@ -874,6 +874,17 @@ expect @tursopg error {
     a VARIADIC function argument is not supported
 }
 
+test named-argument {
+    SELECT make_interval(days => 1);
+}
+expect {
+    1 day
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a named argument in a function call is not supported
+}
+
 # Statements on functions and triggers. No function or trigger can exist, so
 # PostgreSQL rejects them too. To give PostgreSQL's errors, tursopg would have
 # to look the functions and triggers up.
