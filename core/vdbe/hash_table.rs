@@ -3380,10 +3380,11 @@ impl HashTable {
         &mut self,
         mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<Option<Value>>> {
-        turso_assert!(
-            self.aggregate_distinct.is_some(),
-            "final DISTINCT scan needs an aggregate DISTINCT table"
-        );
+        // A group whose rows were all skipped (for example by FILTER) never
+        // inserted a value, so the table was cleared and has no state.
+        if self.aggregate_distinct.is_none() {
+            return Ok(IOResult::Done(None));
+        }
 
         if matches!(
             self.state,
@@ -3500,10 +3501,10 @@ impl HashTable {
         &mut self,
         mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<u64>> {
-        turso_assert!(
-            self.aggregate_distinct.is_some(),
-            "bulk DISTINCT count needs an aggregate DISTINCT table"
-        );
+        // See `next_saved_distinct_value`: no inserted value means a count of zero.
+        if self.aggregate_distinct.is_none() {
+            return Ok(IOResult::Done(0));
+        }
         if matches!(
             self.state,
             HashTableState::Building | HashTableState::Spilled

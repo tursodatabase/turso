@@ -418,3 +418,16 @@ test distinct-spilled-many-duplicates {
 expect {
     5000|12497500
 }
+
+# A group whose rows are all removed by FILTER never inserts a DISTINCT value,
+# after an earlier group has created the hash table.
+test distinct-filter-skips-whole-group {
+    CREATE TABLE distinct_filter (g, x, e);
+    INSERT INTO distinct_filter VALUES ('a', 1, 1), ('a', 2, 0), ('b', 5, 0);
+    SELECT g, count(DISTINCT x) FILTER (WHERE e), ifnull(sum(DISTINCT x) FILTER (WHERE e), 'NULL')
+    FROM distinct_filter GROUP BY g ORDER BY g;
+}
+expect {
+    a|1|1
+    b|0|NULL
+}
