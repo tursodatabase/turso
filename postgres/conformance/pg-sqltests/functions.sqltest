@@ -1634,6 +1634,27 @@ expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }
 
+# tursopg ignores FM, so the test trims the padding instead.
+test to-char-of-a-number-or-null {
+    CREATE TABLE m (x numeric(30, 2));
+    INSERT INTO m VALUES (1.25);
+    SELECT trim(to_char(123, '999')), trim(to_char(x, '9.99')), (to_char(NULL::int, '999') IS NULL)::int FROM m;
+}
+expect {
+    123|1.25|1
+}
+
+test to-char-of-a-date-is-not-supported {
+    SELECT to_char(date '2024-01-05', 'YYYY');
+}
+expect {
+    2024
+}
+@sqlstate 0A000
+expect @tursopg error {
+    to_char of a value that is not a number is not supported
+}
+
 # The time extension's make_date takes other arguments than PostgreSQL's.
 test make-date-of-the-time-extension-is-not-a-function {
     SELECT make_date(2024, 1, 5);
