@@ -2285,6 +2285,15 @@ impl Connection {
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
+        // An open WAL snapshot can use the shared schema only when its
+        // cookie agrees with that snapshot. A transaction that just opened
+        // its snapshot may instead need the newer shared schema.
+        if !self.has_no_open_transaction_state()
+            && !self.mvcc_enabled()
+            && self.pager.load().get_schema_cookie_cached() != Some(schema.schema_version)
+        {
+            return;
+        }
         if current_schema.schema_version < schema.schema_version
             || (self.has_no_open_transaction_state()
                 && self
