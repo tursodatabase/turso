@@ -160,6 +160,49 @@ pub(crate) fn new_row_checks(
         .collect()
 }
 
+/// The checks of row-level security for `INSERT ... ON CONFLICT DO UPDATE`
+/// into `table_name` of `namespace`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UpsertRowChecks {
+    /// The checks of the existing row that conflicts, before it is updated:
+    /// the USING conditions of the UPDATE and SELECT policies. Unlike a
+    /// plain UPDATE, a row that fails them is an error, not skipped, so that
+    /// the row the role proposed is never dropped without a word.
+    pub(crate) conflicting_row: Vec<RowCheck>,
+    /// The checks of the row the update writes, as for a plain UPDATE that
+    /// reads the table's columns.
+    pub(crate) updated_row: Vec<RowCheck>,
+}
+
+/// The checks of `INSERT ... ON CONFLICT DO UPDATE` into `table_name` of
+/// `namespace` for the role, as in PostgreSQL.
+pub(crate) fn upsert_row_checks(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table_name: &str,
+) -> UpsertRowChecks {
+    let Policy::Apply(update_policies) = policy(resolver, namespace, table_name, Command::Update)
+    else {
+        return UpsertRowChecks::default();
+    };
+    let Policy::Apply(select_policies) = policy(resolver, namespace, table_name, Command::Select)
+    else {
+        unreachable!("row-level security limits every command of a role or none");
+    };
+    let conflicting_row = conditions_of(&update_policies, using_condition)
+        .into_iter()
+        .chain(conditions_of(&select_policies, using_condition))
+        .map(|condition| RowCheck {
+            condition,
+            using_condition: true,
+        })
+        .collect();
+    UpsertRowChecks {
+        conflicting_row,
+        updated_row: new_row_checks(resolver, namespace, table_name, Command::Update, true),
+    }
+}
+
 /// Emits `checks` on a row that the statement writes to the first table of
 /// `table_references`, whose rowid is in `rowid_reg` and whose columns are in
 /// the registers `columns` gives. The statement fails at the first check that

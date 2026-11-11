@@ -451,12 +451,11 @@ pub fn translate_insert(
         crate::security::policy::Command::Insert,
         reads_columns,
     );
-    if updates_on_conflict && !row_checks.is_empty() {
-        return Err(crate::LimboError::ParseError(
-            "ON CONFLICT DO UPDATE on a table whose row-level security limits the role is not supported yet"
-                .to_string(),
-        ));
-    }
+    let upsert_row_checks = if updates_on_conflict {
+        crate::translate::row_security::upsert_row_checks(resolver, namespace, table_name.as_str())
+    } else {
+        Default::default()
+    };
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| {
             s.has_child_fks(namespace.id, table_name.as_str())
@@ -1233,6 +1232,7 @@ pub fn translate_insert(
             connection,
             &mut table_references,
             tbl_name.alias.as_ref().map(|alias| alias.as_str()),
+            &upsert_row_checks,
         )?;
     }
 
@@ -1737,6 +1737,7 @@ fn resolve_upserts(
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
+    row_checks: &crate::translate::row_security::UpsertRowChecks,
 ) -> Result<()> {
     for (position, (_, label, upsert)) in upsert_actions.iter_mut().enumerate() {
         // Like SQLite, only compile an action that some constraint check can
@@ -1780,6 +1781,7 @@ fn resolve_upserts(
                 connection,
                 table_references,
                 table_alias,
+                row_checks,
             )?;
         } else {
             // UpsertDo::Nothing case

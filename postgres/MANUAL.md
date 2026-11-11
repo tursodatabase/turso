@@ -110,7 +110,13 @@ command:
   statement has `RETURNING`. Otherwise the statement fails with
   `new row violates row-level security policy for table` (SQLSTATE 42501),
   naming the restrictive policy when one of those fails. A check that is
-  NULL fails.
+  NULL fails. `INSERT ... ON CONFLICT` checks every row it proposes, also
+  the ones that conflict.
+- `INSERT ... ON CONFLICT DO UPDATE` checks the row that conflicts against
+  the `USING` expressions of the `UPDATE` and `SELECT` policies, after the
+  `WHERE` of `DO UPDATE`, and fails with `new row violates row-level
+  security policy (USING expression)` instead of skipping it. The row the
+  update writes is checked as for `UPDATE`.
 
 The policies are checked on each row before the other conditions of a query,
 so a condition of the query, or a function it calls, never sees a row the
@@ -140,8 +146,7 @@ Only the owner of the table or a superuser may create its policies.
 
 A new row is checked against the policies after its `NOT NULL` constraints,
 not before as in PostgreSQL, so a row that breaks both reports the `NOT
-NULL` constraint. `INSERT ... ON CONFLICT DO UPDATE` by a role that the
-table's policies limit is not supported yet.
+NULL` constraint.
 
 `TRUNCATE` is not subject to the policies, as in PostgreSQL: a role with the
 `TRUNCATE` privilege empties the whole table.
