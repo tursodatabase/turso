@@ -1357,20 +1357,39 @@ mod tests {
                 conn.execute(format!("INSERT INTO p{i} SELECT id, c FROM t{i}"))
                     .unwrap();
 
+                // A string literal compared with a value of the type is read as
+                // a value of the type, as INSERT stores it and DECODE reads it
+                // back ('9.5' is 9 for `CAST(value AS integer)`). The plain
+                // table gets the literal as the typed column reads it; a
+                // number literal is compared as written on both sides.
                 let mut conditions = Vec::new();
                 for literal in literals {
+                    let plain_literal = if literal.starts_with('\'') {
+                        let (read_back,): (String,) = conn
+                            .exec_rows(&format!("SELECT quote(CAST({literal} AS k{i}))"))
+                            .remove(0);
+                        read_back
+                    } else {
+                        literal.to_string()
+                    };
                     for op in ["<", "=", ">"] {
-                        conditions.push(format!("c {op} {literal}"));
+                        conditions.push((
+                            format!("c {op} {literal}"),
+                            format!("c {op} {plain_literal}"),
+                        ));
                     }
-                    conditions.push(format!("c IN ({literal}, 100)"));
+                    conditions.push((
+                        format!("c IN ({literal}, 100)"),
+                        format!("c IN ({plain_literal}, 100)"),
+                    ));
                 }
                 let compare_with_plain_table = || {
-                    for condition in &conditions {
+                    for (condition, plain_condition) in &conditions {
                         let got: Vec<(i64,)> = conn.exec_rows(&format!(
                             "SELECT id FROM t{i} WHERE {condition} ORDER BY id"
                         ));
                         let expected: Vec<(i64,)> = conn.exec_rows(&format!(
-                            "SELECT id FROM p{i} WHERE {condition} ORDER BY id"
+                            "SELECT id FROM p{i} WHERE {plain_condition} ORDER BY id"
                         ));
                         assert_eq!(got, expected, "{context}: WHERE {condition}");
                     }

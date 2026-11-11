@@ -266,7 +266,195 @@ test select-cast-to-enum-rejects-unknown-label {
 }
 @sqlstate 22P02
 expect error {
-    invalid input value for enum mood
+    invalid input value for enum mood: "xyz"
+}
+
+test select-insert-rejects-unknown-enum-label {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (m mood);
+    INSERT INTO t VALUES ('nope');
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum mood: "nope"
+}
+
+test select-cast-null-to-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (m mood[]);
+    INSERT INTO t VALUES ('{sad,NULL}');
+    SELECT CASE WHEN NULL::mood IS NULL THEN 'null' END, m FROM t;
+}
+expect {
+    null|{sad,NULL}
+}
+
+test select-enum-label-with-quote {
+    CREATE TYPE q AS ENUM ('it''s', 'b');
+    SELECT 'it''s'::q;
+}
+expect {
+    it's
+}
+
+test select-create-enum-rejects-duplicate-label {
+    CREATE TYPE mood AS ENUM ('x', 'y', 'x');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint "pg_enum_typid_label_index"
+}
+
+# PostgreSQL creates the type before its labels, so a taken name is reported
+# before a repeated or too long label.
+test select-create-enum-with-taken-name-and-duplicate-label {
+    CREATE TYPE mood AS ENUM ('x');
+    CREATE TYPE mood AS ENUM ('x', 'x');
+}
+expect error {
+    type "?mood"? already exists
+}
+
+test select-create-enum-with-taken-name-and-long-label {
+    CREATE TYPE mood AS ENUM ('x');
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+expect error {
+    type "?mood"? already exists
+}
+
+# EnumValuesCreate checks every label's length before pg_enum's unique index
+# sees a repeated label.
+test select-create-enum-checks-label-length-before-duplicates {
+    CREATE TYPE mood AS ENUM ('x', 'x', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+@sqlstate 42602
+expect error {
+    invalid enum label "a{64}"
+}
+
+test select-create-enum-rejects-label-over-63-bytes {
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+@sqlstate 42602
+expect error {
+    invalid enum label "a{64}"
+}
+
+test select-create-enum-accepts-63-byte-label {
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::mood::text);
+}
+expect {
+    63
+}
+
+test select-empty-enum-rejects-every-value {
+    CREATE TYPE e AS ENUM ();
+    SELECT 'a'::e;
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum e: "a"
+}
+
+test select-cast-null-to-empty-enum {
+    CREATE TYPE e AS ENUM ();
+    SELECT CASE WHEN NULL::e IS NULL THEN 'null' END;
+}
+expect {
+    null
+}
+
+test select-cast-null-to-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    SELECT CAST(NULL AS dm);
+}
+expect error {
+    domain dm does not allow null values
+}
+
+# Each element of a column of type dm[] is a value of domain dm; the array
+# itself is not, so it may be NULL.
+test select-insert-null-element-into-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (a dm[]);
+    INSERT INTO t VALUES ('{sad,NULL}');
+}
+expect error {
+    domain dm does not allow null values
+}
+
+test select-update-null-element-into-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (a dm[]);
+    INSERT INTO t VALUES ('{ok}');
+    UPDATE t SET a = '{NULL}';
+}
+expect error {
+    domain dm does not allow null values
+}
+
+test select-insert-null-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (id int, a dm[]);
+    INSERT INTO t VALUES (1, NULL), (2, '{sad,ok}');
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|
+    2|{sad,ok}
+}
+
+test select-insert-array-of-domain-checks-each-element {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t (a pos[]);
+    INSERT INTO t VALUES ('{1,2}');
+    INSERT INTO t VALUES ('{3,-1}');
+}
+expect error {
+    value for domain pos violates check constraint "pos_(0|check)"
+}
+
+test select-insert-array-of-domain-keeps-valid-elements {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t (a pos[]);
+    INSERT INTO t VALUES ('{1,2}');
+    SELECT a FROM t;
+}
+expect {
+    {1,2}
+}
+
+test select-cast-to-enum-quotes-mixed-case-type-name {
+    CREATE TYPE "Up" AS ENUM ('a');
+    SELECT 'b'::"Up";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "Up": "b"
+}
+
+test select-cast-to-enum-quotes-keyword-type-name {
+    CREATE TYPE "select" AS ENUM ('a');
+    SELECT 'b'::"select";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "select": "b"
+}
+
+test select-cast-to-enum-quotes-type-name-with-quotes {
+    CREATE TYPE "it's ""x""" AS ENUM ('a');
+    SELECT 'b'::"it's ""x""";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "it's ""x""": "b"
 }
 
 test select-cast-to-domain {
@@ -1945,4 +2133,459 @@ expect {
     1|1
     2|2
     4|1
+}
+
+# A text compared with a time or timestamp takes the column's type first:
+# '10:00' is the time 10:00:00. Every query runs before and after the indexes
+# exist, so the expected rows are listed twice.
+test compare-time-with-text-same-rows-with-and-without-index {
+    CREATE TABLE cmp_time (id int PRIMARY KEY, tm time, ts timestamp);
+    INSERT INTO cmp_time VALUES (1, '09:30', '2024-01-05 09:30'), (2, '10:00', '2024-01-05 10:00'), (3, '23:59:59', '2024-01-06 00:00'), (4, NULL, NULL);
+    SELECT 'eq', id FROM cmp_time WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM cmp_time WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM cmp_time WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM cmp_time WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM cmp_time WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM cmp_time WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM cmp_time WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM cmp_time WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM cmp_time WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM cmp_time WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM cmp_time WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM cmp_time WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM cmp_time WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM cmp_time WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    CREATE INDEX cmp_time_tm ON cmp_time (tm);
+    CREATE INDEX cmp_time_ts ON cmp_time (ts);
+    SELECT 'eq', id FROM cmp_time WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM cmp_time WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM cmp_time WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM cmp_time WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM cmp_time WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM cmp_time WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM cmp_time WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM cmp_time WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM cmp_time WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM cmp_time WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM cmp_time WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM cmp_time WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM cmp_time WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM cmp_time WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    DROP TABLE cmp_time;
+}
+expect {
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+}
+
+# x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
+# when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
+# holds for a list and a subquery, correlated or not.
+test compare-text-on-the-left-of-in-with-time {
+    CREATE TABLE in_left_ev (id int PRIMARY KEY, tm time);
+    INSERT INTO in_left_ev VALUES (1, '09:45:00'), (2, '10:00:00');
+    SELECT 'list', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'list-two', id FROM in_left_ev WHERE '09:45' IN (tm, '10:00') ORDER BY id;
+    SELECT 'not-in', id FROM in_left_ev WHERE '09:45' NOT IN (tm) ORDER BY id;
+    SELECT 'column', id, ('09:45' IN (tm))::int FROM in_left_ev ORDER BY id;
+    SELECT 'subquery', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    SELECT 'correlated', id FROM in_left_ev WHERE '09:45' IN (SELECT e2.tm FROM in_left_ev e2 WHERE e2.id = in_left_ev.id) ORDER BY id;
+    SELECT 'plain', ('a' IN ('a'))::int;
+    CREATE INDEX in_left_ev_tm ON in_left_ev (tm);
+    SELECT 'list-index', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'subquery-index', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    DROP TABLE in_left_ev;
+}
+expect {
+    list|1
+    list-two|1
+    not-in|2
+    column|1|1
+    column|2|0
+    subquery|1
+    subquery|2
+    correlated|1
+    plain|1
+    list-index|1
+    subquery-index|1
+    subquery-index|2
+}
+
+# DELETE and UPDATE find their rows with the converted text, by a scan and
+# through an index.
+test compare-time-with-text-delete-and-update {
+    CREATE TABLE cmp_time_a (id int PRIMARY KEY, tm time);
+    CREATE TABLE cmp_time_b (id int PRIMARY KEY, tm time);
+    CREATE INDEX cmp_time_b_tm ON cmp_time_b (tm);
+    INSERT INTO cmp_time_a VALUES (1, '09:30'), (2, '10:00'), (3, '23:59:59'), (4, NULL);
+    INSERT INTO cmp_time_b SELECT * FROM cmp_time_a;
+    DELETE FROM cmp_time_a WHERE tm < '09:45';
+    DELETE FROM cmp_time_b WHERE tm < '09:45';
+    UPDATE cmp_time_a SET id = 20 WHERE tm = '10:00';
+    UPDATE cmp_time_b SET id = 20 WHERE tm = '10:00';
+    SELECT 'a', id, tm FROM cmp_time_a ORDER BY id;
+    SELECT 'b', id, tm FROM cmp_time_b ORDER BY id;
+    DROP TABLE cmp_time_a;
+    DROP TABLE cmp_time_b;
+}
+expect {
+    a|3|23:59:59
+    a|4|
+    a|20|10:00:00
+    b|3|23:59:59
+    b|4|
+    b|20|10:00:00
+}
+
+setup scalar_subquery {
+    CREATE TABLE scalar_t (a int, b int);
+    INSERT INTO scalar_t VALUES (1, 30), (2, 10), (3, 20);
+    CREATE TABLE scalar_u (a int, b int);
+    INSERT INTO scalar_u VALUES (1, 5), (1, 6), (2, 7);
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-rejected {
+    SELECT (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-read-from-index-rejected {
+    CREATE INDEX ON scalar_t (b);
+    SELECT (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-where-rejected {
+    CREATE INDEX ON scalar_t (b);
+    SELECT 1 WHERE 10 = (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-of-two-rejected {
+    SELECT (SELECT b FROM scalar_t LIMIT 2);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-above-two-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT 5);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-computed-limit-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT 2 + 3);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-all-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT ALL);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-sorted-rows-rejected {
+    SELECT (SELECT b FROM scalar_t ORDER BY b);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-groups-rejected {
+    SELECT (SELECT max(b) FROM scalar_t GROUP BY a);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-distinct-rows-rejected {
+    SELECT (SELECT DISTINCT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+test scalar-subquery-with-several-values-rows-rejected {
+    SELECT (VALUES (1), (2));
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-with-several-rows-rejected {
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a >= scalar_t.a) FROM scalar_t;
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-update-rejected {
+    UPDATE scalar_t SET b = (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-insert-rejected {
+    INSERT INTO scalar_t VALUES ((SELECT a FROM scalar_t), 0);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-delete-rejected {
+    DELETE FROM scalar_t WHERE a = (SELECT a FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-one-row {
+    SELECT (SELECT b FROM scalar_t LIMIT 1);
+    SELECT (SELECT b FROM scalar_t ORDER BY b OFFSET 2);
+    SELECT (SELECT b FROM scalar_u ORDER BY b LIMIT 1 + 0);
+    SELECT (SELECT b FROM scalar_u ORDER BY b LIMIT 5 OFFSET 2);
+    SELECT (SELECT max(b) FROM scalar_t);
+    SELECT (SELECT DISTINCT a / 10 FROM scalar_t);
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a = scalar_t.a) FROM scalar_t ORDER BY a;
+}
+expect {
+    30
+    30
+    5
+    7
+    30
+    0
+    1|30
+    2|10
+    3|20
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-no-rows-is-null {
+    SELECT coalesce((SELECT b FROM scalar_t WHERE b > 100)::text, 'N');
+    SELECT coalesce((SELECT b FROM scalar_t LIMIT 0)::text, 'N');
+}
+expect {
+    N
+    N
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-whose-value-is-not-read {
+    SELECT CASE WHEN a = 99 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+    SELECT coalesce(1, (SELECT b FROM scalar_u));
+    SELECT count(*) FROM (SELECT (SELECT b FROM scalar_u) FROM scalar_t WHERE false) s;
+    SELECT count(*) FROM scalar_t WHERE a = 5 AND b = (SELECT b FROM scalar_u);
+    SELECT CASE WHEN EXISTS (SELECT (SELECT b FROM scalar_u)) THEN 'yes' ELSE 'no' END;
+}
+expect {
+    0
+    0
+    0
+    1
+    0
+    0
+    yes
+}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-read-only-for-rows-with-one-match {
+    SELECT a, CASE WHEN a = 2 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+}
+expect {
+    1|0
+    2|7
+    3|0
+}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-read-for-a-row-with-several-matches-rejected {
+    SELECT a, CASE WHEN a = 1 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test correlated-aggregate-scalar-subquery {
+    SELECT a, coalesce((SELECT max(b) FROM scalar_u WHERE scalar_u.a = scalar_t.a)::text, 'N') FROM scalar_t ORDER BY a;
+}
+expect {
+    1|6
+    2|7
+    3|N
+}
+
+test row-constructor-comparisons {
+    CREATE TABLE row_values (a int, b int);
+    INSERT INTO row_values VALUES (1, 2), (3, NULL);
+    SELECT CASE WHEN (1, 2) = (1, 2) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN ROW(1, 2) = ROW(1, 2) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) < (1, 3) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) <> (1, 2) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN ((1, NULL) = (1, NULL)) IS NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) IN ((1, 2), (3, 4)) THEN 1 ELSE 0 END;
+    SELECT count(*) FROM row_values WHERE (a, b) = (1, 2);
+    SELECT count(*) FROM row_values WHERE (a, b) IN ((1, 2));
+    SELECT count(*) FROM row_values WHERE ROW(a, b) IN (SELECT 1, 2);
+    SELECT count(*) FROM row_values WHERE (a, b) > (1, 2);
+    SELECT CASE WHEN ROW(1, NULL) IS NOT NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN ROW(1, NULL) IS NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (NULL, NULL) IS NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) IS NOT NULL THEN 1 ELSE 0 END;
+    SELECT count(*) FROM row_values WHERE (a, b) IS NULL;
+    SELECT count(*) FROM row_values WHERE (a, b) IS NOT NULL;
+    SELECT count(*) FROM row_values WHERE NOT (a, b) IS NOT NULL;
+    DROP TABLE row_values;
+}
+expect {
+    1
+    1
+    1
+    0
+    1
+    1
+    1
+    1
+    1
+    1
+    0
+    0
+    1
+    1
+    0
+    1
+    1
+}
+
+test row-constructor-between {
+    CREATE TABLE row_between (a int, b int);
+    INSERT INTO row_between VALUES (1, 2), (1, 5), (2, 0);
+    SELECT CASE WHEN (1, 2) BETWEEN (0, 0) AND (5, 5) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) NOT BETWEEN (1, 3) AND (5, 5) THEN 1 ELSE 0 END;
+    SELECT count(*) FROM row_between WHERE (a, b) BETWEEN (1, 1) AND (1, 3);
+    DROP TABLE row_between;
+}
+expect {
+    1
+    1
+    1
+}
+
+test row-constructor-with-null-in-subquery {
+    CREATE TABLE row_nulls (a int, b int);
+    INSERT INTO row_nulls VALUES (NULL, 1), (1, NULL), (1, 2);
+    SELECT count(*) FROM row_nulls WHERE (a, b) IN (SELECT 1, 2);
+    SELECT count(*) FROM row_nulls WHERE (a, b) NOT IN (SELECT 1, 2);
+    SELECT count(*) FROM row_nulls WHERE ((a, b) IN (SELECT 1, 2)) IS NULL;
+    DROP TABLE row_nulls;
+}
+expect {
+    1
+    1
+    1
+}
+
+test row-constructor-as-inserted-value-errors {
+    CREATE TABLE row_insert (a int, b int);
+    INSERT INTO row_insert VALUES ((7, 8), 3);
+}
+expect error {
+}
+
+test row-constructor-cast-to-integer-errors {
+    SELECT (1, (2, 3)::int) = (1, 2);
+}
+expect error {
+}
+
+@skip-if postgres "PostgreSQL accepts a row value inside a row value"
+test row-constructor-inside-row-constructor-errors {
+    SELECT ((1, 2), 1) = ((1, 3), 1);
+}
+expect error {
+    row value misused
+}
+
+@skip-if postgres "PostgreSQL accepts a row value as a window partition key"
+test row-constructor-as-window-partition-key-errors {
+    CREATE TABLE row_window (a int, b int);
+    SELECT count(*) OVER (PARTITION BY (a, b)) FROM row_window;
+}
+expect error {
+    row value misused
+}
+
+# A text in a row value compared with a time is read as a time, component by
+# component, in a comparison, an IN list and a row subquery.
+test row-constructor-compares-text-with-time {
+    CREATE TABLE row_time (id int, tm time);
+    INSERT INTO row_time VALUES (1, '09:30'), (2, '10:00');
+    SELECT 'eq', id FROM row_time WHERE (id, tm) = (2, '10:00') ORDER BY id;
+    SELECT 'lt', id FROM row_time WHERE (tm, id) < ('10:00', 5) ORDER BY id;
+    SELECT 'in', id FROM row_time WHERE (id, tm) IN ((1, '09:30'), (2, '09:30')) ORDER BY id;
+    SELECT 'subquery', id FROM row_time WHERE (id, tm) = (SELECT 2, tm FROM row_time WHERE id = 2) ORDER BY id;
+    DROP TABLE row_time;
+}
+expect {
+    eq|2
+    lt|1
+    lt|2
+    in|1
+    subquery|2
 }

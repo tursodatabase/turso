@@ -347,10 +347,10 @@ fn translate_subquery_result_expr(
     resolver: &Resolver,
 ) -> Result<usize> {
     let ast::Expr::SubqueryResult {
+        subquery_id,
         lhs,
         not_in,
         query_type,
-        ..
     } = expr
     else {
         unreachable!("translate_subquery_result_expr expects Expr::SubqueryResult");
@@ -389,13 +389,46 @@ fn translate_subquery_result_expr(
             let lhs_column_count = lhs_columns.len();
             let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
             for (i, lhs_column) in lhs_columns.iter().enumerate() {
-                translate_expr(
-                    program,
-                    referenced_tables,
-                    lhs_column,
-                    lhs_column_regs_start + i,
-                    resolver,
-                )?;
+                let read_as = read_untyped_operand_as(lhs_column, resolver.schema(), || {
+                    let column_types = resolver
+                        .in_subquery_column_types
+                        .get(*subquery_id)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "IN subquery {subquery_id} has no result column types"
+                            ))
+                        })?;
+                    column_types.get(i).cloned().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "IN subquery {subquery_id} has no result column {i}"
+                        ))
+                    })
+                })?;
+                match read_as {
+                    Some(resolved) => {
+                        translate_untyped_operand_as(
+                            program,
+                            referenced_tables,
+                            lhs_column,
+                            &resolved,
+                            lhs_column_regs_start + i,
+                            resolver,
+                        )?;
+                    }
+                    None => {
+                        translate_expr(
+                            program,
+                            referenced_tables,
+                            lhs_column,
+                            lhs_column_regs_start + i,
+                            resolver,
+                        )?;
+                    }
+                }
+            }
+            // The NULL checks come after every column is loaded, because the
+            // scan at label_null_rewind compares all of them.
+            for i in 0..lhs_column_count {
                 // If LHS is NULL, we need to check if ephemeral is empty first.
                 // - If empty: IN returns FALSE, NOT IN returns TRUE
                 // - If not empty: result is NULL (unknown)
@@ -529,12 +562,25 @@ fn translate_subquery_result_expr(
         SubqueryType::RowValue {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
-            assert_register_range_allocated(program, target_register, *num_regs)?;
+            if *num_regs != 1 {
+                crate::bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+            }
+            if let Some(row_count_reg) = *row_count_reg {
+                program.emit_insn(Insn::HaltIfNull {
+                    constraint_info: None,
+                    target_reg: row_count_reg,
+                    err_code: SQLITE_ERROR,
+                    description: "more than one row returned by a subquery used as an expression"
+                        .to_string(),
+                    on_error: None,
+                });
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: *result_reg_start,
                 dst_reg: target_register,
-                extra_amount: num_regs - 1,
+                extra_amount: 0,
             });
             Ok(target_register)
         }
@@ -646,6 +692,14 @@ fn translate_case_expr(
     // case statement we're processing.
     let base_reg = base.as_ref().map(|_| program.alloc_register());
     let expr_reg = program.alloc_register();
+    let values_type = untyped_values_type(
+        when_then_pairs
+            .iter()
+            .map(|(_, then)| then.as_ref())
+            .chain(else_expr.as_deref()),
+        referenced_tables,
+        resolver,
+    )?;
     if let Some(base_expr) = base {
         translate_expr(
             program,
@@ -656,19 +710,40 @@ fn translate_case_expr(
         )?;
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            when_expr,
-            expr_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        let when_type = match base {
+            Some(base_expr) => {
+                untyped_operand_type(when_expr, base_expr, referenced_tables, resolver)?
+            }
+            None => None,
+        };
+        // A WHEN value read as a value of the base's type gets its own
+        // register, so its conversion is computed once.
+        let when_reg = match when_type {
+            Some(resolved) => {
+                let reg = program.alloc_register();
+                translate_untyped_operand_as(
+                    program,
+                    referenced_tables,
+                    when_expr,
+                    &resolved,
+                    reg,
+                    resolver,
+                )?
+            }
+            None => translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                when_expr,
+                expr_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?,
+        };
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
                 lhs: base_reg,
-                rhs: expr_reg,
+                rhs: when_reg,
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
                 flags: CmpInsFlags::default()
@@ -688,19 +763,19 @@ fn translate_case_expr(
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
-                reg: expr_reg,
+                reg: when_reg,
                 target_pc: next_case_label,
                 jump_if_null: true,
             }),
         };
         // THEN...
-        translate_expr_no_constant_opt(
+        translate_returned_value(
             program,
             referenced_tables,
             then_expr,
+            values_type.as_ref(),
             target_register,
             resolver,
-            NoConstantOptReason::RegisterReuse,
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: return_label,
@@ -712,13 +787,13 @@ fn translate_case_expr(
     }
     match else_expr {
         Some(expr) => {
-            translate_expr_no_constant_opt(
+            translate_returned_value(
                 program,
                 referenced_tables,
                 expr,
+                values_type.as_ref(),
                 target_register,
                 resolver,
-                NoConstantOptReason::RegisterReuse,
             )?;
         }
         // If ELSE isn't specified, it means ELSE null.
@@ -862,7 +937,13 @@ fn emit_custom_type_cast(
         }),
         StrictType::Any => {}
     }
-    emit_store_value(program, &resolved, reg, &ty_params, resolver)?;
+    emit_store_value(
+        program,
+        &resolved,
+        reg,
+        Coerce::WithArgs(&ty_params),
+        resolver,
+    )?;
     emit_decode(program, &resolved, reg, resolver)?;
     // The domain's CHECKs see the value after DECODE, as they do on a
     // column of the domain.
@@ -1330,14 +1411,19 @@ fn translate_function_call_expr(
                     // coalesce function is implemented as a series of not null checks
                     // whenever a not null check succeeds, we jump to the end of the series
                     let label_coalesce_end = program.allocate_label();
+                    let values_type = untyped_values_type(
+                        args.iter().map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
                     for (index, arg) in args.iter().enumerate() {
-                        let reg = translate_expr_no_constant_opt(
+                        let reg = translate_returned_value(
                             program,
                             referenced_tables,
                             arg,
+                            values_type.as_ref(),
                             target_register,
                             resolver,
-                            NoConstantOptReason::RegisterReuse,
                         )?;
                         if index < args.len() - 1 {
                             program.emit_insn(Insn::NotNull {
@@ -1421,14 +1507,19 @@ fn translate_function_call_expr(
                         );
                     }
 
+                    let values_type = untyped_values_type(
+                        args.iter().map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
                     let temp_reg = program.alloc_register();
-                    translate_expr_no_constant_opt(
+                    translate_returned_value(
                         program,
                         referenced_tables,
                         &args[0],
+                        values_type.as_ref(),
                         temp_reg,
                         resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
                     let before_copy_label = program.allocate_label();
                     program.emit_insn(Insn::NotNull {
@@ -1436,13 +1527,13 @@ fn translate_function_call_expr(
                         target_pc: before_copy_label,
                     });
 
-                    translate_expr_no_constant_opt(
+                    translate_returned_value(
                         program,
                         referenced_tables,
                         &args[1],
+                        values_type.as_ref(),
                         temp_reg,
                         resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
                     program.preassign_label_to_next_insn(before_copy_label);
                     program.emit_insn(Insn::Copy {
@@ -1458,6 +1549,11 @@ fn translate_function_call_expr(
 
                     let iif_end_label = program.allocate_label();
                     let condition_reg = program.alloc_register();
+                    let values_type = untyped_values_type(
+                        iif_values(args).map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
 
                     for pair in args.chunks_exact(2) {
                         let condition_expr = &pair[0];
@@ -1479,13 +1575,13 @@ fn translate_function_call_expr(
                             jump_if_null: true,
                         });
 
-                        translate_expr_no_constant_opt(
+                        translate_returned_value(
                             program,
                             referenced_tables,
                             value_expr,
+                            values_type.as_ref(),
                             target_register,
                             resolver,
-                            NoConstantOptReason::RegisterReuse,
                         )?;
                         program.emit_insn(Insn::Goto {
                             target_pc: iif_end_label,
@@ -1495,13 +1591,13 @@ fn translate_function_call_expr(
                     }
 
                     if args.len() % 2 != 0 {
-                        translate_expr_no_constant_opt(
+                        translate_returned_value(
                             program,
                             referenced_tables,
                             args.last().unwrap(),
+                            values_type.as_ref(),
                             target_register,
                             resolver,
-                            NoConstantOptReason::RegisterReuse,
                         )?;
                     } else {
                         program.emit_insn(Insn::Null {
@@ -1750,9 +1846,7 @@ fn translate_function_call_expr(
                         crate::bail_parse_error!("min function with no arguments");
                     }
                     let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
+                    translate_compared_args(program, referenced_tables, args, start_reg, resolver)?;
 
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
@@ -1767,9 +1861,7 @@ fn translate_function_call_expr(
                         crate::bail_parse_error!("min function with no arguments");
                     }
                     let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
+                    translate_compared_args(program, referenced_tables, args, start_reg, resolver)?;
 
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
@@ -1791,8 +1883,20 @@ fn translate_function_call_expr(
                     // since translate_expr may allocate internal registers.
                     let first_reg = program.alloc_register();
                     let second_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], first_reg, resolver)?;
-                    translate_expr(program, referenced_tables, &args[1], second_reg, resolver)?;
+                    if matches!(srf, ScalarFunc::Nullif) {
+                        translate_compared_pair(
+                            program,
+                            referenced_tables,
+                            &args[0],
+                            &args[1],
+                            first_reg,
+                            second_reg,
+                            resolver,
+                        )?;
+                    } else {
+                        translate_expr(program, referenced_tables, &args[0], first_reg, resolver)?;
+                        translate_expr(program, referenced_tables, &args[1], second_reg, resolver)?;
+                    }
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg: first_reg,
@@ -3112,20 +3216,16 @@ fn translate_parenthesized_expr(
     let ast::Expr::Parenthesized(exprs) = expr else {
         unreachable!("translate_parenthesized_expr expects Expr::Parenthesized");
     };
-    if exprs.is_empty() {
-        crate::bail_parse_error!("parenthesized expression with no arguments");
-    }
-    assert_register_range_allocated(program, target_register, exprs.len())?;
-    for (i, expr) in exprs.iter().enumerate() {
-        translate_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register + i,
-            resolver,
-        )?;
-    }
-    Ok(target_register)
+    // Comparisons, IN and BETWEEN read a row value one component at a time
+    // with translate_row_value. Anywhere else a row value would need more
+    // than the one register it is given.
+    let [expr] = exprs.as_slice() else {
+        if exprs.is_empty() {
+            crate::bail_parse_error!("parenthesized expression with no arguments");
+        }
+        crate::bail_parse_error!("row value misused");
+    };
+    translate_expr(program, referenced_tables, expr, target_register, resolver)
 }
 
 #[inline(never)]

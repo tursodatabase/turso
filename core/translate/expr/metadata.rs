@@ -54,7 +54,14 @@ pub(super) fn translate_between_expr(
     }
 
     let lhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    translate_row_value(
+        program,
+        referenced_tables,
+        lhs,
+        lhs_arity,
+        lhs_reg,
+        resolver,
+    )?;
     let next_comparison = program.allocate_label();
     let mut result_regs = [0; 2];
     for (index, expr) in [&lower_expr, &upper_expr].into_iter().enumerate() {
@@ -73,7 +80,14 @@ pub(super) fn translate_between_expr(
         });
         let bound_reg = program.alloc_registers(lhs_arity);
         let next_span_idx = program.constant_spans_next_idx();
-        translate_expr(program, referenced_tables, bound, bound_reg, resolver)?;
+        translate_row_value(
+            program,
+            referenced_tables,
+            bound,
+            lhs_arity,
+            bound_reg,
+            resolver,
+        )?;
         if lhs_arity > 1 {
             emit_binary_expr_row_valued(
                 program,
@@ -211,24 +225,6 @@ pub(super) fn emit_cond_jump(
             target_pc: cond_meta.jump_target_when_false,
             jump_if_null: true,
         });
-    }
-}
-
-pub(super) fn assert_register_range_allocated(
-    program: &mut ProgramBuilder,
-    start_register: usize,
-    count: usize,
-) -> Result<()> {
-    // Invariant: callers must have pre-allocated [start_register, start_register + count)
-    // before asking expression translation to write a vector into that range.
-    let required_next = start_register + count;
-    let next_free = program.peek_next_register();
-    if required_next <= next_free {
-        Ok(())
-    } else {
-        crate::bail_parse_error!(
-            "insufficient registers allocated for expression vector write (start={start_register}, count={count}, next_free={next_free})"
-        )
     }
 }
 

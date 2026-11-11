@@ -193,6 +193,7 @@ extern "C" {
     fn sqlite3_value_dup(value: *mut libc::c_void) -> *mut libc::c_void;
     fn sqlite3_value_free(value: *mut libc::c_void);
     fn sqlite3_context_db_handle(context: *mut libc::c_void) -> *mut libc::c_void;
+    fn sqlite3_user_data(context: *mut libc::c_void) -> *mut libc::c_void;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -3178,9 +3179,15 @@ mod tests {
     /// is corrupted (reads freed memory).
     #[test]
     fn test_sqlite3_value_blob_use_after_free() {
+        /// What `describe_value` read from its argument: int64, double, text, bytes and type.
+        type Described = (i64, f64, Option<String>, i32, i32);
+        static DESCRIBED: std::sync::Mutex<Option<Described>> = std::sync::Mutex::new(None);
+
         /// Scalar function callback: verifies that the first argument is a BLOB
         /// with the expected content [0xDE, 0xAD, 0xBE, 0xEF].
         /// Returns 1 if the blob matches, 0 otherwise.
+        /// Registered with user data as `describe_value`, it instead stores
+        /// what the sqlite3_value_* accessors read from the argument in DESCRIBED.
         unsafe extern "C" fn check_blob_fn(
             ctx: *mut libc::c_void,
             argc: i32,
@@ -3189,6 +3196,22 @@ mod tests {
             assert_eq!(argc, 1);
             let value = *argv.add(0);
             assert!(!value.is_null());
+
+            if !sqlite3_user_data(ctx).is_null() {
+                let int64 = sqlite3_value_int64(value);
+                let double = sqlite3_value_double(value);
+                let text = sqlite3_value_text(value);
+                let text = (!text.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(text)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                let bytes = sqlite3_value_bytes(value);
+                let vtype = sqlite3_value_type(value);
+                *DESCRIBED.lock().unwrap() = Some((int64, double, text, bytes, vtype));
+                sqlite3_result_int64(ctx, 1);
+                return;
+            }
 
             let vtype = sqlite3_value_type(value);
             if vtype != SQLITE_BLOB {
@@ -3208,6 +3231,16 @@ mod tests {
             let data = std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize);
             let expected: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
             if data == expected {
+                // Read as text, a blob gives its bytes with a NUL after them and reports TEXT.
+                let text = sqlite3_value_text(value);
+                if text.is_null()
+                    || std::ffi::CStr::from_ptr(text).to_bytes() != expected
+                    || sqlite3_value_bytes(value) != 4
+                    || sqlite3_value_type(value) != SQLITE_TEXT
+                {
+                    sqlite3_result_int64(ctx, -3); // wrong text form
+                    return;
+                }
                 sqlite3_result_int64(ctx, 1); // match
             } else {
                 // Print actual bytes for debugging
@@ -3293,10 +3326,50 @@ mod tests {
             let result = sqlite3_column_int(stmt2, 0);
             assert_eq!(
                 result, 1,
-                "check_blob returned {result}: blob data was corrupted (use-after-free in sqlite3_value_blob)"
+                "check_blob returned {result}: -1 wrong type, -2 wrong blob length, -3 wrong text form, 0 corrupted blob (use-after-free in sqlite3_value_blob)"
             );
 
             assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
+
+            // A number or blob argument reads as text, and text or a blob reads as a number.
+            let mut marker = 0u8;
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"describe_value".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    &mut marker as *mut u8 as *mut libc::c_void,
+                    Some(check_blob_fn),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK
+            );
+            let cases: [(&str, Described); 8] = [
+                ("42", (42, 42.0, Some("42".into()), 2, SQLITE_INTEGER)),
+                ("1.5", (1, 1.5, Some("1.5".into()), 3, SQLITE_FLOAT)),
+                ("2.0", (2, 2.0, Some("2.0".into()), 3, SQLITE_FLOAT)),
+                (
+                    "1e20",
+                    (i64::MAX, 1e20, Some("1.0e+20".into()), 7, SQLITE_FLOAT),
+                ),
+                ("X'414243'", (0, 0.0, Some("ABC".into()), 3, SQLITE_TEXT)),
+                ("'hello'", (0, 0.0, Some("hello".into()), 5, SQLITE_TEXT)),
+                ("'12abc'", (12, 12.0, Some("12abc".into()), 5, SQLITE_TEXT)),
+                ("X'3132'", (12, 12.0, Some("12".into()), 2, SQLITE_TEXT)),
+            ];
+            for (arg, expected) in cases {
+                let sql = std::ffi::CString::new(format!("SELECT describe_value({arg})")).unwrap();
+                assert_eq!(
+                    sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt2, ptr::null_mut()),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt2), SQLITE_ROW);
+                assert_eq!(DESCRIBED.lock().unwrap().take(), Some(expected), "{arg}");
+                assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
+            }
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
@@ -3863,6 +3936,78 @@ mod tests {
             assert_eq!(sqlite3_value_int64(dup), 42);
 
             sqlite3_value_free(dup);
+
+            // sqlite3_value_text gives the text form of a number or blob; a number keeps its type.
+            // Text and blobs read as numbers like CAST.
+            let describe = |v: *mut libc::c_void| {
+                let int64 = sqlite3_value_int64(v);
+                let double = sqlite3_value_double(v);
+                let p = sqlite3_value_text(v);
+                assert!(!p.is_null());
+                let text = std::ffi::CStr::from_ptr(p).to_str().unwrap().to_owned();
+                (
+                    int64,
+                    double,
+                    text,
+                    sqlite3_value_bytes(v),
+                    sqlite3_value_type(v),
+                )
+            };
+            let cases = [
+                ("42", 42, 42.0, "42", SQLITE_INTEGER),
+                ("1.5", 1, 1.5, "1.5", SQLITE_FLOAT),
+                ("2.0", 2, 2.0, "2.0", SQLITE_FLOAT),
+                ("1e20", i64::MAX, 1e20, "1.0e+20", SQLITE_FLOAT),
+                ("X'414243'", 0, 0.0, "ABC", SQLITE_TEXT),
+                ("'hello'", 0, 0.0, "hello", SQLITE_TEXT),
+                ("'12abc'", 12, 12.0, "12abc", SQLITE_TEXT),
+                ("X'3132'", 12, 12.0, "12", SQLITE_TEXT),
+            ];
+            for (sql_value, int64, double, text, value_type) in cases {
+                let expected = (
+                    int64,
+                    double,
+                    text.to_owned(),
+                    text.len() as i32,
+                    value_type,
+                );
+                let sql = std::ffi::CString::new(format!("SELECT {sql_value}")).unwrap();
+                assert_eq!(
+                    sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                let column = sqlite3_column_value(stmt, 0);
+                let dup = sqlite3_value_dup(column);
+                assert_eq!(describe(column), expected, "column value {sql_value}");
+                assert_eq!(describe(dup), expected, "copy of {sql_value}");
+                sqlite3_value_free(dup);
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            }
+
+            // sqlite3_value_blob returns the text form of a number and NULL for zero bytes.
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT 42, '', X''".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let number = sqlite3_column_value(stmt, 0);
+            let blob = sqlite3_value_blob(number) as *const u8;
+            assert!(!blob.is_null());
+            assert_eq!(
+                std::slice::from_raw_parts(blob, sqlite3_value_bytes(number) as usize),
+                b"42"
+            );
+            assert_eq!(sqlite3_value_type(number), SQLITE_INTEGER);
+            assert!(sqlite3_value_blob(sqlite3_column_value(stmt, 1)).is_null());
+            assert!(sqlite3_value_blob(sqlite3_column_value(stmt, 2)).is_null());
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
 
             sqlite3_value_free(ptr::null_mut());
             let null_dup = sqlite3_value_dup(ptr::null_mut());

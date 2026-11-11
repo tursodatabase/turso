@@ -5,9 +5,10 @@
 //! prepared statement so CodSpeed simulation measures the steady-state VDBE
 //! path rather than parsing or fixture construction.
 
-use divan::{black_box, AllocProfiler, Bencher};
+use divan::{black_box, AllocProfiler};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
+use turso_benches::Bencher;
 use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
 use turso_sqlite::SqliteDialect;
 

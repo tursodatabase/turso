@@ -13,18 +13,47 @@
 //! itself. The SQLite dialect that users open databases with is
 //! `SqliteDialect` in the `turso_sqlite` crate.
 
-use crate::namespace::NamespaceId;
+use super::ScalarFuncContext;
+use crate::functions::datetime::{
+    exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
+    exec_strftime, exec_time, exec_timediff, exec_unixepoch,
+};
+use crate::functions::math::{exec_gcd, exec_lcm};
+use crate::functions::printf::exec_printf;
+use crate::functions::string::{exec_lpad, exec_repeat, exec_rpad};
+use crate::info;
+#[cfg(feature = "json")]
+use crate::json;
+use crate::namespace::{mangle_name, NamespaceId};
+use crate::numeric::decimal::{
+    bigdecimal_to_blob, blob_to_bigdecimal, check_numeric_limits, format_numeric,
+    numeric_from_value, validate_precision_scale, MAX_FRACTION_DIGITS,
+};
+use crate::numeric::Numeric;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{Schema, Table};
+use crate::stats::StatAccum;
 use crate::sync::Arc;
+use crate::types::AsValueRef;
+use crate::vdbe::array::{
+    compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
+    exec_array_contains_all, exec_array_overlap, exec_array_position, exec_array_prepend,
+    exec_array_remove, exec_array_slice, exec_array_to_string, exec_string_to_array,
+};
+use crate::vdbe::{registers_to_ref_values, Register};
 use crate::vtab::{VirtualTable, VirtualTableType};
+use crate::{LimboError, Value, ValueRef};
+use bigdecimal::Zero;
+use branches::{mark_unlikely, unlikely};
+use std::borrow::Cow;
+use std::sync::atomic::Ordering;
 use turso_ext::VTabKind;
 
 /// SQLite version reported by compatibility APIs.
 ///
-/// This is the source of truth for the SQLite version Turso tracks. Keep
-/// [`SQLITE_VERSION_NUMBER`], `scripts/install-sqlite3.sh`, README.md, and
-/// COMPAT.md in sync when bumping it.
+/// This must equal `sqlite/version`, which `scripts/install-sqlite3.sh`
+/// reads; a test checks that, and that [`SQLITE_VERSION_NUMBER`] matches.
+/// Keep README.md and COMPAT.md in sync when bumping it.
 pub const SQLITE_VERSION: &str = "3.50.4";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
@@ -576,5 +605,944 @@ pub(crate) fn resolve_builtin_function_name(
         "currval" => Ok(Some(Func::Scalar(ScalarFunc::CurrVal))),
         "setval" => Ok(Some(Func::Scalar(ScalarFunc::SetVal))),
         _ => Ok(None),
+    }
+}
+
+/// Runs built-in scalar function `func` on the registers that hold its
+/// arguments. Shared by every dialect that resolves names onto the built-in
+/// set through [`resolve_builtin_function`].
+pub fn call_builtin_scalar(
+    context: &ScalarFuncContext<'_>,
+    func: &ScalarFunc,
+    args: &[Register],
+) -> crate::Result<Value> {
+    let connection = context.connection;
+    match func {
+        ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
+            unreachable!("desugared to dedicated instructions, not Function")
+        }
+        ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Iif => {
+            unreachable!("{func} is compiled to jumps, not Function")
+        }
+        ScalarFunc::Attach | ScalarFunc::TursoVersion => Err(LimboError::InternalError(format!(
+            "{func} is executed by the VDBE, not the dialect"
+        ))),
+        #[cfg(feature = "fs")]
+        #[cfg(not(target_family = "wasm"))]
+        ScalarFunc::LoadExtension => Err(LimboError::InternalError(format!(
+            "{func} is executed by the VDBE, not the dialect"
+        ))),
+        ScalarFunc::Cast => {
+            assert_eq!(args.len(), 2);
+            let Value::Text(cast_type) = args[1].get_value() else {
+                unreachable!("Cast with non-text type");
+            };
+            Ok(args[0].get_value().exec_cast(cast_type.as_str())?)
+        }
+        ScalarFunc::Changes => Ok(Value::from_i64(connection.changes.load(Ordering::SeqCst))),
+        ScalarFunc::Char => Ok(Value::exec_char(args.iter().map(|reg| reg.get_value()))),
+        ScalarFunc::Concat => Ok(Value::exec_concat_strings(
+            args.iter().map(|reg| reg.get_value()),
+        )),
+        ScalarFunc::ConcatWs => Ok(Value::exec_concat_ws(
+            args.iter().map(|reg| reg.get_value()),
+        )),
+        ScalarFunc::Glob => {
+            if args.len() != 2 {
+                mark_unlikely();
+                return Err(LimboError::ParseError(
+                    "wrong number of arguments to function GLOB()".to_string(),
+                ));
+            }
+            let pattern_value = args[0].get_value();
+            let match_value = args[1].get_value();
+            if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let pattern_cow = text_or_cast_to_text(pattern_value)?;
+            let match_cow = text_or_cast_to_text(match_value)?;
+            let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
+            Ok(Value::from_i64(matches as i64))
+        }
+        ScalarFunc::Instr => Ok(match args[0].get_value().exec_instr(args[1].get_value()) {
+            Value::Numeric(Numeric::Integer(i)) => Value::from_i64(i),
+            _ => Value::Null,
+        }),
+        ScalarFunc::LastInsertRowid => Ok(Value::from_i64(connection.last_insert_rowid())),
+        ScalarFunc::Like => {
+            let pattern_value = args[0].get_value();
+            let match_value = args[1].get_value();
+            if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut escape_char = None;
+            if args.len() == 3 {
+                let escape_value = args[2].get_value();
+                if matches!(escape_value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let escape_cow = text_or_cast_to_text(escape_value)?;
+                let mut chars = escape_cow.chars();
+                let c = chars.next();
+                if c.is_none() || chars.next().is_some() {
+                    return Err(LimboError::SqlError(
+                        "ESCAPE expression must be a single character".to_string(),
+                    ));
+                }
+                escape_char = c;
+            }
+            let matches = match (pattern_value, match_value) {
+                (Value::Text(pattern), Value::Text(text)) => {
+                    Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
+                }
+                _ => exec_like_converted(pattern_value, match_value, escape_char)?,
+            };
+            Ok(Value::from_i64(matches as i64))
+        }
+        ScalarFunc::NextVal => Err(LimboError::InternalError(
+            "ScalarFunc::NextVal handler should be unreachable under \
+             the disk-only sequence design"
+                .to_string(),
+        )),
+        ScalarFunc::CurrVal => {
+            let seq_name = match args[0].get_value() {
+                Value::Text(t) => t.as_str().to_string(),
+                _ => {
+                    return Err(LimboError::ParseError(
+                        "currval() requires a text argument".to_string(),
+                    ));
+                }
+            };
+            let (namespace, sequence) = connection.find_sequence(&seq_name)?;
+            match connection.get_sequence_currval(
+                namespace.database_id,
+                &mangle_name(namespace.id, &sequence.name),
+            ) {
+                Some(val) => Ok(Value::from_i64(val)),
+                None => Err(LimboError::ParseError(format!(
+                    "currval of sequence \"{}\" is not yet defined in this session",
+                    sequence.name
+                ))),
+            }
+        }
+        ScalarFunc::SetVal => {
+            if connection.is_tx_read_only() {
+                return Err(LimboError::ReadOnly);
+            }
+            let seq_name = match args[0].get_value() {
+                Value::Text(t) => t.as_str().to_string(),
+                _ => {
+                    return Err(LimboError::ParseError(
+                        "setval() requires a text argument".to_string(),
+                    ));
+                }
+            };
+            let value = match args[1].get_value().as_int() {
+                Some(v) => v,
+                None => {
+                    return Err(LimboError::ParseError(
+                        "setval() requires an integer value".to_string(),
+                    ));
+                }
+            };
+            if args.len() > 2 && args[2].get_value().as_int().is_none() {
+                return Err(LimboError::ParseError(
+                    "setval() requires an integer is_called argument".to_string(),
+                ));
+            }
+            let (_, seq) = connection.find_sequence(&seq_name)?;
+            if value < seq.min_value || value > seq.max_value {
+                return Err(LimboError::ParseError(format!(
+                    "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                    value, seq.name, seq.min_value, seq.max_value
+                )));
+            }
+            Ok(Value::from_i64(value))
+        }
+        ScalarFunc::Abs
+        | ScalarFunc::Lower
+        | ScalarFunc::Upper
+        | ScalarFunc::Length
+        | ScalarFunc::OctetLength
+        | ScalarFunc::Subtype
+        | ScalarFunc::Typeof
+        | ScalarFunc::Unicode
+        | ScalarFunc::Unistr
+        | ScalarFunc::UnistrQuote
+        | ScalarFunc::Quote
+        | ScalarFunc::RandomBlob
+        | ScalarFunc::Sign
+        | ScalarFunc::Soundex
+        | ScalarFunc::ZeroBlob => {
+            let reg_value = args[0].get_value();
+            let result = match func {
+                ScalarFunc::Sign => reg_value.exec_sign(),
+                ScalarFunc::Abs => Some(reg_value.exec_abs()?),
+                ScalarFunc::Lower => reg_value.exec_lower(),
+                ScalarFunc::Upper => reg_value.exec_upper(),
+                ScalarFunc::Length => Some(reg_value.exec_length()),
+                ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
+                ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
+                ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
+                ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
+                ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
+                ScalarFunc::Quote => Some(reg_value.exec_quote()),
+                ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),
+                ScalarFunc::RandomBlob => {
+                    Some(reg_value.exec_randomblob(|dest| context.io.fill_bytes(dest))?)
+                }
+                ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
+                ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
+                _ => unreachable!(),
+            };
+            Ok(match result {
+                Some(value) => value,
+                None => Value::Null,
+            })
+        }
+        ScalarFunc::Hex => Ok(args[0].get_value().exec_hex()),
+        ScalarFunc::Unhex => {
+            let ignored_chars = if args.len() == 2 { args.get(1) } else { None };
+            Ok(args[0]
+                .get_value()
+                .exec_unhex(ignored_chars.map(|x| x.get_value())))
+        }
+        ScalarFunc::GetByte => args[0].get_value().exec_get_byte(args[1].get_value()),
+        ScalarFunc::SetByte => args[0]
+            .get_value()
+            .exec_set_byte(args[1].get_value(), args[2].get_value()),
+        ScalarFunc::Random => Ok(Value::from_i64(context.io.generate_random_number())),
+        #[cfg(feature = "test_helper")]
+        ScalarFunc::TestNondetCounter => Ok(Value::from_i64(
+            connection
+                .test_nondet_counter
+                .fetch_add(1, Ordering::Relaxed),
+        )),
+        ScalarFunc::Trim => {
+            let pattern_value = if args.len() == 2 { args.get(1) } else { None };
+            Ok(args[0]
+                .get_value()
+                .exec_trim(pattern_value.map(|x| x.get_value())))
+        }
+        ScalarFunc::LTrim => {
+            let pattern_value = if args.len() == 2 { args.get(1) } else { None };
+            Ok(args[0]
+                .get_value()
+                .exec_ltrim(pattern_value.map(|x| x.get_value())))
+        }
+        ScalarFunc::RTrim => {
+            let pattern_value = if args.len() == 2 { args.get(1) } else { None };
+            Ok(args[0]
+                .get_value()
+                .exec_rtrim(pattern_value.map(|x| x.get_value())))
+        }
+        ScalarFunc::Round => {
+            assert!(args.len() == 1 || args.len() == 2);
+            let precision_value = if args.len() > 1 { args.get(1) } else { None };
+            Ok(args[0]
+                .get_value()
+                .exec_round(precision_value.map(|x| x.get_value())))
+        }
+        ScalarFunc::Min => {
+            let collation = context.collation;
+            Value::exec_min(args.iter().map(|v| v.get_value()), |a, b| {
+                Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+            })
+        }
+        ScalarFunc::Max => {
+            let collation = context.collation;
+            Value::exec_max(args.iter().map(|v| v.get_value()), |a, b| {
+                Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+            })
+        }
+        ScalarFunc::Nullif => {
+            let collation = context.collation;
+            args[0]
+                .get_value()
+                .exec_nullif(args[1].get_value(), |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })
+        }
+        ScalarFunc::Substr | ScalarFunc::Substring => {
+            let length_value = if args.len() == 3 {
+                Some(&args[2])
+            } else {
+                None
+            };
+            Ok(Value::exec_substring(
+                args[0].get_value(),
+                args[1].get_value(),
+                length_value.map(|x| x.get_value()),
+            )?)
+        }
+        ScalarFunc::Date => Ok(exec_date(context.clock, registers_to_ref_values(args))),
+        ScalarFunc::Time => Ok(exec_time(context.clock, registers_to_ref_values(args))),
+        ScalarFunc::TimeDiff => {
+            if args.len() != 2 {
+                return Ok(Value::Null);
+            }
+            Ok(exec_timediff(
+                context.clock,
+                [args[0].get_value(), args[1].get_value()],
+            ))
+        }
+        ScalarFunc::TotalChanges => Ok(Value::from_i64(
+            connection.total_changes.load(Ordering::SeqCst),
+        )),
+        ScalarFunc::DateTime => Ok(exec_datetime_full(
+            context.clock,
+            registers_to_ref_values(args),
+        )),
+        ScalarFunc::JulianDay => Ok(exec_julianday(context.clock, registers_to_ref_values(args))),
+        ScalarFunc::UnixEpoch => Ok(exec_unixepoch(context.clock, registers_to_ref_values(args))),
+        ScalarFunc::SqliteVersion => Ok(Value::build_text(execute_sqlite_version())),
+        ScalarFunc::SqliteSourceId => Ok(Value::build_text(format!(
+            "{} {}",
+            info::build::BUILT_TIME_SQLITE,
+            info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
+        ))),
+        ScalarFunc::Replace => {
+            assert_eq!(args.len(), 3);
+            Ok(Value::exec_replace(
+                args[0].get_value(),
+                args[1].get_value(),
+                args[2].get_value(),
+            )?)
+        }
+        ScalarFunc::StrfTime => Ok(exec_strftime(context.clock, registers_to_ref_values(args))),
+        ScalarFunc::Printf => exec_printf(args),
+        ScalarFunc::TableColumnsJsonArray => {
+            assert_eq!(args.len(), 1);
+            #[cfg(not(feature = "json"))]
+            {
+                Err(LimboError::InvalidArgument(
+                    "table_columns_json_array: turso must be compiled with JSON support"
+                        .to_string(),
+                ))
+            }
+            #[cfg(feature = "json")]
+            {
+                use crate::types::{TextRef, TextSubtype};
+
+                let Value::Text(table) = args[0].get_value() else {
+                    return Err(LimboError::InvalidArgument(
+                        "table_columns_json_array: function argument must be of type TEXT"
+                            .to_string(),
+                    ));
+                };
+                let table = {
+                    let schema = connection.schema.read();
+                    match schema.get_table(NamespaceId::ROOT, table.as_str()) {
+                        Some(table) => table,
+                        None => {
+                            return Err(LimboError::InvalidArgument(format!(
+                                "table_columns_json_array: table {table} doesn't exists"
+                            )));
+                        }
+                    }
+                };
+
+                let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10)?;
+                for column in table.columns() {
+                    let name = column.name.as_ref().expect("column should have a name");
+                    let name_json = json::convert_ref_dbtype_to_jsonb(
+                        ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
+                        json::Conv::ToString,
+                    )?;
+                    json.append_jsonb_to_end(name_json.data());
+                }
+                json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
+                json::json_string_to_db_type(
+                    json,
+                    json::jsonb::ElementType::ARRAY,
+                    json::OutputVariant::String,
+                )
+            }
+        }
+        ScalarFunc::BinRecordJsonObject => {
+            assert_eq!(args.len(), 2);
+            #[cfg(not(feature = "json"))]
+            {
+                Err(LimboError::InvalidArgument(
+                    "bin_record_json_object: turso must be compiled with JSON support".to_string(),
+                ))
+            }
+            #[cfg(feature = "json")]
+            {
+                use crate::types::ValueIterator;
+                use std::str::FromStr;
+
+                let columns_str = args[0].get_value();
+                let bin_record = args[1].get_value();
+                let Value::Text(columns_str) = columns_str else {
+                    return Err(LimboError::InvalidArgument(
+                        "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
+                    ));
+                };
+
+                if let Value::Null = bin_record {
+                    return Ok(Value::Null);
+                }
+
+                let Value::Blob(bin_record) = bin_record else {
+                    return Err(LimboError::InvalidArgument(
+                        "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
+                    ));
+                };
+                let mut columns_json_array = json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                let columns_len = columns_json_array.array_len()?;
+
+                let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
+
+                let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
+                for i in 0..columns_len {
+                    let mut op = json::jsonb::SearchOperation::new(0)?;
+                    let path = json::path::JsonPath {
+                        elements: vec![
+                            json::path::PathElement::Root(),
+                            json::path::PathElement::ArrayLocator(Some(i as i32)),
+                        ],
+                    };
+
+                    columns_json_array.operate_on_path(&path, &mut op)?;
+                    let column_name = op.result();
+                    json.append_jsonb_to_end(column_name.data());
+
+                    let val = match payload_iterator.next() {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            return Err(LimboError::InvalidArgument(
+                                "bin_record_json_object: binary record has fewer columns than specified in the columns argument".to_string()
+                            ));
+                        }
+                    };
+
+                    if let ValueRef::Blob(..) = val {
+                        return Err(LimboError::InvalidArgument(
+                            "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
+                        ));
+                    }
+                    let val_json = json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
+                    json.append_jsonb_to_end(val_json.data());
+                }
+                json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
+
+                json::json_string_to_db_type(
+                    json,
+                    json::jsonb::ElementType::OBJECT,
+                    json::OutputVariant::String,
+                )
+            }
+        }
+        ScalarFunc::Detach => {
+            assert_eq!(args.len(), 1);
+            let Value::Text(dbname_str) = args[0].get_value() else {
+                return Err(LimboError::InvalidArgument(
+                    "detach: database name argument must be text".to_string(),
+                ));
+            };
+            connection.detach_database(dbname_str.as_str())?;
+            Ok(Value::Null)
+        }
+        ScalarFunc::Unlikely | ScalarFunc::Likely | ScalarFunc::Likelihood => {
+            panic!(
+                "{func:?} should be stripped during expression translation and never reach VDBE"
+            );
+        }
+        ScalarFunc::StatInit => {
+            assert!(!args.is_empty());
+            let n_col = match args[0].get_value() {
+                Value::Numeric(Numeric::Integer(n)) => *n as usize,
+                _ => 0,
+            };
+            Ok(Value::Blob(StatAccum::new(n_col).to_bytes()))
+        }
+        ScalarFunc::StatPush => {
+            assert!(args.len() >= 2);
+            let i_chng = match args[1].get_value() {
+                Value::Numeric(Numeric::Integer(n)) => *n as usize,
+                _ => 0,
+            };
+            Ok(match args[0].get_value() {
+                Value::Blob(bytes) => {
+                    if let Some(mut accum) = StatAccum::from_bytes(bytes) {
+                        accum.push(i_chng);
+                        Value::Blob(accum.to_bytes())
+                    } else {
+                        Value::Null
+                    }
+                }
+                _ => Value::Null,
+            })
+        }
+        ScalarFunc::StatGet => {
+            assert!(!args.is_empty());
+            Ok(match args[0].get_value() {
+                Value::Blob(bytes) => {
+                    if let Some(accum) = StatAccum::from_bytes(bytes) {
+                        let stat_str = accum.get_stat1();
+                        if stat_str.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::build_text(stat_str)
+                        }
+                    } else {
+                        Value::Null
+                    }
+                }
+                _ => Value::Null,
+            })
+        }
+        ScalarFunc::ConnTxnId => {
+            assert_eq!(args.len(), 1);
+            let candidate = match args[0].get_value() {
+                Value::Numeric(Numeric::Integer(n)) => *n,
+                _ => -1,
+            };
+            let current = connection.get_cdc_transaction_id();
+            if current == -1 {
+                connection.set_cdc_transaction_id(candidate);
+                Ok(Value::from_i64(candidate))
+            } else {
+                Ok(Value::from_i64(current))
+            }
+        }
+        ScalarFunc::IsAutocommit => {
+            let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
+            Ok(Value::from_i64(if auto_commit { 1 } else { 0 }))
+        }
+        ScalarFunc::SequenceWatermark => {
+            assert_eq!(args.len(), 1);
+            let sequence_name = match args[0].get_value() {
+                Value::Text(text) => text.as_str(),
+                Value::Null => return Ok(Value::Null),
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "sequence_watermark_experimental() argument must be TEXT".to_string(),
+                    ));
+                }
+            };
+            let (namespace, sequence) = connection.find_sequence(sequence_name)?;
+            let watermark =
+                connection
+                    .mv_store_for_db(namespace.database_id)
+                    .and_then(|mv_store| {
+                        mv_store.sequence_watermark(&mangle_name(namespace.id, &sequence.name))
+                    });
+            Ok(match watermark {
+                Some(watermark) => Value::from_i64(watermark),
+                None => Value::Null,
+            })
+        }
+        ScalarFunc::TestUintEncode => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Numeric(Numeric::Integer(i)) => {
+                    if *i < 0 {
+                        return Err(LimboError::InternalError(
+                            "test_uint_encode: negative value".to_string(),
+                        ));
+                    }
+                    Value::build_text(i.to_string())
+                }
+                Value::Numeric(Numeric::Float(f)) => {
+                    if *f < 0.0 || f.fract() != 0.0 {
+                        return Err(LimboError::InternalError(
+                            "test_uint_encode: not a non-negative integer".to_string(),
+                        ));
+                    }
+                    Value::build_text((f64::from(*f) as u64).to_string())
+                }
+                Value::Text(t) => {
+                    let s = t.to_string();
+                    s.parse::<u64>().map_err(|_| {
+                        LimboError::InternalError(format!("test_uint_encode: invalid uint: {s}"))
+                    })?;
+                    Value::build_text(s)
+                }
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "test_uint_encode: unsupported type".to_string(),
+                    ));
+                }
+            })
+        }
+        ScalarFunc::TestUintDecode => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                other => other.clone(),
+            })
+        }
+        ScalarFunc::StringReverse => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Text(t) => {
+                    let reversed: String = t.to_string().chars().rev().collect();
+                    Value::build_text(reversed)
+                }
+                other => {
+                    let s = other.to_string();
+                    let reversed: String = s.chars().rev().collect();
+                    Value::build_text(reversed)
+                }
+            })
+        }
+        ScalarFunc::Gcd => {
+            check_arg_count(args, 2)?;
+            exec_gcd(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::Lcm => {
+            check_arg_count(args, 2)?;
+            exec_lcm(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::Repeat => {
+            check_arg_count(args, 2)?;
+            exec_repeat(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::Lpad => {
+            let fill = if args.len() >= 3 {
+                Some(args[2].get_value())
+            } else {
+                None
+            };
+            exec_lpad(args[0].get_value(), args[1].get_value(), fill)
+        }
+        ScalarFunc::Rpad => {
+            let fill = if args.len() >= 3 {
+                Some(args[2].get_value())
+            } else {
+                None
+            };
+            exec_rpad(args[0].get_value(), args[1].get_value(), fill)
+        }
+        ScalarFunc::BooleanToInt => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Numeric(Numeric::Integer(i)) => match *i {
+                    0 => Value::from_i64(0),
+                    1 => Value::from_i64(1),
+                    _ => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input for type boolean: \"{i}\""
+                        )));
+                    }
+                },
+                Value::Text(t) => {
+                    let v = &t.value;
+                    match v.to_ascii_lowercase().as_str() {
+                        "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
+                        "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
+                        _ => {
+                            return Err(LimboError::Constraint(format!(
+                                "invalid input for type boolean: \"{v}\""
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(LimboError::Constraint(format!(
+                        "invalid input for type boolean: \"{other}\""
+                    )));
+                }
+            })
+        }
+        ScalarFunc::IntToBoolean => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Numeric(Numeric::Integer(0)) => Value::build_text("false".to_string()),
+                _ => Value::build_text("true".to_string()),
+            })
+        }
+        ScalarFunc::ValidateIpAddr => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Text(t) => {
+                    let v = &t.value;
+                    v.parse::<std::net::IpAddr>().map_err(|_| {
+                        LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
+                    })?;
+                    args[0].get_value().clone()
+                }
+                other => {
+                    return Err(LimboError::Constraint(format!(
+                        "invalid input for type inet: \"{other}\""
+                    )));
+                }
+            })
+        }
+        ScalarFunc::NumericEncode => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                other => {
+                    let bd = numeric_from_value(other)?;
+                    Value::from_blob(bigdecimal_to_blob(&bd))
+                }
+            })
+        }
+        ScalarFunc::NumericFit => {
+            check_arg_count(args, 3)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Blob(stored) => {
+                    let bd = blob_to_bigdecimal(stored)?;
+                    let (
+                        Value::Numeric(Numeric::Integer(precision)),
+                        Value::Numeric(Numeric::Integer(scale)),
+                    ) = (args[1].get_value(), args[2].get_value())
+                    else {
+                        return Err(LimboError::Constraint(
+                            "numeric_fit: precision and scale must be integers".to_string(),
+                        ));
+                    };
+                    let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+                    Value::from_blob(bigdecimal_to_blob(&fitted))
+                }
+                other => {
+                    return Err(LimboError::InternalError(format!(
+                        "numeric_fit expects a stored numeric, got {}",
+                        other.value_type()
+                    )));
+                }
+            })
+        }
+        ScalarFunc::NumericDecode => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                Value::Blob(b) => Value::build_text(format_numeric(&blob_to_bigdecimal(b)?)),
+                other => {
+                    return Err(LimboError::Constraint(format!(
+                        "numeric_decode: expected blob, got \"{other}\""
+                    )));
+                }
+            })
+        }
+        ScalarFunc::NumericAdd
+        | ScalarFunc::NumericSub
+        | ScalarFunc::NumericMul
+        | ScalarFunc::NumericDiv
+        | ScalarFunc::NumericMod => {
+            check_arg_count(args, 2)?;
+            let lhs_val = args[0].get_value();
+            let rhs_val = args[1].get_value();
+            Ok(match (lhs_val, rhs_val) {
+                (Value::Null, _) | (_, Value::Null) => Value::Null,
+                _ => {
+                    let a = numeric_from_value(lhs_val)?;
+                    let b = numeric_from_value(rhs_val)?;
+                    let (a_scale, b_scale) =
+                        (a.fractional_digit_count(), b.fractional_digit_count());
+                    let res = match func {
+                        ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
+                        ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
+                        ScalarFunc::NumericMul => (a * b).with_scale_round(
+                            (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
+                            bigdecimal::RoundingMode::HalfUp,
+                        ),
+                        ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
+                            if b.is_zero() {
+                                return Err(LimboError::Constraint("division by zero".to_string()));
+                            }
+                            if matches!(func, ScalarFunc::NumericDiv) {
+                                a / b
+                            } else {
+                                (a % b).with_scale(a_scale.max(b_scale))
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    check_numeric_limits(&res)?;
+                    Value::build_text(format_numeric(&res))
+                }
+            })
+        }
+        ScalarFunc::NumericNeg => {
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Null => Value::Null,
+                val => Value::build_text(format_numeric(&-numeric_from_value(val)?)),
+            })
+        }
+        ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
+            check_arg_count(args, 2)?;
+            let lhs = args[0].get_value();
+            let rhs = args[1].get_value();
+            match func {
+                ScalarFunc::DatePlus => exec_date_plus(context.clock, lhs, rhs),
+                ScalarFunc::DateMinus => exec_date_minus(context.clock, lhs, rhs),
+                ScalarFunc::DateDiff => exec_date_diff(context.clock, lhs, rhs),
+                _ => unreachable!(),
+            }
+        }
+        ScalarFunc::ArrayAppend => {
+            check_arg_count(args, 2)?;
+            exec_array_append(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::ArrayPrepend => {
+            check_arg_count(args, 2)?;
+            exec_array_prepend(args[1].get_value(), args[0].get_value())
+        }
+        ScalarFunc::ArrayCat => {
+            check_arg_count(args, 2)?;
+            exec_array_cat(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::ArrayRemove => {
+            check_arg_count(args, 2)?;
+            exec_array_remove(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::ArrayContains => {
+            check_arg_count(args, 2)?;
+            Ok(exec_array_contains(
+                args[0].get_value(),
+                args[1].get_value(),
+            ))
+        }
+        ScalarFunc::ArrayPosition => {
+            check_arg_count(args, 2)?;
+            Ok(exec_array_position(
+                args[0].get_value(),
+                args[1].get_value(),
+            ))
+        }
+        ScalarFunc::ArrayLength => {
+            let dim = if args.len() >= 2 {
+                args[1].get_value().as_int().unwrap_or(0)
+            } else {
+                1
+            };
+            Ok(
+                match compute_array_length_at_dim(args[0].get_value(), dim) {
+                    Some(count) => Value::from_i64(count),
+                    None => Value::Null,
+                },
+            )
+        }
+        ScalarFunc::ArraySlice => {
+            check_arg_count(args, 3)?;
+            exec_array_slice(
+                args[0].get_value(),
+                args[1].get_value(),
+                args[2].get_value(),
+            )
+        }
+        ScalarFunc::StringToArray => {
+            let null_str = if args.len() >= 3 {
+                Some(args[2].get_value())
+            } else {
+                None
+            };
+            exec_string_to_array(args[0].get_value(), args[1].get_value(), null_str)
+        }
+        ScalarFunc::ArrayToString => {
+            let null_str = if args.len() >= 3 {
+                Some(args[2].get_value())
+            } else {
+                None
+            };
+            Ok(exec_array_to_string(
+                args[0].get_value(),
+                args[1].get_value(),
+                null_str,
+            ))
+        }
+        ScalarFunc::ArrayOverlap => {
+            check_arg_count(args, 2)?;
+            Ok(exec_array_overlap(args[0].get_value(), args[1].get_value()))
+        }
+        ScalarFunc::ArrayContainsAll => {
+            check_arg_count(args, 2)?;
+            Ok(exec_array_contains_all(
+                args[0].get_value(),
+                args[1].get_value(),
+            ))
+        }
+        ScalarFunc::StructPack
+        | ScalarFunc::StructExtractFunc
+        | ScalarFunc::UnionValueFunc
+        | ScalarFunc::UnionTagFunc
+        | ScalarFunc::UnionExtractFunc => Err(LimboError::InternalError(format!(
+            "{func} should be desugared to a dedicated instruction, not Function"
+        ))),
+    }
+}
+
+fn text_or_cast_to_text(value: &Value) -> crate::Result<Cow<'_, str>> {
+    match value {
+        Value::Text(s) => Ok(Cow::Borrowed(s.as_str())),
+        v => match v.exec_cast("TEXT")? {
+            Value::Text(s) => Ok(Cow::Owned(s.to_string())),
+            _ => unreachable!("Cast to TEXT should yield Text"),
+        },
+    }
+}
+
+/// LIKE with an operand that is not TEXT: both are converted to TEXT first.
+#[inline(never)]
+fn exec_like_converted(
+    pattern_value: &Value,
+    match_value: &Value,
+    escape_char: Option<char>,
+) -> crate::Result<bool> {
+    let pattern_cow = text_or_cast_to_text(pattern_value)?;
+    let match_cow = text_or_cast_to_text(match_value)?;
+    Value::exec_like(&pattern_cow, &match_cow, escape_char)
+}
+
+fn check_arg_count(args: &[Register], expected: usize) -> crate::Result<()> {
+    if unlikely(args.len() != expected) {
+        return Err(wrong_arg_count(expected, args.len()));
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn wrong_arg_count(expected: usize, actual: usize) -> LimboError {
+    LimboError::InternalError(format!("expected {expected} argument(s), got {actual}"))
+}
+
+// Compat for applications that test for SQLite.
+fn execute_sqlite_version() -> String {
+    SQLITE_VERSION.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_execute_sqlite_version() {
+        assert_eq!(execute_sqlite_version(), SQLITE_VERSION);
+    }
+
+    /// The constants cannot read `sqlite/version` while building, because the
+    /// file is outside this crate and would be missing from the published
+    /// package. This test fails when they differ from it.
+    #[test]
+    fn sqlite_version_constants_match_sqlite_version_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../sqlite/version");
+        let text = std::fs::read_to_string(path).expect("sqlite/version should exist");
+        let version = text.trim();
+
+        assert_eq!(SQLITE_VERSION, version);
+
+        let [major, minor, patch]: [i32; 3] = version
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("sqlite/version should have three parts, like 3.50.4");
+        assert_eq!(
+            SQLITE_VERSION_NUMBER,
+            major * 1_000_000 + minor * 1_000 + patch
+        );
     }
 }

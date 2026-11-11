@@ -347,6 +347,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: 1,
+                    ..
                 },
             ..
         } => {
@@ -1155,7 +1156,7 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
 
 /// The arguments of `iif(c1, v1, c2, v2, ..., else)` that it may return:
 /// every second one from the second on, and a last one without a condition.
-pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<ast::Expr>> {
+pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<ast::Expr>> + Clone {
     let has_else = args.len() % 2 == 1;
     args.iter()
         .enumerate()
@@ -1209,7 +1210,10 @@ fn declared_return_type(
 /// exact numbers, such as numeric, mixed with an integer or a decimal is that
 /// type without parameters. A custom type mixed with any other type counts as
 /// the type it is stored as. Any other mix is `Any`.
-fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
+pub(crate) fn common_type<'e>(
+    exprs: impl Iterator<Item = &'e ast::Expr>,
+    env: &TypeEnv,
+) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
@@ -1572,6 +1576,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             Arc::new(crate::EngineDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         );
         let env = TypeEnv::new(None, &resolver);
         let mismatches: Vec<String> = cases

@@ -31,6 +31,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
     Table,
 };
+use crate::security::roles::RoleId;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
@@ -152,7 +153,10 @@ pub struct Resolver<'a> {
     /// redirecting column reads at codegen time.
     pub register_columns: HashMap<usize, RegisterColumn>,
     /// Each planned subquery that gives one row, keyed by its internal ID.
-    pub(crate) row_value_subqueries: Rc<RowValueSubqueries>,
+    pub(crate) row_value_subqueries: Rc<SubqueryMap<RowValueSubquery>>,
+    /// The types of the result columns of each planned IN subquery, keyed by its
+    /// internal ID.
+    pub(crate) in_subquery_column_types: Rc<SubqueryMap<Vec<ExprType>>>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -181,6 +185,12 @@ pub struct Resolver<'a> {
     /// The statement is compiled for a role that is not a superuser, which may
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
+    /// The role whose access row-level security limits in the statement being
+    /// compiled. Every caller of [`Resolver::new`] says which role it is, so
+    /// that compiling a statement as the superuser is a visible choice: the
+    /// engine makes it for the statements it runs on its own behalf and
+    /// inside [`Resolver::without_row_security`].
+    pub(crate) row_security_role: RoleId,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -237,24 +247,32 @@ impl RegisterColumn {
     }
 }
 
-/// The subqueries that give one row which a resolver has planned. A forked
-/// resolver starts a new, empty layer on top of its parent's layer instead of
-/// copying it: deeply nested subqueries fork thousands of times, and copying
+/// The planned subqueries of one kind in a resolver, such as the ones that give
+/// one row or the ones on the right of IN. A forked resolver starts a
+/// new, empty layer on top of its parent's layer instead of copying it: deeply nested subqueries fork thousands of times, and copying
 /// every entry on each fork made planning them quadratic. What a fork adds
 /// stays out of its parent, because a fork can compile a separate program
 /// (a trigger or a foreign key action) whose internal IDs repeat the parent's.
-#[derive(Default)]
-pub(crate) struct RowValueSubqueries {
-    parent: Option<Rc<RowValueSubqueries>>,
-    own: RefCell<HashMap<TableInternalId, Rc<RowValueSubquery>>>,
+pub(crate) struct SubqueryMap<T> {
+    parent: Option<Rc<SubqueryMap<T>>>,
+    own: RefCell<HashMap<TableInternalId, Rc<T>>>,
 }
 
-impl RowValueSubqueries {
-    pub(crate) fn insert(&self, subquery_id: TableInternalId, subquery: RowValueSubquery) {
+impl<T> Default for SubqueryMap<T> {
+    fn default() -> Self {
+        Self {
+            parent: None,
+            own: RefCell::default(),
+        }
+    }
+}
+
+impl<T> SubqueryMap<T> {
+    pub(crate) fn insert(&self, subquery_id: TableInternalId, subquery: T) {
         self.own.borrow_mut().insert(subquery_id, Rc::new(subquery));
     }
 
-    pub(crate) fn get(&self, subquery_id: TableInternalId) -> Option<Rc<RowValueSubquery>> {
+    pub(crate) fn get(&self, subquery_id: TableInternalId) -> Option<Rc<T>> {
         if let Some(subquery) = self.own.borrow().get(&subquery_id) {
             return Some(subquery.clone());
         }
@@ -370,11 +388,21 @@ impl Resolver<'static> {
             DoubleQuotedDml::Enabled,
             Arc::new(crate::EngineDialect),
             None,
+            RoleId::SUPERUSER,
         )
     }
 }
 
 impl<'a> Resolver<'a> {
+    /// Compiles `f` as for the superuser, so row-level security limits
+    /// nothing, and then restores the role.
+    pub(crate) fn without_row_security<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
+        let result = f(self);
+        self.row_security_role = role;
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
@@ -387,6 +415,7 @@ impl<'a> Resolver<'a> {
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
         search_path: Option<&[String]>,
+        row_security_role: RoleId,
     ) -> Self {
         Self {
             catalog: CatalogContext::new(
@@ -404,6 +433,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
             row_value_subqueries: Rc::default(),
+            in_subquery_column_types: Rc::default(),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
@@ -411,6 +441,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
             role_is_not_superuser: false,
+            row_security_role,
         }
     }
 
@@ -439,6 +470,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
             row_value_subqueries: self.row_value_subqueries.fork(),
+            in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
@@ -446,6 +478,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role,
         }
     }
 
@@ -456,6 +489,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_columns: self.register_columns.clone(),
             row_value_subqueries: self.row_value_subqueries.fork(),
+            in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
@@ -463,6 +497,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role,
         }
     }
 
