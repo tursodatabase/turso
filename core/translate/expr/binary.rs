@@ -801,11 +801,9 @@ pub(super) fn emit_binary_insn(
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => {
-                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayContainsAll)
+                    Func::Scalar(&crate::scalar::arrays::ArrayContainsAll)
                 }
-                ast::Operator::ArrayOverlap => {
-                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayOverlap)
-                }
+                ast::Operator::ArrayOverlap => Func::Scalar(&crate::scalar::arrays::ArrayOverlap),
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {
@@ -1112,11 +1110,9 @@ pub(super) fn emit_binary_condition_insn(
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => {
-                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayContainsAll)
+                    Func::Scalar(&crate::scalar::arrays::ArrayContainsAll)
                 }
-                ast::Operator::ArrayOverlap => {
-                    Func::RegisteredScalar(&crate::scalar::arrays::ArrayOverlap)
-                }
+                ast::Operator::ArrayOverlap => Func::Scalar(&crate::scalar::arrays::ArrayOverlap),
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {

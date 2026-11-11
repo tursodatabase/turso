@@ -1059,7 +1059,7 @@ fn binary(a: &Value, b: &Value) -> turso_core::Result<std::cmp::Ordering> {
 
 #[turso_macros::divan_bench(args = ["abs", "lower", "length"])]
 fn registered_scalar(bencher: Bencher, name: &str) {
-    let turso_core::Func::RegisteredScalar(function) =
+    let turso_core::Func::Scalar(function) =
         turso_core::dialect::engine::resolve_builtin_function(name, 1)
             .unwrap()
             .unwrap()

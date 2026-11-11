@@ -190,7 +190,7 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
     let func = resolve_builtin_function_name(name, arg_count)?;
-    if let Some(Func::RegisteredScalar(function)) = &func {
+    if let Some(Func::Scalar(function)) = &func {
         function.metadata().validate_arg_count(name, arg_count)?;
     }
     Ok(func)
@@ -206,7 +206,7 @@ pub(crate) fn resolve_builtin_function_name(
     if let Some(function) =
         crate::function::scalar::BUILTIN_SCALAR_FUNCTIONS.lookup(&normalized_name, arg_count)
     {
-        return Ok(Some(Func::RegisteredScalar(function)));
+        return Ok(Some(Func::Scalar(function)));
     }
     match normalized_name.as_str() {
         "avg" => {
@@ -441,6 +441,6 @@ pub(crate) fn resolve_builtin_function_name(
         // Sequence functions
         _ => Ok(crate::scalar::BUILTIN_SCALAR_FUNCTIONS
             .get(&normalized_name)
-            .map(Func::RegisteredScalar)),
+            .map(Func::Scalar)),
     }
 }

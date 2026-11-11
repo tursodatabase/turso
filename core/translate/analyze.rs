@@ -518,7 +518,7 @@ fn emit_index_stats(
         start_reg: reg_chng,
         dest: reg_accum,
         func: FuncCtx {
-            func: Func::RegisteredScalar(&crate::scalar::internal::StatInit),
+            func: Func::Scalar(&crate::scalar::internal::StatInit),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },
@@ -607,7 +607,7 @@ fn emit_index_stats(
         start_reg: reg_accum,
         dest: reg_accum,
         func: FuncCtx {
-            func: Func::RegisteredScalar(&crate::scalar::internal::StatPush),
+            func: Func::Scalar(&crate::scalar::internal::StatPush),
             arg_count: 2,
             collation: CollationSeq::BINARY,
         },
@@ -628,7 +628,7 @@ fn emit_index_stats(
         start_reg: reg_accum,
         dest: reg_stat,
         func: FuncCtx {
-            func: Func::RegisteredScalar(&crate::scalar::internal::StatGet),
+            func: Func::Scalar(&crate::scalar::internal::StatGet),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },

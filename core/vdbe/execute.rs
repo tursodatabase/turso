@@ -10300,7 +10300,7 @@ pub fn op_function(
                 }
             }
         },
-        crate::function::Func::RegisteredScalar(function) => {
+        crate::function::Func::Scalar(function) => {
             let args = crate::function::scalar::FunctionArgs::new(
                 &state.registers[*start_reg..*start_reg + arg_count],
             );

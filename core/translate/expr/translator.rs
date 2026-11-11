@@ -1099,7 +1099,7 @@ fn translate_function_call_expr(
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
-        Func::RegisteredScalar(function) => {
+        Func::Scalar(function) => {
             function
                 .metadata()
                 .validate_arg_count(name.as_str(), args_count)?;

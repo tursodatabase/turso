@@ -143,7 +143,7 @@ pub(super) fn emit_member_columns(
             start_reg: values_start + column,
             dest: dest + width + column,
             func: FuncCtx {
-                func: Func::RegisteredScalar(&crate::scalar::values::Typeof),
+                func: Func::Scalar(&crate::scalar::values::Typeof),
                 arg_count: 1,
                 collation: CollationSeq::BINARY,
             },

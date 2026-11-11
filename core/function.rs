@@ -1115,7 +1115,7 @@ impl Display for AlterTableFunc {
 pub enum Func {
     Agg(AggFunc),
     Window(WindowFunc),
-    RegisteredScalar(&'static dyn scalar::ScalarFunction),
+    Scalar(&'static dyn scalar::ScalarFunction),
     Math(MathFunc),
     Vector(VectorFunc),
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1135,7 +1135,7 @@ impl Display for Func {
         match self {
             Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
             Self::Window(window_func) => write!(f, "{window_func}"),
-            Self::RegisteredScalar(func) => f.write_str(func.metadata().name),
+            Self::Scalar(func) => f.write_str(func.metadata().name),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1163,7 +1163,7 @@ impl Deterministic for Func {
         match self {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
             Self::Window(window_func) => window_func.is_deterministic(),
-            Self::RegisteredScalar(func) => func.metadata().deterministic,
+            Self::Scalar(func) => func.metadata().deterministic,
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1250,7 +1250,7 @@ impl Func {
             None => ResultType::Unknown,
         };
         match self {
-            Self::RegisteredScalar(func) => func.metadata().result_type,
+            Self::Scalar(func) => func.metadata().result_type,
             Self::Math(func) => func.result_type(),
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
@@ -1276,7 +1276,7 @@ impl Func {
 
     pub fn date_time_arguments(&self) -> Option<scalar::DateTimeArguments> {
         match self {
-            Self::RegisteredScalar(function) => function.date_time_arguments(),
+            Self::Scalar(function) => function.date_time_arguments(),
             _ => None,
         }
     }
@@ -1287,7 +1287,7 @@ impl Func {
     pub fn needs_collation(&self) -> bool {
         matches!(
             self,
-            Self::RegisteredScalar(function)
+            Self::Scalar(function)
                 if function.argument_translation() != scalar::ArgumentTranslation::Values
         )
     }
@@ -1298,7 +1298,7 @@ impl Func {
             return true;
         }
         match self {
-            Self::RegisteredScalar(function) => {
+            Self::Scalar(function) => {
                 !function.is_internal()
                     && matches!(function.metadata().arity, arity::FunctionArity::Exact(0))
             }
@@ -1317,7 +1317,7 @@ impl Func {
     /// This metadata is currently used by optimizer null-rejection analysis.
     pub fn can_mask_nulls(&self) -> bool {
         match self {
-            Self::RegisteredScalar(func) => func.metadata().can_mask_nulls,
+            Self::Scalar(func) => func.metadata().can_mask_nulls,
             _ => false,
         }
     }

@@ -123,7 +123,7 @@ pub fn translate_attach(
         start_reg: arg_reg,
         dest: arg_reg + 3, // Result register (not used but required)
         func: crate::function::FuncCtx {
-            func: Func::RegisteredScalar(&crate::scalar::system::Attach),
+            func: Func::Scalar(&crate::scalar::system::Attach),
             arg_count: 3,
             collation: CollationSeq::BINARY,
         },
@@ -186,7 +186,7 @@ pub fn translate_detach(
         start_reg: arg_reg,
         dest: arg_reg + 1, // Result register (not used but required)
         func: crate::function::FuncCtx {
-            func: Func::RegisteredScalar(&crate::scalar::system::Detach),
+            func: Func::Scalar(&crate::scalar::system::Detach),
             arg_count: 1,
             collation: CollationSeq::BINARY,
         },

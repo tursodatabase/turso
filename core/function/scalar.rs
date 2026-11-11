@@ -807,14 +807,14 @@ mod tests {
             );
             for count in [2, 3, 100] {
                 let function = resolve_builtin_function(name, count).unwrap().unwrap();
-                assert!(matches!(function, Func::RegisteredScalar(_)));
+                assert!(matches!(function, Func::Scalar(_)));
                 assert!(function.needs_collation());
                 assert_eq!(function.to_string(), name);
             }
         }
         assert!(matches!(
             resolve_builtin_function("nullif", 2).unwrap(),
-            Some(Func::RegisteredScalar(_))
+            Some(Func::Scalar(_))
         ));
         for count in [0, 1, 3] {
             assert!(resolve_builtin_function_name("nullif", count)
@@ -844,8 +844,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn argument_count_does_not_truncate() {
-        let Func::RegisteredScalar(function) = resolve_builtin_function("abs", 1).unwrap().unwrap()
-        else {
+        let Func::Scalar(function) = resolve_builtin_function("abs", 1).unwrap().unwrap() else {
             panic!("expected a registered scalar");
         };
         assert!(function
@@ -873,7 +872,7 @@ mod tests {
             "CHARACTER_LENGTH",
         ] {
             let function = resolve_builtin_function(name, 1).unwrap().unwrap();
-            assert!(matches!(function, Func::RegisteredScalar(_)));
+            assert!(matches!(function, Func::Scalar(_)));
             for count in [0, 2] {
                 assert!(resolve_builtin_function(name, count).is_err());
                 assert!(resolve_builtin_function_name(name, count)
@@ -884,7 +883,7 @@ mod tests {
         for count in [1, 2] {
             assert!(matches!(
                 resolve_builtin_function("unhex", count).unwrap(),
-                Some(Func::RegisteredScalar(_))
+                Some(Func::Scalar(_))
             ));
         }
         for count in [0, 3] {

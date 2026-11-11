@@ -583,10 +583,10 @@ mod tests {
                 return engine::resolve_builtin_function("coalesce", arg_count);
             }
             if name.eq_ignore_ascii_case("test_trait_yield") {
-                return Ok(Some(Func::RegisteredScalar(&TestTraitYield)));
+                return Ok(Some(Func::Scalar(&TestTraitYield)));
             }
             if name.eq_ignore_ascii_case("test_trait_add") {
-                return Ok(Some(Func::RegisteredScalar(&TestTraitAdd)));
+                return Ok(Some(Func::Scalar(&TestTraitAdd)));
             }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
                 return Ok(Some(Func::Dialect("test_add_one".to_string())));

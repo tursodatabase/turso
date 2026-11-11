@@ -1610,7 +1610,7 @@ pub fn insn_to_row(
                 *dest as i64,
                 {
                     let s = match &func.func {
-                        Func::RegisteredScalar(function) => function.explain_name(func.arg_count),
+                        Func::Scalar(function) => function.explain_name(func.arg_count),
                         function => function.to_string(),
                     };
                     Value::build_text(s)

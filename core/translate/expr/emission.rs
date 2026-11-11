@@ -85,7 +85,7 @@ fn emit_current_time_function(
     emit_function_call(
         program,
         FuncCtx {
-            func: Func::RegisteredScalar(func),
+            func: Func::Scalar(func),
             arg_count: 0,
             collation: CollationSeq::BINARY,
         },
