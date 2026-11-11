@@ -1634,6 +1634,17 @@ expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }
 
+# The time extension's make_date takes other arguments than PostgreSQL's.
+test make-date-of-the-time-extension-is-not-a-function {
+    SELECT make_date(2024, 1, 5);
+}
+expect {
+    2024-01-05
+}
+expect @tursopg error {
+    no such function: make_date
+}
+
 test numeric-column-plus-round-and-mod-of-exact-numbers-is-exact {
     -- round() and mod() of exact numbers give exact numbers, so the sums keep
     -- the column's scale and are not floating-point.

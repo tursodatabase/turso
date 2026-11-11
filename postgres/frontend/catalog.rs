@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{BuiltinExtension, POSTGRES_TABLE_SQL_PREFIX},
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
@@ -191,6 +191,18 @@ impl Dialect for PostgresDialect {
         let options = crate::functions::register_functions(options);
         let options = crate::auth_functions::register_functions(options);
         register_catalog_modules(options)
+    }
+
+    fn has_builtin_extension(&self, extension: BuiltinExtension) -> bool {
+        match extension {
+            // Its make_date, make_timestamp and to_timestamp take other
+            // arguments than PostgreSQL's functions of the same names.
+            BuiltinExtension::Time => false,
+            BuiltinExtension::Uuid
+            | BuiltinExtension::Series
+            | BuiltinExtension::Percentile
+            | BuiltinExtension::Regexp => true,
+        }
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
