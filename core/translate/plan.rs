@@ -1079,6 +1079,8 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// The checks of row-level security that each new row must pass.
+    pub(crate) row_checks: Vec<crate::translate::row_security::RowCheck>,
 }
 
 impl UpdatePlan {

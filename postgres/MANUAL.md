@@ -23,7 +23,8 @@ the table's owner only the rows that the table's policies allow it, which
 PostgreSQL. The policies apply wherever the table appears in a query: in
 joins, subqueries, common table expressions, views and `COPY ... TO STDOUT`.
 In a `LEFT JOIN`, the columns of a row the role may not see read as NULL.
-Superusers and the table's owner see every row.
+The policies also limit which rows the role may insert, update and delete.
+Superusers and the table's owner see and write every row.
 
 **Parameters:**
 
@@ -86,14 +87,30 @@ CREATE POLICY name ON table_name
 
 **Description:**
 
-`CREATE POLICY` defines which rows of a table the roles it names may read.
-It matters once `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is on for the
-table.
+`CREATE POLICY` defines which rows of a table the roles it names may read
+and write. It matters once `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is on
+for the table.
 
 A role reads the rows for which the `USING` expression of at least one
 permissive policy is true and the `USING` expressions of all restrictive
 policies are true, counting only the policies `FOR ALL` and `FOR SELECT` that
 name the role or `PUBLIC`. Without a permissive policy, it reads no rows.
+
+Writes work as in PostgreSQL, with the policies `FOR ALL` and for the
+command:
+
+- `UPDATE` and `DELETE` change only the rows that pass the `USING`
+  expressions of the `UPDATE` or `DELETE` policies, combined in the same
+  way. When the statement reads the table's columns, in `WHERE`, in `SET`
+  or in `RETURNING`, directly or in a subquery that refers to the table,
+  the rows must also pass the `SELECT` policies.
+- A new row that `INSERT` or `UPDATE` writes must pass the `WITH CHECK`
+  expressions of the `INSERT` or `UPDATE` policies, or their `USING`
+  expressions where they have none, and the `SELECT` policies when the
+  statement has `RETURNING`. Otherwise the statement fails with
+  `new row violates row-level security policy for table` (SQLSTATE 42501),
+  naming the restrictive policy when one of those fails. A check that is
+  NULL fails.
 
 The policies are checked on each row before the other conditions of a query,
 so a condition of the query, or a function it calls, never sees a row the
@@ -114,16 +131,20 @@ role may not read.
   columns of the table, written alone, with the table's name, or with the
   schema and table names, and call scalar functions such as `current_user`.
   It can also use a subquery without `FROM`, such as `(SELECT auth.uid())`.
-- `check_expression`: Which new rows the policy lets a role write. It is
-  stored but has no effect yet, because roles cannot write to tables.
+- `check_expression`: Which new rows the policy lets a role write. It can use
+  what `using_expression` can.
 
 **Notes:**
 
 Only the owner of the table or a superuser may create its policies.
 
-Roles that are not superusers cannot write to tables yet, so the policies
-`FOR INSERT`, `FOR UPDATE` and `FOR DELETE` and the `WITH CHECK` expressions
-are stored but do not change what any role can do.
+A new row is checked against the policies after its `NOT NULL` constraints,
+not before as in PostgreSQL, so a row that breaks both reports the `NOT
+NULL` constraint. `INSERT ... ON CONFLICT DO UPDATE` by a role that the
+table's policies limit is not supported yet.
+
+`TRUNCATE` is not subject to the policies, as in PostgreSQL: a role with the
+`TRUNCATE` privilege empties the whole table.
 
 Policies cannot use subqueries with `FROM`, parameters, aggregate or window
 functions, or generated columns that are computed when they are read. A
@@ -324,9 +345,9 @@ or `UPDATE`, `setval` needs `UPDATE`, and `currval` needs `SELECT` or
 PRIMARY KEY` column is the exception: its value comes from the row's rowid,
 not from the sequence, so the insert needs no privilege on the sequence.
 `pg_sequences.last_value` is null for a role with neither `SELECT` nor
-`USAGE` on the sequence. A table with row-level security still
-refuses writes by a role that does not own it: `INSERT` fails, and
-`UPDATE` and `DELETE` change no rows. As in PostgreSQL, row-level security
+`USAGE` on the sequence. On a table with row-level security, the table's
+policies also limit what a role that does not own it writes, as described
+under `CREATE POLICY`. As in PostgreSQL, row-level security
 does not apply to `TRUNCATE`, which removes every row. A constraint error
 shows the values of the row or key (`Failing row contains ...`, `Key ...
 already exists`) only to a role with `SELECT` on the table; PostgreSQL also

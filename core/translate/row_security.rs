@@ -20,15 +20,15 @@ use crate::{
     dialect::RelationChange,
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
-    schema::{collect_column_dependencies_of_expr, BTreeTable, Schema, Table},
+    schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
     security::permission::{Action, Object, PermissionDenied},
     security::policy::{Command, Policy, RowPolicy},
     security::roles::{RoleCatalog, RoleId},
     translate::{
-        emitter::Resolver,
+        emitter::{with_columns_in_registers, Resolver},
         expr::{
-            bind_and_rewrite_expr, translate_expr, walk_expr, walk_expr_mut, BindingBehavior,
-            WalkControl,
+            bind_and_rewrite_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
         },
         plan::{JoinInfo, JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
         planner::break_predicate_at_and_boundaries,
@@ -36,14 +36,16 @@ use crate::{
         schema::emit_schema_cookie,
     },
     util::normalize_ident,
-    vdbe::builder::ProgramBuilder,
+    vdbe::{builder::ProgramBuilder, insn::Insn},
     vtab::{VirtualTable, VirtualTableType},
-    Connection, Dialect, LimboError, Result, MAIN_DB_ID,
+    Connection, Dialect, HashSet, LimboError, Result, MAIN_DB_ID,
 };
 
 /// Limits the rows of the tables in `table_references` that the statement
-/// reads, updates or deletes to the rows the role may access, which the
-/// policies of all of `commands` decide.
+/// reads, updates or deletes to the rows the role may access. The policies of
+/// `commands` decide: SELECT for a read, and UPDATE or DELETE for the table a
+/// statement writes, with SELECT too when the statement reads the table's
+/// columns, as in PostgreSQL.
 ///
 /// Each such table gets the condition its rows must pass as
 /// [`JoinedTable::row_filter`], which the loop over the table checks before
@@ -81,6 +83,7 @@ pub(crate) fn filter_rows(
         }
         let Some(filter) = conditions
             .into_iter()
+            .map(|condition| condition.expr)
             .reduce(|all, expr| combine(Some(all), ast::Operator::And, expr))
         else {
             continue;
@@ -114,18 +117,115 @@ pub(crate) fn filter_rows(
     Ok(())
 }
 
-/// Checks that the role may insert rows into `table`.
-pub(crate) fn check_insert(
-    table: &BTreeTable,
-    namespace: NamespaceRef,
+/// A check that each row a statement writes must pass, or the statement
+/// fails.
+#[derive(Debug, Clone)]
+pub(crate) struct RowCheck {
+    condition: Condition,
+    /// The condition is a USING condition checked on the existing row.
+    using_condition: bool,
+}
+
+/// The checks that the new rows `command` writes to `table_name` of
+/// `namespace` must pass for the role, as in PostgreSQL: the WITH CHECK
+/// conditions of the command's policies, or their USING conditions where
+/// they have none, and the USING conditions of the SELECT policies when the
+/// statement reads the table's columns, so that a role never writes a row it
+/// could not read back that way.
+pub(crate) fn new_row_checks(
     resolver: &Resolver,
-) -> Result<()> {
-    match policy(resolver, namespace, &table.declared_name, Command::Insert) {
-        Policy::Allow => Ok(()),
-        Policy::Apply(_) => Err(LimboError::PermissionDenied(Box::new(
-            PermissionDenied::policy(Object::Table(table.declared_name.clone()), None, false),
-        ))),
+    namespace: NamespaceRef,
+    table_name: &str,
+    command: Command,
+    reads_columns: bool,
+) -> Vec<RowCheck> {
+    let Policy::Apply(policies) = policy(resolver, namespace, table_name, command) else {
+        return Vec::new();
+    };
+    let mut conditions = conditions_of(&policies, with_check_condition);
+    if reads_columns {
+        let Policy::Apply(select_policies) =
+            policy(resolver, namespace, table_name, Command::Select)
+        else {
+            unreachable!("row-level security limits every command of a role or none");
+        };
+        conditions.extend(conditions_of(&select_policies, using_condition));
     }
+    conditions
+        .into_iter()
+        .map(|condition| RowCheck {
+            condition,
+            using_condition: false,
+        })
+        .collect()
+}
+
+/// Emits `checks` on a row that the statement writes to the first table of
+/// `table_references`, whose rowid is in `rowid_reg` and whose columns are in
+/// the registers `columns` gives. The statement fails at the first check that
+/// the row does not pass; a condition that is NULL fails too, as in
+/// PostgreSQL.
+pub(crate) fn emit_row_checks<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    checks: &[RowCheck],
+    table_references: &TableReferences,
+    rowid_reg: usize,
+    columns: impl Iterator<Item = (&'a Column, usize)>,
+) -> Result<()> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let table = &table_references.joined_tables()[0];
+    let btree = table
+        .btree()
+        .expect("row-level security checks rows of B-tree tables");
+    let mut read_columns = HashSet::default();
+    for check in checks {
+        read_columns.extend(collect_column_dependencies_of_expr(
+            &check.condition.expr,
+            &[],
+        ));
+    }
+    with_columns_in_registers(
+        program,
+        resolver,
+        &btree,
+        rowid_reg,
+        columns,
+        Some(table_references),
+        |name| read_columns.contains(&normalize_ident(name)),
+        |program, resolver, _| {
+            for check in checks {
+                let expr =
+                    bind_policy_expr(&check.condition.expr, table, &btree, resolver, program)?;
+                let result = program.alloc_register();
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &expr,
+                    result,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                let passed = program.allocate_label();
+                program.emit_insn(Insn::If {
+                    reg: result,
+                    target_pc: passed,
+                    jump_if_null: false,
+                });
+                program.emit_insn(Insn::RowSecurityViolation {
+                    denial: Box::new(PermissionDenied::policy(
+                        Object::Table(btree.declared_name.clone()),
+                        check.condition.policy.clone(),
+                        check.using_condition,
+                    )),
+                });
+                program.preassign_label_to_next_insn(passed);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Checks that the role may read the virtual table. A virtual table that
@@ -234,11 +334,6 @@ fn policy_for(
     if command == Command::Truncate {
         return Policy::Allow;
     }
-    // Writes do not check the policies yet, so a write is limited as if no
-    // policy applied to the role, which lets no row pass.
-    if command != Command::Select {
-        return Policy::Apply(Vec::new());
-    }
     Policy::Apply(
         dialect
             .row_security_policies(schema, namespace, &table_name)
@@ -249,6 +344,15 @@ fn policy_for(
     )
 }
 
+/// A condition of a table's policies that rows must pass.
+#[derive(Debug, Clone)]
+struct Condition {
+    expr: ast::Expr,
+    /// The restrictive policy that the condition comes from, which an error
+    /// names. The permissive policies are checked together, without a name.
+    policy: Option<String>,
+}
+
 /// The conditions that `policies`, the policies of one command that apply
 /// to a role, put on rows, as PostgreSQL builds them: the conditions of the
 /// permissive policies combined with OR, and the condition of each
@@ -257,7 +361,7 @@ fn policy_for(
 fn conditions_of(
     policies: &[RowPolicy],
     condition_of: fn(&RowPolicy) -> Option<&ast::Expr>,
-) -> Vec<ast::Expr> {
+) -> Vec<Condition> {
     let permissive = policies
         .iter()
         .filter(|policy| policy.permissive)
@@ -265,19 +369,37 @@ fn conditions_of(
         .cloned()
         .reduce(|any, expr| combine(Some(any), ast::Operator::Or, expr));
     let Some(permissive) = permissive else {
-        return vec![no_rows()];
+        return vec![Condition {
+            expr: no_rows(),
+            policy: None,
+        }];
     };
     let restrictive = policies
         .iter()
         .filter(|policy| !policy.permissive)
-        .filter_map(condition_of)
-        .cloned();
-    std::iter::once(permissive).chain(restrictive).collect()
+        .filter_map(|policy| {
+            condition_of(policy).map(|expr| Condition {
+                expr: expr.clone(),
+                policy: Some(policy.name.clone()),
+            })
+        });
+    std::iter::once(Condition {
+        expr: permissive,
+        policy: None,
+    })
+    .chain(restrictive)
+    .collect()
 }
 
 /// Which existing rows a policy lets a role access.
 fn using_condition(policy: &RowPolicy) -> Option<&ast::Expr> {
     policy.using_expr.as_ref()
+}
+
+/// Which new rows a policy lets a role write: its WITH CHECK condition, or
+/// its USING condition when it has none.
+fn with_check_condition(policy: &RowPolicy) -> Option<&ast::Expr> {
+    policy.check_expr.as_ref().or(policy.using_expr.as_ref())
 }
 
 fn combine(left: Option<ast::Expr>, operator: ast::Operator, right: ast::Expr) -> ast::Expr {
@@ -750,7 +872,9 @@ mod tests {
     use rustc_hash::FxHashMap;
     use turso_parser::ast;
 
-    use super::{check_insert, conditions_of, policy, using_condition, Command, Policy};
+    use super::{
+        conditions_of, policy, using_condition, with_check_condition, Command, Condition, Policy,
+    };
     use crate::dialect::{Dialect, EngineDialect};
     use crate::function::Func;
     use crate::namespace::{NamespaceId, NamespaceRef};
@@ -849,7 +973,17 @@ mod tests {
 
         assert_eq!(
             texts(&conditions_of(&policies, using_condition)),
-            vec!["(a = 1) OR (b = 1)".to_string(), "r = 1".to_string()]
+            vec![
+                (None, "(a = 1) OR (b = 1)".to_string()),
+                (Some("r".to_string()), "r = 1".to_string()),
+            ]
+        );
+        assert_eq!(
+            texts(&conditions_of(&policies, with_check_condition)),
+            vec![
+                (None, "(a = 1) OR (b = 2)".to_string()),
+                (Some("r".to_string()), "r = 1".to_string()),
+            ]
         );
     }
 
@@ -864,7 +998,11 @@ mod tests {
 
         assert_eq!(
             texts(&conditions_of(&policies, using_condition)),
-            vec!["0".to_string()]
+            vec![(None, "0".to_string())]
+        );
+        assert_eq!(
+            texts(&conditions_of(&[], with_check_condition)),
+            vec![(None, "0".to_string())]
         );
     }
 
@@ -898,36 +1036,11 @@ mod tests {
         }
     }
 
-    fn texts(conditions: &[ast::Expr]) -> Vec<String> {
-        conditions.iter().map(ToString::to_string).collect()
-    }
-
-    /// Writes do not check the policies yet, so a table with row-level
-    /// security must refuse every write by a role, whatever its policies
-    /// say, until writes check them.
-    #[test]
-    fn table_with_row_security_denies_every_write_by_a_role() {
-        let (main, alice) = main_schema_with_role_alice();
-        with_resolver(&main, FxHashMap::default(), alice, |resolver| {
-            let root = NamespaceRef::root_of(crate::MAIN_DB_ID);
-
-            assert_eq!(
-                policy(resolver, root, "documents", Command::Select),
-                Policy::Apply(ACCESS_EVERY_ROW.clone())
-            );
-            for command in [Command::Insert, Command::Update, Command::Delete] {
-                assert_eq!(
-                    policy(resolver, root, "documents", command),
-                    Policy::Apply(Vec::new())
-                );
-            }
-            let documents = BTreeTable::from_sql("CREATE TABLE documents (id INTEGER)", 2).unwrap();
-            let error = check_insert(&documents, root, resolver).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "permission denied: write on table documents violates its row-level security policy"
-            );
-        });
+    fn texts(conditions: &[Condition]) -> Vec<(Option<String>, String)> {
+        conditions
+            .iter()
+            .map(|condition| (condition.policy.clone(), condition.expr.to_string()))
+            .collect()
     }
 
     /// Foreign-key actions see every row, as in PostgreSQL, so a cascading
@@ -944,7 +1057,7 @@ mod tests {
             assert_eq!(inside, Policy::Allow);
             assert_eq!(
                 policy(resolver, root, "documents", Command::Delete),
-                Policy::Apply(Vec::new())
+                Policy::Apply(ACCESS_EVERY_ROW.clone())
             );
         });
     }

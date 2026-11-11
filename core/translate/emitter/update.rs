@@ -466,6 +466,7 @@ pub fn emit_program_for_update(
         target_table,
         returning_buffer.as_ref(),
         &mut update_subqueries,
+        &plan.row_checks,
     )?;
 
     // Close the main loop
@@ -1100,6 +1101,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+    row_checks: &[crate::translate::row_security::RowCheck],
 ) -> crate::Result<()> {
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
@@ -1834,6 +1836,23 @@ fn emit_update_insns<'a>(
                 ),
             });
         }
+
+        // Rows that row-level security does not let the role write fail
+        // before the CHECK constraints, as in PostgreSQL.
+        crate::translate::row_security::emit_row_checks(
+            program,
+            &mut t_ctx.resolver,
+            row_checks,
+            &TableReferences::new(vec![target_table.as_ref().clone()], vec![]),
+            effective_rowid_reg,
+            btree_table.columns().iter().enumerate().map(|(idx, col)| {
+                if col.is_rowid_alias() {
+                    (col, effective_rowid_reg)
+                } else {
+                    (col, layout.to_register(start, idx))
+                }
+            }),
+        )?;
 
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
