@@ -208,11 +208,13 @@ actions need no privileges on the other table. `TRUNCATE` needs the
 `TRUNCATE` privilege, not `DELETE`, as in PostgreSQL. The `REFERENCES`,
 `TRIGGER` and `MAINTAIN` privileges are stored but let a role do nothing
 yet. On a sequence, `nextval` needs `USAGE`
-or `UPDATE` and `setval` needs `UPDATE`, as in PostgreSQL, so a role that
-inserts into a table with a `serial` column needs `USAGE` on the column's
-sequence too. A `serial PRIMARY KEY` column is the exception: its value
-comes from the row's rowid, not from the sequence, so the insert needs no
-privilege on the sequence. A table with row-level security still
+or `UPDATE`, `setval` needs `UPDATE`, and `currval` needs `SELECT` or
+`USAGE`, as in PostgreSQL, so a role that inserts into a table with a
+`serial` column needs `USAGE` on the column's sequence too. A `serial
+PRIMARY KEY` column is the exception: its value comes from the row's rowid,
+not from the sequence, so the insert needs no privilege on the sequence.
+`pg_sequences.last_value` is null for a role with neither `SELECT` nor
+`USAGE` on the sequence. A table with row-level security still
 refuses writes by a role that does not own it: `INSERT` fails, and
 `UPDATE` and `DELETE` change no rows. As in PostgreSQL, row-level security
 does not apply to `TRUNCATE`, which removes every row. Column

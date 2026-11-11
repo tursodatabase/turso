@@ -34,6 +34,7 @@ use crate::pragma::PragmaVirtualTable;
 use crate::schema::{Schema, Table};
 use crate::stats::StatAccum;
 use crate::sync::Arc;
+use crate::translate::roles;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{
     compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
@@ -714,6 +715,7 @@ pub fn call_builtin_scalar(
                 }
             };
             let (namespace, sequence) = connection.find_sequence(&seq_name)?;
+            roles::check_sequence_read(connection, namespace, &sequence.name)?;
             match connection.get_sequence_currval(
                 namespace.database_id,
                 &mangle_name(namespace.id, &sequence.name),

@@ -3707,6 +3707,23 @@ impl Connection {
         self.role_catalog().is_superuser(self.current_role())
     }
 
+    /// Whether the current role may read the value of `sequence` of
+    /// `namespace`, which needs SELECT or USAGE on it, as in PostgreSQL.
+    pub fn may_read_sequence(&self, namespace: NamespaceRef, sequence: &str) -> bool {
+        if namespace.database_id != MAIN_DB_ID || self.current_role_is_superuser() {
+            return true;
+        }
+        let role = self.current_role();
+        let dialect = self.dialect();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            [ast::Privilege::Select, ast::Privilege::Usage]
+                .into_iter()
+                .any(|privilege| {
+                    dialect.role_has_privilege(schema, namespace.id, sequence, role, privilege)
+                })
+        })
+    }
+
     /// Statements prepared under the previous role are prepared again, because
     /// privileges are checked when a statement is prepared.
     pub fn set_current_role(&self, role: RoleId) {

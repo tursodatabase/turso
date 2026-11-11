@@ -306,6 +306,24 @@ pub(crate) fn check_sequence_change(
     )))
 }
 
+/// Fails if the current role of `connection` may not read the value of
+/// `sequence` of `namespace` with `currval()`. `currval()` checks this when
+/// it runs, because its argument may be a sequence name that is only known
+/// then.
+pub(crate) fn check_sequence_read(
+    connection: &Connection,
+    namespace: NamespaceRef,
+    sequence: &str,
+) -> Result<()> {
+    if connection.may_read_sequence(namespace, sequence) {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        Object::Sequence(sequence.to_string()),
+    )))
+}
+
 /// Fails if the statement is compiled for a role that does not have
 /// `privilege` on relation `name` of `namespace`, a table, view or
 /// materialized view, which `object` names in the error. Inside a view, the

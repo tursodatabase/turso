@@ -1320,3 +1320,97 @@ expect {
     1|a
     2|b
 }
+
+test role-without-privileges-cannot-call-currval {
+    CREATE ROLE gq_no_currval;
+    CREATE SEQUENCE gq_no_currval_seq;
+    SELECT nextval('gq_no_currval_seq');
+    SET ROLE gq_no_currval;
+    SELECT currval('gq_no_currval_seq');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_no_currval_seq
+}
+
+test grant-select-lets-a-role-call-currval {
+    CREATE ROLE gq_currval_select;
+    CREATE SEQUENCE gq_currval_select_seq;
+    SELECT nextval('gq_currval_select_seq');
+    GRANT SELECT ON SEQUENCE gq_currval_select_seq TO gq_currval_select;
+    SET ROLE gq_currval_select;
+    SELECT currval('gq_currval_select_seq');
+}
+expect {
+    1
+    1
+}
+
+test grant-usage-lets-a-role-call-currval {
+    CREATE ROLE gq_currval_usage;
+    CREATE SEQUENCE gq_currval_usage_seq;
+    GRANT USAGE ON SEQUENCE gq_currval_usage_seq TO gq_currval_usage;
+    SET ROLE gq_currval_usage;
+    SELECT nextval('gq_currval_usage_seq');
+    SELECT currval('gq_currval_usage_seq');
+}
+expect {
+    1
+    1
+}
+
+test currval-checks-a-sequence-name-computed-when-the-statement-runs {
+    CREATE ROLE gq_currval_computed;
+    CREATE SEQUENCE gq_currval_computed_seq;
+    CREATE TABLE gq_currval_names (n text);
+    INSERT INTO gq_currval_names VALUES ('gq_currval_computed_seq');
+    GRANT SELECT ON gq_currval_names TO gq_currval_computed;
+    GRANT USAGE ON SEQUENCE gq_currval_computed_seq TO gq_currval_computed;
+    SET ROLE gq_currval_computed;
+    SELECT nextval('gq_currval_computed_seq');
+    SELECT currval(lower('GQ_CURRVAL_COMPUTED_SEQ'));
+    SELECT currval(n) FROM gq_currval_names;
+}
+expect {
+    1
+    1
+    1
+}
+
+test currval-denies-a-sequence-name-computed-when-the-statement-runs {
+    CREATE ROLE gq_currval_computed_denied;
+    CREATE SEQUENCE gq_currval_computed_denied_seq;
+    SELECT nextval('gq_currval_computed_denied_seq');
+    SET ROLE gq_currval_computed_denied;
+    SELECT currval(lower('GQ_CURRVAL_COMPUTED_DENIED_SEQ'));
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_currval_computed_denied_seq
+}
+
+test pg-sequences-hides-last-value-from-a-role-without-privileges {
+    CREATE ROLE gq_seq_view;
+    CREATE SEQUENCE gq_seq_view_seq;
+    SELECT nextval('gq_seq_view_seq');
+    SET ROLE gq_seq_view;
+    SELECT coalesce(last_value::text, 'null') FROM pg_sequences
+        WHERE sequencename = 'gq_seq_view_seq';
+}
+expect {
+    1
+    null
+}
+
+test pg-sequences-shows-last-value-to-a-role-with-usage {
+    CREATE ROLE gq_seq_view_usage;
+    CREATE SEQUENCE gq_seq_view_usage_seq;
+    SELECT nextval('gq_seq_view_usage_seq');
+    GRANT USAGE ON SEQUENCE gq_seq_view_usage_seq TO gq_seq_view_usage;
+    SET ROLE gq_seq_view_usage;
+    SELECT last_value FROM pg_sequences WHERE sequencename = 'gq_seq_view_usage_seq';
+}
+expect {
+    1
+    1
+}
