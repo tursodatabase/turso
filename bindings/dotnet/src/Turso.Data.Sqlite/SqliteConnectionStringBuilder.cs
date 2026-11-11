@@ -8,6 +8,9 @@ namespace Turso.Data.Sqlite;
 
 public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 {
+    private bool _parsingConnectionString;
+    private bool _parsedEmptyCloudKey;
+
     private static readonly string[] CanonicalKeywords =
     [
         "Data Source",
@@ -32,6 +35,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Partial Sync Prefetch",
         "Remote Encryption Cipher",
         "Remote Encryption Key",
+        "Local Encryption Key",
         "Push Operations Threshold",
         "Pull Bytes Threshold",
         "Force Logical MVCC Pull",
@@ -89,6 +93,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["RemoteEncryptionCipher"] = "Remote Encryption Cipher",
         ["Remote Encryption Key"] = "Remote Encryption Key",
         ["RemoteEncryptionKey"] = "Remote Encryption Key",
+        ["Local Encryption Key"] = "Local Encryption Key",
+        ["LocalEncryptionKey"] = "Local Encryption Key",
         ["Push Operations Threshold"] = "Push Operations Threshold",
         ["PushOperationsThreshold"] = "Push Operations Threshold",
         ["Pull Bytes Threshold"] = "Pull Bytes Threshold",
@@ -207,6 +213,12 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set => SetString("Remote Encryption Key", value);
     }
 
+    public string LocalEncryptionKey
+    {
+        get => GetString("Local Encryption Key");
+        set => SetString("Local Encryption Key", value);
+    }
+
     public long PushOperationsThreshold
     {
         get => GetLong("Push Operations Threshold", 0);
@@ -248,6 +260,27 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     public SqliteConnectionStringBuilder(string? connectionString)
     {
         ConnectionString = connectionString ?? string.Empty;
+    }
+
+    [AllowNull]
+    public new string ConnectionString
+    {
+        get => base.ConnectionString;
+        set
+        {
+            _parsingConnectionString = true;
+            _parsedEmptyCloudKey = false;
+            try
+            {
+                base.ConnectionString = value;
+                if (_parsedEmptyCloudKey && !base.ContainsKey("Local Encryption Key"))
+                    base.Remove("Remote Encryption Key");
+            }
+            finally
+            {
+                _parsingConnectionString = false;
+            }
+        }
     }
 
     public bool IsLocal => !IsDirectRemote && !IsReplica;
@@ -380,9 +413,11 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set
         {
             var normalizedKeyword = NormalizeKeyword(keyword);
+            if (normalizedKeyword == "Remote Encryption Key")
+                _parsedEmptyCloudKey = false;
             if (value is null)
             {
-                Remove(normalizedKeyword);
+                base.Remove(normalizedKeyword);
                 return;
             }
 
@@ -397,6 +432,17 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         if (!KeywordMap.TryGetValue(keyword, out var normalizedKeyword))
             return false;
 
+        if (!_parsingConnectionString && normalizedKeyword == "Local Encryption Key")
+            throw new InvalidOperationException(
+                "Local Encryption Key cannot be removed with Remove. Assign null through the builder indexer to omit it.");
+        // Preserve explicit empty credentials when the base parser calls Remove.
+        if (_parsingConnectionString && normalizedKeyword is "Local Encryption Key" or "Remote Encryption Key")
+        {
+            if (normalizedKeyword == "Remote Encryption Key")
+                _parsedEmptyCloudKey = true;
+            base[normalizedKeyword] = string.Empty;
+            return true;
+        }
         return base.Remove(normalizedKeyword);
     }
 
@@ -449,6 +495,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Partial Sync Prefetch",
         "Remote Encryption Cipher",
         "Remote Encryption Key",
+        "Local Encryption Key",
         "Push Operations Threshold",
         "Pull Bytes Threshold",
         "Force Logical MVCC Pull",
@@ -588,6 +635,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Partial Sync Prefetch" => false,
             "Remote Encryption Cipher" => string.Empty,
             "Remote Encryption Key" => string.Empty,
+            "Local Encryption Key" => string.Empty,
             "Push Operations Threshold" => 0L,
             "Pull Bytes Threshold" => 0L,
             "Force Logical MVCC Pull" => false,

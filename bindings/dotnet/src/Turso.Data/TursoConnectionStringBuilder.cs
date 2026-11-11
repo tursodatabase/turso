@@ -337,7 +337,7 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
                 _parsedEmptyCloudKey = false;
             if (value is null)
             {
-                Remove(normalizedKeyword);
+                base.Remove(normalizedKeyword);
                 return;
             }
 
@@ -350,6 +350,9 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     public override bool Remove(string keyword)
     {
         var normalizedKeyword = NormalizeKeyword(keyword);
+        if (!_parsingConnectionString && normalizedKeyword == "Local Encryption Key")
+            throw new InvalidOperationException(
+                "Local Encryption Key cannot be removed with Remove. Assign null through the builder indexer to omit it.");
         // The base parser removes unquoted empty values. Keep explicit keys so
         // validation can distinguish a blank credential from an omitted one.
         if (_parsingConnectionString && normalizedKeyword is "Local Encryption Key" or "Remote Encryption Key")
