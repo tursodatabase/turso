@@ -785,16 +785,22 @@ fn parse_format_digits(chars: &mut Peekable<Chars>) -> Result<Option<usize>> {
                 })?,
         );
     }
+    // A specification cannot end inside a number, even before the `$`.
+    if number.is_some() && chars.peek().is_none() {
+        return Err(unterminated_format_spec());
+    }
     Ok(number)
 }
 
 fn next_format_char(chars: &mut Peekable<Chars>) -> Result<char> {
-    chars.next().ok_or_else(|| {
-        sqlstate_error(
-            SQLSTATE_INVALID_PARAMETER_VALUE,
-            "unterminated format() type specifier",
-        )
-    })
+    chars.next().ok_or_else(unterminated_format_spec)
+}
+
+fn unterminated_format_spec() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INVALID_PARAMETER_VALUE,
+        "unterminated format() type specifier",
+    )
 }
 
 fn argument_position(n: usize) -> Result<usize> {
