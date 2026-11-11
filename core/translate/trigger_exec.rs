@@ -593,6 +593,7 @@ fn execute_trigger_commands(
                 &mut subprogram_builder,
                 connection,
                 "trigger subprogram",
+                crate::statement::StatementOrigin::Subprogram,
             )?;
             if matches!(
                 command,

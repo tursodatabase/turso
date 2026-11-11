@@ -2172,3 +2172,48 @@ fn test_mvcc_pragma_journal_mode_preserves_changes_and_rowid() -> anyhow::Result
     assert_eq!(counts_after, vec![(1, 1, 42)]);
     Ok(())
 }
+
+/// Regression test for the #11596 CDC finding: enabling change capture must not
+/// overwrite last_insert_rowid() with the rowid of an internal bookkeeping row.
+#[test]
+fn test_cdc_pragma_capture_data_changes_preserves_rowid_autoincrement() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_cdc_capture_pragma_rowid_autoincrement.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(100, 'hello')")?;
+    let counts: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts, vec![(1, 1, 100)]);
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+    let counts_after: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_after, vec![(1, 1, 100)]);
+
+    conn.execute("INSERT INTO t VALUES(101, 'world')")?;
+    let counts_final: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_final, vec![(1, 4, 101)]);
+    Ok(())
+}
+
+/// Regression test for the WAL + AUTOINCREMENT half of #11596: changing to
+/// MVCC on an AUTOINCREMENT table must not overwrite last_insert_rowid().
+#[test]
+fn test_mvcc_pragma_wal_autoincrement_preserves_rowid() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_wal_autoincrement_rowid.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(100, 'hello')")?;
+    let counts: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts, vec![(1, 1, 100)]);
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    let counts_after: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_after, vec![(1, 1, 100)]);
+    Ok(())
+}

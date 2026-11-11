@@ -256,6 +256,7 @@ pub fn translate_insert(
     with: Option<With>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
+    origin: crate::statement::StatementOrigin,
 ) -> Result<()> {
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
@@ -980,8 +981,15 @@ pub fn translate_insert(
 
     resolver.register_columns.clear();
 
+    // Engine-run statements (CDC setup, metadata reads, open-time schema
+    // writes) must not move last_insert_rowid() or change counters, matching
+    // the change-count rule in translate(). Trigger and FK subprograms do not
+    // go through translate at all, so they keep SQLite-compatible behavior.
+    let is_engine_statement = connection.is_mvcc_bootstrap_connection()
+        || !matches!(origin, crate::statement::StatementOrigin::Root);
+
     let mut insert_flags = InsertFlags::new();
-    if connection.is_mvcc_bootstrap_connection() {
+    if is_engine_statement {
         insert_flags = insert_flags.skip_last_rowid().skip_all_change_counts();
     }
 

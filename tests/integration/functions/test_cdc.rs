@@ -70,6 +70,38 @@ fn v2_row(
 }
 
 #[turso_macros::test]
+fn test_cdc_pragma_preserves_changes_and_rowid(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (5, 1)").unwrap();
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(5),
+        ]],
+    );
+
+    conn.execute("INSERT INTO t VALUES (10, 1)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::Integer(4),
+            Value::Integer(10),
+        ]],
+    );
+}
+
+#[turso_macros::test]
 fn test_cdc_internal_inserts_change_counters(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")

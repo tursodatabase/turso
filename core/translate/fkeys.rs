@@ -1933,6 +1933,7 @@ fn emit_fk_action_subprogram(
                 &mut subprogram_builder,
                 connection,
                 description,
+                crate::statement::StatementOrigin::Subprogram,
             )
         })?;
         subprogram_builder.epilogue(resolver.schema());
