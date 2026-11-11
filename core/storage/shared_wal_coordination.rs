@@ -616,6 +616,15 @@ pub(crate) enum SharedWalCoordinationOpenMode {
     MultiProcess,
 }
 
+/// Result of locking the lifetime byte and mapping the coordination header.
+struct OpenedHeader {
+    open_mode: SharedWalCoordinationOpenMode,
+    metadata_len: usize,
+    /// The file was short and no other process holds it: initialize it.
+    initialize: bool,
+    base_mapping: Box<dyn SharedWalMappedRegion>,
+}
+
 /// Which locking primitive is used for cross-process slot ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SharedWalOwnershipMode {
@@ -930,6 +939,35 @@ impl MappedSharedWalCoordination {
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
     ) -> Result<Self> {
+        Self::create_or_open_with_hook(io, path, reader_slot_count, ownership_mode, &|| {})
+    }
+
+    /// Like `create_or_open`, but calls `before_initialize` while this process
+    /// is the creator of a new file: sized, lifetime lock held, header not yet
+    /// published.
+    #[cfg(test)]
+    pub(crate) fn create_or_open_paused_for_tests(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+        before_initialize: &dyn Fn(),
+    ) -> Result<Self> {
+        Self::create_or_open_with_hook(
+            io,
+            path,
+            reader_slot_count,
+            Self::default_ownership_mode(),
+            before_initialize,
+        )
+    }
+
+    fn create_or_open_with_hook(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+        before_initialize: &dyn Fn(),
+    ) -> Result<Self> {
         turso_assert!(
             reader_slot_count >= 64 && reader_slot_count % 64 == 0,
             "reader_slot_count must be a non-zero multiple of 64"
@@ -942,39 +980,12 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let deadline = Instant::now() + CREATOR_INIT_WAIT;
-        let (open_mode, metadata_len, initialize, base_mapping) = loop {
-            let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
-            let metadata_len = file.size()? as usize;
-            let multi_process = open_mode == SharedWalCoordinationOpenMode::MultiProcess;
-            // The creator holds the lifetime lock while it sizes and initializes.
-            let mut creator_in_progress = multi_process && metadata_len < base_len;
-            let initialize = !multi_process && metadata_len < base_len;
-            if initialize {
-                file.shared_wal_set_len(initial_file_len as u64)?;
-            }
-            let mut mapping = None;
-            if !creator_in_progress {
-                let base_mapping = file.shared_wal_map(0, base_len)?;
-                creator_in_progress = multi_process && !Self::header_published(&*base_mapping);
-                mapping = Some(base_mapping);
-            }
-            match mapping {
-                Some(base_mapping) if !creator_in_progress => {
-                    break (open_mode, metadata_len, initialize, base_mapping);
-                }
-                _ => {}
-            }
-            // Unlock while waiting so a dead creator's file gets re-initialized.
-            drop(mapping);
-            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            if Instant::now() >= deadline {
-                return Err(LimboError::Corrupt(format!(
-                    "shared WAL coordination file was not initialized in time: got {metadata_len}, minimum {base_len}"
-                )));
-            }
-            std::thread::sleep(CREATOR_INIT_POLL);
-        };
+        let OpenedHeader {
+            open_mode,
+            metadata_len,
+            initialize,
+            base_mapping,
+        } = Self::lock_and_map_header(&file, lock_kind, base_len, Some(initial_file_len))?;
         let base_ptr = base_mapping.ptr();
 
         let mut region = Self::new_region(
@@ -987,6 +998,7 @@ impl MappedSharedWalCoordination {
             open_mode,
         );
         if initialize {
+            before_initialize();
             region.initialize(reader_slot_count);
         } else if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
             if open_mode == SharedWalCoordinationOpenMode::Exclusive {
@@ -1040,16 +1052,12 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
-        let metadata_len = file.size()? as usize;
-        if metadata_len < base_len {
-            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
-            )));
-        }
-
-        let base_mapping = file.shared_wal_map(0, base_len)?;
+        let OpenedHeader {
+            open_mode,
+            metadata_len,
+            base_mapping,
+            ..
+        } = Self::lock_and_map_header(&file, lock_kind, base_len, None)?;
         let base_ptr = base_mapping.ptr();
         let mut region = Self::new_region(
             file,
@@ -1081,6 +1089,64 @@ impl MappedSharedWalCoordination {
 
     fn process_lock_offset_for_reader(slot_index: u32) -> u64 {
         READER_LOCK_START_OFFSET + slot_index as u64
+    }
+
+    /// Take the lifetime lock and map the header once no other process is
+    /// still creating the file.
+    ///
+    /// A new coordination file is created, sized and initialized by one
+    /// process that holds the lifetime lock throughout, and publishes the magic
+    /// last. An opener that finds the lock held by someone else while the file
+    /// is short or unpublished treats that as creation in flight: it releases
+    /// its own lock and probes again until the creator is done (bounded wait).
+    /// A creator that died leaves no lock holder, so the next opener becomes
+    /// the exclusive owner.
+    ///
+    /// `initial_file_len` is `Some` for openers that may create the file. With
+    /// `None` the file is never resized or initialized, and a short file with
+    /// no live creator is reported as corrupt.
+    fn lock_and_map_header(
+        file: &Arc<dyn File>,
+        lock_kind: SharedWalLockKind,
+        base_len: usize,
+        initial_file_len: Option<usize>,
+    ) -> Result<OpenedHeader> {
+        let deadline = Instant::now() + CREATOR_INIT_WAIT;
+        loop {
+            let open_mode = Self::detect_open_mode(file, lock_kind, base_len)?;
+            let metadata_len = file.size()? as usize;
+            let multi_process = open_mode == SharedWalCoordinationOpenMode::MultiProcess;
+            let mut initialize = false;
+            if !multi_process && metadata_len < base_len {
+                let Some(initial_file_len) = initial_file_len else {
+                    file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+                    return Err(LimboError::Corrupt(format!(
+                        "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
+                    )));
+                };
+                file.shared_wal_set_len(initial_file_len as u64)?;
+                initialize = true;
+            }
+            if !multi_process || metadata_len >= base_len {
+                let base_mapping = file.shared_wal_map(0, base_len)?;
+                if !multi_process || Self::header_published(&*base_mapping) {
+                    return Ok(OpenedHeader {
+                        open_mode,
+                        metadata_len,
+                        initialize,
+                        base_mapping,
+                    });
+                }
+            }
+            // Unlock while waiting so a dead creator's file gets re-initialized.
+            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+            if Instant::now() >= deadline {
+                return Err(LimboError::Corrupt(format!(
+                    "shared WAL coordination file was not initialized in time: got {metadata_len}, minimum {base_len}"
+                )));
+            }
+            std::thread::sleep(CREATOR_INIT_POLL);
+        }
     }
 
     fn detect_open_mode(

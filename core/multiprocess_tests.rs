@@ -41,6 +41,8 @@ const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
 const MULTIPROCESS_FRESH_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_fresh_open_child_process";
+const MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_paused_creator_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -557,6 +559,105 @@ fn multiprocess_fresh_open_child_process() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let _db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     std::thread::sleep(Duration::from_millis(50));
+}
+
+/// Start a child that stalls as the creator of the coordination file of
+/// `db_path` (file sized, lifetime lock held, header not published) and wait
+/// until it has. It finishes creating the file once `release_file` exists.
+fn spawn_paused_creator(
+    db_path: &std::path::Path,
+    ready_file: &std::path::Path,
+    release_file: &std::path::Path,
+) -> std::process::Child {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+        .env("TURSO_MULTIPROCESS_READY_FILE", ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(ready_file);
+    child
+}
+
+/// Child half of the creator-in-flight tests.
+#[test]
+fn multiprocess_paused_creator_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let wal_path = format!("{}-wal", db_path.to_str().unwrap());
+    let shm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+    let _authority =
+        storage::shared_wal_coordination::MappedSharedWalCoordination::create_or_open_paused_for_tests(
+            &io,
+            std::path::Path::new(&shm_path),
+            64,
+            &|| {
+                std::fs::write(&ready_file, b"ready").unwrap();
+                wait_for_file(&release_file);
+            },
+        )
+        .unwrap();
+}
+
+/// A read-only open that finds another process creating the coordination file
+/// waits for it instead of failing on the short or unpublished file.
+///
+/// The creator stays paused until the reader has had ample time to fail, so
+/// the reader cannot finish before the release on a correct build; an opener
+/// without the wait returns its error immediately.
+#[test]
+fn readonly_multiprocess_open_waits_for_concurrent_creator() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-waits-for-creator.db");
+    let db_path_str = db_path.to_str().unwrap().to_string();
+    let ready_file = dir.path().join("creator-ready");
+    let release_file = dir.path().join("creator-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    {
+        let db = Database::open_file(io.clone(), &db_path_str, Arc::new(EngineDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test(value) values ('seed')")
+            .unwrap();
+    }
+    remove_file_from_database_registry(&db_path_str);
+
+    let mut creator = spawn_paused_creator(&db_path, &ready_file, &release_file);
+    let reader = std::thread::spawn(move || -> Result<(bool, i64)> {
+        let db = open_multiprocess_db_with_flags(io, &db_path_str, OpenFlags::ReadOnly)?;
+        let attached = db.shared_wal_coordination()?.is_some();
+        let conn = db.connect(ConnectOpts::new())?;
+        Ok((attached, count_test_rows(&conn)))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let finished_early = reader.is_finished();
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        !finished_early,
+        "read-only open must wait for the creator that holds the lifetime lock"
+    );
+
+    let (attached, rows) = reader.join().unwrap().unwrap();
+    assert!(
+        attached,
+        "reader must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+    assert!(creator.wait().unwrap().success());
 }
 
 /// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
