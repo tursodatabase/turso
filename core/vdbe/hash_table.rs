@@ -808,6 +808,78 @@ struct SpillState {
     /// Id for the next grace sub-partition. Ids start at `partitioning.count`, so
     /// they never collide with the top-level partition indices.
     next_sub_partition_id: usize,
+    /// Space in the temp file below `next_spill_offset` that no chunk uses any more:
+    /// the chunks of a partition after a grace re-split read them. Re-split writes
+    /// of the build side fill it before they append.
+    free_extents: FreeExtents,
+}
+
+/// Unused byte ranges of a spill file, as sorted, non-adjacent (offset, length).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FreeExtents {
+    extents: Vec<(u64, u64)>,
+}
+
+impl FreeExtents {
+    /// Mark `[offset, offset + len)` unused, merging it with its neighbours.
+    fn release(&mut self, offset: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset + len;
+        let at = self.extents.partition_point(|&(o, _)| o < offset);
+        debug_assert!(
+            at == 0 || self.extents[at - 1].0 + self.extents[at - 1].1 <= offset,
+            "released extent overlaps a free extent"
+        );
+        debug_assert!(
+            at == self.extents.len() || end <= self.extents[at].0,
+            "released extent overlaps a free extent"
+        );
+        let merges_prev = at > 0 && self.extents[at - 1].0 + self.extents[at - 1].1 == offset;
+        let merges_next = at < self.extents.len() && self.extents[at].0 == end;
+        match (merges_prev, merges_next) {
+            (true, true) => {
+                self.extents[at - 1].1 += len + self.extents[at].1;
+                self.extents.remove(at);
+            }
+            (true, false) => self.extents[at - 1].1 += len,
+            (false, true) => {
+                self.extents[at].0 = offset;
+                self.extents[at].1 += len;
+            }
+            (false, false) => {
+                self.extents.try_push((offset, len))?;
+                self.extents[at..].rotate_right(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Take space for the first entries of a chunk. `entry_sizes` are the sizes the
+    /// entries have in a chunk. The first extent that holds at least the first
+    /// entry gives as many whole entries as fit. Returns (offset, entries taken,
+    /// bytes taken), or None when no extent holds the first entry.
+    fn take(&mut self, entry_sizes: &[usize]) -> Option<(u64, usize, usize)> {
+        let first = *entry_sizes.first()? as u64;
+        let at = self.extents.iter().position(|&(_, len)| len >= first)?;
+        let (offset, len) = self.extents[at];
+        let mut taken = 0usize;
+        let mut bytes = 0u64;
+        for &size in entry_sizes {
+            if bytes + size as u64 > len {
+                break;
+            }
+            bytes += size as u64;
+            taken += 1;
+        }
+        if bytes == len {
+            self.extents.remove(at);
+        } else {
+            self.extents[at] = (offset + bytes, len - bytes);
+        }
+        Some((offset, taken, bytes as usize))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,6 +954,7 @@ impl SpillState {
                 .try_collect()?,
             distinct_key_read: None,
             next_sub_partition_id: partitioning.count,
+            free_extents: FreeExtents::default(),
         })
     }
 
@@ -1016,6 +1089,10 @@ struct SplitSide {
     buffers: Vec<PartitionBuffer>,
     /// The sub-partitions being filled, with the chunks flushed so far.
     subs: Vec<SpilledPartition>,
+    /// Sub-partition whose buffer is only partly written. A flush into free space
+    /// writes as much as the free extent holds, so the rest of the buffer follows
+    /// with the next write.
+    draining: Option<usize>,
 }
 
 /// Re-split of an oversized grace partition into `GRACE_SPLIT_FANOUT`
@@ -1050,14 +1127,21 @@ impl PartitionSplit {
     }
 }
 
+/// Size of an entry in a chunk: its length prefix and its serialized form.
+fn chunk_entry_size(entry: &HashEntry) -> usize {
+    let entry_size = entry.serialized_size();
+    varint_len(entry_size as u64) + entry_size
+}
+
 /// Serialize `entries` into one chunk, in the format of the spill writers, and
-/// start writing it at `*next_offset`. Returns (file offset, size, completion).
+/// start writing it at `file_offset`. The caller owns the space there. Returns
+/// (size, completion).
 fn write_entries_chunk(
     file: &Arc<dyn File>,
-    next_offset: &mut u64,
+    file_offset: u64,
     entries: &[HashEntry],
     io_state: Arc<AtomicSpillIOState>,
-) -> Result<(u64, usize, Completion)> {
+) -> Result<(usize, Completion)> {
     let mut entry_sizes = Vec::try_with_capacity_ext(entries.len())?;
     let mut total_size = 0usize;
     for entry in entries {
@@ -1074,7 +1158,6 @@ fn write_entries_chunk(
     }
     turso_assert!(offset == total_size, "serialized size mismatch");
 
-    let file_offset = *next_offset;
     io_state.set(SpillIOState::WaitingForWrite);
     let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
         Ok(_) => io_state.set(SpillIOState::WriteComplete),
@@ -1085,8 +1168,7 @@ fn write_entries_chunk(
     });
     let completion = Completion::new_write(write_complete);
     let completion = file.pwrite(file_offset, Arc::new(buffer), completion)?;
-    *next_offset += total_size as u64;
-    Ok((file_offset, total_size, completion))
+    Ok((total_size, completion))
 }
 
 /// Decode the entries of one self-contained spilled chunk.
@@ -3622,6 +3704,17 @@ impl HashTable {
             (bits, prefix, source, parent.split_first_id)
         };
         let split_build = existing_first_id.is_none();
+        // The parent's build chunks are released while it is split, and the parent is
+        // never loaded again (its sub-partitions stand in for it). DISTINCT keeps
+        // offsets into chunks and never reaches grace.
+        debug_assert!(
+            !split_build
+                || spill_state
+                    .distinct_key_places
+                    .iter()
+                    .all(|places| places.is_empty()),
+            "a DISTINCT build cannot be split: its key places point into released space"
+        );
         let first_id = match existing_first_id {
             Some(first_id) => first_id,
             None => {
@@ -3662,6 +3755,7 @@ impl HashTable {
                         )
                     })
                     .try_collect()?,
+                draining: None,
             })
         };
         let build = if split_build {
@@ -3672,6 +3766,7 @@ impl HashTable {
                 next_source: 0,
                 buffers: vec![],
                 subs: vec![],
+                draining: None,
             }
         };
         Ok(PartitionSplit {
@@ -3700,13 +3795,24 @@ impl HashTable {
         split: &mut PartitionSplit,
         mut metrics: Option<&mut HashJoinMetrics>,
     ) -> IOResultOr<()> {
-        loop {
+        'split: loop {
             let stage = split.stage;
             let is_probe = match stage {
                 SplitStage::Build => false,
                 SplitStage::Probe => true,
                 SplitStage::Done => return Ok(IOResult::Done(())),
             };
+
+            // Finish a buffer that was written only in part.
+            let side = if is_probe {
+                &mut split.probe
+            } else {
+                &mut split.build
+            };
+            if let Some(k) = side.draining {
+                return_if_io!(self.flush_split_buffer(side, k, is_probe, metrics.as_deref_mut()));
+                continue;
+            }
 
             // Route what was read, flushing a sub-partition buffer when it fills up.
             while let Some(entry) = split.pending.pop() {
@@ -3725,6 +3831,9 @@ impl HashTable {
                         is_probe,
                         metrics.as_deref_mut()
                     ));
+                    if side.draining.is_some() {
+                        continue 'split;
+                    }
                 }
             }
 
@@ -3778,13 +3887,23 @@ impl HashTable {
                     ));
                     entries.reverse();
                     split.pending = entries;
+                    if !is_probe {
+                        // The chunk is read and parsed: its extent is dead for the
+                        // rest of the build, because a split partition is never
+                        // loaded again (see `PartitionSplit::split_build`).
+                        self.spill_state
+                            .as_mut()
+                            .expect("spill state must exist")
+                            .free_extents
+                            .release(file_offset, size_bytes as u64)?;
+                    }
                 }
                 side.next_source += 1;
                 continue;
             }
 
             for k in 0..GRACE_SPLIT_FANOUT {
-                if !side.buffers[k].is_empty() {
+                while !side.buffers[k].is_empty() {
                     return_if_io!(self.flush_split_buffer(
                         side,
                         k,
@@ -3801,7 +3920,10 @@ impl HashTable {
         }
     }
 
-    /// Append sub-partition buffer `k` to the temp file of its side as a new chunk.
+    /// Write sub-partition buffer `k` to the temp file of its side as a new chunk.
+    /// The build side fills the free extents first, so a write can cover only the
+    /// first entries of the buffer (cut at an entry boundary); the rest stays in the
+    /// buffer and `side.draining` is set. The probe side appends the whole buffer.
     fn flush_split_buffer(
         &mut self,
         side: &mut SplitSide,
@@ -3809,26 +3931,55 @@ impl HashTable {
         is_probe: bool,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> IOResultOr<()> {
-        let (file, next_offset) = if is_probe {
+        let buffer = &mut side.buffers[k];
+        let sub = &mut side.subs[k];
+        let (file, file_offset, num_entries) = if is_probe {
             let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
+            let file_offset = probe_state.next_spill_offset;
             (
                 probe_state.temp_file.file.clone(),
-                &mut probe_state.next_spill_offset,
+                file_offset,
+                buffer.entries.len(),
             )
         } else {
             let spill_state = self.spill_state.as_mut().expect("spill state must exist");
-            (
-                spill_state.temp_file.file.clone(),
-                &mut spill_state.next_spill_offset,
-            )
+            let mut entry_sizes = Vec::try_with_capacity_ext(buffer.entries.len())?;
+            for entry in &buffer.entries {
+                entry_sizes.try_push(chunk_entry_size(entry))?;
+            }
+            let (file_offset, num_entries) = match spill_state.free_extents.take(&entry_sizes) {
+                Some((file_offset, num_entries, _)) => (file_offset, num_entries),
+                None => (spill_state.next_spill_offset, buffer.entries.len()),
+            };
+            (spill_state.temp_file.file.clone(), file_offset, num_entries)
         };
-        let buffer = &mut side.buffers[k];
-        let sub = &mut side.subs[k];
-        let num_entries = buffer.entries.len();
-        let mem_bytes = buffer.mem_used;
-        let (file_offset, size, completion) =
-            write_entries_chunk(&file, next_offset, &buffer.entries, sub.io_state.clone())?;
-        buffer.clear();
+        let (size, completion) = write_entries_chunk(
+            &file,
+            file_offset,
+            &buffer.entries[..num_entries],
+            sub.io_state.clone(),
+        )?;
+        let mem_bytes: usize = buffer.entries[..num_entries]
+            .iter()
+            .map(HashEntry::size_bytes)
+            .sum();
+        if is_probe {
+            let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
+            probe_state.next_spill_offset += size as u64;
+        } else {
+            let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+            // Appended space moves the end of the file; free space is already below it.
+            spill_state.next_spill_offset =
+                spill_state.next_spill_offset.max(file_offset + size as u64);
+        }
+        if num_entries == buffer.entries.len() {
+            buffer.clear();
+            side.draining = None;
+        } else {
+            buffer.entries.drain(..num_entries);
+            buffer.mem_used -= mem_bytes;
+            side.draining = Some(k);
+        }
         sub.add_chunk(file_offset, size, num_entries, mem_bytes)?;
         if let Some(metrics) = metrics {
             if is_probe {
@@ -4664,6 +4815,7 @@ mod hashtests {
                 .unwrap(),
             distinct_key_read: None,
             next_sub_partition_id: partitioning.count,
+            free_extents: FreeExtents::default(),
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -4720,6 +4872,7 @@ mod hashtests {
                 .unwrap(),
             distinct_key_read: None,
             next_sub_partition_id: partitioning.count,
+            free_extents: FreeExtents::default(),
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -6474,7 +6627,8 @@ mod hashtests {
 
     /// Probe the same re-split build in several passes, each with different probe
     /// rows. The build is split once: later passes route their probe rows to the
-    /// kept sub-partitions and do not write to the build temp file again.
+    /// kept sub-partitions and do not write to the build temp file again, nor
+    /// change its free space.
     fn check_resplit_across_probe_passes(track_matched: bool) {
         const KEYS: i64 = 16_000;
         const PASSES: i64 = 4;
@@ -6486,8 +6640,8 @@ mod hashtests {
                 !ht.is_partition_loaded(partition_idx)
             })
             .collect();
-        let offset_before_grace = ht.spill_state.as_ref().unwrap().next_spill_offset;
         let mut offset_after_first_pass = 0;
+        let mut free_after_first_pass = FreeExtents::default();
 
         for pass in 0..PASSES {
             if pass > 0 {
@@ -6521,17 +6675,20 @@ mod hashtests {
                 assert_eq!(unmatched, expected_unmatched, "pass {pass}");
             }
 
-            let offset = ht.spill_state.as_ref().unwrap().next_spill_offset;
+            // The first pass splits the build (asserted above), into the space of the
+            // split partitions where it can: the file may not grow.
+            let spill_state = ht.spill_state.as_ref().unwrap();
             if pass == 0 {
-                assert!(
-                    offset > offset_before_grace,
-                    "the first pass splits the build"
-                );
-                offset_after_first_pass = offset;
+                offset_after_first_pass = spill_state.next_spill_offset;
+                free_after_first_pass = spill_state.free_extents.clone();
             } else {
                 assert_eq!(
-                    offset, offset_after_first_pass,
+                    spill_state.next_spill_offset, offset_after_first_pass,
                     "pass {pass} wrote to the build temp file"
+                );
+                assert_eq!(
+                    spill_state.free_extents, free_after_first_pass,
+                    "pass {pass} changed the free space of the build temp file"
                 );
             }
         }
@@ -6545,5 +6702,252 @@ mod hashtests {
     #[test]
     fn test_grace_resplit_build_is_split_once_across_probe_passes_with_matched_tracking() {
         check_resplit_across_probe_passes(true);
+    }
+
+    /// Byte ranges of the chunks a grace run can still read: the chunks of every
+    /// partition that was not replaced by sub-partitions.
+    fn live_build_extents(ht: &HashTable) -> Vec<(u64, u64)> {
+        let spill_state = ht.spill_state.as_ref().expect("spill state");
+        spill_state
+            .partitions
+            .iter()
+            .filter(|partition| partition.split_first_id.is_none())
+            .flat_map(|partition| partition.chunks.iter())
+            .filter(|chunk| chunk.size_bytes > 0)
+            .map(|chunk| (chunk.file_offset, chunk.size_bytes as u64))
+            .collect()
+    }
+
+    /// Free space of the build temp file, and what can still be read, never
+    /// overlap, and all of it lies below the end of the file.
+    fn assert_build_extents_disjoint(ht: &HashTable) {
+        let spill_state = ht.spill_state.as_ref().expect("spill state");
+        let mut extents = live_build_extents(ht);
+        extents.extend(spill_state.free_extents.extents.iter().copied());
+        extents.sort_unstable();
+        for pair in extents.windows(2) {
+            assert!(
+                pair[0].0 + pair[0].1 <= pair[1].0,
+                "extents {:?} and {:?} overlap",
+                pair[0],
+                pair[1]
+            );
+        }
+        if let Some(last) = extents.last() {
+            assert!(last.0 + last.1 <= spill_state.next_spill_offset);
+        }
+    }
+
+    /// Re-splitting writes the sub-partitions into the space of the partition it
+    /// reads, so the build temp file does not double with every split level.
+    #[test]
+    fn test_grace_resplit_reuses_the_space_of_the_split_partition() {
+        const KEYS: i64 = 32_000;
+        let mem_budget = 16 * 1024;
+        let mut ht = make_partitioned_ht(mem_budget, false, (0..KEYS).map(|k| (k, k)));
+        let buffered = buffer_probe_rows(&mut ht, 0..KEYS);
+        let offset_before = ht.spill_state.as_ref().unwrap().next_spill_offset;
+        // The sub-partition buffers (together `mem_budget` of memory, written as
+        // chunks no larger than that) are the most that can be in flight.
+        let slack = mem_budget as u64;
+        assert!(
+            offset_before > 4 * slack,
+            "the build is too small to tell reuse from appending"
+        );
+
+        let run = drive_grace(&mut ht, false);
+
+        assert!(has_subpartitions(&ht), "no partition was re-split");
+        let mut matches = run.matches;
+        matches.sort_unstable();
+        let mut expected: Vec<(i64, i64)> = buffered
+            .iter()
+            .map(|key| (*key, key + PROBE_ROWID_BASE))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(matches, expected, "every probe row matches its build row");
+        let offset_after = ht.spill_state.as_ref().unwrap().next_spill_offset;
+        assert!(
+            offset_after <= offset_before + slack,
+            "the build temp file grew from {offset_before} to {offset_after} bytes"
+        );
+        assert_build_extents_disjoint(&ht);
+    }
+
+    /// A hot key cannot be separated, so the partition is split once and its
+    /// sub-partitions are loaded whole. The sub-partitions stay readable after
+    /// the space of the parent is reused.
+    #[test]
+    fn test_grace_resplit_reuse_keeps_skewed_sub_partitions_readable() {
+        const HOT_KEY: i64 = 7;
+        const HOT_ROWS: i64 = 3_000;
+        let mem_budget = 16 * 1024;
+        let rows = (0..HOT_ROWS)
+            .map(|rowid| (rowid, HOT_KEY))
+            .chain((0..2_000).map(|i| (10_000 + i, 1_000 + i)));
+        let mut ht = make_partitioned_ht(mem_budget, false, rows);
+        let buffered = buffer_probe_rows(&mut ht, std::iter::once(HOT_KEY).chain(1_000..3_000));
+        assert!(buffered.contains(&HOT_KEY), "the hot partition is on disk");
+
+        let run = drive_grace(&mut ht, false);
+
+        assert!(has_subpartitions(&ht), "no partition was re-split");
+        let mut matches = run.matches;
+        matches.sort_unstable();
+        let mut expected: Vec<(i64, i64)> = (0..HOT_ROWS)
+            .map(|rowid| (rowid, HOT_KEY + PROBE_ROWID_BASE))
+            .collect();
+        expected.extend(
+            buffered
+                .iter()
+                .filter(|key| (1_000..3_000).contains(*key))
+                .map(|key| (10_000 + (key - 1_000), key + PROBE_ROWID_BASE)),
+        );
+        expected.sort_unstable();
+        assert_eq!(matches, expected);
+        assert_build_extents_disjoint(&ht);
+    }
+
+    #[test]
+    fn test_free_extents_merge_neighbours() {
+        let mut free = FreeExtents::default();
+        free.release(100, 10).unwrap();
+        free.release(130, 10).unwrap();
+        assert_eq!(free.extents, vec![(100, 10), (130, 10)]);
+        // Next to the first one only.
+        free.release(110, 5).unwrap();
+        assert_eq!(free.extents, vec![(100, 15), (130, 10)]);
+        // Next to the second one only.
+        free.release(125, 5).unwrap();
+        assert_eq!(free.extents, vec![(100, 15), (125, 15)]);
+        // Fills the gap between the two.
+        free.release(115, 10).unwrap();
+        assert_eq!(free.extents, vec![(100, 40)]);
+        // Before all others, and empty ranges.
+        free.release(10, 5).unwrap();
+        free.release(50, 0).unwrap();
+        assert_eq!(free.extents, vec![(10, 5), (100, 40)]);
+    }
+
+    #[test]
+    fn test_free_extents_take_whole_entries_first_fit() {
+        let mut free = FreeExtents::default();
+        free.release(0, 5).unwrap();
+        free.release(100, 25).unwrap();
+        // No extent holds a first entry of 30 bytes.
+        assert_eq!(free.take(&[30, 1]), None);
+        assert_eq!(free.take(&[]), None);
+        // The first extent is too small for the first entry: the second gives two
+        // entries (10 + 10) and keeps 5 bytes.
+        assert_eq!(free.take(&[10, 10, 10]), Some((100, 2, 20)));
+        assert_eq!(free.extents, vec![(0, 5), (120, 5)]);
+        // An exact fit uses the extent up.
+        assert_eq!(free.take(&[5]), Some((0, 1, 5)));
+        assert_eq!(free.extents, vec![(120, 5)]);
+    }
+
+    /// A buffer that does not fit one free extent is cut at entry boundaries over
+    /// several extents, then appended. Every chunk holds whole entries.
+    #[test]
+    fn test_flush_split_buffer_cuts_a_buffer_over_free_extents() {
+        const ENTRIES: usize = 20;
+        let mut ht = make_partitioned_ht(16 * 1024, false, (0..2_000).map(|k| (k, k)));
+        let entries: Vec<HashEntry> = (0..ENTRIES as i64)
+            .map(|rowid| HashEntry::new(rowid as u64, vec![Value::from_i64(rowid)], rowid))
+            .collect();
+        let sizes: Vec<u64> = entries.iter().map(|e| chunk_entry_size(e) as u64).collect();
+
+        // Leave a gap in the file for the free extents: 5 entries and a spare byte,
+        // then exactly the next 7 entries.
+        let first_len = sizes[..5].iter().sum::<u64>() + 1;
+        let second_len = sizes[5..12].iter().sum::<u64>();
+        let appended_len = sizes[12..].iter().sum::<u64>();
+        let end_before = {
+            let spill_state = ht.spill_state.as_mut().unwrap();
+            let base = spill_state.next_spill_offset;
+            spill_state.next_spill_offset = base + first_len + 1_000 + second_len + 1_000;
+            spill_state.free_extents = FreeExtents::default();
+            spill_state.free_extents.release(base, first_len).unwrap();
+            spill_state
+                .free_extents
+                .release(base + first_len + 1_000, second_len)
+                .unwrap();
+            spill_state.next_spill_offset
+        };
+
+        let mut side = SplitSide {
+            source: vec![],
+            next_source: 0,
+            buffers: (0..GRACE_SPLIT_FANOUT)
+                .map(|_| PartitionBuffer::new())
+                .try_collect()
+                .unwrap(),
+            subs: (0..GRACE_SPLIT_FANOUT)
+                .map(|k| SpilledPartition::new_sub_partition(5_000 + k, 4, k as u64))
+                .try_collect()
+                .unwrap(),
+            draining: None,
+        };
+        for entry in entries {
+            side.buffers[3].insert(entry).unwrap();
+        }
+        let mut writes = 0;
+        while !side.buffers[3].is_empty() {
+            let _ = ht.flush_split_buffer(&mut side, 3, false, None).unwrap();
+            writes += 1;
+            assert!(writes <= 3, "more writes than extents");
+            assert_eq!(side.draining.is_some(), !side.buffers[3].is_empty());
+        }
+
+        let chunks = &side.subs[3].chunks;
+        let layout: Vec<(usize, usize)> = chunks
+            .iter()
+            .map(|c| (c.num_entries, c.size_bytes))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                (5, (first_len - 1) as usize),
+                (7, second_len as usize),
+                (8, appended_len as usize),
+            ]
+        );
+        let spill_state = ht.spill_state.as_ref().unwrap();
+        let base = end_before - first_len - 1_000 - second_len - 1_000;
+        assert_eq!(chunks[0].file_offset, base);
+        assert_eq!(chunks[1].file_offset, base + first_len + 1_000);
+        assert_eq!(chunks[2].file_offset, end_before, "the rest is appended");
+        assert_eq!(spill_state.next_spill_offset, end_before + appended_len);
+        // The spare byte of the first extent is what is left.
+        assert_eq!(
+            spill_state.free_extents.extents,
+            vec![(base + first_len - 1, 1)]
+        );
+
+        // The chunks read back as the entries, in order.
+        let file = spill_state.temp_file.file.clone();
+        let reader = ChunkReader::new();
+        let mut rowids = vec![];
+        for chunk in chunks {
+            let read = loop {
+                match poll_chunk_entries(
+                    &reader,
+                    &file,
+                    chunk.file_offset,
+                    chunk.size_bytes,
+                    chunk.num_entries,
+                )
+                .unwrap()
+                {
+                    IOResult::Done(read) => break read,
+                    IOResult::IO(_) => {}
+                }
+            };
+            for entry in read {
+                assert_eq!(entry.hash, entry.rowid as u64);
+                rowids.push(entry.rowid);
+            }
+        }
+        assert_eq!(rowids, (0..ENTRIES as i64).collect::<Vec<_>>());
     }
 }

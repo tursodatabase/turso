@@ -2192,8 +2192,8 @@ mod tests {
         ] {
             conn.execute(sql).unwrap();
         }
-        for join in ["LEFT JOIN"] {
-            let sql = format!("SELECT l.k, l.a, r.k, r.b FROM l {join} r ON l.k = r.k");
+        {
+            let sql = "SELECT l.k, l.a, r.k, r.b FROM l LEFT JOIN r ON l.k = r.k".to_string();
             let run = |mem_budget: usize| {
                 let mut stmt = conn.prepare(&sql).unwrap();
                 let mut hash_builds = 0;
