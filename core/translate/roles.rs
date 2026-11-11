@@ -292,38 +292,38 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     )))
 }
 
-/// Fails if the statement is compiled for a role that may not read relation
-/// `name` of `namespace`, a table, view or materialized view, which `object`
-/// names in the error. Inside a view, the view's owner is the reader, as in
-/// PostgreSQL, so a view shows its readers the tables its owner may read.
-/// Relations outside the main database, temp among them, have no
-/// privileges, and everyone reads them.
-pub(crate) fn check_read_privilege(
+/// Fails if the statement is compiled for a role that does not have
+/// `privilege` on relation `name` of `namespace`, a table, view or
+/// materialized view, which `object` names in the error. Inside a view, the
+/// view's owner is the reader, as in PostgreSQL, so a view shows its readers
+/// the tables its owner may read. Relations outside the main database, temp
+/// among them, have no privileges, and everyone uses them.
+pub(crate) fn check_privilege(
     resolver: &Resolver,
     connection: &Arc<Connection>,
     namespace: NamespaceRef,
     name: &str,
+    privilege: ast::Privilege,
     object: Object,
 ) -> Result<()> {
     if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
         return Ok(());
     }
     let schema = resolver.schema();
-    let reader = table_reader(resolver, connection.current_role());
-    if schema.roles.is_superuser(reader)
-        || resolver.catalog.dialect.role_has_privilege(
-            schema,
-            namespace.id,
-            name,
-            reader,
-            ast::Privilege::Select,
-        )
+    let role = table_reader(resolver, connection.current_role());
+    if schema.roles.is_superuser(role)
+        || resolver
+            .catalog
+            .dialect
+            .role_has_privilege(schema, namespace.id, name, role, privilege)
     {
         return Ok(());
     }
+    let action = match privilege {
+        ast::Privilege::Select => Action::Read,
+    };
     Err(permission_denied(PermissionDenied::privilege(
-        Action::Read,
-        object,
+        action, object,
     )))
 }
 
