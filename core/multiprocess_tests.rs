@@ -551,6 +551,7 @@ fn multiprocess_paused_creator_child_process() {
         &io,
         std::path::Path::new(&shm_path),
         64,
+        &|| {},
         &|| {
             std::fs::write(&ready_file, b"ready").unwrap();
             wait_for_file(&release_file);
