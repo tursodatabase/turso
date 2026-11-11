@@ -215,7 +215,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_index_method(source_db.experimental_index_method_enabled())
         .with_custom_types(source_db.experimental_custom_types_enabled())
         .with_encryption(source_db.experimental_encryption_enabled())
-        .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }

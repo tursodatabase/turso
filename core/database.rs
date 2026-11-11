@@ -78,7 +78,6 @@ pub struct DatabaseOpts {
     pub enable_custom_types: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
-    pub enable_autovacuum: bool,
     pub enable_vacuum: bool,
     pub enable_attach: bool,
     pub enable_multiprocess_wal: bool,
@@ -120,11 +119,6 @@ impl DatabaseOpts {
 
     pub fn with_index_method(mut self, enable: bool) -> Self {
         self.enable_index_method = enable;
-        self
-    }
-
-    pub fn with_autovacuum(mut self, enable: bool) -> Self {
-        self.enable_autovacuum = enable;
         self
     }
 
@@ -2099,9 +2093,9 @@ impl Database {
                         header.vacuum_mode_largest_root_page.get() > 0
                             || header.incremental_vacuum_enabled.get() > 0
                     }));
-                    if is_autovacuumed_db && !self.opts.enable_autovacuum {
+                    if is_autovacuumed_db {
                         tracing::warn!(
-                            "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
+                            "Database has autovacuum enabled, which is not supported. Opening in readonly mode."
                         );
                         self.open_flags |= OpenFlags::ReadOnly;
                     }
@@ -3645,10 +3639,6 @@ impl Database {
 
     pub fn experimental_encryption_enabled(&self) -> bool {
         self.opts.enable_encryption
-    }
-
-    pub fn experimental_autovacuum_enabled(&self) -> bool {
-        self.opts.enable_autovacuum
     }
 
     pub fn experimental_vacuum_enabled(&self) -> bool {

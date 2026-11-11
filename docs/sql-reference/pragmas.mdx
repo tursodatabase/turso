@@ -310,8 +310,10 @@ PRAGMA auto_vacuum = full;       -- accepted, but changes nothing
 Setting the mode accepts any value and does nothing, as in SQLite built without
 auto-vacuum.
 
-Opening a database that already has auto-vacuum enabled without the
-`--experimental-autovacuum` flag logs a warning and opens the connection read-only.
+Opening a database that already has auto-vacuum enabled, for example one created by
+SQLite, logs a warning and opens the connection read-only.
+[VACUUM INTO](/docs/sql-reference/statements/vacuum#vacuum-into) can copy it into a
+database without auto-vacuum.
 
 ### cache_size
 
