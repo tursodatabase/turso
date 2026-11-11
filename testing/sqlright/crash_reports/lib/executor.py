@@ -48,7 +48,6 @@ class CrashExecutor:
                     "-m", "list",  # List mode
                     "--experimental-views",
                     "--experimental-index-method",
-                    "--experimental-autovacuum",
                     "--experimental-attach",
                     "--experimental-encryption",
                 ],

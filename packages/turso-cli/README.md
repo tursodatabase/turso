@@ -52,7 +52,6 @@ These features are available behind `--experimental-*` flags:
 - **Generated Columns** — virtual and stored computed columns
 - **Triggers** — `CREATE TRIGGER` / `DROP TRIGGER`
 - **Attach** — `ATTACH DATABASE` / `DETACH DATABASE`
-- **Autovacuum** — automatic database compaction
 
 Run `npx turso --help` for the full list of flags.
 

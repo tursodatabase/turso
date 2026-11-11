@@ -582,7 +582,7 @@ impl TursoMcpServer {
                 &path,
                 None::<&str>,
                 OpenFlags::default(),
-                DatabaseOpts::new().with_autovacuum(false),
+                DatabaseOpts::new(),
                 None,
                 Arc::new(SqliteDialect),
             ) {
