@@ -249,12 +249,7 @@ impl PostgreSQLTranslator {
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
             NodeRef::AlterSeqStmt(alter) => self.translate_alter_sequence(alter)?,
-            _ => {
-                return Err(ParseError::ParseError(format!(
-                    "{} is not supported",
-                    node_ref_name(&node)
-                )))
-            }
+            _ => return Err(not_supported(node_ref_name(&node))),
         })
     }
 
@@ -6382,16 +6377,8 @@ fn translate_create_role(
 
     match RoleStmtType::try_from(stmt.stmt_type) {
         Ok(RoleStmtType::RolestmtRole) => {}
-        Ok(RoleStmtType::RolestmtUser) => {
-            return Err(ParseError::ParseError(
-                "CREATE USER is not supported".to_string(),
-            ))
-        }
-        Ok(RoleStmtType::RolestmtGroup) => {
-            return Err(ParseError::ParseError(
-                "CREATE GROUP is not supported".to_string(),
-            ))
-        }
+        Ok(RoleStmtType::RolestmtUser) => return Err(not_supported("CREATE USER")),
+        Ok(RoleStmtType::RolestmtGroup) => return Err(not_supported("CREATE GROUP")),
         _ => {
             return Err(ParseError::ParseError(format!(
                 "unknown CREATE ROLE statement type: {}",
@@ -6400,9 +6387,10 @@ fn translate_create_role(
         }
     }
     if !stmt.options.is_empty() {
-        return Err(ParseError::ParseError(
-            "CREATE ROLE options are not supported".to_string(),
-        ));
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: "CREATE ROLE options are not supported".to_string(),
+        });
     }
     if stmt.role.starts_with("pg_") {
         return Err(ParseError::ParseError(format!(

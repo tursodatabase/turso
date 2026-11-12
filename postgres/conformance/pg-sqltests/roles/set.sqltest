@@ -212,6 +212,16 @@ expect error {
     role "public" does not exist
 }
 
+@skip-if postgres "PostgreSQL supports SET SESSION AUTHORIZATION"
+test set-session-authorization-is-not-supported {
+    CREATE ROLE un_session;
+    SET SESSION AUTHORIZATION un_session;
+}
+@sqlstate 0A000
+expect error {
+    SET session_authorization is not supported
+}
+
 test reset-role-restores-superuser-privileges {
     CREATE TABLE sr_restore (x int);
     INSERT INTO sr_restore VALUES (1);

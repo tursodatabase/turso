@@ -1977,9 +1977,10 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 PgSetTo::Default => "RESET",
                 PgSetTo::Values(_) | PgSetTo::Current => "SET",
             };
-            return Err(LimboError::ParseError(format!(
-                "{command} {name} is not supported"
-            )));
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("{command} {name} is not supported"),
+            ));
         }
     };
     // Change the setting when the statement runs, not when it is prepared.
@@ -2001,9 +2002,10 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
             .name_as_defined(name)
             .unwrap_or_else(|| name.clone()),
         None => {
-            return Err(LimboError::ParseError(format!(
-                "SHOW {name} is not supported"
-            )))
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("SHOW {name} is not supported"),
+            ))
         }
     };
     pg_conn.conn.prepare(format!(
