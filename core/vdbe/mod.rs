@@ -1779,6 +1779,19 @@ impl ProgramState {
         }
     }
 
+    /// Close the cursors of this program that read an MVCC store: the MVCC cursors, and the
+    /// materialized view cursors, which read through an MVCC cursor.
+    ///
+    /// An MVCC cursor keeps the row store that it reads. A checkpoint frees the row store
+    /// in one step only if no cursor keeps it.
+    pub(crate) fn close_mvcc_cursors(&mut self) {
+        for slot in self.cursors.iter_mut() {
+            if matches!(slot, Some(Cursor::Dyn(..))) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Begin a statement subtransaction.
     ///
     /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
@@ -3272,6 +3285,9 @@ impl Program {
         if !auto_commit {
             return Ok(IOResult::Done(()));
         }
+        // The commit can start a checkpoint, and this statement reads no row after its
+        // commit.
+        program_state.close_mvcc_cursors();
 
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
