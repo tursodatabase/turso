@@ -67,6 +67,7 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+use turso_core::SessionRole;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -1084,7 +1085,9 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_page_codec(page_codec.clone()),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1093,7 +1096,9 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))

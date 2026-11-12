@@ -914,6 +914,7 @@ fn single_value_of_mut(select: &mut ast::Select) -> Option<&mut ast::Expr> {
 
 #[cfg(test)]
 mod tests {
+    use crate::security::roles::SessionRole;
     use std::sync::Arc;
 
     use rustc_hash::FxHashMap;
@@ -1191,7 +1192,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t (x)").unwrap();
         conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT x FROM t")
             .unwrap();
@@ -1233,7 +1236,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t (x)").unwrap();
         let enable = ast::Cmd::Stmt(ast::Stmt::AlterTable(ast::AlterTable {
             name: ast::QualifiedName::single(ast::Name::exact("t".to_string())),

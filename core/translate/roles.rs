@@ -748,6 +748,7 @@ fn emit_role_name_index_entry(
 
 #[cfg(test)]
 mod tests {
+    use crate::security::roles::SessionRole;
     use std::sync::Arc;
 
     use turso_parser::ast;
@@ -762,7 +763,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let error = create_role(&conn, "alice").unwrap_err();
 

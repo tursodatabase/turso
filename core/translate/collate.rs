@@ -1764,6 +1764,7 @@ mod tests {
 #[cfg(test)]
 mod typed_value_order_tests {
     use super::CollationSeq;
+    use crate::security::roles::SessionRole;
     use crate::sync::Arc;
     use crate::vdbe::{builder::CursorType, insn::Insn};
     use crate::{
@@ -1912,7 +1913,9 @@ mod typed_value_order_tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
             .unwrap();
         conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")

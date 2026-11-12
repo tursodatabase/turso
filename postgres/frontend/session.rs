@@ -36,6 +36,7 @@ use turso_pg_parser::translator::{
 use turso_pg_parser::ParseError;
 
 use crate::copy::parse_copy_text_format;
+use turso_core::SessionRole;
 
 #[derive(Clone)]
 pub struct PgConnection {
@@ -128,14 +129,14 @@ fn refuse_a_file_with_tables_in_no_schema(
     if db.mvcc_enabled() {
         return Ok(());
     }
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    let conn = db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
     refuse_tables_in_no_schema(&conn)?;
     Ok(())
 }
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        Self::connect_with(db, turso_core::ConnectOpts::new())
+        Self::connect_with(db, turso_core::ConnectOpts::new(SessionRole::Superuser))
     }
 
     /// Opens a session on `db`, connecting with `opts`, such as the
@@ -2431,7 +2432,9 @@ mod tests {
     use crate::PostgresDialect;
     use chumsky::Parser;
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, Value};
+    use turso_core::{
+        Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, SessionRole, Value,
+    };
 
     #[test]
     fn a_materialized_view_of_a_schema_is_maintained_and_dropped_with_the_schema() {
@@ -2613,7 +2616,7 @@ mod tests {
             OpenOptions::new(Arc::new(PostgresDialect)),
         )
         .unwrap();
-        db.connect(turso_core::ConnectOpts::new())
+        db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
             .unwrap();
