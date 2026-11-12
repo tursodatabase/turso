@@ -31,11 +31,7 @@ pub(super) struct Config {
     pub disabled: Vec<Feature>,
 }
 
-const DISABLED_BY_DEFAULT: [Feature; 3] = [
-    Feature::ForceRls,
-    Feature::Policies,
-    Feature::DefaultPrivileges,
-];
+const DISABLED_BY_DEFAULT: [Feature; 2] = [Feature::Policies, Feature::DefaultPrivileges];
 
 pub fn disabled_features(enable: &[Feature], disable: &[Feature]) -> Result<Vec<Feature>> {
     let mut enabled = enable.to_vec();

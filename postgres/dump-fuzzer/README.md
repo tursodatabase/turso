@@ -71,10 +71,9 @@ make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
 ## Feature configuration
 
 The hard-coded compatible configuration is in `src/generation/config.rs`. It disables
-`force-rls`, `policies`, and `default-privileges` by default,
-including the dependent operations described below. Tables, column defaults,
-data, indexes, grants, revokes, and ENABLE/DISABLE ROW LEVEL SECURITY remain
-enabled.
+`policies` and `default-privileges` by default, including the dependent
+operations described below. Tables, column defaults, data, indexes, grants,
+revokes, and row-level security remain enabled.
 
 Use `fuzz --enable-features` to opt features back in, and `--disable-features`
 for additional exclusions. Both accept comma-separated names and can be
@@ -84,9 +83,10 @@ Enabling a child also enables its required parent: `force-rls` enables `rls`,
 `alter-policy`/`drop-policy` enable `policies`, and `revokes` enables `grants`. Index subfeatures (`composite-indexes`,
 `unique-indexes`, `descending-indexes`) enable `indexes`.
 Explicitly disabling a required parent is an error.
-The defaults exercise RLS without FORCE. When opting into FORCE with
-`--enable-features force-rls`, the reference dump role needs BYPASSRLS;
-otherwise PostgreSQL itself rejects the dump.
+With FORCE ROW LEVEL SECURITY, the reference dump role needs BYPASSRLS;
+otherwise PostgreSQL itself rejects the dump. The `postgres` superuser that
+the Docker helper uses has it. Use `--disable-features force-rls` to
+exercise RLS without FORCE.
 
 ```sh
 # Current compatible defaults: no exclusion list needed.
@@ -132,7 +132,7 @@ Feature-isolated campaigns against PostgreSQL 18 and `tursopg` found:
 | Basic tables/data | 30 cases passed |
 | Single-column indexes | 30 cases passed |
 | RLS without FORCE | 100 cases passed |
-| FORCE ROW LEVEL SECURITY | Turso rejects ALTER TABLE FORCE ROW LEVEL SECURITY |
+| FORCE ROW LEVEL SECURITY | 200 cases passed |
 | Policies | Turso rejects CREATE POLICY |
 | Grants and revokes | 200 cases passed |
 | Default privileges | Turso rejects ALTER DEFAULT PRIVILEGES |
@@ -141,8 +141,8 @@ Feature-isolated campaigns against PostgreSQL 18 and `tursopg` found:
 | DESC index keys | 200 cases passed |
 
 Column defaults, mixed-case identifiers, DESC index keys, grants, revokes,
-and ENABLE/DISABLE ROW LEVEL SECURITY failed in earlier campaigns and now
-pass, so the compatible profile enables them.
+and row-level security failed in earlier campaigns and now pass, so the
+compatible profile enables them.
 
 Child operations were not reached independently after their parent failed.
 These observations are campaign results, not an exhaustive compatibility claim.
