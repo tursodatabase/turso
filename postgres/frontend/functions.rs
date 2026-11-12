@@ -11,7 +11,7 @@ use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
-use turso_pg_parser::coerce::parse_oid;
+use turso_pg_parser::coerce::{parse_int4, parse_int8, parse_oid};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
@@ -19,6 +19,7 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
     SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
+use turso_pg_parser::ParseError;
 
 /// Registers one native scalar function per name. Each body is a Rust
 /// expression that can use `?`. The planner reads the SQL return type from the
@@ -91,6 +92,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",
         ))?,
+        "text_to_int4"(FunctionArity::Exact(1), true) => {
+            exec_text_to_integer(args[0].get_value(), parse_int4)?
+        },
+        "text_to_int8"(FunctionArity::Exact(1), true) => {
+            exec_text_to_integer(args[0].get_value(), parse_int8)?
+        },
         "number_to_int2"(FunctionArity::Exact(1), true) => exec_number_to_int2(args[0].get_value())?,
         "text_to_regclass"(FunctionArity::Exact(1), false) => {
             exec_oid_alias_of(connection, args[0].get_value(), regclass_of_name)?
@@ -555,6 +562,19 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         ));
     }
     Ok(Some(value))
+}
+
+fn exec_text_to_integer(
+    value: &Value,
+    parse: fn(&str) -> std::result::Result<i64, ParseError>,
+) -> Result<Option<i64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => parse(text.as_str()).map(Some).map_err(parse_error_to_core),
+        other => parse(&other.to_string())
+            .map(Some)
+            .map_err(parse_error_to_core),
+    }
 }
 
 fn exec_number_to_int2(value: &Value) -> Result<Option<i64>> {
@@ -1732,6 +1752,9 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorReport;
+    use turso_parser::ast;
+    use turso_pg_parser::coerce::{coerce, CastContext, PgType};
 
     #[test]
     fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
@@ -1750,6 +1773,95 @@ mod tests {
         assert_eq!(
             role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
             "postgres"
+        );
+    }
+
+    const INTEGER_INPUTS: &[&str] = &[
+        "42",
+        " 42 ",
+        "+7",
+        "-7",
+        "0",
+        "007",
+        "0x1F",
+        "0o17",
+        "0b101",
+        "1_000",
+        "0x_1",
+        "\t42\n",
+        "abc",
+        "",
+        " ",
+        "1.5",
+        "1e3",
+        "0x",
+        "1__0",
+        "_1",
+        "1_",
+        "4 2",
+        "--1",
+        "- 1",
+        "2147483647",
+        "2147483648",
+        "-2147483648",
+        "-2147483649",
+        "0x80000000",
+        "99999999999999999999",
+        "99999999999x",
+        "2147483649x",
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "0x7FFFFFFFFFFFFFFF",
+        "0x8000000000000000",
+    ];
+
+    #[test]
+    fn text_read_as_an_integer_at_run_time_agrees_with_the_string_literal_read_at_translation() {
+        for (target, parse) in [
+            (
+                PgType::Int4,
+                parse_int4 as fn(&str) -> std::result::Result<i64, ParseError>,
+            ),
+            (PgType::Int8, parse_int8),
+        ] {
+            for input in INTEGER_INPUTS {
+                let quoted = format!("'{}'", input.replace('\'', "''"));
+                let literal = ast::Expr::Literal(ast::Literal::String(quoted));
+                let translated = coerce(
+                    literal,
+                    Some(&PgType::Unknown),
+                    &target,
+                    CastContext::Implicit,
+                );
+                let at_run_time = exec_text_to_integer(&Value::build_text(*input), parse);
+                match (translated, at_run_time) {
+                    (Ok(ast::Expr::Literal(ast::Literal::Numeric(text))), Ok(Some(value))) => {
+                        assert_eq!(text, value.to_string(), "{target} {input:?}");
+                    }
+                    (Err(ParseError::Sqlstate { sqlstate, message }), Err(error)) => {
+                        let report = ErrorReport::from(&error);
+                        assert_eq!(report.sqlstate, sqlstate, "{target} {input:?}");
+                        assert_eq!(report.message, message, "{target} {input:?}");
+                    }
+                    (translated, at_run_time) => {
+                        panic!("{target} {input:?}: {translated:?} but {at_run_time:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_read_as_an_integer_at_run_time_keeps_null_as_null() {
+        assert_eq!(
+            exec_text_to_integer(&Value::Null, parse_int4).unwrap(),
+            None
+        );
+        assert_eq!(
+            exec_text_to_integer(&Value::Null, parse_int8).unwrap(),
+            None
         );
     }
 }

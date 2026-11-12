@@ -213,6 +213,8 @@ const UNKNOWN_TO_REGCLASS: &str = "unknown_to_regclass";
 const UNKNOWN_TO_REGNAMESPACE: &str = "unknown_to_regnamespace";
 const TEXT_TO_REGCLASS: &str = "text_to_regclass";
 const NUMBER_TO_INT2: &str = "number_to_int2";
+const TEXT_TO_INT4: &str = "text_to_int4";
+const TEXT_TO_INT8: &str = "text_to_int8";
 
 impl fmt::Display for PgType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -589,6 +591,8 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
         (Oid, Text) => Allowed(Assignment, EngineCast),
         (Regclass | Regnamespace | Regproc, Text) => Unsupported(Assignment),
         (Text, Regclass) => Allowed(Implicit, Function(TEXT_TO_REGCLASS)),
+        (Text, Int4) => Allowed(Explicit, Function(TEXT_TO_INT4)),
+        (Text, Int8) => Allowed(Explicit, Function(TEXT_TO_INT8)),
         (Text, Regproc) => Allowed(Explicit, Nothing),
         (Char, Text) => Allowed(Implicit, Nothing),
         (alias, Bool | Float8 | Numeric | Bytea) | (Bool | Float8 | Numeric | Bytea, alias)
@@ -4091,6 +4095,54 @@ mod tests {
             parse_int4("2147483649x").map(|_| null()),
             "22P02",
             "invalid input syntax for type integer: \"2147483649x\"",
+        );
+    }
+
+    #[test]
+    fn text_converts_to_integers_only_with_an_explicit_cast() {
+        for source in [PgType::Text, PgType::Varchar] {
+            for (target, function) in [
+                (PgType::Int4, "text_to_int4"),
+                (PgType::Int8, "text_to_int8"),
+            ] {
+                let call = function_call(function, vec![number("5")]);
+                assert_eq!(
+                    convert(&source, &target, Explicit).unwrap(),
+                    cast_to(call, &target),
+                    "{source} to {target}"
+                );
+                for context in [Implicit, Assignment] {
+                    assert_error(
+                        convert(&source, &target, context),
+                        "42804",
+                        &format!(
+                            "a value of type {source} cannot be used as {target} without a cast"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_to_the_other_numbers_boolean_and_smallint_stays_unsupported() {
+        for target in [PgType::Float8, PgType::Numeric, PgType::Bool, PgType::Int2] {
+            assert_error(
+                convert(&PgType::Text, &target, Explicit),
+                "0A000",
+                &format!("a cast from text to {target} is not supported"),
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_of_text_to_an_integer_column_gives_the_column_message() {
+        assert_assignment_error(
+            Some(&PgType::Text),
+            Some(&PgType::Int4),
+            number("5"),
+            "42804",
+            "column \"col\" is of type integer but expression is of type text",
         );
     }
 }
