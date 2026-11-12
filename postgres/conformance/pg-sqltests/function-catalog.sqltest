@@ -683,6 +683,44 @@ expect {
 
 # The body is checked when the function is created.
 
+test body-reads-a-table-that-does-not-exist {
+    CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such table: nosuch
+}
+
+test body-reads-a-column-that-does-not-exist {
+    CREATE TABLE t (a integer);
+    CREATE FUNCTION first_b() RETURNS integer LANGUAGE sql AS $$SELECT b FROM t$$;
+}
+@sqlstate 42703
+expect error {
+    column "b" does not exist
+}
+@sqlstate 42703
+expect @tursopg error {
+    no such column: b
+}
+
+# To give PostgreSQL's message, tursopg must know the types of the arguments.
+test body-calls-a-function-that-does-not-exist {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT nosuch(1)$$;
+}
+@sqlstate 42883
+expect error {
+    function nosuch\(integer\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: nosuch
+}
+
 test body-reads-a-table {
     CREATE TABLE t (a integer);
     CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT a FROM t ORDER BY a LIMIT 1$$;
@@ -690,6 +728,39 @@ test body-reads-a-table {
 }
 expect {
     SELECT a FROM t ORDER BY a LIMIT 1
+}
+
+test body-uses-a-parameter-that-the-function-does-not-have {
+    CREATE FUNCTION add(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + $2$$;
+}
+@sqlstate 42P02
+expect error {
+    there is no parameter \$2
+}
+
+test body-uses-a-parameter-that-the-function-does-not-have-in-limit {
+    CREATE FUNCTION one(integer) RETURNS integer LANGUAGE sql AS $$SELECT 1 LIMIT $2$$;
+}
+@sqlstate 42P02
+expect error {
+    there is no parameter \$2
+}
+
+test body-returns-two-columns {
+    CREATE FUNCTION pair() RETURNS integer LANGUAGE sql AS $$SELECT 1, 2$$;
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
+}
+
+test body-returns-the-two-columns-of-a-table {
+    CREATE TABLE t (a integer, b integer);
+    CREATE FUNCTION first_row() RETURNS integer LANGUAGE sql AS $$SELECT * FROM t$$;
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
 }
 
 test body-returns-no-column {
@@ -721,6 +792,45 @@ expect @tursopg {
 }
 
 # Features that tursopg does not support
+
+# PostgreSQL creates a function that calls itself. tursopg rejects it, also
+# when CREATE OR REPLACE makes an existing function call itself.
+test function-that-calls-itself {
+    CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT forever($1)$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'forever';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function that calls a function of its own name is not supported
+}
+
+test function-that-calls-itself-in-limit {
+    CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT 1 LIMIT forever($1)$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'forever';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function that calls a function of its own name is not supported
+}
+
+test replaced-function-that-calls-itself {
+    CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE OR REPLACE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT forever($1)$$;
+    SELECT prosrc FROM pg_proc WHERE proname = 'forever';
+}
+expect {
+    SELECT forever($1)
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function that calls a function of its own name is not supported
+}
 
 # A relation can have the text of a function's signature as its name.
 test table-with-the-signature-of-a-function-as-its-name {

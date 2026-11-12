@@ -23,9 +23,10 @@ use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
+    SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
     SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
@@ -476,6 +477,9 @@ fn prepare_statement_inner(
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    if let ast::Stmt::CreateFunction(function) = translated.cmd.stmt() {
+        validate_function_body(pg_conn, function)?;
+    }
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
@@ -533,6 +537,66 @@ fn prepare_statement_inner(
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
     .with_post_run(post_run))
+}
+
+/// Fails when PostgreSQL would not create a function with this body, as
+/// far as tursopg can tell: the body uses a parameter that the function does
+/// not have, its query does not compile, such as with a table, a column or a
+/// function that does not exist, or its result has several columns. The
+/// query is compiled like a statement of the session, with the function's
+/// parameters as bind parameters.
+fn validate_function_body(
+    pg_conn: &Arc<PgConnectionInner>,
+    function: &ast::CreateFunction,
+) -> Result<()> {
+    let body = function.body.trim();
+    let (parameter_numbers, called_functions) = parameters_and_calls(body)?;
+    if let Some(number) = parameter_numbers
+        .into_iter()
+        .find(|number| *number < 1 || *number as usize > function.parameter_types.len())
+    {
+        return Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_PARAMETER,
+            format!("there is no parameter ${number}"),
+        ));
+    }
+    // PostgreSQL accepts a function that calls itself. tursopg cannot run
+    // one: a call takes the place of the function's body.
+    if called_functions
+        .iter()
+        .any(|called| called.name == function.name.name.as_str())
+    {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "a function that calls a function of its own name is not supported",
+        ));
+    }
+    let query = prepare_statement_inner(pg_conn, body)?;
+    // PostgreSQL says in the DETAIL of the error that the final statement
+    // must return exactly one column.
+    if query.num_columns() != 1 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_FUNCTION_DEFINITION,
+            turso_pg_parser::return_type_mismatch_message(
+                &turso_pg_parser::display_signature_type_name(&function.return_type),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The numbers of the parameters that the query `sql` uses and the
+/// functions that it calls.
+fn parameters_and_calls(sql: &str) -> Result<(Vec<i32>, Vec<turso_pg_parser::CalledFunction>)> {
+    let parsed = turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let translator = PostgreSQLTranslator::new();
+    // A query that the translator rejects fails when it is compiled, with
+    // the error that a statement of the session gets.
+    let _ = translator.translate_with_prereqs(&parsed);
+    Ok((
+        translator.parameter_numbers(),
+        translator.called_functions(),
+    ))
 }
 
 /// Connection and session state changes that must follow a statement's

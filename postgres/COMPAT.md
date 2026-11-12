@@ -523,11 +523,14 @@ Notes on `CREATE FUNCTION`:
 - A database that has a function needs a version of tursopg that has
   `CREATE FUNCTION`. An earlier version does not know the stored rows of a
   function, and it reports the database as corrupt.
-- The body is not compiled when the function is created. PostgreSQL rejects
-  a body that reads a table or a column that does not exist.
+- The body is checked when the function is created: the query must compile.
+  The errors for a missing table, column or function have tursopg's
+  messages, not PostgreSQL's.
 - tursopg does not know the type of the body's result, so it accepts a body
   whose result PostgreSQL rejects with `return type mismatch`, such as text
   for a function that returns integer.
+- A function whose body calls a function of the same name is rejected, also
+  with `CREATE OR REPLACE`. PostgreSQL accepts such a function.
 - The name of a function or of its schema cannot have a dot, and a function
   cannot be created in `pg_catalog`. When `pg_catalog` is the first schema
   of the search path, PostgreSQL creates a function without a schema name
