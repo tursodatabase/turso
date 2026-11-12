@@ -19,8 +19,7 @@
 //! whenever it loads the schema.
 //!
 //! The PostgreSQL opening functions create these tables before
-//! returning the database. Existing relations from files without a catalog
-//! receive persistent OIDs and belong to the bootstrap superuser.
+//! returning the database. Every relation receives its catalog row when created.
 //!
 //! Oids start at 16384, PostgreSQL's `FirstNormalObjectId`, and are never
 //! reused inside one database, even after the relation is dropped: the
@@ -1823,12 +1822,14 @@ pub(crate) fn initialize_schema(
     read_only: bool,
 ) -> turso_core::Result<Vec<String>> {
     let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME);
+    if table.is_none() && !schema.user_relations().is_empty() {
+        return Err(LimboError::ParseError(
+            "the database has relations but no relation catalog, as an earlier version of tursopg \
+             made it; this version does not open it"
+                .to_string(),
+        ));
+    }
     if read_only {
-        if table.is_none() && !schema.user_relations().is_empty() {
-            return Err(LimboError::ParseError(
-                "the database has relations but no relation catalog; open it writable to initialize the catalog".into(),
-            ));
-        }
         return Ok(Vec::new());
     }
     let mut statements = Vec::new();
@@ -1851,19 +1852,9 @@ pub(crate) fn initialize_schema(
         {
             statements.push("CREATE TABLE sqlite_sequence(name,seq)".to_string());
         }
-        let mut relations = schema.user_relations();
-        relations.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        let mut next_oid = FIRST_NORMAL_OBJECT_ID;
-        for (namespace, name, kind) in relations {
-            statements.push(format!(
-                "INSERT INTO {CLASSES_TABLE_NAME} (oid, relname, relnamespace, relkind, relowner, relownedby) VALUES ({next_oid}, '{}', {}, '{}', 0, 0)",
-                name.replace('\'', "''"), namespace.as_u32(), relkind_letter(kind)
-            ));
-            next_oid += 1;
-        }
         statements.push(format!(
             "INSERT INTO sqlite_sequence (name, seq) VALUES ('{CLASSES_TABLE_NAME}', {})",
-            next_oid - 1
+            FIRST_NORMAL_OBJECT_ID - 1
         ));
     }
     if schema
