@@ -953,6 +953,17 @@ expect {
     idx_items_price|CREATE UNIQUE INDEX idx_items_price ON items USING btree (price)
 }
 
+test pg-get-indexdef-of-one-column {
+    CREATE TABLE idx_cols (a int, b text, c int);
+    CREATE INDEX idx_cols_b_c ON idx_cols (b, c DESC);
+    SELECT substr(pg_get_indexdef(oid, 0, true), 1, 25),
+           pg_get_indexdef(oid, 1, true), pg_get_indexdef(oid, 2, true)
+    FROM pg_class WHERE relname = 'idx_cols_b_c';
+}
+expect {
+    CREATE INDEX idx_cols_b_c|b|c
+}
+
 test pg-database-has-datlocale {
     SELECT count(datlocale) FROM pg_database WHERE datname = current_database();
 }

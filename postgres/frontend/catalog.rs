@@ -4116,14 +4116,25 @@ fn render_expr(expr: &ast::Expr) -> String {
     expr.to_string()
 }
 
-/// Look up an index by OID and return its definition (CREATE INDEX ...).
-/// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
-pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
+/// Look up an index by OID and return its definition (CREATE INDEX ...),
+/// or with `column` other than 0, the key of that 1-based column alone, as
+/// PostgreSQL does. Uses the same OID assignment as [PgIndexTable] /
+/// [PgClassTable].
+pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64, column: i64) -> Option<String> {
     let schema = conn.current_schema();
-    catalog_indexes(&schema)
-        .iter()
-        .find(|index| index.oid == target_oid)
-        .map(|index| index_definition(&schema, index))
+    let indexes = catalog_indexes(&schema);
+    let index = indexes.iter().find(|index| index.oid == target_oid)?;
+    if column == 0 {
+        return Some(index_definition(&schema, index));
+    }
+    let key = index
+        .columns
+        .get(usize::try_from(column).ok()?.checked_sub(1)?)?;
+    Some(
+        key.expression
+            .clone()
+            .unwrap_or_else(|| quote_identifier(&key.name)),
+    )
 }
 
 fn index_definition(schema: &Schema, index: &CatalogIndex) -> String {
