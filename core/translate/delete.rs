@@ -45,10 +45,13 @@ fn validate_delete(
         s.get_table(namespace.id, tbl_name)
     }) {
         Some(table) => table,
-        None => crate::bail_parse_error!(
-            "no such table: {}",
-            crate::util::table_name_for_error(qualified_name)
-        ),
+        None => {
+            return Err(crate::util::missing_write_target_error(
+                resolver,
+                namespace,
+                qualified_name,
+            ))
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);

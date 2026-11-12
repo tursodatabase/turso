@@ -31,7 +31,7 @@ A view is a virtual table defined by a SELECT statement. It does not store data 
 
 ### Behavior
 
-- Views are read-only. INSERT, UPDATE, and DELETE on a view are not supported unless an INSTEAD OF trigger is defined on the view.
+- Views are read-only. INSERT, UPDATE, and DELETE on a view fail with `cannot modify v because it is a view`, as in SQLite. SQLite makes a view writable with INSTEAD OF triggers, which Turso does not support yet.
 - The SELECT statement is stored in the `sqlite_schema` table and parsed each time the view is referenced.
 - If a table referenced by the view is dropped or altered in an incompatible way, queries against the view produce an error.
 
@@ -77,4 +77,3 @@ WHERE assignee = 'alice';
 - [CREATE MATERIALIZED VIEW](/docs/sql-reference/statements/create-materialized-view) for views that store precomputed results on disk
 - [DROP VIEW](/docs/sql-reference/statements/drop-view) for removing views
 - [SELECT](/docs/sql-reference/statements/select) for the query syntax used in view definitions
-- [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) for INSTEAD OF triggers that make views writable

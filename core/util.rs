@@ -218,6 +218,23 @@ pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
     }
 }
 
+/// The error for an INSERT, UPDATE or DELETE whose target `name` is not a
+/// table. Like SQLite, a view is refused as a view, not reported as missing.
+pub(crate) fn missing_write_target_error(
+    resolver: &Resolver,
+    namespace: crate::namespace::NamespaceRef,
+    name: &turso_parser::ast::QualifiedName,
+) -> LimboError {
+    match resolver.with_schema(namespace.database_id, |s| {
+        s.get_view(namespace.id, name.name.as_str())
+    }) {
+        Some(view) => {
+            LimboError::ParseError(format!("cannot modify {} because it is a view", view.name))
+        }
+        None => LimboError::ParseError(format!("no such table: {}", table_name_for_error(name))),
+    }
+}
+
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {

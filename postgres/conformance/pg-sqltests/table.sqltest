@@ -884,3 +884,48 @@ test table-insert-values-different-row-length-with-default {
 }
 @sqlstate 42601
 expect error {}
+
+# Turso does not support writes to views, so it refuses them with 0A000.
+# PostgreSQL updates simple views itself, but not a view with DISTINCT,
+# which it refuses with 55000.
+test insert-on-a-view-fails {
+    CREATE TABLE vw_base (id INT);
+    CREATE VIEW vw_distinct AS SELECT DISTINCT id FROM vw_base;
+    INSERT INTO vw_distinct VALUES (1);
+}
+@sqlstate 55000
+expect error {
+    cannot insert into view "vw_distinct"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot modify vw_distinct because it is a view
+}
+
+test update-on-a-view-fails {
+    CREATE TABLE vw_base (id INT);
+    CREATE VIEW vw_distinct AS SELECT DISTINCT id FROM vw_base;
+    UPDATE vw_distinct SET id = 2;
+}
+@sqlstate 55000
+expect error {
+    cannot update view "vw_distinct"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot modify vw_distinct because it is a view
+}
+
+test delete-on-a-view-fails {
+    CREATE TABLE vw_base (id INT);
+    CREATE VIEW vw_distinct AS SELECT DISTINCT id FROM vw_base;
+    DELETE FROM vw_distinct;
+}
+@sqlstate 55000
+expect error {
+    cannot delete from view "vw_distinct"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot modify vw_distinct because it is a view
+}
