@@ -979,16 +979,16 @@ impl SnapshotRows for PgRolesTable {
     const SCHEMA: &'static str = "CREATE TABLE pg_roles (
             oid INTEGER,
             rolname TEXT,
-            rolsuper INTEGER,
-            rolinherit INTEGER,
-            rolcreaterole INTEGER,
-            rolcreatedb INTEGER,
-            rolcanlogin INTEGER,
-            rolreplication INTEGER,
+            rolsuper BOOLEAN,
+            rolinherit BOOLEAN,
+            rolcreaterole BOOLEAN,
+            rolcreatedb BOOLEAN,
+            rolcanlogin BOOLEAN,
+            rolreplication BOOLEAN,
             rolconnlimit INTEGER,
             rolpassword TEXT,
             rolvaliduntil TEXT,
-            rolbypassrls INTEGER,
+            rolbypassrls BOOLEAN,
             rolconfig TEXT
         )";
     const TABLE_OID: Option<i64> = None;
@@ -1358,10 +1358,10 @@ impl SnapshotRows for PgTablesTable {
             tablename TEXT,
             tableowner TEXT,
             tablespace TEXT,
-            hasindexes INTEGER,
-            hasrules INTEGER,
-            hastriggers INTEGER,
-            rowsecurity INTEGER
+            hasindexes BOOLEAN,
+            hasrules BOOLEAN,
+            hastriggers BOOLEAN,
+            rowsecurity BOOLEAN
         )";
     const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 1000.0;
@@ -2409,7 +2409,7 @@ impl SnapshotRows for PgSequencesTable {
             min_value INTEGER,
             max_value INTEGER,
             increment_by INTEGER,
-            cycle INTEGER,
+            cycle BOOLEAN,
             cache_size INTEGER,
             last_value INTEGER
         )";
@@ -2599,7 +2599,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal BOOLEAN, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable BOOLEAN, tginitdeferred BOOLEAN, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_statistic_ext",
@@ -2609,12 +2609,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_inherits",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending BOOLEAN)".to_string() },
     );
     options = options.native_module(
         "pg_rewrite",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead BOOLEAN, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_foreign_table",
@@ -2636,7 +2636,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         EmptyPgCatalogTable {
             create_sql: "CREATE TABLE pg_collation (
                 oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
-                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
+                collprovider TEXT, collisdeterministic BOOLEAN, collencoding INTEGER,
                 collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
                 collversion TEXT, tableoid INTEGER HIDDEN
             )"
@@ -2662,7 +2662,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables BOOLEAN, pubinsert BOOLEAN, pubupdate BOOLEAN, pubdelete BOOLEAN, pubtruncate BOOLEAN, pubviaroot BOOLEAN, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_namespace",
