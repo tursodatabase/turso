@@ -8557,6 +8557,11 @@ pub fn frontend_stmt(
     sql: &str,
     parse_result: &ParseResult,
 ) -> Result<Option<FrontendStmt>, ParseError> {
+    if let Some(NodeRef::CreateFunctionStmt(stmt)) =
+        parse_result.protobuf.nodes().first().map(|(node, ..)| node)
+    {
+        return Err(crate::create_function::reject_create_function(sql, stmt));
+    }
     if let Some(stmt) = try_extract_set(parse_result) {
         return Ok(Some(FrontendStmt::Set(stmt)));
     }

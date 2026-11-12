@@ -1,5 +1,6 @@
 pub mod cmdtag;
 pub mod copy;
+mod create_function;
 pub mod functions;
 mod names;
 use pg_query::NodeEnum;
@@ -24,6 +25,18 @@ pub enum ParseError {
     /// missing schema. Only a caller with a connection can find that out.
     #[error("a schema-qualified {kind} name is not supported")]
     SchemaQualifiedName { kind: String, schema: String },
+    /// A type of a function's parameter or result that is not built in. It
+    /// is a relation or a custom type, which tursopg does not support in a
+    /// function, or it does not exist. Only a caller with a connection can
+    /// find that out.
+    #[error("{} is not supported", .used_as.unsupported_feature(.full_name))]
+    UnresolvedFunctionType {
+        schema: Option<String>,
+        name: String,
+        /// The type as PostgreSQL writes it in errors, such as `public.t[]`.
+        full_name: String,
+        used_as: FunctionTypeUse,
+    },
 }
 
 impl ParseError {
@@ -32,6 +45,33 @@ impl ParseError {
         Self::Sqlstate {
             sqlstate: sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
             message: format!("{what} is not supported"),
+        }
+    }
+}
+
+/// Where a type appears in the signature of a function.
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionTypeUse {
+    Parameter,
+    Result,
+    SetofResult,
+}
+
+impl FunctionTypeUse {
+    /// PostgreSQL's error when the type does not exist. PostgreSQL quotes
+    /// the name only in the error for a result.
+    pub fn missing_message(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("type {full_name} does not exist"),
+            Self::Result | Self::SetofResult => format!("type \"{full_name}\" does not exist"),
+        }
+    }
+
+    fn unsupported_feature(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("a function parameter of type {full_name}"),
+            Self::Result => format!("a function result of type {full_name}"),
+            Self::SetofResult => format!("a function result of type SETOF {full_name}"),
         }
     }
 }
