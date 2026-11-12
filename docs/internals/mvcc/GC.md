@@ -92,6 +92,11 @@ to the `RowStore` that its iterators read. If such a cursor exists,
 entries one at a time. The transaction of that cursor is complete, so the
 cursor reads no row again. The reset of the statement frees the `RowStore`.
 
+A statement that commits its transaction closes its MVCC cursors before the
+commit. A checkpoint that this commit starts thus finds no cursor of that
+statement. A statement in an explicit transaction keeps its cursors, as
+before.
+
 The write set of a transaction has an `Arc` to each version chain that the
 transaction wrote. The skip map frees a removed transaction only during later
 operations, so `remove_tx` drops the write set. If it did not, the chains of
