@@ -1274,6 +1274,12 @@ impl PostgreSQLTranslator {
 
         let rename_type = ObjectType::try_from(rename.rename_type)
             .map_err(|_| ParseError::ParseError("RENAME: invalid type".into()))?;
+        if !matches!(
+            rename_type,
+            ObjectType::ObjectTable | ObjectType::ObjectColumn
+        ) {
+            return Err(not_supported(renamed_object_name(rename_type)));
+        }
 
         let relation = rename
             .relation
@@ -1311,9 +1317,7 @@ impl PostgreSQLTranslator {
                     body: ast::AlterTableBody::RenameColumn { old, new },
                 }))
             }
-            _ => Err(ParseError::ParseError(format!(
-                "Unsupported RENAME type: {rename_type:?}"
-            ))),
+            _ => unreachable!("only tables and columns reach here"),
         }
     }
 
@@ -8906,6 +8910,16 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
         .strip_prefix("Object")
         .unwrap_or(&debug)
         .to_ascii_uppercase()
+}
+
+/// How a rename of `object_type` is written, such as `ALTER ROLE ... RENAME`.
+fn renamed_object_name(object_type: pg_query::protobuf::ObjectType) -> String {
+    use pg_query::protobuf::ObjectType;
+    match object_type {
+        ObjectType::ObjectTabconstraint => "ALTER TABLE ... RENAME CONSTRAINT".to_string(),
+        ObjectType::ObjectMatview => "ALTER MATERIALIZED VIEW ... RENAME".to_string(),
+        other => format!("ALTER {} ... RENAME", drop_object_type_name(other)),
+    }
 }
 
 fn not_supported(what: impl std::fmt::Display) -> ParseError {
