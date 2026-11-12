@@ -5,6 +5,7 @@ mod classes;
 mod copy;
 mod error;
 mod functions;
+mod numeric;
 mod open;
 mod options;
 mod pg_type;

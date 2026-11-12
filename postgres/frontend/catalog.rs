@@ -1,4 +1,5 @@
 use crate::functions::validate_pg_input;
+use crate::numeric::str_to_i64_checked;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -352,6 +353,13 @@ impl Dialect for PostgresDialect {
 
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
+    }
+
+    fn cast_to_integer(&self, value: &Value) -> Result<Value> {
+        let Value::Text(raw_str) = value else {
+            return Ok(value.exec_cast("INTEGER")?);
+        };
+        Ok(Value::from_i64(str_to_i64_checked(raw_str)?))
     }
 }
 

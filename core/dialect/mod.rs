@@ -603,6 +603,10 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    fn cast_to_integer(&self, value: &Value) -> Result<Value> {
+        Ok(value.exec_cast("INTEGER")?)
+    }
 }
 
 #[cfg(test)]
