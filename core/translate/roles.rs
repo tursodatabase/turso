@@ -566,7 +566,7 @@ pub fn translate_grant(
         if namespace.database_id != MAIN_DB_ID {
             continue;
         }
-        changes.push(crate::RelationChange::Grant {
+        changes.push(crate::CatalogChange::Grant {
             namespace: namespace.id,
             name: normalized_name,
             privileges: grant.privileges.clone(),
@@ -575,7 +575,7 @@ pub fn translate_grant(
     }
     let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_relation_changes(
+    resolver.catalog.dialect.translate_catalog_changes(
         program,
         resolver.schema(),
         connection,

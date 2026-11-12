@@ -8,7 +8,7 @@
 //!
 //! Which tables have row-level security, and their policies, are the
 //! dialect's schema state, like the owner of a table. The module compiles the
-//! statements that change them into a [`RelationChange`] for the dialect to
+//! statements that change them into a [`CatalogChange`] for the dialect to
 //! record.
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::RelationChange,
+    dialect::CatalogChange,
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
@@ -580,7 +580,7 @@ pub(crate) fn translate_set_row_security(
 ) -> Result<()> {
     let (namespace, table) = row_security_table(qualified_name, resolver)?;
     translate_change(
-        RelationChange::SetRowSecurity {
+        CatalogChange::SetRowSecurity {
             namespace: namespace.id,
             name: normalize_ident(&table.declared_name),
             enabled,
@@ -630,7 +630,7 @@ pub(crate) fn translate_create_policy(
         prepare_policy_expr(expr, namespace, &table, resolver)?;
     }
     translate_change(
-        RelationChange::CreatePolicy {
+        CatalogChange::CreatePolicy {
             namespace: namespace.id,
             name: normalize_ident(&table.declared_name),
             policy: Box::new(stored),
@@ -665,7 +665,7 @@ pub(crate) fn translate_drop_policy(
     }
     let (namespace, table) = row_security_table(tbl_name, resolver)?;
     translate_change(
-        RelationChange::DropPolicy {
+        CatalogChange::DropPolicy {
             namespace: namespace.id,
             name: normalize_ident(&table.declared_name),
             policy_name: policy_name.as_str().to_string(),
@@ -751,7 +751,7 @@ fn row_security_table(
 /// Records `change` through the dialect, in a write transaction that bumps
 /// the schema cookie so that other connections load it.
 fn translate_change(
-    change: RelationChange,
+    change: CatalogChange,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -761,7 +761,7 @@ fn translate_change(
     resolver
         .catalog
         .dialect
-        .translate_relation_changes(program, schema, connection, &[change])?;
+        .translate_catalog_changes(program, schema, connection, &[change])?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }

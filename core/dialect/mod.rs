@@ -36,11 +36,11 @@ pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
 /// A change a statement makes to a relation of the main database. DDL
 /// translation tells the dialect about it through
-/// [`Dialect::translate_relation_changes`], and the dialect's own bytecode
-/// tells it back through [`Dialect::apply_relation_change`] once the change
+/// [`Dialect::translate_catalog_changes`], and the dialect's own bytecode
+/// tells it back through [`Dialect::apply_catalog_change`] once the change
 /// is written.
 #[derive(Debug, Clone)]
-pub enum RelationChange {
+pub enum CatalogChange {
     Create {
         namespace: NamespaceId,
         name: String,
@@ -94,7 +94,7 @@ pub enum RelationChange {
     },
 }
 
-/// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
+/// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
 #[derive(Debug, Clone)]
 pub enum NewOwner {
     /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
@@ -368,17 +368,17 @@ pub trait Dialect: Send + Sync + 'static {
     /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
     /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY` and
     /// `DROP POLICY`.
-    fn translate_relation_changes(
+    fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[RelationChange],
+        changes: &[CatalogChange],
     ) -> Result<()> {
         let _ = (program, schema, connection);
         for change in changes {
             match change {
-                RelationChange::ChangeOwner {
+                CatalogChange::ChangeOwner {
                     owner: NewOwner::Role(_),
                     ..
                 } => {
@@ -386,7 +386,7 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER ... OWNER TO is not supported".to_string(),
                     ));
                 }
-                RelationChange::ChangeOwner {
+                CatalogChange::ChangeOwner {
                     owner: NewOwner::Table(_),
                     ..
                 } => {
@@ -394,12 +394,12 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
                 }
-                RelationChange::Grant { .. } => {
+                CatalogChange::Grant { .. } => {
                     return Err(LimboError::ParseError("GRANT is not supported".to_string()));
                 }
-                RelationChange::SetRowSecurity { .. }
-                | RelationChange::CreatePolicy { .. }
-                | RelationChange::DropPolicy { .. } => {
+                CatalogChange::SetRowSecurity { .. }
+                | CatalogChange::CreatePolicy { .. }
+                | CatalogChange::DropPolicy { .. } => {
                     return Err(LimboError::ParseError(
                         "row-level security is not supported".to_string(),
                     ));
@@ -414,10 +414,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// schema state, to the in-memory copy in `schema`. `values` are the
     /// registers the dialect named when it emitted the instruction, such as
     /// the id its state gave a created relation.
-    fn apply_relation_change(
+    fn apply_catalog_change(
         &self,
         schema: &mut Schema,
-        change: &RelationChange,
+        change: &CatalogChange,
         values: &[Value],
     ) -> Result<()> {
         let _ = (schema, change, values);

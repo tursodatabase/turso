@@ -2112,18 +2112,18 @@ pub fn insn_to_row(
                 0,
                 format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
             ),
-            Insn::RelationChange {
+            Insn::CatalogChange {
                 db,
                 change,
                 value_regs,
             } => (
-                "RelationChange",
+                "CatalogChange",
                 *db as i64,
                 value_regs.first().map_or(0, |reg| *reg as i64),
                 0,
                 Value::build_text(format!("{change:?}")),
                 0,
-                "tell the dialect a relation changed".to_string(),
+                "tell the dialect its catalog changed".to_string(),
             ),
             Insn::DropView {
                 db,

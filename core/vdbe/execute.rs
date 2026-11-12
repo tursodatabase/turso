@@ -13999,14 +13999,14 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_relation_change(
+pub fn op_catalog_change(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
-        RelationChange {
+        CatalogChange {
             db,
             change,
             value_regs
@@ -14021,7 +14021,7 @@ pub fn op_relation_change(
     program
         .connection
         .with_database_schema_mut(*db, |schema| {
-            dialect.apply_relation_change(schema, change, &values)
+            dialect.apply_catalog_change(schema, change, &values)
         })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

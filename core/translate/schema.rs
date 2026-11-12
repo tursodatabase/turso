@@ -1,4 +1,4 @@
-use crate::dialect::RelationChange;
+use crate::dialect::CatalogChange;
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -1509,21 +1509,21 @@ pub fn translate_create_table(
     }
 
     if dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![RelationChange::Create {
+        let mut changes = vec![CatalogChange::Create {
             namespace: namespace.id,
             name: normalized_tbl_name.clone(),
             kind: RelationKind::Table,
             table: None,
         }];
         for index_name in autoindex_names {
-            changes.push(RelationChange::Create {
+            changes.push(CatalogChange::Create {
                 namespace: namespace.id,
                 name: index_name,
                 kind: RelationKind::Index,
                 table: Some(normalized_tbl_name.clone()),
             });
         }
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             connection,
@@ -2481,15 +2481,15 @@ pub fn translate_drop_table(
     // Dropping a table also drops its indexes, the automatic ones among
     // them, so the dialect hears about all of them.
     if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![RelationChange::Drop {
+        let mut changes = vec![CatalogChange::Drop {
             namespace: namespace.id,
             name: normalize_ident(name),
         }];
-        changes.extend(indices.iter().map(|index| RelationChange::Drop {
+        changes.extend(indices.iter().map(|index| CatalogChange::Drop {
             namespace: namespace.id,
             name: index.name.clone(),
         }));
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             connection,

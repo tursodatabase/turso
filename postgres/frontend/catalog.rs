@@ -246,23 +246,23 @@ impl Dialect for PostgresDialect {
         crate::classes::build_schema_state(schema, rows)
     }
 
-    fn translate_relation_changes(
+    fn translate_catalog_changes(
         &self,
         program: &mut turso_core::ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[turso_core::RelationChange],
+        changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        crate::classes::translate_relation_changes(program, schema, connection, changes)
+        crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
 
-    fn apply_relation_change(
+    fn apply_catalog_change(
         &self,
         schema: &mut Schema,
-        change: &turso_core::RelationChange,
+        change: &turso_core::CatalogChange,
         values: &[Value],
     ) -> turso_core::Result<()> {
-        crate::classes::apply_relation_change(schema, change, values)
+        crate::classes::apply_catalog_change(schema, change, values)
     }
 
     fn relation_owner(
