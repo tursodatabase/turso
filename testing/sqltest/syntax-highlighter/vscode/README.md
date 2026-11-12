@@ -45,6 +45,7 @@ setup schema {
 @skip "known bug"
 @skip-if mvcc "not supported in MVCC"
 @skip-if sqlite "sqlite has different behavior"
+@skip-if tursopg "tursopg does not support this yet"
 @backend rust
 @requires trigger "needs trigger support"
 test my-test {

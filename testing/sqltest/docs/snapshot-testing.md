@@ -304,7 +304,7 @@ Snapshots support all test decorators:
 |-----------|-------------|
 | `@setup <name>` | Apply a setup block before the snapshot |
 | `@skip "reason"` | Skip this snapshot unconditionally |
-| `@skip-if <cond> "reason"` | Skip conditionally (e.g., `mvcc`, `sqlite`) |
+| `@skip-if <cond> "reason"` | Skip conditionally (e.g., `mvcc`, `sqlite`, `postgres`, `tursopg`) |
 | `@backend <name>` | Only run on specified backend (snapshots only run on `rust`) |
 | `@requires <cap> "reason"` | Only run if backend supports capability |
 
