@@ -303,6 +303,25 @@ expect error {
     schema "nosuch" does not exist
 }
 
+# PostgreSQL names the function as the statement does, with its schema.
+test drop-function-that-the-schema-does-not-have {
+    CREATE SCHEMA app;
+    DROP FUNCTION app.one();
+}
+@sqlstate 42883
+expect error {
+    function app\.one\(\) does not exist
+}
+
+test drop-function-without-parameter-types-that-the-schema-does-not-have {
+    CREATE SCHEMA app;
+    DROP FUNCTION app.one;
+}
+@sqlstate 42883
+expect error {
+    could not find a function named "app\.one"
+}
+
 test drop-function-uses-the-search-path {
     CREATE SCHEMA app;
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;

@@ -413,14 +413,19 @@ pub(crate) fn translate_drop_function(
     drop: &ast::DropFunction,
 ) -> turso_core::Result<()> {
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
-    let name = drop.name.name.as_str();
     let Some(function) = find_function_to_drop(connection, functions, drop)? else {
         if drop.if_exists {
             return Ok(());
         }
+        // PostgreSQL names the function as the statement does, with its
+        // schema when the statement has one.
+        let name = match &drop.name.namespace {
+            Some(schema_name) => format!("{}.{}", schema_name.as_str(), drop.name.name.as_str()),
+            None => drop.name.name.as_str().to_string(),
+        };
         let function = match &drop.parameter_types {
-            Some(parameter_types) => display_signature(name, parameter_types),
-            None => name.to_string(),
+            Some(parameter_types) => display_signature(&name, parameter_types),
+            None => name,
         };
         return Err(sqlstate_error(
             SQLSTATE_UNDEFINED_FUNCTION,
