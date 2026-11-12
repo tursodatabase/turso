@@ -10,9 +10,11 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
 };
+use crate::typing::{ColumnLookup, Scopes};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
+use std::cell::RefCell;
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
@@ -56,6 +58,15 @@ pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    scopes: RefCell<Scopes>,
+}
+
+struct ScopeGuard<'a>(&'a RefCell<Scopes>);
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().leave();
+    }
 }
 
 impl PostgreSQLTranslator {
@@ -71,6 +82,19 @@ impl PostgreSQLTranslator {
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
         self
+    }
+
+    /// A translator that finds the columns of the tables a statement reads with `lookup`.
+    pub fn with_column_types(self, lookup: ColumnLookup) -> Self {
+        Self {
+            scopes: RefCell::new(Scopes::new(Some(lookup))),
+            ..self
+        }
+    }
+
+    fn enter_scope(&self, enter: impl FnOnce(&mut Scopes)) -> ScopeGuard<'_> {
+        enter(&mut self.scopes.borrow_mut());
+        ScopeGuard(&self.scopes)
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
@@ -313,6 +337,7 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<(ast::Stmt, Vec<SerialSequence>), ParseError> {
+        let _scope = self.enter_scope(|scopes| scopes.enter_create_table(create));
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -1330,6 +1355,7 @@ impl PostgreSQLTranslator {
             )
         };
 
+        let _scope = self.enter_scope(|scopes| scopes.enter_create_index(idx));
         self.translating_index.set(true);
         let index_parts = self.translate_index_parts(idx);
         self.translating_index.set(false);
@@ -1734,6 +1760,7 @@ impl PostgreSQLTranslator {
         &self,
         insert: &pg_query::protobuf::InsertStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        let _scope = self.enter_scope(|scopes| scopes.enter_insert(insert));
         use pg_query::protobuf::node::Node;
 
         // Extract table name
@@ -1933,6 +1960,7 @@ impl PostgreSQLTranslator {
         &self,
         update: &pg_query::protobuf::UpdateStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        let _scope = self.enter_scope(|scopes| scopes.enter_update(update));
         use pg_query::protobuf::node::Node;
 
         // Extract table name
@@ -2015,6 +2043,7 @@ impl PostgreSQLTranslator {
         &self,
         delete: &pg_query::protobuf::DeleteStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        let _scope = self.enter_scope(|scopes| scopes.enter_delete(delete));
         // Extract table name
         let relation = delete
             .relation
@@ -2050,6 +2079,7 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
+        let _scope = self.enter_scope(|scopes| scopes.enter_select(select));
         // Top-level SELECT INTO is intercepted (and its IntoClause stripped)
         // before translation, so an INTO seen here is in a nested position,
         // which PG rejects during parse analysis.
@@ -2301,6 +2331,7 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::OneSelect, ParseError> {
+        let _scope = self.enter_scope(|scopes| scopes.enter_select(select));
         // Compound-select leaves carry their own IntoClause. PG allows INTO
         // only on the first leaf of a top-level compound; reject all of them
         // rather than implement that form.
