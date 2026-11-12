@@ -118,6 +118,47 @@ expect {
     2|b
 }
 
+test grant-usage-on-all-sequences-in-schema-lets-a-role-call-nextval {
+    CREATE ROLE sq_all_user;
+    CREATE SEQUENCE sq_all_a;
+    CREATE SEQUENCE sq_all_b;
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO sq_all_user;
+    SET ROLE sq_all_user;
+    SELECT nextval('sq_all_a'), nextval('sq_all_b');
+}
+expect {
+    1|1
+}
+
+test insert-into-a-column-with-a-nextval-default-needs-usage-on-the-sequence {
+    CREATE ROLE sq_default_inserter;
+    CREATE SEQUENCE sq_default_s;
+    CREATE TABLE sq_default_t (id INT DEFAULT nextval('sq_default_s'), n INT);
+    GRANT INSERT ON sq_default_t TO sq_default_inserter;
+    SET ROLE sq_default_inserter;
+    INSERT INTO sq_default_t (n) VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence sq_default_s
+}
+
+test insert-into-a-column-with-a-nextval-default-with-usage-on-the-sequence {
+    CREATE ROLE sq_default_user;
+    CREATE SEQUENCE sq_default_used;
+    CREATE TABLE sq_default_used_t (id INT DEFAULT nextval('sq_default_used'), n INT);
+    GRANT INSERT ON sq_default_used_t TO sq_default_user;
+    GRANT USAGE ON sq_default_used TO sq_default_user;
+    SET ROLE sq_default_user;
+    INSERT INTO sq_default_used_t (n) VALUES (1), (2);
+    RESET ROLE;
+    SELECT id, n FROM sq_default_used_t ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+}
+
 test role-without-privileges-cannot-call-currval {
     CREATE ROLE gq_no_currval;
     CREATE SEQUENCE gq_no_currval_seq;

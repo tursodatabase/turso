@@ -17,6 +17,17 @@ expect {
     readable
 }
 
+test role-reads-the-privileges-of-a-table-in-relacl {
+    CREATE ROLE ca_relacl_reader;
+    CREATE TABLE ca_relacl (id INT);
+    GRANT SELECT ON ca_relacl TO ca_relacl_reader;
+    SET ROLE ca_relacl_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'ca_relacl';
+}
+expect {
+    {postgres=arwdDxtm/postgres,ca_relacl_reader=r/postgres}
+}
+
 # The engine keeps its catalogs, such as the roles and the privileges of
 # each table, in __turso_internal_* tables, which only a superuser uses.
 @skip-if postgres "PostgreSQL has no __turso_internal_* tables"

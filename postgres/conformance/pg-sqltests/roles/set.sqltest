@@ -43,6 +43,27 @@ expect {
     session user
 }
 
+test set-role-while-another-role-is-set-changes-to-it {
+    CREATE ROLE st_first;
+    CREATE ROLE st_second;
+    SET ROLE st_first;
+    SET ROLE st_second;
+    SELECT current_user;
+}
+expect {
+    st_second
+}
+
+test set-role-to-default-returns-to-session-user {
+    CREATE ROLE st_default;
+    SET ROLE st_default;
+    SET ROLE TO DEFAULT;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
 test set-role-with-quoted-uppercase-setting-name-changes-current-user {
     CREATE ROLE sr_quoted_name;
     SET "ROLE" TO sr_quoted_name;

@@ -226,6 +226,16 @@ expect {
     2
 }
 
+@skip-if postgres "PostgreSQL supports security_invoker views"
+test view-that-reads-as-its-reader-is-not-supported {
+    CREATE TABLE by_invoker_base (id INT);
+    CREATE VIEW by_invoker_view WITH (security_invoker = true) AS SELECT id FROM by_invoker_base;
+}
+@sqlstate 0A000
+expect error {
+    CREATE VIEW ... WITH \(options\) is not supported
+}
+
 test owner-writes-every-row-of-its-table-with-row-security {
     CREATE ROLE rw_owner_20;
     CREATE TABLE rw_docs_20 (id INT PRIMARY KEY, owner TEXT);

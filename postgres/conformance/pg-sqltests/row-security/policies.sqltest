@@ -184,6 +184,90 @@ expect {
     1
 }
 
+test policy-to-public-applies-to-every-role {
+    CREATE ROLE po_public_alice;
+    CREATE ROLE po_public_bob;
+    CREATE TABLE po_public_docs (id INT PRIMARY KEY);
+    INSERT INTO po_public_docs VALUES (1), (2);
+    ALTER TABLE po_public_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_public_docs TO PUBLIC USING (true);
+    GRANT SELECT ON po_public_docs TO po_public_alice, po_public_bob;
+    SET ROLE po_public_alice;
+    SELECT count(*) FROM po_public_docs;
+    SET ROLE po_public_bob;
+    SELECT count(*) FROM po_public_docs;
+}
+expect {
+    2
+    2
+}
+
+test policy-to-several-roles-applies-to-each-of-them {
+    CREATE ROLE po_several_alice;
+    CREATE ROLE po_several_bob;
+    CREATE ROLE po_several_carol;
+    CREATE TABLE po_several_docs (id INT PRIMARY KEY);
+    INSERT INTO po_several_docs VALUES (1), (2);
+    ALTER TABLE po_several_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_several_docs TO po_several_alice, po_several_bob USING (true);
+    GRANT SELECT ON po_several_docs TO po_several_alice, po_several_bob, po_several_carol;
+    SET ROLE po_several_alice;
+    SELECT count(*) FROM po_several_docs;
+    SET ROLE po_several_bob;
+    SELECT count(*) FROM po_several_docs;
+    SET ROLE po_several_carol;
+    SELECT count(*) FROM po_several_docs;
+}
+expect {
+    2
+    2
+    0
+}
+
+# The superuser creates the policies below, so SESSION_USER and CURRENT_ROLE
+# name the superuser, and the policy does not apply to other roles.
+test policy-to-session-user-applies-to-the-session-role-only {
+    CREATE ROLE po_session_alice;
+    CREATE TABLE po_session_docs (id INT PRIMARY KEY);
+    INSERT INTO po_session_docs VALUES (1), (2);
+    ALTER TABLE po_session_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_session_docs TO SESSION_USER USING (true);
+    GRANT SELECT ON po_session_docs TO po_session_alice;
+    SET ROLE po_session_alice;
+    SELECT count(*) FROM po_session_docs;
+}
+expect {
+    0
+}
+
+test policy-to-current-role-applies-to-the-current-role-only {
+    CREATE ROLE po_current_alice;
+    CREATE TABLE po_current_docs (id INT PRIMARY KEY);
+    INSERT INTO po_current_docs VALUES (1), (2);
+    ALTER TABLE po_current_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_current_docs TO CURRENT_ROLE USING (true);
+    GRANT SELECT ON po_current_docs TO po_current_alice;
+    SET ROLE po_current_alice;
+    SELECT count(*) FROM po_current_docs;
+}
+expect {
+    0
+}
+
+test policy-uses-a-stored-generated-column {
+    CREATE ROLE po_generated_alice;
+    CREATE TABLE po_generated_docs (id INT PRIMARY KEY, owner TEXT, lower_owner TEXT GENERATED ALWAYS AS (lower(owner)) STORED);
+    INSERT INTO po_generated_docs (id, owner) VALUES (1, 'PO_GENERATED_ALICE'), (2, 'someone else');
+    ALTER TABLE po_generated_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON po_generated_docs USING (lower_owner = current_user);
+    GRANT SELECT ON po_generated_docs TO po_generated_alice;
+    SET ROLE po_generated_alice;
+    SELECT id FROM po_generated_docs;
+}
+expect {
+    1
+}
+
 test role-that-does-not-own-the-table-cannot-create-a-policy {
     CREATE ROLE rp_alice_15;
     CREATE TABLE rp_docs_15 (id INT PRIMARY KEY);
@@ -255,6 +339,17 @@ test drop-policy-if-exists-skips-missing-policy-and-table {
 }
 expect {
     1
+}
+
+@skip-if postgres "PostgreSQL accepts CASCADE"
+test drop-policy-cascade-is-not-supported {
+    CREATE TABLE po_cascade_docs (id INT PRIMARY KEY);
+    CREATE POLICY everything ON po_cascade_docs USING (true);
+    DROP POLICY everything ON po_cascade_docs CASCADE;
+}
+@sqlstate 0A000
+expect error {
+    DROP POLICY ... CASCADE is not supported
 }
 
 test policy-on-a-view-is-rejected {

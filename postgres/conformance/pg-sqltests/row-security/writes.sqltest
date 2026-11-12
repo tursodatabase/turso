@@ -335,6 +335,59 @@ expect {
     1
 }
 
+test delete-returning-returns-only-the-rows-the-policies-allow {
+    CREATE ROLE wr_returning_alice;
+    CREATE TABLE wr_returning_docs (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO wr_returning_docs VALUES (1, 'wr_returning_alice'), (2, 'someone else');
+    ALTER TABLE wr_returning_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON wr_returning_docs USING (owner = current_user);
+    GRANT SELECT, DELETE ON wr_returning_docs TO wr_returning_alice;
+    SET ROLE wr_returning_alice;
+    DELETE FROM wr_returning_docs RETURNING id;
+    RESET ROLE;
+    SELECT id FROM wr_returning_docs;
+}
+expect {
+    1
+    2
+}
+
+# A policy FOR ALL limits the rows a role reads with USING and checks the
+# rows it writes with WITH CHECK.
+test policy-for-all-reads-with-using-and-writes-with-with-check {
+    CREATE ROLE wr_all_alice;
+    CREATE TABLE wr_all_docs (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO wr_all_docs VALUES (1, 'wr_all_alice', 'a'), (2, 'someone else', 'b');
+    ALTER TABLE wr_all_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON wr_all_docs FOR ALL USING (owner = current_user) WITH CHECK (title <> 'forbidden');
+    GRANT SELECT, INSERT ON wr_all_docs TO wr_all_alice;
+    SET ROLE wr_all_alice;
+    SELECT id FROM wr_all_docs;
+    INSERT INTO wr_all_docs VALUES (3, 'someone else', 'c');
+    RESET ROLE;
+    SELECT id FROM wr_all_docs ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+    3
+}
+
+test policy-for-all-refuses-a-row-that-fails-with-check {
+    CREATE ROLE wr_all_checked;
+    CREATE TABLE wr_all_checked_docs (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    ALTER TABLE wr_all_checked_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON wr_all_checked_docs FOR ALL USING (owner = current_user) WITH CHECK (title <> 'forbidden');
+    GRANT SELECT, INSERT ON wr_all_checked_docs TO wr_all_checked;
+    SET ROLE wr_all_checked;
+    INSERT INTO wr_all_checked_docs VALUES (1, 'wr_all_checked', 'forbidden');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "wr_all_checked_docs"
+}
+
 # As in PostgreSQL, TRUNCATE is not subject to row-level security.
 test truncate-empties-the-table-whatever-its-policies {
     CREATE ROLE rw_truncater;

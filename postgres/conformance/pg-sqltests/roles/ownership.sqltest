@@ -107,6 +107,42 @@ expect error {
     must be owner of table ro_guarded2
 }
 
+test non-owner-may-not-drop-the-sequence {
+    CREATE SEQUENCE ow_dropped_sequence;
+    CREATE ROLE ow_sequence_dropper;
+    SET ROLE ow_sequence_dropper;
+    DROP SEQUENCE ow_dropped_sequence;
+}
+@sqlstate 42501
+expect error {
+    must be owner of sequence ow_dropped_sequence
+}
+
+test non-owner-may-not-drop-the-view {
+    CREATE TABLE ow_view_base (id INT);
+    CREATE VIEW ow_dropped_view AS SELECT id FROM ow_view_base;
+    CREATE ROLE ow_view_dropper;
+    SET ROLE ow_view_dropper;
+    DROP VIEW ow_dropped_view;
+}
+@sqlstate 42501
+expect error {
+    must be owner of view ow_dropped_view
+}
+
+test owner-may-truncate-its-table {
+    CREATE ROLE ow_truncater;
+    CREATE TABLE ow_truncated (id INT);
+    INSERT INTO ow_truncated VALUES (1);
+    ALTER TABLE ow_truncated OWNER TO ow_truncater;
+    SET ROLE ow_truncater;
+    TRUNCATE ow_truncated;
+    SELECT count(*) FROM ow_truncated;
+}
+expect {
+    0
+}
+
 test owner-may-not-transfer-ownership-yet {
     CREATE ROLE ro_owner3;
     CREATE ROLE ro_other3;
