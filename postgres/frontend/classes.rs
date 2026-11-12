@@ -702,6 +702,7 @@ pub(crate) fn translate_catalog_changes(
                         "relation \"{name}\" already exists"
                     )));
                 }
+                check_no_function_has_the_name(schema, *namespace, *kind, name)?;
                 // An index is owned by its table's owner, anything else by
                 // the current role, which is what PostgreSQL's GetUserId()
                 // gives after SET ROLE.
@@ -765,9 +766,10 @@ pub(crate) fn translate_catalog_changes(
                 old_name,
                 new_name,
             } => {
-                let has_row = class_catalog(schema)
-                    .is_some_and(|catalog| catalog.get_by_name(*namespace, old_name).is_some());
-                if has_row {
+                let class = class_catalog(schema)
+                    .and_then(|catalog| catalog.get_by_name(*namespace, old_name));
+                if let Some(class) = class {
+                    check_no_function_has_the_name(schema, *namespace, class.relkind, new_name)?;
                     emit_class_row_rename(program, &cursors, *namespace, old_name, new_name);
                 }
             }
@@ -1035,6 +1037,38 @@ fn resolve_policy_role(
         ast::Grantee::Public => Ok(RoleId::PUBLIC),
         ast::Grantee::Role(role) => resolve_role(schema, connection, role),
     }
+}
+
+/// Fails when a table or view gets the name of a function of its schema.
+/// PostgreSQL lets a table and a function have the same name. tursopg does
+/// not yet.
+fn check_no_function_has_the_name(
+    schema: &Schema,
+    namespace: NamespaceId,
+    kind: RelationKind,
+    name: &str,
+) -> turso_core::Result<()> {
+    let has_function = class_catalog(schema)
+        .is_some_and(|catalog| catalog.functions.named(namespace, name).next().is_some());
+    if cannot_have_the_name_of_a_function(kind) && has_function {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a relation with the name of function \"{name}\" of the same schema is not \
+                 supported"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a relation of `kind` and a function of the same schema cannot
+/// have the same name: a table or a view.
+pub(crate) fn cannot_have_the_name_of_a_function(kind: RelationKind) -> bool {
+    matches!(
+        kind,
+        RelationKind::Table | RelationKind::View | RelationKind::MaterializedView
+    )
 }
 
 /// The relation of `class` as a permission error names it.

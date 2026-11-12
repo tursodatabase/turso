@@ -1110,6 +1110,70 @@ expect @tursopg error {
     no such function: forever
 }
 
+# In PostgreSQL a table and a function of one schema can have the same name.
+test function-with-the-name-of-a-table {
+    CREATE TABLE item (a integer);
+    CREATE FUNCTION item() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'item';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of relation "item" of the same schema is not supported
+}
+
+test table-with-the-name-of-a-function {
+    CREATE FUNCTION item() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE TABLE item (a integer);
+    SELECT count(*) FROM item;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a relation with the name of function "item" of the same schema is not supported
+}
+
+test view-with-the-name-of-a-function {
+    CREATE FUNCTION item() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE VIEW item AS SELECT 1 AS a;
+    SELECT a FROM item;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a relation with the name of function "item" of the same schema is not supported
+}
+
+test table-renamed-to-the-name-of-a-function {
+    CREATE FUNCTION item() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE TABLE thing (a integer);
+    ALTER TABLE thing RENAME TO item;
+    SELECT count(*) FROM item;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a relation with the name of function "item" of the same schema is not supported
+}
+
+test table-and-function-with-the-same-name-in-two-schemas {
+    CREATE SCHEMA app;
+    CREATE TABLE item (a integer);
+    CREATE FUNCTION app.item() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'item';
+}
+expect {
+    1
+}
+
 # A relation can have the text of a function's signature as its name.
 test table-with-the-signature-of-a-function-as-its-name {
     CREATE TABLE "one()" (a integer);

@@ -37,8 +37,9 @@ use turso_pg_parser::{display_signature_type_name, is_base_type_name, is_pseudo_
 
 use crate::catalog::pg_base_type_oid;
 use crate::classes::{
-    class_catalog, corrupt_row, emit_class_row_insert_of_kind, emit_function_class_row_removal,
-    open_class_table_for_writing, read_back_integer, FIRST_NORMAL_OBJECT_ID,
+    cannot_have_the_name_of_a_function, class_catalog, corrupt_row, emit_class_row_insert_of_kind,
+    emit_function_class_row_removal, open_class_table_for_writing, read_back_integer,
+    FIRST_NORMAL_OBJECT_ID,
 };
 use crate::error::sqlstate_error;
 use crate::session::{check_schema_exists, relation_lookup_namespaces};
@@ -353,6 +354,20 @@ pub(crate) fn translate_create_function(
     let name = create.name.name.as_str();
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
     check_types_are_supported(create)?;
+    // PostgreSQL lets a table and a function have the same name. tursopg
+    // does not yet.
+    if schema
+        .relation_kind(namespace, name)
+        .is_some_and(cannot_have_the_name_of_a_function)
+    {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a function with the name of relation \"{name}\" of the same schema is not \
+                 supported"
+            ),
+        ));
+    }
 
     let function = SqlFunction {
         oid: 0,
