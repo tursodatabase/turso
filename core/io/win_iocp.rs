@@ -40,7 +40,8 @@
 use super::windows_lock::{
     acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
     shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
-    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
+    stable_lock_path, stable_lock_path_for_handle, ProcessFileLockGuard, ProcessLockMode,
+    SharedWalLockState,
 };
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
@@ -69,26 +70,24 @@ use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use crate::io::{SharedWalLockKind, SharedWalMappedRegion};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION,
-    ERROR_NOT_LOCKED, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
+    ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    OPEN_ALWAYS, OPEN_EXISTING,
+    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, ReadFile,
+    SetFileInformationByHandle, WriteFile, FILE_END_OF_FILE_INFO, FILE_FLAG_NO_BUFFERING,
+    FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
     PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
-    OVERLAPPED_0, OVERLAPPED_0_0,
+    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, OVERLAPPED_0,
+    OVERLAPPED_0_0,
 };
 
 // Constants
@@ -350,12 +349,16 @@ impl IO for WindowsIOCP {
                 return Err(io_error(io::Error::last_os_error(), "open"));
             };
 
+            // Resolve the lock key once; `lock_file` reuses it, so both hit the
+            // same registry entry even if the cwd changes.
+            let lock_key = stable_lock_path(Path::new(file_path));
+
             let process_lock = if ENABLE_LOCK_ON_OPEN
                 && !open_flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
                 && std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             {
-                match acquire_process_file_lock(file_path) {
-                    Ok(guard) => Some(guard),
+                match acquire_process_file_lock(&lock_key, ProcessLockMode::OpenTime) {
+                    Ok(guard) => Some((ProcessLockMode::OpenTime, guard)),
                     Err(err) => {
                         CloseHandle(file_handle);
                         return Err(err);
@@ -369,7 +372,8 @@ impl IO for WindowsIOCP {
                 file_handle,
                 parent_io: self.instance.clone(),
                 path: stable_lock_path_for_handle(file_handle, Path::new(file_path)),
-                _process_lock: process_lock,
+                process_lock: Mutex::new(process_lock),
+                lock_key,
                 shared_wal_locks: Mutex::new(SharedWalLockState::default()),
             });
 
@@ -719,142 +723,14 @@ pub struct WindowsFile {
     file_handle: HANDLE,
     parent_io: Arc<InnerWindowsIOCP>,
     path: PathBuf,
-    _process_lock: Option<ProcessFileLockGuard>,
+    /// Advisory process lock (with its mode), kept outside the data range.
+    process_lock: Mutex<Option<(ProcessLockMode, ProcessFileLockGuard)>>,
+    /// Lock key resolved once in `open_file`, used to re-acquire the process lock.
+    lock_key: PathBuf,
     shared_wal_locks: Mutex<SharedWalLockState>,
 }
 
 impl WindowsFile {
-    fn overlapped_for_position(position: u64) -> OVERLAPPED {
-        unsafe {
-            let mut overlapped: OVERLAPPED = mem::zeroed();
-            overlapped.Anonymous = OVERLAPPED_0 {
-                Anonymous: OVERLAPPED_0_0 {
-                    Offset: position as u32,
-                    OffsetHigh: (position >> 32) as u32,
-                },
-            };
-            overlapped
-        }
-    }
-
-    fn suppressed_iocp_overlapped_for_position(position: u64) -> Result<(OVERLAPPED, HANDLE)> {
-        let event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
-        if event.is_null() {
-            return Err(get_generic_limboerror_from_last_os_err());
-        }
-
-        let mut overlapped = Self::overlapped_for_position(position);
-        overlapped.hEvent = ((event as usize) | 1) as HANDLE;
-        Ok((overlapped, event))
-    }
-
-    fn lock_range(
-        &self,
-        offset: u64,
-        len: u64,
-        exclusive: bool,
-        fail_immediately: bool,
-    ) -> Result<bool> {
-        let (mut overlapped, event) = Self::suppressed_iocp_overlapped_for_position(offset)?;
-        let flags = (if exclusive {
-            LOCKFILE_EXCLUSIVE_LOCK
-        } else {
-            0
-        }) | if fail_immediately {
-            LOCKFILE_FAIL_IMMEDIATELY
-        } else {
-            0
-        };
-        let low = len as u32;
-        let high = (len >> 32) as u32;
-        let result = (|| {
-            unsafe {
-                if LockFileEx(self.file_handle, flags, 0, low, high, &raw mut overlapped) == TRUE {
-                    return Ok(true);
-                }
-            }
-
-            let initial_error = unsafe { GetLastError() };
-            if initial_error == ERROR_LOCK_VIOLATION {
-                return Ok(false);
-            }
-            if initial_error != ERROR_IO_PENDING {
-                return Err(LimboError::LockingError(
-                    io::Error::from_raw_os_error(initial_error as i32).to_string(),
-                ));
-            }
-
-            let mut bytes = 0;
-            unsafe {
-                if GetOverlappedResult(self.file_handle, &raw mut overlapped, &raw mut bytes, TRUE)
-                    == TRUE
-                {
-                    return Ok(true);
-                }
-            }
-
-            let completion_error = unsafe { GetLastError() };
-            if completion_error == ERROR_LOCK_VIOLATION {
-                return Ok(false);
-            }
-            Err(LimboError::LockingError(
-                io::Error::from_raw_os_error(completion_error as i32).to_string(),
-            ))
-        })();
-
-        unsafe {
-            CloseHandle(event);
-        }
-
-        result
-    }
-
-    fn unlock_range(&self, offset: u64, len: u64) -> Result<()> {
-        let (mut overlapped, event) = Self::suppressed_iocp_overlapped_for_position(offset)?;
-        let low = len as u32;
-        let high = (len >> 32) as u32;
-        let result = (|| {
-            unsafe {
-                if UnlockFileEx(self.file_handle, 0, low, high, &raw mut overlapped) == TRUE {
-                    return Ok(());
-                }
-            }
-
-            let initial_error = unsafe { GetLastError() };
-            if initial_error == ERROR_NOT_LOCKED {
-                return Ok(());
-            }
-            if initial_error != ERROR_IO_PENDING {
-                return Err(LimboError::LockingError(
-                    io::Error::from_raw_os_error(initial_error as i32).to_string(),
-                ));
-            }
-
-            let mut bytes = 0;
-            unsafe {
-                if GetOverlappedResult(self.file_handle, &raw mut overlapped, &raw mut bytes, TRUE)
-                    == TRUE
-                {
-                    return Ok(());
-                }
-            }
-
-            let completion_error = unsafe { GetLastError() };
-            if completion_error == ERROR_NOT_LOCKED {
-                return Ok(());
-            }
-            Err(LimboError::LockingError(
-                io::Error::from_raw_os_error(completion_error as i32).to_string(),
-            ))
-        })();
-
-        unsafe {
-            CloseHandle(event);
-        }
-
-        result
-    }
-
     fn async_iocp_operation(
         &self,
         position: u64,
@@ -903,20 +779,31 @@ impl File for WindowsFile {
             self.file_handle.addr()
         );
 
-        match self.lock_range(0, u64::MAX, exclusive_access, true) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(LimboError::LockingError(
-                "The process cannot access the file because another process has locked a portion of the file."
-                    .into(),
-            )),
-            Err(err) => Err(err),
+        // Convert between modes by releasing the held lock first, like flock.
+        let mut held = self.process_lock.lock();
+        let mode = if exclusive_access {
+            ProcessLockMode::Exclusive
+        } else {
+            ProcessLockMode::Shared
+        };
+        // An open-time lock already is an exclusive lock.
+        if matches!(&*held, Some((held_mode, _))
+            if *held_mode == mode
+                || (exclusive_access && *held_mode == ProcessLockMode::OpenTime))
+        {
+            return Ok(());
         }
+        drop(held.take());
+        let guard = acquire_process_file_lock(&self.lock_key, mode)?;
+        *held = Some((mode, guard));
+        Ok(())
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
         trace!("Unlocking file {:08X}", self.file_handle.addr());
-        self.unlock_range(0, u64::MAX)
+        drop(self.process_lock.lock().take());
+        Ok(())
     }
 
     #[instrument(skip(self, completion), level = Level::TRACE)]

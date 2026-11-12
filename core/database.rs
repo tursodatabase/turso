@@ -1095,7 +1095,9 @@ impl Database {
         if std::env::var(crate::io::common::ENV_DISABLE_FILE_LOCK).is_ok() {
             return Ok(());
         }
-        // Shared, so multiprocess openers do not reject each other.
+        // Shared, so multiprocess openers do not reject each other. The lock is
+        // advisory; on Windows it lives outside the data range so it does not
+        // block I/O.
         match file.lock_file(false) {
             Ok(()) => Ok(()),
             Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
