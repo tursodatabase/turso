@@ -1809,6 +1809,62 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test create-type-parameter-in-encode-rejected {
+    CREATE TYPE bad_type(value text) BASE text
+        ENCODE value || ?
+        DECODE value;
+}
+expect error {
+    parameters prohibited in ENCODE expressions
+}
+
+@requires strict "uses STRICT tables"
+test create-type-parameter-in-coerce-rejected {
+    CREATE TYPE bad_type(value text) BASE text
+        ENCODE value
+        COERCE value || ?1
+        DECODE value;
+}
+expect error {
+    parameters prohibited in COERCE expressions
+}
+
+@requires strict "uses STRICT tables"
+test create-type-parameter-in-decode-rejected {
+    CREATE TYPE bad_type(value text) BASE text
+        ENCODE value
+        DECODE value || :x;
+}
+expect error {
+    parameters prohibited in DECODE expressions
+}
+
+@requires strict "uses STRICT tables"
+test create-type-parameter-in-default-rejected {
+    CREATE TYPE bad_type BASE text
+        ENCODE value
+        DECODE value
+        DEFAULT ?;
+}
+expect error {
+    parameters prohibited in DEFAULT expressions
+}
+
+@requires strict "uses STRICT tables"
+test create-type-default-may-call-random {
+    CREATE TYPE rand_default BASE integer
+        ENCODE value
+        DECODE value
+        DEFAULT random();
+    CREATE TABLE t(x rand_default, y INTEGER) STRICT;
+    INSERT INTO t(y) VALUES (1);
+    SELECT typeof(x) FROM t;
+}
+expect {
+    integer
+}
+
+@requires strict "uses STRICT tables"
 test numeric-zero-precision-rejected {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(0,0)) STRICT;
     INSERT INTO t1 VALUES (1, 5);
