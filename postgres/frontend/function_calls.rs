@@ -19,7 +19,8 @@ use turso_parser::ast;
 use turso_parser::parser::MAX_EXPR_DEPTH;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::{inlined_function, InlinedFunction};
 
@@ -152,13 +153,14 @@ impl Expansion<'_> {
                  expression,"
             ))
         })?;
-        // CREATE FUNCTION makes this check when it checks the body, which
+        // CREATE FUNCTION makes these checks when it checks the body, which
         // it does not do when check_function_bodies is off.
         check_schemas_of_calls(
             self.connection,
             Some(self.functions),
             &inlined.called_functions,
         )?;
+        check_body_has_no_column(&inlined.result)?;
 
         let (mut expression, use_counts) = with_arguments(inlined, args)?;
         // PostgreSQL does not inline a function that would compute a
@@ -393,6 +395,26 @@ fn cast_argument(mut cast: ast::Expr, argument: &ast::Expr) -> ast::Expr {
         },
     );
     cast
+}
+
+/// Fails with PostgreSQL's errors when the body `expression` names a column.
+/// A body that tursopg can call has no FROM clause, so it has no column.
+/// The name must not get a column of the statement that calls the function.
+fn check_body_has_no_column(expression: &ast::Expr) -> turso_core::Result<()> {
+    walk_expr(expression, &mut |part: &ast::Expr| match part {
+        ast::Expr::Id(column) | ast::Expr::Name(column) => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_COLUMN,
+            format!("column \"{}\" does not exist", column.as_str()),
+        )),
+        ast::Expr::Qualified(table, _) | ast::Expr::DoublyQualified(_, table, _) => {
+            Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("missing FROM-clause entry for table \"{}\"", table.as_str()),
+            ))
+        }
+        _ => Ok(WalkControl::Continue),
+    })?;
+    Ok(())
 }
 
 /// The engine error for an error in the body of a stored function.

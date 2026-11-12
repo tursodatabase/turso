@@ -746,6 +746,54 @@ expect @tursopg error {
     no such function: nosuch
 }
 
+# A body that tursopg can call has no FROM clause, so it has no column. The
+# name must not get a column of the statement that calls the function.
+test call-of-a-function-whose-body-names-a-column {
+    SET check_function_bodies = off;
+    CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT a$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (100);
+    SELECT first_a() FROM t;
+}
+@sqlstate 42703
+expect error {
+    column "a" does not exist
+}
+
+test call-of-a-function-whose-body-names-a-column-in-an-update {
+    SET check_function_bodies = off;
+    CREATE FUNCTION add_a(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + a$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (100);
+    UPDATE t SET a = add_a(1) RETURNING a;
+}
+@sqlstate 42703
+expect error {
+    column "a" does not exist
+}
+
+test call-of-a-function-whose-body-names-a-column-of-a-table {
+    SET check_function_bodies = off;
+    CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT t.a$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (100);
+    SELECT first_a() FROM t;
+}
+@sqlstate 42P01
+expect error {
+    missing FROM-clause entry for table "t"
+}
+
+test call-of-a-function-whose-body-has-a-boolean-constant {
+    SET check_function_bodies = off;
+    CREATE FUNCTION yes() RETURNS boolean LANGUAGE sql AS $$SELECT true$$;
+    CREATE FUNCTION is_yes(boolean) RETURNS boolean LANGUAGE sql AS $$SELECT $1 IS TRUE$$;
+    SELECT CASE WHEN is_yes(yes()) AND NOT false THEN 'yes' ELSE 'no' END;
+}
+expect {
+    yes
+}
+
 # PostgreSQL runs the function until the stack is full.
 test call-of-a-function-whose-body-calls-the-function {
     SET check_function_bodies = off;
