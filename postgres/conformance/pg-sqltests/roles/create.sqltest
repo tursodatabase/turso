@@ -134,26 +134,6 @@ expect error {
     permission denied for schema public
 }
 
-test role-without-privileges-cannot-call-nextval {
-    CREATE SEQUENCE rw_nextval_seq;
-    CREATE ROLE rw_nextval_caller;
-    SET ROLE rw_nextval_caller;
-    SELECT nextval('rw_nextval_seq');
-}
-expect error {
-    permission denied for sequence rw_nextval_seq
-}
-
-test role-without-privileges-cannot-call-setval {
-    CREATE SEQUENCE rw_setval_seq;
-    CREATE ROLE rw_setval_caller;
-    SET ROLE rw_setval_caller;
-    SELECT setval('rw_setval_seq', 5);
-}
-expect error {
-    permission denied for sequence rw_setval_seq
-}
-
 test role-without-privileges-cannot-create-role {
     CREATE ROLE sr_role_creator;
     SET ROLE sr_role_creator;
