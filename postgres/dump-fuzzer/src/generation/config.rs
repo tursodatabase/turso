@@ -31,10 +31,9 @@ pub(super) struct Config {
     pub disabled: Vec<Feature>,
 }
 
-const DISABLED_BY_DEFAULT: [Feature; 4] = [
-    Feature::Rls,
+const DISABLED_BY_DEFAULT: [Feature; 3] = [
+    Feature::ForceRls,
     Feature::Policies,
-    Feature::Grants,
     Feature::DefaultPrivileges,
 ];
 
