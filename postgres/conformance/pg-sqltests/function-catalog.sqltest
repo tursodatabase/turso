@@ -134,6 +134,21 @@ expect @tursopg error {
     a function in schema pg_catalog is not supported
 }
 
+# PostgreSQL creates an object in the first schema of the search path, also
+# when it is pg_catalog. tursopg does not create objects in pg_catalog: for a
+# name without a schema, it uses the next schema of the search path.
+test function-with-pg-catalog-first-in-the-search-path {
+    SET search_path = pg_catalog, public;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'one';
+}
+expect {
+    pg_catalog
+}
+expect @tursopg {
+    public
+}
+
 # tursopg names a function of a schema `schema.name` in a call, so neither
 # name can have a dot.
 test function-name-with-a-dot {

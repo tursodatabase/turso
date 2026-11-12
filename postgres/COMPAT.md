@@ -529,7 +529,10 @@ Notes on `CREATE FUNCTION`:
   whose result PostgreSQL rejects with `return type mismatch`, such as text
   for a function that returns integer.
 - The name of a function or of its schema cannot have a dot, and a function
-  cannot be created in `pg_catalog`.
+  cannot be created in `pg_catalog`. When `pg_catalog` is the first schema
+  of the search path, PostgreSQL creates a function without a schema name
+  there. tursopg creates it in the next schema of the search path, as it
+  does for a table.
 - `DROP SCHEMA` fails for a schema that has functions; `CASCADE` drops
   them.
 - pg_dump fails on a database that has a function: it reads each function
