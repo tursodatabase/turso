@@ -505,8 +505,9 @@ enum TypeClass {
     Array(String),
     /// `table.column%TYPE`.
     ColumnType,
-    /// A relation, a custom type such as a domain or an enum, or no type at
-    /// all. Only a caller with a connection can tell which.
+    /// The row type of a table or view, a custom type such as a domain or an
+    /// enum, or no type at all. Only a caller with a connection can tell
+    /// which.
     NotBuiltIn {
         schema: Option<String>,
         name: String,

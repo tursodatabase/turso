@@ -64,9 +64,7 @@ pub(crate) fn type_name_text(type_name: &TypeName) -> Result<String, ParseError>
 }
 
 // FIXME: the three lists that follow are written by hand, and they must
-// follow the PostgreSQL version of pg_query. They are also one of three
-// places that say what a type name is. The FIXME in
-// postgres/frontend/pg_type.rs gives the plan for one type lookup.
+// follow the PostgreSQL version of pg_query.
 
 /// The types that stand for the types of a function's arguments.
 const POLYMORPHIC_TYPES: &[&str] = &[

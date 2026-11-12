@@ -27,9 +27,9 @@ pub enum ParseError {
     #[error("a schema-qualified {kind} name is not supported")]
     SchemaQualifiedName { kind: String, schema: String },
     /// A type of a function's parameter or result that is not built in. It
-    /// is a relation or a custom type, which tursopg does not support in a
-    /// function, or it does not exist. Only a caller with a connection can
-    /// find that out.
+    /// is the row type of a table or view, or a custom type, which tursopg
+    /// does not support in a function, or it does not exist. Only a caller
+    /// with a connection can find that out.
     #[error("{} is not supported", .used_as.unsupported_feature(.full_name))]
     UnresolvedFunctionType {
         schema: Option<String>,
