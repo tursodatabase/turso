@@ -625,6 +625,7 @@ fn collect_update_set_clauses(
                 Some(idx) => {
                     let col = &table.columns()[*idx];
                     col.ensure_not_generated("UPDATE", col_name.as_str())?;
+                    col.ensure_update_value_allowed(&expr, col_name.as_str())?;
                     if matches!(expr.as_ref(), Expr::Default) {
                         expr = column_default_expr(col, table.is_strict(), resolver);
                     }

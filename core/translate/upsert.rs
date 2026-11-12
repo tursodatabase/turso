@@ -1820,6 +1820,7 @@ pub fn collect_set_clauses_for_upsert(
                 Some(idx) => {
                     let col = &table.columns()[*idx];
                     col.ensure_not_generated("UPDATE", cn.as_str())?;
+                    col.ensure_update_value_allowed(&e, cn.as_str())?;
                     if matches!(e.as_ref(), ast::Expr::Default) {
                         e = column_default_expr(col, table.is_strict(), resolver);
                     }

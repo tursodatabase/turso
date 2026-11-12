@@ -1413,7 +1413,8 @@ fn bind_sequence_names_in_column_constraints(
             | ast::ColumnConstraint::Unique(_)
             | ast::ColumnConstraint::Collate { .. }
             | ast::ColumnConstraint::ForeignKey { .. }
-            | ast::ColumnConstraint::Generated { .. } => {}
+            | ast::ColumnConstraint::Generated { .. }
+            | ast::ColumnConstraint::Identity(_) => {}
         }
     }
     Ok(bound)
@@ -1502,6 +1503,9 @@ pub fn translate_alter_sequence_owned_by(
     let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
         bail_parse_error!("sequence \"{normalized_name}\" does not exist");
     };
+    if is_identity_sequence(resolver, namespace, &normalized_name) {
+        bail_parse_error!("cannot change ownership of identity sequence");
+    }
     let owner_column = match owner {
         Some((table_name, column)) => {
             let normalized_table = normalize_ident(table_name.name.as_str());
@@ -1565,6 +1569,31 @@ pub fn translate_alter_sequence_owned_by(
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
+}
+
+fn is_identity_sequence(resolver: &Resolver, namespace: NamespaceRef, sequence: &str) -> bool {
+    let dialect = &resolver.catalog.dialect;
+    resolver.with_schema(namespace.database_id, |schema| {
+        schema
+            .tables(namespace.id)
+            .filter_map(|table| table.btree())
+            .any(|table| {
+                table.columns().iter().any(|column| {
+                    column.identity.is_some()
+                        && column.name.as_deref().is_some_and(|column_name| {
+                            dialect
+                                .owned_sequences(
+                                    schema,
+                                    namespace.id,
+                                    table.name.as_str(),
+                                    Some(column_name),
+                                )
+                                .iter()
+                                .any(|owned| owned == sequence)
+                        })
+                })
+            })
+    })
 }
 
 /// The namespace and bare name of the sequence `name` names: `schema.name`,

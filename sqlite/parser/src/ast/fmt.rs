@@ -2118,6 +2118,7 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
+            Self::Identity(_) => Ok(()),
         }
     }
 }
