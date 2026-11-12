@@ -1272,6 +1272,39 @@ mod tests {
         conn.close().unwrap();
     }
 
+    #[test]
+    fn vacuum_refuses_a_database_with_a_dialect_row() {
+        use turso_parser::ast::Name;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-vacuum.db", Arc::new(FunctionStoringDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let create = Stmt::CreateFunction(CreateFunction {
+            or_replace: false,
+            name: QualifiedName::single(Name::exact("one".to_string())),
+            parameter_types: vec![],
+            return_type: "int4".to_string(),
+            body: "SELECT 1".to_string(),
+        });
+        conn.prepare_translated_stmt(create, "SELECT 1")
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let copy = directory.path().join("copy.db");
+        let error = conn
+            .execute(format!("VACUUM INTO '{}'", copy.display()))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "VACUUM is not supported for a database with a sqlite_schema row of type test_function"
+        );
+        conn.close().unwrap();
+    }
+
     /// A dialect that resolves no functions at all, proving the dialect —
     /// not the engine — owns the function name surface of user SQL.
     struct NoFunctionsDialect;

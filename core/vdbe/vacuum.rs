@@ -52,8 +52,11 @@ impl SchemaEntryType {
             "index" => Ok(Self::Index),
             "trigger" => Ok(Self::Trigger),
             "view" => Ok(Self::View),
-            other => Err(crate::error::LimboError::Corrupt(format!(
-                "unexpected sqlite_schema type: {other}"
+            // A dialect stores rows of its own types, which VACUUM cannot
+            // make again in the new database.
+            other => Err(crate::error::LimboError::ParseError(format!(
+                "VACUUM is not supported for a database with a sqlite_schema row of type \
+                 {other}"
             ))),
         }
     }
