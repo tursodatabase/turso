@@ -15,8 +15,8 @@
 //! table change each row of `sqlite_schema` with the name of the table.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use turso_core::namespace::{mangle_name, NamespaceId};
 use turso_core::schema::{RelationKind, Schema};
@@ -354,6 +354,20 @@ pub(crate) fn translate_create_function(
     let name = create.name.name.as_str();
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
     check_types_are_supported(create)?;
+    // PostgreSQL looks in pg_catalog first and chooses between functions of
+    // one name by the types of the arguments. tursopg does not know these
+    // types. With a user-defined function of the same name, it could not
+    // tell which function a call names. For a built-in function that only
+    // PostgreSQL has, tursopg would call the function of the user where
+    // PostgreSQL calls the built-in function.
+    if is_built_in_function(connection, name) {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a function with the name of the built-in function \"{name}\" is not supported"
+            ),
+        ));
+    }
     // PostgreSQL lets a table and a function have the same name. tursopg
     // does not yet.
     if schema
@@ -731,6 +745,40 @@ pub(crate) fn search_path_namespaces(connection: &Connection) -> Vec<NamespaceId
         .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
         .map(|qualifier| qualifier.target.id)
         .collect()
+}
+
+/// Whether a call of `name` without a schema can name a built-in function:
+/// a function of the engine, a function that the frontend or an extension
+/// registered, or a function of PostgreSQL. The last group has the
+/// functions that tursopg does not have, and the functions that the
+/// translator replaces with another expression, such as `int4(x)`.
+pub(crate) fn is_built_in_function(connection: &Connection, name: &str) -> bool {
+    turso_core::Func::builtin_function_list()
+        .iter()
+        .any(|function| function.name.eq_ignore_ascii_case(name))
+        || connection
+            .get_syms_functions()
+            .iter()
+            .any(|(function_name, ..)| function_name.eq_ignore_ascii_case(name))
+        || is_postgres_built_in_function(name)
+}
+
+/// Whether PostgreSQL 18 has a function `name` in pg_catalog.
+///
+/// `pg_catalog_function_names.list` has the names, one for each line. For a
+/// new PostgreSQL version, write the result of this query to the file:
+///
+/// ```sql
+/// SELECT DISTINCT proname FROM pg_proc
+/// WHERE pronamespace = 'pg_catalog'::regnamespace ORDER BY proname COLLATE "C";
+/// ```
+fn is_postgres_built_in_function(name: &str) -> bool {
+    static NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+        include_str!("pg_catalog_function_names.list")
+            .lines()
+            .collect()
+    });
+    NAMES.contains(name)
 }
 
 /// tursopg has fewer base types than PostgreSQL. A function can only have

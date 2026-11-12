@@ -550,6 +550,9 @@ Notes on `CREATE FUNCTION`:
   so the check does not find the new function.
 - A function and a table or view of the same schema cannot have the same
   name. PostgreSQL accepts this.
+- A function cannot have the name of a built-in function of tursopg or of
+  PostgreSQL 18, such as `abs` or `to_hex`. PostgreSQL chooses between the
+  two by the types of the arguments, which tursopg does not know.
 - The name of a function or of its schema cannot have a dot, and a function
   cannot be created in `pg_catalog`. When `pg_catalog` is the first schema
   of the search path, PostgreSQL creates a function without a schema name

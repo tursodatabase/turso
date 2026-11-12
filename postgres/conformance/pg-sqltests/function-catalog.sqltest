@@ -433,9 +433,10 @@ expect error {
 
 # PostgreSQL looks in pg_catalog before the schemas of the search path. It
 # finds the built-in function lower(text), which it does not drop. tursopg
-# does not know the parameter types of its built-in functions, so it cannot
-# tell if the statement names the built-in function or the function of the
-# user. It refuses the statement.
+# does not create a function with the name of a built-in function. For such
+# a function that a database has already, tursopg refuses the DROP FUNCTION
+# without a schema: it cannot tell if the statement names the built-in
+# function or the function of the user.
 test drop-function-with-the-signature-of-a-built-in-function {
     CREATE FUNCTION lower(text) RETURNS text LANGUAGE sql AS $$SELECT 'x'$$;
     DROP FUNCTION lower(text);
@@ -446,7 +447,7 @@ expect error {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    DROP FUNCTION without a schema for "lower", a name that a built-in function also has, is not supported
+    a function with the name of the built-in function "lower" is not supported
 }
 
 # PostgreSQL has no built-in function lower(integer), so it drops the
@@ -461,7 +462,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    DROP FUNCTION without a schema for "lower", a name that a built-in function also has, is not supported
+    a function with the name of the built-in function "lower" is not supported
 }
 
 test drop-function-with-the-name-of-a-built-in-function-with-its-schema {
@@ -472,6 +473,10 @@ test drop-function-with-the-name-of-a-built-in-function-with-its-schema {
 expect {
     0
 }
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "lower" is not supported
+}
 
 test drop-function-with-the-name-of-a-built-in-function-without-a-parameter-list {
     CREATE FUNCTION lower(integer) RETURNS text LANGUAGE sql AS $$SELECT 'x'$$;
@@ -480,6 +485,10 @@ test drop-function-with-the-name-of-a-built-in-function-without-a-parameter-list
 @sqlstate 42725
 expect error {
     function name "lower" is not unique
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "lower" is not supported
 }
 
 test drop-function-with-a-parameter-type-that-does-not-exist {
@@ -1188,6 +1197,79 @@ expect {
     2
     0
     2
+}
+
+# PostgreSQL looks in pg_catalog first and chooses between functions of one
+# name by the types of the arguments: abs(-3) is the built-in function, and
+# abs('x') is the function of the user. tursopg does not know the types of
+# the arguments, so it does not create a function that a call could not
+# tell from a built-in function.
+test function-with-the-name-of-a-built-in-function {
+    CREATE FUNCTION abs(text) RETURNS integer LANGUAGE sql AS $$SELECT 0$$;
+    SELECT abs(-3), abs('x'::text);
+}
+expect {
+    3|0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "abs" is not supported
+}
+
+test function-with-the-name-of-a-built-in-aggregate {
+    CREATE TABLE t (a integer);
+    CREATE FUNCTION count(integer) RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "count" is not supported
+}
+
+# to_hex is a built-in function of PostgreSQL that tursopg does not have.
+# PostgreSQL calls its built-in function, because the types of the arguments
+# are the same. tursopg would call the function of the user.
+test function-with-the-name-of-a-built-in-function-that-only-postgresql-has {
+    CREATE FUNCTION to_hex(integer) RETURNS text LANGUAGE sql AS $$SELECT 'mine'$$;
+    SELECT to_hex(255), public.to_hex(255);
+}
+expect {
+    ff|mine
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "to_hex" is not supported
+}
+
+# generate_series is a function of PostgreSQL that returns a set. tursopg has
+# it as a table function, which pg_proc of tursopg does not show.
+test function-with-the-name-of-a-built-in-set-returning-function {
+    CREATE FUNCTION generate_series(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    SELECT * FROM generate_series(1, 2);
+}
+expect {
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "generate_series" is not supported
+}
+
+# The translator turns int4(x) into a cast.
+test function-with-the-name-of-a-type {
+    CREATE FUNCTION int4(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'int4' AND pronargs = 2;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "int4" is not supported
 }
 
 # tursopg has fewer base types than PostgreSQL.
