@@ -470,6 +470,127 @@ fn a_rolled_back_grant_leaves_the_list_as_it_was(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test(mvcc)]
+fn a_revoke_is_stored_in_the_file_and_survives_a_reopen(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    pg.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
+    pg.execute("GRANT SELECT, INSERT ON t, v TO reader")
+        .unwrap();
+
+    pg.execute("REVOKE INSERT ON t, v FROM reader").unwrap();
+    let stored = "{10=arwdDxtm/10,16385=r/10}";
+    let list = "{postgres=arwdDxtm/postgres,reader=r/postgres}";
+    assert_eq!(stored_relacl(&conn, "t").as_deref(), Some(stored));
+    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(stored));
+    assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
+
+    drop(pg);
+    drop(conn);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    assert_eq!(stored_relacl(&conn, "v").as_deref(), Some(stored));
+    assert_eq!(relacl(&pg, "t").as_deref(), Some(list));
+    pg.execute("SET ROLE reader").unwrap();
+    assert_eq!(
+        pg.execute("INSERT INTO t VALUES (1)")
+            .unwrap_err()
+            .to_string(),
+        "permission denied for table t"
+    );
+    pg.execute("SELECT x FROM v").unwrap();
+    // The reopened database keeps revoking on the stored list.
+    pg.execute("RESET ROLE").unwrap();
+    pg.execute("REVOKE SELECT ON t FROM reader").unwrap();
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres}")
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn a_revoke_is_seen_by_another_connection(db: TempDatabase) {
+    let revoking = db.connect_postgres();
+    let watching = db.connect_postgres();
+    revoking.execute("CREATE ROLE reader").unwrap();
+    revoking.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    revoking.execute("GRANT SELECT ON t TO reader").unwrap();
+    watching.execute("SET ROLE reader").unwrap();
+    watching.execute("SELECT x FROM t").unwrap();
+
+    revoking.execute("REVOKE SELECT ON t FROM reader").unwrap();
+
+    assert_eq!(
+        watching.execute("SELECT x FROM t").unwrap_err().to_string(),
+        "permission denied for table t"
+    );
+    watching.execute("RESET ROLE").unwrap();
+    assert_eq!(
+        relacl(&watching, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres}")
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn a_statement_prepared_before_a_revoke_is_checked_against_the_new_list(db: TempDatabase) {
+    let revoking = db.connect_postgres();
+    let reading = db.connect_postgres();
+    revoking.execute("CREATE ROLE reader").unwrap();
+    revoking.execute("CREATE ROLE owner").unwrap();
+    revoking.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    revoking.execute("ALTER TABLE t OWNER TO owner").unwrap();
+    revoking.execute("GRANT SELECT ON t TO reader").unwrap();
+    reading.execute("SET ROLE reader").unwrap();
+    let mut select = reading.prepare("SELECT x FROM t").unwrap();
+    select.run_ignore_rows().unwrap();
+    // The owner revokes on the connection it prepared the statement on.
+    revoking.execute("SET ROLE owner").unwrap();
+    let mut select_as_owner = revoking.prepare("SELECT x FROM t").unwrap();
+    select_as_owner.run_ignore_rows().unwrap();
+
+    revoking
+        .execute("REVOKE SELECT ON t FROM reader, owner")
+        .unwrap();
+
+    for mut stmt in [select, select_as_owner] {
+        stmt.reset().unwrap();
+        assert_eq!(
+            stmt.run_ignore_rows().unwrap_err().to_string(),
+            "permission denied for table t"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn a_rolled_back_revoke_leaves_the_list_as_it_was(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    pg.execute("GRANT SELECT ON t TO reader").unwrap();
+    let stored = "{10=arwdDxtm/10,16385=r/10}";
+
+    pg.execute("BEGIN").unwrap();
+    pg.execute("REVOKE SELECT ON t FROM reader").unwrap();
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres}"),
+        "the transaction sees its own revoke"
+    );
+    pg.execute("ROLLBACK").unwrap();
+    assert_eq!(stored_relacl(&conn, "t").as_deref(), Some(stored));
+    assert_eq!(
+        relacl(&pg, "t").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}"),
+        "the in-memory catalog forgot it too"
+    );
+    pg.execute("SET ROLE reader").unwrap();
+    pg.execute("SELECT x FROM t").unwrap();
+}
+
 /// Writes a database at `path` with the catalog as the first tursopg with
 /// one made it: six columns, no `relacl`, and a class row for the table
 /// `app.t`, written by hand.
