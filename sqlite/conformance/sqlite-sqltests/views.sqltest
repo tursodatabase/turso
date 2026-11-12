@@ -561,3 +561,30 @@ expect {
     1|1
     2|3
 }
+
+test view-insert-is-refused {
+    CREATE TABLE t (id INTEGER);
+    CREATE VIEW v AS SELECT id FROM t;
+    INSERT INTO v VALUES (1);
+}
+expect error {
+    cannot modify v because it is a view
+}
+
+test view-update-is-refused {
+    CREATE TABLE t (id INTEGER);
+    CREATE VIEW v AS SELECT id FROM t;
+    UPDATE v SET id = 2;
+}
+expect error {
+    cannot modify v because it is a view
+}
+
+test view-delete-is-refused {
+    CREATE TABLE t (id INTEGER);
+    CREATE VIEW v AS SELECT id FROM t;
+    DELETE FROM v;
+}
+expect error {
+    cannot modify v because it is a view
+}
