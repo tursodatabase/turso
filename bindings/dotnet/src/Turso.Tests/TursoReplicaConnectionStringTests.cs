@@ -67,7 +67,7 @@ public sealed class TursoReplicaConnectionStringTests
 
         connection.Invoking(x => x.CreateReplicaOptions())
             .Should().Throw<InvalidOperationException>()
-            .WithMessage("*Remote Encryption Cipher*Remote Encryption Key*");
+            .WithMessage("*Remote Encryption Cipher*Local Encryption Key*Remote Encryption Key*");
     }
 
     [Test]
