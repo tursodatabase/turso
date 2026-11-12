@@ -144,7 +144,7 @@ pub struct TursoDatabaseSyncChanges {
 
 impl TursoDatabaseSyncChanges {
     pub fn empty(&self) -> bool {
-        self.changes.file_slot.is_none()
+        self.changes.is_empty()
     }
     pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_sync_changes_t {
         Box::into_raw(self) as *mut capi::c::turso_sync_changes_t
@@ -255,6 +255,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         // match the main database opened via TursoDatabase below.
         let db_opts = db_config.database_opts();
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
+            encryption: None,
             remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
             tables_ignore: vec![],

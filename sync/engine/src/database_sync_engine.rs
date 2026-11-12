@@ -12,17 +12,18 @@ use turso_core::{
 };
 
 use crate::{
-    database_sync_engine_io::SyncEngineIo,
+    changes_file::ChangesFile,
+    database_sync_engine_io::{DataCompletion, SyncEngineIo},
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
-        acquire_slot,
-        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
-        apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
-        is_logically_replayable_table, list_user_tables, max_local_change_id, pull_updates_v1,
-        push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
-        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
-        wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        acquire_slot, apply_logical_transactions_staging_without_commit, apply_transformation,
+        bootstrap_db_file, connect_untracked, count_local_changes, has_table,
+        is_logically_replayable_table, list_user_tables, max_local_change_id,
+        pull_updates_to_staging, push_logical_changes, read_last_change_id,
+        read_logical_replay_table_map, read_wal_salt, reset_wal_file, should_replay_local_change,
+        sync_file, update_last_change_id, wait_all_results, wal_apply_from_file,
+        wal_apply_from_staging, wal_pull_to_staging, PullUpdatesV1Result, SyncEngineIoStats,
+        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
@@ -45,6 +46,7 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct DatabaseSyncEngineOpts {
+    pub encryption: Option<crate::sync_encryption::SyncEncryption>,
     pub remote_url: Option<String>,
     pub client_name: String,
     pub tables_ignore: Vec<String>,
@@ -80,7 +82,8 @@ pub struct DatabaseSyncEngineOpts {
     /// a single HTTP round-trip. Currently applied only to the bootstrap phase
     /// — incremental pulls are unaffected. **No-op when partial-sync uses the
     /// `Query` bootstrap strategy** — the server picks the page set, so the
-    /// client can't chunk it locally.
+    /// client can't chunk it locally. Locally encrypted bootstrap rejects positive
+    /// values; use `None` or zero for its unfiltered bootstrap request.
     pub pull_bytes_threshold: Option<usize>,
     /// Sync-protocol override for incremental pulls.
     ///
@@ -95,6 +98,52 @@ pub struct DatabaseSyncEngineOpts {
 pub struct DataStats {
     pub written_bytes: AtomicUsize,
     pub read_bytes: AtomicUsize,
+}
+
+impl DatabaseSyncEngineOpts {
+    pub fn local_encryption_context(&self) -> Result<Option<turso_core::EncryptionContext>> {
+        let crypto = self
+            .encryption
+            .as_ref()
+            .map(|config| config.local_context())
+            .transpose()?
+            .flatten();
+        if crypto.is_some() {
+            if !self.db_opts.enable_encryption {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encryption must be enabled in database options".into(),
+                ));
+            }
+            if self.partial_sync_opts.is_some()
+                || self.protocol_version_hint == DatabaseSyncEngineProtocolVersion::Legacy
+            {
+                return Err(Error::DatabaseSyncEngineError(
+                    "local encryption requires full sync with protocol V1".into(),
+                ));
+            }
+        }
+        Ok(crypto)
+    }
+
+    fn connect_options(&self) -> ConnectOpts {
+        self.encryption
+            .as_ref()
+            .map(|config| config.connect_options())
+            .unwrap_or_else(ConnectOpts::new)
+    }
+
+    fn local_key(&self) -> Option<turso_core::EncryptionKey> {
+        self.encryption
+            .as_ref()
+            .and_then(|config| config.local_key())
+            .cloned()
+    }
+
+    fn local_options(&self) -> Option<turso_core::EncryptionOpts> {
+        self.encryption
+            .as_ref()
+            .and_then(|config| config.local_options())
+    }
 }
 
 impl Default for DataStats {
@@ -127,10 +176,11 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     revert_db_wal_path: String,
     main_db_path: String,
     meta_path: String,
-    changes_file: Arc<Mutex<Option<Arc<dyn turso_core::File>>>>,
+    changes_file: Arc<Mutex<Option<ChangesFile>>>,
     opts: DatabaseSyncEngineOpts,
     meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
+    local_crypto: Option<turso_core::EncryptionContext>,
 }
 
 fn db_size_from_page(page: &[u8]) -> u32 {
@@ -175,6 +225,16 @@ fn create_replace_base_marker_path(main_db_path: &str) -> String {
 }
 fn replace_base_backup_path(main_db_path: &str, name: &str) -> String {
     format!("{main_db_path}-replace-base-apply-{name}.backup")
+}
+
+fn replace_base_file_specs(main_db_path: &str) -> [(String, &'static str); 5] {
+    [
+        (main_db_path.to_string(), "main-db"),
+        (create_main_db_wal_path(main_db_path), "main-wal"),
+        (create_main_db_log_path(main_db_path), "main-log"),
+        (create_revert_db_wal_path(main_db_path), "revert-wal"),
+        (create_meta_path(main_db_path), "metadata"),
+    ]
 }
 
 #[cfg(test)]
@@ -419,13 +479,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
             ));
         }
         let is_memory = is_memory(main_db_path);
-        let file_specs = [
-            (main_db_path.to_string(), "main-db"),
-            (create_main_db_wal_path(main_db_path), "main-wal"),
-            (create_main_db_log_path(main_db_path), "main-log"),
-            (create_revert_db_wal_path(main_db_path), "revert-wal"),
-            (create_meta_path(main_db_path), "metadata"),
-        ];
+        let file_specs = replace_base_file_specs(main_db_path);
         let mut files = Vec::with_capacity(file_specs.len());
         for (path, name) in file_specs {
             let backup_path = replace_base_backup_path(main_db_path, name);
@@ -599,15 +653,16 @@ fn resolve_remote_pull_protocol(
 fn ensure_logical_mvcc_pull_supported(
     partial_sync_active: bool,
     remote_encryption_key: Option<&Secret>,
+    encryption: Option<&crate::sync_encryption::SyncEncryption>,
 ) -> Result<()> {
     if partial_sync_active {
         return Err(Error::DatabaseSyncEngineError(
             "MVCC logical sync does not support partial sync; disable partialSyncExperimental for this database".to_string(),
         ));
     }
-    if remote_encryption_key.is_some() {
+    if remote_encryption_key.is_some() && encryption.is_none() {
         return Err(Error::DatabaseSyncEngineError(
-            "MVCC logical sync does not support encrypted remote databases".to_string(),
+            "encrypted MVCC logical sync requires an explicit cipher".to_string(),
         ));
     }
     Ok(())
@@ -929,11 +984,33 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
+        Self::read_db_meta_with_encryption(coro, io, sync_engine_io, main_db_path, None).await
+    }
+
+    pub async fn read_db_meta_with_encryption<Ctx>(
+        coro: &Coro<Ctx>,
+        io: Option<Arc<dyn turso_core::IO>>,
+        sync_engine_io: SyncEngineIoStats<IO>,
+        main_db_path: &str,
+        crypto: Option<&turso_core::EncryptionContext>,
+    ) -> Result<Option<DatabaseMetadata>> {
         let path = create_meta_path(main_db_path);
         let is_memory = is_memory(main_db_path);
-        let meta = full_read(coro, io, sync_engine_io.io.clone(), &path, is_memory).await?;
+        let meta = if is_memory {
+            full_read(coro, io, sync_engine_io.io.clone(), &path, true).await?
+        } else {
+            let completion = sync_engine_io.full_read(&path)?;
+            let data = wait_all_results(coro, &completion, None).await?;
+            match completion.status()? {
+                // Hosts can keep metadata outside core's filesystem (localStorage
+                // and OPFS in browsers). Their existence result is authoritative.
+                Some(404) => None,
+                _ if !data.is_empty() => Some(data),
+                _ => None,
+            }
+        };
         match meta {
-            Some(meta) => Ok(Some(DatabaseMetadata::load(&meta)?)),
+            Some(meta) => Ok(Some(DatabaseMetadata::load_with_encryption(&meta, crypto)?)),
             None => Ok(None),
         }
     }
@@ -947,6 +1024,60 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         meta: Option<DatabaseMetadata>,
     ) -> Result<DatabaseMetadata> {
         tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
+        let local_crypto = opts.local_encryption_context()?;
+        if local_crypto.is_some() && meta.is_none() {
+            if !opts.bootstrap_if_empty || opts.remote_encryption_key.is_none() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync creation requires a cloud key and full bootstrap".into(),
+                ));
+            }
+            // Recovery runs before bootstrap. Remaining artifacts must not be
+            // silently reused by fresh creation, even when they are empty.
+            // Keep this separate from sync_database_file_paths: the browser
+            // eagerly creates/registers every path in that public inventory.
+            let recovery_paths = std::iter::once(create_replace_base_marker_path(main_db_path))
+                .chain(
+                    replace_base_file_specs(main_db_path)
+                        .into_iter()
+                        .map(|(_, name)| replace_base_backup_path(main_db_path, name)),
+                );
+            for path in recovery_paths {
+                let exists = if is_memory(main_db_path) {
+                    io.try_open(&path)?.is_some()
+                } else {
+                    let completion = sync_engine_io.full_read(&path)?;
+                    let data = wait_all_results(coro, &completion, None).await?;
+                    match completion.status()? {
+                        // Host storage can differ from core IO (e.g. localStorage).
+                        Some(404) => false,
+                        Some(204) => true,
+                        _ if !data.is_empty() => true,
+                        // Legacy hosts conflate absent and empty files.
+                        _ => io.try_open(&path)?.is_some(),
+                    }
+                };
+                if exists {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "cannot bootstrap encrypted sync over existing recovery artifact without valid metadata: {path}"
+                    )));
+                }
+            }
+            for path in sync_database_file_paths(main_db_path) {
+                // Bootstrap can leave downloaded pages before metadata is
+                // published. Missing or empty metadata permits retrying over
+                // the main file, just as it does for plaintext replicas.
+                if path == main_db_path {
+                    continue;
+                }
+                if let Some(file) = io.try_open(&path)? {
+                    if file.size()? != 0 {
+                        return Err(Error::DatabaseSyncEngineError(format!(
+                            "cannot bootstrap encrypted sync over existing replica file without valid metadata: {path}"
+                        )));
+                    }
+                }
+            }
+        }
         let meta_path = create_meta_path(main_db_path);
         let partial_sync_opts = opts.partial_sync_opts.clone();
         let partial = partial_sync_opts.is_some();
@@ -967,7 +1098,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         .to_string(),
                 ));
             }
-            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_ref())?;
+            ensure_logical_mvcc_pull_supported(
+                partial,
+                opts.remote_encryption_key.as_ref(),
+                opts.encryption.as_ref(),
+            )?;
         }
 
         let configuration = DatabaseSavedConfiguration {
@@ -990,6 +1125,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ensure_logical_mvcc_pull_supported(
                         partial,
                         opts.remote_encryption_key.as_ref(),
+                        opts.encryption.as_ref(),
                     )?;
                 }
                 if metadata_changed {
@@ -999,7 +1135,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         sync_engine_io.io.clone(),
                         &meta_path,
                         is_memory(main_db_path),
-                        meta.dump()?,
+                        meta.dump_with_encryption(local_crypto.as_ref())?,
                     )
                     .await?;
                 }
@@ -1013,12 +1149,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         &sync_engine_io,
                         opts.remote_url.clone(),
                         opts.remote_encryption_key.as_ref(),
-                    ),
+                    )
+                    .with_encryption_config(opts.encryption.as_ref()),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
                     partial_sync_opts,
                     opts.pull_bytes_threshold,
+                    local_crypto.as_ref(),
                 )
                 .await?;
                 let remote_pull_protocol = forced_protocol.unwrap_or(detected_protocol);
@@ -1026,6 +1164,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ensure_logical_mvcc_pull_supported(
                         partial,
                         opts.remote_encryption_key.as_ref(),
+                        opts.encryption.as_ref(),
                     )?;
                 }
                 let meta = DatabaseMetadata {
@@ -1051,7 +1190,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
-                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
+                tracing::info!("write metadata after successful bootstrap");
 
                 full_write(
                     coro,
@@ -1059,7 +1198,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     sync_engine_io.io.clone(),
                     &meta_path,
                     is_memory(main_db_path),
-                    meta.dump()?,
+                    meta.dump_with_encryption(local_crypto.as_ref())?,
                 )
                 .await?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
@@ -1098,14 +1237,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
-                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
+                tracing::info!("write metadata after successful bootstrap");
                 full_write(
                     coro,
                     io.clone(),
                     sync_engine_io.io.clone(),
                     &meta_path,
                     is_memory(main_db_path),
-                    meta.dump()?,
+                    meta.dump_with_encryption(local_crypto.as_ref())?,
                 )
                 .await?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
@@ -1182,6 +1321,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
         let main_db_path = main_db.path.to_string();
+        let local_crypto = opts.local_encryption_context()?;
         tracing::info!("open_db(path={}): opts={:?}", main_db_path, opts);
         // A previous process may have crashed after writing the replace-base
         // marker but before completing local replay. Restore the backed-up
@@ -1196,7 +1336,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if recovered {
             // Recovery restored files behind this already-open Database handle,
             // so rebuild its shared WAL/MVCC view before continuing.
-            main_db.reload_wal_after_external_restore()?;
+            main_db.reload_wal_after_external_restore_with_encryption_key(opts.local_key())?;
         }
 
         let meta_path = create_meta_path(&main_db_path);
@@ -1214,11 +1354,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 "meta must be initialized before open".to_string(),
             ));
         };
-        let meta = DatabaseMetadata::load(&meta)?;
+        let meta = DatabaseMetadata::load_with_encryption(&meta, local_crypto.as_ref())?;
 
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
-            let conn = main_db.connect(ConnectOpts::new())?;
+            let conn = main_db.connect(opts.connect_options())?;
             conn.wal_auto_actions_disable();
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
 
@@ -1235,7 +1375,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         tracing::info!("initialize database tape connection: path={}", main_db_path);
         let main_db_io = main_db.io.clone();
         let main_db_file = main_db.db_file.clone();
-        let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
+        let main_tape =
+            DatabaseTape::new_with_opts(main_db, tape_opts).with_encryption_key(opts.local_key());
         // Initialize CDC pragma and cache CDC version so iterate_changes() can work
         main_tape.connect(coro).await?;
 
@@ -1251,10 +1392,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_wal_path: create_main_db_wal_path(&main_db_path),
             revert_db_wal_path: create_revert_db_wal_path(&main_db_path),
             meta_path: create_meta_path(&main_db_path),
-            changes_file: Arc::new(Mutex::new(Some(changes_file))),
+            changes_file: Arc::new(Mutex::new(Some(ChangesFile::new(
+                changes_file,
+                local_crypto.clone(),
+            )))),
             opts,
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
+            local_crypto,
         };
 
         let synced_revision = meta.synced_revision.as_ref();
@@ -1271,6 +1416,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // logical log. Catch up with one incremental pull so a freshly
         // bootstrapped database is current at connect time, matching what
         // page-protocol bootstraps always provided.
+        if meta.fresh_bootstrap_catch_up_pending
+            && meta.remote_pull_protocol == RemotePullProtocol::MvccLogical
+        {
+            // An empty generation base has no page-one journal-mode header to inherit.
+            db.ensure_local_mvcc_journal_mode(coro).await?;
+        }
         db.catch_up_after_fresh_bootstrap(coro).await?;
 
         tracing::info!("sync engine was initialized");
@@ -1285,6 +1436,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
+        let local_crypto = opts.local_encryption_context()?;
         ReplaceBaseApplyGuard::recover_pending(
             coro,
             io.clone(),
@@ -1292,8 +1444,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_path,
         )
         .await?;
-        let meta = Self::read_db_meta(coro, Some(io.clone()), sync_engine_io.clone(), main_db_path)
-            .await?;
+        let meta = Self::read_db_meta_with_encryption(
+            coro,
+            Some(io.clone()),
+            sync_engine_io.clone(),
+            main_db_path,
+            local_crypto.as_ref(),
+        )
+        .await?;
         let meta = Self::bootstrap_db(
             coro,
             io.clone(),
@@ -1315,7 +1473,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let main_db_options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
             .storage(main_db_storage)
             .flags(OpenFlags::Create)
-            .db_opts(opts.db_opts);
+            .db_opts(opts.db_opts)
+            .encryption(opts.local_options());
         let mut open_state = turso_core::OpenDbAsyncState::new();
         let main_db = loop {
             match turso_core::Database::open_async(
@@ -1345,7 +1504,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .storage(self.db_file.clone())
                 .wal_path(self.revert_db_wal_path.clone())
                 .flags(OpenFlags::Create)
-                .db_opts(self.opts.db_opts);
+                .db_opts(self.opts.db_opts)
+                .encryption(self.opts.local_options());
             let mut state = OpenDbAsyncState::new();
             loop {
                 match turso_core::Database::do_open_async(
@@ -1364,7 +1524,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
         };
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(self.opts.connect_options())?;
         conn.wal_auto_actions_disable();
         Ok(conn)
     }
@@ -1699,7 +1859,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<DbChangesStatus> {
         tracing::info!("wait_changes(path={})", self.main_db_path);
 
-        let file = acquire_slot(&self.changes_file)?;
+        let mut file = acquire_slot(&self.changes_file)?;
 
         let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
@@ -1708,20 +1868,24 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             &self.sync_engine_io,
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_ref(),
-        );
-        let mut stream_kind =
-            if self.opts.protocol_version_hint == DatabaseSyncEngineProtocolVersion::Legacy {
-                DbChangesStreamKind::LegacyPages
-            } else {
-                DbChangesStreamKind::Pages
-            };
+        )
+        .with_encryption_config(self.opts.encryption.as_ref());
+        let stream_kind;
         let remote_pull_protocol = resolve_remote_pull_protocol(
             self.opts.logical_mvcc_pull,
             self.meta().remote_pull_protocol,
         );
         let next_revision = match (remote_pull_protocol, &revision) {
             (RemotePullProtocol::MvccLogical, Some(DatabasePullRevision::V1 { revision })) => {
-                match pull_updates_v1(ctx, &file.value, revision, long_poll_timeout, true).await? {
+                match pull_updates_to_staging(
+                    ctx,
+                    file.value_mut(),
+                    revision,
+                    long_poll_timeout,
+                    true,
+                )
+                .await?
+                {
                     (next_revision, result @ PullUpdatesV1Result::Logical { txns, ops }, _) => {
                         tracing::info!(
                             "wait_changes(path={}): logical pull returned {} transactions / {} ops",
@@ -1744,7 +1908,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             (RemotePullProtocol::MvccLogical, None) => {
                 let (next_revision, result, _) =
-                    pull_updates_v1(ctx, &file.value, "", long_poll_timeout, false).await?;
+                    pull_updates_to_staging(ctx, file.value_mut(), "", long_poll_timeout, false)
+                        .await?;
                 tracing::info!(
                     "wait_changes(path={}): initial logical MVCC sync returned page base",
                     self.main_db_path,
@@ -1784,11 +1949,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // the response header tells us which protocol the remote speaks.
             (RemotePullProtocol::Unknown, None) => {
                 let (next_revision, result, detected) =
-                    pull_updates_v1(ctx, &file.value, "", long_poll_timeout, false).await?;
+                    pull_updates_to_staging(ctx, file.value_mut(), "", long_poll_timeout, false)
+                        .await?;
                 if detected == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         self.opts.partial_sync_opts.is_some(),
                         self.opts.remote_encryption_key.as_ref(),
+                        self.opts.encryption.as_ref(),
                     )?;
                     // Deferred replicas may still be in WAL mode locally; the
                     // MVCC page base must be applied to an MVCC-mode database.
@@ -1831,18 +1998,29 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 next_revision
             }
             (RemotePullProtocol::Pages | RemotePullProtocol::Unknown, _) => {
-                wal_pull_to_file(
+                let next_revision = wal_pull_to_staging(
                     ctx,
-                    &file.value,
+                    file.value_mut(),
                     &revision,
                     self.opts.wal_pull_batch_size,
                     long_poll_timeout,
                 )
-                .await?
+                .await?;
+                // Existing replicas keep their saved protocol even when the SDK's hint changes.
+                stream_kind = match &next_revision {
+                    DatabasePullRevision::Legacy { .. } => DbChangesStreamKind::LegacyPages,
+                    DatabasePullRevision::V1 { .. } => DbChangesStreamKind::Pages,
+                };
+                next_revision
             }
         };
 
-        if file.value.size()? == 0 {
+        let empty = if matches!(stream_kind, DbChangesStreamKind::LegacyPages) {
+            file.value_mut().raw_file().size()? == 0
+        } else {
+            file.value_mut().validate_boundary(coro).await?
+        };
+        if empty {
             tracing::info!(
                 "wait_changes(path={}): no changes detected",
                 self.main_db_path
@@ -1881,7 +2059,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn apply_changes_from_remote<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        remote_changes: DbChangesStatus,
+        mut remote_changes: DbChangesStatus,
     ) -> Result<()> {
         let mut new_revision = remote_changes.revision.clone();
         if remote_changes.is_empty() {
@@ -1894,13 +2072,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
         let changes_file = remote_changes
             .file_slot
-            .as_ref()
+            .as_mut()
             .expect("non-empty remote changes must keep a file slot")
-            .value
-            .clone();
+            .value_mut();
+        if !matches!(remote_changes.stream_kind, DbChangesStreamKind::LegacyPages) {
+            changes_file.validate_boundary(coro).await?;
+        }
         if matches!(remote_changes.stream_kind, DbChangesStreamKind::Logical) {
             let logical_table_names_by_stable_id = self
-                .apply_logical_mvcc_changes_internal(coro, &changes_file)
+                .apply_logical_mvcc_changes_internal(coro, changes_file)
                 .await?;
             self.update_meta(coro, |m| {
                 m.revert_since_wal_salt = None;
@@ -1918,7 +2098,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let pull_result = self
             .apply_changes_internal(
                 coro,
-                &changes_file,
+                changes_file,
                 remote_changes.stream_kind,
                 &remote_changes.revision,
             )
@@ -1955,7 +2135,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     async fn apply_logical_mvcc_changes_internal<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        changes_file: &Arc<dyn turso_core::File>,
+        changes_file: &mut ChangesFile,
     ) -> Result<BTreeMap<u64, String>> {
         tracing::info!("apply_logical_mvcc_changes(path={})", self.main_db_path);
 
@@ -1997,7 +2177,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         );
         let apply_result = async {
             let remote_apply_stats =
-                apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                apply_logical_transactions_staging_without_commit(
                     coro,
                     &mut replay,
                     changes_file,
@@ -2070,7 +2250,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         &self.sync_engine_io,
                         self.meta().remote_url(),
                         self.opts.remote_encryption_key.as_ref(),
-                    );
+                    ).with_encryption_config(self.opts.encryption.as_ref());
                     Some(apply_transformation(ctx, &local_changes, &local_replay.generator).await?)
                 } else {
                     None
@@ -2169,7 +2349,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     async fn apply_changes_internal<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        changes_file: &Arc<dyn turso_core::File>,
+        changes_file: &mut ChangesFile,
         stream_kind: DbChangesStreamKind,
         remote_revision: &DatabasePullRevision,
     ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
@@ -2368,14 +2548,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             self.main_db_path,
                         );
                     }
-                    let db_size = wal_apply_from_file(
-                        coro,
-                        changes_file,
-                        main_session
-                            .as_mut()
-                            .expect("main WAL session must be active"),
-                    )
-                    .await?;
+                    let session = main_session.as_mut().expect("main WAL session must be active");
+                    let db_size = if matches!(stream_kind, DbChangesStreamKind::LegacyPages) {
+                        wal_apply_from_file(coro, changes_file.raw_file(), session).await?
+                    } else {
+                        wal_apply_from_staging(coro, changes_file, session).await?
+                    };
                     tracing::info!(
                         "apply_changes(path={}): applied changes from remote: db_size={}",
                         self.main_db_path,
@@ -2516,8 +2694,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 &self.sync_engine_io,
                                 self.meta().remote_url(),
                                 self.opts.remote_encryption_key.as_ref(),
-                            );
-                            match pull_updates_v1(ctx, changes_file, revision, None, true).await? {
+                            ).with_encryption_config(self.opts.encryption.as_ref());
+                            match pull_updates_to_staging(ctx, changes_file, revision, None, true).await? {
                                 (next_revision, PullUpdatesV1Result::Logical { txns, ops }, _) => {
                                     tracing::info!(
                                         "apply_changes(path={}): replace-base follow-up logical pull returned {} transactions / {} ops",
@@ -2526,7 +2704,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         ops,
                                     );
                                     followup_revision = Some(next_revision);
-                                    if txns != 0 || ops != 0 || changes_file.size()? != 0 {
+                                    let empty = changes_file.validate_boundary(coro).await?;
+                                    if txns != 0 || ops != 0 || !empty {
                                         let replay_conn = logical_replay_conn
                                             .as_ref()
                                             .expect("replace-base replay connection should exist");
@@ -2536,7 +2715,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                                 use_implicit_rowid: true,
                                             },
                                         );
-                                        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                                        apply_logical_transactions_staging_without_commit(
                                             coro,
                                             &mut replay,
                                             changes_file,
@@ -2840,7 +3019,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             &self.sync_engine_io,
                             self.meta().remote_url(),
                             self.opts.remote_encryption_key.as_ref(),
-                        );
+                        ).with_encryption_config(self.opts.encryption.as_ref());
                         Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
                     } else {
                         None
@@ -3152,7 +3331,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             &self.sync_engine_io,
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_ref(),
-        );
+        )
+        .with_encryption_config(self.opts.encryption.as_ref());
         let (pull_gen, replay_floor_change_id, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
@@ -3205,14 +3385,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<()> {
         let mut meta = self.meta().clone();
         update(&mut meta);
-        tracing::info!("update_meta: {meta:?}");
+        tracing::info!("update sync metadata");
         full_write(
             coro,
             self.io.clone(),
             self.sync_engine_io.io.clone(),
             &self.meta_path,
             is_memory(&self.main_db_path),
-            meta.dump()?,
+            meta.dump_with_encryption(self.local_crypto.as_ref())?,
         )
         .await?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
@@ -3307,17 +3487,19 @@ mod tests {
     fn logical_mvcc_pull_with_partial_sync_is_a_hard_error() {
         // Silent downgrade to page pull would just defer the failure to an
         // opaque server-side protocol error on every incremental pull.
-        assert!(ensure_logical_mvcc_pull_supported(true, None).is_err());
+        assert!(ensure_logical_mvcc_pull_supported(true, None, None).is_err());
     }
 
     #[test]
     fn logical_mvcc_pull_with_remote_encryption_is_a_hard_error() {
-        assert!(ensure_logical_mvcc_pull_supported(false, Some(&Secret::new("key"))).is_err());
+        assert!(
+            ensure_logical_mvcc_pull_supported(false, Some(&Secret::new("key")), None).is_err()
+        );
     }
 
     #[test]
     fn logical_mvcc_pull_remains_enabled_for_plain_full_sync() {
-        assert!(ensure_logical_mvcc_pull_supported(false, None).is_ok());
+        assert!(ensure_logical_mvcc_pull_supported(false, None, None).is_ok());
     }
 
     #[test]
@@ -3524,18 +3706,22 @@ mod tests {
     }
 
     struct EmptyCompletion<T> {
+        status: u16,
         data: Mutex<Option<Vec<T>>>,
     }
 
     impl<T> EmptyCompletion<T> {
         fn empty() -> Self {
-            Self {
-                data: Mutex::new(Some(Vec::new())),
-            }
+            Self::with_data(Vec::new())
         }
 
         fn with_data(data: Vec<T>) -> Self {
+            Self::with_status(200, data)
+        }
+
+        fn with_status(status: u16, data: Vec<T>) -> Self {
             Self {
+                status,
                 data: Mutex::new(Some(data)),
             }
         }
@@ -3545,7 +3731,7 @@ mod tests {
         type DataPollResult = EmptyPollResult<T>;
 
         fn status(&self) -> Result<Option<u16>> {
-            Ok(Some(200))
+            Ok(Some(self.status))
         }
 
         fn poll_data(&self) -> Result<Option<Self::DataPollResult>> {
@@ -3670,7 +3856,7 @@ mod tests {
     /// requests than responses were queued. Records every request for
     /// assertions on the wire traffic.
     struct QueuedSyncEngineIo {
-        responses: Mutex<std::collections::VecDeque<Vec<u8>>>,
+        responses: Mutex<std::collections::VecDeque<EmptyCompletion<u8>>>,
         #[allow(clippy::type_complexity)]
         requests: Mutex<Vec<(String, String, Option<Vec<u8>>)>>,
     }
@@ -3718,7 +3904,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("engine made more HTTP requests than queued responses");
-            Ok(EmptyCompletion::with_data(response))
+            Ok(response)
         }
 
         fn add_io_callback(&self, _callback: Box<dyn FnMut() -> bool + Send>) {}
@@ -3744,6 +3930,7 @@ mod tests {
 
     fn default_test_opts() -> DatabaseSyncEngineOpts {
         DatabaseSyncEngineOpts {
+            encryption: None,
             remote_url: None,
             client_name: "test-client".to_string(),
             tables_ignore: vec![],
@@ -3770,6 +3957,168 @@ mod tests {
         assert!(!printed.contains("c2VjcmV0LWtleQ=="));
         assert!(printed.contains("remote_encryption_key: Some(<redacted>)"));
         assert!(printed.contains("client_name: \"test-client\""));
+    }
+
+    #[test]
+    fn encrypted_offline_open_keys_internal_connections_and_metadata() {
+        let dir = tempfile::tempdir().expect("directory");
+        let path = dir.path().join("encrypted.db");
+        let path = path.to_str().expect("path").to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().expect("IO"));
+        let mut opts = default_test_opts();
+        opts.db_opts = turso_core::DatabaseOpts::new().with_encryption(true);
+        opts.remote_url = Some("https://example.invalid/private-database".into());
+        opts.encryption = Some(
+            crate::sync_encryption::SyncEncryption::new(
+                turso_core::CipherMode::Aes256Gcm,
+                Some(turso_core::EncryptionKey::new_256([11; 32])),
+            )
+            .expect("config"),
+        );
+        let crypto = opts
+            .local_encryption_context()
+            .expect("crypto")
+            .expect("local");
+        {
+            let db = turso_core::Database::open_file_with_flags(
+                io.clone(),
+                &path,
+                turso_core::OpenFlags::Create,
+                opts.db_opts,
+                opts.local_options(),
+                Arc::new(SqliteDialect),
+            )
+            .expect("open encrypted database");
+            let conn = db
+                .connect(opts.connect_options())
+                .expect("keyed connection");
+            conn.execute("PRAGMA journal_mode = 'mvcc'").expect("MVCC");
+            conn.execute("CREATE TABLE private_table(value TEXT)")
+                .expect("schema");
+            conn.execute("INSERT INTO private_table VALUES ('private initial value')")
+                .expect("insert");
+        }
+        let meta = DatabaseMetadata::load(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": "v1", "client_unique_id": "private-client",
+                "synced_revision": {"type": "v1", "revision": "g1:o56"},
+                "revert_since_wal_watermark": 0,
+                "last_pushed_pull_gen_hint": 0, "last_pushed_change_id_hint": 0,
+                "remote_pull_protocol": "mvcc_logical"
+            }))
+            .expect("metadata JSON"),
+        )
+        .expect("metadata");
+        let original = meta
+            .dump_with_encryption(Some(&crypto))
+            .expect("seal metadata");
+        std::fs::write(create_meta_path(&path), &original).expect("write fixture");
+        let stats = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let engine = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                stats.clone(),
+                &path,
+                opts.clone(),
+            )
+            .await?;
+            let conn = engine.connect_rw(&coro).await?;
+            assert!(conn.get_pager().is_encryption_ctx_set());
+            conn.execute("INSERT INTO private_table VALUES ('private new value')")?;
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let untracked = engine.main_tape.connect_untracked()?;
+            assert!(untracked.get_pager().is_encryption_ctx_set());
+            assert_eq!(
+                untracked
+                    .prepare("SELECT count(*) FROM private_table")?
+                    .run_collect_rows()?,
+                vec![vec![turso_core::Value::from_i64(2)]]
+            );
+            drop(untracked);
+            let mut iterator = engine.main_tape.iterate_changes(Default::default())?;
+            assert!(iterator.next(&coro).await?.is_some());
+            drop(iterator);
+            drop(conn);
+            let revert = engine.open_revert_db_conn(&coro).await?;
+            assert!(revert.get_pager().is_encryption_ctx_set());
+            assert_eq!(
+                revert
+                    .prepare("SELECT count(*) FROM private_table")?
+                    .run_collect_rows()?,
+                vec![vec![turso_core::Value::from_i64(2)]]
+            );
+            drop(revert);
+            engine
+                .update_meta(&coro, |meta| meta.last_push_unix_time = Some(123))
+                .await?;
+            let updated = std::fs::read(create_meta_path(&path))?;
+            assert_ne!(updated, original);
+            for secret in ["private-client", "private-database", "private_table"] {
+                assert!(!updated
+                    .windows(secret.len())
+                    .any(|part| part == secret.as_bytes()));
+            }
+            let decoded = DatabaseMetadata::load_with_encryption(&updated, Some(&crypto))?;
+            assert_eq!(decoded.last_push_unix_time, Some(123));
+            assert_eq!(decoded.remote_url(), opts.remote_url);
+            assert!(DatabaseMetadata::load_with_encryption(&updated, None).is_err());
+            drop(engine);
+            let reopened = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                stats.clone(),
+                &path,
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(reopened.meta().last_push_unix_time, Some(123));
+            Ok::<_, crate::errors::Error>(())
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(_) => {
+                    io.step().expect("drive IO");
+                }
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.expect("encrypted offline roundtrip");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_metadata_treats_empty_file_as_missing_and_requires_key_for_nonempty() {
+        let dir = tempfile::tempdir().expect("directory");
+        let path = dir.path().join("db");
+        let path = path.to_str().expect("path");
+        std::fs::write(create_meta_path(path), []).expect("empty metadata");
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().expect("IO"));
+        let crypto = turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([1; 32]),
+            4096,
+        )
+        .expect("crypto");
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let result = DatabaseSyncEngine::read_db_meta_with_encryption(
+                &coro,
+                Some(io.clone()),
+                SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo)),
+                path,
+                Some(&crypto),
+            )
+            .await;
+            assert!(result.expect("empty metadata is missing").is_none());
+        });
+        assert!(matches!(
+            gen.resume_with(Ok(())),
+            genawaiter::GeneratorState::Complete(())
+        ));
+        assert!(DatabaseMetadata::load_with_encryption(b"TSYNMETA\x01\x00", None).is_err());
     }
 
     fn replace_base_guard_test_paths(
@@ -4116,6 +4465,15 @@ mod tests {
 
     #[test]
     fn apply_changes_from_remote_applies_logical_stream_without_local_replay() {
+        apply_logical_staging_without_local_replay(false);
+    }
+
+    #[test]
+    fn apply_changes_from_remote_decrypts_logical_staging() {
+        apply_logical_staging_without_local_replay(true);
+    }
+
+    fn apply_logical_staging_without_local_replay(encrypted: bool) {
         let db_temp = NamedTempFile::new().unwrap();
         let meta_temp = NamedTempFile::new().unwrap();
         let changes_temp = NamedTempFile::new().unwrap();
@@ -4214,6 +4572,7 @@ mod tests {
             }),
         };
         let engine = DatabaseSyncEngine {
+            local_crypto: None,
             io: db_io,
             sync_engine_io,
             db_file,
@@ -4227,13 +4586,18 @@ mod tests {
             meta: Mutex::new(meta),
             client_unique_id: "client-a".to_string(),
         };
-        let remote_changes = DbChangesStatus {
+        let mut remote_changes = DbChangesStatus {
             time: io.current_time_wall_clock(),
             revision: DatabasePullRevision::V1 {
                 revision: "g1:o2".to_string(),
             },
             file_slot: Some(crate::database_sync_operations::MutexSlot {
-                value: changes_file,
+                value: Some(crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Logical,
+                    txns.len(),
+                    txns.iter().map(prost::Message::encoded_len).sum(),
+                )),
                 slot,
             }),
             stream_kind: DbChangesStreamKind::Logical,
@@ -4243,6 +4607,29 @@ mod tests {
             let engine = engine;
             move |coro| async move {
                 let coro: Coro<()> = coro.into();
+                if encrypted {
+                    let slot = remote_changes.file_slot.as_mut().unwrap();
+                    let file = slot.value_mut().raw_file().clone();
+                    let crypto = turso_core::EncryptionContext::new(
+                        turso_core::CipherMode::Aes256Gcm,
+                        &turso_core::EncryptionKey::new_256([3; 32]),
+                        4096,
+                    )
+                    .unwrap();
+                    let mut staging = crate::changes_file::ChangesFile::new(file, Some(crypto));
+                    staging
+                        .reset(&coro, crate::sync_cipher::ChangeKind::Logical)
+                        .await
+                        .unwrap();
+                    for txn in &txns {
+                        staging
+                            .append_record(&coro, &txn.encode_to_vec())
+                            .await
+                            .unwrap();
+                    }
+                    staging.finish(&coro).await.unwrap();
+                    slot.value = Some(staging);
+                }
                 engine
                     .apply_changes_from_remote(&coro, remote_changes)
                     .await
@@ -4390,6 +4777,7 @@ mod tests {
             }),
         };
         let engine = DatabaseSyncEngine {
+            local_crypto: None,
             io: db_io,
             sync_engine_io,
             db_file,
@@ -4409,7 +4797,12 @@ mod tests {
                 revision: "g1:o2".to_string(),
             },
             file_slot: Some(crate::database_sync_operations::MutexSlot {
-                value: changes_file,
+                value: Some(crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Logical,
+                    txns.len(),
+                    txns.iter().map(prost::Message::encoded_len).sum(),
+                )),
                 slot: Arc::new(Mutex::new(None)),
             }),
             stream_kind: DbChangesStreamKind::Logical,
@@ -4575,9 +4968,17 @@ mod tests {
 
                 let changes_file =
                     write_replace_base_pages_file(&coro, &io, &remote_path, &changes_path).await?;
+                let records =
+                    changes_file.size()? as usize / crate::database_sync_operations::WAL_FRAME_SIZE;
+                let changes_file = crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Pages,
+                    records,
+                    records * crate::database_sync_operations::WAL_FRAME_SIZE,
+                );
                 let slot = Arc::new(Mutex::new(Some(changes_file)));
                 let file_slot = MutexSlot {
-                    value: slot.lock().unwrap().take().unwrap(),
+                    value: slot.lock().unwrap().take(),
                     slot: slot.clone(),
                 };
 
@@ -4760,6 +5161,7 @@ mod tests {
             responses: Mutex::new(
                 vec![first_contact_response, followup_logical_response]
                     .into_iter()
+                    .map(EmptyCompletion::with_data)
                     .collect(),
             ),
             requests: Mutex::new(Vec::new()),
@@ -4931,6 +5333,7 @@ mod tests {
             responses: Mutex::new(
                 vec![bootstrap_response, catch_up_response]
                     .into_iter()
+                    .map(EmptyCompletion::with_data)
                     .collect(),
             ),
             requests: Mutex::new(Vec::new()),
@@ -4992,6 +5395,191 @@ mod tests {
         );
         assert_eq!(catch_up.client_revision, server_revision);
         assert_eq!(catch_up.long_poll_timeout_ms, 0);
+    }
+
+    #[test]
+    fn legacy_replica_empty_pull_preserves_progress_with_v1_hint() {
+        check_legacy_replica_pull(false);
+    }
+
+    #[test]
+    fn legacy_replica_pull_applies_frames_and_preserves_local_writes_with_v1_hint() {
+        check_legacy_replica_pull(true);
+    }
+
+    fn check_legacy_replica_pull(with_frames: bool) {
+        for hint in [
+            DatabaseSyncEngineProtocolVersion::V1,
+            DatabaseSyncEngineProtocolVersion::Legacy,
+        ] {
+            for remote_protocol in [RemotePullProtocol::Pages, RemotePullProtocol::Unknown] {
+                let dir = tempfile::tempdir().unwrap();
+                let main_path = dir.path().join("replica.db").to_str().unwrap().to_string();
+                let remote_path = dir.path().join("remote.db").to_str().unwrap().to_string();
+                let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+                let remote_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &remote_path,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+                remote_conn.wal_auto_actions_disable();
+                remote_conn
+                    .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                remote_conn
+                    .execute("INSERT INTO items VALUES (1, 'base')")
+                    .unwrap();
+                remote_conn
+                    .checkpoint(turso_core::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    })
+                    .unwrap();
+                let base = std::fs::read(&remote_path).unwrap();
+                let frames = if with_frames {
+                    remote_conn
+                        .execute("INSERT INTO items VALUES (2, 'remote')")
+                        .unwrap();
+                    let wal = std::fs::read(format!("{remote_path}-wal")).unwrap();
+                    wal[32..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let frame_count = frames.len() as u64 / super::WAL_FRAME_SIZE as u64;
+                assert_eq!(frames.len() % super::WAL_FRAME_SIZE, 0);
+                assert_eq!(frame_count > 0, with_frames);
+                assert!(frame_count < 100);
+                let checkpoint_status = serde_json::to_vec(&serde_json::json!({
+                    "status": "checkpoint_needed",
+                    "generation": 1,
+                    "max_frame_no": frame_count,
+                }))
+                .unwrap();
+                let checkpoint_needed =
+                    || EmptyCompletion::with_status(400, checkpoint_status.clone());
+                let response = if with_frames {
+                    EmptyCompletion::with_data(frames)
+                } else {
+                    checkpoint_needed()
+                };
+                let sync_io = Arc::new(QueuedSyncEngineIo {
+                    responses: Mutex::new(
+                        [
+                            EmptyCompletion::with_data(encoded_page_stream_response(
+                                &base,
+                                "base",
+                                PullUpdatesProtocol::Pages,
+                            )),
+                            response,
+                            checkpoint_needed(),
+                        ]
+                        .into(),
+                    ),
+                    requests: Mutex::new(Vec::new()),
+                });
+                let mut opts = default_test_opts();
+                opts.remote_url = Some("https://example.com".into());
+                opts.bootstrap_if_empty = true;
+                opts.logical_mvcc_pull = None;
+                opts.wal_pull_batch_size = 100;
+                let expected_revision = DatabasePullRevision::Legacy {
+                    generation: 1,
+                    synced_frame_no: Some(frame_count),
+                };
+                let mut gen = genawaiter::sync::Gen::new({
+                    let io = io.clone();
+                    let sync_io = sync_io.clone();
+                    let main_path = main_path.clone();
+                    move |coro| async move {
+                        let coro: Coro<()> = coro.into();
+                        let stats = SyncEngineIoStats::new(sync_io.clone());
+                        let engine = DatabaseSyncEngine::create_db(
+                            &coro,
+                            io.clone(),
+                            stats.clone(),
+                            &main_path,
+                            opts.clone(),
+                        )
+                        .await?;
+                        // Model an existing plaintext replica with legacy progress on disk.
+                        engine
+                            .update_meta(&coro, |meta| {
+                                meta.synced_revision = Some(DatabasePullRevision::Legacy {
+                                    generation: 1,
+                                    synced_frame_no: Some(0),
+                                });
+                                meta.remote_pull_protocol = remote_protocol;
+                            })
+                            .await?;
+                        let conn = engine.connect_rw(&coro).await?;
+                        conn.execute("INSERT INTO items VALUES (3, 'local')")?;
+                        drop(conn);
+                        drop(engine);
+
+                        opts.protocol_version_hint = hint;
+                        let engine = DatabaseSyncEngine::create_db(
+                            &coro,
+                            io.clone(),
+                            stats.clone(),
+                            &main_path,
+                            opts.clone(),
+                        )
+                        .await?;
+                        let changes = engine.wait_changes_from_remote(&coro).await?;
+                        assert_eq!(changes.stream_kind, DbChangesStreamKind::LegacyPages);
+                        assert_eq!(changes.is_empty(), !with_frames);
+                        engine.apply_changes_from_remote(&coro, changes).await?;
+                        assert_eq!(
+                            engine.meta().synced_revision,
+                            Some(expected_revision.clone())
+                        );
+                        assert!(engine.meta().last_pull_unix_time.is_some());
+                        drop(engine);
+
+                        // Reopening must resume from the saved legacy frame number.
+                        let engine =
+                            DatabaseSyncEngine::create_db(&coro, io, stats, &main_path, opts)
+                                .await?;
+                        assert_eq!(
+                            engine.meta().synced_revision,
+                            Some(expected_revision.clone())
+                        );
+                        engine.pull_changes_from_remote(&coro).await?;
+                        assert_eq!(engine.meta().synced_revision, Some(expected_revision));
+                        let conn = engine.connect_rw(&coro).await?;
+                        let mut stmt = conn.prepare("SELECT id, value FROM items ORDER BY id")?;
+                        let mut rows = Vec::new();
+                        while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                            rows.push((row.get::<i64>(0)?, row.get::<String>(1)?));
+                        }
+                        let mut expected = vec![(1, "base".to_string())];
+                        if with_frames {
+                            expected.push((2, "remote".to_string()));
+                        }
+                        expected.push((3, "local".to_string()));
+                        assert_eq!(rows, expected);
+                        Result::Ok(())
+                    }
+                });
+                loop {
+                    match gen.resume_with(Ok(())) {
+                        genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                        genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+                    }
+                }
+                assert!(sync_io.responses.lock().unwrap().is_empty());
+                let requests = sync_io.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[0].1, "/pull-updates");
+                assert_eq!((&*requests[1].0, &*requests[1].1), ("GET", "/sync/1/1/101"));
+                assert_eq!(requests[2].0, "GET");
+                assert_eq!(
+                    requests[2].1,
+                    format!("/sync/1/{}/{}", frame_count + 1, frame_count + 101)
+                );
+            }
+        }
     }
 
     /// Forcing `logical_mvcc_pull: Some(true)` on a replica whose revision
@@ -5165,7 +5753,7 @@ mod tests {
         let bootstrap_response =
             encoded_page_stream_response(&remote_bytes, "g1:o0", PullUpdatesProtocol::Pages);
         let sync_io = Arc::new(QueuedSyncEngineIo {
-            responses: Mutex::new(vec![bootstrap_response].into_iter().collect()),
+            responses: Mutex::new([EmptyCompletion::with_data(bootstrap_response)].into()),
             requests: Mutex::new(Vec::new()),
         });
         let sync_engine_io = SyncEngineIoStats::new(sync_io);
