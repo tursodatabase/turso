@@ -332,28 +332,23 @@ fn expand_in_clause_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Resul
     Ok(WalkControl::SkipChildren)
 }
 
-/// Expands the calls in `expr`, an expression of a clause, and in its
-/// subqueries. Fails when `expr` is then deeper than the parser permits:
-/// the engine walks an expression with recursion.
+/// Expands the calls in `expr` and in its subqueries. Fails when `expr` is
+/// then deeper than the parser permits: the engine and the dialect walk an
+/// expression with recursion.
 fn expand_in_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
     let replaced_calls_before = expand.replaced_calls;
-    expand_in_part(expr, expand)?;
+    walk_expr_mut(expr, &mut |expr| expand_call_or_subquery(expr, expand))?;
     if expand.replaced_calls > replaced_calls_before && is_deeper_than(expr, MAX_EXPR_DEPTH) {
         return Err(expression_tree_is_too_large());
     }
     Ok(())
 }
 
-/// Expands the calls in `expr`, a part of an expression, and in its
-/// subqueries.
-fn expand_in_part(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
-    walk_expr_mut(expr, &mut |expr| expand_call_or_subquery(expr, expand))?;
-    Ok(())
-}
-
 /// Expands the calls in the subquery that `expr` is, or the call that `expr`
 /// is. The arguments of a call are expanded before the call, so the dialect
-/// sees the arguments as they will run.
+/// sees the arguments as they will run. No argument that the dialect gets,
+/// and no expression that it gives for a call, is deeper than the parser
+/// permits.
 fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<WalkControl> {
     match expr {
         ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
@@ -368,20 +363,23 @@ fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Res
             ..
         } => {
             for arg in args.iter_mut() {
-                expand_in_part(arg, expand)?;
+                expand_in_expr(arg, expand)?;
             }
             for sorted_column in order_by.iter_mut().chain(within_group.iter_mut()) {
-                expand_in_part(&mut sorted_column.expr, expand)?;
+                expand_in_expr(&mut sorted_column.expr, expand)?;
             }
             if let Some(filter) = &mut filter_over.filter_clause {
-                expand_in_part(filter, expand)?;
+                expand_in_expr(filter, expand)?;
             }
             if let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref_mut() {
                 rewrite_window_expressions(window, &mut |expr| {
-                    expand_call_or_subquery(expr, expand)
+                    expand_in_clause_expr(expr, expand)
                 })?;
             }
             if let Some(expansion) = (expand.replacement)(expr)? {
+                if is_deeper_than(&expansion, MAX_EXPR_DEPTH) {
+                    return Err(expression_tree_is_too_large());
+                }
                 *expr = expansion;
                 expand.replaced_calls += 1;
             }

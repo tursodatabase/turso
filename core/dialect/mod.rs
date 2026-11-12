@@ -1097,6 +1097,14 @@ mod tests {
                     Expr::Parenthesized(vec![argument.clone()]),
                 )])));
             }
+            if name.as_str() == "first_of" {
+                let [first, _] = args.as_slice() else {
+                    return Err(LimboError::ParseError(
+                        "first_of takes two arguments".to_string(),
+                    ));
+                };
+                return Ok(Some(Expr::Parenthesized(vec![first.clone()])));
+            }
             if name.as_str() != "twice" {
                 return Ok(None);
             }
@@ -1183,6 +1191,13 @@ mod tests {
                  GROUP BY t.b HAVING count(*) = twice(1) - 1"
             ),
             [[1]]
+        );
+        assert_eq!(
+            integers(
+                "SELECT sum(b) OVER (PARTITION BY twice(b) > 2 ORDER BY twice(a)) \
+                 FROM t ORDER BY a"
+            ),
+            [[1], [2], [5]]
         );
         assert_eq!(
             integers("UPDATE t SET b = twice(b) WHERE a = twice(1) RETURNING twice(b)"),
@@ -1287,6 +1302,15 @@ mod tests {
                 let rows = run(below_negations(9)).unwrap();
                 assert_eq!(rows, vec![vec![Value::from_i64(-1)]]);
                 let error = run(below_negations(10)).unwrap_err();
+                assert!(error.to_string().contains(too_large), "{error}");
+
+                // The dialect does not get an argument that is too deep,
+                // also when the expansion of the call does not use it.
+                let unused_argument =
+                    |calls: usize| format!("SELECT first_of(1, {})", nested_wrapped_calls(calls));
+                let rows = run(unused_argument(49)).unwrap();
+                assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+                let error = run(unused_argument(50)).unwrap_err();
                 assert!(error.to_string().contains(too_large), "{error}");
                 conn.close().unwrap();
             })
