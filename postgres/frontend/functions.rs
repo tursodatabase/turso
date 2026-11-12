@@ -100,6 +100,8 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
+        "uuid_in"(FunctionArity::Exact(1), true) => exec_uuid_in(args[0].get_value())?,
+        "jsonb_in"(FunctionArity::Exact(1), true) => exec_jsonb_in(args[0].get_value())?,
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",
@@ -247,6 +249,88 @@ impl ScalarReturn for Uuid {
     fn into_value(self) -> Value {
         Value::build_text(self.0)
     }
+}
+
+/// The operand of a cast to uuid: text is read the way PostgreSQL's uuid_in()
+/// reads it and written out in the usual form, such as
+/// `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`. A value that is not text is left
+/// for the cast.
+fn exec_uuid_in(value: &Value) -> Result<Value> {
+    let Value::Text(text) = value else {
+        return Ok(value.clone());
+    };
+    let text = text.as_str();
+    let bytes = parse_uuid(text).ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            format!("invalid input syntax for type uuid: \"{text}\""),
+        )
+    })?;
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    Ok(Value::build_text(format!(
+        "{}-{}-{}-{}-{}",
+        hex(&bytes[..4]),
+        hex(&bytes[4..6]),
+        hex(&bytes[6..8]),
+        hex(&bytes[8..10]),
+        hex(&bytes[10..])
+    )))
+}
+
+/// The bytes of the UUID that `text` spells, by the rules of PostgreSQL's
+/// string_to_uuid(): 32 hexadecimal digits, with an optional hyphen after
+/// any group of four digits, optionally in braces.
+fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let mut rest = text.as_bytes();
+    let braces = rest.first() == Some(&b'{');
+    if braces {
+        rest = &rest[1..];
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let [high, low, tail @ ..] = rest else {
+            return None;
+        };
+        let digit = |c: &u8| (*c as char).to_digit(16);
+        *byte = (digit(high)? * 16 + digit(low)?) as u8;
+        rest = tail;
+        if rest.first() == Some(&b'-') && i % 2 == 1 && i < 15 {
+            rest = &rest[1..];
+        }
+    }
+    if braces {
+        let [b'}', tail @ ..] = rest else {
+            return None;
+        };
+        rest = tail;
+    }
+    rest.is_empty().then_some(bytes)
+}
+
+/// The operand of a cast to jsonb: text has to be JSON, as for PostgreSQL's
+/// jsonb_in(). The text itself is the value. A value that is not text is
+/// left for the cast.
+fn exec_jsonb_in(value: &Value) -> Result<Value> {
+    if let Value::Text(text) = value {
+        let json = text.as_str();
+        serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+        if has_nul_escape(json) {
+            return Err(unsupported_unicode_escape());
+        }
+    }
+    Ok(value.clone())
+}
+
+/// Whether JSON text `json` has the escape of the NUL character, which
+/// PostgreSQL's jsonb cannot store.
+fn has_nul_escape(json: &str) -> bool {
+    let mut bytes = json.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' && bytes.next() == Some(b'u') && bytes.by_ref().take(4).eq(*b"0000") {
+            return true;
+        }
+    }
+    false
 }
 
 fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<String>> {

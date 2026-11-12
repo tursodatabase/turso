@@ -800,7 +800,6 @@ struct Repl {
     db_file: String,
     table_config: TableConfig,
     input_buf: String,
-    read_state: ReadState,
     interrupt_count: Arc<AtomicUsize>,
     had_error: bool,
     expanded_display: bool,
@@ -821,7 +820,6 @@ impl Repl {
             db_file,
             table_config,
             input_buf: String::new(),
-            read_state: ReadState::default(),
             interrupt_count,
             had_error: false,
             expanded_display: false,
@@ -839,7 +837,6 @@ impl Repl {
 
     fn reset_input(&mut self) {
         self.input_buf.clear();
-        self.read_state = ReadState::default();
     }
 
     fn consume(&mut self, flush: bool) {
@@ -867,7 +864,11 @@ impl Repl {
             return;
         }
 
-        let is_complete = self.read_state.is_complete();
+        // The whole input is read again for every line, because a quoted
+        // string can start on one line and end on a later one.
+        let mut read_state = ReadState::default();
+        read_state.process(&self.input_buf);
+        let is_complete = read_state.is_complete();
         if is_complete || flush {
             let sql = self.input_buf.clone();
             let start = if self.timing {
@@ -930,7 +931,6 @@ impl Repl {
                     }
 
                     self.interrupt_count.store(0, Ordering::Release);
-                    self.read_state.process(&line);
                     self.input_buf.push_str(&line);
                     if !self.input_buf.ends_with(char::is_whitespace) {
                         self.input_buf.push('\n');
@@ -962,13 +962,11 @@ impl Repl {
     fn run_stdin(&mut self) {
         let stdin = std::io::stdin();
         loop {
-            let prev_len = self.input_buf.len();
             if std::io::BufRead::read_line(&mut stdin.lock(), &mut self.input_buf).unwrap_or(0) == 0
             {
                 self.consume(true);
                 break;
             }
-            self.read_state.process(&self.input_buf[prev_len..]);
             self.consume(false);
         }
     }

@@ -1,0 +1,111 @@
+# Casts of text to uuid and jsonb, which read the text by the type's rules.
+
+@database :memory:
+
+test cast-text-to-uuid-prints-lowercase-digits-with-hyphens {
+    SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
+    SELECT CAST('a0eebc999c0b4ef8bb6d6bb9bd380a11' AS uuid);
+    SELECT ('a0eebc99' || '9c0b4ef8bb6d6bb9bd380a11')::uuid;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test cast-text-to-uuid-accepts-braces-and-a-hyphen-after-every-four-digits {
+    SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid;
+    SELECT 'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11'::uuid;
+    SELECT '{a0eebc999c0b4ef8bb6d6bb9bd380a11}'::uuid;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test cast-text-to-uuid-compares-as-a-uuid {
+    SELECT count(*) FROM (SELECT 1) AS one
+    WHERE 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
+    SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid::text;
+}
+expect {
+    1
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test cast-null-to-uuid-is-null {
+    SELECT 5, coalesce(NULL::uuid::text, '<null>'), 6;
+    SELECT 5, coalesce(nullif('', '')::uuid::text, '<null>'), 6;
+}
+expect {
+    5|<null>|6
+    5|<null>|6
+}
+
+test cast-text-that-is-not-a-uuid-errors {
+    SELECT 'not-a-uuid'::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "not-a-uuid"
+}
+
+test cast-uuid-with-a-leading-space-errors {
+    SELECT ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+test cast-uuid-with-a-hyphen-after-two-digits-errors {
+    SELECT ('a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::text)::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+test cast-uuid-urn-errors {
+    SELECT 'urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type uuid: "urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+test cast-text-to-jsonb-can-be-read-with-json-operators {
+    SELECT '{"role": "authenticated", "app_metadata": {"provider": "email"}}'::jsonb ->> 'role';
+    SELECT ('\{"a": ' || '[1, 2]\}')::jsonb -> 'a' ->> 1;
+    SELECT 5, coalesce(NULL::jsonb ->> 'a', '<null>'), 6;
+}
+expect {
+    authenticated
+    2
+    5|<null>|6
+}
+
+test cast-text-that-is-not-json-to-jsonb-errors {
+    SELECT 'not json'::jsonb;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test cast-text-with-half-an-object-to-jsonb-errors {
+    SELECT ('\{"a": ' || '1')::jsonb;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test cast-json-with-the-nul-escape-to-jsonb-errors {
+    SELECT '{"a": "\u0000"}'::jsonb;
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}

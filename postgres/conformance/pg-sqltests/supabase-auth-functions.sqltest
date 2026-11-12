@@ -1,0 +1,196 @@
+# Supabase's auth helpers, defined with the SQL of its migrations
+# (20220224000811_update_auth_functions and 20220531120530_add_auth_jwt_function
+# of supabase/auth), and what a Supabase project does with them.
+
+@database :memory:
+
+setup auth_functions {
+    create schema auth;
+
+    create or replace function auth.uid()
+    returns uuid
+    language sql stable
+    as $$
+      select
+      coalesce(
+        nullif(current_setting('request.jwt.claim.sub', true), ''),
+        (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+      )::uuid
+    $$;
+
+    create or replace function auth.role()
+    returns text
+    language sql stable
+    as $$
+      select
+      coalesce(
+        nullif(current_setting('request.jwt.claim.role', true), ''),
+        (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role')
+      )::text
+    $$;
+
+    create or replace function auth.email()
+    returns text
+    language sql stable
+    as $$
+      select
+      coalesce(
+        nullif(current_setting('request.jwt.claim.email', true), ''),
+        (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email')
+      )::text
+    $$;
+
+    comment on function auth.uid() is 'Deprecated. Use auth.jwt() -> ''sub'' instead.';
+    comment on function auth.role() is 'Deprecated. Use auth.jwt() -> ''role'' instead.';
+    comment on function auth.email() is 'Deprecated. Use auth.jwt() -> ''email'' instead.';
+
+    create or replace function auth.jwt()
+    returns jsonb
+    language sql stable
+    as $$
+      select
+        coalesce(
+            nullif(current_setting('request.jwt.claim', true), ''),
+            nullif(current_setting('request.jwt.claims', true), '')
+        )::jsonb
+    $$;
+}
+
+@setup auth_functions
+test auth-helpers-without-claims-return-null {
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.role(), '<null>'), coalesce(auth.email(), '<null>'), coalesce(auth.jwt() ->> 'role', '<null>');
+}
+expect {
+    <null>|<null>|<null>|<null>
+}
+
+@setup auth_functions
+test auth-helpers-read-request-jwt-claims {
+    SELECT length(set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}', false)) > 0;
+    SELECT auth.uid(), auth.role(), auth.email(), auth.jwt() ->> 'role';
+}
+expect {
+    t
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|authenticated|a@b.co|authenticated
+}
+expect @tursopg {
+    1
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|authenticated|a@b.co|authenticated
+}
+
+@setup auth_functions
+test auth-role-reads-the-role-claim-setting-before-the-claims {
+    SELECT set_config('request.jwt.claims', '{"role": "authenticated"}', false);
+    SELECT auth.role();
+    SELECT set_config('request.jwt.claim.role', 'anon', false);
+    SELECT auth.role();
+    SELECT quote_literal(set_config('request.jwt.claim.role', '', false));
+    SELECT auth.role();
+}
+expect {
+    {"role": "authenticated"}
+    authenticated
+    anon
+    anon
+    ''
+    authenticated
+}
+
+@setup auth_functions
+test auth-role-of-a-role-claim-that-is-not-a-string {
+    SELECT set_config('request.jwt.claims', '{"role": 7}', false);
+    SELECT auth.role();
+    SELECT set_config('request.jwt.claims', '{"role": null}', false);
+    SELECT coalesce(auth.role(), '<null>');
+}
+expect {
+    {"role": 7}
+    7
+    {"role": null}
+    <null>
+}
+
+@setup auth_functions
+test auth-role-with-claims-that-are-not-json-errors {
+    SELECT set_config('request.jwt.claims', 'not json', false);
+    SELECT auth.role();
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+@setup auth_functions
+test auth-helpers-in-where {
+    CREATE TABLE notes (id int PRIMARY KEY, owner uuid, audience text);
+    INSERT INTO notes VALUES
+        (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'authenticated'),
+        (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'authenticated'),
+        (3, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'anon');
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","role":"authenticated"}', false);
+    SELECT id FROM notes WHERE owner = auth.uid() AND audience = auth.role() ORDER BY id;
+    SELECT id FROM notes WHERE owner = (SELECT auth.uid()) ORDER BY id;
+}
+expect {
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","role":"authenticated"}
+    1
+    1
+    3
+}
+
+@setup auth_functions
+test auth-helpers-as-column-defaults {
+    CREATE TABLE notes (id int PRIMARY KEY, owner uuid DEFAULT auth.uid(), audience text DEFAULT auth.role(), email text DEFAULT auth.email());
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}', false);
+    INSERT INTO notes (id) VALUES (1) RETURNING owner, audience, email;
+}
+expect {
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|authenticated|a@b.co
+}
+
+@setup auth_functions
+test auth-helper-default-is-printed-with-its-schema {
+    CREATE TABLE notes (owner uuid DEFAULT auth.uid(), audience text DEFAULT auth.role());
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
+    WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 'notes') ORDER BY adnum;
+}
+expect {
+    auth.uid()
+    auth.role()
+}
+
+@setup auth_functions
+test auth-helpers-in-a-check-constraint {
+    CREATE TABLE notes (owner uuid CHECK (owner = auth.uid()), audience text CHECK (audience = auth.role()));
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","role":"authenticated"}', false);
+    INSERT INTO notes VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'authenticated');
+    SELECT count(*) FROM notes;
+}
+expect {
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","role":"authenticated"}
+    1
+}
+
+@setup auth_functions
+test auth-helper-check-constraint-rejects-another-users-row {
+    CREATE TABLE notes (owner uuid CHECK (owner = auth.uid()));
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}', false);
+    INSERT INTO notes VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+@sqlstate 23514
+expect error {
+    violates check constraint
+}
+
+@setup auth_functions
+test auth-helpers-are-listed-in-pg-proc {
+    SELECT p.proname, p.provolatile FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'auth' ORDER BY p.proname;
+}
+expect {
+    email|s
+    jwt|s
+    role|s
+    uid|s
+}

@@ -57,6 +57,21 @@ fn position_in_form_returns_index() {
     );
 }
 
+/// A semicolon at the end of a line inside a quoted string that spans
+/// lines does not end the statement.
+#[test]
+fn quoted_string_over_several_lines_with_semicolons() {
+    let output = run_tursopg(
+        b"SELECT length('a\nb;\nc') + 100 AS a;\nSELECT length($$a\nb;\nc$$) + 200 AS b;\nSELECT 'done' AS c;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for expected in ["106", "206", "done"] {
+        assert!(out.contains(expected), "expected {expected}: {out}");
+    }
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
 #[test]
 fn create_table_then_select() {
     let output = run_tursopg(

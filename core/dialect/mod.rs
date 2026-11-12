@@ -19,7 +19,7 @@ pub(crate) use engine::EngineDialect;
 
 use crate::{
     function::ScalarFunc,
-    namespace::NamespaceId,
+    namespace::{NamespaceId, NamespaceRef, Qualifiers},
     schema::{BTreeTable, RelationKind, Schema},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
@@ -27,7 +27,7 @@ use crate::{
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{
-    self, Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt,
+    self, Cmd, CreateTableBody, Expr, Grantee, Privilege, QualifiedName, RoleSpec, Stmt,
 };
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -109,6 +109,16 @@ pub enum NewOwner {
     Table(Option<String>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// What a dialect looks its own functions up in when a statement calls one.
+pub struct FunctionScope<'a> {
+    pub schema: &'a Schema,
+    /// The names that can qualify a function name, with their namespaces.
+    pub qualifiers: &'a Qualifiers,
+    /// The namespaces that a function name without a qualifier is looked up
+    /// in, in order.
+    pub search_order: &'a [NamespaceRef],
 }
 
 /// What a built-in scalar function may read besides its arguments.
@@ -285,6 +295,24 @@ pub trait Dialect: Send + Sync + 'static {
         _args: &[Value],
     ) -> Result<Value> {
         Err(LimboError::ParseError(format!("no such function: {name}")))
+    }
+
+    /// The expression that a call of function `name` with `args` stands
+    /// for, or None when `name` is not a function that the dialect expands.
+    /// The engine compiles the expression in place of the call, so the
+    /// optimizer sees what the function computes. A dialect uses it for
+    /// functions that users define with an SQL expression, as PostgreSQL's
+    /// `CREATE FUNCTION ... LANGUAGE sql` does. Consulted for a name that
+    /// [`Dialect::resolve_function`] does not resolve, before extension
+    /// functions.
+    fn expand_function_call(
+        &self,
+        scope: &FunctionScope<'_>,
+        name: &str,
+        args: &[Box<Expr>],
+    ) -> Result<Option<Expr>> {
+        let _ = (scope, name, args);
+        Ok(None)
     }
 
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
@@ -677,6 +705,38 @@ mod tests {
                 return Ok(Some(Func::Dialect("test_add_one".to_string())));
             }
             engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn expand_function_call(
+            &self,
+            _scope: &FunctionScope<'_>,
+            name: &str,
+            args: &[Box<Expr>],
+        ) -> Result<Option<Expr>> {
+            let [arg] = args else {
+                return Ok(None);
+            };
+            if name.eq_ignore_ascii_case("test_forever") {
+                return Ok(Some(Expr::FunctionCall {
+                    name: turso_parser::ast::Name::exact("test_forever".to_string()),
+                    distinctness: None,
+                    args: args.to_vec(),
+                    order_by: Vec::new(),
+                    within_group: Vec::new(),
+                    filter_over: turso_parser::ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                }));
+            }
+            if !name.eq_ignore_ascii_case("test_twice") {
+                return Ok(None);
+            }
+            Ok(Some(Expr::Binary(
+                arg.clone(),
+                turso_parser::ast::Operator::Add,
+                arg.clone(),
+            )))
         }
 
         fn exec_scalar_function(
@@ -1247,6 +1307,114 @@ mod tests {
         // Unknown names still error.
         let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
         assert!(err.to_string().contains("no such function"));
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_expands_a_function_call_into_an_expression() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-expand.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let query = |sql: &str| conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER DEFAULT (test_twice(4)))")
+            .unwrap();
+        conn.execute("INSERT INTO t (a) VALUES (1), (2), (3)")
+            .unwrap();
+
+        assert_eq!(
+            query("SELECT test_twice(a), b FROM t WHERE a = test_twice(1)"),
+            vec![vec![Value::from_i64(4), Value::from_i64(8)]]
+        );
+        // The expansion is compiled like any expression, so its arguments
+        // can be aggregates, subqueries and other expanded calls.
+        assert_eq!(
+            query("SELECT test_twice(count(*)), test_twice((SELECT max(a) FROM t)) FROM t"),
+            vec![vec![Value::from_i64(6), Value::from_i64(6)]]
+        );
+        assert_eq!(
+            query("SELECT test_twice(test_twice(a)) FROM t ORDER BY test_twice(a) DESC LIMIT 1"),
+            vec![vec![Value::from_i64(12)]]
+        );
+        conn.execute("CREATE VIEW v AS SELECT test_twice(a) AS doubled FROM t")
+            .unwrap();
+        assert_eq!(
+            query("SELECT doubled FROM v WHERE doubled > 2 ORDER BY doubled"),
+            vec![vec![Value::from_i64(4)], vec![Value::from_i64(6)]]
+        );
+
+        // A CHECK constraint can call the function too.
+        conn.execute("CREATE TABLE c (a INTEGER CHECK (a = test_twice(2)))")
+            .unwrap();
+        conn.execute("INSERT INTO c VALUES (4)").unwrap();
+        let err = conn.execute("INSERT INTO c VALUES (5)").unwrap_err();
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+
+        // The optimizer sees the expansion: the comparison with the primary
+        // key is a seek, not a scan.
+        let plan = query("EXPLAIN QUERY PLAN SELECT b FROM t WHERE a = test_twice(1)");
+        let detail = plan[0].last().unwrap().to_string();
+        assert!(detail.contains("SEARCH"), "{detail}");
+
+        // The dialect expands the call only with one argument.
+        let err = conn.prepare("SELECT test_twice(1, 2)").unwrap_err();
+        assert!(err.to_string().contains("no such function"), "{err}");
+
+        // An expansion that calls the function again is an error instead of
+        // a statement that never finishes compiling.
+        let err = conn.prepare("SELECT test_forever(1)").unwrap_err();
+        assert!(err.to_string().contains("does it call itself"), "{err}");
+        let err = conn
+            .prepare("CREATE TABLE u (a INTEGER DEFAULT (test_forever(1)))")
+            .and_then(|mut stmt| stmt.run_ignore_rows())
+            .and_then(|()| conn.execute("INSERT INTO u DEFAULT VALUES"))
+            .unwrap_err();
+        assert!(err.to_string().contains("does it call itself"), "{err}");
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_schema_write_increments_the_schema_cookie() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-state.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let schema_version = || {
+            conn.prepare("PRAGMA schema_version")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        let write = |sql: &str| {
+            conn.prepare_dialect_schema_write(sql)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap()
+        };
+
+        conn.execute("CREATE TABLE state (name TEXT)").unwrap();
+        let before = schema_version();
+        write("INSERT INTO state VALUES ('a')");
+        let after_insert = schema_version();
+        assert_ne!(before, after_insert);
+        write("DELETE FROM state WHERE name = 'a'");
+        let after_delete = schema_version();
+        assert_ne!(after_insert, after_delete);
+
+        // A write that is rolled back leaves the cookie as it was.
+        conn.execute("BEGIN").unwrap();
+        write("INSERT INTO state VALUES ('b')");
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(schema_version(), after_delete);
+        let rows = conn
+            .prepare("SELECT count(*) FROM state")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
         conn.close().unwrap();
     }
 

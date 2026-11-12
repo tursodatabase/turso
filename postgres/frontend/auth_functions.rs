@@ -4,6 +4,11 @@ use turso_core::native_ext::FunctionArity;
 use turso_core::{Connection, OpenOptions, Result};
 use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
 
+/// The schema of the functions of this module. The functions exist in a
+/// database that has no such schema, so a call of a function of the schema
+/// is not an error for the missing schema.
+pub(crate) const SCHEMA: &str = "auth";
+
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
         .extension_function(pg_scalar_function(

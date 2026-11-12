@@ -1857,7 +1857,7 @@ pub(crate) fn ensure_classes_table(
 /// Runs `change` in a write transaction of its own. Two processes can race
 /// to open the same file; BEGIN IMMEDIATE serializes them, and `change`
 /// finds what the winner did.
-fn in_write_transaction(
+pub(crate) fn in_write_transaction(
     conn: &Arc<Connection>,
     change: fn(&Arc<Connection>) -> crate::Result<()>,
 ) -> crate::Result<()> {
@@ -1942,7 +1942,7 @@ fn table_exists(conn: &Arc<Connection>, name: &str) -> crate::Result<bool> {
         .is_some())
 }
 
-fn run_internal(conn: &Arc<Connection>, sql: &str) -> crate::Result<()> {
+pub(crate) fn run_internal(conn: &Arc<Connection>, sql: &str) -> crate::Result<()> {
     conn.prepare_engine_schema_statement(sql)?
         .run_ignore_rows()
         .map_err(Into::into)
