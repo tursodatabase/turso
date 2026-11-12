@@ -1307,13 +1307,18 @@ impl Value {
             if lhs.len() + rhs.len() > Self::MAX_BLOB_LENGTH as usize {
                 return Err(LimboError::TooBig);
             }
-            let mut blob =
+            let mut joined =
                 <crate::ValueBlob as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     lhs.len() + rhs.len(),
                 )?;
-            blob.extend_from_slice(lhs);
-            blob.extend_from_slice(rhs);
-            return Ok(Value::Blob(blob));
+            joined.extend_from_slice(lhs);
+            joined.extend_from_slice(rhs);
+            if crate::types::validate_utf8(&joined).is_none() {
+                return Ok(Value::Blob(joined));
+            }
+            // SAFETY: validate_utf8 just checked that the bytes are valid UTF-8.
+            let text = unsafe { std::str::from_utf8_unchecked(&joined) };
+            return Ok(Value::build_text(text.to_string()));
         }
 
         let Some(lhs) = self.cast_text_ref() else {
@@ -1895,11 +1900,22 @@ mod tests {
     }
 
     #[test]
-    fn exec_concat_builds_blob_fallibly() {
+    fn exec_concat_of_blobs_is_text_when_the_bytes_are_utf8() {
         let lhs = blob(&[1, 2]);
         let rhs = blob(&[3, 4]);
 
-        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+        assert_eq!(
+            lhs.exec_concat(&rhs).unwrap(),
+            Value::build_text("\u{1}\u{2}\u{3}\u{4}")
+        );
+    }
+
+    #[test]
+    fn exec_concat_of_blobs_keeps_bytes_that_are_not_utf8() {
+        let lhs = blob(&[0xff]);
+        let rhs = blob(&[0xfe]);
+
+        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[0xff, 0xfe]));
     }
 
     #[test]
