@@ -545,7 +545,10 @@ Notes on `CREATE FUNCTION`:
 - PostgreSQL stores a function before it checks the body, so a body can call
   the new function. tursopg checks the body before it stores the function,
   so the check does not find the new function.
-- A function name with an uppercase letter is rejected.
+- `CREATE FUNCTION` rejects a function name with an uppercase letter. A
+  database can have such a function from a version without this rule:
+  `pg_proc` shows it and `DROP FUNCTION` removes it, but no statement can
+  call it.
 - A function and a table or view of the same schema cannot have the same
   name. PostgreSQL accepts this. tursopg stores the name of a relation in
   lowercase, so the function `thing` and the table `"Thing"` have the same

@@ -922,3 +922,17 @@ fn emit_function_change(
 fn no_catalog() -> LimboError {
     LimboError::ParseError("the database has no relation catalog".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stored_function_with_an_uppercase_letter_in_its_name_is_readable() {
+        let definition = parse_stored_function(
+            r#"CREATE FUNCTION "One"() RETURNS integer LANGUAGE sql AS $$SELECT 1$$"#,
+        )
+        .unwrap();
+        assert_eq!(definition.name.name.as_str(), "One");
+    }
+}

@@ -1010,3 +1010,12 @@ expect {
 expect @tursopg error {
     a function name with an uppercase letter is not supported
 }
+
+# An error of PostgreSQL comes before the refusal of the name.
+test function-name-with-an-uppercase-letter-and-a-language-that-does-not-exist {
+    CREATE FUNCTION "One"() RETURNS integer LANGUAGE nosuch AS $$SELECT 1$$;
+}
+@sqlstate 42704
+expect error {
+    language "nosuch" does not exist
+}
