@@ -1663,3 +1663,75 @@ test random-divisor-is-not-an-integer {
 expect {
     ok
 }
+
+# log(b, x) is defined for every positive base other than 1. SQLite's log()
+# returns NULL for a base below 1, so tursopg does not use it for two arguments.
+test log-base-below-one {
+    SELECT CASE WHEN abs(log(0.5, 8) + 3) < 1e-12 THEN 'ok' END,
+           CASE WHEN abs(log(0.1, 100) + 2) < 1e-12 THEN 'ok' END,
+           CASE WHEN abs(log(0.5, 0.25) - 2) < 1e-12 THEN 'ok' END;
+}
+expect {
+    ok|ok|ok
+}
+
+test log-base-below-one-from-columns {
+    SELECT CASE WHEN abs(log(b, x) + 3) < 1e-12 THEN 'ok' END FROM (VALUES (0.5, 8)) AS v(b, x);
+}
+expect {
+    ok
+}
+
+test log-base-above-one {
+    SELECT CASE WHEN abs(log(2, 8) - 3) < 1e-12 THEN 'ok' END;
+}
+expect {
+    ok
+}
+
+test log-null-argument-is-null {
+    SELECT CASE WHEN log(NULL, 8) IS NULL AND log(0.5, NULL) IS NULL THEN 'ok' END;
+}
+expect {
+    ok
+}
+
+test log-base-one-is-division-by-zero {
+    SELECT log(1, 8);
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+
+test log-base-zero-errors {
+    SELECT log(0, 8);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of zero
+}
+
+test log-of-zero-errors {
+    SELECT log(0.5, 0);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of zero
+}
+
+test log-negative-base-errors {
+    SELECT log(-2, 8);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of a negative number
+}
+
+test log-of-negative-number-errors {
+    SELECT log(0.5, -8);
+}
+@sqlstate 2201E
+expect error {
+    cannot take logarithm of a negative number
+}

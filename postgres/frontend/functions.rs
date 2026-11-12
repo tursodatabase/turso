@@ -11,11 +11,11 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ARGUMENT_FOR_LOGARITHM,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -131,6 +131,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
+        "log"(FunctionArity::Exact(2), true) => exec_log(args)?,
         "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
             FunctionArity::Variadic, false
         ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
@@ -538,6 +539,37 @@ fn unrecognized_parameter(name: &str) -> LimboError {
 fn exec_random(bits: i64) -> f64 {
     let mantissa = (bits as u64) >> 11;
     mantissa as f64 / (1_u64 << 53) as f64
+}
+
+/// log(b, x) as PostgreSQL computes it: defined for every positive base
+/// other than 1, and an error, not NULL, outside that domain.
+fn exec_log(args: &[Register]) -> Result<Option<f64>> {
+    let number = |i: usize| Numeric::from_value_strict(args[i].get_value()).map(|n| n.to_f64());
+    let (Some(base), Some(x)) = (number(0), number(1)) else {
+        return Ok(None);
+    };
+    let ln_base = ln(base)?;
+    let ln_x = ln(x)?;
+    if ln_base == 0.0 {
+        return Err(LimboError::DivisionByZero);
+    }
+    Ok(Some(ln_x / ln_base))
+}
+
+fn ln(x: f64) -> Result<f64> {
+    if x == 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_LOGARITHM,
+            "cannot take logarithm of zero",
+        ));
+    }
+    if x < 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_LOGARITHM,
+            "cannot take logarithm of a negative number",
+        ));
+    }
+    Ok(x.ln())
 }
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
