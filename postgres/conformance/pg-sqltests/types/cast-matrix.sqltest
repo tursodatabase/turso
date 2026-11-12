@@ -846,7 +846,7 @@ test cast-int4-to-uuid {
 }
 @sqlstate 42846
 expect error {}
-@sqlstate 22P02
+@sqlstate 42804
 expect @tursopg error {}
 
 @compat-gap "cast:bool -> uuid"
@@ -855,7 +855,7 @@ test cast-bool-to-uuid {
 }
 @sqlstate 42846
 expect error {}
-@sqlstate 22P02
+@sqlstate 42804
 expect @tursopg error {}
 
 @compat-gap "type:bytea"
@@ -2358,7 +2358,6 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
-@compat-gap "cast:int4 -> uuid"
 test assign-int4-to-uuid-column {
     CREATE TABLE t (c uuid);
     INSERT INTO t VALUES (5);
@@ -2366,8 +2365,6 @@ test assign-int4-to-uuid-column {
 }
 @sqlstate 42804
 expect error {}
-@sqlstate 22P02
-expect @tursopg error {}
 
 @compat-gap "cast:uuid -> int4"
 test assign-uuid-to-int4-column {

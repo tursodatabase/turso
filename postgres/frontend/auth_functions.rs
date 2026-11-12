@@ -1,5 +1,6 @@
 use crate::error::sqlstate_error;
 use crate::functions::{invalid_json, pg_scalar_function, unsupported_unicode_escape, Uuid};
+use crate::pg_type::jsonb::has_nul_escape;
 use turso_core::native_ext::FunctionArity;
 use turso_core::{Connection, OpenOptions, Result};
 use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
@@ -76,14 +77,4 @@ fn parse_claims(claims: &str) -> Result<serde_json::Value> {
         return Err(unsupported_unicode_escape());
     }
     Ok(parsed_claims)
-}
-
-fn has_nul_escape(json: &str) -> bool {
-    let mut bytes = json.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'\\' && bytes.next() == Some(b'u') && bytes.by_ref().take(4).eq(*b"0000") {
-            return true;
-        }
-    }
-    false
 }

@@ -3743,8 +3743,22 @@ impl PostgreSQLTranslator {
                         None => error,
                     });
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int8_cast_operand(arg, *expr));
+                match extract_type_name_from_typename(pg_type_name)?.as_str() {
+                    "int8" => expr = Box::new(int8_cast_operand(arg, *expr)),
+                    // The engine's cast to jsonb does not check text by
+                    // PostgreSQL's rules. An index expression and a
+                    // generation expression can use only core functions, so
+                    // there the text is not checked. A number or a boolean
+                    // has no text to check, and a call around a boolean
+                    // would make `true` reach the cast as 1.
+                    "jsonb"
+                        if !self.translating_index.get()
+                            && self.generation_expression_table.borrow().is_none()
+                            && !is_number_or_boolean_literal(&expr) =>
+                    {
+                        expr = Box::new(function_call("jsonb_in", vec![*expr]))
+                    }
+                    _ => {}
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -7985,6 +7999,22 @@ fn json_type_or_raise(
             )
             .collect(),
         else_expr: Some(raise(error)),
+    }
+}
+
+/// Whether `expr` is a number literal or a boolean literal, which the
+/// translator writes as `CAST(1 AS boolean)`.
+fn is_number_or_boolean_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
+        ast::Expr::Cast {
+            expr,
+            type_name: Some(type_name),
+        } => {
+            type_name.name == "boolean"
+                && matches!(**expr, ast::Expr::Literal(ast::Literal::Numeric(_)))
+        }
+        _ => false,
     }
 }
 

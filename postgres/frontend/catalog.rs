@@ -4484,6 +4484,16 @@ fn render_expr(expr: &ast::Expr) -> String {
                 *collation = ast::Name::from_string("\"C\"");
             }
         }
+        // The translator calls jsonb_in in front of a cast to jsonb. It is
+        // not a part of the expression that the user wrote.
+        if let ast::Expr::Cast { expr: operand, .. } = expr {
+            if let ast::Expr::FunctionCall { name, args, .. } = &mut **operand {
+                if name.as_str() == "jsonb_in" && args.len() == 1 {
+                    let text = args.pop().expect("jsonb_in has one argument");
+                    *operand = text;
+                }
+            }
+        }
         if let ast::Expr::FunctionCall { name, args, .. } = expr {
             if args.is_empty() {
                 if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
