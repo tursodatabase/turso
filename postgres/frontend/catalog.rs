@@ -47,6 +47,14 @@ const CONSTRAINT_OID_START: i64 = 1 << 30;
 pub struct PostgresDialect;
 
 impl Dialect for PostgresDialect {
+    fn unique_subquery_column_names(&self) -> bool {
+        false
+    }
+
+    fn aliased_join_hides_input_names(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "postgres"
     }

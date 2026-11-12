@@ -1901,6 +1901,9 @@ pub struct OuterQueryReference {
     /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
     /// errors when the same column name exists at different nesting depths.
     pub scope_depth: usize,
+    /// This same-level FROM reference is visible inside LATERAL items, but not
+    /// in the enclosing parenthesized join's ON clauses.
+    pub hidden_from_join_on: bool,
 }
 
 impl OuterQueryReference {
@@ -2158,6 +2161,10 @@ impl TableReferences {
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
     pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
         &self.outer_query_refs
+    }
+
+    pub(crate) fn outer_query_refs_mut(&mut self) -> &mut [OuterQueryReference] {
+        &mut self.outer_query_refs
     }
 
     /// Remove outer references after an optimizer rewrite has removed every
@@ -3248,7 +3255,9 @@ fn subquery_output_columns(
     resolver: &Resolver,
 ) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
-    make_column_names_unique(&mut columns);
+    if resolver.catalog.dialect.unique_subquery_column_names() {
+        make_column_names_unique(&mut columns);
+    }
     Ok((columns, column_types))
 }
 

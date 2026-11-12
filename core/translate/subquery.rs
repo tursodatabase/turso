@@ -40,7 +40,7 @@ use crate::{
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
-            WhereTerm,
+            WhereTerm, WhereTermOrigin,
         },
         select::prepare_select_plan,
     },
@@ -278,20 +278,48 @@ pub fn plan_subqueries_from_select_plan(
     {
         crate::stack::trace_stack!("select_where");
         let aggregates_moved_before_where = resolver.count_aggregates_moved_from_subqueries();
-        plan_subqueries_with_outer_query_access(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            plan.where_clause.iter_mut().map(|t| &mut t.expr),
-            connection,
-            SubqueryPosition::Where,
-            SubqueryOrigin::SelectWhere,
-            SubqueryPosition::Where.allow_correlated(),
-            &mut cse_map,
-            &mut same_query_map,
-            &[],
-        )?;
+        for term in &mut plan.where_clause {
+            let mut hidden = Vec::new();
+            if matches!(term.origin, WhereTermOrigin::Join(_)) {
+                for (index, reference) in plan
+                    .table_references
+                    .outer_query_refs_mut()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    if reference.hidden_from_join_on && reference.scope_depth == 0 {
+                        hidden.push((index, reference.cte_definition_only));
+                        reference.cte_definition_only = true;
+                    }
+                }
+            }
+            // Expressions planned under different visibility rules cannot share a cached subquery.
+            let mut restricted_query_map = Vec::new();
+            let query_map = if hidden.is_empty() {
+                &mut same_query_map
+            } else {
+                &mut restricted_query_map
+            };
+            let result = plan_subqueries_with_outer_query_access(
+                program,
+                &mut plan.non_from_clause_subqueries,
+                &mut plan.table_references,
+                resolver,
+                std::iter::once(&mut term.expr),
+                connection,
+                SubqueryPosition::Where,
+                SubqueryOrigin::SelectWhere,
+                SubqueryPosition::Where.allow_correlated(),
+                &mut cse_map,
+                query_map,
+                &[],
+            );
+            for (index, was_definition_only) in hidden {
+                plan.table_references.outer_query_refs_mut()[index].cte_definition_only =
+                    was_definition_only;
+            }
+            result?;
+        }
         // A subquery in WHERE moves an aggregate of this query's columns up to
         // this query, but this query cannot compute an aggregate in WHERE. ON
         // clauses and table-valued function arguments are WHERE terms too.
@@ -704,6 +732,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 outer_join_may_null_extend: referenced_tables
                     .outer_join_may_null_extend(t.internal_id),
                 scope_depth: 0,
+                hidden_from_join_on: false,
             };
             Ok::<_, crate::LimboError>(outer_ref)
         })
@@ -723,6 +752,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 rowid_referenced: false,
                 outer_join_may_null_extend: t.outer_join_may_null_extend,
                 scope_depth: t.scope_depth + 1,
+                hidden_from_join_on: t.hidden_from_join_on,
             })
         }))
         .try_collect::<Result<crate::alloc::Vec<_>>>()??;

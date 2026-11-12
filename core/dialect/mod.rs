@@ -123,6 +123,16 @@ pub struct ScalarFuncContext<'a> {
 /// preparation, re-preparation, and every schema load go through this
 /// interface.
 pub trait Dialect: Send + Sync + 'static {
+    /// Whether duplicate output names of a FROM subquery are made unique.
+    fn unique_subquery_column_names(&self) -> bool {
+        true
+    }
+
+    /// Whether an alias on a parenthesized join hides its input table names.
+    fn aliased_join_hides_input_names(&self) -> bool {
+        false
+    }
+
     /// Stable identifier for this dialect (e.g. "sqlite", "postgres").
     ///
     /// A database file must always be opened with the same dialect it was

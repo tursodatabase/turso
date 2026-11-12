@@ -1269,6 +1269,7 @@ fn plan_cte(
                 rowid_referenced: false,
                 outer_join_may_null_extend: false,
                 scope_depth: 0,
+                hidden_from_join_on: false,
             });
         }
         Ok(outer_query_refs)
@@ -1472,6 +1473,7 @@ fn prepare_recursive_cte_plan(
         rowid_referenced: false,
         outer_join_may_null_extend: false,
         scope_depth: 0,
+        hidden_from_join_on: false,
     });
 
     let recursive_query = prepare_select_plan_from_arms(
@@ -1591,6 +1593,7 @@ pub fn plan_ctes_as_outer_refs(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
@@ -1599,6 +1602,7 @@ fn parse_from_clause_table(
     vtab_predicates: &mut Vec<Expr>,
     cte_definitions: &[CteDefinition],
     connection: &Arc<crate::Connection>,
+    aliased_join_group: bool,
 ) -> Result<()> {
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => parse_table(
@@ -1626,6 +1630,13 @@ fn parse_from_clause_table(
             } else {
                 table_references.outer_query_refs().to_vec()
             };
+            if aliased_join_group && lateral {
+                for reference in &mut outer_query_refs_for_subquery {
+                    if reference.scope_depth == 0 {
+                        reference.hidden_from_join_on = true;
+                    }
+                }
+            }
             // Make the parent's CTEs visible while planning this inline subquery.
             let base_outer_query_refs_for_subquery = base_outer_refs_for_cte_planning(
                 table_references.outer_query_refs(),
@@ -1675,6 +1686,7 @@ fn parse_from_clause_table(
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
+                    hidden_from_join_on: false,
                 });
             }
 
@@ -1747,11 +1759,15 @@ fn parse_from_clause_table(
                 vtab_predicates,
                 cte_definitions,
                 connection,
+                false,
             )
         }
         ast::SelectTable::Sub(from_clause, maybe_alias) => {
             // SQLite represents a parenthesized join group as a SELECT * subquery.
             // It names an unaliased group "(join-N)" in query plans.
+            let aliased_join_group =
+                maybe_alias.is_some() && resolver.catalog.dialect.aliased_join_hides_input_names();
+            let lateral = aliased_join_group && from_clause_contains_lateral(&from_clause);
             let alias = maybe_alias.unwrap_or_else(|| {
                 ast::As::As(ast::Name::exact(format!(
                     "(join-{})",
@@ -1778,7 +1794,7 @@ fn parse_from_clause_table(
                 ast::SelectTable::Select {
                     select: join_select,
                     alias: Some(alias),
-                    lateral: false,
+                    lateral,
                 },
                 resolver,
                 program,
@@ -1786,7 +1802,11 @@ fn parse_from_clause_table(
                 vtab_predicates,
                 cte_definitions,
                 connection,
+                aliased_join_group,
             )?;
+            if aliased_join_group {
+                return Ok(());
+            }
             let table = table_references
                 .joined_tables_mut()
                 .last_mut()
@@ -1794,6 +1814,18 @@ fn parse_from_clause_table(
             keep_parenthesized_join_columns(table, resolver)
         }
     }
+}
+
+fn from_clause_contains_lateral(from: &ast::FromClause) -> bool {
+    fn table_has_lateral(table: &ast::SelectTable) -> bool {
+        match table {
+            ast::SelectTable::Select { lateral, .. } => *lateral,
+            ast::SelectTable::Sub(from, _) => from_clause_contains_lateral(from),
+            ast::SelectTable::TableCall(..) => true,
+            ast::SelectTable::Table(..) => false,
+        }
+    }
+    table_has_lateral(&from.select) || from.joins.iter().any(|join| table_has_lateral(&join.table))
 }
 
 /// Keep the source columns that SQLite stores for a parenthesized join.
@@ -2535,6 +2567,7 @@ pub fn parse_from(
             vtab_predicates,
             &cte_definitions,
             connection,
+            false,
         )?;
 
         for join in joins_owned.into_iter() {
@@ -2599,6 +2632,7 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             rowid_referenced: false,
             outer_join_may_null_extend: false,
             scope_depth: 0,
+            hidden_from_join_on: false,
         });
     }
 
@@ -3091,6 +3125,7 @@ fn parse_join(
         vtab_predicates,
         cte_definitions,
         connection,
+        false,
     )?;
     let lateral_reference = left_table_read_by_rightmost_table(table_references).map(str::to_owned);
 
@@ -3176,16 +3211,35 @@ fn parse_join(
             ast::JoinConstraint::On(ref expr) => {
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
-                for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.origin = WhereTermOrigin::Join(join_origin);
-                    bind_and_rewrite_expr(
-                        &mut predicate.expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                let mut hidden = Vec::new();
+                for (index, reference) in table_references
+                    .outer_query_refs_mut()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    if reference.hidden_from_join_on && reference.scope_depth == 0 {
+                        hidden.push((index, reference.cte_definition_only));
+                        reference.cte_definition_only = true;
+                    }
                 }
+                let result = (|| -> Result<()> {
+                    for predicate in out_where_clause[start_idx..].iter_mut() {
+                        predicate.origin = WhereTermOrigin::Join(join_origin);
+                        bind_and_rewrite_expr(
+                            &mut predicate.expr,
+                            Some(table_references),
+                            None,
+                            resolver,
+                            BindingBehavior::TryResultColumnsFirst,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                for (index, was_definition_only) in hidden {
+                    table_references.outer_query_refs_mut()[index].cte_definition_only =
+                        was_definition_only;
+                }
+                result?;
             }
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates

@@ -1035,6 +1035,7 @@ pub fn translate_alter_table(
                             rowid_referenced: false,
                             outer_join_may_null_extend: false,
                             scope_depth: 0,
+                            hidden_from_join_on: false,
                         }],
                     );
                     let where_copy = index

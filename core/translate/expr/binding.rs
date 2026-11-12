@@ -56,12 +56,15 @@ pub(super) fn resolve_qualified_on_ref(
     internal_id: TableInternalId,
     normalized_id: &str,
 ) -> Result<Option<QualifiedMatch>> {
-    if let Some(col_idx) = table.columns().iter().position(|c| {
+    let mut matching = table.columns().iter().enumerate().filter(|(_, c)| {
         c.name
             .as_ref()
             .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
-    }) {
-        let col = table.columns().get(col_idx).unwrap();
+    });
+    if let Some((col_idx, col)) = matching.next() {
+        if matching.next().is_some() {
+            crate::bail_parse_error!("ambiguous column name: {}", normalized_id);
+        }
         return Ok(Some(QualifiedMatch::Column {
             col_idx,
             is_rowid_alias: col.is_rowid_alias(),
@@ -771,6 +774,23 @@ pub(in crate::translate) fn lookup_unqualified_column(
     include_rowid: bool,
 ) -> ColumnLookup {
     let Some(join_columns) = table.parenthesized_join_columns() else {
+        if matches!(
+            table,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+        ) && table
+            .columns()
+            .iter()
+            .filter(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+            })
+            .count()
+            > 1
+        {
+            return ColumnLookup::Ambiguous;
+        }
         return match table.get_column_by_name(column_name) {
             Some((column_index, _)) => ColumnLookup::Found(column_index),
             None => ColumnLookup::Missing,
