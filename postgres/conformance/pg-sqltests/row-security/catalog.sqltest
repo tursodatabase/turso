@@ -1,8 +1,8 @@
-# How pg_policy shows row-level security policies, through the PostgreSQL
-# frontend. Oids differ between servers, so the tests compare them instead
-# of printing them. pg_get_expr prints a condition as PostgreSQL's ruleutils
-# does: every operator in parentheses, and a cast where a quoted literal
-# meets a column.
+# How pg_policy and the pg_policies view show row-level security policies,
+# through the PostgreSQL frontend. Oids differ between servers, so the tests
+# compare them instead of printing them. pg_get_expr prints a condition as
+# PostgreSQL's ruleutils does: every operator in parentheses, and a cast
+# where a quoted literal meets a column.
 # PostgreSQL roles belong to the whole server, so every test uses its own
 # role and table names.
 
@@ -176,4 +176,47 @@ test pg-policy-rows-are-rolled-back-with-their-transaction {
 expect {
     rolled_back
     kept
+}
+
+test pg-policies-shows-each-policy {
+    CREATE ROLE pp_alice_7;
+    CREATE ROLE "PP Bob 7";
+    CREATE SCHEMA pp_schema_7;
+    CREATE TABLE pp_schema_7.pp_docs_7 (id INT, owner TEXT);
+    CREATE POLICY p_all ON pp_schema_7.pp_docs_7
+        USING (owner = current_user) WITH CHECK (id > 0);
+    CREATE POLICY p_select ON pp_schema_7.pp_docs_7 AS RESTRICTIVE FOR SELECT
+        TO pp_alice_7, "PP Bob 7" USING (id < 10);
+    CREATE POLICY p_insert ON pp_schema_7.pp_docs_7 FOR INSERT TO pp_alice_7
+        WITH CHECK (true);
+    CREATE POLICY p_update ON pp_schema_7.pp_docs_7 FOR UPDATE TO PUBLIC USING (true);
+    CREATE POLICY "P Delete" ON pp_schema_7.pp_docs_7 FOR DELETE USING (false);
+    SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check
+    FROM pg_catalog.pg_policies
+    WHERE tablename = 'pp_docs_7'
+    ORDER BY policyname;
+}
+expect {
+    pp_schema_7|pp_docs_7|P Delete|PERMISSIVE|{public}|DELETE|false|
+    pp_schema_7|pp_docs_7|p_all|PERMISSIVE|{public}|ALL|(owner = CURRENT_USER)|(id > 0)
+    pp_schema_7|pp_docs_7|p_insert|PERMISSIVE|{pp_alice_7}|INSERT||true
+    pp_schema_7|pp_docs_7|p_select|RESTRICTIVE|{"PP Bob 7",pp_alice_7}|SELECT|(id < 10)|
+    pp_schema_7|pp_docs_7|p_update|PERMISSIVE|{public}|UPDATE|true|
+}
+
+test pg-policies-follows-renamed-and-dropped-tables {
+    CREATE TABLE pp_docs_8 (id INT);
+    CREATE TABLE pp_other_8 (id INT);
+    CREATE POLICY kept ON pp_docs_8 USING (id = 1);
+    CREATE POLICY dropped ON pp_docs_8 USING (id = 2);
+    CREATE POLICY with_table ON pp_other_8 USING (id = 3);
+    ALTER TABLE pp_docs_8 RENAME TO pp_renamed_8;
+    DROP POLICY dropped ON pp_renamed_8;
+    DROP TABLE pp_other_8;
+    SELECT tablename, policyname, qual FROM pg_policies
+    WHERE tablename IN ('pp_docs_8', 'pp_renamed_8', 'pp_other_8')
+    ORDER BY policyname;
+}
+expect {
+    pp_renamed_8|kept|(id = 1)
 }

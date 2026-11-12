@@ -177,7 +177,8 @@ constants, comparisons, arithmetic, `AND`, `OR`, `NOT`, `IS [NOT] NULL`,
 `current_user`, `lower`, `upper`, `length`, `abs`, `COALESCE` and
 `(SELECT ...)` without `FROM`; other conditions, such as ones with other
 functions, casts or `CASE`, are shown as the engine's SQL. `pg_policies`
-does not show the policies yet.
+shows the same policies by schema, table and role names, with their
+conditions printed the same way.
 
 Materialized views store the rows of their query when they are refreshed, so
 a role that reads a materialized view built on a table with row-level

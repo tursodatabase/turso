@@ -5963,6 +5963,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_amproc"
             | "pg_tables"
             | "pg_indexes"
+            | "pg_policies"
     )
 }
 
@@ -5972,7 +5973,13 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 pub fn is_catalog_view_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "pg_roles" | "pg_seclabels" | "pg_sequences" | "pg_settings" | "pg_tables" | "pg_indexes"
+        "pg_roles"
+            | "pg_seclabels"
+            | "pg_sequences"
+            | "pg_settings"
+            | "pg_tables"
+            | "pg_indexes"
+            | "pg_policies"
     )
 }
 

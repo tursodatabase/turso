@@ -15,8 +15,8 @@ use turso_core::{
     },
     security::policy::RowPolicy,
     security::roles::RoleId,
-    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
-    OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
+    text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
+    NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
@@ -1457,7 +1457,6 @@ impl SnapshotRows for PgPolicyTable {
             .into_iter()
             .map(|policy| {
                 let roles = policy
-                    .policy
                     .roles
                     .iter()
                     .map(|role| role_oid(*role).to_string())
@@ -1480,11 +1479,79 @@ impl SnapshotRows for PgPolicyTable {
     }
 }
 
+#[derive(Debug)]
+struct PgPoliciesTable;
+
+impl SnapshotRows for PgPoliciesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_policies (
+            schemaname TEXT,
+            tablename TEXT,
+            policyname TEXT,
+            permissive TEXT,
+            roles TEXT[],
+            cmd TEXT,
+            qual TEXT,
+            with_check TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    /// As PostgreSQL's view: `roles` is `{public}` for PUBLIC and the role
+    /// names in order otherwise.
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let role_catalog = schema_roles(&schema);
+        catalog_policies(&schema)
+            .into_iter()
+            .map(|policy| {
+                let mut roles: Vec<String> = if policy.roles == [RoleId::PUBLIC] {
+                    vec!["public".to_string()]
+                } else {
+                    policy
+                        .roles
+                        .iter()
+                        .filter_map(|role| role_name_by_oid(role_catalog, role_oid(*role)))
+                        .collect()
+                };
+                roles.sort();
+                let permissive = if policy.policy.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                };
+                let command = match policy.policy.command {
+                    ast::PolicyCommand::All => "ALL",
+                    ast::PolicyCommand::Select => "SELECT",
+                    ast::PolicyCommand::Insert => "INSERT",
+                    ast::PolicyCommand::Update => "UPDATE",
+                    ast::PolicyCommand::Delete => "DELETE",
+                };
+                vec![
+                    Value::build_text(schema_name_of(&schema, policy.namespace).to_string()),
+                    Value::build_text(policy.table_name.to_string()),
+                    Value::build_text(policy.policy.name.clone()),
+                    Value::build_text(permissive),
+                    Value::build_text(text_array_literal(roles.iter().map(String::as_str))),
+                    Value::build_text(command),
+                    policy.qual.map_or(Value::Null, Value::build_text),
+                    policy.with_check.map_or(Value::Null, Value::build_text),
+                ]
+            })
+            .collect()
+    }
+}
+
 /// A row-level security policy as the catalogs show it.
 struct CatalogPolicy<'a> {
     oid: i64,
     table_oid: i64,
+    namespace: NamespaceId,
+    table_name: &'a str,
     policy: &'a RowPolicy,
+    /// The roles the policy applies to: only [`RoleId::PUBLIC`] when it is
+    /// one of them, as PostgreSQL stores them.
+    roles: Vec<RoleId>,
     /// The `USING` condition as PostgreSQL prints it.
     qual: Option<String>,
     /// The `WITH CHECK` condition as PostgreSQL prints it.
@@ -1511,10 +1578,18 @@ fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
             })
         };
         for (oid, policy) in class.relpolicies.iter() {
+            let roles = if policy.roles.contains(&RoleId::PUBLIC) {
+                vec![RoleId::PUBLIC]
+            } else {
+                policy.roles.clone()
+            };
             policies.push(CatalogPolicy {
                 oid,
                 table_oid: class.oid,
+                namespace: class.relnamespace,
+                table_name: &class.relname,
                 policy,
+                roles,
                 qual: condition_text(&policy.using_expr),
                 with_check: condition_text(&policy.check_expr),
             });
@@ -2735,6 +2810,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_policy",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgPolicyTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_policies",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgPoliciesTable>(PhantomData),
     );
     options = options.native_module(
         "pg_trigger",
@@ -4471,6 +4551,7 @@ mod tests {
             "pg_settings",
             "pg_extension",
             "pg_policy",
+            "pg_policies",
             "pg_trigger",
             "pg_statistic_ext",
             "pg_inherits",
