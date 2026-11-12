@@ -1439,6 +1439,43 @@ impl WalCoordination for InProcessWalCoordination {
     }
 }
 
+/// The shared writer and checkpoint locks, held while a connection overwrites
+/// the shared authority (header and frame index) with its own WAL view.
+///
+/// Taken with try-acquire only, in the order checkpoint then writer like
+/// `acquire_checkpoint_guard`, so it cannot deadlock against a checkpoint or
+/// a writer; released on drop, so every return path and unwind lets go.
+#[cfg(host_shared_wal)]
+struct AuthorityMutationLocks<'a> {
+    authority: &'a MappedSharedWalCoordination,
+    owner: SharedOwnerRecord,
+}
+
+#[cfg(host_shared_wal)]
+impl<'a> AuthorityMutationLocks<'a> {
+    fn try_acquire(
+        authority: &'a MappedSharedWalCoordination,
+        owner: SharedOwnerRecord,
+    ) -> Option<Self> {
+        if !authority.try_acquire_checkpoint(owner) {
+            return None;
+        }
+        if !authority.try_acquire_writer(owner) {
+            authority.release_checkpoint(owner);
+            return None;
+        }
+        Some(Self { authority, owner })
+    }
+}
+
+#[cfg(host_shared_wal)]
+impl Drop for AuthorityMutationLocks<'_> {
+    fn drop(&mut self) {
+        self.authority.release_writer(self.owner);
+        self.authority.release_checkpoint(self.owner);
+    }
+}
+
 /// Per-connection WAL coordination that delegates to the mmap'd tshm authority.
 ///
 /// One instance exists per `WalFile` (i.e. per `Connection`). All instances
@@ -1508,20 +1545,32 @@ impl ShmWalCoordination {
         }
     }
 
+    /// Fails with `Busy` when the shared authority has to be seeded from this
+    /// process's WAL view but another connection or process holds the writer
+    /// or checkpoint lock; see `seed_or_sync_authority`.
     fn new(
+        shared: Arc<RwLock<WalFileShared>>,
+        authority: Arc<MappedSharedWalCoordination>,
+    ) -> Result<Self> {
+        let coordination = Self::unseeded(shared, authority);
+        coordination.seed_or_sync_authority()?;
+        Ok(coordination)
+    }
+
+    /// A coordination handle that has not reconciled its local WAL view with
+    /// the shared authority yet.
+    fn unseeded(
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
         let fallback = InProcessWalCoordination::new(shared.clone());
-        let coordination = Self {
+        Self {
             shared,
             fallback,
             owner: authority.owner_record(),
             authority,
             active_reader: Mutex::new(None),
-        };
-        coordination.seed_or_sync_authority();
-        coordination
+        }
     }
 
     fn authority_is_uninitialized(snapshot: SharedWalCoordinationHeader) -> bool {
@@ -1583,8 +1632,18 @@ impl ShmWalCoordination {
     }
 
     fn sync_authority_from_local(&self) {
-        self.authority
-            .install_snapshot(self.local_authority_snapshot());
+        let snapshot = self.local_authority_snapshot();
+        // Every offset in the WAL is computed from the page size: a shared
+        // snapshot that has frames but no page size misplaces all of them.
+        turso_debug_assert!(
+            snapshot.max_frame == 0 || snapshot.page_size != 0,
+            "installing a shared WAL snapshot with frames but no page size",
+            {
+                "max_frame": snapshot.max_frame,
+                "page_size": snapshot.page_size
+            }
+        );
+        self.authority.install_snapshot(snapshot);
     }
 
     fn sync_local_to_zero_frame_authority(&self, snapshot: SharedWalCoordinationHeader) {
@@ -1622,6 +1681,27 @@ impl ShmWalCoordination {
         &self,
         mut authority_snapshot: SharedWalCoordinationHeader,
     ) {
+        if self.local_scan_predates_wal_covered_by_authority(authority_snapshot) {
+            // Adopting only touches process-local state; repairing or
+            // rewriting the authority first would mutate state that the
+            // process that wrote the WAL is relying on.
+            self.sync_local_from_authority(authority_snapshot);
+            return;
+        }
+        // Everything below repairs or rewrites the shared authority (owners,
+        // reader slots, checkpoint progress, frame index) from this process's
+        // scan. That is only safe when no other process has the tshm mapped:
+        // `open_mode` was decided at map time and peers may have attached and
+        // committed since. Peers rely on the authority, so with any other
+        // mapping alive it wins.
+        if !self.authority.is_last_process_mapping() {
+            tracing::debug!(
+                authority_max_frame = authority_snapshot.max_frame,
+                "keeping the shared WAL authority: another process has the tshm mapped"
+            );
+            self.sync_local_from_authority(authority_snapshot);
+            return;
+        }
         self.authority.repair_transient_state_for_exclusive_open();
         if authority_snapshot.nbackfills != 0 {
             // A local WAL scan can rebuild the visible WAL tail, but it cannot
@@ -1690,6 +1770,45 @@ impl ShmWalCoordination {
             .discard_durable_frame_index_for_exclusive_rebuild();
         self.sync_authority_from_local();
         self.sync_authority_frames_from_local();
+    }
+
+    /// The local view is a scan that found no WAL header (an empty or missing
+    /// WAL when it was taken), while the authority is initialized and the WAL
+    /// file is now long enough to hold every frame the authority references.
+    /// The WAL was written after the scan, so the scan says nothing against
+    /// the authority. A file shorter than the authority's frames means the
+    /// authority references frames that do not exist, which a scan can fix.
+    fn local_scan_predates_wal_covered_by_authority(
+        &self,
+        authority_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        let local_snapshot = self.local_authority_snapshot();
+        let scan_saw_no_wal_header = local_snapshot.max_frame == 0
+            && local_snapshot.page_size == 0
+            && local_snapshot.checkpoint_seq == 0
+            && local_snapshot.salt_1 == 0
+            && local_snapshot.salt_2 == 0;
+        if !scan_saw_no_wal_header
+            || Self::authority_is_uninitialized(authority_snapshot)
+            || authority_snapshot.page_size == 0
+        {
+            return false;
+        }
+        let wal_size = {
+            let shared = self.shared.read();
+            shared
+                .runtime
+                .file
+                .as_ref()
+                .and_then(|file| file.size().ok())
+        };
+        let frame_size =
+            (WAL_FRAME_HEADER_SIZE as u64).saturating_add(authority_snapshot.page_size as u64);
+        let covered_size = authority_snapshot
+            .max_frame
+            .saturating_mul(frame_size)
+            .saturating_add(WAL_HEADER_SIZE as u64);
+        wal_size.is_some_and(|size| size >= covered_size)
     }
 
     fn local_scan_cannot_disprove_zero_frame_authority(
@@ -1816,46 +1935,106 @@ impl ShmWalCoordination {
     ///    frame index and rebuild it from the local scan.
     ///
     /// 3. **Authority initialized and trustworthy**: adopt the authority's
-    ///    snapshot as our local state. If our local view also came from a
-    ///    disk scan and the authority's frame index is empty, backfill it
-    ///    from our local frame cache.
-    fn seed_or_sync_authority(&self) {
+    ///    snapshot as our local state. Case 2 also ends here when the scan
+    ///    saw no WAL header while the WAL file now covers the authority's
+    ///    frames (read-only openers scan before any tshm exists), and when
+    ///    another process still has the tshm mapped: the shared authority is
+    ///    then the truth, and only a sole mapper may replace it with a scan.
+    ///
+    /// Once any of the cases succeeded the local view counts as reconciled
+    /// (`disk_scan_reconciled`), so later connections of this process adopt
+    /// instead of acting on the same old scan again.
+    ///
+    /// Cases 1 and 2 overwrite the shared header and frame index with this
+    /// process's view, so they run only while holding the shared writer and
+    /// checkpoint locks, and decide again on a fresh snapshot after taking
+    /// them. A writer that installed the first WAL header since the snapshot
+    /// this connection first read is therefore never overwritten with an
+    /// empty or older view (which left frames with page size 0 and every
+    /// later read at the wrong offset). Without the locks the authority is
+    /// left alone: an initialized one is adopted (case 3), an uninitialized
+    /// one that this connection would have to seed fails with `Busy`.
+    fn seed_or_sync_authority(&self) -> Result<()> {
         let snapshot = self.authority.snapshot();
         let local_wal_view_loaded_from_disk = self
             .shared
             .read()
             .metadata
-            .loaded_from_disk_scan
-            .load(Ordering::Acquire);
+            .loaded_from_disk_scan_unreconciled();
+        self.seed_or_sync_authority_from(snapshot, local_wal_view_loaded_from_disk)
+    }
+
+    /// `seed_or_sync_authority` for a snapshot read earlier, which another
+    /// process may have overtaken since.
+    fn seed_or_sync_authority_from(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        local_wal_view_loaded_from_disk: bool,
+    ) -> Result<()> {
+        self.seed_or_sync_authority_inner(snapshot, local_wal_view_loaded_from_disk)?;
+        self.shared
+            .read()
+            .metadata
+            .disk_scan_reconciled
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn seed_or_sync_authority_inner(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        local_wal_view_loaded_from_disk: bool,
+    ) -> Result<()> {
+        let uninitialized = Self::authority_is_uninitialized(snapshot);
+        if !uninitialized
+            && (!local_wal_view_loaded_from_disk
+                || self.authority.writer_or_checkpoint_lock_active())
+        {
+            self.adopt_authority_snapshot(snapshot);
+            return Ok(());
+        }
+        if uninitialized && Self::authority_is_uninitialized(self.local_authority_snapshot()) {
+            // An empty local view has nothing to publish: the first writer
+            // installs the header when it creates the WAL.
+            return Ok(());
+        }
+        let Some(_locks) = AuthorityMutationLocks::try_acquire(&self.authority, self.owner) else {
+            let snapshot = self.authority.snapshot();
+            if Self::authority_is_uninitialized(snapshot) {
+                return Err(LimboError::Busy);
+            }
+            self.adopt_authority_snapshot(snapshot);
+            return Ok(());
+        };
+        // The snapshot read above is stale once another process wrote in
+        // between; only the one read under the locks may be acted on.
+        let snapshot = self.authority.snapshot();
         if Self::authority_is_uninitialized(snapshot) {
             self.sync_authority_from_local();
             self.sync_authority_frames_from_local();
-        } else if local_wal_view_loaded_from_disk
-            && !self.authority.writer_or_checkpoint_lock_active()
-        {
+        } else if local_wal_view_loaded_from_disk {
             self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
         } else {
-            let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
-                let shared = self.shared.read();
-                !shared.metadata.initialized.load(Ordering::Acquire)
-                    || !Self::local_zero_frame_generation_matches_authority_snapshot(
-                        snapshot, &shared,
-                    )
-            };
-            self.sync_local_from_authority(snapshot);
-            if needs_zero_frame_header_rewrite {
-                self.shared
-                    .read()
-                    .metadata
-                    .initialized
-                    .store(false, Ordering::Release);
-            }
-            if local_wal_view_loaded_from_disk
-                && !self.authority.writer_or_checkpoint_lock_active()
-                && self.authority.iter_latest_frames(0, u64::MAX).is_empty()
-            {
-                self.sync_authority_frames_from_local();
-            }
+            self.adopt_authority_snapshot(snapshot);
+        }
+        Ok(())
+    }
+
+    /// Case 3 of `seed_or_sync_authority`: take the authority's snapshot as
+    /// the local WAL state. Only touches process-local state.
+    fn adopt_authority_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
+        let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
+            let shared = self.shared.read();
+            !shared.metadata.initialized.load(Ordering::Acquire)
+                || !Self::local_zero_frame_generation_matches_authority_snapshot(snapshot, &shared)
+        };
+        self.sync_local_from_authority(snapshot);
+        if needs_zero_frame_header_rewrite {
+            self.shared
+                .read()
+                .metadata
+                .initialized
+                .store(false, Ordering::Release);
         }
     }
 
@@ -2969,8 +3148,24 @@ pub struct WalSharedMetadata {
     pub transaction_count: AtomicU64,
     pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     pub loaded: AtomicBool,
+    /// The WAL view was built by scanning the WAL file, not copied from the
+    /// shared authority. Telemetry: never cleared.
     pub loaded_from_disk_scan: AtomicBool,
+    /// A coordination handle has since reconciled the local view with the
+    /// shared authority (seeded, reseeded or adopted it). The scan that
+    /// `loaded_from_disk_scan` records is then history, not evidence: peers may
+    /// have committed since, so later connections must adopt the authority.
+    pub disk_scan_reconciled: AtomicBool,
     pub initialized: AtomicBool,
+}
+
+impl WalSharedMetadata {
+    /// The local WAL view still is the disk scan it was opened from: no
+    /// coordination handle has reconciled it with the shared authority yet.
+    fn loaded_from_disk_scan_unreconciled(&self) -> bool {
+        self.loaded_from_disk_scan.load(Ordering::Acquire)
+            && !self.disk_scan_reconciled.load(Ordering::Acquire)
+    }
 }
 
 /// Process-local coordination and caches layered around the shared WAL metadata.
@@ -4871,16 +5066,16 @@ impl WalFile {
         authority: Arc<MappedSharedWalCoordination>,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self> {
         let coordination: Arc<dyn WalCoordination> =
-            Arc::new(ShmWalCoordination::new(shared, authority));
+            Arc::new(ShmWalCoordination::new(shared, authority)?);
         let snapshot = coordination.load_snapshot();
-        Self::new_with_coordination(
+        Ok(Self::new_with_coordination(
             io,
             coordination,
             (snapshot.last_checksum, snapshot.max_frame),
             buffer_pool,
-        )
+        ))
     }
 
     pub fn new(
@@ -5941,6 +6136,7 @@ impl WalFileShared {
                 last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
                 loaded: AtomicBool::new(true),
                 loaded_from_disk_scan: AtomicBool::new(false),
+                disk_scan_reconciled: AtomicBool::new(false),
                 initialized: AtomicBool::new(wal_is_initialized),
             },
             runtime: WalSharedRuntime {
@@ -6019,6 +6215,7 @@ impl WalFileShared {
                 last_checksum: (0, 0),
                 loaded: AtomicBool::new(true),
                 loaded_from_disk_scan: AtomicBool::new(false),
+                disk_scan_reconciled: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
@@ -6063,6 +6260,7 @@ impl WalFileShared {
                 last_checksum: (0, 0),
                 loaded: AtomicBool::new(true),
                 loaded_from_disk_scan: AtomicBool::new(false),
+                disk_scan_reconciled: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
@@ -7449,7 +7647,7 @@ pub mod test {
         let io = shared_wal_test_io();
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap());
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         (authority, coordination)
     }
 
@@ -8179,7 +8377,7 @@ pub mod test {
 
         let mut readers = Vec::new();
         for i in 0..5 {
-            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
             let read_guard = coordination
                 .try_begin_read_tx(empty)
                 .unwrap_or_else(|| panic!("reader {i} should share a mark pinned at 0"));
@@ -8328,7 +8526,7 @@ pub mod test {
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         let mut readers = Vec::new();
         for _ in 0..128 {
-            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
             let read_guard = coordination
                 .try_begin_read_tx(snapshot)
                 .expect("same-snapshot readers should share a published reader barrier");
@@ -8387,14 +8585,14 @@ pub mod test {
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        let first = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let first = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard = first.try_begin_read_tx(snapshot).unwrap();
         assert_eq!(
             authority.min_active_reader_frame(),
             Some(snapshot.max_frame)
         );
 
-        let second = ShmWalCoordination::new(shared, authority.clone());
+        let second = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         assert_eq!(
             authority.min_active_reader_frame(),
             Some(snapshot.max_frame),
@@ -8406,6 +8604,381 @@ pub mod test {
         assert_eq!(authority.min_active_reader_frame(), None);
         assert_eq!(active_shared_reader_slot_count(&authority), 0);
         drop(second);
+    }
+
+    /// Give `shared` the local WAL view of a WAL with `snapshot.max_frame`
+    /// frames, as a connection that scanned it from disk would have.
+    #[cfg(host_shared_wal)]
+    fn set_local_wal_view(
+        shared: &Arc<RwLock<WalFileShared>>,
+        snapshot: WalSnapshot,
+        salts: (u32, u32),
+        loaded_from_disk: bool,
+    ) {
+        set_shared_snapshot(shared, snapshot);
+        let shared = shared.write();
+        let mut header = shared.metadata.wal_header.lock();
+        header.page_size = 4096;
+        header.salt_1 = salts.0;
+        header.salt_2 = salts.1;
+        header.checksum_1 = snapshot.last_checksum.0;
+        header.checksum_2 = snapshot.last_checksum.1;
+        drop(header);
+        shared
+            .metadata
+            .loaded_from_disk_scan
+            .store(loaded_from_disk, Ordering::Release);
+    }
+
+    #[cfg(host_shared_wal)]
+    fn new_test_shared_wal(
+        io: &Arc<dyn IO>,
+        wal_path: &std::path::Path,
+    ) -> Arc<RwLock<WalFileShared>> {
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        WalFileShared::new_shared(file).unwrap()
+    }
+
+    /// A connection reads the authority as uninitialized, then another
+    /// process installs the first WAL header and frames before the connection
+    /// seeds. The seed must act on the authority as it is under the locks,
+    /// not on what it read: overwriting it with the connection's older view
+    /// leaves frames with page size 0 and salts 0, and every later read of
+    /// them lands at the wrong offset.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn seeding_keeps_an_authority_installed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io = shared_wal_test_io();
+        let shared_a = new_test_shared_wal(&io, &wal_path);
+        let shared_b = new_test_shared_wal(&io, &wal_path);
+        let authority_b =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        // B's view: a scan of an older WAL generation with one frame.
+        set_local_wal_view(
+            &shared_b,
+            WalSnapshot {
+                max_frame: 1,
+                nbackfills: 0,
+                last_checksum: (3, 4),
+                checkpoint_seq: 1,
+                transaction_count: 1,
+            },
+            (1, 2),
+            true,
+        );
+        let stale = authority_b.snapshot();
+        assert!(ShmWalCoordination::authority_is_uninitialized(stale));
+
+        // A installs the first header and three frames after B's read.
+        let installed = WalSnapshot {
+            max_frame: 3,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 2,
+        };
+        set_local_wal_view(&shared_a, installed, (17, 23), false);
+        let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        let authority_snapshot = authority_b.snapshot();
+        assert_eq!(authority_snapshot.max_frame, 3);
+        assert_eq!(authority_snapshot.page_size, 4096);
+        assert_eq!(authority_snapshot.salt_1, 17);
+
+        let coordination_b = ShmWalCoordination::unseeded(shared_b, authority_b.clone());
+        coordination_b
+            .seed_or_sync_authority_from(stale, true)
+            .unwrap();
+
+        assert_eq!(
+            authority_b.snapshot(),
+            authority_snapshot,
+            "a stale seed must not overwrite the installed authority"
+        );
+        assert_eq!(coordination_a.load_snapshot(), installed);
+        let header = coordination_b.wal_header();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!((header.salt_1, header.salt_2), (17, 23));
+        assert_eq!(coordination_b.load_snapshot(), installed);
+        assert!(!authority_b.writer_or_checkpoint_lock_active());
+    }
+
+    /// The state of the 11509 lost commit: a WAL view that is a scan which saw
+    /// no WAL header (taken before the tshm and the WAL existed), against an
+    /// authority a writer has since committed to. The WAL file is made long
+    /// enough to hold the committed frames only if `wal_covers_authority`.
+    /// Returns the stale view, the coordination file path and the committed
+    /// snapshot; the caller installs it into an authority.
+    #[cfg(host_shared_wal)]
+    fn no_header_scan_view_and_committed_snapshot(
+        io: &Arc<dyn IO>,
+        dir: &std::path::Path,
+        wal_covers_authority: bool,
+    ) -> (
+        Arc<RwLock<WalFileShared>>,
+        std::path::PathBuf,
+        SharedWalCoordinationHeader,
+    ) {
+        let wal_path = dir.join("test.db-wal");
+        let stale_shared = new_test_shared_wal(io, &wal_path);
+        set_local_wal_view(
+            &stale_shared,
+            WalSnapshot {
+                max_frame: 0,
+                nbackfills: 0,
+                last_checksum: (0, 0),
+                checkpoint_seq: 0,
+                transaction_count: 0,
+            },
+            (0, 0),
+            true,
+        );
+        stale_shared.write().metadata.wal_header.lock().page_size = 0;
+        let committed = SharedWalCoordinationHeader {
+            max_frame: 2,
+            nbackfills: 0,
+            transaction_count: 1,
+            visibility_generation: 1,
+            checkpoint_seq: 0,
+            checkpoint_epoch: 0,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+        let wal_len = if wal_covers_authority {
+            wal_len_covering(committed)
+        } else {
+            0
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_len(wal_len)
+            .unwrap();
+        (stale_shared, dir.join("test.db-tshm"), committed)
+    }
+
+    /// Bytes a WAL needs to hold every frame of `snapshot`.
+    #[cfg(host_shared_wal)]
+    fn wal_len_covering(snapshot: SharedWalCoordinationHeader) -> u64 {
+        WAL_HEADER_SIZE as u64
+            + snapshot.max_frame * (WAL_FRAME_HEADER_SIZE as u64 + snapshot.page_size as u64)
+    }
+
+    /// A scan that saw no WAL header predates a WAL that now holds all of the
+    /// authority's frames: the connection must adopt the authority, even as
+    /// the only mapper, where nothing else would stop it from reseeding.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn no_header_scan_adopts_an_authority_covered_by_the_wal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let (stale_shared, shm_path, committed) =
+            no_header_scan_view_and_committed_snapshot(&io, dir.path(), true);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert!(authority.is_last_process_mapping());
+        authority.install_snapshot(committed);
+        let installed = authority.snapshot();
+
+        let coordination = ShmWalCoordination::new(stale_shared, authority.clone()).unwrap();
+        assert_eq!(
+            authority.snapshot(),
+            installed,
+            "a scan from before the WAL existed must not overrule the authority"
+        );
+        assert_eq!(coordination.load_snapshot().max_frame, 2);
+        assert_eq!(coordination.wal_header().page_size, 4096);
+        assert_eq!(coordination.wal_header().salt_1, 17);
+    }
+
+    /// The authority references frames beyond the WAL file, so the scan is not
+    /// provably older. With another mapping alive the authority still wins:
+    /// that process relies on it.
+    #[cfg(all(host_shared_wal, target_os = "linux"))]
+    #[test]
+    fn shared_authority_beyond_the_wal_file_is_not_reseeded_while_a_peer_maps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let (stale_shared, shm_path, committed) =
+            no_header_scan_view_and_committed_snapshot(&io, dir.path(), false);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(committed);
+        let installed = authority.snapshot();
+        let peer =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert!(!authority.is_last_process_mapping());
+
+        let coordination = ShmWalCoordination::new(stale_shared, authority.clone()).unwrap();
+        assert_eq!(
+            authority.snapshot(),
+            installed,
+            "a handle must not reseed the authority while another process maps it"
+        );
+        assert_eq!(peer.snapshot(), installed);
+        assert_eq!(coordination.load_snapshot().max_frame, 2);
+        assert_eq!(coordination.wal_header().page_size, 4096);
+        assert!(!authority.writer_or_checkpoint_lock_active());
+    }
+
+    /// The only mapper with an authority that references frames the WAL file
+    /// does not have rebuilds the authority from its scan.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn sole_mapper_reseeds_an_authority_beyond_the_wal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let (stale_shared, shm_path, committed) =
+            no_header_scan_view_and_committed_snapshot(&io, dir.path(), false);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(committed);
+        assert!(authority.is_last_process_mapping());
+
+        let coordination = ShmWalCoordination::new(stale_shared, authority.clone()).unwrap();
+        let reseeded = authority.snapshot();
+        assert_eq!(reseeded.max_frame, 0);
+        assert_eq!(reseeded.transaction_count, 0);
+        assert_eq!(coordination.load_snapshot().max_frame, 0);
+    }
+
+    /// The sole mapper of a writable database still trusts its fresh disk scan
+    /// over a rolled-back authority, and once it has done so a later
+    /// connection of the same process adopts the authority instead of acting
+    /// on the same old scan again.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn exclusive_writable_handle_reseeds_once_from_its_disk_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io = shared_wal_test_io();
+        let shared = new_test_shared_wal(&io, &wal_path);
+        let scanned = WalSnapshot {
+            max_frame: 3,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 2,
+        };
+        set_local_wal_view(&shared, scanned, (17, 23), true);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+        // The persisted authority is behind the WAL file.
+        let mut rolled_back = authority.snapshot();
+        rolled_back.max_frame = 1;
+        rolled_back.transaction_count = 1;
+        rolled_back.checkpoint_seq = 5;
+        rolled_back.page_size = 4096;
+        rolled_back.salt_1 = 17;
+        rolled_back.salt_2 = 23;
+        rolled_back.checksum_1 = 3;
+        rolled_back.checksum_2 = 4;
+        authority.install_snapshot(rolled_back);
+
+        let first = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
+        let reseeded = authority.snapshot();
+        assert_eq!(reseeded.max_frame, 3);
+        assert_eq!(reseeded.transaction_count, 2);
+        assert_eq!(first.load_snapshot(), scanned);
+
+        // A peer moves on to a newer WAL generation that the old scan cannot
+        // disprove or match: the next connection must adopt it.
+        let mut peer = reseeded;
+        peer.max_frame = 2;
+        peer.transaction_count = 3;
+        peer.salt_1 = 18;
+        peer.salt_2 = 24;
+        authority.install_snapshot(peer);
+        let second = ShmWalCoordination::new(shared, authority.clone()).unwrap();
+        assert_eq!(
+            authority.snapshot(),
+            peer,
+            "a second connection must not reseed from the scan the first one already reconciled"
+        );
+        assert_eq!(second.load_snapshot().max_frame, 2);
+        assert_eq!(second.wal_header().salt_1, 18);
+    }
+
+    /// While another handle holds the writer lock the authority is not B's to
+    /// write: a connection that has a WAL view to publish gets `Busy`, one
+    /// with nothing to publish just proceeds, and neither changes the
+    /// authority. Once the writer has installed its header, a seed adopts it.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn seeding_does_not_write_while_another_handle_holds_the_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io = shared_wal_test_io();
+        let shared_a = new_test_shared_wal(&io, &wal_path);
+        let shared_b = new_test_shared_wal(&io, &wal_path);
+        let shared_c = new_test_shared_wal(&io, &wal_path);
+        let (authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        let authority_b =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let authority_c =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let uninitialized = authority_a.snapshot();
+        assert!(ShmWalCoordination::authority_is_uninitialized(
+            uninitialized
+        ));
+
+        assert!(coordination_a.try_begin_write_tx());
+        set_local_wal_view(
+            &shared_b,
+            WalSnapshot {
+                max_frame: 1,
+                nbackfills: 0,
+                last_checksum: (3, 4),
+                checkpoint_seq: 1,
+                transaction_count: 1,
+            },
+            (1, 2),
+            true,
+        );
+        let busy = ShmWalCoordination::new(shared_b.clone(), authority_b.clone()).err();
+        assert!(matches!(busy, Some(LimboError::Busy)), "{busy:?}");
+        ShmWalCoordination::new(shared_c, authority_c).unwrap();
+        assert_eq!(
+            authority_a.snapshot(),
+            uninitialized,
+            "no seed may write while the writer lock is held elsewhere"
+        );
+
+        // A installs its first header and frames, then lets go of the lock.
+        let installed = WalSnapshot {
+            max_frame: 3,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 2,
+        };
+        set_local_wal_view(&shared_a, installed, (17, 23), false);
+        coordination_a.sync_authority_from_local();
+        coordination_a.end_write_tx();
+        let authority_snapshot = authority_a.snapshot();
+        assert_eq!(authority_snapshot.page_size, 4096);
+
+        let coordination_b = ShmWalCoordination::new(shared_b, authority_b.clone()).unwrap();
+        assert_eq!(authority_a.snapshot(), authority_snapshot);
+        assert_eq!(coordination_b.load_snapshot(), installed);
+        assert_eq!(coordination_b.wal_header().page_size, 4096);
+        assert_eq!(coordination_b.wal_header().salt_1, 17);
+        assert!(!authority_b.writer_or_checkpoint_lock_active());
     }
 
     #[cfg(host_shared_wal)]
@@ -8439,9 +9012,9 @@ pub mod test {
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_a1 = reader_a1.try_begin_read_tx(snapshot_a).unwrap();
-        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_a2 = reader_a2.try_begin_read_tx(snapshot_a).unwrap();
         assert_eq!(
             authority.min_active_reader_frame(),
@@ -8462,9 +9035,9 @@ pub mod test {
             transaction_count: snapshot_b.transaction_count,
         });
 
-        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_b1 = reader_b1.try_begin_read_tx(snapshot_b).unwrap();
-        let reader_b2 = ShmWalCoordination::new(shared, authority.clone());
+        let reader_b2 = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         let guard_b2 = reader_b2.try_begin_read_tx(snapshot_b).unwrap();
 
         assert_eq!(
@@ -8820,7 +9393,8 @@ pub mod test {
             reopened_authority.clone(),
             ((0, 0), 0),
             buffer_pool,
-        );
+        )
+        .unwrap();
 
         wal.begin_read_tx().unwrap();
         reopened_authority.mark_frame_index_overflowed_for_tests();
@@ -8963,7 +9537,8 @@ pub mod test {
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool.finalize_with_page_size(4096).unwrap();
         let wal =
-            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);
+            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool)
+                .unwrap();
 
         assert_eq!(wal.get_max_frame(), 1);
         assert_eq!(wal.get_last_checksum(), (31, 37));
@@ -9049,7 +9624,7 @@ pub mod test {
             "open_shared_from_authority_if_exists should not republish authority before coordination reconciliation"
         );
 
-        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone());
+        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone()).unwrap();
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
         assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
 
@@ -9076,7 +9651,8 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
-        let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
+        let reopened_coordination =
+            ShmWalCoordination::new(reopened_shared, reopened_authority).unwrap();
         assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
     }
 
@@ -9121,7 +9697,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
 
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let reopened = coordination.load_snapshot();
         assert_eq!(reopened.max_frame, 0);
         assert_eq!(reopened.nbackfills, 0);
@@ -9611,6 +10187,10 @@ pub mod test {
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         coordination_a.cache_frame(7, 2);
         coordination_a.cache_frame(9, 5);
+        // A live mapping makes the reopen adopt the authority as is; this test
+        // covers the exclusive reopen, so the first mapping has to be gone.
+        drop(coordination_a);
+        drop(authority);
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -9634,7 +10214,7 @@ pub mod test {
             frame_cache.insert(9, vec![5]);
         }
 
-        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        let (authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
 
         let reopened = coordination_b.load_snapshot();
         assert_eq!(reopened.max_frame, authoritative.max_frame);
@@ -9645,10 +10225,10 @@ pub mod test {
             reopened.nbackfills, 0,
             "disk-scan reconciliation must preserve the frame index without reviving positive nbackfills"
         );
-        assert_eq!(authority.find_frame(7, 0, 5, None), Some(2));
-        assert_eq!(authority.find_frame(9, 0, 5, None), Some(5));
+        assert_eq!(authority_b.find_frame(7, 0, 5, None), Some(2));
+        assert_eq!(authority_b.find_frame(9, 0, 5, None), Some(5));
         assert_eq!(
-            authority.iter_latest_frames(0, authoritative.max_frame),
+            authority_b.iter_latest_frames(0, authoritative.max_frame),
             vec![(7, 2), (9, 5)]
         );
     }
@@ -9774,7 +10354,7 @@ pub mod test {
                 .store(true, Ordering::Release);
         }
 
-        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         let snapshot = authority.snapshot();
         assert_eq!(snapshot, authoritative);
         let header = coordination.wal_header();
@@ -9905,7 +10485,7 @@ pub mod test {
             shared.runtime.epoch.store(1, Ordering::Release);
         }
 
-        let coordination = ShmWalCoordination::new(shared.clone(), authority);
+        let coordination = ShmWalCoordination::new(shared.clone(), authority).unwrap();
         assert!(
             !coordination.wal_is_initialized(),
             "a stale local initialized bit must not suppress the first header rewrite after RESTART/TRUNCATE"
@@ -9950,7 +10530,7 @@ pub mod test {
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
         let shared = WalFileShared::new_shared(file).unwrap();
-        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone()).unwrap();
 
         let prepared = coordination
             .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
@@ -10029,7 +10609,7 @@ pub mod test {
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
-        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone());
+        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone()).unwrap();
         // Simulate a long-lived process whose process-wide shared WAL metadata
         // fell behind the authority after another process checkpointed and
         // restarted the WAL back to frame 0.

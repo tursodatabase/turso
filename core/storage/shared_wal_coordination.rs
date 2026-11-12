@@ -1485,16 +1485,22 @@ impl MappedSharedWalCoordination {
     /// probes here is weaker and can misclassify recycled PIDs as live.
     pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
         let header = self.header();
-        header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
-        header
-            .checkpoint_owner
-            .store(UNOWNED_LOCK, Ordering::Release);
+        let local = self.local_lock_state.lock();
+        // A lock this mapping holds itself keeps its owner record: the caller
+        // may hold the writer and checkpoint locks while it repairs.
+        if !local.writer_lock_held {
+            header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
+        }
+        if !local.checkpoint_lock_held {
+            header
+                .checkpoint_owner
+                .store(UNOWNED_LOCK, Ordering::Release);
+        }
 
         // For reader slots, we must check byte-range locks before
         // clearing: another live process may hold a slot. Blindly clearing
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
-        let local = self.local_lock_state.lock();
         let process_local = self.process_local_ownership.lock();
         for slot_index in 0..header.reader_slot_count {
             if local.reader_locks[slot_index as usize] > 0 {

@@ -3345,7 +3345,7 @@ impl Database {
                 authority,
                 last_checksum_and_max_frame,
                 buffer_pool,
-            )));
+            )?));
         }
 
         Ok(Arc::new(WalFile::new(
