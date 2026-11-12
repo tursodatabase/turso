@@ -1288,6 +1288,14 @@ expect {
     42|f
 }
 
+test pg-get-sequence-data-has-two-columns {
+    CREATE SEQUENCE sd_columns START 3;
+    SELECT d.* FROM pg_class c, pg_get_sequence_data(c.oid) d WHERE c.relname = 'sd_columns';
+}
+expect {
+    3|f
+}
+
 test pg-get-sequence-data-of-a-table-is-null {
     CREATE TABLE sd_table (id int);
     SELECT coalesce(d.last_value::text, 'null'), coalesce(d.is_called::text, 'null')

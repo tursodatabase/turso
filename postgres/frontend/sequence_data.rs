@@ -15,7 +15,7 @@ use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode};
 use crate::catalog::sequence_catalog_entries;
 use crate::table_function::one_argument_best_index;
 
-const SEQUENCE_OID_COLUMN: usize = 3;
+const SEQUENCE_OID_COLUMN: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct PgGetSequenceData;
@@ -26,7 +26,7 @@ impl VirtualTableModule for PgGetSequenceData {
     fn schema(&self, _args: &[Value]) -> Result<String> {
         Ok(
             "CREATE TABLE pg_get_sequence_data (last_value BIGINT, is_called BOOLEAN, \
-            page_lsn TEXT, sequence_oid INTEGER HIDDEN)"
+            sequence_oid INTEGER HIDDEN)"
                 .into(),
         )
     }
@@ -88,7 +88,6 @@ impl VirtualTableCursor for SequenceDataCursor {
             .expect("the cursor is on its row while columns are read");
         let value = match column {
             0 | 1 => row[column].clone(),
-            2 => Value::Null,
             SEQUENCE_OID_COLUMN => self.sequence_oid.clone(),
             _ => unreachable!("invalid pg_get_sequence_data column"),
         };
