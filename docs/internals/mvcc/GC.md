@@ -80,6 +80,23 @@ No reader needs the store then. The checkpoint skips `GcTableRows` and
 every version and every slot with `clear_row_versions`. This includes the
 versions of an earlier checkpoint that stopped after its pager commit.
 
+The row maps are in a `RowStore` that `MvStore` keeps in an `ArcSwap`.
+`clear_row_versions` puts an empty `RowStore` there and frees the replaced one.
+A skip map frees all its entries in one step when it is dropped. A removal from
+a skip map that stays in use is slower, and the skip map frees the entry only
+during later operations.
+
+A statement keeps its cursors until it is reset, and each cursor has an `Arc`
+to the `RowStore` that its iterators read. If such a cursor exists,
+`clear_row_versions` cannot drop the replaced `RowStore`, and it removes the
+entries one at a time. The transaction of that cursor is complete, so the
+cursor reads no row again. The reset of the statement frees the `RowStore`.
+
+The write set of a transaction has an `Arc` to each version chain that the
+transaction wrote. The skip map frees a removed transaction only during later
+operations, so `remove_tx` drops the write set. If it did not, the chains of
+the dropped `RowStore` stayed in memory.
+
 ## Materialization stamps
 
 Stamps are **not** applied when a row is handed to the pager. They run in

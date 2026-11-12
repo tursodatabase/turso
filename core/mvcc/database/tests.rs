@@ -5590,6 +5590,77 @@ fn test_removed_transaction_does_not_keep_version_chains() {
     }
 }
 
+/// A blocking checkpoint replaces the row store with an empty one. When no cursor reads
+/// the replaced row store, the checkpoint must free it.
+#[test]
+fn test_blocking_checkpoint_frees_the_row_store_that_no_cursor_reads() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let mvcc_store = db.get_mvcc_store();
+    let row_store_before_checkpoint = Arc::downgrade(&mvcc_store.row_store());
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(row_store_before_checkpoint.upgrade().is_none());
+    assert!(mvcc_store.row_store().rows.is_empty());
+}
+
+/// A statement in an explicit transaction keeps its cursors until it is reset, and each
+/// cursor keeps the row store that it reads. The checkpoint must empty that row store, and
+/// the reset of the statement must free it. The statement must then read its row from the
+/// B-tree.
+#[test]
+fn test_blocking_checkpoint_empties_the_row_store_that_a_cursor_reads() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let mvcc_store = db.get_mvcc_store();
+    let row_store_before_checkpoint = Arc::downgrade(&mvcc_store.row_store());
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut select = conn.prepare("SELECT id FROM t WHERE v = 10").unwrap();
+    assert_eq!(ids_of_completed_statement(&mut select), [1]);
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let row_store = row_store_before_checkpoint
+        .upgrade()
+        .expect("the cursors of the statement keep the row store");
+    assert!(row_store.rows.is_empty());
+    assert!(row_store
+        .index_rows
+        .iter()
+        .all(|index| index.value().is_empty()));
+    drop(row_store);
+
+    select.reset().unwrap();
+    assert!(row_store_before_checkpoint.upgrade().is_none());
+    assert_eq!(ids_of_completed_statement(&mut select), [1]);
+}
+
+/// Steps `statement` until it is complete, and does not reset it.
+fn ids_of_completed_statement(statement: &mut Statement) -> Vec<i64> {
+    let mut ids = Vec::new();
+    loop {
+        match statement.step().unwrap() {
+            StepResult::Row => ids.push(statement.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::IO | StepResult::Yield => statement.get_pager().io.step().unwrap(),
+            StepResult::Done => return ids,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
@@ -11488,11 +11559,12 @@ fn test_update_multiple_unique_columns_partial_rollback() {
 
 // ─── GC helpers ───────────────────────────────────────────────────────────
 
-fn unique_index_btree_is_allocated(mv: &crate::MvStore) -> bool {
-    mv.row_store()
-        .index_rows
-        .iter()
-        .any(|idx| mv.is_btree_allocated(idx.key()))
+/// True when a checkpoint gave a B-tree to the unique index of table `t`.
+fn unique_index_btree_is_allocated(conn: &Arc<Connection>, mv: &crate::MvStore) -> bool {
+    conn.schema
+        .read()
+        .get_indices(NamespaceId::ROOT, "t")
+        .any(|index| mv.is_btree_allocated(&mv.get_table_id_from_root_page(index.root_page)))
 }
 
 /// An index current that no checkpoint has written to the B-tree yet. GC must
@@ -13527,7 +13599,7 @@ fn test_gc_unwritten_text_pk_upsert_does_not_fork() {
         .unwrap();
     conn.execute("INSERT INTO t VALUES ('k9', '1')").unwrap();
     assert!(
-        unique_index_btree_is_allocated(&mv),
+        unique_index_btree_is_allocated(&conn, &mv),
         "CREATE TABLE must publish the unique index so fallthrough can hit an empty btree"
     );
 
@@ -13590,7 +13662,7 @@ fn test_gc_reclaimed_text_pk_same_txn_sees_own_append() {
         .unwrap();
     conn.execute("INSERT INTO t VALUES ('k6', '1')").unwrap();
     assert!(
-        unique_index_btree_is_allocated(&mv),
+        unique_index_btree_is_allocated(&conn, &mv),
         "CREATE TABLE must publish the unique index"
     );
 
@@ -13645,7 +13717,7 @@ fn test_gc_unstamped_text_pk_unique_lookup_still_sees_key() {
         .unwrap();
     conn.execute("INSERT INTO t VALUES ('k7', '1')").unwrap();
     assert!(
-        unique_index_btree_is_allocated(&mv),
+        unique_index_btree_is_allocated(&conn, &mv),
         "CREATE TABLE must publish the unique index so fallthrough can hit an empty btree"
     );
 
