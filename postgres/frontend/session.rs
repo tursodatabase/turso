@@ -573,10 +573,18 @@ fn validate_function_body(
     }
     // PostgreSQL accepts a function that calls itself. tursopg cannot run
     // one: a call takes the place of the function's body.
-    if called_functions
-        .iter()
-        .any(|called| called.name == function.name.name.as_str())
-    {
+    let schema_of_function = match &function.name.namespace {
+        Some(schema) => Some(schema.as_str().to_lowercase()),
+        None => current_schema(&pg_conn.conn),
+    };
+    let names_the_function = |called: &turso_pg_parser::CalledFunction| {
+        called.name == function.name.name.as_str()
+            && called
+                .schema
+                .as_ref()
+                .is_none_or(|schema| Some(schema.to_lowercase()) == schema_of_function)
+    };
+    if called_functions.iter().any(names_the_function) {
         return Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             "a function that calls a function of its own name is not supported",

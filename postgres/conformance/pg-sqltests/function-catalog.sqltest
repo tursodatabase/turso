@@ -900,6 +900,22 @@ expect @tursopg error {
     a function that calls a function of its own name is not supported
 }
 
+# The body calls the function of another schema, not the new function.
+# tursopg cannot call a function of a schema yet.
+test function-that-calls-a-function-of-its-name-in-another-schema {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT app.one()$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a schema-qualified function name is not supported
+}
+
 test function-that-calls-itself-in-limit {
     CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT 1 LIMIT forever($1)$$;
     SELECT count(*) FROM pg_proc WHERE proname = 'forever';
