@@ -16,7 +16,8 @@ Three things keep that work honest:
 - **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
   that CI runs against the front-end and against a real PostgreSQL server
   (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
-  behavior have `@skip-if postgres "reason"`. Tests for SQL that the SQLite
+  behavior have `@skip-if postgres "reason"`; tests for SQL that tursopg
+  does not support yet have `@skip-if tursopg "reason"`. Tests for SQL that the SQLite
   frontend also runs are in
   [`testing/shared-sqltests/`](../testing/shared-sqltests/), which CI runs on
   every backend.

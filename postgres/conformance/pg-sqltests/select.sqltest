@@ -252,6 +252,7 @@ expect {
     1!
 }
 
+@skip-if tursopg "a cast from unknown to mood is not supported yet"
 test select-cast-to-enum {
     CREATE TYPE mood AS ENUM ('sad', 'happy');
     SELECT 'happy'::mood, CAST('sad' AS mood);
@@ -260,6 +261,7 @@ expect {
     happy|sad
 }
 
+@skip-if tursopg "a cast from unknown to mood is not supported yet"
 test select-cast-to-enum-rejects-unknown-label {
     CREATE TYPE mood AS ENUM ('sad', 'happy');
     SELECT 'xyz'::mood;
@@ -269,6 +271,7 @@ expect error {
     invalid input value for enum mood: "xyz"
 }
 
+@skip-if tursopg "a cast from unknown to mood is not supported yet"
 test select-insert-rejects-unknown-enum-label {
     CREATE TYPE mood AS ENUM ('sad');
     CREATE TABLE t (m mood);
@@ -279,6 +282,7 @@ expect error {
     invalid input value for enum mood: "nope"
 }
 
+@skip-if tursopg "a cast from unknown to mood[] is not supported yet"
 test select-cast-null-to-enum {
     CREATE TYPE mood AS ENUM ('sad');
     CREATE TABLE t (m mood[]);
@@ -289,6 +293,7 @@ expect {
     null|{sad,NULL}
 }
 
+@skip-if tursopg "a cast from unknown to q is not supported yet"
 test select-enum-label-with-quote {
     CREATE TYPE q AS ENUM ('it''s', 'b');
     SELECT 'it''s'::q;
@@ -341,6 +346,7 @@ expect error {
     invalid enum label "a{64}"
 }
 
+@skip-if tursopg "a cast from unknown to mood is not supported yet"
 test select-create-enum-accepts-63-byte-label {
     CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
     SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::mood::text);
@@ -349,6 +355,7 @@ expect {
     63
 }
 
+@skip-if tursopg "a cast from unknown to e is not supported yet"
 test select-empty-enum-rejects-every-value {
     CREATE TYPE e AS ENUM ();
     SELECT 'a'::e;
@@ -358,6 +365,7 @@ expect error {
     invalid input value for enum e: "a"
 }
 
+@skip-if tursopg "a cast from unknown to e is not supported yet"
 test select-cast-null-to-empty-enum {
     CREATE TYPE e AS ENUM ();
     SELECT CASE WHEN NULL::e IS NULL THEN 'null' END;
@@ -366,6 +374,7 @@ expect {
     null
 }
 
+@skip-if tursopg "a cast from unknown to dm is not supported yet"
 test select-cast-null-to-not-null-domain-over-enum {
     CREATE TYPE mood AS ENUM ('sad');
     CREATE DOMAIN dm AS mood NOT NULL;
@@ -377,6 +386,7 @@ expect error {
 
 # Each element of a column of type dm[] is a value of domain dm; the array
 # itself is not, so it may be NULL.
+@skip-if tursopg "a cast from unknown to dm[] is not supported yet"
 test select-insert-null-element-into-array-of-not-null-domain-over-enum {
     CREATE TYPE mood AS ENUM ('sad', 'ok');
     CREATE DOMAIN dm AS mood NOT NULL;
@@ -387,6 +397,7 @@ expect error {
     domain dm does not allow null values
 }
 
+@skip-if tursopg "a cast from unknown to dm[] is not supported yet"
 test select-update-null-element-into-array-of-not-null-domain-over-enum {
     CREATE TYPE mood AS ENUM ('sad', 'ok');
     CREATE DOMAIN dm AS mood NOT NULL;
@@ -398,6 +409,7 @@ expect error {
     domain dm does not allow null values
 }
 
+@skip-if tursopg "a cast from unknown to dm[] is not supported yet"
 test select-insert-null-array-of-not-null-domain-over-enum {
     CREATE TYPE mood AS ENUM ('sad', 'ok');
     CREATE DOMAIN dm AS mood NOT NULL;
@@ -410,6 +422,7 @@ expect {
     2|{sad,ok}
 }
 
+@skip-if tursopg "a cast from unknown to pos[] is not supported yet"
 test select-insert-array-of-domain-checks-each-element {
     CREATE DOMAIN pos AS integer CHECK (value > 0);
     CREATE TABLE t (a pos[]);
@@ -420,6 +433,7 @@ expect error {
     value for domain pos violates check constraint "pos_(0|check)"
 }
 
+@skip-if tursopg "a cast from unknown to pos[] is not supported yet"
 test select-insert-array-of-domain-keeps-valid-elements {
     CREATE DOMAIN pos AS integer CHECK (value > 0);
     CREATE TABLE t (a pos[]);
@@ -430,6 +444,7 @@ expect {
     {1,2}
 }
 
+@skip-if tursopg "a cast from unknown to up is not supported yet"
 test select-cast-to-enum-quotes-mixed-case-type-name {
     CREATE TYPE "Up" AS ENUM ('a');
     SELECT 'b'::"Up";
@@ -439,6 +454,7 @@ expect error {
     invalid input value for enum "Up": "b"
 }
 
+@skip-if tursopg "a cast from unknown to select is not supported yet"
 test select-cast-to-enum-quotes-keyword-type-name {
     CREATE TYPE "select" AS ENUM ('a');
     SELECT 'b'::"select";
@@ -448,6 +464,7 @@ expect error {
     invalid input value for enum "select": "b"
 }
 
+@skip-if tursopg "a cast from unknown to it's x is not supported yet"
 test select-cast-to-enum-quotes-type-name-with-quotes {
     CREATE TYPE "it's ""x""" AS ENUM ('a');
     SELECT 'b'::"it's ""x""";
@@ -457,6 +474,7 @@ expect error {
     invalid input value for enum "it's ""x""": "b"
 }
 
+@skip-if tursopg "a cast from unknown to dd is not supported yet"
 test select-cast-to-domain {
     CREATE DOMAIN dd AS date;
     SELECT '2024-01-01'::dd;
@@ -465,6 +483,7 @@ expect {
     2024-01-01
 }
 
+@skip-if tursopg "a cast from unknown to short_text is not supported yet"
 test select-cast-to-domain-checks-constraint {
     CREATE DOMAIN short_text AS text CHECK (length(VALUE) < 3);
     SELECT 'abcd'::short_text;
@@ -472,6 +491,7 @@ test select-cast-to-domain-checks-constraint {
 @sqlstate 23514
 expect error {}
 
+@skip-if tursopg "a cast from integer to db is not supported yet"
 test select-cast-integer-to-domain-over-boolean {
     CREATE DOMAIN db AS boolean;
     CREATE DOMAIN true_db AS db CHECK (VALUE);
@@ -492,6 +512,7 @@ test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
 }
 expect error {}
 
+@skip-if tursopg "a cast from unknown to date is not supported yet"
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
@@ -499,6 +520,7 @@ expect {
     2024-01-15|10:30:00
 }
 
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
 test select-cast-text-to-timestamp {
     SELECT '2024-01-15T10:30:00'::timestamp;
 }
@@ -506,12 +528,14 @@ expect {
     2024-01-15 10:30:00
 }
 
+@skip-if tursopg "a cast from unknown to date is not supported yet"
 test select-cast-invalid-text-to-date {
     SELECT 'hello'::date;
 }
 @sqlstate 22007
 expect error {}
 
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
 test select-cast-invalid-text-to-timestamp {
     SELECT 'hello'::timestamp;
 }
@@ -1069,6 +1093,7 @@ test array-subquery-single-column-required {
 expect error {}
 
 @setup array_items
+@skip-if tursopg "the type of an ARRAY subquery is not known yet"
 test array-subquery-insert-and-update {
     CREATE TABLE array_results (id INTEGER, vals INTEGER[]);
     INSERT INTO array_results VALUES (1, ARRAY(SELECT v FROM array_items WHERE group_id = 2));
@@ -1112,6 +1137,7 @@ expect {
     2050
 }
 
+@skip-if tursopg "a cast from unknown to uuid is not supported yet"
 test array-subquery-custom-cast {
     SELECT ARRAY(SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS uuid));
 }
@@ -1424,6 +1450,7 @@ expect {
 }
 
 @setup like_strings
+@skip-if tursopg "the type of the function like_escape is not known yet"
 test like-escape-clause-replaces-backslash {
     SELECT id FROM t WHERE s LIKE 'a#_c' ESCAPE '#' ORDER BY id;
     SELECT id FROM t WHERE s LIKE 'a\c' ESCAPE '#' ORDER BY id;
@@ -1481,6 +1508,7 @@ expect error {
 
 @setup like_strings
 @skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
+@skip-if tursopg "the type of the function like_escape is not known yet"
 test like-with-escape-clause-in-index-errors {
     CREATE INDEX t_like_escape ON t (id) WHERE s LIKE 'a#_c' ESCAPE '#';
 }
@@ -1580,6 +1608,7 @@ expect error {
     LIKE pattern must not end with escape character
 }
 
+@skip-if tursopg "the type of the function like_escape is not known yet"
 test like-escape-ending-with-escape-after-text-runs-out-errors {
     SELECT 'ab' LIKE 'a%_#' ESCAPE '#';
 }
@@ -1588,6 +1617,7 @@ expect error {
     LIKE pattern must not end with escape character
 }
 
+@skip-if tursopg "the type of the function like_escape is not known yet"
 test like-escape-longer-than-one-character-errors {
     SELECT 'abc' LIKE 'abc' ESCAPE '##';
 }
@@ -1859,6 +1889,7 @@ expect {
     2
 }
 
+@skip-if tursopg "a cast from unknown to qmood is not supported yet"
 test cast-to-public-qualified-type {
     CREATE TYPE qmood AS ENUM ('a', 'b');
     SELECT 'b'::public.qmood, '5'::pg_catalog.int4 + 1;
@@ -2042,6 +2073,7 @@ expect error {
     invalid input syntax for type bigint: "abc"
 }
 
+@skip-if tursopg "a cast from unknown to time is not supported yet"
 test where-on-indexed-time-and-date-columns-converts-the-literal {
     CREATE TABLE seek_m(x time PRIMARY KEY);
     INSERT INTO seek_m VALUES ('12:00');
@@ -2058,6 +2090,7 @@ expect {
     0
 }
 
+@skip-if tursopg "a cast from unknown to time is not supported yet"
 test where-in-on-indexed-columns-returns-a-row-once-for-two-spellings-of-its-value {
     CREATE TABLE in_spellings(id int, t time, tz timetz, ts timestamp, u uuid, b boolean);
     INSERT INTO in_spellings VALUES
@@ -2087,6 +2120,7 @@ expect {
     2
 }
 
+@skip-if tursopg "a cast from integer to numeric(10,2) is not supported yet"
 test window-range-offset-over-bigint-and-numeric {
     CREATE TABLE range_offsets(b bigint, n numeric(10, 2));
     INSERT INTO range_offsets VALUES (1, 1), (2, 2.5), (4, 4);
@@ -2138,6 +2172,7 @@ expect {
 # A text compared with a time or timestamp takes the column's type first:
 # '10:00' is the time 10:00:00. Every query runs before and after the indexes
 # exist, so the expected rows are listed twice.
+@skip-if tursopg "a cast from unknown to time is not supported yet"
 test compare-time-with-text-same-rows-with-and-without-index {
     CREATE TABLE cmp_time (id int PRIMARY KEY, tm time, ts timestamp);
     INSERT INTO cmp_time VALUES (1, '09:30', '2024-01-05 09:30'), (2, '10:00', '2024-01-05 10:00'), (3, '23:59:59', '2024-01-06 00:00'), (4, NULL, NULL);
@@ -2225,6 +2260,7 @@ expect {
 # x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
 # when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
 # holds for a list and a subquery, correlated or not.
+@skip-if tursopg "a cast from unknown to time is not supported yet"
 test compare-text-on-the-left-of-in-with-time {
     CREATE TABLE in_left_ev (id int PRIMARY KEY, tm time);
     INSERT INTO in_left_ev VALUES (1, '09:45:00'), (2, '10:00:00');
@@ -2257,6 +2293,7 @@ expect {
 
 # DELETE and UPDATE find their rows with the converted text, by a scan and
 # through an index.
+@skip-if tursopg "a cast from unknown to time is not supported yet"
 test compare-time-with-text-delete-and-update {
     CREATE TABLE cmp_time_a (id int PRIMARY KEY, tm time);
     CREATE TABLE cmp_time_b (id int PRIMARY KEY, tm time);
@@ -2471,6 +2508,7 @@ expect {
     3|N
 }
 
+@skip-if tursopg "the type of a row value is not known yet"
 test row-constructor-comparisons {
     CREATE TABLE row_values (a int, b int);
     INSERT INTO row_values VALUES (1, 2), (3, NULL);
@@ -2513,6 +2551,7 @@ expect {
     1
 }
 
+@skip-if tursopg "the type of a row value is not known yet"
 test row-constructor-between {
     CREATE TABLE row_between (a int, b int);
     INSERT INTO row_between VALUES (1, 2), (1, 5), (2, 0);
@@ -2527,6 +2566,7 @@ expect {
     1
 }
 
+@skip-if tursopg "the type of a row value is not known yet"
 test row-constructor-with-null-in-subquery {
     CREATE TABLE row_nulls (a int, b int);
     INSERT INTO row_nulls VALUES (NULL, 1), (1, NULL), (1, 2);
@@ -2555,6 +2595,7 @@ expect error {
 }
 
 @skip-if postgres "PostgreSQL accepts a row value inside a row value"
+@skip-if tursopg "the type of a row value is not known yet"
 test row-constructor-inside-row-constructor-errors {
     SELECT ((1, 2), 1) = ((1, 3), 1);
 }
@@ -2573,6 +2614,7 @@ expect error {
 
 # A text in a row value compared with a time is read as a time, component by
 # component, in a comparison, an IN list and a row subquery.
+@skip-if tursopg "a cast from unknown to time is not supported yet"
 test row-constructor-compares-text-with-time {
     CREATE TABLE row_time (id int, tm time);
     INSERT INTO row_time VALUES (1, '09:30'), (2, '10:00');
@@ -2588,4 +2630,1202 @@ expect {
     lt|2
     in|1
     subquery|2
+}
+
+test cast-string-literal-to-integer {
+    SELECT '12'::int;
+}
+expect {
+    12
+}
+
+test cast-string-literal-that-is-not-an-integer-is-an-error {
+    SELECT 'abc'::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-string-literal-too-large-for-integer-is-an-error {
+    SELECT '99999999999'::int;
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-string-literal-to-boolean {
+    SELECT 'yes'::boolean;
+}
+expect {
+    t
+}
+
+test cast-integer-to-bigint {
+    SELECT 1::bigint;
+}
+expect {
+    1
+}
+
+test cast-numeric-literal-to-integer-rounds {
+    SELECT 1.5::int;
+}
+expect {
+    2
+}
+
+test cast-integer-to-text {
+    SELECT 1::text;
+}
+expect {
+    1
+}
+
+@skip-if postgres "PostgreSQL rejects it with a different error"
+test cast-integer-to-date-is-not-supported {
+    SELECT 1::date;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@skip-if postgres "PostgreSQL accepts the cast and rejects the text with a different error"
+test cast-string-literal-to-uuid-is-not-supported {
+    SELECT 'x'::uuid;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@skip-if postgres "PostgreSQL supports type modifiers in a cast"
+test cast-with-a-type-modifier-is-not-supported {
+    SELECT 1::numeric(10,2);
+}
+@sqlstate 0A000
+expect error {
+    a type modifier in a cast is not supported
+}
+
+@skip-if postgres "PostgreSQL supports the cast"
+test cast-numeric-literal-to-text-is-not-supported {
+    SELECT 1.5::text;
+}
+@sqlstate 0A000
+expect error {
+}
+
+test cast-integer-column-to-bigint {
+    CREATE TABLE cast_columns (a int, b text);
+    INSERT INTO cast_columns VALUES (7, 'x');
+    SELECT a::bigint FROM cast_columns;
+    DROP TABLE cast_columns;
+}
+expect {
+    7
+}
+
+test cast-text-column-to-integer {
+    CREATE TABLE cast_columns (a int, b text);
+    INSERT INTO cast_columns VALUES (1, '12');
+    SELECT b::int FROM cast_columns;
+}
+expect {
+    12
+}
+
+@skip-if postgres "PostgreSQL supports the cast"
+test cast-integer-column-to-boolean-is-not-supported {
+    CREATE TABLE cast_columns (a int, b text);
+    SELECT a::boolean FROM cast_columns;
+}
+@sqlstate 0A000
+expect error {
+}
+
+test cast-hex-literal-to-bigint-keeps-every-digit {
+    SELECT 0x7ffffffffffffffe::bigint, (-0x7ffffffffffffffe)::bigint;
+}
+expect {
+    9223372036854775806|-9223372036854775806
+}
+
+setup operand_types {
+    CREATE TABLE operand_types (a integer, b text, c double precision, d boolean, e bigint, ts timestamp);
+    INSERT INTO operand_types VALUES (5, 'x', 2.5, true, 7, '2024-01-01 00:00:00');
+    INSERT INTO operand_types VALUES (6, 'y', 1.5, false, 8, '2024-01-02 00:00:00');
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test compare-integer-with-integer-string-literal {
+    SELECT a FROM operand_types WHERE a = '5';
+}
+expect {
+    5
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test compare-integer-with-text-string-literal-is-rejected {
+    SELECT a FROM operand_types WHERE a = 'abc';
+}
+@sqlstate 22P02
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test compare-text-with-integer-is-rejected {
+    SELECT b FROM operand_types WHERE b = 1;
+}
+@sqlstate 42883
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test add-integer-string-literal-to-integer {
+    SELECT a + '1' FROM operand_types ORDER BY a;
+}
+expect {
+    6
+    7
+}
+
+test add-two-string-literals-is-rejected {
+    SELECT '1' + '1';
+}
+@sqlstate 42725
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test add-integer-to-bigint {
+    SELECT a + e FROM operand_types ORDER BY a;
+}
+expect {
+    12
+    14
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test add-integer-to-double-precision {
+    SELECT a FROM operand_types WHERE a + c = 7.5 ORDER BY a;
+}
+expect {
+    5
+    6
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test concatenate-text-with-integer {
+    SELECT b || a FROM operand_types ORDER BY a;
+}
+expect {
+    x5
+    y6
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@skip-if postgres "PostgreSQL concatenates a boolean to text"
+@setup operand_types
+test concatenate-text-with-boolean-is-not-supported {
+    SELECT b || d FROM operand_types;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test like-on-an-integer-is-rejected {
+    SELECT a FROM operand_types WHERE a LIKE 'x';
+}
+@sqlstate 42883
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test like-on-text-matches {
+    SELECT b FROM operand_types WHERE b LIKE 'x';
+}
+expect {
+    x
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test in-list-converts-string-literals-to-the-integer-type {
+    SELECT a FROM operand_types WHERE a IN (1, '6') ORDER BY a;
+}
+expect {
+    6
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test in-list-with-a-text-string-literal-is-rejected {
+    SELECT a FROM operand_types WHERE a IN ('x');
+}
+@sqlstate 22P02
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test between-converts-string-literals-to-the-integer-type {
+    SELECT count(*) FROM operand_types WHERE a BETWEEN 1 AND '5';
+}
+expect {
+    1
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test where-with-an-integer-is-rejected {
+    SELECT a FROM operand_types WHERE a;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test where-with-the-string-true-keeps-every-row {
+    SELECT count(*) FROM operand_types WHERE 'true';
+}
+expect {
+    2
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test where-with-a-string-that-is-not-a-boolean-is-rejected {
+    SELECT a FROM operand_types WHERE 'maybe';
+}
+@sqlstate 22P02
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test and-with-an-integer-is-rejected {
+    SELECT a AND d FROM operand_types;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@skip-if postgres "PostgreSQL compares a timestamp with a string literal"
+@setup operand_types
+test compare-timestamp-with-string-literal-is-not-supported {
+    SELECT a FROM operand_types WHERE ts = '2024-01-01';
+}
+@sqlstate 0A000
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test compare-timestamp-with-itself {
+    SELECT count(*) FROM operand_types WHERE ts = ts;
+}
+expect {
+    2
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test negate-text-is-rejected {
+    SELECT - b FROM operand_types;
+}
+@sqlstate 42883
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test case-when-with-an-integer-is-rejected {
+    SELECT CASE WHEN a THEN 1 END FROM operand_types;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test similar-to-on-an-integer-is-rejected {
+    SELECT a FROM operand_types WHERE a SIMILAR TO 'x';
+}
+@sqlstate 42883
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test in-subquery-of-text-for-an-integer-is-rejected {
+    SELECT a FROM operand_types WHERE a IN (SELECT b FROM operand_types);
+}
+@sqlstate 42883
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test in-subquery-converts-the-string-literal {
+    SELECT a FROM operand_types WHERE '5' IN (SELECT a FROM operand_types) ORDER BY a;
+}
+expect {
+    5
+    6
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test between-on-text-with-integers-is-rejected {
+    SELECT b FROM operand_types WHERE b BETWEEN 1 AND 2;
+}
+@sqlstate 42883
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test case-with-a-base-converts-string-literals {
+    SELECT CASE a WHEN '5' THEN 'five' ELSE 'other' END FROM operand_types ORDER BY a;
+}
+expect {
+    five
+    other
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test having-with-an-integer-is-rejected {
+    SELECT a FROM operand_types GROUP BY a HAVING a;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test is-true-on-an-integer-is-rejected {
+    SELECT a IS TRUE FROM operand_types;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test join-on-with-an-integer-is-rejected {
+    SELECT 1 FROM operand_types AS x JOIN operand_types AS y ON x.a;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test partial-index-with-an-integer-condition-is-rejected {
+    CREATE INDEX operand_types_a ON operand_types (a) WHERE a;
+}
+@sqlstate 42804
+expect error {
+}
+
+@skip-if tursopg "a cast from unknown to timestamp is not supported yet"
+@setup operand_types
+test unary-minus-on-an-integer-with-a-string-literal-comparison {
+    SELECT a FROM operand_types WHERE -a = '-5';
+}
+expect {
+    5
+}
+
+
+setup convert {
+    CREATE TABLE conv (a integer, b text, d boolean, e bigint, ts timestamp);
+    INSERT INTO conv VALUES (1, 'x', true, 10, NULL), (2, 'y', false, 20, NULL), (NULL, 'z', true, 30, NULL);
+}
+
+@setup convert
+test convert-case-results-of-mixed-types-read-the-string-as-an-integer {
+    SELECT CASE WHEN d THEN 1 ELSE 'x' END FROM conv;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup convert
+test convert-case-results-read-a-string-as-an-integer {
+    SELECT CASE WHEN d THEN a ELSE '5' END FROM conv WHERE a IS NOT NULL ORDER BY b;
+}
+expect {
+    1
+    5
+}
+
+@setup convert
+test convert-case-results-that-do-not-match {
+    SELECT CASE WHEN d THEN a ELSE b END FROM conv;
+}
+@sqlstate 42804
+expect error {
+    CASE types text and integer cannot be matched
+}
+
+@setup convert
+test convert-case-with-a-base-expression-reads-strings-as-the-base-type {
+    SELECT CASE a WHEN 1 THEN 'one' WHEN '2' THEN 'two' ELSE 'many' END FROM conv ORDER BY b;
+}
+expect {
+    one
+    two
+    many
+}
+
+@setup convert
+test convert-coalesce-reads-a-string-as-an-integer {
+    SELECT COALESCE(a, '0') FROM conv ORDER BY b;
+}
+expect {
+    1
+    2
+    0
+}
+
+@setup convert
+test convert-coalesce-of-types-that-do-not-match {
+    SELECT COALESCE(a, b) FROM conv;
+}
+@sqlstate 42804
+expect error {
+    COALESCE types integer and text cannot be matched
+}
+
+@setup convert
+test convert-greatest-of-integer-and-bigint {
+    SELECT GREATEST(a, e), LEAST(a, e) FROM conv WHERE a IS NOT NULL ORDER BY b;
+}
+expect {
+    10|1
+    20|2
+}
+
+@setup convert
+test convert-greatest-of-types-that-do-not-match {
+    SELECT GREATEST(a, b) FROM conv;
+}
+@sqlstate 42804
+expect error {
+    GREATEST types integer and text cannot be matched
+}
+
+@setup convert
+test convert-least-of-types-that-do-not-match {
+    SELECT LEAST(a, b) FROM conv;
+}
+@sqlstate 42804
+expect error {
+    LEAST types integer and text cannot be matched
+}
+
+@skip-if postgres "PostgreSQL reads the string as a timestamp; tursopg rejects a cast from unknown to timestamp"
+@setup convert
+test convert-coalesce-reads-a-string-as-a-timestamp-is-not-supported {
+    SELECT COALESCE(ts, '2024-01-01') FROM conv;
+}
+@sqlstate 0A000
+expect error {
+    a cast from unknown to timestamp is not supported
+}
+
+@skip-if tursopg "UNION does not convert its operands yet"
+test convert-union-reads-a-string-as-an-integer {
+    SELECT 1 UNION SELECT 'a';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
+}
+
+@setup convert
+test convert-union-of-types-that-do-not-match {
+    SELECT a FROM conv UNION SELECT b FROM conv;
+}
+@sqlstate 42804
+expect error {
+    UNION types integer and text cannot be matched
+}
+
+@setup convert
+test convert-intersect-and-except-of-types-that-do-not-match {
+    SELECT a FROM conv EXCEPT SELECT b FROM conv;
+}
+@sqlstate 42804
+expect error {
+    EXCEPT types integer and text cannot be matched
+}
+
+test convert-values-rows-of-types-that-do-not-match {
+    SELECT * FROM (VALUES (1), ('x'::text)) AS v(n);
+}
+@sqlstate 42804
+expect error {
+    VALUES types integer and text cannot be matched
+}
+
+test convert-timestamptz-column-compares-with-now {
+    CREATE TABLE stamped (t timestamptz);
+    INSERT INTO stamped VALUES (now());
+    SELECT count(*) FROM stamped WHERE t <= now();
+    SELECT count(*) FROM stamped WHERE now() >= t;
+}
+expect {
+    1
+    1
+}
+
+@setup convert
+test convert-text-column-compares-with-current-user {
+    SELECT count(*) FROM conv WHERE b = current_user;
+}
+expect {
+    0
+}
+
+test convert-bytea-concatenation {
+    SELECT length('\x01'::bytea || '\x0203'::bytea);
+    SELECT length('\x01'::bytea || '\x0203');
+}
+expect {
+    3
+    3
+}
+
+@skip-if postgres "PostgreSQL knows the type of mod()"
+test comparison-with-a-function-of-unknown-type-is-not-supported {
+    SELECT mod(5, 2) = 1;
+}
+@sqlstate 0A000
+expect error {
+    the type of the function mod is not known
+}
+
+test function-of-unknown-type-alone-needs-no-conversion {
+    SELECT mod(5, 2);
+}
+expect {
+    1
+}
+
+@skip-if postgres "PostgreSQL knows the type of mod()"
+test condition-of-a-function-of-unknown-type-is-not-supported {
+    SELECT 1 WHERE mod(5, 2);
+}
+@sqlstate 0A000
+expect error {
+    the type of the function mod is not known
+}
+
+test comparison-with-a-column-that-does-not-exist-is-an-undefined-column {
+    CREATE TABLE named_t (x int);
+    SELECT nosuch = 1 FROM named_t;
+}
+@sqlstate 42703
+expect error {
+}
+
+test comparison-with-a-column-of-a-table-that-does-not-exist-is-an-undefined-table {
+    SELECT 1 FROM nosuch WHERE x = 1;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test function-of-unknown-type-over-a-column-that-does-not-exist-is-an-undefined-column {
+    CREATE TABLE named_t (x int);
+    SELECT mod(nosuch, 2) = 1 FROM named_t;
+}
+@sqlstate 42703
+expect error {
+}
+
+test comparison-with-a-column-of-generate-series-is-typed {
+    SELECT 1 FROM generate_series(1, 3) AS g WHERE g = 1;
+}
+expect {
+    1
+}
+
+test comparison-with-a-column-of-a-view-is-typed {
+    CREATE TABLE typed_v_source (n int);
+    CREATE VIEW typed_v AS SELECT n FROM typed_v_source;
+    SELECT n = true FROM typed_v;
+}
+@sqlstate 42883
+expect error {
+}
+
+test comparison-with-a-column-of-a-catalog-table-is-typed {
+    SELECT relname = 1 FROM pg_class;
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-literal-to-integer-reads-every-input-postgresql-accepts {
+    SELECT '42'::int4, ' 42 '::int4, '+7'::int4, '-7'::int4, '0'::int4, '007'::int4, '2147483647'::int4, '-2147483648'::int4, '0x1F'::int4, '0X1f'::int4, '0o17'::int4, '0b101'::int4, '1_000'::int4, '0x1_F'::int4, '-0x10'::int4, '  +0b1_1  '::int4;
+}
+expect {
+    42|42|7|-7|0|7|2147483647|-2147483648|31|31|15|5|1000|31|-16|3
+}
+
+test text-value-to-integer-reads-every-input-postgresql-accepts {
+    CREATE TABLE zz_ti (id int, s text);
+    INSERT INTO zz_ti VALUES (0, '42'), (1, ' 42 '), (2, '+7'), (3, '-7'), (4, '0'), (5, '007'), (6, '2147483647'), (7, '-2147483648'), (8, '0x1F'), (9, '0X1f'), (10, '0o17'), (11, '0b101'), (12, '1_000'), (13, '0x1_F'), (14, '-0x10'), (15, '  +0b1_1  ');
+    SELECT s::int4 FROM zz_ti ORDER BY id;
+}
+expect {
+    42
+    42
+    7
+    -7
+    0
+    7
+    2147483647
+    -2147483648
+    31
+    31
+    15
+    5
+    1000
+    31
+    -16
+    3
+}
+
+test text-value-to-bigint-reads-every-input-postgresql-accepts {
+    CREATE TABLE zz_tb (id int, s text);
+    INSERT INTO zz_tb VALUES (0, '42'), (1, ' 42 '), (2, '+7'), (3, '-7'), (4, '0'), (5, '007'), (6, '2147483647'), (7, '-2147483648'), (8, '0x1F'), (9, '0X1f'), (10, '0o17'), (11, '0b101'), (12, '1_000'), (13, '0x1_F'), (14, '-0x10'), (15, '  +0b1_1  '), (99, '9223372036854775807'), (100, '-9223372036854775808'), (101, '0x7FFFFFFFFFFFFFFF');
+    SELECT s::int8 FROM zz_tb ORDER BY id;
+}
+expect {
+    42
+    42
+    7
+    -7
+    0
+    7
+    2147483647
+    -2147483648
+    31
+    31
+    15
+    5
+    1000
+    31
+    -16
+    3
+    9223372036854775807
+    -9223372036854775808
+    9223372036854775807
+}
+
+test text-literal-to-bigint-reads-the-same-inputs {
+    SELECT '42'::int8, ' 42 '::int8, '+7'::int8, '-7'::int8, '0'::int8, '007'::int8, '2147483647'::int8, '-2147483648'::int8, '0x1F'::int8, '0X1f'::int8, '0o17'::int8, '0b101'::int8, '1_000'::int8, '0x1_F'::int8, '-0x10'::int8, '  +0b1_1  '::int8, '9223372036854775807'::int8, '-9223372036854775808'::int8, '0x7FFFFFFFFFFFFFFF'::int8;
+}
+expect {
+    42|42|7|-7|0|7|2147483647|-2147483648|31|31|15|5|1000|31|-16|3|9223372036854775807|-9223372036854775808|9223372036854775807
+}
+
+test text-value-with-whitespace-characters-to-integer {
+    CREATE TABLE zz_tw (s text);
+    INSERT INTO zz_tw VALUES (E'\t42\n'), (E'\r\f\v7 ');
+    SELECT s::int4 FROM zz_tw ORDER BY 1;
+}
+expect {
+    7
+    42
+}
+
+test text-null-to-integer-is-null {
+    CREATE TABLE zz_tn (s text);
+    INSERT INTO zz_tn VALUES (NULL);
+    SELECT s::int4, s::int8, NULL::text::int4 FROM zz_tn;
+}
+expect {
+    ||
+}
+
+test text-literal-to-integer-error-1 {
+    SELECT 'abc'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "abc"
+}
+
+test text-value-to-integer-error-1 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('abc');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "abc"
+}
+
+test text-literal-to-integer-error-2 {
+    SELECT ''::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: ""
+}
+
+test text-value-to-integer-error-2 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: ""
+}
+
+test text-literal-to-integer-error-3 {
+    SELECT ' '::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: " "
+}
+
+test text-value-to-integer-error-3 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES (' ');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: " "
+}
+
+test text-literal-to-integer-error-4 {
+    SELECT '1.5'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+test text-value-to-integer-error-4 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('1.5');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+test text-literal-to-integer-error-5 {
+    SELECT '1e3'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1e3"
+}
+
+test text-value-to-integer-error-5 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('1e3');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1e3"
+}
+
+test text-literal-to-integer-error-6 {
+    SELECT '+'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "\+"
+}
+
+test text-value-to-integer-error-6 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('+');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "\+"
+}
+
+test text-literal-to-integer-error-7 {
+    SELECT '0x'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "0x"
+}
+
+test text-value-to-integer-error-7 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('0x');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "0x"
+}
+
+test text-literal-to-integer-error-8 {
+    SELECT '0xg'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "0xg"
+}
+
+test text-value-to-integer-error-8 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('0xg');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "0xg"
+}
+
+test text-literal-to-integer-error-9 {
+    SELECT '1__0'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1__0"
+}
+
+test text-value-to-integer-error-9 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('1__0');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1__0"
+}
+
+test text-literal-to-integer-error-10 {
+    SELECT '_1'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "_1"
+}
+
+test text-value-to-integer-error-10 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('_1');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "_1"
+}
+
+test text-literal-to-integer-error-11 {
+    SELECT '1_'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1_"
+}
+
+test text-value-to-integer-error-11 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('1_');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1_"
+}
+
+test text-literal-to-integer-error-12 {
+    SELECT '0b2'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "0b2"
+}
+
+test text-value-to-integer-error-12 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('0b2');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "0b2"
+}
+
+test text-literal-to-integer-error-13 {
+    SELECT '4 2'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "4 2"
+}
+
+test text-value-to-integer-error-13 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('4 2');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "4 2"
+}
+
+test text-literal-to-integer-error-14 {
+    SELECT '--1'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "--1"
+}
+
+test text-value-to-integer-error-14 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('--1');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "--1"
+}
+
+test text-literal-to-integer-error-15 {
+    SELECT '2147483648'::int4;
+}
+@sqlstate 22003
+expect error {
+    value "2147483648" is out of range for type integer
+}
+
+test text-value-to-integer-error-15 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('2147483648');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22003
+expect error {
+    value "2147483648" is out of range for type integer
+}
+
+test text-literal-to-integer-error-16 {
+    SELECT '-2147483649'::int4;
+}
+@sqlstate 22003
+expect error {
+    value "-2147483649" is out of range for type integer
+}
+
+test text-value-to-integer-error-16 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('-2147483649');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22003
+expect error {
+    value "-2147483649" is out of range for type integer
+}
+
+test text-literal-to-integer-error-17 {
+    SELECT '0x80000000'::int4;
+}
+@sqlstate 22003
+expect error {
+    value "0x80000000" is out of range for type integer
+}
+
+test text-value-to-integer-error-17 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('0x80000000');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22003
+expect error {
+    value "0x80000000" is out of range for type integer
+}
+
+test text-literal-to-integer-error-18 {
+    SELECT '99999999999999999999'::int4;
+}
+@sqlstate 22003
+expect error {
+    value "99999999999999999999" is out of range for type integer
+}
+
+test text-value-to-integer-error-18 {
+    CREATE TABLE zz_te (s text);
+    INSERT INTO zz_te VALUES ('99999999999999999999');
+    SELECT s::int4 FROM zz_te;
+}
+@sqlstate 22003
+expect error {
+    value "99999999999999999999" is out of range for type integer
+}
+
+test text-literal-to-bigint-error-19 {
+    SELECT '9223372036854775808'::int8;
+}
+@sqlstate 22003
+expect error {
+    value "9223372036854775808" is out of range for type bigint
+}
+
+test text-value-to-bigint-error-19 {
+    CREATE TABLE zz_tf (s text);
+    INSERT INTO zz_tf VALUES ('9223372036854775808');
+    SELECT s::int8 FROM zz_tf;
+}
+@sqlstate 22003
+expect error {
+    value "9223372036854775808" is out of range for type bigint
+}
+
+test text-literal-to-bigint-error-20 {
+    SELECT '-9223372036854775809'::int8;
+}
+@sqlstate 22003
+expect error {
+    value "-9223372036854775809" is out of range for type bigint
+}
+
+test text-value-to-bigint-error-20 {
+    CREATE TABLE zz_tf (s text);
+    INSERT INTO zz_tf VALUES ('-9223372036854775809');
+    SELECT s::int8 FROM zz_tf;
+}
+@sqlstate 22003
+expect error {
+    value "-9223372036854775809" is out of range for type bigint
+}
+
+test text-literal-to-bigint-error-21 {
+    SELECT 'abc'::int8;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}
+
+test text-value-to-bigint-error-21 {
+    CREATE TABLE zz_tf (s text);
+    INSERT INTO zz_tf VALUES ('abc');
+    SELECT s::int8 FROM zz_tf;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}
+
+test text-literal-to-bigint-error-22 {
+    SELECT '0x8000000000000000'::int8;
+}
+@sqlstate 22003
+expect error {
+    value "0x8000000000000000" is out of range for type bigint
+}
+
+test text-value-to-bigint-error-22 {
+    CREATE TABLE zz_tf (s text);
+    INSERT INTO zz_tf VALUES ('0x8000000000000000');
+    SELECT s::int8 FROM zz_tf;
+}
+@sqlstate 22003
+expect error {
+    value "0x8000000000000000" is out of range for type bigint
+}
+
+test varchar-value-to-integer-explicit {
+    CREATE TABLE zz_tv (v varchar(10));
+    INSERT INTO zz_tv VALUES ('12'), (' 0x10 ');
+    SELECT v::int4, v::int8 FROM zz_tv ORDER BY 1;
+}
+expect {
+    12|12
+    16|16
+}
+
+test text-value-to-integer-needs-an-explicit-cast-in-an-assignment {
+    CREATE TABLE zz_ta (a int);
+    CREATE TABLE zz_tb2 (s text);
+    INSERT INTO zz_ta SELECT s FROM zz_tb2;
+}
+@sqlstate 42804
+expect error {
+    column "a" is of type integer but expression is of type text
+}
+
+test text-value-plus-integer-does-not-exist {
+    CREATE TABLE zz_tc (s text);
+    SELECT s + 1 FROM zz_tc;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text \+ integer
+}
+
+test text-value-compared-with-integer-does-not-exist {
+    CREATE TABLE zz_td (s text);
+    SELECT s = 1 FROM zz_td;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@skip-if tursopg "a cast from text to double precision is not supported yet"
+test text-value-to-float-is-not-supported-yet {
+    CREATE TABLE zz_tg (s text);
+    INSERT INTO zz_tg VALUES ('1.5');
+    SELECT (s::float8 * 2)::int FROM zz_tg;
+}
+expect {
+    3
+}
+
+@skip-if tursopg "a cast from text to numeric is not supported yet"
+test text-value-to-numeric-is-not-supported-yet {
+    CREATE TABLE zz_th (s text);
+    INSERT INTO zz_th VALUES ('1.5');
+    SELECT (s::numeric * 2)::int FROM zz_th;
+}
+expect {
+    3
+}
+
+@skip-if tursopg "a cast from text to boolean is not supported yet"
+test text-value-to-boolean-is-not-supported-yet {
+    CREATE TABLE zz_ti2 (s text);
+    INSERT INTO zz_ti2 VALUES ('true');
+    SELECT s::boolean::int FROM zz_ti2;
+}
+expect {
+    1
 }

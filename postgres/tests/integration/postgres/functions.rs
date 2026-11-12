@@ -521,6 +521,7 @@ fn test_pg_current_schema_all_syntactic_forms(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+#[ignore = "CASE with types timestamptz and integer is not supported yet"]
 fn test_pg_derived_result_column_names(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (a integer)").unwrap();

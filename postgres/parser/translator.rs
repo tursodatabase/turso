@@ -13553,6 +13553,22 @@ mod tests {
         assert!(translated.contains("CAST ('{}' AS jsonb)"), "{translated}");
     }
 
+    #[test]
+    fn stored_sql_casts_with_the_type_a_column_of_that_type_has() {
+        let translator = PostgreSQLTranslator::new().for_stored_sql();
+        for (cast, expected) in [
+            ("'x'::varchar", "CAST ('x' AS TEXT)"),
+            ("'x'::bytea", "CAST ('x' AS bytea)"),
+            ("'1'::int[]", "CAST ('1' AS INTEGER[])"),
+            ("'x'::timestamptz", "CAST ('x' AS timestamptz)"),
+        ] {
+            let translated = translate_with(&translator, &format!("SELECT {cast}"))
+                .unwrap()
+                .to_string();
+            assert!(translated.contains(expected), "{cast}: {translated}");
+        }
+    }
+
     fn translated_sql(translator: &PostgreSQLTranslator, sql: &str) -> String {
         translate_with(translator, sql)
             .unwrap_or_else(|error| panic!("{sql}: {error}"))
