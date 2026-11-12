@@ -21,7 +21,7 @@ fn test_pg_object_catalog_column_counts(db: TempDatabase) {
         ("pg_conversion", 8),
         ("pg_range", 7),
         ("pg_event_trigger", 7),
-        ("pg_subscription", 17),
+        ("pg_subscription", 18),
         ("pg_largeobject_metadata", 3),
         ("pg_amop", 9),
         ("pg_amproc", 6),
@@ -55,7 +55,7 @@ fn test_physical_catalog_tableoid_is_hidden(db: TempDatabase) {
         conn.prepare("SELECT * FROM pg_class")
             .unwrap()
             .num_columns(),
-        33
+        34
     );
     assert_eq!(
         conn.prepare("SELECT * FROM pg_namespace")

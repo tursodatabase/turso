@@ -7874,7 +7874,7 @@ const MAX_IDENTIFIER_BYTES: usize = 63;
 /// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
 /// of the table and column parts shortened first until the name fits in
 /// [`MAX_IDENTIFIER_BYTES`], so the name can be referred to again.
-fn make_object_name(table: &str, columns: &str, label: &str) -> String {
+pub fn make_object_name(table: &str, columns: &str, label: &str) -> String {
     let available = MAX_IDENTIFIER_BYTES - label.len() - 2;
     let (mut table_len, mut columns_len) = (table.len(), columns.len());
     while table_len + columns_len > available {

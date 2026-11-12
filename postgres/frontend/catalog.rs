@@ -19,6 +19,7 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::translator::make_object_name;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -544,6 +545,7 @@ impl SnapshotRows for PgClassTable {
             relpages INTEGER,
             reltuples REAL,
             relallvisible INTEGER,
+            relallfrozen INTEGER,
             reltoastrelid INTEGER,
             relhasindex BOOLEAN,
             relisshared BOOLEAN,
@@ -608,6 +610,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(1),                                             // relpages
                 Value::from_f64(0.0),                                           // reltuples
                 Value::from_i64(0),                                             // relallvisible
+                Value::from_i64(0),                                             // relallfrozen
                 Value::from_i64(0),                                             // reltoastrelid
                 Value::from_i64(relhasindex),                                   // relhasindex
                 Value::from_i64(0),                                             // relisshared
@@ -649,6 +652,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(1),                                       // relpages
                 Value::from_f64(0.0),                                     // reltuples
                 Value::from_i64(0),                                       // relallvisible
+                Value::from_i64(0),                                       // relallfrozen
                 Value::from_i64(0),                                       // reltoastrelid
                 Value::from_i64(0),                                       // relhasindex
                 Value::from_i64(0),                                       // relisshared
@@ -686,7 +690,8 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),
                 Value::from_i64(1),
                 Value::from_f64(1.0),
-                Value::from_i64(0),
+                Value::from_i64(0), // relallvisible
+                Value::from_i64(0), // relallfrozen
                 Value::from_i64(0),
                 Value::from_i64(0),
                 Value::from_i64(0),
@@ -1212,7 +1217,7 @@ impl SnapshotRows for PgDatabaseTable {
             dattablespace INTEGER,
             datcollate TEXT,
             datctype TEXT,
-            daticulocale TEXT,
+            datlocale TEXT,
             daticurules TEXT,
             datacl TEXT,
             tableoid INTEGER HIDDEN
@@ -1237,7 +1242,7 @@ impl SnapshotRows for PgDatabaseTable {
             Value::from_i64(1663),            // dattablespace (pg_default)
             Value::build_text("en_US.UTF-8"), // datcollate
             Value::build_text("en_US.UTF-8"), // datctype
-            Value::Null,                      // daticulocale
+            Value::Null,                      // datlocale
             Value::Null,                      // daticurules
             Value::Null,                      // datacl
         ]]
@@ -1995,9 +2000,11 @@ enum ConstraintKind {
     ForeignKey,
     #[strum(serialize = "c")]
     Check,
+    #[strum(serialize = "n")]
+    NotNull,
 }
 
-const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
+const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, conenforced BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conperiod BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgConstraintTable;
@@ -2005,7 +2012,7 @@ struct PgConstraintTable;
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
     /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
-    /// unique constraints, foreign keys and checks.
+    /// unique constraints, foreign keys, checks and NOT NULL constraints.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
@@ -2050,16 +2057,17 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
                 let contype: &'static str = ConstraintKind::PrimaryKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
                     Value::build_text(conname),
                     Value::from_i64(2200),
                     Value::build_text(contype),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(1),
+                    Value::from_i64(0), // condeferrable
+                    Value::from_i64(0), // condeferred
+                    Value::from_i64(1), // conenforced
+                    Value::from_i64(1), // convalidated
                     Value::from_i64(table_oid),
                     Value::from_i64(0),
                     Value::from_i64(index.oid),
@@ -2068,10 +2076,11 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,
                     Value::Null,
                     Value::Null,
-                    Value::from_i64(1),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::build_text(conkey),
+                    Value::from_i64(1), // conislocal
+                    Value::from_i64(0), // coninhcount
+                    Value::from_i64(0), // connoinherit
+                    Value::from_i64(0), // conperiod
+                    Value::build_text(format!("{{{conkey}}}")),
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -2103,7 +2112,7 @@ impl SnapshotRows for PgConstraintTable {
                     })
                 };
 
-                // Build conkey: space-separated 1-based attnums
+                // Build conkey: the 1-based attnums
                 let conkey: String = col_names
                     .iter()
                     .map(|name| {
@@ -2113,7 +2122,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
 
                 let positions: Vec<usize> = col_names
                     .iter()
@@ -2144,31 +2153,33 @@ impl SnapshotRows for PgConstraintTable {
 
                 let contype: &'static str = contype.into();
                 rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace (public)
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(conindid),       // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
-                    Value::build_text(conkey),       // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::Null,                     // conbin
+                    Value::from_i64(constraint_oid),            // oid
+                    Value::build_text(conname),                 // conname
+                    Value::from_i64(2200),                      // connamespace (public)
+                    Value::build_text(contype),                 // contype
+                    Value::from_i64(0),                         // condeferrable
+                    Value::from_i64(0),                         // condeferred
+                    Value::from_i64(1),                         // conenforced
+                    Value::from_i64(1),                         // convalidated
+                    Value::from_i64(table_oid),                 // conrelid
+                    Value::from_i64(0),                         // contypid
+                    Value::from_i64(conindid),                  // conindid
+                    Value::from_i64(0),                         // conparentid
+                    Value::from_i64(0),                         // confrelid
+                    Value::Null,                                // confupdtype
+                    Value::Null,                                // confdeltype
+                    Value::Null,                                // confmatchtype
+                    Value::from_i64(1),                         // conislocal
+                    Value::from_i64(0),                         // coninhcount
+                    Value::from_i64(0),                         // connoinherit
+                    Value::from_i64(0),                         // conperiod
+                    Value::build_text(format!("{{{conkey}}}")), // conkey
+                    Value::Null,                                // confkey
+                    Value::Null,                                // conpfeqop
+                    Value::Null,                                // conppeqop
+                    Value::Null,                                // conffeqop
+                    Value::Null,                                // conexclop
+                    Value::Null,                                // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2191,7 +2202,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
 
                 let confrelid = tbl_oid_map
                     .get(&(fk.parent_namespace, fk.parent_table.clone()))
@@ -2212,7 +2223,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
 
                 let contype: &'static str = ConstraintKind::ForeignKey.into();
                 rows.push(vec![
@@ -2222,6 +2233,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
+                    Value::from_i64(1),                                // conenforced
                     Value::from_i64(1),                                // convalidated
                     Value::from_i64(table_oid),                        // conrelid
                     Value::from_i64(0),                                // contypid
@@ -2234,8 +2246,9 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),                                // conislocal
                     Value::from_i64(0),                                // coninhcount
                     Value::from_i64(0),                                // connoinherit
-                    Value::build_text(conkey),                         // conkey
-                    Value::build_text(confkey),                        // confkey
+                    Value::from_i64(0),                                // conperiod
+                    Value::build_text(format!("{{{conkey}}}")),        // conkey
+                    Value::build_text(format!("{{{confkey}}}")),       // confkey
                     Value::Null,                                       // conpfeqop
                     Value::Null,                                       // conppeqop
                     Value::Null,                                       // conffeqop
@@ -2270,6 +2283,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::build_text(contype),      // contype
                     Value::from_i64(0),              // condeferrable
                     Value::from_i64(0),              // condeferred
+                    Value::from_i64(1),              // conenforced
                     Value::from_i64(1),              // convalidated
                     Value::from_i64(table_oid),      // conrelid
                     Value::from_i64(0),              // contypid
@@ -2282,10 +2296,11 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),              // conislocal
                     Value::from_i64(0),              // coninhcount
                     Value::from_i64(0),              // connoinherit
+                    Value::from_i64(0),              // conperiod
                     if conkey.is_empty() {
                         Value::Null
                     } else {
-                        Value::build_text(conkey)
+                        Value::build_text(format!("{{{conkey}}}"))
                     }, // conkey
                     Value::Null,                     // confkey
                     Value::Null,                     // conpfeqop
@@ -2293,6 +2308,46 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
                     Value::build_text(render_expr(&chk.expr)), // conbin
+                ]);
+                constraint_oid += 1;
+            }
+
+            // As in PostgreSQL 18, each NOT NULL column has a constraint of
+            // its own, primary key columns included.
+            for (position, column) in btree.columns().iter().enumerate() {
+                if !column.notnull() {
+                    continue;
+                }
+                let column_name = column.name.as_deref().expect("table columns have names");
+                let contype: &'static str = ConstraintKind::NotNull.into();
+                rows.push(vec![
+                    Value::from_i64(constraint_oid), // oid
+                    Value::build_text(make_object_name(table_name, column_name, "not_null")), // conname
+                    Value::from_i64(2200),      // connamespace
+                    Value::build_text(contype), // contype
+                    Value::from_i64(0),         // condeferrable
+                    Value::from_i64(0),         // condeferred
+                    Value::from_i64(1),         // conenforced
+                    Value::from_i64(1),         // convalidated
+                    Value::from_i64(table_oid), // conrelid
+                    Value::from_i64(0),         // contypid
+                    Value::from_i64(0),         // conindid
+                    Value::from_i64(0),         // conparentid
+                    Value::from_i64(0),         // confrelid
+                    Value::Null,                // confupdtype
+                    Value::Null,                // confdeltype
+                    Value::Null,                // confmatchtype
+                    Value::from_i64(1),         // conislocal
+                    Value::from_i64(0),         // coninhcount
+                    Value::from_i64(0),         // connoinherit
+                    Value::from_i64(0),         // conperiod
+                    Value::build_text(format!("{{{}}}", position + 1)), // conkey
+                    Value::Null,                // confkey
+                    Value::Null,                // conpfeqop
+                    Value::Null,                // conppeqop
+                    Value::Null,                // conffeqop
+                    Value::Null,                // conexclop
+                    Value::Null,                // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2396,7 +2451,7 @@ impl SnapshotRows for PgSequenceTable {
 
 /// The sequences the catalogs list, each with its stored oid and its
 /// namespace, so a join on them agrees across catalogs.
-fn sequence_catalog_entries(schema: &Schema) -> Vec<(i64, NamespaceId, &Sequence)> {
+pub(crate) fn sequence_catalog_entries(schema: &Schema) -> Vec<(i64, NamespaceId, &Sequence)> {
     let mut sequences = Vec::new();
     for namespace in namespaces_sorted(schema) {
         let mut named: Vec<_> = schema
@@ -2503,6 +2558,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_options_to_table",
         VTabKind::TableValuedFunction,
         crate::options::PgOptionsToTable,
+    );
+    options = options.native_module(
+        "pg_get_sequence_data",
+        VTabKind::TableValuedFunction,
+        crate::sequence_data::PgGetSequenceData,
     );
     options = options.native_module(
         "pg_class",
@@ -2688,7 +2748,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, pubgencols TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_namespace",
@@ -2857,7 +2917,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             "CREATE TABLE pg_subscription (
             oid INTEGER, subdbid INTEGER, subskiplsn TEXT, subname TEXT, subowner INTEGER,
             subenabled BOOLEAN, subbinary BOOLEAN, substream TEXT, subtwophasestate TEXT,
-            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN,
+            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN, subfailover BOOLEAN,
             subconninfo TEXT, subslotname TEXT, subsynccommit TEXT, subpublications TEXT[],
             suborigin TEXT, tableoid INTEGER HIDDEN
         )",
@@ -3164,12 +3224,17 @@ impl SnapshotRows for PgDependTable {
     }
 }
 
+/// The column numbers of a catalog row, from `int2vector` text such as
+/// `1 2` or `int2[]` text such as `{1,2}`.
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
     match text {
         None => vec![WHOLE_OBJECT_COLUMN_NUMBER],
         Some(text) => {
             let mut columns: Vec<i64> = text
-                .split_ascii_whitespace()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                .filter(|column| !column.is_empty())
                 .map(|column| column.parse().expect("catalog column numbers are integers"))
                 .collect();
             if columns.is_empty() {
@@ -3221,7 +3286,7 @@ impl RelationRow {
     const OID_COLUMN: usize = 0;
     const NAMESPACE_OID_COLUMN: usize = 2;
     const ACCESS_METHOD_OID_COLUMN: usize = 6;
-    const KIND_COLUMN: usize = 16;
+    const KIND_COLUMN: usize = 17;
 
     fn from_row(row: &[Value]) -> Self {
         Self {
@@ -3248,11 +3313,11 @@ impl<'a> ConstraintRow<'a> {
     // Zero-based positions in PgConstraintTable's SQL column order.
     const OID_COLUMN: usize = 0;
     const KIND_COLUMN: usize = 3;
-    const TABLE_OID_COLUMN: usize = 7;
-    const INDEX_OID_COLUMN: usize = 9;
-    const REFERENCED_TABLE_OID_COLUMN: usize = 11;
-    const COLUMN_NUMBERS_COLUMN: usize = 18;
-    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 19;
+    const TABLE_OID_COLUMN: usize = 8;
+    const INDEX_OID_COLUMN: usize = 10;
+    const REFERENCED_TABLE_OID_COLUMN: usize = 12;
+    const COLUMN_NUMBERS_COLUMN: usize = 20;
+    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 21;
 
     fn from_row(row: &'a [Value]) -> Self {
         Self {
@@ -4006,6 +4071,15 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
             }
             constraint_oid += 1;
         }
+
+        // NOT NULL constraints, one per column
+        for column in btree.columns().iter().filter(|column| column.notnull()) {
+            if constraint_oid == target_oid {
+                let column_name = column.name.as_deref().expect("table columns have names");
+                return Some(format!("NOT NULL {}", quote_identifier(column_name)));
+            }
+            constraint_oid += 1;
+        }
     }
 
     None
@@ -4126,14 +4200,25 @@ fn render_pg_number(text: &str) -> Option<String> {
     }
 }
 
-/// Look up an index by OID and return its definition (CREATE INDEX ...).
-/// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
-pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
+/// Look up an index by OID and return its definition (CREATE INDEX ...),
+/// or with `column` other than 0, the key of that 1-based column alone, as
+/// PostgreSQL does. Uses the same OID assignment as [PgIndexTable] /
+/// [PgClassTable].
+pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64, column: i64) -> Option<String> {
     let schema = conn.current_schema();
-    catalog_indexes(&schema)
-        .iter()
-        .find(|index| index.oid == target_oid)
-        .map(|index| index_definition(&schema, index))
+    let indexes = catalog_indexes(&schema);
+    let index = indexes.iter().find(|index| index.oid == target_oid)?;
+    if column == 0 {
+        return Some(index_definition(&schema, index));
+    }
+    let key = index
+        .columns
+        .get(usize::try_from(column).ok()?.checked_sub(1)?)?;
+    Some(
+        key.expression
+            .clone()
+            .unwrap_or_else(|| quote_identifier(&key.name)),
+    )
 }
 
 fn index_definition(schema: &Schema, index: &CatalogIndex) -> String {
