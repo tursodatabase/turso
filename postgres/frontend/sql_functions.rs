@@ -759,10 +759,8 @@ fn function_namespace(
         return Ok(search_path_namespaces(connection).into_iter().next());
     };
     let schema_name = schema_name.as_str();
-    connection
-        .qualifier(&schema_name.to_lowercase())
-        .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
-        .map(|qualifier| Some(qualifier.target.id))
+    schema_namespace(connection, schema_name)
+        .map(Some)
         .ok_or_else(|| {
             sqlstate_error(
                 SQLSTATE_INVALID_SCHEMA_NAME,
@@ -783,6 +781,14 @@ fn function_schema_name(connection: &Connection, name: &ast::QualifiedName) -> O
             .find(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
             .map(|qualifier| qualifier.name),
     }
+}
+
+/// The namespace of schema `schema_name` of the main database.
+pub(crate) fn schema_namespace(connection: &Connection, schema_name: &str) -> Option<NamespaceId> {
+    connection
+        .qualifier(&schema_name.to_lowercase())
+        .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
+        .map(|qualifier| qualifier.target.id)
 }
 
 /// The namespaces of the schemas of the search path that exist, in order.

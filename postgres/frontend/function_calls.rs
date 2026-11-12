@@ -14,7 +14,7 @@
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
-use turso_core::{walk_expr, walk_expr_mut, Connection, Func, LimboError, WalkControl, MAIN_DB_ID};
+use turso_core::{walk_expr, walk_expr_mut, Connection, Func, LimboError, WalkControl};
 use turso_parser::ast;
 use turso_parser::parser::MAX_EXPR_DEPTH;
 use turso_pg_parser::sqlstate::{
@@ -25,7 +25,8 @@ use turso_pg_parser::{inlined_function, InlinedFunction};
 
 use crate::error::sqlstate_error;
 use crate::sql_functions::{
-    function_catalog, is_built_in_function, search_path_namespaces, FunctionCatalog, SqlFunction,
+    function_catalog, is_built_in_function, schema_namespace, search_path_namespaces,
+    FunctionCatalog, SqlFunction,
 };
 
 /// [`turso_core::Dialect::expands_function_calls`] for the PostgreSQL
@@ -70,7 +71,7 @@ pub(crate) fn check_function_calls(
     let schema = connection.current_schema();
     let functions = function_catalog(&schema);
     check_schemas_of_calls(connection, functions, called_functions)?;
-    if functions.is_none_or(|functions| functions.iter().next().is_none()) {
+    if !has_functions(&schema) {
         return Ok(());
     }
     let unsupported_call = |called: &turso_pg_parser::CalledFunction, place: &str| {
@@ -491,14 +492,6 @@ fn functions_named<'a>(
     namespaces
         .into_iter()
         .flat_map(move |namespace| functions.named(namespace, &name))
-}
-
-/// The namespace of schema `schema_name` of the main database.
-pub(crate) fn schema_namespace(connection: &Connection, schema_name: &str) -> Option<NamespaceId> {
-    connection
-        .qualifier(&schema_name.to_lowercase())
-        .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
-        .map(|qualifier| qualifier.target.id)
 }
 
 /// The number of levels of `expression`: 1 for an expression that has no
