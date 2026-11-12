@@ -349,6 +349,30 @@ expect {
     {postgres=arwdDxtm/postgres,GsAclCased=r/postgres}
 }
 
+# The table's owner is another role here, so that the entry of the role
+# the keyword names is not the owner's.
+test grant-select-to-session-user-is-stored-for-the-session-role {
+    CREATE ROLE gx_session_owner;
+    CREATE TABLE gx_session (id INT);
+    ALTER TABLE gx_session OWNER TO gx_session_owner;
+    GRANT SELECT ON gx_session TO SESSION_USER;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_session';
+}
+expect {
+    {gx_session_owner=arwdDxtm/gx_session_owner,postgres=r/gx_session_owner}
+}
+
+test grant-select-to-current-role-is-stored-for-the-current-role {
+    CREATE ROLE gx_current_owner;
+    CREATE TABLE gx_current (id INT);
+    ALTER TABLE gx_current OWNER TO gx_current_owner;
+    GRANT SELECT ON gx_current TO CURRENT_ROLE;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_current';
+}
+expect {
+    {gx_current_owner=arwdDxtm/gx_current_owner,postgres=r/gx_current_owner}
+}
+
 test grant-select-on-sequence-is-stored-with-sequence-privileges {
     CREATE ROLE gs_acl_seq_reader;
     CREATE SEQUENCE gs_acl_seq;
@@ -394,6 +418,46 @@ expect {
     gs_acl_all_privileges_docs|{postgres=arwdDxtm/postgres,gs_acl_everything=arwdDxtm/postgres}
 }
 
+test grant-truncate-is-stored-in-relacl {
+    CREATE ROLE gx_truncate_grantee;
+    CREATE TABLE gx_truncate_granted (id INT);
+    GRANT TRUNCATE ON gx_truncate_granted TO gx_truncate_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_truncate_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_truncate_grantee=D/postgres}
+}
+
+test grant-references-is-stored-in-relacl {
+    CREATE ROLE gx_references_grantee;
+    CREATE TABLE gx_references_granted (id INT);
+    GRANT REFERENCES ON gx_references_granted TO gx_references_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_references_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_references_grantee=x/postgres}
+}
+
+test grant-trigger-is-stored-in-relacl {
+    CREATE ROLE gx_trigger_grantee;
+    CREATE TABLE gx_trigger_granted (id INT);
+    GRANT TRIGGER ON gx_trigger_granted TO gx_trigger_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_trigger_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_trigger_grantee=t/postgres}
+}
+
+test grant-maintain-is-stored-in-relacl {
+    CREATE ROLE gx_maintain_grantee;
+    CREATE TABLE gx_maintain_granted (id INT);
+    GRANT MAINTAIN ON gx_maintain_granted TO gx_maintain_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_maintain_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_maintain_grantee=m/postgres}
+}
+
 test grant-all-on-all-tables-in-schema-is-stored-on-each-table {
     CREATE ROLE gs_acl_all_schema;
     CREATE SCHEMA gs_acl_all_schema_s;
@@ -406,6 +470,23 @@ test grant-all-on-all-tables-in-schema-is-stored-on-each-table {
 expect {
     a|{postgres=arwdDxtm/postgres,gs_acl_all_schema=arwdDxtm/postgres}
     b|{postgres=arwdDxtm/postgres,gs_acl_all_schema=arwdDxtm/postgres}
+}
+
+test grant-on-all-tables-in-several-schemas-is-stored-on-their-tables-only {
+    CREATE ROLE gx_schemas_reader;
+    CREATE SCHEMA gx_schema_a;
+    CREATE SCHEMA gx_schema_b;
+    CREATE TABLE gx_schema_a.gx_in_a (id INT);
+    CREATE TABLE gx_schema_b.gx_in_b (id INT);
+    CREATE TABLE gx_in_public (id INT);
+    GRANT SELECT ON ALL TABLES IN SCHEMA gx_schema_a, gx_schema_b TO gx_schemas_reader;
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+    WHERE relname IN ('gx_in_a', 'gx_in_b', 'gx_in_public') ORDER BY relname;
+}
+expect {
+    gx_in_a|{postgres=arwdDxtm/postgres,gx_schemas_reader=r/postgres}
+    gx_in_b|{postgres=arwdDxtm/postgres,gx_schemas_reader=r/postgres}
+    gx_in_public|null
 }
 
 # A sequence has only SELECT, UPDATE and USAGE, and PostgreSQL leaves out
@@ -449,6 +530,60 @@ test grant-of-column-privileges-is-not-supported {
 @sqlstate 0A000
 expect error {
     GRANT of column privileges is not supported
+}
+
+@skip-if postgres "PostgreSQL supports REVOKE"
+test revoke-is-not-supported {
+    CREATE ROLE gx_revoked;
+    CREATE TABLE gx_revoked_from (id INT);
+    GRANT SELECT ON gx_revoked_from TO gx_revoked;
+    REVOKE SELECT ON gx_revoked_from FROM gx_revoked;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports WITH GRANT OPTION"
+test grant-with-grant-option-is-not-supported {
+    CREATE ROLE gx_grant_option;
+    CREATE TABLE gx_grant_option_on (id INT);
+    GRANT SELECT ON gx_grant_option_on TO gx_grant_option WITH GRANT OPTION;
+}
+@sqlstate 0A000
+expect error {
+    GRANT ... WITH GRANT OPTION is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANTED BY"
+test grant-granted-by-is-not-supported {
+    CREATE ROLE gx_granted_by;
+    CREATE TABLE gx_granted_by_on (id INT);
+    GRANT SELECT ON gx_granted_by_on TO gx_granted_by GRANTED BY postgres;
+}
+@sqlstate 0A000
+expect error {
+    GRANT ... GRANTED BY is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANT on schemas"
+test grant-on-a-schema-is-not-supported {
+    CREATE ROLE gx_schema_user;
+    GRANT USAGE ON SCHEMA public TO gx_schema_user;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on objects other than tables and sequences is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANT on functions"
+test grant-on-a-function-is-not-supported {
+    CREATE ROLE gx_function_user;
+    GRANT EXECUTE ON FUNCTION lower(text) TO gx_function_user;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on objects other than tables and sequences is not supported
 }
 
 # Views are granted on too, which the Rust integration tests cover, because
