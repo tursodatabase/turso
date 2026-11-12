@@ -526,7 +526,8 @@ impl<'a> CatalogContext<'a> {
         let namespace_name = self
             .name_of_namespace(namespace)
             .expect("the namespace of a sequence has a name");
-        format!("{namespace_name}.{seq_name}")
+        let quote = |part: &str| format!("\"{}\"", part.replace('"', "\"\""));
+        format!("{}.{}", quote(&namespace_name), quote(seq_name))
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or

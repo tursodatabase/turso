@@ -131,6 +131,69 @@ pub fn normalize_ident(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
 
+/// Splits text that names an object, such as the argument of `nextval`,
+/// into its optional schema and its name. Each part is an identifier,
+/// double-quoted when it contains a dot or a quote, with `""` for a quote
+/// inside the quotes. Returns None for text that is not one or two such
+/// parts.
+pub fn split_qualified_name(text: &str) -> Option<(Option<String>, String)> {
+    let mut parts = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        part.push('"');
+                    }
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == '.' || c == '"' {
+                    break;
+                }
+                part.push(c);
+                chars.next();
+            }
+        }
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match chars.next() {
+            None => break,
+            Some('.') => continue,
+            Some(_) => return None,
+        }
+    }
+    match <[String; 2]>::try_from(parts) {
+        Ok([schema, name]) => Some((Some(schema), name)),
+        Err(parts) => match <[String; 1]>::try_from(parts) {
+            Ok([name]) => Some((None, name)),
+            Err(_) => None,
+        },
+    }
+}
+
+/// Splits the sequence argument of `nextval`, `currval` and `setval` into its
+/// optional schema and its name, as [`split_qualified_name`] does. Text
+/// that is not such a name keeps the meaning that earlier versions gave it,
+/// because they stored such text in the defaults of serial columns, such as
+/// `__turso_ns1_"t"_id_seq` for a table named `"t"`: everything before the
+/// first dot is the schema, and no quotes are removed.
+pub fn split_sequence_name(text: &str) -> (Option<String>, String) {
+    split_qualified_name(text).unwrap_or_else(|| match text.split_once('.') {
+        Some((schema, name)) => (Some(schema.to_string()), name.to_string()),
+        None => (None, text.to_string()),
+    })
+}
+
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
 pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
@@ -4611,6 +4674,36 @@ pub mod tests {
     use crate::schema::{BTreeTable, Type as SchemaValueType};
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use turso_parser::parser::Parser;
+
+    #[test]
+    fn split_qualified_name_reads_quoted_and_dotted_parts() {
+        let split = |text: &str| split_qualified_name(text);
+        assert_eq!(split("seq"), Some((None, "seq".into())));
+        assert_eq!(split("app.seq"), Some((Some("app".into()), "seq".into())));
+        assert_eq!(split("\"My Seq\""), Some((None, "My Seq".into())));
+        assert_eq!(split("\"a.b\""), Some((None, "a.b".into())));
+        assert_eq!(split("\"q\"\"x\""), Some((None, "q\"x".into())));
+        assert_eq!(
+            split("\"App\".\"My.Seq\""),
+            Some((Some("App".into()), "My.Seq".into()))
+        );
+        for invalid in ["", ".", "a.", ".a", "a.b.c", "\"open", "\"a\"b", "a\"b\""] {
+            assert_eq!(split(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn split_sequence_name_reads_serial_defaults_of_earlier_versions() {
+        assert_eq!(
+            split_sequence_name("__turso_ns1_\"t\"_id_seq"),
+            (None, "__turso_ns1_\"t\"_id_seq".into())
+        );
+        assert_eq!(
+            split_sequence_name("public.a.b_id_seq"),
+            (Some("public".into()), "a.b_id_seq".into())
+        );
+        assert_eq!(split_sequence_name("\"My Seq\""), (None, "My Seq".into()));
+    }
 
     #[test]
     fn test_normalize_ident() {

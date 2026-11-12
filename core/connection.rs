@@ -3983,15 +3983,16 @@ impl Connection {
             })
             .map(|sequence| (namespace, sequence))
         };
-        if let Some((namespace, seq)) = name.split_once('.') {
+        let (schema_name, seq_name) = crate::util::split_sequence_name(name);
+        if let Some(schema_name) = schema_name {
             let namespace = self
                 .current_qualifiers()
-                .get(&crate::util::normalize_ident(namespace))
+                .get(&crate::util::normalize_ident(&schema_name))
                 .ok_or_else(|| not_found(name))?;
-            let seq_name = crate::util::normalize_ident(seq);
+            let seq_name = crate::util::normalize_ident(&seq_name);
             return get(namespace.target, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
-        let seq_name = crate::util::normalize_ident(name);
+        let seq_name = crate::util::normalize_ident(&seq_name);
         let mut namespaces = Vec::new();
         if self.temp.database.read().is_some() {
             namespaces.push(NamespaceRef::root_of(TEMP_DB_ID));

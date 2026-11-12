@@ -1417,16 +1417,17 @@ pub(crate) fn resolve_sequence_name(
     name: &str,
     resolver: &Resolver,
 ) -> Option<(NamespaceRef, String)> {
-    if let Some((schema_name, bare_name)) = name.split_once('.') {
-        let namespace = resolver.namespace_named(&normalize_ident(schema_name))?;
-        let bare_name = normalize_ident(bare_name);
+    let (schema_name, bare_name) = crate::util::split_sequence_name(name);
+    if let Some(schema_name) = schema_name {
+        let namespace = resolver.namespace_named(&normalize_ident(&schema_name))?;
+        let bare_name = normalize_ident(&bare_name);
         return resolver
             .with_schema(namespace.database_id, |schema| {
                 schema.get_sequence(namespace.id, &bare_name).is_some()
             })
             .then_some((namespace, bare_name));
     }
-    let bare_name = normalize_ident(name);
+    let bare_name = normalize_ident(&bare_name);
     resolver
         .sequence_of_mangled_name(&bare_name)
         .or_else(|| Some((resolver.find_existing_sequence(&bare_name)?, bare_name)))
