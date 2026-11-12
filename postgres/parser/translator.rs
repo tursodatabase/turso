@@ -219,6 +219,12 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
+        if let Some(routine_type) = altered_routine_type(&node) {
+            return Err(ParseError::not_supported(format!(
+                "ALTER {}",
+                drop_object_type_name(routine_type)
+            )));
+        }
         Ok(match node {
             NodeRef::SelectStmt(select) => {
                 // Top-level SELECT ... INTO is PG's legacy spelling of
@@ -8943,6 +8949,31 @@ fn alter_subtype_name(subtype: pg_query::protobuf::AlterTableType) -> String {
     let debug = format!("{subtype:?}");
     let trimmed = debug.strip_prefix("At").unwrap_or(&debug);
     camel_to_sql(trimmed)
+}
+
+/// FUNCTION, PROCEDURE or ROUTINE when `node` is a statement that alters
+/// one: its options, name, owner, schema or dependencies.
+fn altered_routine_type(node: &NodeRef<'_>) -> Option<pg_query::protobuf::ObjectType> {
+    use pg_query::protobuf::ObjectType;
+
+    let object_type = match node {
+        NodeRef::AlterFunctionStmt(alter) => alter.objtype,
+        NodeRef::RenameStmt(rename) => rename.rename_type,
+        NodeRef::AlterOwnerStmt(alter) => alter.object_type,
+        NodeRef::AlterObjectSchemaStmt(alter) => alter.object_type,
+        NodeRef::AlterObjectDependsStmt(alter) => alter.object_type,
+        _ => return None,
+    };
+    ObjectType::try_from(object_type)
+        .ok()
+        .filter(|object_type| {
+            matches!(
+                object_type,
+                ObjectType::ObjectFunction
+                    | ObjectType::ObjectProcedure
+                    | ObjectType::ObjectRoutine
+            )
+        })
 }
 
 /// Returns a human-readable name for a `DROP` object type.

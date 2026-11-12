@@ -500,6 +500,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
+| ALTER FUNCTION / ALTER ROUTINE | ❌ Not supported | |
 | CREATE FUNCTION | 🟡 Partial | Stores a function of `LANGUAGE sql` whose body is one query in a dollar-quoted string, and whose parameters and result have base types that `pg_type` shows. The function cannot be called yet. `CREATE OR REPLACE FUNCTION` is supported. A function that PostgreSQL rejects gets PostgreSQL's error; any other unsupported function gets an error that names the first unsupported feature, such as the language, RETURNS SETOF or an option. See the notes below this table |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |

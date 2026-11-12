@@ -327,6 +327,75 @@ expect @tursopg error {
     a function result of type point is not supported
 }
 
+# ALTER FUNCTION
+
+test alter-function {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    ALTER FUNCTION one() IMMUTABLE;
+    SELECT provolatile FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    i
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ALTER FUNCTION is not supported
+}
+
+test alter-function-rename {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    ALTER FUNCTION one() RENAME TO uno;
+    SELECT count(*) FROM pg_proc WHERE proname = 'uno';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ALTER FUNCTION is not supported
+}
+
+test alter-function-owner {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    ALTER FUNCTION one() OWNER TO CURRENT_USER;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ALTER FUNCTION is not supported
+}
+
+test alter-function-set-schema {
+    CREATE SCHEMA app;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    ALTER FUNCTION one() SET SCHEMA app;
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'one';
+}
+expect {
+    app
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ALTER FUNCTION is not supported
+}
+
+test alter-routine {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    ALTER ROUTINE one() IMMUTABLE;
+    SELECT provolatile FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    i
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ALTER ROUTINE is not supported
+}
+
 # DROP SCHEMA
 
 test drop-schema-with-a-function {
