@@ -347,9 +347,8 @@ fn expand_in_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
 
 /// Expands the calls in the subquery that `expr` is, or the call that `expr`
 /// is. The arguments of a call are expanded before the call, so the dialect
-/// sees the arguments as they will run. No argument that the dialect gets,
-/// and no expression that it gives for a call, is deeper than the parser
-/// permits.
+/// sees the arguments as they will run. No argument that the dialect gets is
+/// deeper than the parser permits.
 fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<WalkControl> {
     match expr {
         ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
@@ -378,9 +377,6 @@ fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Res
                 })?;
             }
             if let Some(expansion) = (expand.replacement)(expr)? {
-                if expr_is_deeper_than(&expansion, MAX_EXPR_DEPTH) {
-                    return Err(expression_tree_is_too_large());
-                }
                 *expr = expansion;
                 expand.replaced_calls += 1;
             }
