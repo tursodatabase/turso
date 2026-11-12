@@ -6890,6 +6890,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 "committed writer must be visible in finalized_tx_states before leaving txs",
                 { "tx_id": tx_id }
             );
+            // The skip map frees a removed transaction only during later operations. Drop
+            // the write set and the savepoints here, so that the removed transaction does
+            // not keep row versions or savepoint records.
+            drop(tx.write_set.lock().take());
+            drop(std::mem::take(&mut *tx.savepoint_stack.write()));
             self.txs.remove(&tx_id);
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
