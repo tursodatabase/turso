@@ -95,6 +95,7 @@ expect error {
 test create-role-with-pg-prefix-fails {
     CREATE ROLE pg_cr_reserved;
 }
+@sqlstate 42939
 expect error {
     role name "pg_cr_reserved" is reserved
 }
@@ -102,6 +103,7 @@ expect error {
 test create-role-named-public-fails {
     CREATE ROLE public;
 }
+@sqlstate 42939
 expect error {
     role name "public" is reserved
 }
@@ -109,6 +111,7 @@ expect error {
 test create-role-named-none-fails {
     CREATE ROLE none;
 }
+@sqlstate 42939
 expect error {
     role name "none" is reserved
 }
@@ -116,6 +119,7 @@ expect error {
 test create-role-named-current-user-fails {
     CREATE ROLE current_user;
 }
+@sqlstate 42939
 expect error {
     CURRENT_USER cannot be used as a role name here
 }

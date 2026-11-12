@@ -62,6 +62,17 @@ pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>)
     }))
 }
 
+/// The engine error for SQL that `turso_pg_parser::parse` refuses, which
+/// keeps the SQLSTATE that the parser gave it.
+pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
+    match error {
+        turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
+            sqlstate_error(sqlstate, message)
+        }
+        other => LimboError::ParseError(other.to_string()),
+    }
+}
+
 /// The error PostgreSQL returns for every statement in an aborted
 /// transaction block, until COMMIT, ROLLBACK, or ROLLBACK TO SAVEPOINT
 /// ends it.

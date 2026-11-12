@@ -9,9 +9,9 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_OBJECT_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE,
-    SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -6397,10 +6397,10 @@ fn translate_create_role(
         });
     }
     if stmt.role.starts_with("pg_") {
-        return Err(ParseError::ParseError(format!(
-            "role name \"{}\" is reserved",
-            stmt.role
-        )));
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_RESERVED_NAME,
+            message: format!("role name \"{}\" is reserved", stmt.role),
+        });
     }
     if stmt.role == BOOTSTRAP_SUPERUSER_NAME {
         return Err(ParseError::ParseError(format!(
