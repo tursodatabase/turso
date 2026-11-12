@@ -2408,7 +2408,7 @@ impl SnapshotRows for PgAttrdefTable {
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 let adbin = match (&col.default, col.generated_type()) {
-                    (Some(default_expr), _) => render_expr(default_expr),
+                    (Some(default_expr), _) => render_default(conn, &schema, default_expr),
                     (None, GeneratedType::Stored { expr, .. }) => {
                         let named = generated_expr_with_names(expr, btree.columns())
                             .expect("stored generated column expression resolves its columns");
@@ -3233,58 +3233,115 @@ impl SnapshotRows for PgDependTable {
             ));
         }
 
-        // A sequence that a column owns, such as the sequence of a serial
-        // column, automatically depends on that column.
+        // A default that takes values from a sequence depends on it, and a
+        // sequence that the default's table owns, such as the sequence of a
+        // serial column, automatically depends on that column.
         let schema = conn.current_schema();
-        for (sequence_oid, owner_oid, column_number) in sequence_owner_columns(&schema) {
-            rows.push(dependency_row(
-                ObjectAddress::whole::<PgClassTable>(sequence_oid),
-                ObjectAddress::column(owner_oid, column_number),
-                DependencyKind::Auto,
-            ));
+        let default_rows = PgAttrdefTable::load_rows(conn);
+        let defaults: Vec<_> = default_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(ColumnDefaultRow::from_row)
+            .collect();
+        for (table_oid, column_number, sequence) in nextval_defaults(conn, &schema) {
+            if let Some(default) = defaults.iter().find(|default| {
+                default.table_oid == table_oid && default.column_number == column_number
+            }) {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgAttrdefTable>(default.oid),
+                    ObjectAddress::whole::<PgClassTable>(sequence.oid),
+                    DependencyKind::Normal,
+                ));
+            }
+            if sequence.owner_oid == table_oid {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgClassTable>(sequence.oid),
+                    ObjectAddress::column(table_oid, column_number),
+                    DependencyKind::Auto,
+                ));
+            }
         }
         rows
     }
 }
 
-/// `(sequence oid, table oid, column number)` for each sequence that a
-/// table owns, with the column whose default takes values from it. The
-/// relation catalog records only the owning table, so a sequence that no
-/// column of its table takes values from is left out.
-fn sequence_owner_columns(schema: &Schema) -> Vec<(i64, i64, i64)> {
-    let tables = user_tables_with_oids(schema);
-    let mut owners = Vec::new();
-    for (sequence_oid, namespace, sequence) in sequence_catalog_entries(schema) {
-        let Some(owner_oid) = crate::classes::class_catalog(schema)
-            .and_then(|catalog| catalog.get_by_name(namespace, &sequence.name))
-            .map(|class| class.relownedby)
-            .filter(|owner_oid| *owner_oid != 0)
-        else {
-            continue;
-        };
-        let Some((.., table, _)) = tables.iter().find(|(.., oid)| *oid == owner_oid) else {
-            continue;
-        };
-        let mangled = mangle_name(namespace, &sequence.name);
-        let column = table.columns().iter().position(|column| {
-            column
+/// `(table oid, column number, sequence)` for each column whose default is
+/// `nextval` of a sequence.
+fn nextval_defaults(conn: &Connection, schema: &Schema) -> Vec<(i64, i64, DefaultSequence)> {
+    let mut defaults = Vec::new();
+    for (_, _, table, table_oid) in user_tables_with_oids(schema) {
+        for (position, column) in table.columns().iter().enumerate() {
+            let sequence = column
                 .default
                 .as_deref()
-                .and_then(nextval_sequence_name)
-                .is_some_and(|name| {
-                    name.eq_ignore_ascii_case(&mangled) || name.eq_ignore_ascii_case(&sequence.name)
-                })
-        });
-        if let Some(position) = column {
-            owners.push((sequence_oid, owner_oid, position as i64 + 1));
+                .and_then(|default| default_sequence(conn, schema, default));
+            if let Some(sequence) = sequence {
+                defaults.push((table_oid, position as i64 + 1, sequence));
+            }
         }
     }
-    owners
+    defaults
 }
 
-/// The bare name of the sequence in a default of the form
-/// `nextval('sequence')`.
-fn nextval_sequence_name(default: &ast::Expr) -> Option<String> {
+/// The sequence that a `nextval('sequence')` default takes values from.
+struct DefaultSequence {
+    oid: i64,
+    namespace: NamespaceId,
+    name: String,
+    /// The oid of the table that owns the sequence, 0 for none.
+    owner_oid: i64,
+}
+
+fn default_sequence(
+    conn: &Connection,
+    schema: &Schema,
+    default: &ast::Expr,
+) -> Option<DefaultSequence> {
+    let (schema_name, name) = turso_core::split_sequence_name(&nextval_argument(default)?);
+    let name = name.to_ascii_lowercase();
+    let (namespace, name) = match schema_name {
+        Some(schema_name) => (
+            conn.qualifier(&schema_name.to_ascii_lowercase())?.target.id,
+            name,
+        ),
+        None => match schema.demangle_name(&name) {
+            // Defaults of serial columns of a schema's tables name the
+            // sequence by its mangled name.
+            (namespace, bare) if !namespace.is_root() => (namespace, bare.to_string()),
+            _ => (
+                conn.search_order()
+                    .into_iter()
+                    .map(|qualifier| qualifier.target.id)
+                    .find(|namespace| schema.get_sequence(*namespace, &name).is_some())?,
+                name,
+            ),
+        },
+    };
+    let (oid, ..) = sequence_catalog_entries(schema).into_iter().find(
+        |(_, sequence_namespace, sequence)| {
+            *sequence_namespace == namespace && sequence.name.eq_ignore_ascii_case(&name)
+        },
+    )?;
+    let owner_oid = crate::classes::class_catalog(schema)
+        .and_then(|catalog| catalog.get_by_name(namespace, &name))
+        .map_or(0, |class| class.relownedby);
+    Some(DefaultSequence {
+        oid,
+        namespace,
+        name,
+        owner_oid,
+    })
+}
+
+/// The text argument of a default of the form `nextval('text')`, which
+/// may be stored in parentheses.
+fn nextval_argument(default: &ast::Expr) -> Option<String> {
+    if let ast::Expr::Parenthesized(inner) = default {
+        let [inner] = inner.as_slice() else {
+            return None;
+        };
+        return nextval_argument(inner);
+    }
     let ast::Expr::FunctionCall { name, args, .. } = default else {
         return None;
     };
@@ -3297,11 +3354,38 @@ fn nextval_sequence_name(default: &ast::Expr) -> Option<String> {
     let ast::Expr::Literal(ast::Literal::String(quoted)) = argument.as_ref() else {
         return None;
     };
-    let text = quoted
-        .strip_prefix('\'')?
-        .strip_suffix('\'')?
-        .replace("''", "'");
-    Some(turso_core::split_sequence_name(&text).1)
+    Some(
+        quoted
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?
+            .replace("''", "'"),
+    )
+}
+
+/// The default of a column as `pg_get_expr` shows it. A `nextval` default
+/// names its sequence as a regclass constant, qualified with its schema
+/// when the search path does not find it, as PostgreSQL does.
+fn render_default(conn: &Connection, schema: &Schema, default: &ast::Expr) -> String {
+    let Some(sequence) = default_sequence(conn, schema, default) else {
+        return render_expr(default);
+    };
+    let visible = conn
+        .search_order()
+        .into_iter()
+        .map(|qualifier| qualifier.target.id)
+        .find(|namespace| stored_relation_oid(schema, *namespace, &sequence.name).is_some())
+        == Some(sequence.namespace);
+    let declared_name = schema
+        .get_sequence(sequence.namespace, &sequence.name)
+        .map_or(sequence.name.as_str(), |declared| declared.name.as_str());
+    let mut name = quote_identifier(declared_name);
+    if !visible {
+        name = format!(
+            "{}.{name}",
+            quote_identifier(schema_name_of(schema, sequence.namespace))
+        );
+    }
+    format!("nextval('{}'::regclass)", name.replace('\'', "''"))
 }
 
 /// The column numbers of a catalog row, from `int2vector` text such as

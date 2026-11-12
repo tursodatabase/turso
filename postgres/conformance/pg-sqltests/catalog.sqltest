@@ -1888,6 +1888,42 @@ expect {
     rc_owner_id_seq|rc_owner|1
 }
 
+# A nextval default names its sequence as a regclass, qualified when the
+# search path does not find it. pg_dump empties the search path.
+test pg-get-expr-of-serial-defaults {
+    CREATE SCHEMA rd_app;
+    CREATE TABLE rd_items (id serial);
+    CREATE TABLE "rd quoted" (id serial);
+    CREATE TABLE rd_app.inner_items (id serial);
+    SELECT c.relname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname IN ('rd_items', 'rd quoted', 'inner_items') ORDER BY c.relname;
+    SELECT set_config('search_path', '', false);
+    SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_catalog.pg_attrdef d
+    JOIN pg_catalog.pg_class c ON c.oid = d.adrelid WHERE c.relname = 'rd_items';
+}
+expect {
+    inner_items|nextval('rd_app.inner_items_id_seq'::regclass)
+    rd quoted|nextval('"rd quoted_id_seq"'::regclass)
+    rd_items|nextval('rd_items_id_seq'::regclass)
+
+    nextval('public.rd_items_id_seq'::regclass)
+}
+
+test pg-get-expr-of-a-nextval-default {
+    CREATE SEQUENCE rd_shared;
+    CREATE TABLE rd_uses_shared (a int DEFAULT nextval('rd_shared'));
+    SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_class c ON c.oid = d.adrelid WHERE c.relname = 'rd_uses_shared';
+    SELECT count(*) FROM pg_depend d JOIN pg_attrdef a ON d.objid = a.oid
+    WHERE d.classid = 'pg_attrdef'::regclass AND d.refclassid = 'pg_class'::regclass
+      AND d.refobjid = 'rd_shared'::regclass AND d.deptype = 'n';
+}
+expect {
+    nextval('rd_shared'::regclass)
+    1
+}
+
 test serial-sequence-names-are-shortened-like-postgresql {
     CREATE SEQUENCE rd_a_table_with_a_name_long_e_a_column_with_a_name_long_eno_seq;
     CREATE TABLE rd_a_table_with_a_name_long_enough_to_shorten (
