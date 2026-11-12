@@ -3960,6 +3960,48 @@ mod tests {
     }
 
     #[test]
+    fn local_encryption_rejects_partial_and_legacy_sync_before_io() {
+        for partial in [false, true] {
+            let mut opts = default_test_opts();
+            opts.db_opts = turso_core::DatabaseOpts::new().with_encryption(true);
+            opts.encryption = Some(
+                crate::sync_encryption::SyncEncryption::new(
+                    turso_core::CipherMode::Aes256Gcm,
+                    Some(turso_core::EncryptionKey::new_256([22; 32])),
+                )
+                .unwrap(),
+            );
+            if partial {
+                opts.partial_sync_opts = Some(PartialSyncOpts {
+                    bootstrap_strategy: None,
+                    segment_size: 4096,
+                    prefetch: false,
+                });
+            } else {
+                opts.protocol_version_hint = DatabaseSyncEngineProtocolVersion::Legacy;
+            }
+            let error = opts
+                .local_encryption_context()
+                .expect_err("unsupported configuration");
+            assert!(
+                error.to_string().contains("full sync with protocol V1"),
+                "{error}"
+            );
+            opts.encryption = Some(
+                crate::sync_encryption::SyncEncryption::new(
+                    turso_core::CipherMode::Aes256Gcm,
+                    None,
+                )
+                .unwrap(),
+            );
+            assert!(
+                opts.local_encryption_context().unwrap().is_none(),
+                "cloud-only configuration keeps existing behavior"
+            );
+        }
+    }
+
+    #[test]
     fn encrypted_offline_open_keys_internal_connections_and_metadata() {
         let dir = tempfile::tempdir().expect("directory");
         let path = dir.path().join("encrypted.db");

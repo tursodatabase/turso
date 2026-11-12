@@ -306,6 +306,9 @@ export interface DatabaseOpts {
   /** Hex local key. Uses remoteEncryption.cipher and is never sent to the server. */
   localEncryptionKey?: string;
 
+  /** Experimental feature names. Local encryption requires 'sync_encryption'. */
+  experimental?: string[];
+
   /**
    * Optional long-polling timeout for pull operation
    * If not set - no timeout is applied

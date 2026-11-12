@@ -397,7 +397,7 @@ impl TursoDatabaseConfig {
                 "custom_types" => opts.with_custom_types(true),
                 "autovacuum" => opts.with_autovacuum(true),
                 "vacuum" => opts.with_vacuum(true),
-                "encryption" => opts.with_encryption(true),
+                "encryption" | "sync_encryption" => opts.with_encryption(true),
                 "attach" => opts.with_attach(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),

@@ -354,7 +354,7 @@ pub fn apply_experimental_features(
             // always enabled, kept for backwards compatibility
             "strict" | "generated_columns" => opts,
             "custom_types" => opts.with_custom_types(true),
-            "encryption" => opts.with_encryption(true),
+            "encryption" | "sync_encryption" => opts.with_encryption(true),
             "index_method" => opts.with_index_method(true),
             "autovacuum" => opts.with_autovacuum(true),
             "vacuum" => opts.with_vacuum(true),

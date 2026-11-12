@@ -58,9 +58,46 @@ impl SyncEncryption {
     }
 }
 
+/// Check the public feature list before converting it to core database options.
+pub fn validate_experimental_opt_in<'a>(
+    has_local_key: bool,
+    experimental_features: impl IntoIterator<Item = &'a str>,
+) -> std::result::Result<(), &'static str> {
+    if has_local_key
+        && !experimental_features
+            .into_iter()
+            .any(|feature| feature == "sync_encryption")
+    {
+        return Err("local sync encryption requires experimental feature 'sync_encryption'");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_encryption_requires_exact_experimental_feature() {
+        assert!(validate_experimental_opt_in(true, ["sync_encryption"]).is_ok());
+        for features in [
+            vec![],
+            vec!["encryption"],
+            vec!["sync_encryption_extra"],
+            vec!["prefix_sync_encryption"],
+            vec!["sync-encryption"],
+        ] {
+            let error = validate_experimental_opt_in(true, features.iter().copied()).unwrap_err();
+            assert_eq!(
+                error,
+                "local sync encryption requires experimental feature 'sync_encryption'"
+            );
+            assert!(validate_experimental_opt_in(false, features.iter().copied()).is_ok());
+        }
+        assert!(
+            validate_experimental_opt_in(true, ["views", "encryption", "sync_encryption"]).is_ok()
+        );
+    }
 
     #[test]
     fn validates_keys_and_redacts_debug() {

@@ -129,8 +129,8 @@ pub struct Builder {
     logical_mvcc_pull: Option<bool>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
-    // expose the same SQL surface as their local-only counterparts. Local
-    // Local encryption is enabled when a local key is configured.
+    // expose the same SQL surface as their local-only counterparts.
+    // The sync encryption opt-in also enables core encryption.
     enable_attach: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
@@ -139,6 +139,7 @@ pub struct Builder {
     enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    enable_sync_encryption: bool,
 }
 
 impl Builder {
@@ -164,6 +165,7 @@ impl Builder {
             enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            enable_sync_encryption: false,
         }
     }
 
@@ -231,6 +233,13 @@ impl Builder {
     /// [`crate::Builder::experimental_without_rowid`].
     pub fn experimental_without_rowid(mut self, enable: bool) -> Self {
         self.enable_without_rowid = enable;
+        self
+    }
+
+    /// Opt in to experimental local encryption for synced replicas.
+    /// Required when a local encryption key is configured, including offline reopen.
+    pub fn experimental_sync_encryption(mut self, enable: bool) -> Self {
+        self.enable_sync_encryption = enable;
         self
     }
 
@@ -320,6 +329,7 @@ impl Builder {
 
     /// Encrypt local database and sync files with this hex-encoded key.
     /// Uses the same cipher selected by `with_remote_encryption`.
+    /// Requires `experimental_sync_encryption(true)`.
     pub fn with_local_encryption_key(mut self, hex_key: impl Into<String>) -> Self {
         self.local_encryption_key = Some(hex_key.into());
         self
@@ -352,6 +362,9 @@ impl Builder {
     /// feature tokens must match the names parsed by the core.
     fn experimental_features_string(&self) -> Option<String> {
         let mut features: Vec<&str> = Vec::new();
+        if self.enable_sync_encryption {
+            features.push("sync_encryption");
+        }
         if self.enable_attach {
             features.push("attach");
         }
@@ -387,7 +400,7 @@ impl Builder {
     pub async fn build(self) -> Result<Database> {
         // Compose the experimental_features string from the boolean flags
         // exposed on this Builder.
-        let mut experimental_features = self.experimental_features_string();
+        let experimental_features = self.experimental_features_string();
         let local_encryption = self
             .local_encryption_key
             .as_ref()
@@ -401,13 +414,6 @@ impl Builder {
                 })
             })
             .transpose()?;
-        if local_encryption.is_some() {
-            experimental_features = Some(match experimental_features {
-                Some(features) => format!("{features},encryption"),
-                None => "encryption".into(),
-            });
-        }
-
         // Build core database config for the embedded engine.
         let db_config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
             path: self.path.clone(),
@@ -1404,6 +1410,19 @@ mod tests {
     #[test]
     fn experimental_features_string_composition() {
         use crate::sync::Builder;
+
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_sync_encryption(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("sync_encryption")
+        );
+        assert!(Builder::new_remote(":memory:")
+            .experimental_sync_encryption(true)
+            .experimental_sync_encryption(false)
+            .experimental_features_string()
+            .is_none());
 
         // No features enabled -> no experimental_features string at all.
         assert_eq!(

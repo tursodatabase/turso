@@ -1,5 +1,9 @@
 using System.Net;
 using System.Data.Common;
+using System.Diagnostics;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
 using AwesomeAssertions;
 
 namespace Turso.Tests;
@@ -189,6 +193,7 @@ public sealed class TursoSyncEncryptionTests
             DataSource = "turso://example.test",
             ReplicaPath = path,
             Pooling = true,
+            SyncExperimentalFeatures = "sync_encryption",
             RemoteEncryptionCipher = "aes256gcm",
             RemoteEncryptionKey = cloudKey,
         };
@@ -197,12 +202,130 @@ public sealed class TursoSyncEncryptionTests
         return builder.ConnectionString;
     }
 
+    [TestCase(null)]
+    [TestCase("encryption")]
+    [TestCase("sync_encryption_extra")]
+    public async Task LocalEncryptionRequiresExplicitExperimentalFeature(string? features)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "turso-sync-opt-in-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "replica.db");
+        try
+        {
+            Func<Task> create = async () => {
+                using var db = await TursoSyncDatabase.CreateAsync(new(path, new Uri("http://127.0.0.1:1")) {
+                    ExperimentalFeatures = features, LocalEncryptionKey = string.Concat(Enumerable.Repeat("16", 32)),
+                    RemoteEncryption = new() { Cipher = TursoRemoteEncryptionCipher.Aes256Gcm, Key = Convert.ToBase64String(Enumerable.Repeat((byte)11, 32).ToArray()) },
+                });
+            };
+            await create.Should().ThrowAsync<Turso.Raw.Public.TursoSyncNativeException>().WithMessage("*sync_encryption*");
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + "-info").Should().BeFalse();
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [TestCase(TursoRemoteEncryptionCipher.Aes256Gcm, "aes256gcm", 32)]
+    [TestCase(TursoRemoteEncryptionCipher.Aes128Gcm, "aes128gcm", 16)]
+    [TestCase(TursoRemoteEncryptionCipher.Aegis128L, "aegis128l", 16)]
+    public async Task RealEncryptedIncrementalSyncAndCipherMappings(TursoRemoteEncryptionCipher cipher, string name, int keySize)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "turso-real-encryption-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "replica.db");
+        var localKey = string.Concat(Enumerable.Repeat("16", keySize));
+        var cloudKey = Convert.ToBase64String(Enumerable.Repeat((byte)11, keySize).ToArray());
+        var keyPath = Path.Combine(directory, "key.hex");
+        File.WriteAllText(keyPath, string.Concat(Enumerable.Repeat("0b", keySize)));
+        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        var url = new Uri($"http://127.0.0.1:{port}");
+        var executable = Environment.GetEnvironmentVariable("LOCAL_SYNC_SERVER");
+        if (executable is null)
+        {
+            var root = new DirectoryInfo(Environment.CurrentDirectory);
+            while (root is not null && !File.Exists(Path.Combine(root.FullName, "cli", "sync_server.rs"))) root = root.Parent;
+            executable = Path.Combine(root?.FullName ?? throw new InvalidOperationException("Cannot find repository root"), "target", "debug", OperatingSystem.IsWindows() ? "tursodb.exe" : "tursodb");
+        }
+        var start = new ProcessStartInfo(executable) { RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var argument in new[] { "--sync-server", $"127.0.0.1:{port}", "--sync-encryption-cipher", name,
+            "--sync-encryption-key-file", keyPath, Path.Combine(directory, "source.db") }) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Failed to start encrypted source");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        async Task<JsonElement> Sql(string sql)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(url, "/v2/pipeline"));
+            request.Headers.Add("x-turso-encryption-key", cloudKey);
+            request.Headers.Add("x-turso-encryption-cipher", name);
+            request.Content = new StringContent(JsonSerializer.Serialize(new { requests = new[] { new { type = "execute", stmt = new { sql } } } }), Encoding.UTF8, "application/json");
+            using var response = await http.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var result = document.RootElement.GetProperty("results")[0];
+            result.GetProperty("type").GetString().Should().Be("ok");
+            return result.GetProperty("response").GetProperty("result").Clone();
+        }
+        TursoSyncDatabaseOptions Options(bool online) => new(path, url) {
+            ExperimentalFeatures = "sync_encryption", LocalEncryptionKey = localKey, BootstrapIfEmpty = online,
+            RemoteEncryption = new TursoRemoteEncryptionOptions { Cipher = cipher, Key = online ? cloudKey : null },
+        };
+        try
+        {
+            var ready = false;
+            for (var attempt = 0; attempt < 200; attempt++)
+            {
+                if (process.HasExited) throw new InvalidOperationException(await stderr);
+                try { using var response = await http.GetAsync(url); ready = true; break; }
+                catch (HttpRequestException) { await Task.Delay(25); }
+            }
+            ready.Should().BeTrue("encrypted source must start");
+            await Sql("PRAGMA journal_mode=mvcc");
+            await Sql("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)");
+            await Sql("INSERT INTO items VALUES (1, 'nonempty bootstrap')");
+            using (var db = await TursoSyncDatabase.CreateAsync(Options(true)))
+            {
+                using var connection = db.Connect();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT value FROM items WHERE id=1";
+                command.ExecuteScalar().Should().Be("nonempty bootstrap");
+                command.CommandText = "INSERT INTO items VALUES (2, 'dotnet local marker')";
+                command.ExecuteNonQuery();
+                await db.PushAsync();
+                (await Sql("SELECT count(*) FROM items")).GetProperty("rows")[0][0].GetProperty("value").GetString().Should().Be("2");
+                await Sql("INSERT INTO items VALUES (3, hex(zeroblob(40000)))");
+                await db.PullAsync();
+                command.CommandText = "SELECT length(value) FROM items WHERE id=3";
+                Convert.ToInt64(command.ExecuteScalar()).Should().Be(80000);
+                await db.CheckpointAsync();
+            }
+            using (var db = await TursoSyncDatabase.OpenAsync(Options(false)))
+            {
+                using var connection = db.Connect();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT count(*) FROM items";
+                Convert.ToInt64(command.ExecuteScalar()).Should().Be(3);
+            }
+        }
+        finally
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            await process.WaitForExitAsync();
+            await Task.WhenAll(stdout, stderr);
+            Directory.Delete(directory, true);
+        }
+    }
+
     [Test]
     public void ReplicaConnectionStringMapsIndependentLocalKey()
     {
         using var connection = new TursoConnection(
             "Data Source=turso://example.test;Replica Path=replica.db;"
-            + "Remote Encryption Cipher=aes256gcm;Local Encryption Key=" + new string('1', 64));
+            + "Sync Experimental Features=sync_encryption;Remote Encryption Cipher=aes256gcm;Local Encryption Key=" + new string('1', 64));
         var options = connection.CreateReplicaOptions();
         options.Validate();
         var configuration = TursoSyncDatabase.CreateNativeConfiguration(options, options.GetNormalizedRemoteUri());
@@ -223,6 +346,7 @@ public sealed class TursoSyncEncryptionTests
         using var http = new HttpClient(handler);
         TursoSyncDatabaseOptions Options(string key, bool online) => new(path, new Uri("https://fixture.test"))
         {
+            ExperimentalFeatures = "sync_encryption",
             LocalEncryptionKey = key,
             RemoteEncryption = new TursoRemoteEncryptionOptions { Cipher = TursoRemoteEncryptionCipher.Aes256Gcm, Key = online ? cloudKey : null },
             BootstrapIfEmpty = online,
