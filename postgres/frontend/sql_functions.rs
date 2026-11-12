@@ -380,10 +380,11 @@ pub(crate) fn translate_create_function(
         ));
     }
     // PostgreSQL lets a table and a function have the same name. tursopg
-    // does not yet.
-    if schema
-        .relation_kind(namespace, name)
-        .is_some_and(cannot_have_the_name_of_a_function)
+    // does not yet. The class of a relation has its name with its case, so
+    // names that differ in case are two names, as in PostgreSQL.
+    if class_catalog(schema)
+        .and_then(|classes| classes.get_by_name(namespace, name))
+        .is_some_and(|class| cannot_have_the_name_of_a_function(class.relkind))
     {
         return Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,

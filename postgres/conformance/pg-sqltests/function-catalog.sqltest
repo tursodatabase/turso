@@ -1133,6 +1133,54 @@ expect @tursopg error {
     a function with the name of relation "item" of the same schema is not supported
 }
 
+# The name of a function keeps its case, so "Item" and item are two names,
+# as in PostgreSQL.
+test function-with-a-name-that-differs-in-case-from-a-table {
+    CREATE TABLE item (a integer);
+    CREATE FUNCTION "Item"() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT proname FROM pg_proc WHERE proname = 'Item';
+}
+expect {
+    Item
+}
+
+test table-with-a-name-that-differs-in-case-from-a-function {
+    CREATE FUNCTION "Item"() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE TABLE item (a integer);
+    SELECT proname FROM pg_proc WHERE proname = 'Item';
+}
+expect {
+    Item
+}
+
+# tursopg stores the name of a relation without its case, so the table
+# "Thing" has the name thing.
+test table-with-a-quoted-name-and-a-function-with-that-name-in-lowercase {
+    CREATE FUNCTION thing() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE TABLE "Thing" (a integer);
+    SELECT relname FROM pg_class WHERE relname = 'Thing';
+}
+expect {
+    Thing
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a relation with the name of function "thing" of the same schema is not supported
+}
+
+test function-with-the-name-of-a-quoted-table-in-lowercase {
+    CREATE TABLE "Thing" (a integer);
+    CREATE FUNCTION thing() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT proname FROM pg_proc WHERE proname = 'thing';
+}
+expect {
+    thing
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of relation "thing" of the same schema is not supported
+}
+
 test table-with-the-name-of-a-function {
     CREATE FUNCTION item() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
     CREATE TABLE item (a integer);
