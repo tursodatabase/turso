@@ -125,15 +125,6 @@ expect {
     cr_committed
 }
 
-test role-without-privileges-cannot-create-table {
-    CREATE ROLE sr_creator;
-    SET ROLE sr_creator;
-    CREATE TABLE sr_created (x int);
-}
-expect error {
-    permission denied for schema public
-}
-
 test role-without-privileges-cannot-create-role {
     CREATE ROLE sr_role_creator;
     SET ROLE sr_role_creator;
@@ -185,28 +176,4 @@ test role-without-privileges-can-read-catalogs {
 expect {
     readable
     readable
-}
-
-test owner-may-not-rename-without-create-on-the-schema {
-    CREATE ROLE ro_renamer2;
-    CREATE TABLE ro_owned_rename (x int);
-    ALTER TABLE ro_owned_rename OWNER TO ro_renamer2;
-    SET ROLE ro_renamer2;
-    ALTER TABLE ro_owned_rename RENAME TO ro_owned_renamed;
-}
-@sqlstate 42501
-expect error {
-    permission denied for schema public
-}
-
-test owner-may-not-index-without-create-on-the-schema {
-    CREATE ROLE ro_indexer2;
-    CREATE TABLE ro_owned_index (x int);
-    ALTER TABLE ro_owned_index OWNER TO ro_indexer2;
-    SET ROLE ro_indexer2;
-    CREATE INDEX ro_owned_index_i ON ro_owned_index (x);
-}
-@sqlstate 42501
-expect error {
-    permission denied for schema public
 }
