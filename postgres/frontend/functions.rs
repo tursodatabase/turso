@@ -89,6 +89,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",
         ))?,
+        "number_to_int2"(FunctionArity::Exact(1), true) => exec_number_to_int2(args[0].get_value())?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -580,6 +581,24 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         ));
     }
     Ok(Some(value))
+}
+
+fn exec_number_to_int2(value: &Value) -> Result<Option<i64>> {
+    let rounded = match value {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Float(number)) => f64::from(*number).round(),
+        other => match other.as_int() {
+            Some(integer) => integer as f64,
+            None => f64::NAN,
+        },
+    };
+    if !(f64::from(i16::MIN)..=f64::from(i16::MAX)).contains(&rounded) {
+        return Err(sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "smallint out of range",
+        ));
+    }
+    Ok(Some(rounded as i64))
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {

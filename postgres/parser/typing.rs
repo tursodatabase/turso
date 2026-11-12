@@ -645,6 +645,7 @@ fn binary_operator_type(operator: &str, left: &ExprType, right: &ExprType) -> Ex
                     found,
                     PgType::Text
                         | PgType::Unknown
+                        | PgType::Int2
                         | PgType::Int4
                         | PgType::Int8
                         | PgType::Numeric
@@ -683,6 +684,7 @@ fn arithmetic_type(left: PgType, right: PgType) -> Option<PgType> {
 
 fn number_rank(ty: &PgType) -> Option<u8> {
     match ty {
+        PgType::Int2 => Some(0),
         PgType::Int4 => Some(1),
         PgType::Int8 => Some(2),
         PgType::Numeric => Some(3),
@@ -2104,8 +2106,8 @@ mod tests {
     #[test]
     fn create_table_scope_has_the_new_columns_without_a_lookup() {
         let NodeEnum::CreateStmt(create) = statement(
-            "CREATE TABLE made (i serial, j bigserial, l serial4, m serial8, \
-             o numeric(8,2), p text, q boolean, s double precision, \
+            "CREATE TABLE made (i serial, j bigserial, k smallserial, l serial4, m serial8, \
+             n smallint, o numeric(8,2), p text, q boolean, s double precision, \
              CHECK (i > 0))",
         ) else {
             panic!("not a create table");
@@ -2115,8 +2117,10 @@ mod tests {
         let expected = [
             ("i", int4()),
             ("j", Some(PgType::Int8)),
+            ("k", Some(PgType::Int2)),
             ("l", int4()),
             ("m", Some(PgType::Int8)),
+            ("n", Some(PgType::Int2)),
             ("o", other("numeric(8,2)")),
             ("p", Some(PgType::Text)),
             ("q", Some(PgType::Bool)),
@@ -2637,5 +2641,17 @@ mod tests {
     fn a_slice_or_several_subscripts_of_a_name_are_not_typed() {
         assert_eq!(type_from_t("b[0:1]"), None);
         assert_eq!(type_from_t("b[0][1]"), None);
+    }
+
+    #[test]
+    fn casts_to_regnamespace_regproc_smallint_and_char_have_those_types() {
+        assert_eq!(type_from_t("0::pg_catalog.int2"), Some(PgType::Int2));
+    }
+
+    #[test]
+    fn smallint_is_the_narrowest_number_for_arithmetic() {
+        assert_eq!(type_from_t("0::int2 + 1::int2"), Some(PgType::Int2));
+        assert_eq!(type_from_t("0::int2 + 1"), Some(PgType::Int4));
+        assert_eq!(type_from_t("-(0::int2)"), Some(PgType::Int2));
     }
 }

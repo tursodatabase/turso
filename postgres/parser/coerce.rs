@@ -12,6 +12,8 @@ use turso_parser::ast;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgType {
     Bool,
+    /// The two-byte integer, smallint.
+    Int2,
     Int4,
     Int8,
     Float8,
@@ -46,6 +48,7 @@ impl PgType {
     pub fn from_name(name: &str) -> PgType {
         let spelled = one_spelling(name);
         match spelled.as_str() {
+            "int2" => PgType::Int2,
             "int4" => PgType::Int4,
             "int8" => PgType::Int8,
             "float8" => PgType::Float8,
@@ -83,6 +86,7 @@ impl PgType {
     /// The type the engine uses to store values of this type, if there is one.
     pub fn engine_type(&self) -> Option<ast::Type> {
         let name = match self {
+            PgType::Int2 => "smallint",
             PgType::Int4 => "INTEGER",
             PgType::Int8 => "BIGINT",
             PgType::Float8 | PgType::Numeric => "REAL",
@@ -112,7 +116,9 @@ impl PgType {
     fn category(&self) -> TypeCategory {
         match self {
             PgType::Bool => TypeCategory::Boolean,
-            PgType::Int4 | PgType::Int8 | PgType::Float8 | PgType::Numeric => TypeCategory::Number,
+            PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Float8 | PgType::Numeric => {
+                TypeCategory::Number
+            }
             PgType::Text => TypeCategory::String,
             PgType::Bytea => TypeCategory::UserDefined,
             PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
@@ -133,10 +139,13 @@ enum TypeCategory {
     Other,
 }
 
+const NUMBER_TO_INT2: &str = "number_to_int2";
+
 impl fmt::Display for PgType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             PgType::Bool => "boolean",
+            PgType::Int2 => "smallint",
             PgType::Int4 => "integer",
             PgType::Int8 => "bigint",
             PgType::Float8 => "double precision",
@@ -439,11 +448,16 @@ enum CastRule {
 
 fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
     use CastContext::{Assignment, Explicit, Implicit};
-    use CastMethod::{EngineCast, Nothing, RoundThenCast};
+    use CastMethod::{EngineCast, Function, Nothing, RoundThenCast};
     use CastRule::{Allowed, NoCast, Unsupported};
-    use PgType::{Bool, Bytea, Float8, Int4, Int8, Numeric, Other, Text};
+    use PgType::{Bool, Bytea, Float8, Int2, Int4, Int8, Numeric, Other, Text};
 
     match (source, target) {
+        (Int2, Int4 | Int8) => Allowed(Implicit, Nothing),
+        (Int2, Float8 | Numeric) => Allowed(Implicit, EngineCast),
+        (Int2, Text) => Allowed(Assignment, EngineCast),
+        (Int4 | Int8 | Float8 | Numeric, Int2) => Allowed(Assignment, Function(NUMBER_TO_INT2)),
+        (Bool | Bytea, Int2) | (Int2, Bool | Bytea) => NoCast,
         (Int4, Int8) => Allowed(Implicit, Nothing),
         (Int4, Float8) => Allowed(Implicit, EngineCast),
         (Int4, Numeric) => Allowed(Implicit, EngineCast),
@@ -537,10 +551,16 @@ fn operator_does_not_exist(
     )
 }
 
-const ARITHMETIC_OPERAND_TYPES: &[PgType] =
-    &[PgType::Int4, PgType::Int8, PgType::Numeric, PgType::Float8];
+const ARITHMETIC_OPERAND_TYPES: &[PgType] = &[
+    PgType::Int2,
+    PgType::Int4,
+    PgType::Int8,
+    PgType::Numeric,
+    PgType::Float8,
+];
 
 const COMPARISON_OPERAND_TYPES: &[PgType] = &[
+    PgType::Int2,
     PgType::Int4,
     PgType::Int8,
     PgType::Numeric,
@@ -564,6 +584,7 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
     let trimmed = text.trim();
     let literal = match target {
         PgType::Text => return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string()))),
+        PgType::Int2 => ast::Literal::Numeric(parse_int2(&text)?.to_string()),
         PgType::Int4 => ast::Literal::Numeric(parse_int4(&text)?.to_string()),
         PgType::Int8 => ast::Literal::Numeric(parse_int8(&text)?.to_string()),
         PgType::Float8 => parse_real(&text, trimmed, "double precision")?,
@@ -583,6 +604,11 @@ fn unquote(quoted: &str) -> String {
         .and_then(|rest| rest.strip_suffix('\''))
         .unwrap_or(quoted);
     inner.replace("''", "'")
+}
+
+/// Reads `text` the way PostgreSQL reads a smallint.
+pub fn parse_int2(text: &str) -> Result<i64, ParseError> {
+    parse_integer(text, "smallint", 1 << 15)
 }
 
 /// Reads `text` the way PostgreSQL reads an integer: spaces around, an optional sign, then decimal digits or a 0x, 0o or 0b prefix, with single underscores between digits.
@@ -1518,7 +1544,7 @@ mod tests {
 
     #[test]
     fn from_name_gives_one_value_for_every_name_of_a_type() {
-        let groups: [&[&str]; 9] = [
+        let groups: [&[&str]; 10] = [
             &[
                 "timestamptz",
                 "timestamp with time zone",
@@ -1527,6 +1553,7 @@ mod tests {
             &["timestamp", "timestamp without time zone"],
             &["timetz", "time with time zone"],
             &["time", "time without time zone"],
+            &["int2", "smallint"],
             &["float4", "real"],
             &["bpchar", "character"],
             &["int4[]", "integer[]", "int[]"],
@@ -1616,6 +1643,7 @@ mod tests {
             ("bytea", PgType::Bytea),
             ("BOOLEAN", PgType::Bool),
             ("DATE", PgType::Other("date".to_string())),
+            ("smallint", PgType::Int2),
             ("timestamptz", PgType::Other("timestamptz".to_string())),
         ] {
             assert_eq!(
@@ -2621,6 +2649,167 @@ mod tests {
         );
     }
 
+    #[test]
+    fn common_type_of_numbers_is_the_widest_in_every_order() {
+        let numbers = [
+            PgType::Int2,
+            PgType::Int4,
+            PgType::Int8,
+            PgType::Numeric,
+            PgType::Float8,
+        ];
+        let rank = |ty: &PgType| numbers.iter().position(|n| n == ty).unwrap();
+        for mask in 1u32..(1 << 6) {
+            let mut types: Vec<PgType> = (0..5)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| numbers[i].clone())
+                .collect();
+            if mask & 32 != 0 {
+                types.insert(0, PgType::Unknown);
+            }
+            if types.iter().all(|t| *t == PgType::Unknown) {
+                continue;
+            }
+            let mut orders = vec![types.clone()];
+            orders.push(types.iter().rev().cloned().collect());
+            for order in orders {
+                let widest = order
+                    .iter()
+                    .filter(|t| **t != PgType::Unknown)
+                    .max_by_key(|t| rank(t))
+                    .unwrap();
+                assert_eq!(common_type(&order, "CASE").unwrap(), *widest, "{order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn operands_of_numbers_convert_to_the_widest_in_every_order() {
+        let numbers = [
+            PgType::Int2,
+            PgType::Int4,
+            PgType::Int8,
+            PgType::Numeric,
+            PgType::Float8,
+        ];
+        let rank = |ty: &PgType| numbers.iter().position(|n| n == ty).unwrap();
+        for first in &numbers {
+            for second in &numbers {
+                for kind in [OperatorKind::Arithmetic, OperatorKind::Comparison] {
+                    let widest = if rank(first) >= rank(second) {
+                        first
+                    } else {
+                        second
+                    };
+                    let items = vec![
+                        (number("1"), Some(first.clone())),
+                        (number("2"), Some(second.clone())),
+                    ];
+                    let expected: Vec<ast::Expr> = [("1", first), ("2", second)]
+                        .iter()
+                        .map(|(text, ty)| coerce(number(text), Some(ty), widest, Implicit).unwrap())
+                        .collect();
+                    assert_eq!(
+                        coerce_operands("+", kind, items).unwrap(),
+                        expected,
+                        "{first} {second}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn smallint_is_found_by_name_and_stored_as_a_smallint() {
+        for name in ["int2", "smallint", "SMALLINT"] {
+            assert_eq!(PgType::from_name(name), PgType::Int2, "{name}");
+        }
+        assert_eq!(PgType::Int2.to_string(), "smallint");
+        assert_eq!(
+            PgType::Int2.engine_type().map(|ty| ty.name),
+            Some("smallint".to_string())
+        );
+    }
+
+    #[test]
+    fn smallint_converts_up_without_a_check_and_down_with_one() {
+        expect_expr(&PgType::Int2, &PgType::Int4, Implicit, "nothing");
+        expect_expr(&PgType::Int2, &PgType::Int8, Implicit, "nothing");
+        expect_expr(&PgType::Int2, &PgType::Float8, Implicit, "cast");
+        expect_expr(&PgType::Int2, &PgType::Numeric, Implicit, "cast");
+        expect_expr(&PgType::Int2, &PgType::Text, Assignment, "cast");
+        for source in [PgType::Int4, PgType::Int8, PgType::Float8, PgType::Numeric] {
+            let checked = function_call("number_to_int2", vec![number("5")]);
+            assert_eq!(
+                convert(&source, &PgType::Int2, Assignment).unwrap(),
+                checked
+            );
+            assert_eq!(
+                convert(&source, &PgType::Int2, Explicit).unwrap(),
+                cast_to(checked, &PgType::Int2)
+            );
+            assert_error(
+                convert(&source, &PgType::Int2, Implicit),
+                "42804",
+                &format!("a value of type {source} cannot be used as smallint without a cast"),
+            );
+        }
+    }
+
+    #[test]
+    fn smallint_has_no_cast_to_or_from_boolean_bytea_or_an_oid_type() {
+        for other in [PgType::Bool, PgType::Bytea] {
+            for (source, target) in [(PgType::Int2, other.clone()), (other.clone(), PgType::Int2)] {
+                assert_error(
+                    convert(&source, &target, Explicit),
+                    "42846",
+                    &format!("cannot cast type {source} to {target}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn string_literal_becomes_a_smallint() {
+        assert_eq!(convert_text(" -7 ", &PgType::Int2).unwrap(), number("-7"));
+        assert_eq!(
+            convert_text("32767", &PgType::Int2).unwrap(),
+            number("32767")
+        );
+        assert_error(
+            convert_text("32768", &PgType::Int2),
+            "22003",
+            "value \"32768\" is out of range for type smallint",
+        );
+        assert_error(
+            convert_text("x", &PgType::Int2),
+            "22P02",
+            "invalid input syntax for type smallint: \"x\"",
+        );
+    }
+
+    #[test]
+    fn smallint_and_integers_compare_and_combine_as_integers() {
+        let items = vec![
+            (number("1"), Some(PgType::Int2)),
+            (number("2"), Some(PgType::Int4)),
+        ];
+        for kind in [OperatorKind::Comparison, OperatorKind::Arithmetic] {
+            assert_eq!(
+                coerce_operands("<", kind, items.clone()).unwrap(),
+                vec![number("1"), number("2")]
+            );
+        }
+        assert_eq!(
+            common_type(&[PgType::Int2, PgType::Int4], "CASE").unwrap(),
+            PgType::Int4
+        );
+        assert_eq!(
+            common_type(&[PgType::Int4, PgType::Int2], "CASE").unwrap(),
+            PgType::Int4
+        );
+    }
+
     const ACCEPTED_INTEGERS: &[(&str, i64)] = &[
         ("42", 42),
         (" 42 ", 42),
@@ -2668,7 +2857,11 @@ mod tests {
     fn integer_text_that_is_not_a_number_is_invalid_for_every_size() {
         for text in REJECTED_INTEGERS {
             for (name, parse) in [
-                ("integer", parse_int4 as fn(&str) -> Result<i64, ParseError>),
+                (
+                    "smallint",
+                    parse_int2 as fn(&str) -> Result<i64, ParseError>,
+                ),
+                ("integer", parse_int4),
                 ("bigint", parse_int8),
             ] {
                 assert_error(
@@ -2684,10 +2877,12 @@ mod tests {
     fn integer_text_outside_the_range_is_out_of_range() {
         for (text, name, parse) in [
             (
-                "2147483648",
-                "integer",
-                parse_int4 as fn(&str) -> Result<i64, ParseError>,
+                "32768",
+                "smallint",
+                parse_int2 as fn(&str) -> Result<i64, ParseError>,
             ),
+            ("-32769", "smallint", parse_int2),
+            ("2147483648", "integer", parse_int4),
             ("-2147483649", "integer", parse_int4),
             ("0x80000000", "integer", parse_int4),
             ("0b100000000000000000000000000000000", "integer", parse_int4),
@@ -2707,6 +2902,8 @@ mod tests {
 
     #[test]
     fn integer_text_at_the_edge_of_the_range_is_accepted() {
+        assert_eq!(parse_int2("-32768").unwrap(), -32768);
+        assert_eq!(parse_int2("32767").unwrap(), 32767);
         assert_eq!(parse_int4("-2147483648").unwrap(), i64::from(i32::MIN));
         assert_eq!(parse_int8("9223372036854775807").unwrap(), i64::MAX);
         assert_eq!(parse_int8("-9223372036854775808").unwrap(), i64::MIN);
