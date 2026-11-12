@@ -463,8 +463,10 @@ impl FixedParameter {
         let valid = match self.validation {
             FixedValidation::Exact => value_trimmed.eq_ignore_ascii_case(self.value),
             FixedValidation::Identifier => value == self.value,
+            // PostgreSQL reads the value of a Boolean parameter without a
+            // trim.
             FixedValidation::Bool(expected) => {
-                crate::functions::parse_pg_bool(value_trimmed) == Some(expected)
+                on_or_off(self.name, value)? == if expected { "on" } else { "off" }
             }
             FixedValidation::DateStyle => {
                 let parts: Vec<_> = value_trimmed.split(',').map(str::trim).collect();

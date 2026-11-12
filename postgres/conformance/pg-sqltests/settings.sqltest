@@ -352,3 +352,28 @@ expect {
     yes
     yes
 }
+
+# The value of a Boolean parameter cannot have spaces around it.
+test boolean-parameter-with-a-space-before-the-value {
+    SET row_security = ' off';
+}
+@sqlstate 22023
+expect error {
+    parameter "row_security" requires a Boolean value
+}
+
+test boolean-parameter-with-a-space-after-the-value {
+    SELECT set_config('quote_all_identifiers', 'off ', false);
+}
+@sqlstate 22023
+expect error {
+    parameter "quote_all_identifiers" requires a Boolean value
+}
+
+test boolean-parameter-with-a-value-that-is-not-boolean {
+    SET synchronize_seqscans = sometimes;
+}
+@sqlstate 22023
+expect error {
+    parameter "synchronize_seqscans" requires a Boolean value
+}
