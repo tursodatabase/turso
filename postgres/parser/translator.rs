@@ -3331,7 +3331,10 @@ impl PostgreSQLTranslator {
         Ok(result_columns)
     }
 
-    fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+    pub(crate) fn translate_expr(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 // Extract column name from fields
