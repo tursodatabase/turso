@@ -8549,15 +8549,6 @@ fn object_name(
 
 /// The name of a function call, in the FROM clause or in an expression.
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
-    if let [schema, name] = extract_key_columns(names)?.as_slice() {
-        if schema == "auth" {
-            let qualified_name = format!("{schema}.{name}");
-            return match name.as_str() {
-                "uid" | "email" | "jwt" => Ok(qualified_name),
-                _ => Err(no_such_function(&qualified_name)),
-            };
-        }
-    }
     let name = object_name(names, is_pg_catalog, "function")?;
     if name.contains('.') {
         return Err(no_such_function(&name));
