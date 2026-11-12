@@ -7,9 +7,6 @@ use turso_core::schema::RelationKind;
 use turso_core::Connection;
 use turso_pg_parser::PgType;
 
-// FIXME: casts do not call `lookup_type`. They give core a type name that is
-// not built in as it is written, and core knows only the custom types.
-
 /// What `name` names among the types that are not built in. A name with
 /// `schema` is looked up in that schema. Otherwise it is looked up in the
 /// same order as a relation: temp first, then the schemas of the search
