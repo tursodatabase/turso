@@ -1843,10 +1843,11 @@ fn find_best_access_method_for_subquery(
 
     // SQLite does not build an automatic index on the right side of a
     // RIGHT JOIN or FULL JOIN. The unmatched-row pass must scan that source.
-    if rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(JoinInfo::keeps_right_rows)
+    if !planning_context.allow_automatic_index
+        || rhs_table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
     {
         return Ok(Some(AccessMethod {
             cost: scan_cost,

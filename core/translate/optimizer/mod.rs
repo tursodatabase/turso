@@ -2726,7 +2726,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: true,
+        allow_automatic_index: resolver.automatic_index,
         resolver,
     };
 
