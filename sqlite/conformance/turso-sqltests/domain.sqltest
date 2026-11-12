@@ -1818,3 +1818,55 @@ expect {
     2|8
     3|8
 }
+
+# ------------------------------------------------------------------------------
+# Quoted domain names are the same name without the quotes
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-quoted-builtin-name-refused {
+    CREATE DOMAIN "INT" AS text;
+}
+expect error {
+    name is a built-in type
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-quoted-name-used-unquoted {
+    CREATE DOMAIN "Pos" AS integer CHECK (value > 0);
+    CREATE TABLE t1(a pos) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT a FROM t1;
+    SELECT name, sql FROM __turso_internal_types WHERE name = 'pos';
+}
+expect {
+    5
+    pos|CREATE DOMAIN pos AS integer CHECK (value > 0)
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-quoted-name-drop-unquoted {
+    CREATE DOMAIN "pos" AS integer CHECK (value > 0);
+    DROP DOMAIN pos;
+    SELECT count(*) FROM __turso_internal_types WHERE name LIKE '%pos%';
+    CREATE DOMAIN pos AS text;
+    SELECT name FROM __turso_internal_types WHERE name LIKE '%pos%';
+}
+expect {
+    0
+    pos
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-name-with-space-and-quoted-base {
+    CREATE TYPE "my type"(value text) BASE text ENCODE upper(value) DECODE value;
+    CREATE DOMAIN "my dom" AS "my type" CHECK (value <> 'X');
+    CREATE TABLE t1(a "my dom") STRICT;
+    INSERT INTO t1 VALUES ('abc');
+    SELECT a FROM t1;
+    SELECT sql FROM __turso_internal_types WHERE name = 'my dom';
+}
+expect {
+    ABC
+    CREATE DOMAIN "my dom" AS "my type" CHECK (value != 'X')
+}

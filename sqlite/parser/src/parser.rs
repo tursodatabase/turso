@@ -4918,12 +4918,7 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_TYPE);
         let if_not_exists = self.parse_if_not_exists()?;
 
-        // Parse type name
-        let name_tok = self.eat()?;
-        let type_name = match name_tok {
-            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-            _ => return Err(Error::ParseError("expected type name".to_owned())),
-        };
+        let type_name = self.parse_type_name("type name")?;
 
         // Check for AS STRUCT/UNION syntax
         if let Some(tok) = self.peek()? {
@@ -5167,22 +5162,13 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_ID);
         let if_not_exists = self.parse_if_not_exists()?;
 
-        // Parse domain name
-        let name_tok = self.eat()?;
-        let domain_name = match name_tok {
-            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-            _ => return Err(Error::ParseError("expected domain name".to_owned())),
-        };
+        let domain_name = self.parse_type_name("domain name")?;
 
         // Eat AS keyword
         eat_expect!(self, TK_AS);
 
         // Parse base type name (any identifier — primitive, custom type, or another domain)
-        let base_tok = self.eat()?;
-        let base_type = match base_tok {
-            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-            _ => return Err(Error::ParseError("expected base type name".to_owned())),
-        };
+        let base_type = self.parse_type_name("base type name")?;
 
         let mut default = None;
         let mut not_null = false;
@@ -5409,11 +5395,7 @@ impl<'a> Parser<'a> {
             TK_TYPE => {
                 eat_assert!(self, TK_TYPE);
                 let if_exists = self.parse_if_exists()?;
-                let name_tok = self.eat()?;
-                let type_name = match name_tok {
-                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-                    _ => return Err(Error::ParseError("expected type name".to_owned())),
-                };
+                let type_name = self.parse_type_name("type name")?;
                 Ok(Stmt::DropType {
                     if_exists,
                     type_name,
@@ -5422,11 +5404,7 @@ impl<'a> Parser<'a> {
             TK_ID if tok.to_utf8().eq_ignore_ascii_case("DOMAIN") => {
                 eat_assert!(self, TK_ID);
                 let if_exists = self.parse_if_exists()?;
-                let name_tok = self.eat()?;
-                let domain_name = match name_tok {
-                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-                    _ => return Err(Error::ParseError("expected domain name".to_owned())),
-                };
+                let domain_name = self.parse_type_name("domain name")?;
                 Ok(Stmt::DropDomain {
                     if_exists,
                     domain_name,
@@ -5445,6 +5423,17 @@ impl<'a> Parser<'a> {
                 "unexpected token: {}",
                 tok.to_utf8()
             )))?,
+        }
+    }
+
+    /// Parses the name of a type or domain. Quotes are removed as in any
+    /// other identifier, so `"pos"` and `pos` name the same type.
+    fn parse_type_name(&mut self, expected: &str) -> Result<String> {
+        match self.eat()? {
+            Some(tok) if tok.token_type == TK_ID => {
+                Ok(Name::from_bytes(tok.as_bytes()).as_str().to_owned())
+            }
+            _ => Err(Error::ParseError(format!("expected {expected}"))),
         }
     }
 
