@@ -212,6 +212,10 @@ pub enum Stmt {
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
     Grant(Grant),
+    /// `ALTER DEFAULT PRIVILEGES`: privileges that relations get when they
+    /// are created later. Not SQLite syntax; a frontend with roles
+    /// translates its own statement into this.
+    AlterDefaultPrivileges(AlterDefaultPrivileges),
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -1572,6 +1576,25 @@ pub struct Grant {
     /// which names any relation.
     pub on_sequences: bool,
     pub relations: Vec<QualifiedName>,
+    pub grantees: Vec<Grantee>,
+}
+
+/// `ALTER DEFAULT PRIVILEGES [FOR ROLE roles] [IN SCHEMA schemas] GRANT
+/// privileges ON TABLES TO grantees`: the privileges that relations get when
+/// one of `roles` creates them later in one of `schemas`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AlterDefaultPrivileges {
+    /// The roles whose relations get the privileges. Empty for the current
+    /// role.
+    pub roles: Vec<RoleSpec>,
+    /// The schemas whose relations get the privileges. Empty for every
+    /// schema.
+    pub schemas: Vec<Name>,
+    /// Whether the privileges are for sequences rather than for tables,
+    /// views and materialized views.
+    pub on_sequences: bool,
+    pub privileges: Vec<Privilege>,
     pub grantees: Vec<Grantee>,
 }
 

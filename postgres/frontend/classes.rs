@@ -349,10 +349,10 @@ impl ClassCatalog {
                         .relpolicies = read_back_policies(relpolicies)?;
                 }
             }
-            CatalogChange::CreateRole { .. } => {
-                return Err(LimboError::InternalError(
-                    "CREATE ROLE reached the relation catalog".to_string(),
-                ));
+            CatalogChange::CreateRole { .. } | CatalogChange::DefaultPrivileges { .. } => {
+                return Err(LimboError::InternalError(format!(
+                    "{change:?} reached the relation catalog"
+                )));
             }
         }
         Ok(())
@@ -957,10 +957,10 @@ pub(crate) fn translate_catalog_changes(
                 let stored = (!relpolicies.is_empty()).then(|| policies::stored_text(&relpolicies));
                 emit_class_row_set_policies(program, &cursors, *namespace, name, stored, change);
             }
-            CatalogChange::CreateRole { .. } => {
-                return Err(LimboError::InternalError(
-                    "CREATE ROLE reached the relation catalog".to_string(),
-                ));
+            CatalogChange::CreateRole { .. } | CatalogChange::DefaultPrivileges { .. } => {
+                return Err(LimboError::InternalError(format!(
+                    "{change:?} reached the relation catalog"
+                )));
             }
         }
     }
