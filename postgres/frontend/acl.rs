@@ -245,6 +245,25 @@ impl Acl {
         }
     }
 
+    /// Takes `revoked` away from the entry that `grantor` gave `grantee`,
+    /// and drops the entry once it has no privileges left, as PostgreSQL's
+    /// `merge_acl_with_grant` does for REVOKE. What other grantors gave
+    /// `grantee` stays.
+    pub(crate) fn revoke(&mut self, grantee: i64, revoked: Privileges, grantor: i64) {
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.grantee == grantee && item.grantor == grantor)
+        else {
+            return;
+        };
+        let item = &mut self.items[index];
+        item.privileges.remove(revoked);
+        if item.privileges.is_empty() {
+            self.items.remove(index);
+        }
+    }
+
     /// Whether the list gives `role`, by oid or through `PUBLIC`, every
     /// privilege of `wanted`.
     pub(crate) fn grants(&self, role: i64, wanted: Privileges) -> bool {
@@ -330,6 +349,48 @@ mod tests {
             acl.display_text(&names),
             "{postgres=arwdDxtm/postgres,reader=r/postgres,=r/postgres}"
         );
+    }
+
+    #[test]
+    fn a_revoke_takes_privileges_out_of_the_entry() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT | Privileges::INSERT, OWNER);
+        acl.revoke(READER, Privileges::INSERT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+        acl.revoke(READER, Privileges::UPDATE, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+    }
+
+    #[test]
+    fn a_revoke_of_every_privilege_drops_the_entry() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(PUBLIC_OID, Privileges::SELECT, OWNER);
+        acl.revoke(READER, Privileges::SELECT | Privileges::INSERT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,=r/10}");
+        acl.revoke(PUBLIC_OID, Privileges::RELATION, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10}");
+        acl.revoke(OWNER, Privileges::RELATION, OWNER);
+        assert_eq!(acl.stored_text(), "{}");
+    }
+
+    #[test]
+    fn a_revoke_changes_only_what_the_grantor_gave() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(READER, Privileges::SELECT, STRANGER);
+        acl.revoke(READER, Privileges::SELECT, STRANGER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+        acl.revoke(STRANGER, Privileges::SELECT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+    }
+
+    #[test]
+    fn the_owner_may_revoke_from_itself() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.revoke(OWNER, Privileges::SELECT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=awdDxtm/10}");
+        assert!(!acl.grants(OWNER, Privileges::SELECT));
     }
 
     #[test]
