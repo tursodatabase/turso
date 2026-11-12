@@ -499,7 +499,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error. A function that PostgreSQL rejects gets PostgreSQL's error; otherwise the error names the first unsupported feature, such as the language, RETURNS SETOF or an option |
+| CREATE FUNCTION | 🟡 Partial | Stores a function of `LANGUAGE sql` whose body is one query in a dollar-quoted string, and whose parameters and result have base types that `pg_type` shows. The function cannot be called yet. `CREATE OR REPLACE FUNCTION` is supported. A function that PostgreSQL rejects gets PostgreSQL's error; any other unsupported function gets an error that names the first unsupported feature, such as the language, RETURNS SETOF or an option. See the notes below this table |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
 | Event triggers | ❌ Not supported | |
@@ -514,6 +514,23 @@ Upgrade is not supported.
 | Triggers on views | ❌ Not supported | |
 | Variadic functions | ❌ Not supported | VARIADIC arguments rejected |
 | WHEN clause for CREATE TRIGGER | ❌ Not supported | |
+
+Notes on `CREATE FUNCTION`:
+
+- A database that has a function needs a version of tursopg that has
+  `CREATE FUNCTION`. An earlier version does not know the stored rows of a
+  function, and it reports the database as corrupt.
+- The body is not compiled when the function is created. PostgreSQL rejects
+  a body that reads a table or a column that does not exist.
+- tursopg does not know the type of the body's result, so it accepts a body
+  whose result PostgreSQL rejects with `return type mismatch`, such as text
+  for a function that returns integer.
+- The name of a function or of its schema cannot have a dot, and a function
+  cannot be created in `pg_catalog`.
+- `pg_proc` shows a function with its `proname` and `prosrc` as in
+  PostgreSQL. `pronamespace` is the oid of the schema in `pg_namespace`: the
+  oid of `public` is PostgreSQL's 2200, the oid of any other schema is
+  tursopg's own.
 
 ## Procedural Languages
 

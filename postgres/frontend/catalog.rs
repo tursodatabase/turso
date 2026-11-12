@@ -262,6 +262,19 @@ impl Dialect for PostgresDialect {
         crate::classes::apply_relation_change(schema, change, values)
     }
 
+    fn translate_create_function(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        function: &ast::CreateFunction,
+        input: &str,
+    ) -> turso_core::Result<()> {
+        crate::sql_functions::translate_create_function(
+            program, schema, connection, function, input,
+        )
+    }
+
     fn relation_owner(
         &self,
         schema: &Schema,
@@ -1169,9 +1182,56 @@ impl SnapshotRows for PgProcTable {
             ]);
             oid += 1;
         }
+
+        let schema = conn.current_schema();
+        let functions = crate::sql_functions::function_catalog(&schema)
+            .map(|functions| functions.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for function in functions {
+            let type_oid = |name: &str| pg_base_type_oid(name).unwrap_or(0);
+            let parameter_type_oids: Vec<_> = function
+                .parameter_types
+                .iter()
+                .map(|name| type_oid(name).to_string())
+                .collect();
+            rows.push(vec![
+                Value::from_i64(function.oid),                               // oid
+                Value::build_text(function.name.clone()),                    // proname
+                Value::from_i64(namespace_oid(&schema, function.namespace)), // pronamespace
+                Value::from_i64(role_oid(function.owner)),                   // proowner
+                Value::from_i64(SQL_LANGUAGE_OID),                           // prolang
+                Value::from_f64(100.0),                                      // procost
+                Value::from_f64(0.0),                                        // prorows
+                Value::from_i64(0),                                          // provariadic
+                Value::build_text("f"),                                      // prokind
+                Value::from_i64(0),                                          // prosecdef
+                Value::from_i64(0),                                          // proleakproof
+                Value::from_i64(0),                                          // proisstrict
+                Value::from_i64(0),                                          // proretset
+                Value::build_text("v"),                                      // provolatile
+                Value::build_text("u"),                                      // proparallel
+                Value::from_i64(function.parameter_types.len() as i64),      // pronargs
+                Value::from_i64(0),                                          // pronargdefaults
+                Value::from_i64(type_oid(&function.return_type)),            // prorettype
+                Value::build_text(parameter_type_oids.join(" ")),            // proargtypes
+                Value::Null,                                                 // proallargtypes
+                Value::Null,                                                 // proargmodes
+                Value::Null,                                                 // proargnames
+                Value::Null,                                                 // proargdefaults
+                Value::Null,                                                 // protrftypes
+                Value::build_text(function.body.clone()),                    // prosrc
+                Value::Null,                                                 // probin
+                Value::Null,                                                 // prosqlbody
+                Value::Null,                                                 // proconfig
+                Value::Null,                                                 // proacl
+            ]);
+        }
         rows
     }
 }
+
+/// The oid of the language `sql` in `pg_language`.
+const SQL_LANGUAGE_OID: i64 = 14;
 
 /// Virtual table implementation for pg_catalog.pg_database
 /// Returns one row per database, deriving the name from the database file path.
@@ -1438,6 +1498,15 @@ struct PgTypeInfo {
     typbyval: bool,
     typalign: &'static str,
     typstorage: &'static str,
+}
+
+/// The oid of the base type that PostgreSQL stores under `name`, such as
+/// `int4`, or None when tursopg has no such base type.
+pub(crate) fn pg_base_type_oid(name: &str) -> Option<i64> {
+    PG_BASE_TYPES
+        .iter()
+        .find(|base_type| base_type.name == name)
+        .map(|base_type| base_type.oid)
 }
 
 const PG_BASE_TYPES: &[PgTypeInfo] = &[
@@ -2880,25 +2949,31 @@ impl SnapshotRows for PgLanguageTable {
     )";
     const TABLE_OID: Option<i64> = Some(2612);
     const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 2;
+    const ESTIMATED_ROWS: u32 = 3;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        [(12, "internal"), (13, "c")]
-            .into_iter()
-            .map(|(oid, name)| {
-                vec![
-                    Value::from_i64(oid),
-                    Value::build_text(name),
-                    Value::from_i64(10),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::Null,
-                ]
-            })
-            .collect()
+        // Only sql is a trusted language: a role that is not a superuser
+        // can create functions in it.
+        [
+            (12, "internal", false),
+            (13, "c", false),
+            (SQL_LANGUAGE_OID, "sql", true),
+        ]
+        .into_iter()
+        .map(|(oid, name, is_trusted)| {
+            vec![
+                Value::from_i64(oid),
+                Value::build_text(name),
+                Value::from_i64(10),
+                Value::from_i64(0),
+                Value::from_i64(i64::from(is_trusted)),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+            ]
+        })
+        .collect()
     }
 }
 

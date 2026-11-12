@@ -1,6 +1,7 @@
 pub mod cmdtag;
 pub mod copy;
 mod create_function;
+pub use create_function::display_signature_type_name;
 mod names;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;

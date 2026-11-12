@@ -9,6 +9,7 @@ mod options;
 mod pg_type;
 mod session;
 mod settings;
+mod sql_functions;
 mod statement;
 mod unnest;
 

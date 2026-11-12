@@ -52,6 +52,9 @@ use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
+use crate::sql_functions::{
+    FunctionCatalog, FunctionChange, FUNCTION_RELKIND, FUNCTION_SCHEMA_ROW_TYPE,
+};
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -144,16 +147,37 @@ pub(crate) struct RelationClass {
 pub(crate) struct ClassCatalog {
     by_oid: BTreeMap<i64, RelationClass>,
     oids_by_name: HashMap<(NamespaceId, String), i64>,
+    /// The functions, whose class rows have the kind
+    /// [`crate::sql_functions::FUNCTION_RELKIND`].
+    pub(crate) functions: FunctionCatalog,
 }
 
 impl ClassCatalog {
-    /// Returns a catalog of the rows read from the classes table. Each row is
-    /// `(oid, relname, relnamespace, relkind, relowner, relownedby, relacl,
-    /// relrowsecurity)`.
+    /// Returns a catalog of the rows that [`schema_state_query`] read. A row
+    /// of the classes table is `(oid, relname, relnamespace, relkind,
+    /// relowner, relownedby, relacl, relrowsecurity, NULL)`. A row of
+    /// `sqlite_schema` that stores a function is `(NULL, name, ..., sql)`.
     fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
+        let mut function_rows = Vec::new();
+        let mut function_sql = HashMap::new();
         for row in rows {
-            let class = class_from_row(row)?;
+            let [class_columns @ .., sql] = row.as_slice() else {
+                return Err(corrupt_row(row));
+            };
+            if let [Value::Null, Value::Text(name), ..] = class_columns {
+                let Value::Text(sql) = sql else {
+                    return Err(corrupt_row(row));
+                };
+                function_sql.insert(name.as_str().to_string(), sql.as_str().to_string());
+                continue;
+            }
+            if matches!(class_columns.get(3), Some(Value::Text(kind)) if kind.as_str() == FUNCTION_RELKIND)
+            {
+                function_rows.push(class_columns);
+                continue;
+            }
+            let class = class_from_row(class_columns)?;
             if catalog.by_oid.contains_key(&class.oid)
                 || catalog
                     .get_by_name(class.relnamespace, &class.relname)
@@ -165,6 +189,7 @@ impl ClassCatalog {
             }
             catalog.add(class);
         }
+        catalog.functions = FunctionCatalog::new(&function_rows, &function_sql)?;
         Ok(catalog)
     }
 
@@ -289,8 +314,14 @@ impl ClassCatalog {
                         .relrowsecurity = *enabled;
                 }
             }
-            // The frontend has no objects of its own that are not relations.
-            RelationChange::DialectObject(_) => {}
+            RelationChange::DialectObject(change) => {
+                let change = change.downcast_ref::<FunctionChange>().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "the dialect object change is not a function change".to_string(),
+                    )
+                })?;
+                self.functions.apply(change, values)?;
+            }
         }
         Ok(())
     }
@@ -370,7 +401,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
     }
 }
 
-fn corrupt_row(row: &[Value]) -> LimboError {
+pub(crate) fn corrupt_row(row: &[Value]) -> LimboError {
     LimboError::Corrupt(format!("{CLASSES_TABLE_NAME} has an invalid row: {row:?}"))
 }
 
@@ -385,6 +416,8 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
 /// A catalog made before it had `relacl` or `relrowsecurity` and opened
 /// read-only, which cannot add them, reads as having no grants and no
 /// row-level security.
+/// It also reads the rows of `sqlite_schema` that store the functions, which
+/// the engine skips when it loads the schema.
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     let relacl = if has_acl_column(&table) {
@@ -399,7 +432,10 @@ pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     };
     Some(format!(
         "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, {relacl}, \
-         {relrowsecurity} FROM {CLASSES_TABLE_NAME}"
+         {relrowsecurity}, NULL AS sql FROM {CLASSES_TABLE_NAME} \
+         UNION ALL \
+         SELECT NULL, name, NULL, NULL, NULL, NULL, NULL, NULL, sql FROM sqlite_schema \
+         WHERE type = '{FUNCTION_SCHEMA_ROW_TYPE}'"
     ))
 }
 
@@ -510,7 +546,7 @@ pub(crate) fn table_rls_enabled(schema: &Schema, namespace: NamespaceId, name: &
 }
 
 /// An integer the emitted instruction read back from a register.
-fn read_back_integer(value: &Value) -> turso_core::Result<i64> {
+pub(crate) fn read_back_integer(value: &Value) -> turso_core::Result<i64> {
     match value {
         Value::Numeric(Numeric::Integer(value)) => Ok(*value),
         other => Err(LimboError::InternalError(format!(
@@ -807,8 +843,11 @@ pub(crate) fn translate_relation_changes(
                 }
                 emit_class_row_set_row_security(program, &cursors, *namespace, name, change);
             }
-            // The frontend has no objects of its own that are not relations.
-            RelationChange::DialectObject(_) => {}
+            RelationChange::DialectObject(_) => {
+                return Err(LimboError::InternalError(
+                    "only the bytecode of the dialect carries a dialect object change".to_string(),
+                ));
+            }
         }
     }
     Ok(())
@@ -878,7 +917,7 @@ fn resolve_new_owner(
 /// The cursors of one statement's class row writes: the classes table, its
 /// name index, and `sqlite_sequence`, which keeps the highest oid ever used
 /// under the classes table's own name.
-struct ClassTableCursors {
+pub(crate) struct ClassTableCursors {
     table_cursor_id: usize,
     index_cursor_id: usize,
     index_name: String,
@@ -897,7 +936,7 @@ struct ClassTableCursors {
 /// frontend's own open path, such as a core-level open for tests.
 /// `allocates_oids` also opens `sqlite_sequence`, which inserting a class
 /// row updates.
-fn open_class_table_for_writing(
+pub(crate) fn open_class_table_for_writing(
     program: &mut ProgramBuilder,
     schema: &Schema,
     allocates_oids: bool,
@@ -966,6 +1005,42 @@ fn emit_class_row_insert(
     if !is_user_relation_name(kind, name) {
         return;
     }
+    let row = emit_class_row_insert_of_kind(
+        program,
+        cursors,
+        namespace,
+        name,
+        relkind_letter(kind),
+        owner,
+    );
+    program.emit_insn(Insn::RelationChange {
+        db: MAIN_DB_ID,
+        change: Box::new(RelationChange::Create {
+            namespace,
+            name: name.to_string(),
+            kind,
+            table: table.map(str::to_string),
+        }),
+        value_regs: vec![row.oid_reg, row.owner_reg],
+    });
+}
+
+/// The registers that hold the oid and the owner of an inserted class row.
+pub(crate) struct InsertedClassRow {
+    pub(crate) oid_reg: usize,
+    pub(crate) owner_reg: usize,
+}
+
+/// Inserts the class row `(relname, namespace, relkind, owner)` under the
+/// next oid. The caller tells the in-memory catalog.
+pub(crate) fn emit_class_row_insert_of_kind(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+    relkind: &str,
+    owner: RoleId,
+) -> InsertedClassRow {
     let seq_cursor_id = cursors
         .seq_cursor_id
         .expect("the caller opened the cursors with allocates_oids");
@@ -1016,7 +1091,7 @@ fn emit_class_row_insert(
         dest: first_column_reg + 2,
     });
     program.emit_insn(Insn::String8 {
-        value: relkind_letter(kind).to_string(),
+        value: relkind.to_string(),
         dest: first_column_reg + 3,
     });
     program.emit_insn(Insn::Integer {
@@ -1065,16 +1140,10 @@ fn emit_class_row_insert(
         oid_reg,
     );
 
-    program.emit_insn(Insn::RelationChange {
-        db: MAIN_DB_ID,
-        change: Box::new(RelationChange::Create {
-            namespace,
-            name: name.to_string(),
-            kind,
-            table: table.map(str::to_string),
-        }),
-        value_regs: vec![oid_reg, first_column_reg + 4],
-    });
+    InsertedClassRow {
+        oid_reg,
+        owner_reg: first_column_reg + 4,
+    }
 }
 
 /// Makes the table with oid `table_oid` the owner of relation `name` of

@@ -1,0 +1,437 @@
+//! The functions that users define with `CREATE FUNCTION`.
+//!
+//! A function has two stored rows, written in one transaction:
+//!
+//! - A row of `sqlite_schema` with the type [`FUNCTION_SCHEMA_ROW_TYPE`],
+//!   which holds the `CREATE FUNCTION` statement. The engine skips rows of
+//!   a type it does not know.
+//! - A row of the relation catalog (see [`crate::classes`]) with the kind
+//!   [`FUNCTION_RELKIND`], which gives the function its oid and its owner.
+//!
+//! Both rows are named after the function's signature, such as
+//! `add_one(int4)`, because functions with different parameter types can
+//! have the same name. The name starts with [`FUNCTION_ROW_NAME_PREFIX`],
+//! so that no relation can have it: the statements that drop or rename a
+//! table change each row of `sqlite_schema` with the name of the table.
+
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use turso_core::namespace::{mangle_name, NamespaceId};
+use turso_core::schema::Schema;
+use turso_core::security::roles::RoleId;
+use turso_core::{
+    emit_dialect_schema_row_delete, emit_dialect_schema_row_insert,
+    open_schema_table_for_dialect_rows, Connection, Insn, LimboError, Numeric, ProgramBuilder,
+    RelationChange, Value, MAIN_DB_ID,
+};
+use turso_parser::ast;
+use turso_pg_parser::display_signature_type_name;
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_DUPLICATE_FUNCTION, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
+    SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+};
+
+use crate::catalog::pg_base_type_oid;
+use crate::classes::{
+    class_catalog, corrupt_row, emit_class_row_insert_of_kind, open_class_table_for_writing,
+    read_back_integer, FIRST_NORMAL_OBJECT_ID,
+};
+use crate::error::sqlstate_error;
+
+/// The `type` of the `sqlite_schema` row that stores a function. The
+/// version is part of the type, so that a later format gets a type of its
+/// own.
+pub(crate) const FUNCTION_SCHEMA_ROW_TYPE: &str = "pg_function_v1";
+
+/// The `relkind` of the class row of a function. PostgreSQL keeps functions
+/// in `pg_proc`, not in `pg_class`, so no `pg_class.relkind` letter stands
+/// for one.
+pub(crate) const FUNCTION_RELKIND: &str = "function";
+
+/// What the name of the two stored rows of a function starts with, before
+/// the signature. The engine keeps names with this prefix for itself, so a
+/// relation of the user, whose rows are in the same tables, cannot have
+/// such a name.
+const FUNCTION_ROW_NAME_PREFIX: &str = "__turso_internal_function_";
+
+/// A function that a user defined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlFunction {
+    pub(crate) oid: i64,
+    pub(crate) namespace: NamespaceId,
+    pub(crate) name: String,
+    /// The name PostgreSQL stores for the type of each parameter, such as
+    /// `int4`.
+    pub(crate) parameter_types: Vec<String>,
+    pub(crate) return_type: String,
+    /// The body as the user wrote it, which is `pg_proc.prosrc`.
+    pub(crate) body: String,
+    pub(crate) owner: RoleId,
+}
+
+impl SqlFunction {
+    fn signature(&self) -> String {
+        signature(&self.name, &self.parameter_types)
+    }
+
+    /// The name of the function's two stored rows.
+    fn stored_name(&self) -> String {
+        format!("{FUNCTION_ROW_NAME_PREFIX}{}", self.signature())
+    }
+}
+
+/// The function `name` with the parameters `parameter_types` as its stored
+/// rows name it, such as `add_one(int4)`.
+fn signature(name: &str, parameter_types: &[String]) -> String {
+    format!("{name}({})", parameter_types.join(","))
+}
+
+/// The functions of a database.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FunctionCatalog {
+    by_oid: BTreeMap<i64, SqlFunction>,
+}
+
+impl FunctionCatalog {
+    /// Returns the functions of `class_rows`, each `(oid, relname,
+    /// relnamespace, relkind, relowner, ...)`, with the statements of
+    /// `sql_by_name`, which has the `sqlite_schema` rows of the functions by
+    /// name.
+    pub(crate) fn new(
+        class_rows: &[&[Value]],
+        sql_by_name: &HashMap<String, String>,
+    ) -> turso_core::Result<Self> {
+        let mut catalog = Self::default();
+        for row in class_rows {
+            let function = function_from_rows(row, sql_by_name)?;
+            if catalog.by_oid.contains_key(&function.oid)
+                || catalog
+                    .get(
+                        function.namespace,
+                        &function.name,
+                        &function.parameter_types,
+                    )
+                    .is_some()
+            {
+                return Err(LimboError::Corrupt(format!(
+                    "the catalog has a duplicate function: {function:?}"
+                )));
+            }
+            catalog.by_oid.insert(function.oid, function);
+        }
+        Ok(catalog)
+    }
+
+    /// The functions in the order of their oids.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SqlFunction> {
+        self.by_oid.values()
+    }
+
+    /// The functions named `name` of `namespace`, which differ in their
+    /// parameter types.
+    pub(crate) fn named<'a>(
+        &'a self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> impl Iterator<Item = &'a SqlFunction> + use<'a> {
+        let name = name.to_string();
+        self.iter()
+            .filter(move |function| function.namespace == namespace && function.name == name)
+    }
+
+    fn get(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+        parameter_types: &[String],
+    ) -> Option<&SqlFunction> {
+        self.named(namespace, name)
+            .find(|function| function.parameter_types == parameter_types)
+    }
+
+    /// Applies what a statement wrote to the stored rows. `values` are what
+    /// the emitted instruction read back: the oid and the owner of a created
+    /// function.
+    pub(crate) fn apply(
+        &mut self,
+        change: &FunctionChange,
+        values: &[Value],
+    ) -> turso_core::Result<()> {
+        match change {
+            FunctionChange::Create(function) => {
+                let [oid, owner] = values else {
+                    return Err(LimboError::InternalError(
+                        "a created function carries its oid and owner".to_string(),
+                    ));
+                };
+                let oid = read_back_integer(oid)?;
+                let function = SqlFunction {
+                    oid,
+                    owner: RoleId::from_stored(read_back_integer(owner)?),
+                    ..function.clone()
+                };
+                assert!(
+                    self.by_oid.insert(oid, function).is_none(),
+                    "oid {oid} is already in use"
+                );
+            }
+            FunctionChange::Replace(function) => {
+                let replaced = self.by_oid.insert(function.oid, function.clone());
+                assert!(replaced.is_some(), "a replaced function exists");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a statement did to a function, which the emitted bytecode tells the
+/// in-memory catalog once the rows are written.
+#[derive(Debug)]
+pub(crate) enum FunctionChange {
+    /// The oid and the owner come from the stored class row.
+    Create(SqlFunction),
+    /// `CREATE OR REPLACE` of a function that exists keeps its oid and
+    /// owner.
+    Replace(SqlFunction),
+}
+
+fn function_from_rows(
+    class_row: &[Value],
+    sql_by_name: &HashMap<String, String>,
+) -> turso_core::Result<SqlFunction> {
+    let [Value::Numeric(Numeric::Integer(oid)), Value::Text(stored_name), Value::Numeric(Numeric::Integer(namespace)), _, Value::Numeric(Numeric::Integer(owner)), ..] =
+        class_row
+    else {
+        return Err(corrupt_row(class_row));
+    };
+    if *oid < FIRST_NORMAL_OBJECT_ID || u32::try_from(*namespace).is_err() || *owner < 0 {
+        return Err(corrupt_row(class_row));
+    }
+    let namespace = NamespaceId::new(*namespace as u32);
+    let stored_signature = stored_name
+        .as_str()
+        .strip_prefix(FUNCTION_ROW_NAME_PREFIX)
+        .ok_or_else(|| corrupt_row(class_row))?;
+    let sql = sql_by_name
+        .get(&mangle_name(namespace, stored_name.as_str()))
+        .ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "function {stored_signature} has no {FUNCTION_SCHEMA_ROW_TYPE} row in \
+                 sqlite_schema"
+            ))
+        })?;
+    let definition = parse_stored_function(sql)?;
+    let function = SqlFunction {
+        oid: *oid,
+        namespace,
+        name: definition.name.name.as_str().to_string(),
+        parameter_types: definition.parameter_types,
+        return_type: definition.return_type,
+        body: definition.body,
+        owner: RoleId::from_stored(*owner),
+    };
+    if function.signature() != stored_signature {
+        return Err(LimboError::Corrupt(format!(
+            "function {stored_signature} is stored with the statement of {}",
+            function.signature()
+        )));
+    }
+    Ok(function)
+}
+
+/// The definition in `sql`, the `CREATE FUNCTION` statement of a stored
+/// function.
+fn parse_stored_function(sql: &str) -> turso_core::Result<ast::CreateFunction> {
+    let corrupt =
+        |reason: String| LimboError::Corrupt(format!("invalid stored function {sql:?}: {reason}"));
+    let parsed = turso_pg_parser::parse(sql).map_err(|error| corrupt(error.to_string()))?;
+    let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+    match translator.translate(&parsed) {
+        Ok(ast::Stmt::CreateFunction(definition)) => Ok(definition),
+        Ok(_) => Err(corrupt("it is not CREATE FUNCTION".to_string())),
+        Err(error) => Err(corrupt(error.to_string())),
+    }
+}
+
+/// The functions that the engine loaded with the relation catalog, or None
+/// when the catalog is not loaded.
+pub(crate) fn function_catalog(schema: &Schema) -> Option<&FunctionCatalog> {
+    class_catalog(schema).map(|catalog| &catalog.functions)
+}
+
+/// [`turso_core::Dialect::translate_create_function`] for the PostgreSQL
+/// frontend. With PostgreSQL's errors: a schema that does not exist (3F000),
+/// a function with the same parameter types (42723), `OR REPLACE` by a role
+/// that does not own the function (42501) or with another result type
+/// (42P13).
+pub(crate) fn translate_create_function(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    create: &ast::CreateFunction,
+    input: &str,
+) -> turso_core::Result<()> {
+    let namespace = function_namespace(connection, &create.name)?.ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_INVALID_SCHEMA_NAME,
+            "no schema has been selected to create in",
+        )
+    })?;
+    let name = create.name.name.as_str();
+    let functions = function_catalog(schema).ok_or_else(no_catalog)?;
+    check_types_are_supported(create)?;
+
+    let function = SqlFunction {
+        oid: 0,
+        namespace,
+        name: name.to_string(),
+        parameter_types: create.parameter_types.clone(),
+        return_type: create.return_type.clone(),
+        body: create.body.clone(),
+        owner: connection.current_role(),
+    };
+    let stored_name = function.stored_name();
+    let schema_cursor_id = open_schema_table_for_dialect_rows(program, schema)?;
+    let change = match functions.get(namespace, name, &create.parameter_types) {
+        Some(_) if !create.or_replace => {
+            return Err(sqlstate_error(
+                SQLSTATE_DUPLICATE_FUNCTION,
+                format!("function \"{name}\" already exists with same argument types"),
+            ));
+        }
+        Some(existing) => {
+            check_ownership(connection, existing)?;
+            if existing.return_type != create.return_type {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_FUNCTION_DEFINITION,
+                    "cannot change return type of existing function",
+                ));
+            }
+            emit_dialect_schema_row_delete(
+                program,
+                schema_cursor_id,
+                FUNCTION_SCHEMA_ROW_TYPE,
+                &mangle_name(namespace, &stored_name),
+            );
+            (
+                FunctionChange::Replace(SqlFunction {
+                    oid: existing.oid,
+                    owner: existing.owner,
+                    ..function
+                }),
+                vec![],
+            )
+        }
+        None => {
+            let cursors =
+                open_class_table_for_writing(program, schema, true)?.ok_or_else(no_catalog)?;
+            let row = emit_class_row_insert_of_kind(
+                program,
+                &cursors,
+                namespace,
+                &stored_name,
+                FUNCTION_RELKIND,
+                function.owner,
+            );
+            (
+                FunctionChange::Create(function),
+                vec![row.oid_reg, row.owner_reg],
+            )
+        }
+    };
+    emit_dialect_schema_row_insert(
+        program,
+        schema_cursor_id,
+        FUNCTION_SCHEMA_ROW_TYPE,
+        &mangle_name(namespace, &stored_name),
+        input,
+    );
+    emit_function_change(program, change.0, change.1);
+    Ok(())
+}
+
+/// The namespace of the schema that `name` puts a function in: the schema
+/// it names, or the first schema of the search path, None when no schema of
+/// the search path exists.
+fn function_namespace(
+    connection: &Arc<Connection>,
+    name: &ast::QualifiedName,
+) -> turso_core::Result<Option<NamespaceId>> {
+    let Some(schema_name) = &name.namespace else {
+        return Ok(search_path_namespaces(connection).into_iter().next());
+    };
+    let schema_name = schema_name.as_str();
+    connection
+        .qualifier(&schema_name.to_lowercase())
+        .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
+        .map(|qualifier| Some(qualifier.target.id))
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_SCHEMA_NAME,
+                format!("schema \"{schema_name}\" does not exist"),
+            )
+        })
+}
+
+/// The namespaces of the schemas of the search path that exist, in order.
+pub(crate) fn search_path_namespaces(connection: &Connection) -> Vec<NamespaceId> {
+    connection
+        .search_order()
+        .into_iter()
+        .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
+        .map(|qualifier| qualifier.target.id)
+        .collect()
+}
+
+/// tursopg has fewer base types than PostgreSQL. A function can only have
+/// the ones that `pg_type` shows.
+fn check_types_are_supported(create: &ast::CreateFunction) -> turso_core::Result<()> {
+    let unsupported = |used_as: &str, type_name: &str| {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a function {used_as} of type {} is not supported",
+                display_signature_type_name(type_name)
+            ),
+        )
+    };
+    for parameter_type in &create.parameter_types {
+        if pg_base_type_oid(parameter_type).is_none() {
+            return Err(unsupported("parameter", parameter_type));
+        }
+    }
+    if pg_base_type_oid(&create.return_type).is_none() {
+        return Err(unsupported("result", &create.return_type));
+    }
+    Ok(())
+}
+
+/// Only the owner of a function and a superuser may replace or drop it.
+fn check_ownership(connection: &Connection, function: &SqlFunction) -> turso_core::Result<()> {
+    if connection.current_role_is_superuser() || function.owner == connection.current_role() {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        format!("must be owner of function {}", function.name),
+    ))
+}
+
+fn emit_function_change(
+    program: &mut ProgramBuilder,
+    change: FunctionChange,
+    value_regs: Vec<usize>,
+) {
+    let change: Arc<dyn Any + Send + Sync> = Arc::new(change);
+    program.emit_insn(Insn::RelationChange {
+        db: MAIN_DB_ID,
+        change: Box::new(RelationChange::DialectObject(change)),
+        value_regs,
+    });
+}
+
+fn no_catalog() -> LimboError {
+    LimboError::ParseError("the database has no relation catalog".to_string())
+}

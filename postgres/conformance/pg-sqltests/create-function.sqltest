@@ -1,14 +1,15 @@
 # CREATE FUNCTION, CREATE PROCEDURE and the statements around them.
 #
-# tursopg does not support functions yet. When PostgreSQL rejects a
-# statement, tursopg gives the same error. Otherwise tursopg names the first
-# feature it does not support. Each test shows what PostgreSQL does, so a
-# feature is supported once its `expect @tursopg error` block is removed.
+# tursopg stores SQL functions (see function-catalog.sqltest) but cannot call
+# them yet. When PostgreSQL rejects a statement, tursopg gives the same
+# error. Otherwise tursopg names the first feature it does not support. Each
+# test shows what PostgreSQL does, so a feature is supported once its
+# `expect @tursopg error` block is removed.
 
 @database :memory:
 
 # A plain SQL function, which is the first kind of function tursopg will
-# support.
+# call.
 test sql-function {
     CREATE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
@@ -16,9 +17,9 @@ test sql-function {
 expect {
     1
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
-    CREATE FUNCTION is not supported
+    no such function: one
 }
 
 test sql-function-with-parameter {
@@ -28,9 +29,9 @@ test sql-function-with-parameter {
 expect {
     42
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
-    CREATE FUNCTION is not supported
+    no such function: add_one
 }
 
 test sql-function-in-public-schema {
@@ -42,7 +43,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    CREATE FUNCTION is not supported
+    a schema-qualified function name is not supported
 }
 
 test sql-function-in-other-schema {
@@ -56,6 +57,34 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     a schema-qualified function name is not supported
+}
+
+test sql-function-in-check-constraint {
+    CREATE FUNCTION is_positive(int) RETURNS boolean AS $$ SELECT $1 > 0 $$ LANGUAGE sql;
+    CREATE TABLE t (a int CHECK (is_positive(a)));
+    INSERT INTO t VALUES (1);
+    SELECT a FROM t;
+}
+expect {
+    1
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: is_positive
+}
+
+test sql-function-in-column-default {
+    CREATE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+    CREATE TABLE t (a int DEFAULT one(), b int);
+    INSERT INTO t (b) VALUES (2);
+    SELECT a, b FROM t;
+}
+expect {
+    1|2
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: one
 }
 
 test sql-function-in-missing-schema {
@@ -73,9 +102,9 @@ test create-or-replace-function {
 expect {
     1
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
-    CREATE OR REPLACE FUNCTION is not supported
+    no such function: one
 }
 
 test create-procedure {
@@ -418,7 +447,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    CREATE FUNCTION is not supported
+    a function parameter of type int4range is not supported
 }
 
 test pg-lsn-result {
@@ -428,7 +457,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    CREATE FUNCTION is not supported
+    a function result of type pg_lsn is not supported
 }
 
 test missing-qualified-parameter-type {
@@ -885,9 +914,9 @@ expect @tursopg error {
     a named argument in a function call is not supported
 }
 
-# Statements on functions and triggers. No function or trigger can exist, so
-# PostgreSQL rejects them too. To give PostgreSQL's errors, tursopg would have
-# to look the functions and triggers up.
+# Statements on functions and triggers. tursopg cannot drop a function yet,
+# and no procedure or trigger can exist. To give PostgreSQL's errors, tursopg
+# would have to look the functions and triggers up.
 
 test drop-function {
     DROP FUNCTION nosuch;
