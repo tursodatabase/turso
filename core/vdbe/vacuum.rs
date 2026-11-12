@@ -1115,7 +1115,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &entry.sql)?;
+                let target_stmt = prepare_replay_on_target(&state.target_conn, &entry.sql)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1193,6 +1193,17 @@ fn prepare_on_target(
     if is_system {
         target_conn.end_nested();
     }
+    stmt
+}
+
+/// Replay a schema entry the source database already holds. The statement is
+/// engine-internal, so the checks that only a new user statement must pass are
+/// bypassed the same way [`prepare_on_target`] bypasses them, and for the same
+/// reason the guard is held only around prepare().
+fn prepare_replay_on_target(target_conn: &Arc<Connection>, sql: &str) -> Result<crate::Statement> {
+    target_conn.start_nested();
+    let stmt = target_conn.prepare(sql);
+    target_conn.end_nested();
     stmt
 }
 
