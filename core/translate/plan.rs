@@ -3248,33 +3248,8 @@ fn subquery_output_columns(
     resolver: &Resolver,
 ) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
-    make_column_names_unique(&mut columns);
+    crate::util::name_derived_columns(columns.iter_mut().map(|column| &mut column.name));
     Ok((columns, column_types))
-}
-
-fn make_column_names_unique(columns: &mut [Column]) {
-    let mut used_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-    for column in columns {
-        let Some(name) = column.name.clone() else {
-            continue;
-        };
-        let base_name = strip_numbered_suffix(&name);
-        let mut candidate = name.clone();
-        let mut count = 0;
-        while !used_names.insert(candidate.to_lowercase()) {
-            count += 1;
-            candidate = format!("{base_name}:{count}");
-        }
-        column.name = Some(candidate);
-    }
-}
-
-fn strip_numbered_suffix(name: &str) -> &str {
-    let without_digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
-    match without_digits.strip_suffix(':') {
-        Some(base_name) if !base_name.is_empty() => base_name,
-        _ => name,
-    }
 }
 
 impl JoinedTable {
