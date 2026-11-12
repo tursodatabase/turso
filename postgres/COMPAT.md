@@ -530,6 +530,11 @@ Notes on `CREATE FUNCTION`:
   cannot parse or that is not a query, because it reads the body when it
   stores the function. PostgreSQL finds these errors when the function is
   called.
+- The check refuses a body that PostgreSQL accepts when the query uses a
+  feature that tursopg does not have, such as `FOR UPDATE`, `DISTINCT ON` or
+  the function `pg_typeof`. The error is the one that the query gets as a
+  statement. With `check_function_bodies = off`, such a function can be
+  created, but a call of it cannot work.
 - tursopg does not know the type of the body's result, so it accepts a body
   whose result PostgreSQL rejects with `return type mismatch`, such as text
   for a function that returns integer.

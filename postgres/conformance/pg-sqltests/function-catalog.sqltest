@@ -961,6 +961,44 @@ expect @tursopg error {
     no such function: forever
 }
 
+# PostgreSQL accepts these bodies. tursopg cannot compile them, so it refuses
+# the function when it is created, with the error that the query gets as a
+# statement.
+test body-with-a-clause-that-is-not-supported {
+    CREATE TABLE items (id integer);
+    CREATE FUNCTION locked() RETURNS integer LANGUAGE sql AS $$SELECT id FROM items FOR UPDATE$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'locked';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    SELECT ... FOR UPDATE / FOR SHARE is not supported
+}
+
+test body-with-a-built-in-function-that-tursopg-does-not-have {
+    CREATE FUNCTION type_name() RETURNS text LANGUAGE sql AS $$SELECT pg_typeof(1)::text$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'type_name';
+}
+expect {
+    1
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: pg_typeof
+}
+
+test body-with-a-clause-that-is-not-supported-when-check-function-bodies-is-off {
+    SET check_function_bodies = off;
+    CREATE TABLE items (id integer);
+    CREATE FUNCTION locked() RETURNS integer LANGUAGE sql AS $$SELECT id FROM items FOR UPDATE$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'locked';
+}
+expect {
+    1
+}
+
 # tursopg cannot call a stored function yet, so the check of a body that
 # calls one fails.
 test body-that-calls-a-stored-function {
