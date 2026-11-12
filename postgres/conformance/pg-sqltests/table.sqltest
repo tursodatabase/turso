@@ -948,3 +948,111 @@ test update-set-default-without-column-default-sets-null {
 expect {
     1|x
 }
+
+# ---------------------------------------------------------------------------
+# Column types that are not built in
+# ---------------------------------------------------------------------------
+
+test table-column-of-missing-type {
+    CREATE TABLE t (a nosuch);
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+test table-column-of-missing-array-type-in-public-schema {
+    CREATE TABLE t (a public.nosuch[]);
+}
+@sqlstate 42704
+expect error {
+    type "public\.nosuch\[\]" does not exist
+}
+
+# An index and a sequence have no row type.
+test table-column-of-index-name {
+    CREATE TABLE emp (name text);
+    CREATE INDEX emp_name ON emp (name);
+    CREATE TABLE t (a emp_name);
+}
+@sqlstate 42704
+expect error {
+    type "emp_name" does not exist
+}
+
+test table-column-of-sequence-name {
+    CREATE SEQUENCE s;
+    CREATE TABLE t (a s);
+}
+@sqlstate 42704
+expect error {
+    type "s" does not exist
+}
+
+test table-column-of-table-row-type {
+    CREATE TABLE emp (name text);
+    CREATE TABLE dept (head emp);
+    INSERT INTO dept VALUES (ROW('ann'));
+    SELECT (head).name FROM dept;
+}
+expect {
+    ann
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a column of row type emp is not supported
+}
+
+test table-column-of-view-row-type {
+    CREATE VIEW v AS SELECT 1 AS a;
+    CREATE TABLE t (r v);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a column of row type v is not supported
+}
+
+test table-add-column-of-missing-type {
+    CREATE TABLE t (a int);
+    ALTER TABLE t ADD COLUMN b nosuch;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+# `_mood` is the array type of `mood`.
+test table-column-of-enum-array-type-named-with-underscore {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (a _mood);
+    INSERT INTO t VALUES ('{sad,happy}');
+    SELECT a FROM t;
+}
+expect {
+    {sad,happy}
+}
+
+test table-domain-over-missing-type {
+    CREATE DOMAIN d AS nosuch;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+test table-domain-over-table-row-type {
+    CREATE TABLE emp (name text);
+    CREATE DOMAIN named_emp AS emp CHECK ((VALUE).name IS NOT NULL);
+    SELECT ('(ann)'::named_emp).name;
+}
+expect {
+    ann
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a domain over row type emp is not supported
+}

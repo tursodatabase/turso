@@ -471,10 +471,12 @@ fn prepare_statement_inner(
         }
     }
     let conn_for_names = Arc::clone(&pg_conn.conn);
+    let conn_for_types = Arc::clone(&pg_conn.conn);
     let translator = PostgreSQLTranslator::new()
         .with_relation_name_check(move |schema, name| {
             schema_has_relation(&conn_for_names, schema, name)
         })
+        .with_type_lookup(move |schema, name| lookup_type(&conn_for_types, schema, name))
         .with_existing_generated_columns(existing_generated);
     let translated = translator
         .translate_with_prereqs(&parse_result)

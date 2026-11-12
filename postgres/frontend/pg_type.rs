@@ -5,19 +5,10 @@ use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::Connection;
+use turso_pg_parser::PgType;
 
-// FIXME: CREATE TABLE and casts do not call `lookup_type`. They give core a
-// type name that is not built in as it is written, and core knows only the
-// custom types.
-
-/// What a type name that is not built in names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PgType {
-    /// A custom type: a domain or an enum.
-    Custom,
-    /// The row type of a table, a view or a materialized view.
-    Row,
-}
+// FIXME: casts do not call `lookup_type`. They give core a type name that is
+// not built in as it is written, and core knows only the custom types.
 
 /// What `name` names among the types that are not built in. A name with
 /// `schema` is looked up in that schema. Otherwise it is looked up in the

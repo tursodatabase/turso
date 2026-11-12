@@ -14,9 +14,11 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR,
 };
+use crate::type_names::{built_in_type, schema_and_name, type_name_text, PgType};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -57,12 +59,19 @@ pub struct SerialSequence {
 /// Whether a schema, by name, has a relation of a name.
 type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
+/// What a type name that is not built in names, in a schema or, without
+/// one, in the schemas of the search path.
+type TypeLookup = Box<dyn Fn(Option<&str>, &str) -> Option<PgType>>;
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    /// None when nothing is known about the catalog, as when a stored
+    /// statement is translated again.
+    type_lookup: Option<TypeLookup>,
     /// Table name in scope while a generation expression is being translated.
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
@@ -81,6 +90,16 @@ impl PostgreSQLTranslator {
         is_taken: impl Fn(&str, &str) -> bool + 'static,
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
+    }
+
+    /// A translator that asks `lookup(schema, name)` what a type name
+    /// names, when tursopg has no type of its own for the name.
+    pub fn with_type_lookup(
+        mut self,
+        lookup: impl Fn(Option<&str>, &str) -> Option<PgType> + 'static,
+    ) -> Self {
+        self.type_lookup = Some(Box::new(lookup));
         self
     }
 
@@ -664,7 +683,7 @@ impl PostgreSQLTranslator {
 
         reject_column_def_clauses(col_def)?;
         let name = col_def.colname.clone();
-        let pg_type = extract_type_name(col_def)?;
+        let pg_type = self.column_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def)?;
 
         let is_serial = is_serial_type(&pg_type);
@@ -1349,7 +1368,7 @@ impl PostgreSQLTranslator {
         let col_name = exact_name(&col_def.colname);
         reject_column_def_clauses(col_def)?;
 
-        let pg_type = extract_type_name(col_def)?;
+        let pg_type = self.column_type_name(col_def)?;
         if is_serial_type(&pg_type) {
             return Err(ParseError::not_supported(format!(
                 "{pg_type} in ALTER TABLE"
@@ -5536,6 +5555,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
+        self.check_type_name(type_name_node, TypeUse::Domain)?;
         if !type_name_node.array_bounds.is_empty() {
             return Err(ParseError::not_supported(
                 "CREATE DOMAIN over an array type",
@@ -5625,6 +5645,83 @@ impl PostgreSQLTranslator {
             constraints,
         })
     }
+
+    /// The type of column `col_def`, written with its array brackets, such
+    /// as `int4[]`, once [`Self::check_type_name`] accepts it.
+    fn column_type_name(
+        &self,
+        col_def: &pg_query::protobuf::ColumnDef,
+    ) -> Result<String, ParseError> {
+        let type_name = col_def
+            .type_name
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("column missing type".into()))?;
+        let pg_type = extract_type_name_from_typename(type_name)?;
+        self.check_type_name(type_name, TypeUse::Column)?;
+        Ok(pg_type)
+    }
+
+    /// Checks `type_name`, used as `used_as`, when tursopg has no type of
+    /// its own for it. Core then gets the name as it is written and takes
+    /// it for a custom type, so the name must be one. A built-in type of
+    /// PostgreSQL is left to core. Without a type lookup, nothing is
+    /// checked.
+    fn check_type_name(
+        &self,
+        type_name: &pg_query::protobuf::TypeName,
+        used_as: TypeUse,
+    ) -> Result<(), ParseError> {
+        let Some(lookup) = &self.type_lookup else {
+            return Ok(());
+        };
+        let (schema, name) = schema_and_name(type_name)?;
+        // `_mood` is the array type of `mood`.
+        let element = name.strip_prefix('_');
+        if has_turso_type(name)
+            || built_in_type(schema, name).is_some()
+            || element.is_some_and(|element| built_in_type(schema, element).is_some())
+        {
+            return Ok(());
+        }
+        let found =
+            lookup(schema, name).or_else(|| element.and_then(|element| lookup(schema, element)));
+        match found {
+            Some(PgType::Custom) => Ok(()),
+            Some(PgType::Row) => Err(ParseError::not_supported(
+                used_as.row_type_feature(&type_name_text(type_name)?),
+            )),
+            None => Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_UNDEFINED_OBJECT,
+                message: format!("type \"{}\" does not exist", type_name_text(type_name)?),
+            }),
+        }
+    }
+}
+
+/// Where a type name is used.
+#[derive(Debug, Clone, Copy)]
+enum TypeUse {
+    Column,
+    /// The base type of a domain.
+    Domain,
+}
+
+impl TypeUse {
+    /// The feature that is not supported when a type name used so names a
+    /// row type.
+    fn row_type_feature(self, type_name: &str) -> String {
+        match self {
+            Self::Column => format!("a column of row type {type_name}"),
+            Self::Domain => format!("a domain over row type {type_name}"),
+        }
+    }
+}
+
+/// Whether tursopg has a type of its own for `name`, a type name without
+/// its schema. As map_pg_type does, each leading underscore is read as an
+/// array.
+fn has_turso_type(name: &str) -> bool {
+    turso_type(name.trim_start_matches('_'), &[]).is_some()
 }
 
 #[allow(clippy::vec_box)]
@@ -6347,6 +6444,16 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         });
     }
 
+    // Unknown types pass through as-is (e.g. user-defined enums).
+    Some(
+        turso_type(pg_type, params)
+            .unwrap_or_else(|| PgTypeMapping::scalar(pg_type.to_lowercase())),
+    )
+}
+
+/// The Turso type of `pg_type`, a type that is not an array, or None when
+/// tursopg has no type of its own for it.
+fn turso_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     let type_name = match pg_type.to_uppercase().as_str() {
         // Types with Turso custom type equivalents
         "BOOLEAN" | "BOOL" => "boolean".into(),
@@ -6398,9 +6505,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
-        // Unknown types pass through as-is (e.g. user-defined enums).
-        // The custom type system will validate at CREATE TABLE time.
-        _ => pg_type.to_lowercase(),
+        _ => return None,
     };
 
     Some(PgTypeMapping {
@@ -6955,14 +7060,6 @@ fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {
         Some(Node::Integer(i)) => i.ival != 0,
         _ => false,
     }
-}
-
-fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, ParseError> {
-    let type_name = col_def
-        .type_name
-        .as_ref()
-        .ok_or_else(|| ParseError::ParseError("column missing type".into()))?;
-    extract_type_name_from_typename(type_name)
 }
 
 /// Extract integer type modifiers from a column definition.

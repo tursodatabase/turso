@@ -1,10 +1,20 @@
-//! Type names: how to read them, and the names of PostgreSQL's built-in
-//! types.
+//! Type names: how to read them, the names of PostgreSQL's built-in types,
+//! and what the other names name.
 
 use crate::names::extract_key_columns;
 use crate::ParseError;
 use pg_query::protobuf::node::Node;
 use pg_query::protobuf::TypeName;
+
+/// What a type name that is not built in names. Only a caller with a
+/// connection can look it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgType {
+    /// A custom type: a domain or an enum.
+    Custom,
+    /// The row type of a table, a view or a materialized view.
+    Row,
+}
 
 /// The kind of a built-in type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
