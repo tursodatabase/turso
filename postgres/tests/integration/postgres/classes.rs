@@ -11,7 +11,7 @@ use turso_core::{Connection, SessionRole, Value};
 /// ordered by oid.
 fn class_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, String, i64)> {
     let rows = conn
-        .prepare("SELECT oid, relname, relnamespace, relkind, relowner FROM __turso_internal_classes ORDER BY oid")
+        .prepare_engine_schema_statement("SELECT oid, relname, relnamespace, relkind, relowner FROM __turso_internal_classes ORDER BY oid")
         .unwrap()
         .run_collect_rows()
         .unwrap();
@@ -34,6 +34,167 @@ fn class_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, String, i64)> {
 
 fn class_row(conn: &Arc<Connection>, relname: &str) -> Option<(i64, String, i64, String, i64)> {
     class_rows(conn).into_iter().find(|row| row.1 == relname)
+}
+
+#[test]
+fn postgres_async_open_initializes_the_postgres_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server-open.db");
+    let db = open_like_server(path.to_str().unwrap());
+    let pg = turso_pg::PgConnection::connect(&db).unwrap();
+    pg.execute("CREATE TABLE a (id integer PRIMARY KEY, name text)")
+        .unwrap();
+    pg.execute("CREATE TABLE b (value text)").unwrap();
+    assert_catalog_columns(&pg, "public");
+    let rows = class_rows(pg.inner());
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.0 >= 16384));
+    assert_ne!(rows[0].0, rows[1].0);
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn postgres_async_open_initializes_catalog_across_io_yields() {
+    let db = open_like_server_with_io("yielded.db", Arc::new(turso_core::MemoryYieldIO::new()));
+    let pg = turso_pg::PgConnection::connect(&db).unwrap();
+    pg.execute("CREATE TABLE a (id integer PRIMARY KEY, name text)")
+        .unwrap();
+    pg.execute("CREATE TABLE b (value text)").unwrap();
+    assert_catalog_columns(&pg, "public");
+    assert_eq!(class_rows(pg.inner()).len(), 2);
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn cancelled_catalog_backfill_can_be_reopened_at_every_io_boundary() {
+    for cancel_after in 0..100 {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryYieldIO::new());
+        let path = "cancelled-catalog.db";
+        let file = io
+            .open_file(path, turso_core::OpenFlags::default(), true)
+            .unwrap();
+        let options = turso_core::OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+                file,
+            )))
+            .db_opts(turso_core::DatabaseOpts::new().with_mvcc(true));
+        {
+            let db = turso_core::Database::open(io.clone(), path, options.clone()).unwrap();
+            let conn = db
+                .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.create_namespace("app").unwrap();
+            conn.execute("CREATE TABLE app.t (x integer); INSERT INTO app.t VALUES (42)")
+                .unwrap();
+        }
+        let mut state = turso_pg::OpenDatabaseState::default();
+        let mut yields = 0;
+        let completed = loop {
+            match turso_pg::open_database_async(
+                &mut state,
+                io.clone(),
+                path,
+                &options,
+                turso_core::ConnectOpts::new(SessionRole::Superuser),
+            )
+            .unwrap()
+            {
+                turso_core::IOResult::Done(_) => break true,
+                turso_core::IOResult::IO(completions) => {
+                    completions.wait(io.as_ref()).unwrap();
+                    if yields == cancel_after {
+                        break false;
+                    }
+                    yields += 1;
+                }
+            }
+        };
+        drop(state);
+        let db = open_like_server_with_io(path, io);
+        let pg = turso_pg::PgConnection::connect(&db).unwrap();
+        assert_eq!(
+            class_rows(pg.inner()).len(),
+            1,
+            "cancel_after={cancel_after}"
+        );
+        let rows = pg
+            .query("SELECT x FROM app.t")
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
+        if completed {
+            return;
+        }
+    }
+    panic!("opening exceeded the cancellation test's I/O bound");
+}
+
+fn assert_catalog_columns(pg: &turso_pg::PgConnection, namespace: &str) {
+    let rows = pg
+        .query(format!(
+            "SELECT c.relname, a.attnum, a.attname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid
+        WHERE n.nspname='{namespace}' AND c.relname IN ('a', 'b') AND a.attnum > 0
+        ORDER BY c.relname, a.attnum"
+        ))
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::from_text("a"),
+                Value::from_i64(1),
+                Value::from_text("id")
+            ],
+            vec![
+                Value::from_text("a"),
+                Value::from_i64(2),
+                Value::from_text("name")
+            ],
+            vec![
+                Value::from_text("b"),
+                Value::from_i64(1),
+                Value::from_text("value")
+            ],
+        ]
+    );
+}
+
+fn open_like_server(path: &str) -> Arc<turso_core::Database> {
+    open_like_server_with_io(path, Arc::new(turso_core::PlatformIO::new().unwrap()))
+}
+
+fn open_like_server_with_io(path: &str, io: Arc<dyn turso_core::IO>) -> Arc<turso_core::Database> {
+    let file = io
+        .open_file(path, turso_core::OpenFlags::default(), true)
+        .unwrap();
+    let options = turso_core::OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+        .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+            file,
+        )))
+        .db_opts(turso_core::DatabaseOpts::new().with_mvcc(true));
+    let mut state = turso_pg::OpenDatabaseState::default();
+    loop {
+        match turso_pg::open_database_async(
+            &mut state,
+            io.clone(),
+            path,
+            &options,
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
+        )
+        .unwrap()
+        {
+            turso_core::IOResult::Done(db) => return db,
+            turso_core::IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+        }
+    }
 }
 
 #[test]
@@ -280,7 +441,24 @@ fn open_without_catalog(path: &str) -> Arc<turso_core::Database> {
 }
 
 #[test]
-fn a_database_with_relations_but_no_catalog_is_refused() {
+fn a_database_without_catalog_gets_stable_oids_on_server_open() {
+    check_catalog_backfill(open_like_server);
+}
+
+#[test]
+fn a_database_without_catalog_gets_stable_oids_on_frontend_open() {
+    check_catalog_backfill(|path| {
+        turso_pg::open_database_with_io(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            path,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap()
+    });
+}
+
+fn check_catalog_backfill(open: impl Fn(&str) -> Arc<turso_core::Database>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pre-catalog.db");
     let path = path.to_str().unwrap();
@@ -290,27 +468,52 @@ fn a_database_with_relations_but_no_catalog_is_refused() {
             .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
         conn.create_namespace("app").unwrap();
-        conn.prepare("CREATE TABLE app.t (x int)")
-            .unwrap()
-            .run_ignore_rows()
-            .unwrap();
-    }
-
-    for read_only in [false, true] {
-        let mut flags = turso_core::OpenFlags::default();
-        if read_only {
-            flags |= turso_core::OpenFlags::ReadOnly;
+        conn.create_namespace("other").unwrap();
+        for sql in [
+            "CREATE TABLE app.a (id integer PRIMARY KEY, name text)",
+            "CREATE TABLE app.b (value text)",
+            "CREATE INDEX app.b_value ON b(value)",
+            "INSERT INTO app.a VALUES (1, 'preserved')",
+            "CREATE TABLE other.a (different integer)",
+            "CREATE TABLE app.\"quote'name\" (x integer)",
+            "CREATE VIEW app.v AS SELECT id FROM app.a",
+            "CREATE SEQUENCE app.s",
+        ] {
+            conn.prepare(sql).unwrap().run_ignore_rows().unwrap();
         }
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let error =
-            turso_pg::open_database_with_io(io, path, flags, turso_core::DatabaseOpts::new())
-                .unwrap_err()
-                .to_string();
-        assert!(
-            error.contains("has relations but no relation catalog"),
-            "read_only={read_only}: {error}"
-        );
     }
+    let error = turso_pg::open_database_with_io(
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path,
+        turso_core::OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("open it writable"), "{error}");
+    let initial;
+    {
+        let db = open(path);
+        let pg = turso_pg::PgConnection::connect(&db).unwrap();
+        assert_catalog_columns(&pg, "app");
+        initial = class_rows(pg.inner());
+        assert_eq!(initial.len(), 7);
+        assert!(initial.iter().all(|row| row.0 >= 16384));
+        let oids: std::collections::HashSet<_> = initial.iter().map(|row| row.0).collect();
+        assert_eq!(oids.len(), initial.len());
+        let data = pg
+            .inner()
+            .prepare("SELECT name FROM app.a WHERE id=1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(data, vec![vec![Value::from_text("preserved")]]);
+    }
+    let db = open(path);
+    let pg = turso_pg::PgConnection::connect(&db).unwrap();
+    assert_catalog_columns(&pg, "app");
+    assert_eq!(class_rows(pg.inner()), initial);
+    pg.execute("CREATE TABLE app.c (x integer)").unwrap();
+    assert!(class_row(pg.inner(), "c").unwrap().0 > initial.last().unwrap().0);
 }
 
 #[test]

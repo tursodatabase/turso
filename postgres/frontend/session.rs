@@ -94,20 +94,25 @@ pub fn open_database_with_io(
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    let db = turso_core::Database::open(
-        io,
-        path,
-        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
-            .storage(db_file)
-            .flags(flags)
-            .db_opts(opts.with_mvcc(true)),
-    )?;
-    // After the open, the classes table exists before the database holds
-    // any relation, and every relation gets its row from its CREATE. A
-    // database with relations but no catalog is from an earlier tursopg and
-    // is refused.
-    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
-    Ok(db)
+    let options = turso_core::OpenOptions::new(Arc::new(PostgresDialect))
+        .storage(db_file)
+        .flags(flags)
+        .db_opts(opts.with_mvcc(true));
+    let mut state = crate::OpenDatabaseState::default();
+    loop {
+        match crate::open_database_async(
+            &mut state,
+            io.clone(),
+            path,
+            &options,
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
+        )
+        .map_err(|error| *error)?
+        {
+            IOResult::Done(db) => return Ok(db),
+            IOResult::IO(completions) => completions.wait(io.as_ref())?,
+        }
+    }
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -297,7 +302,7 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
 /// made by an earlier version of tursopg or by SQLite. This version keeps
 /// every table in a schema and would hide those, so it refuses the
 /// database instead.
-fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
+pub(crate) fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
     let schema = conn.current_schema();
     let has_tables_in_no_schema = schema
         .tables(turso_core::NamespaceId::ROOT)
