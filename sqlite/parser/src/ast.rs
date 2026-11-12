@@ -1551,12 +1551,14 @@ pub enum RoleSpec {
     SessionUser,
 }
 
-/// `GRANT privileges ON relations TO grantees`. The relations are named one
-/// by one: a frontend expands a form like `ALL TABLES IN SCHEMA` before it
-/// builds this.
+/// `GRANT privileges ON relations TO grantees`, or `REVOKE privileges ON
+/// relations FROM grantees`. The relations are named one by one: a frontend
+/// expands a form like `ALL TABLES IN SCHEMA` before it builds this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Grant {
+    /// GRANT when true, REVOKE when false.
+    pub is_grant: bool,
     pub privileges: Vec<Privilege>,
     /// Whether the statement grants on `SEQUENCE`s rather than on tables,
     /// which names any relation.

@@ -357,10 +357,10 @@ does not apply to `TRUNCATE`, which removes every row. A constraint error
 shows the values of the row or key (`Failing row contains ...`, `Key ...
 already exists`) only to a role with `SELECT` on the table; PostgreSQL also
 shows the values that the statement itself gave. Column
-privileges, `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of
-objects, and `REVOKE` fail as not supported, so that a script never believes
-it changed what a role may do when it did not. `GRANT role_name TO
-role_name` is not supported either.
+privileges, `WITH GRANT OPTION`, `GRANTED BY`, and `GRANT` on other kinds
+of objects fail as not supported, so that a script never believes it changed
+what a role may do when it did not. `GRANT role_name TO role_name` is not
+supported either.
 
 **Examples:**
 
@@ -369,6 +369,51 @@ CREATE ROLE reader;
 CREATE TABLE accounts (id int);
 GRANT SELECT ON accounts TO reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+```
+
+### `REVOKE` — take privileges on tables away from roles
+
+**Synopsis:**
+
+```sql
+REVOKE { { SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN }
+        [, ...] | ALL [ PRIVILEGES ] }
+    ON { [ TABLE ] table_name [, ...] | ALL TABLES IN SCHEMA schema_name [, ...] }
+    FROM role_specification [, ...]
+    [ CASCADE | RESTRICT ]
+
+REVOKE { { USAGE | SELECT | UPDATE } [, ...] | ALL [ PRIVILEGES ] }
+    ON { SEQUENCE sequence_name [, ...] | ALL SEQUENCES IN SCHEMA schema_name [, ...] }
+    FROM role_specification [, ...]
+    [ CASCADE | RESTRICT ]
+```
+
+**Description:**
+
+`REVOKE` takes privileges that `GRANT` gave away again. The parameters and
+the errors for missing tables, schemas and roles are those of `GRANT`.
+
+As in PostgreSQL, `REVOKE` changes only the entry that the owner granted in
+the table's access control list, and removes the entry when it has no
+privileges left. Revoking from `PUBLIC` leaves the privileges granted to a
+role by name, so that role can still use them. The owner can revoke its own
+privileges too: `REVOKE ALL ON accounts FROM postgres` by the owner leaves
+the list `{}`. A `REVOKE` on a table whose list is still `NULL` stores the
+default list, in which the owner has every privilege, as in PostgreSQL.
+
+As with `GRANT`, the owner or a superuser may revoke. Any other role gets
+`permission denied for table` (SQLSTATE 42501), unless the list gives it a
+privilege on the table, when the statement succeeds and changes nothing, as
+in PostgreSQL, which warns. Grant options are not supported, so no role can
+have passed a privilege on, and `CASCADE` and `RESTRICT` revoke the same.
+`REVOKE GRANT OPTION FOR`, `GRANTED BY`, column privileges and other kinds
+of objects fail as not supported.
+
+**Examples:**
+
+```sql
+REVOKE SELECT ON accounts FROM reader;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
 ```
 
 ### `SET ROLE` — set the current role

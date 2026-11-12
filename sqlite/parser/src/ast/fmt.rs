@@ -1783,14 +1783,18 @@ impl ToTokens for Grant {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_ID, Some("GRANT"))?;
+        s.append(TK_ID, Some(if self.is_grant { "GRANT" } else { "REVOKE" }))?;
         s.comma(&self.privileges, context)?;
         s.append(TK_ON, None)?;
         if self.on_sequences {
             s.append(TK_ID, Some("SEQUENCE"))?;
         }
         s.comma(&self.relations, context)?;
-        s.append(TK_TO, None)?;
+        if self.is_grant {
+            s.append(TK_TO, None)?;
+        } else {
+            s.append(TK_FROM, None)?;
+        }
         s.comma(&self.grantees, context)
     }
 }

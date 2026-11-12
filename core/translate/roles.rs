@@ -531,8 +531,8 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT`: the dialect stores the privileges with each relation, through
-/// its relation hooks, as it stores ownership.
+/// `GRANT` and `REVOKE`: the dialect stores the privileges with each
+/// relation, through its relation hooks, as it stores ownership.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
@@ -567,6 +567,7 @@ pub fn translate_grant(
             continue;
         }
         changes.push(crate::RelationChange::Grant {
+            is_grant: grant.is_grant,
             namespace: namespace.id,
             name: normalized_name,
             privileges: grant.privileges.clone(),

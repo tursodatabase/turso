@@ -8099,12 +8099,14 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// A GRANT statement on tables or sequences. The frontend checks that its
-/// relations and roles exist, expands `ALL TABLES IN SCHEMA` and `ALL
-/// SEQUENCES IN SCHEMA`, and hands the engine a GRANT statement that stores
-/// the privileges with each relation.
+/// A GRANT or REVOKE statement on tables or sequences. The frontend checks
+/// that its relations and roles exist, expands `ALL TABLES IN SCHEMA` and
+/// `ALL SEQUENCES IN SCHEMA`, and hands the engine a statement that changes
+/// the privileges stored with each relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgGrantStmt {
+    /// GRANT when true, REVOKE when false.
+    pub is_grant: bool,
     pub privileges: Vec<ast::Privilege>,
     /// `ON SEQUENCE` or `ON ALL SEQUENCES IN SCHEMA` rather than tables.
     pub on_sequences: bool,
@@ -8112,7 +8114,7 @@ pub struct PgGrantStmt {
     pub roles: Vec<PgGrantee>,
 }
 
-/// The relations of a GRANT statement.
+/// The relations of a GRANT or REVOKE statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgGrantTables {
     /// `ON [TABLE] t, s.u`: the names the tables have in the engine, as for
@@ -8123,7 +8125,8 @@ pub enum PgGrantTables {
     AllInSchemas(Vec<String>),
 }
 
-/// A role that a GRANT gives a privilege to.
+/// A role that a GRANT gives a privilege to, or that a REVOKE takes one
+/// from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgGrantee {
     /// `PUBLIC`, every role.
@@ -8148,9 +8151,11 @@ impl PgGrantee {
     }
 }
 
-/// Extracts a GRANT statement on tables or sequences. Only privileges on
-/// whole relations are stored, so column privileges, GRANT on other objects,
-/// and REVOKE are rejected rather than reported as done.
+/// Extracts a GRANT or REVOKE statement on tables or sequences. Only
+/// privileges on whole relations are stored, so column privileges, other
+/// objects and grant options are rejected rather than reported as done.
+/// Without grant options no role can have granted a privilege onwards, so
+/// REVOKE's CASCADE and RESTRICT revoke the same.
 pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStmt>, ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
@@ -8160,17 +8165,15 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
     let Some((NodeRef::GrantStmt(grant), ..)) = nodes.first() else {
         return Ok(None);
     };
-    if !grant.is_grant {
-        return Err(not_supported("REVOKE"));
-    }
+    let command = if grant.is_grant { "GRANT" } else { "REVOKE" };
     let on_sequences = if grant.objtype == ObjectType::ObjectSequence as i32 {
         true
     } else if grant.objtype == ObjectType::ObjectTable as i32 {
         false
     } else {
-        return Err(not_supported(
-            "GRANT on objects other than tables and sequences",
-        ));
+        return Err(not_supported(format!(
+            "{command} on objects other than tables and sequences"
+        )));
     };
     // pg_query gives `ALL [PRIVILEGES]` as no privileges.
     let privileges = if grant.privileges.is_empty() {
@@ -8181,22 +8184,26 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
             .iter()
             .map(|privilege| {
                 let Some(Node::AccessPriv(privilege)) = &privilege.node else {
-                    return Err(ParseError::ParseError(
-                        "GRANT: unexpected privilege node".into(),
-                    ));
+                    return Err(ParseError::ParseError(format!(
+                        "{command}: unexpected privilege node"
+                    )));
                 };
                 if !privilege.cols.is_empty() {
-                    return Err(not_supported("GRANT of column privileges"));
+                    return Err(not_supported(format!("{command} of column privileges")));
                 }
                 relation_privilege(&privilege.priv_name, on_sequences)
             })
             .collect::<Result<_, _>>()?
     };
     if grant.grant_option {
-        return Err(not_supported("GRANT ... WITH GRANT OPTION"));
+        return Err(not_supported(if grant.is_grant {
+            "GRANT ... WITH GRANT OPTION"
+        } else {
+            "REVOKE GRANT OPTION FOR"
+        }));
     }
     if grant.grantor.is_some() {
-        return Err(not_supported("GRANT ... GRANTED BY"));
+        return Err(not_supported(format!("{command} ... GRANTED BY")));
     }
     let tables = match GrantTargetType::try_from(grant.targtype) {
         Ok(GrantTargetType::AclTargetObject) => PgGrantTables::Named(
@@ -8207,9 +8214,9 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
                     Some(Node::RangeVar(table)) => {
                         PostgreSQLTranslator::new().qualified_name_from_range_var(table)
                     }
-                    _ => Err(ParseError::ParseError(
-                        "GRANT: unexpected table node".into(),
-                    )),
+                    _ => Err(ParseError::ParseError(format!(
+                        "{command}: unexpected table node"
+                    ))),
                 })
                 .collect::<Result<_, _>>()?,
         ),
@@ -8219,16 +8226,16 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
                 .iter()
                 .map(|object| match &object.node {
                     Some(Node::String(schema)) => Ok(schema.sval.clone()),
-                    _ => Err(ParseError::ParseError(
-                        "GRANT: unexpected schema node".into(),
-                    )),
+                    _ => Err(ParseError::ParseError(format!(
+                        "{command}: unexpected schema node"
+                    ))),
                 })
                 .collect::<Result<_, _>>()?,
         ),
         _ => {
-            return Err(not_supported(
-                "GRANT on objects other than tables and sequences",
-            ))
+            return Err(not_supported(format!(
+                "{command} on objects other than tables and sequences"
+            )))
         }
     };
     let roles = grant
@@ -8236,7 +8243,9 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
         .iter()
         .map(|grantee| {
             let Some(Node::RoleSpec(role)) = &grantee.node else {
-                return Err(ParseError::ParseError("GRANT: unexpected role node".into()));
+                return Err(ParseError::ParseError(format!(
+                    "{command}: unexpected role node"
+                )));
             };
             match RoleSpecType::try_from(role.roletype) {
                 Ok(RoleSpecType::RolespecPublic) => Ok(PgGrantee::Public),
@@ -8245,11 +8254,14 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
                 }
                 Ok(RoleSpecType::RolespecSessionUser) => Ok(PgGrantee::SessionUser),
                 Ok(RoleSpecType::RolespecCstring) => Ok(PgGrantee::Role(role.rolename.clone())),
-                _ => Err(ParseError::ParseError("GRANT: unknown role kind".into())),
+                _ => Err(ParseError::ParseError(format!(
+                    "{command}: unknown role kind"
+                ))),
             }
         })
         .collect::<Result<_, _>>()?;
     Ok(Some(PgGrantStmt {
+        is_grant: grant.is_grant,
         privileges,
         on_sequences,
         tables,
@@ -13363,6 +13375,7 @@ mod tests {
             )
             .unwrap(),
             Some(PgGrantStmt {
+                is_grant: true,
                 privileges: vec![ast::Privilege::Select],
                 on_sequences: false,
                 tables: PgGrantTables::Named(vec![
@@ -13381,10 +13394,21 @@ mod tests {
         assert_eq!(
             grant("GRANT SELECT ON ALL TABLES IN SCHEMA public, app TO anon").unwrap(),
             Some(PgGrantStmt {
+                is_grant: true,
                 privileges: vec![ast::Privilege::Select],
                 on_sequences: false,
                 tables: PgGrantTables::AllInSchemas(vec!["public".to_string(), "app".to_string()]),
                 roles: vec![PgGrantee::Role("anon".to_string())],
+            })
+        );
+        assert_eq!(
+            grant("REVOKE INSERT ON TABLE t FROM PUBLIC CASCADE").unwrap(),
+            Some(PgGrantStmt {
+                is_grant: false,
+                privileges: vec![ast::Privilege::Insert],
+                on_sequences: false,
+                tables: PgGrantTables::Named(vec![ast::QualifiedName::single(exact_name("t"))]),
+                roles: vec![PgGrantee::Public],
             })
         );
         assert_eq!(grant("SELECT 1").unwrap(), None);
@@ -13460,7 +13484,14 @@ mod tests {
     #[test]
     fn grant_other_than_on_whole_tables_is_not_supported() {
         for (sql, message) in [
-            ("REVOKE SELECT ON t FROM alice", "REVOKE is not supported"),
+            (
+                "REVOKE GRANT OPTION FOR SELECT ON t FROM alice",
+                "REVOKE GRANT OPTION FOR is not supported",
+            ),
+            (
+                "REVOKE SELECT (a) ON t FROM alice",
+                "REVOKE of column privileges is not supported",
+            ),
             (
                 "GRANT SELECT (a) ON t TO alice",
                 "GRANT of column privileges is not supported",

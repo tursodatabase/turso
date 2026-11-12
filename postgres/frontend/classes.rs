@@ -620,8 +620,9 @@ fn read_back_policies(value: &Value) -> turso_core::Result<Vec<RowPolicy>> {
 /// a catalog relation (42501). A sequence a serial column owns changes
 /// owner with its table only, as in PostgreSQL: on its own it fails with
 /// `cannot change owner of sequence` (0A000). `GRANT` adds to the access
-/// control list when the owner or a superuser runs it; anyone else grants
-/// nothing, as in PostgreSQL, which only warns. `ALTER TABLE ... ENABLE ROW
+/// control list and `REVOKE` takes from it when the owner or a superuser
+/// runs them; anyone else changes nothing, as in PostgreSQL, which only
+/// warns. `ALTER TABLE ... ENABLE ROW
 /// LEVEL SECURITY` sets `relrowsecurity` of the table's row, which a catalog
 /// table does not have (42501).
 pub(crate) fn translate_relation_changes(
@@ -800,11 +801,13 @@ pub(crate) fn translate_relation_changes(
                 }
             }
             RelationChange::Grant {
+                is_grant,
                 namespace,
                 name,
                 privileges,
                 grantees,
             } => {
+                let command = if *is_grant { "GRANT" } else { "REVOKE" };
                 let grantees = grantees
                     .iter()
                     .map(|grantee| resolve_grantee(schema, connection, grantee))
@@ -820,7 +823,7 @@ pub(crate) fn translate_relation_changes(
                     if schema.get_btree_table(*namespace, name).is_some() {
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
-                            format!("GRANT on internal table {name} is not supported"),
+                            format!("{command} on internal table {name} is not supported"),
                         ));
                     }
                     continue;
@@ -840,10 +843,10 @@ pub(crate) fn translate_relation_changes(
                     .relacl
                     .clone()
                     .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
-                // Only the owner may grant, and a superuser grants as the
-                // owner. As in PostgreSQL, anyone else is refused when the
-                // list gives it nothing on the relation, and grants nothing
-                // otherwise, for want of a grant option.
+                // Only the owner may grant or revoke, and a superuser does
+                // so as the owner. As in PostgreSQL, anyone else is refused
+                // when the list gives it nothing on the relation, and
+                // changes nothing otherwise, for want of a grant option.
                 let may_grant = connection.current_role_is_superuser()
                     || class.relowner == connection.current_role();
                 if !may_grant {
@@ -854,15 +857,19 @@ pub(crate) fn translate_relation_changes(
                         PermissionDenied::privilege(Action::Read, relation_object(class)),
                     )));
                 }
-                // As in PostgreSQL, a GRANT that gives nothing on the
-                // relation, such as INSERT on a sequence, leaves its list
-                // as it is, even when it has none yet.
-                let granted = Privileges::granted_on(class.relkind, privileges);
-                if granted.is_empty() {
+                // As in PostgreSQL, a GRANT or REVOKE of nothing the
+                // relation has, such as INSERT on a sequence, leaves its
+                // list as it is, even when it has none yet.
+                let changed = Privileges::granted_on(class.relkind, privileges);
+                if changed.is_empty() {
                     continue;
                 }
                 for grantee in &grantees {
-                    acl.grant(*grantee, granted, owner);
+                    if *is_grant {
+                        acl.grant(*grantee, changed, owner);
+                    } else {
+                        acl.revoke(*grantee, changed, owner);
+                    }
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;

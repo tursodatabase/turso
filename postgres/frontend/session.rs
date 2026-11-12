@@ -1845,7 +1845,7 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
     Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
-/// The engine GRANT that stores a GRANT. The engine checks the
+/// The engine statement that stores a GRANT or REVOKE. The engine checks the
 /// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
 /// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
@@ -1896,6 +1896,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
     }
     Ok(vec![DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            is_grant: stmt.is_grant,
             privileges: stmt.privileges.clone(),
             on_sequences: stmt.on_sequences,
             relations,

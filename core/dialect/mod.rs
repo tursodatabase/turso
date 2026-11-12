@@ -64,8 +64,10 @@ pub enum RelationChange {
         name: String,
         owner: NewOwner,
     },
-    /// `GRANT privileges ON relation TO grantees`.
+    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
+    /// relation FROM grantees` when `is_grant` is false.
     Grant {
+        is_grant: bool,
         namespace: NamespaceId,
         name: String,
         privileges: Vec<Privilege>,
@@ -394,8 +396,11 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
                 }
-                RelationChange::Grant { .. } => {
-                    return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                RelationChange::Grant { is_grant, .. } => {
+                    let command = if *is_grant { "GRANT" } else { "REVOKE" };
+                    return Err(LimboError::ParseError(format!(
+                        "{command} is not supported"
+                    )));
                 }
                 RelationChange::SetRowSecurity { .. }
                 | RelationChange::CreatePolicy { .. }
