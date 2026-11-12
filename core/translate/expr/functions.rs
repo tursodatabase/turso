@@ -373,6 +373,16 @@ pub(crate) fn names_mangled_sequence(args: &[Box<ast::Expr>], resolver: &Resolve
     })
 }
 
+/// The namespace and bare name of the sequence that `expr` draws from, when
+/// it is `nextval('name')` of a sequence that exists.
+pub(crate) fn nextval_sequence(
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Option<(crate::namespace::NamespaceRef, String)> {
+    let sequence_name = nextval_sequence_argument(expr)?;
+    crate::translate::sequence::resolve_sequence_name(&sequence_name, resolver)
+}
+
 /// The sequence name written in `nextval('name')`, looking through parentheses.
 pub fn nextval_sequence_argument(expr: &ast::Expr) -> Option<String> {
     if let ast::Expr::Parenthesized(inner) = expr {
