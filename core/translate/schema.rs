@@ -1868,6 +1868,55 @@ pub fn emit_schema_entry(
     root_page_reg: usize,
     sql: Option<String>,
 ) -> Result<()> {
+    let row = emit_schema_row(
+        program,
+        sqlite_schema_cursor_id,
+        entry_type,
+        name,
+        tbl_name,
+        root_page_reg,
+        sql,
+    );
+
+    if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
+        let after_record_reg = if program.capture_data_changes_info().has_after() {
+            Some(row.record_reg)
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::INSERT,
+            cdc_table_cursor_id,
+            row.rowid_reg,
+            None,
+            after_record_reg,
+            None,
+            SQLITE_TABLEID,
+        )?;
+        emit_cdc_autocommit_commit(program, resolver, Some(cdc_table_cursor_id))?;
+    }
+    Ok(())
+}
+
+/// The registers of an inserted `sqlite_schema` row.
+pub(crate) struct SchemaRow {
+    rowid_reg: usize,
+    record_reg: usize,
+}
+
+/// Inserts the `sqlite_schema` row `(entry_type, name, tbl_name, root page,
+/// sql)`. A `root_page_reg` of 0 stores root page 0.
+pub(crate) fn emit_schema_row(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    entry_type: SchemaEntryType,
+    name: &str,
+    tbl_name: &str,
+    root_page_reg: usize,
+    sql: Option<String>,
+) -> SchemaRow {
     let rowid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
         cursor: sqlite_schema_cursor_id,
@@ -1917,26 +1966,79 @@ pub fn emit_schema_entry(
         table_name: tbl_name.to_string(),
     });
 
-    if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
-        let after_record_reg = if program.capture_data_changes_info().has_after() {
-            Some(record_reg)
-        } else {
-            None
-        };
-        emit_cdc_insns(
-            program,
-            resolver,
-            OperationMode::INSERT,
-            cdc_table_cursor_id,
-            rowid_reg,
-            None,
-            after_record_reg,
-            None,
-            SQLITE_TABLEID,
-        )?;
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_table_cursor_id))?;
+    SchemaRow {
+        rowid_reg,
+        record_reg,
     }
-    Ok(())
+}
+
+/// Deletes the `sqlite_schema` rows of type `entry_type` that are named
+/// `name`.
+pub(crate) fn emit_schema_rows_delete(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    entry_type: SchemaEntryType,
+    name: &str,
+) {
+    let name_reg = program.alloc_register();
+    let type_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: name_reg,
+        value: name.to_string(),
+    });
+    program.emit_insn(Insn::String8 {
+        dest: type_reg,
+        value: entry_type.as_str().to_string(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Column 0 is type, column 1 is name.
+    let row_type_reg = program.alloc_register();
+    let row_name_reg = program.alloc_register();
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, row_type_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, row_name_reg);
+
+    let skip_delete_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: row_type_reg,
+        rhs: type_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: row_name_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_delete_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(end_loop_label);
 }
 
 /// Check if an automatic PRIMARY KEY index is required for the table.
