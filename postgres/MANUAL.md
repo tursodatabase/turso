@@ -213,6 +213,7 @@ CREATE ROLE name [ [ WITH ] option [ ... ] ]
 where option can be:
 
       BYPASSRLS | NOBYPASSRLS
+    | INHERIT | NOINHERIT
     | NOLOGIN
 ```
 
@@ -230,6 +231,10 @@ and cannot log in. Roles are listed in the `pg_roles` catalog.
   role with `BYPASSRLS` reads and writes every row of a table with row-level
   security, but still needs privileges on the table. The default is
   `NOBYPASSRLS`.
+- `INHERIT`, `NOINHERIT`: Whether the role uses the privileges of the roles it
+  is a member of without `SET ROLE`. The default is `INHERIT`. Turso stores
+  the value and shows it in `pg_roles.rolinherit`. It has no other effect yet,
+  because a role cannot be made a member of another role.
 - `NOLOGIN`: The role cannot log in. This is the default, and the only choice:
   `LOGIN` is not supported.
 

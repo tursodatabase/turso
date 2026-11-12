@@ -83,6 +83,47 @@ expect error {
     conflicting or redundant options
 }
 
+test create-role-inherits-by-default {
+    CREATE ROLE cr_default_inherit;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'cr_default_inherit' AND rolinherit;
+}
+expect {
+    1
+}
+
+test create-role-with-inherit {
+    CREATE ROLE cr_inherit INHERIT;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'cr_inherit' AND rolinherit;
+}
+expect {
+    1
+}
+
+test create-role-with-noinherit {
+    CREATE ROLE cr_noinherit NOINHERIT;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'cr_noinherit' AND NOT rolinherit;
+}
+expect {
+    1
+}
+
+test create-role-with-nologin-noinherit-and-bypassrls {
+    CREATE ROLE cr_all_options NOLOGIN NOINHERIT BYPASSRLS;
+    SELECT count(*) FROM pg_roles
+    WHERE rolname = 'cr_all_options' AND NOT rolcanlogin AND NOT rolinherit AND rolbypassrls;
+}
+expect {
+    1
+}
+
+test create-role-with-inherit-twice-fails {
+    CREATE ROLE cr_inherit_twice INHERIT NOINHERIT;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
 test create-role-named-postgres-fails {
     CREATE ROLE postgres;
 }

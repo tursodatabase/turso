@@ -996,6 +996,7 @@ pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> 
         id: RoleId::SUPERUSER,
         name: BOOTSTRAP_SUPERUSER_NAME.to_string(),
         superuser: true,
+        inherit: true,
         bypassrls: true,
     };
     std::iter::once(superuser).chain(roles.iter().cloned())
@@ -1057,7 +1058,7 @@ fn role_row(role: &Role) -> Vec<Value> {
         Value::from_i64(role_oid(role.id)),     // oid
         Value::build_text(role.name.clone()),   // rolname
         superuser.clone(),                      // rolsuper
-        Value::from_i64(1),                     // rolinherit
+        Value::from_i64(role.inherit as i64),   // rolinherit
         superuser.clone(),                      // rolcreaterole
         superuser.clone(),                      // rolcreatedb
         Value::from_i64(can_login as i64),      // rolcanlogin
