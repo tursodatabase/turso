@@ -1,0 +1,633 @@
+# What a role may write to a table with row-level security, through the
+# PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, so every test uses its own
+# role and table names.
+
+@database :memory:
+
+test role-cannot-insert-rows {
+    CREATE ROLE ra_role_56;
+    CREATE TABLE ra_docs_56 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_56 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_56 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_56 TO ra_role_56;
+    SET ROLE ra_role_56;
+    INSERT INTO ra_docs_56 VALUES (9, 'mallory', 'x');
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ra_docs_56
+}
+
+test role-cannot-update-rows {
+    CREATE ROLE ra_role_57;
+    CREATE TABLE ra_docs_57 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_57 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_57 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_57 TO ra_role_57;
+    SET ROLE ra_role_57;
+    UPDATE ra_docs_57 SET title = 'x' WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ra_docs_57
+}
+
+test role-cannot-delete-rows {
+    CREATE ROLE ra_role_58;
+    CREATE TABLE ra_docs_58 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_58 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_58 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_58 TO ra_role_58;
+    SET ROLE ra_role_58;
+    DELETE FROM ra_docs_58 WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ra_docs_58
+}
+
+# Writes by roles. As in PostgreSQL, the USING conditions of the policies of
+# UPDATE and DELETE limit the rows those change, and a new row that INSERT
+# or UPDATE writes must pass the policies' WITH CHECK conditions, or the
+# statement fails. A write that reads the table's columns is limited by the
+# SELECT policies too.
+
+test insert-checks-the-with-check-of-insert-policies {
+    CREATE ROLE rw_alice_1;
+    CREATE TABLE rw_docs_1 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_1 FOR INSERT WITH CHECK (owner = current_user);
+    GRANT INSERT ON rw_docs_1 TO rw_alice_1;
+    SET ROLE rw_alice_1;
+    INSERT INTO rw_docs_1 VALUES (1, 'rw_alice_1');
+    RESET ROLE;
+    SELECT id, owner FROM rw_docs_1;
+}
+expect {
+    1|rw_alice_1
+}
+
+test insert-of-a-row-that-fails-with-check-fails {
+    CREATE ROLE rw_alice_2;
+    CREATE TABLE rw_docs_2 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_2 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_2 FOR INSERT WITH CHECK (owner = current_user);
+    GRANT INSERT ON rw_docs_2 TO rw_alice_2;
+    SET ROLE rw_alice_2;
+    INSERT INTO rw_docs_2 VALUES (1, 'someone else');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_2"
+}
+
+test insert-without-an-insert-policy-fails {
+    CREATE ROLE rw_alice_3;
+    CREATE TABLE rw_docs_3 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_3 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY read ON rw_docs_3 FOR SELECT USING (true);
+    GRANT INSERT ON rw_docs_3 TO rw_alice_3;
+    SET ROLE rw_alice_3;
+    INSERT INTO rw_docs_3 VALUES (1, 'rw_alice_3');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_3"
+}
+
+test insert-checks-using-of-a-policy-for-all-without-with-check {
+    CREATE ROLE rw_alice_4;
+    CREATE TABLE rw_docs_4 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_4 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_4 USING (owner = current_user);
+    GRANT INSERT ON rw_docs_4 TO rw_alice_4;
+    SET ROLE rw_alice_4;
+    INSERT INTO rw_docs_4 VALUES (1, 'someone else');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_4"
+}
+
+test insert-of-a-row-that-fails-a-restrictive-policy-names-it {
+    CREATE ROLE rw_alice_5;
+    CREATE TABLE rw_docs_5 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_5 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_5 FOR INSERT WITH CHECK (true);
+    CREATE POLICY positive_ids ON rw_docs_5 AS RESTRICTIVE FOR INSERT WITH CHECK (id > 0);
+    GRANT INSERT ON rw_docs_5 TO rw_alice_5;
+    SET ROLE rw_alice_5;
+    INSERT INTO rw_docs_5 VALUES (1, 'a');
+    INSERT INTO rw_docs_5 VALUES (-1, 'b');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy "positive_ids" for table "rw_docs_5"
+}
+
+# A row that fails several restrictive policies names the first of them by
+# name, not the first that was created, as in PostgreSQL.
+test insert-of-a-row-that-fails-several-restrictive-policies-names-the-first-by-name {
+    CREATE ROLE rw_alice_31;
+    CREATE TABLE rw_docs_31 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_31 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_31 FOR INSERT WITH CHECK (true);
+    CREATE POLICY small_ids ON rw_docs_31 AS RESTRICTIVE FOR INSERT WITH CHECK (id < 100);
+    CREATE POLICY even_ids ON rw_docs_31 AS RESTRICTIVE FOR INSERT WITH CHECK (id % 2 = 0);
+    GRANT INSERT ON rw_docs_31 TO rw_alice_31;
+    SET ROLE rw_alice_31;
+    INSERT INTO rw_docs_31 VALUES (501, 'a');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy "even_ids" for table "rw_docs_31"
+}
+
+test insert-of-a-row-whose-check-is-null-fails {
+    CREATE ROLE rw_alice_6;
+    CREATE TABLE rw_docs_6 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_6 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_6 FOR INSERT WITH CHECK (owner = current_user);
+    GRANT INSERT ON rw_docs_6 TO rw_alice_6;
+    SET ROLE rw_alice_6;
+    INSERT INTO rw_docs_6 VALUES (1, NULL);
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_6"
+}
+
+test insert-of-several-rows-fails-as-a-whole {
+    CREATE ROLE rw_alice_7;
+    CREATE TABLE rw_docs_7 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_7 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_7 FOR INSERT WITH CHECK (owner = current_user);
+    GRANT INSERT ON rw_docs_7 TO rw_alice_7;
+    SET ROLE rw_alice_7;
+    INSERT INTO rw_docs_7 SELECT g, CASE WHEN g = 3 THEN 'x' ELSE 'rw_alice_7' END
+        FROM generate_series(1, 5) AS g;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_7"
+}
+
+test insert-returning-checks-the-new-row-against-select-policies {
+    CREATE ROLE rw_alice_9;
+    CREATE TABLE rw_docs_9 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_9 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_9 FOR INSERT WITH CHECK (true);
+    CREATE POLICY own ON rw_docs_9 FOR SELECT USING (owner = current_user);
+    GRANT SELECT, INSERT ON rw_docs_9 TO rw_alice_9;
+    SET ROLE rw_alice_9;
+    INSERT INTO rw_docs_9 VALUES (1, 'someone else');
+    INSERT INTO rw_docs_9 VALUES (2, 'rw_alice_9') RETURNING id;
+    INSERT INTO rw_docs_9 VALUES (3, 'someone else') RETURNING id;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_9"
+}
+
+test update-changes-only-the-rows-update-policies-allow {
+    CREATE ROLE rw_alice_10;
+    CREATE TABLE rw_docs_10 (id INT PRIMARY KEY, owner TEXT, body TEXT);
+    INSERT INTO rw_docs_10 VALUES (1, 'rw_alice_10', 'a'), (2, 'someone else', 'b'), (3, 'rw_alice_10', 'c');
+    ALTER TABLE rw_docs_10 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_10 FOR UPDATE USING (owner = current_user);
+    GRANT UPDATE ON rw_docs_10 TO rw_alice_10;
+    SET ROLE rw_alice_10;
+    UPDATE rw_docs_10 SET body = 'x';
+    RESET ROLE;
+    SELECT id, body FROM rw_docs_10 ORDER BY id;
+}
+expect {
+    1|x
+    2|b
+    3|x
+}
+
+test update-without-an-update-policy-changes-nothing {
+    CREATE ROLE rw_alice_11;
+    CREATE TABLE rw_docs_11 (id INT PRIMARY KEY, body TEXT);
+    INSERT INTO rw_docs_11 VALUES (1, 'a');
+    ALTER TABLE rw_docs_11 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY read ON rw_docs_11 FOR SELECT USING (true);
+    GRANT UPDATE ON rw_docs_11 TO rw_alice_11;
+    SET ROLE rw_alice_11;
+    UPDATE rw_docs_11 SET body = 'x';
+    RESET ROLE;
+    SELECT body FROM rw_docs_11;
+}
+expect {
+    a
+}
+
+test update-of-a-row-into-one-that-fails-with-check-fails {
+    CREATE ROLE rw_alice_12;
+    CREATE TABLE rw_docs_12 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_12 VALUES (1, 'rw_alice_12');
+    ALTER TABLE rw_docs_12 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_12 FOR UPDATE USING (owner = current_user)
+        WITH CHECK (owner = current_user);
+    GRANT UPDATE ON rw_docs_12 TO rw_alice_12;
+    SET ROLE rw_alice_12;
+    UPDATE rw_docs_12 SET owner = 'someone else';
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_12"
+}
+
+test update-checks-the-new-row-against-using-without-with-check {
+    CREATE ROLE rw_alice_13;
+    CREATE TABLE rw_docs_13 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_13 VALUES (1, 'rw_alice_13');
+    ALTER TABLE rw_docs_13 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_13 FOR UPDATE USING (owner = current_user);
+    GRANT UPDATE ON rw_docs_13 TO rw_alice_13;
+    SET ROLE rw_alice_13;
+    UPDATE rw_docs_13 SET owner = 'someone else';
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_13"
+}
+
+test update-that-reads-columns-is-limited-by-select-policies-too {
+    CREATE ROLE rw_alice_14;
+    CREATE TABLE rw_docs_14 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rw_docs_14 VALUES (1, 'rw_alice_14', 0), (2, 'someone else', 0);
+    ALTER TABLE rw_docs_14 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_14 FOR UPDATE USING (true);
+    CREATE POLICY own ON rw_docs_14 FOR SELECT USING (owner = current_user);
+    GRANT SELECT, UPDATE ON rw_docs_14 TO rw_alice_14;
+    SET ROLE rw_alice_14;
+    UPDATE rw_docs_14 SET n = 1;
+    UPDATE rw_docs_14 SET n = 2 WHERE id > 0;
+    RESET ROLE;
+    SELECT id, n FROM rw_docs_14 ORDER BY id;
+}
+expect {
+    1|2
+    2|1
+}
+
+test update-returning-checks-the-new-row-against-select-policies {
+    CREATE ROLE rw_alice_15;
+    CREATE TABLE rw_docs_15 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_15 VALUES (1, 'rw_alice_15');
+    ALTER TABLE rw_docs_15 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_15 FOR UPDATE USING (true) WITH CHECK (true);
+    CREATE POLICY own ON rw_docs_15 FOR SELECT USING (owner = current_user);
+    GRANT SELECT, UPDATE ON rw_docs_15 TO rw_alice_15;
+    SET ROLE rw_alice_15;
+    UPDATE rw_docs_15 SET owner = 'someone else' RETURNING id;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_15"
+}
+
+test update-returning-shows-the-updated-rows {
+    CREATE ROLE rw_alice_16;
+    CREATE TABLE rw_docs_16 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rw_docs_16 VALUES (1, 'rw_alice_16', 1), (2, 'someone else', 2);
+    ALTER TABLE rw_docs_16 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_16 USING (owner = current_user);
+    GRANT SELECT, UPDATE ON rw_docs_16 TO rw_alice_16;
+    SET ROLE rw_alice_16;
+    UPDATE rw_docs_16 SET n = n + 10 RETURNING id, n;
+}
+expect {
+    1|11
+}
+
+test delete-removes-only-the-rows-delete-policies-allow {
+    CREATE ROLE rw_alice_17;
+    CREATE TABLE rw_docs_17 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_17 VALUES (1, 'rw_alice_17'), (2, 'someone else'), (3, 'rw_alice_17');
+    ALTER TABLE rw_docs_17 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_17 FOR DELETE USING (owner = current_user);
+    GRANT DELETE ON rw_docs_17 TO rw_alice_17;
+    SET ROLE rw_alice_17;
+    DELETE FROM rw_docs_17;
+    RESET ROLE;
+    SELECT id FROM rw_docs_17;
+}
+expect {
+    2
+}
+
+test delete-that-reads-columns-is-limited-by-select-policies-too {
+    CREATE ROLE rw_alice_18;
+    CREATE TABLE rw_docs_18 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_18 VALUES (1, 'rw_alice_18'), (2, 'someone else');
+    ALTER TABLE rw_docs_18 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_18 FOR DELETE USING (true);
+    CREATE POLICY own ON rw_docs_18 FOR SELECT USING (owner = current_user);
+    GRANT SELECT, DELETE ON rw_docs_18 TO rw_alice_18;
+    SET ROLE rw_alice_18;
+    DELETE FROM rw_docs_18 WHERE id > 0 RETURNING id;
+}
+expect {
+    1
+}
+
+# As in PostgreSQL, TRUNCATE is not subject to row-level security.
+test truncate-empties-the-table-whatever-its-policies {
+    CREATE ROLE rw_truncater;
+    CREATE TABLE rw_truncated (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_truncated VALUES (1, 'rw_truncater'), (2, 'someone else');
+    ALTER TABLE rw_truncated ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_truncated FOR DELETE USING (owner = current_user);
+    GRANT TRUNCATE ON rw_truncated TO rw_truncater;
+    SET ROLE rw_truncater;
+    TRUNCATE rw_truncated;
+    RESET ROLE;
+    SELECT count(*) FROM rw_truncated;
+}
+expect {
+    0
+}
+
+# A subquery that does not read the written table does not make the
+# statement read its columns, so the SELECT policies do not apply, as in
+# PostgreSQL. A subquery that reads them does.
+test update-with-a-subquery-that-does-not-read-the-table-ignores-select-policies {
+    CREATE ROLE rw_sub_1;
+    CREATE TABLE rw_sub_docs_1 (id INT PRIMARY KEY, owner TEXT, n INT);
+    CREATE TABLE rw_sub_limits_1 (x INT);
+    INSERT INTO rw_sub_docs_1 VALUES (1, 'rw_sub_1', 0), (2, 'someone else', 0);
+    INSERT INTO rw_sub_limits_1 VALUES (5);
+    ALTER TABLE rw_sub_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_sub_docs_1 FOR ALL USING (true);
+    CREATE POLICY own ON rw_sub_docs_1 AS RESTRICTIVE FOR SELECT USING (owner = current_user);
+    GRANT UPDATE ON rw_sub_docs_1 TO rw_sub_1;
+    GRANT SELECT ON rw_sub_limits_1 TO rw_sub_1;
+    SET ROLE rw_sub_1;
+    UPDATE rw_sub_docs_1 SET n = (SELECT max(x) FROM rw_sub_limits_1);
+    RESET ROLE;
+    SELECT id, n FROM rw_sub_docs_1 ORDER BY id;
+}
+expect {
+    1|5
+    2|5
+}
+
+test update-with-a-subquery-that-reads-the-table-is-limited-by-select-policies {
+    CREATE ROLE rw_sub_2;
+    CREATE TABLE rw_sub_docs_2 (id INT PRIMARY KEY, owner TEXT, n INT);
+    CREATE TABLE rw_sub_limits_2 (x INT);
+    INSERT INTO rw_sub_docs_2 VALUES (1, 'rw_sub_2', 0), (2, 'someone else', 0);
+    INSERT INTO rw_sub_limits_2 VALUES (5);
+    ALTER TABLE rw_sub_docs_2 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_sub_docs_2 FOR ALL USING (true);
+    CREATE POLICY own ON rw_sub_docs_2 AS RESTRICTIVE FOR SELECT USING (owner = current_user);
+    GRANT SELECT, UPDATE ON rw_sub_docs_2 TO rw_sub_2;
+    GRANT SELECT ON rw_sub_limits_2 TO rw_sub_2;
+    SET ROLE rw_sub_2;
+    UPDATE rw_sub_docs_2 SET n = (SELECT max(x) FROM rw_sub_limits_2 WHERE x > rw_sub_docs_2.id);
+    RESET ROLE;
+    SELECT id, n FROM rw_sub_docs_2 ORDER BY id;
+}
+expect {
+    1|5
+    2|0
+}
+
+test delete-with-a-subquery-that-does-not-read-the-table-ignores-select-policies {
+    CREATE ROLE rw_sub_3;
+    CREATE TABLE rw_sub_docs_3 (id INT PRIMARY KEY, owner TEXT, n INT);
+    CREATE TABLE rw_sub_limits_3 (x INT);
+    INSERT INTO rw_sub_docs_3 VALUES (1, 'rw_sub_3', 0), (2, 'someone else', 0);
+    INSERT INTO rw_sub_limits_3 VALUES (5);
+    ALTER TABLE rw_sub_docs_3 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_sub_docs_3 FOR ALL USING (true);
+    CREATE POLICY own ON rw_sub_docs_3 AS RESTRICTIVE FOR SELECT USING (owner = current_user);
+    GRANT DELETE ON rw_sub_docs_3 TO rw_sub_3;
+    GRANT SELECT ON rw_sub_limits_3 TO rw_sub_3;
+    SET ROLE rw_sub_3;
+    DELETE FROM rw_sub_docs_3 WHERE EXISTS (SELECT 1 FROM rw_sub_limits_3);
+    RESET ROLE;
+    SELECT id, n FROM rw_sub_docs_3 ORDER BY id;
+}
+expect {
+}
+
+test delete-with-a-subquery-that-reads-the-table-is-limited-by-select-policies {
+    CREATE ROLE rw_sub_4;
+    CREATE TABLE rw_sub_docs_4 (id INT PRIMARY KEY, owner TEXT, n INT);
+    CREATE TABLE rw_sub_limits_4 (x INT);
+    INSERT INTO rw_sub_docs_4 VALUES (1, 'rw_sub_4', 0), (2, 'someone else', 0);
+    INSERT INTO rw_sub_limits_4 VALUES (5);
+    ALTER TABLE rw_sub_docs_4 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_sub_docs_4 FOR ALL USING (true);
+    CREATE POLICY own ON rw_sub_docs_4 AS RESTRICTIVE FOR SELECT USING (owner = current_user);
+    GRANT SELECT, DELETE ON rw_sub_docs_4 TO rw_sub_4;
+    GRANT SELECT ON rw_sub_limits_4 TO rw_sub_4;
+    SET ROLE rw_sub_4;
+    DELETE FROM rw_sub_docs_4 WHERE EXISTS (SELECT 1 FROM rw_sub_limits_4 WHERE x > rw_sub_docs_4.id);
+    RESET ROLE;
+    SELECT id, n FROM rw_sub_docs_4 ORDER BY id;
+}
+expect {
+    2|0
+}
+
+test delete-without-a-delete-policy-removes-nothing {
+    CREATE ROLE rw_alice_19;
+    CREATE TABLE rw_docs_19 (id INT PRIMARY KEY);
+    INSERT INTO rw_docs_19 VALUES (1);
+    ALTER TABLE rw_docs_19 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY read ON rw_docs_19 FOR SELECT USING (true);
+    GRANT DELETE ON rw_docs_19 TO rw_alice_19;
+    SET ROLE rw_alice_19;
+    DELETE FROM rw_docs_19;
+    RESET ROLE;
+    SELECT id FROM rw_docs_19;
+}
+expect {
+    1
+}
+
+test policy-with-a-subquery-of-a-function-checks-new-rows {
+    CREATE ROLE rw_alice_21;
+    CREATE TABLE rw_docs_21 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_21 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_21 USING (owner = (SELECT current_user));
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_21 TO rw_alice_21;
+    SET ROLE rw_alice_21;
+    INSERT INTO rw_docs_21 VALUES (1, 'rw_alice_21'), (2, 'rw_alice_21');
+    UPDATE rw_docs_21 SET id = id + 10 WHERE id = 2;
+    SELECT id FROM rw_docs_21 ORDER BY id;
+}
+expect {
+    1
+    12
+}
+
+# A subquery of a WITH CHECK condition that reads no column of the row is
+# computed once per statement too, not once per row the statement writes, so
+# an INSERT of five rows takes one value from the sequence.
+test scalar-subquery-of-with-check-is-computed-once-for-an-insert-of-several-rows {
+    CREATE ROLE rw_alice_30;
+    CREATE SEQUENCE rw_seq_30;
+    CREATE TABLE rw_docs_30 (id INT PRIMARY KEY);
+    ALTER TABLE rw_docs_30 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY counted ON rw_docs_30 FOR INSERT WITH CHECK ((SELECT nextval('rw_seq_30')) > 0);
+    GRANT INSERT ON rw_docs_30 TO rw_alice_30;
+    GRANT USAGE ON SEQUENCE rw_seq_30 TO rw_alice_30;
+    SET ROLE rw_alice_30;
+    INSERT INTO rw_docs_30 VALUES (1), (2), (3), (4), (5);
+    RESET ROLE;
+    SELECT nextval('rw_seq_30');
+}
+expect {
+    2
+}
+
+# INSERT ... ON CONFLICT DO UPDATE checks the row that conflicts against the
+# USING conditions of the UPDATE and SELECT policies, and fails instead of
+# skipping it, and checks the row the update writes like an UPDATE does.
+
+test insert-on-conflict-do-update-updates-a-row-the-role-may-update {
+    CREATE ROLE rw_alice_22;
+    CREATE TABLE rw_docs_22 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rw_docs_22 VALUES (1, 'rw_alice_22', 1);
+    ALTER TABLE rw_docs_22 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_22 USING (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_22 TO rw_alice_22;
+    SET ROLE rw_alice_22;
+    INSERT INTO rw_docs_22 VALUES (1, 'rw_alice_22', 10), (2, 'rw_alice_22', 20)
+        ON CONFLICT (id) DO UPDATE SET n = rw_docs_22.n + excluded.n;
+    SELECT id, n FROM rw_docs_22 ORDER BY id;
+}
+expect {
+    1|11
+    2|20
+}
+
+test insert-on-conflict-do-update-of-a-row-update-policies-hide-fails {
+    CREATE ROLE rw_alice_23;
+    CREATE TABLE rw_docs_23 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rw_docs_23 VALUES (1, 'someone else', 1);
+    ALTER TABLE rw_docs_23 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_23 FOR INSERT WITH CHECK (true);
+    CREATE POLICY read ON rw_docs_23 FOR SELECT USING (true);
+    CREATE POLICY own ON rw_docs_23 FOR UPDATE USING (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_23 TO rw_alice_23;
+    SET ROLE rw_alice_23;
+    INSERT INTO rw_docs_23 VALUES (1, 'rw_alice_23', 10)
+        ON CONFLICT (id) DO UPDATE SET n = excluded.n;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy \(USING expression\) for table "rw_docs_23"
+}
+
+test insert-on-conflict-do-update-of-a-row-select-policies-hide-fails {
+    CREATE ROLE rw_alice_24;
+    CREATE TABLE rw_docs_24 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rw_docs_24 VALUES (1, 'someone else', 1);
+    ALTER TABLE rw_docs_24 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_24 FOR INSERT WITH CHECK (true);
+    CREATE POLICY own ON rw_docs_24 FOR SELECT USING (owner = current_user OR owner IS NULL);
+    CREATE POLICY change ON rw_docs_24 FOR UPDATE USING (true);
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_24 TO rw_alice_24;
+    SET ROLE rw_alice_24;
+    INSERT INTO rw_docs_24 VALUES (1, NULL, 10)
+        ON CONFLICT (id) DO UPDATE SET n = excluded.n;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy \(USING expression\) for table "rw_docs_24"
+}
+
+test insert-on-conflict-do-update-of-a-row-a-restrictive-policy-hides-names-it {
+    CREATE ROLE rw_alice_25;
+    CREATE TABLE rw_docs_25 (id INT PRIMARY KEY, owner TEXT, locked BOOLEAN);
+    INSERT INTO rw_docs_25 VALUES (1, 'rw_alice_25', true);
+    ALTER TABLE rw_docs_25 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_25 USING (owner = current_user);
+    CREATE POLICY unlocked ON rw_docs_25 AS RESTRICTIVE FOR UPDATE USING (NOT locked);
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_25 TO rw_alice_25;
+    SET ROLE rw_alice_25;
+    INSERT INTO rw_docs_25 VALUES (1, 'rw_alice_25', false)
+        ON CONFLICT (id) DO UPDATE SET locked = excluded.locked;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy "unlocked" \(USING expression\) for table "rw_docs_25"
+}
+
+test insert-on-conflict-do-update-checks-the-updated-row {
+    CREATE ROLE rw_alice_26;
+    CREATE TABLE rw_docs_26 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_26 VALUES (1, 'rw_alice_26');
+    ALTER TABLE rw_docs_26 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY read ON rw_docs_26 FOR SELECT USING (true);
+    CREATE POLICY anything ON rw_docs_26 FOR INSERT WITH CHECK (true);
+    CREATE POLICY own ON rw_docs_26 FOR UPDATE USING (owner = current_user)
+        WITH CHECK (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_26 TO rw_alice_26;
+    SET ROLE rw_alice_26;
+    INSERT INTO rw_docs_26 VALUES (1, 'rw_alice_26')
+        ON CONFLICT (id) DO UPDATE SET owner = 'someone else';
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_26"
+}
+
+test insert-on-conflict-do-update-with-where-skips-the-row-before-checking-it {
+    CREATE ROLE rw_alice_27;
+    CREATE TABLE rw_docs_27 (id INT PRIMARY KEY, owner TEXT, n INT);
+    INSERT INTO rw_docs_27 VALUES (1, 'someone else', 1);
+    ALTER TABLE rw_docs_27 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY read ON rw_docs_27 FOR SELECT USING (true);
+    CREATE POLICY anything ON rw_docs_27 FOR INSERT WITH CHECK (true);
+    CREATE POLICY own ON rw_docs_27 FOR UPDATE USING (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE ON rw_docs_27 TO rw_alice_27;
+    SET ROLE rw_alice_27;
+    INSERT INTO rw_docs_27 VALUES (1, 'rw_alice_27', 10)
+        ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE rw_docs_27.n > 5;
+    SELECT id, owner, n FROM rw_docs_27;
+}
+expect {
+    1|someone else|1
+}
+
+test insert-on-conflict-do-nothing-skips-a-row-the-policies-hide {
+    CREATE ROLE rw_alice_28;
+    CREATE TABLE rw_docs_28 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_28 VALUES (1, 'someone else');
+    ALTER TABLE rw_docs_28 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_28 USING (owner = current_user);
+    GRANT SELECT, INSERT ON rw_docs_28 TO rw_alice_28;
+    SET ROLE rw_alice_28;
+    INSERT INTO rw_docs_28 VALUES (1, 'rw_alice_28'), (2, 'rw_alice_28')
+        ON CONFLICT (id) DO NOTHING;
+    RESET ROLE;
+    SELECT id, owner FROM rw_docs_28 ORDER BY id;
+}
+expect {
+    1|someone else
+    2|rw_alice_28
+}
+
+test insert-on-conflict-checks-the-proposed-row-even-when-it-conflicts {
+    CREATE ROLE rw_alice_29;
+    CREATE TABLE rw_docs_29 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_29 VALUES (1, 'rw_alice_29');
+    ALTER TABLE rw_docs_29 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rw_docs_29 USING (owner = current_user);
+    GRANT SELECT, INSERT ON rw_docs_29 TO rw_alice_29;
+    SET ROLE rw_alice_29;
+    INSERT INTO rw_docs_29 VALUES (1, 'someone else') ON CONFLICT (id) DO NOTHING;
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rw_docs_29"
+}

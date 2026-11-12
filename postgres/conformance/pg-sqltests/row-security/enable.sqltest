@@ -138,3 +138,74 @@ test enable-on-a-view-is-rejected {
 expect error {
     "rls_view" is not a table
 }
+
+test grant-before-enabling-row-security {
+    CREATE ROLE ra_role_48;
+    CREATE TABLE ra_docs_48 (id INT);
+    INSERT INTO ra_docs_48 VALUES (1);
+    GRANT SELECT ON ra_docs_48 TO ra_role_48;
+    ALTER TABLE ra_docs_48 ENABLE ROW LEVEL SECURITY;
+    SET ROLE ra_role_48;
+    SELECT count(*) FROM ra_docs_48;
+}
+expect {
+    0
+}
+
+test disabling-row-security-shows-the-rows-to-the-role {
+    CREATE ROLE ra_role_49;
+    CREATE TABLE ra_docs_49 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_49 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_49 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_49 TO ra_role_49;
+    ALTER TABLE ra_docs_49 DISABLE ROW LEVEL SECURITY;
+    SET ROLE ra_role_49;
+    SELECT count(*) FROM ra_docs_49;
+}
+expect {
+    3
+}
+
+test enabling-row-security-hides-the-rows-in-the-same-transaction {
+    CREATE ROLE ra_role_50;
+    CREATE TABLE ra_docs_50 (id INT);
+    INSERT INTO ra_docs_50 VALUES (1), (2);
+    GRANT SELECT ON ra_docs_50 TO ra_role_50;
+    BEGIN;
+    ALTER TABLE ra_docs_50 ENABLE ROW LEVEL SECURITY;
+    SET LOCAL ROLE ra_role_50;
+    SELECT count(*) FROM ra_docs_50;
+    ROLLBACK;
+    SET ROLE ra_role_50;
+    SELECT count(*) FROM ra_docs_50;
+}
+expect {
+    0
+    2
+}
+
+test rows-inserted-after-enabling-are-hidden-too {
+    CREATE ROLE ra_role_51;
+    CREATE TABLE ra_docs_51 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_51 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_51 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_51 TO ra_role_51;
+    INSERT INTO ra_docs_51 VALUES (4, 'carol', 'd');
+    SELECT count(*) FROM ra_docs_51;
+    SET ROLE ra_role_51;
+    SELECT count(*) FROM ra_docs_51;
+}
+expect {
+    4
+    0
+}
+
+test role-that-does-not-own-the-table-cannot-enable-row-security {
+    CREATE ROLE rp_alice_17;
+    CREATE TABLE rp_docs_17 (id INT PRIMARY KEY);
+    SET ROLE rp_alice_17;
+    ALTER TABLE rp_docs_17 ENABLE ROW LEVEL SECURITY;
+}
+expect error {
+    must be owner of table rp_docs_17
+}
