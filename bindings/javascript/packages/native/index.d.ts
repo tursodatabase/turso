@@ -162,7 +162,7 @@ export declare class Statement {
 
 /**
  * Most of the options are aligned with better-sqlite API
- * (see <https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options>)
+ * (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
  */
 export interface DatabaseOpts {
   readonly?: boolean
