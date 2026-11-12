@@ -3745,6 +3745,15 @@ pub fn halt(
     // control of this batch.
     return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
 
+    // The program has no more rows to produce, so it is done with its cursors.
+    // A pragma virtual table cursor owns a nested helper statement whose guard
+    // keeps `Connection::is_nested_stmt()` true until the cursor is dropped.
+    // Inside an explicit transaction nothing below drops it (`commit_txn` does,
+    // but it does not run here), so a statement kept alive by the caller after
+    // it finished would make the next statement on the connection skip its own
+    // transaction upgrade and panic in SetCookie (issue #11276).
+    state.close_virtual_table_cursors();
+
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
