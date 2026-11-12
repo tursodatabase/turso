@@ -1088,6 +1088,8 @@ pub enum ScalarFunc {
     NextVal,
     CurrVal,
     SetVal,
+    /// The array `{value, is_called}` of a sequence's current state.
+    SequenceState,
 }
 
 impl Deterministic for ScalarFunc {
@@ -1208,7 +1210,10 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::UnionValueFunc
             | ScalarFunc::UnionTagFunc
             | ScalarFunc::UnionExtractFunc => true,
-            ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
+            ScalarFunc::NextVal
+            | ScalarFunc::CurrVal
+            | ScalarFunc::SetVal
+            | ScalarFunc::SequenceState => false,
         }
     }
 }
@@ -1336,7 +1341,8 @@ impl ScalarFunc {
             | Self::ArrayCat
             | Self::ArrayRemove
             | Self::ArraySlice
-            | Self::StringToArray => ResultType::Declared(ReturnType::Array),
+            | Self::StringToArray
+            | Self::SequenceState => ResultType::Declared(ReturnType::Array),
         }
     }
 
@@ -1475,6 +1481,7 @@ impl Display for ScalarFunc {
             Self::NextVal => "nextval",
             Self::CurrVal => "currval",
             Self::SetVal => "setval",
+            Self::SequenceState => "sequence_state_experimental",
         };
         write!(f, "{str}")
     }
@@ -1627,7 +1634,7 @@ impl ScalarFunc {
             Self::UnionTagFunc => &[1],      // union_tag(col)
             Self::UnionExtractFunc => &[2],  // union_extract(col, 'tag')
             // Sequence functions
-            Self::NextVal | Self::CurrVal => &[1],
+            Self::NextVal | Self::CurrVal | Self::SequenceState => &[1],
             Self::SetVal => &[2, 3],
         }
     }

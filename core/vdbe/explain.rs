@@ -2062,6 +2062,7 @@ pub fn insn_to_row(
                 db,
                 path_kind_reg,
                 saved_outer_reg,
+                read_only: _,
             } => (
                 "SequenceBeginInnerTx",
                 *db as i64,

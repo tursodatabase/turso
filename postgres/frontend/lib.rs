@@ -7,14 +7,17 @@ mod error;
 mod functions;
 mod options;
 mod policies;
+mod sequence_data;
 mod session;
 mod settings;
 mod statement;
+mod table_function;
 mod unnest;
 
 pub use catalog::PostgresDialect;
 pub use copy::CopyTextEncoder;
 pub use error::{Error, ErrorReport, Result};
+pub use functions::SERVER_VERSION;
 pub use session::PgConnection as Connection;
 pub use session::{
     open_database, open_database_with_io, split_statements, PgConnection, PgQueryRunner,

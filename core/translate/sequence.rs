@@ -224,6 +224,7 @@ pub fn emit_disk_read_nextval(
         db: database_id,
         path_kind_reg,
         saved_outer_reg,
+        read_only: false,
     });
 
     program.emit_insn(Insn::OpenWrite {
@@ -425,6 +426,109 @@ pub fn emit_disk_read_nextval(
     Ok(())
 }
 
+/// Emit bytecode that reads the sequence's watermark row into the array
+/// `{value, is_called}` in `target_register`, or `{start, 0}` for a
+/// sequence that has no row yet. The read runs in the autonomous inner
+/// transaction that nextval wraps its read-modify-write in, so it sees
+/// each value nextval has handed out, also when the caller's snapshot is
+/// older than that nextval.
+pub fn emit_sequence_state_read(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    seq_name: &str,
+    seq: &Sequence,
+    target_register: usize,
+) -> Result<()> {
+    let database_id = namespace.database_id;
+    let backing_table_name =
+        sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name));
+    let backing_table = resolver
+        .with_schema(database_id, |s| {
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+        })
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing backing table for sequence \"{seq_name}\""
+            ))
+        })?;
+    let root_page = backing_table.root_page;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
+
+    let path_kind_reg = program.alloc_register();
+    let saved_outer_reg = program.alloc_register();
+    let status_reg = program.alloc_register();
+    let state_reg = program.alloc_registers(2);
+
+    let retry_top_label = program.allocate_label();
+    program.preassign_label_to_next_insn(retry_top_label);
+    program.emit_insn(Insn::SequenceBeginInnerTx {
+        db: database_id,
+        path_kind_reg,
+        saved_outer_reg,
+        read_only: true,
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page,
+        db: database_id,
+    });
+
+    let empty_label = program.allocate_label();
+    let have_row_label = program.allocate_label();
+    if seq.increment_by >= 0 {
+        program.emit_insn(Insn::Last {
+            cursor_id,
+            pc_if_empty: empty_label,
+        });
+    } else {
+        program.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: empty_label,
+        });
+    }
+    program.emit_column_or_rowid(cursor_id, 0, state_reg);
+    program.emit_column_or_rowid(cursor_id, 1, state_reg + 1);
+    program.emit_insn(Insn::Goto {
+        target_pc: have_row_label,
+    });
+    program.preassign_label_to_next_insn(empty_label);
+    program.emit_insn(Insn::Integer {
+        dest: state_reg,
+        value: seq.start_value,
+    });
+    program.emit_insn(Insn::Integer {
+        dest: state_reg + 1,
+        value: 0,
+    });
+    program.preassign_label_to_next_insn(have_row_label);
+    program.emit_insn(Insn::Close { cursor_id });
+
+    program.emit_insn(Insn::SequenceCommitInnerTx {
+        db: database_id,
+        path_kind_reg,
+        saved_outer_reg,
+        status_reg,
+    });
+    let after_retry_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: status_reg,
+        target_pc: after_retry_label,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: retry_top_label,
+    });
+    program.preassign_label_to_next_insn(after_retry_label);
+
+    program.emit_insn(Insn::MakeArray {
+        start_reg: state_reg,
+        count: 2,
+        dest: target_register,
+    });
+    Ok(())
+}
+
 /// Emit bytecode that makes the sequence's next id come after `value_reg`.
 /// Used for AUTOINCREMENT when an INSERT supplies an explicit rowid, so that
 /// later generated ids never reuse it. Mirrors `Sequence::advance_past`, but
@@ -472,6 +576,7 @@ pub fn emit_disk_advance_past(
         db: database_id,
         path_kind_reg,
         saved_outer_reg,
+        read_only: false,
     });
 
     program.emit_insn(Insn::OpenWrite {

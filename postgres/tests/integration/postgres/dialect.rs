@@ -4413,32 +4413,6 @@ fn test_postgres_ne_all_bound_array_param(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
-    let conn = db.connect_postgres();
-    conn.execute("CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")
-        .unwrap();
-
-    let mut stmt = conn.prepare("SELECT count(*) FROM pg_constraint").unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    assert_eq!(
-        rows,
-        vec![vec![Value::from_i64(1)]],
-        "pkey constraint row must be present"
-    );
-
-    // conkey is space-separated TEXT, not a PG array; array_contains
-    // yields NULL over it, so attnum = ANY(conkey) matches no rows.
-    let mut stmt = conn
-        .prepare(
-            "SELECT count(*) FROM pg_attribute a, pg_constraint c \
-             WHERE a.attnum = ANY(c.conkey)",
-        )
-        .unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
-}
-
-#[turso_macros::test(mvcc)]
 fn test_postgres_show_search_path_reads_the_setting_when_executed(db: TempDatabase) {
     let conn = db.connect_postgres();
     let mut show = conn.prepare("SHOW search_path").unwrap();

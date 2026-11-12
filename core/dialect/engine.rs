@@ -605,6 +605,7 @@ pub(crate) fn resolve_builtin_function_name(
         "nextval" => Ok(Some(Func::Scalar(ScalarFunc::NextVal))),
         "currval" => Ok(Some(Func::Scalar(ScalarFunc::CurrVal))),
         "setval" => Ok(Some(Func::Scalar(ScalarFunc::SetVal))),
+        "sequence_state_experimental" => Ok(Some(Func::Scalar(ScalarFunc::SequenceState))),
         _ => Ok(None),
     }
 }
@@ -705,6 +706,9 @@ pub fn call_builtin_scalar(
              the disk-only sequence design"
                 .to_string(),
         )),
+        ScalarFunc::SequenceState => {
+            unreachable!("sequence_state_experimental is translated to a backing table read")
+        }
         ScalarFunc::CurrVal => {
             let seq_name = match args[0].get_value() {
                 Value::Text(t) => t.as_str().to_string(),
