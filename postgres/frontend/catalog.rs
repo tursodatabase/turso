@@ -987,8 +987,15 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = i64::from(col.default.is_some() || col.is_stored_generated());
+                let has_def = i64::from(
+                    (col.default.is_some() && col.identity.is_none()) || col.is_stored_generated(),
+                );
                 let generated = if col.is_stored_generated() { "s" } else { "" };
+                let identity = match col.identity {
+                    Some(ast::IdentityKind::Always) => "a",
+                    Some(ast::IdentityKind::ByDefault) => "d",
+                    None => "",
+                };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -1007,7 +1014,7 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(notnull),      // attnotnull
                     Value::from_i64(has_def),      // atthasdef
                     Value::from_i64(0),            // atthasmissing
-                    Value::Text("".into()),        // attidentity
+                    Value::Text(identity.into()),  // attidentity
                     Value::Text(generated.into()), // attgenerated
                     Value::from_i64(0),            // attisdropped
                     Value::from_i64(1),            // attislocal
@@ -2492,6 +2499,9 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
+                if col.identity.is_some() {
+                    continue;
+                }
                 let adbin = match (&col.default, col.generated_type()) {
                     (Some(default_expr), _) => render_expr(default_expr),
                     (None, GeneratedType::Stored { expr, .. }) => {
@@ -3318,6 +3328,36 @@ impl SnapshotRows for PgDependTable {
             ));
         }
 
+        // A sequence owned by a column depends on it: internally for identity columns, automatically otherwise.
+        let schema = conn.current_schema();
+        for (namespace, table_name, table, table_oid) in user_tables_with_oids(&schema) {
+            for (index, column) in table.columns().iter().enumerate() {
+                let Some(column_name) = column.name.as_deref() else {
+                    continue;
+                };
+                for sequence_name in crate::classes::owned_sequences(
+                    &schema,
+                    namespace,
+                    table_name,
+                    Some(column_name),
+                ) {
+                    let Some(sequence_oid) =
+                        stored_relation_oid(&schema, namespace, &sequence_name)
+                    else {
+                        continue;
+                    };
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgClassTable>(sequence_oid),
+                        ObjectAddress::column(table_oid, index as i64 + 1),
+                        if column.identity.is_some() {
+                            DependencyKind::Internal
+                        } else {
+                            DependencyKind::Auto
+                        },
+                    ));
+                }
+            }
+        }
         rows
     }
 }
