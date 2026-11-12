@@ -105,6 +105,29 @@ expect error {
     role name "public" is reserved
 }
 
+test create-role-named-none-fails {
+    CREATE ROLE none;
+}
+expect error {
+    role name "none" is reserved
+}
+
+test create-role-named-current-user-fails {
+    CREATE ROLE current_user;
+}
+expect error {
+    CURRENT_USER cannot be used as a role name here
+}
+
+# PostgreSQL cuts identifiers to 63 bytes.
+test create-role-cuts-a-long-name-to-63-bytes {
+    CREATE ROLE cn_a_name_that_is_much_longer_than_the_sixty_three_bytes_postgresql_keeps;
+    SELECT rolname FROM pg_roles WHERE rolname LIKE 'cn_a_name_that_is_much_longer%';
+}
+expect {
+    cn_a_name_that_is_much_longer_than_the_sixty_three_bytes_postgr
+}
+
 test create-role-rolled-back-is-not-listed {
     BEGIN;
     CREATE ROLE cr_rolled_back;
