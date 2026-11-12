@@ -1210,6 +1210,20 @@ expect {
     descending_seq|bigint|-5|-2|-1|-99|1|f
 }
 
+test pg-constraint-conkey-is-an-array {
+    CREATE TABLE ck_pair (a int, b int, c int, PRIMARY KEY (b, c));
+    SELECT conname, conkey FROM pg_constraint
+    WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ck_pair') AND contype = 'p';
+    SELECT a.attname FROM pg_attribute a, pg_constraint c
+    WHERE c.conname = 'ck_pair_pkey' AND a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+    ORDER BY a.attname;
+}
+expect {
+    ck_pair_pkey|{2,3}
+    b
+    c
+}
+
 test pg-sequence-reflects-drop {
     CREATE SEQUENCE removed_seq;
     CREATE SEQUENCE kept_seq;

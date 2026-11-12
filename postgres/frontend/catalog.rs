@@ -2044,7 +2044,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
                 let contype: &'static str = ConstraintKind::PrimaryKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
@@ -2065,7 +2065,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),
                     Value::from_i64(0),
                     Value::from_i64(0),
-                    Value::build_text(conkey),
+                    Value::build_text(format!("{{{conkey}}}")),
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -2097,7 +2097,7 @@ impl SnapshotRows for PgConstraintTable {
                     })
                 };
 
-                // Build conkey: space-separated 1-based attnums
+                // Build conkey: the 1-based attnums
                 let conkey: String = col_names
                     .iter()
                     .map(|name| {
@@ -2107,7 +2107,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
 
                 let positions: Vec<usize> = col_names
                     .iter()
@@ -2138,31 +2138,31 @@ impl SnapshotRows for PgConstraintTable {
 
                 let contype: &'static str = contype.into();
                 rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace (public)
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(conindid),       // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
-                    Value::build_text(conkey),       // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::Null,                     // conbin
+                    Value::from_i64(constraint_oid),            // oid
+                    Value::build_text(conname),                 // conname
+                    Value::from_i64(2200),                      // connamespace (public)
+                    Value::build_text(contype),                 // contype
+                    Value::from_i64(0),                         // condeferrable
+                    Value::from_i64(0),                         // condeferred
+                    Value::from_i64(1),                         // convalidated
+                    Value::from_i64(table_oid),                 // conrelid
+                    Value::from_i64(0),                         // contypid
+                    Value::from_i64(conindid),                  // conindid
+                    Value::from_i64(0),                         // conparentid
+                    Value::from_i64(0),                         // confrelid
+                    Value::Null,                                // confupdtype
+                    Value::Null,                                // confdeltype
+                    Value::Null,                                // confmatchtype
+                    Value::from_i64(1),                         // conislocal
+                    Value::from_i64(0),                         // coninhcount
+                    Value::from_i64(0),                         // connoinherit
+                    Value::build_text(format!("{{{conkey}}}")), // conkey
+                    Value::Null,                                // confkey
+                    Value::Null,                                // conpfeqop
+                    Value::Null,                                // conppeqop
+                    Value::Null,                                // conffeqop
+                    Value::Null,                                // conexclop
+                    Value::Null,                                // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2185,7 +2185,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
 
                 let confrelid = tbl_oid_map
                     .get(&(fk.parent_namespace, fk.parent_table.clone()))
@@ -2206,7 +2206,7 @@ impl SnapshotRows for PgConstraintTable {
                             .unwrap_or_else(|| "0".to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(",");
 
                 let contype: &'static str = ConstraintKind::ForeignKey.into();
                 rows.push(vec![
@@ -2228,8 +2228,8 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),                                // conislocal
                     Value::from_i64(0),                                // coninhcount
                     Value::from_i64(0),                                // connoinherit
-                    Value::build_text(conkey),                         // conkey
-                    Value::build_text(confkey),                        // confkey
+                    Value::build_text(format!("{{{conkey}}}")),        // conkey
+                    Value::build_text(format!("{{{confkey}}}")),       // confkey
                     Value::Null,                                       // conpfeqop
                     Value::Null,                                       // conppeqop
                     Value::Null,                                       // conffeqop
@@ -2279,7 +2279,7 @@ impl SnapshotRows for PgConstraintTable {
                     if conkey.is_empty() {
                         Value::Null
                     } else {
-                        Value::build_text(conkey)
+                        Value::build_text(format!("{{{conkey}}}"))
                     }, // conkey
                     Value::Null,                     // confkey
                     Value::Null,                     // conpfeqop
@@ -3158,12 +3158,17 @@ impl SnapshotRows for PgDependTable {
     }
 }
 
+/// The column numbers of a catalog row, from `int2vector` text such as
+/// `1 2` or `int2[]` text such as `{1,2}`.
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
     match text {
         None => vec![WHOLE_OBJECT_COLUMN_NUMBER],
         Some(text) => {
             let mut columns: Vec<i64> = text
-                .split_ascii_whitespace()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                .filter(|column| !column.is_empty())
                 .map(|column| column.parse().expect("catalog column numbers are integers"))
                 .collect();
             if columns.is_empty() {
