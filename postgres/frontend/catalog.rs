@@ -1,6 +1,5 @@
-use crate::error::sqlstate_error;
 use crate::functions::validate_pg_input;
-use crate::numeric::{str_to_i64_checked, str_to_integer, IntegerWidth};
+use crate::numeric::str_to_i64_checked;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -207,13 +206,7 @@ impl Dialect for PostgresDialect {
         if name.eq_ignore_ascii_case("random") {
             return Ok(None);
         }
-
-        match name.to_ascii_lowercase().as_str() {
-            "pg_cast_int2" | "pg_cast_int4" | "pg_cast_int8" if arg_count == 1 => {
-                Ok(Some(Func::DialectInPlace(name.to_string())))
-            }
-            _ => turso_core::dialect::engine::resolve_builtin_function(name, arg_count),
-        }
+        turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -368,86 +361,6 @@ impl Dialect for PostgresDialect {
             return Ok(value.exec_cast("INTEGER")?);
         };
         Ok(Value::from_i64(str_to_i64_checked(raw_str)?))
-    }
-
-    fn exec_scalar_function(
-        &self,
-        _conn: &Connection,
-        name: &str,
-        args: &[Value],
-    ) -> Result<Value> {
-        assert_eq!(args.len(), 1);
-        match name {
-            "pg_cast_int2" => cast_value_to_integer(&args[0], IntegerWidth::Int16),
-            "pg_cast_int4" => cast_value_to_integer(&args[0], IntegerWidth::Int32),
-            "pg_cast_int8" => cast_value_to_integer(&args[0], IntegerWidth::Int64),
-            _ => Err(LimboError::ParseError(format!("no such function: {name}"))),
-        }
-    }
-}
-
-fn check_integer_bounds(value: i64, width: IntegerWidth) -> Result<i64> {
-    let in_range = match width {
-        IntegerWidth::Int16 => (i16::MIN as i64..=i16::MAX as i64).contains(&value),
-        IntegerWidth::Int32 => (i32::MIN as i64..=i32::MAX as i64).contains(&value),
-        IntegerWidth::Int64 => true,
-    };
-
-    if in_range {
-        Ok(value)
-    } else {
-        Err(integer_out_of_range_error(width))
-    }
-}
-
-fn integer_out_of_range_error(width: IntegerWidth) -> LimboError {
-    match width {
-        IntegerWidth::Int16 => {
-            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "smallint out of range")
-        }
-        IntegerWidth::Int32 => {
-            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range")
-        }
-        IntegerWidth::Int64 => {
-            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range")
-        }
-    }
-}
-
-fn cast_value_to_integer(value: &Value, width: IntegerWidth) -> Result<Value> {
-    match value {
-        Value::Text(raw) => Ok(Value::from_i64(str_to_integer(raw.as_str(), width)?)),
-
-        Value::Numeric(_) => {
-            if let Some(integer) = value.as_int() {
-                Ok(Value::from_i64(check_integer_bounds(integer, width)?))
-            } else {
-                let float = value.as_float();
-                let rounded = float.round();
-
-                if !rounded.is_finite()
-                    || rounded < i64::MIN as f64
-                    || rounded >= 9223372036854775808.0
-                {
-                    return Err(integer_out_of_range_error(width));
-                }
-
-                Ok(Value::from_i64(check_integer_bounds(
-                    rounded as i64,
-                    width,
-                )?))
-            }
-        }
-
-        Value::Null => Ok(Value::Null),
-
-        Value::Blob(_) => {
-            let result = value.exec_cast("INTEGER")?;
-            let integer = result
-                .as_int()
-                .ok_or_else(|| integer_out_of_range_error(width))?;
-            Ok(Value::from_i64(check_integer_bounds(integer, width)?))
-        }
     }
 }
 

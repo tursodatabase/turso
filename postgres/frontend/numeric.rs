@@ -1,6 +1,6 @@
 use std::num::{IntErrorKind, ParseIntError};
 
-use turso_core::LimboError;
+use turso_core::{LimboError, Result, Value};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
@@ -14,6 +14,71 @@ pub enum IntegerWidth {
     Int16,
     Int32,
     Int64,
+}
+
+pub fn cast_value_to_integer(value: &Value, width: IntegerWidth) -> Result<Value> {
+    match value {
+        Value::Text(raw) => Ok(Value::from_i64(str_to_integer(raw.as_str(), width)?)),
+
+        Value::Numeric(_) => {
+            if let Some(integer) = value.as_int() {
+                Ok(Value::from_i64(check_integer_bounds(integer, width)?))
+            } else {
+                let float = value.as_float();
+                let rounded = float.round();
+
+                if !rounded.is_finite()
+                    || rounded < i64::MIN as f64
+                    || rounded >= 9223372036854775808.0
+                {
+                    return Err(integer_out_of_range_error(width));
+                }
+
+                Ok(Value::from_i64(check_integer_bounds(
+                    rounded as i64,
+                    width,
+                )?))
+            }
+        }
+
+        Value::Null => Ok(Value::Null),
+
+        Value::Blob(_) => {
+            let result = value.exec_cast("INTEGER")?;
+            let integer = result
+                .as_int()
+                .ok_or_else(|| integer_out_of_range_error(width))?;
+            Ok(Value::from_i64(check_integer_bounds(integer, width)?))
+        }
+    }
+}
+
+fn check_integer_bounds(value: i64, width: IntegerWidth) -> Result<i64> {
+    let in_range = match width {
+        IntegerWidth::Int16 => (i16::MIN as i64..=i16::MAX as i64).contains(&value),
+        IntegerWidth::Int32 => (i32::MIN as i64..=i32::MAX as i64).contains(&value),
+        IntegerWidth::Int64 => true,
+    };
+
+    if in_range {
+        Ok(value)
+    } else {
+        Err(integer_out_of_range_error(width))
+    }
+}
+
+fn integer_out_of_range_error(width: IntegerWidth) -> LimboError {
+    match width {
+        IntegerWidth::Int16 => {
+            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "smallint out of range")
+        }
+        IntegerWidth::Int32 => {
+            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range")
+        }
+        IntegerWidth::Int64 => {
+            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range")
+        }
+    }
 }
 
 pub fn str_to_integer(input: impl AsRef<str>, width: IntegerWidth) -> Result<i64, LimboError> {
