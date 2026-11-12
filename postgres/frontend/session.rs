@@ -660,7 +660,8 @@ enum DeferredOperation {
 enum DeferredCommand {
     Translated(ast::Cmd, String),
     /// A statement the frontend built as an AST, with no text of its own
-    /// that a dialect parses: CREATE SCHEMA, DROP SCHEMA and GRANT.
+    /// that a dialect parses: CREATE SCHEMA, DROP SCHEMA, GRANT, and the
+    /// DROP FUNCTION statements of DROP SCHEMA ... CASCADE.
     Ast(ast::Stmt),
     Postgres(String),
     Sqlite(String),
@@ -2261,17 +2262,11 @@ fn drop_schema_commands(
     }
 
     let objects = schema_objects(conn, &name);
-    let has_functions = crate::sql_functions::schema_has_functions(conn, &name);
-    if !stmt.cascade && (!objects.is_empty() || has_functions) {
+    let function_drops = crate::sql_functions::drops_of_schema_functions(conn, &name);
+    if !stmt.cascade && (!objects.is_empty() || !function_drops.is_empty()) {
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
             format!("cannot drop schema \"{name}\" because other objects depend on it"),
-        ));
-    }
-    if has_functions {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "DROP SCHEMA ... CASCADE of a schema with functions is not supported",
         ));
     }
 
@@ -2282,6 +2277,10 @@ fn drop_schema_commands(
             context: CommandContext::DropSchema,
         })
         .collect();
+    commands.extend(function_drops.into_iter().map(|drop| DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::DropFunction(drop)),
+        context: CommandContext::DropSchema,
+    }));
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name),
