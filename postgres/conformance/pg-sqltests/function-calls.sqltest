@@ -926,6 +926,43 @@ expect @tursopg error {
     a call of function "forever", which calls itself, is not supported
 }
 
+# The size of the expression of a call
+#
+# The body of each function calls the next function 7 times, so the
+# expression of a call has 7 times the calls of the function below it.
+
+# The expression has 400 function bodies.
+test call-whose-expression-has-many-function-bodies {
+    CREATE FUNCTION k5() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION k4() RETURNS integer LANGUAGE sql AS $$SELECT k5() + k5() + k5() + k5() - k5() - k5() - k5()$$;
+    CREATE FUNCTION k3() RETURNS integer LANGUAGE sql AS $$SELECT k4() + k4() + k4() + k4() - k4() - k4() - k4()$$;
+    CREATE FUNCTION k2() RETURNS integer LANGUAGE sql AS $$SELECT k3() + k3() + k3() + k3() - k3() - k3() - k3()$$;
+    SELECT k2();
+}
+expect {
+    1
+}
+
+# The expression has 2801 function bodies. PostgreSQL has no limit on the
+# size of the expression. tursopg stops when the bodies have added 10000
+# expressions to the statement: with more functions in the chain, the
+# expression does not fit in memory.
+test call-whose-expression-has-too-many-function-bodies {
+    CREATE FUNCTION k5() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION k4() RETURNS integer LANGUAGE sql AS $$SELECT k5() + k5() + k5() + k5() - k5() - k5() - k5()$$;
+    CREATE FUNCTION k3() RETURNS integer LANGUAGE sql AS $$SELECT k4() + k4() + k4() + k4() - k4() - k4() - k4()$$;
+    CREATE FUNCTION k2() RETURNS integer LANGUAGE sql AS $$SELECT k3() + k3() + k3() + k3() - k3() - k3() - k3()$$;
+    CREATE FUNCTION k1() RETURNS integer LANGUAGE sql AS $$SELECT k2() + k2() + k2() + k2() - k2() - k2() - k2()$$;
+    SELECT k1();
+}
+expect {
+    1
+}
+@sqlstate 54001
+expect @tursopg error {
+    the expression that takes the place of the call of function "k1" is too large
+}
+
 # Functions with the same name
 
 # PostgreSQL chooses the function by the types of the arguments, which

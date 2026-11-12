@@ -47,6 +47,9 @@ pub(crate) fn expand_function_call(
     let Some(functions) = function_catalog(schema) else {
         return Ok(None);
     };
+    let ast::Expr::FunctionCall { name, .. } = call else {
+        return Ok(None);
+    };
     Expansion {
         built_in_functions: BuiltInFunctions {
             dialect,
@@ -54,7 +57,9 @@ pub(crate) fn expand_function_call(
         },
         connection,
         functions,
+        statement_call_name: name.as_str(),
         active: Vec::new(),
+        added_expressions: 0,
     }
     .expand(call)
 }
@@ -102,12 +107,16 @@ struct Expansion<'a> {
     built_in_functions: BuiltInFunctions<'a>,
     connection: &'a Connection,
     functions: &'a FunctionCatalog,
+    /// The name of the function that the statement calls.
+    statement_call_name: &'a str,
     /// The oids of the functions whose bodies are being expanded, outermost
     /// first.
     active: Vec<i64>,
+    /// How many expressions the bodies added to the statement.
+    added_expressions: usize,
 }
 
-impl Expansion<'_> {
+impl<'a> Expansion<'a> {
     /// The expression that `call` stands for, or None when `call` does not
     /// call a function that a user defined.
     fn expand(&mut self, call: &ast::Expr) -> turso_core::Result<Option<ast::Expr>> {
@@ -162,6 +171,7 @@ impl Expansion<'_> {
         )?;
         check_body_has_no_column(&inlined.result)?;
 
+        self.add_expressions(size(&inlined.result))?;
         let (mut expression, use_counts) = with_arguments(inlined, args)?;
         // PostgreSQL does not inline a function that would compute a
         // volatile or an expensive argument more than once. tursopg cannot
@@ -198,6 +208,23 @@ impl Expansion<'_> {
         Ok(Some(expression))
     }
 
+    /// Counts `count` expressions that a body adds to the statement. Fails
+    /// when the bodies then add more than [`MAX_ADDED_EXPRESSIONS`].
+    fn add_expressions(&mut self, count: usize) -> turso_core::Result<()> {
+        self.added_expressions += count;
+        if self.added_expressions > MAX_ADDED_EXPRESSIONS {
+            return Err(sqlstate_error(
+                SQLSTATE_STATEMENT_TOO_COMPLEX,
+                format!(
+                    "the expression that takes the place of the call of function \"{}\" is too \
+                     large",
+                    self.statement_call_name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Expands the calls in `expression`, the arguments of a call before the
     /// call.
     fn expand_calls_in(&mut self, expression: &mut ast::Expr) -> turso_core::Result<()> {
@@ -228,7 +255,7 @@ impl Expansion<'_> {
     /// CREATE FUNCTION refuses the name of a built-in function, but a later
     /// version of tursopg or an extension can add a built-in function with
     /// the name of a stored function.
-    fn called_function(&self, name: &str) -> turso_core::Result<Option<&SqlFunction>> {
+    fn called_function(&self, name: &str) -> turso_core::Result<Option<&'a SqlFunction>> {
         let (schema_name, function_name) = match name.split_once('.') {
             Some((schema_name, function_name)) => (Some(schema_name), function_name),
             None => (None, name),
@@ -544,6 +571,25 @@ fn functions_named<'a>(
     namespaces
         .into_iter()
         .flat_map(move |namespace| functions.named(namespace, &name))
+}
+
+/// How many expressions the bodies of functions can add to the statement
+/// for one call of the statement.
+///
+/// A body can call a function several times, and the body of that function
+/// can do the same. The expression of a short chain of such functions has a
+/// size that no statement text has: 7 calls in each of 7 bodies make 823543
+/// calls.
+const MAX_ADDED_EXPRESSIONS: usize = 10_000;
+
+/// The number of expressions in `expression`, with `expression`.
+fn size(expression: &ast::Expr) -> usize {
+    let mut size = 0;
+    let _ = walk_expr(expression, &mut |_| {
+        size += 1;
+        Ok(WalkControl::Continue)
+    });
+    size
 }
 
 /// The number of levels of `expression`: 1 for an expression that has no

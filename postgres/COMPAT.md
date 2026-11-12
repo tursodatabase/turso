@@ -638,6 +638,11 @@ Notes on calls of SQL functions:
   is then `Expression tree is too large`, with the same SQLSTATE 54001.
   PostgreSQL limits the size of the stack (`max_stack_depth`), which
   permits more.
+- A call fails with SQLSTATE 54001 when the function bodies that take its
+  place add more than 10000 expressions to the statement. A body can call
+  a function several times, and the body of that function can do the same,
+  so the expression of a short chain of such functions is very large.
+  PostgreSQL has no such limit.
 
 ## Procedural Languages
 
