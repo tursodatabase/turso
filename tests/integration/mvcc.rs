@@ -1620,20 +1620,6 @@ fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(
 // auto-checkpoint combined with GC resurrects a deleted row and corrupts the
 // secondary index.
 
-fn open_file_conn(path: &str) -> Arc<turso_core::Connection> {
-    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let db = Database::open_file_with_flags(
-        io,
-        path,
-        OpenFlags::default(),
-        DatabaseOpts::new(),
-        None,
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    db.connect(ConnectOpts::new()).unwrap()
-}
-
 fn collect(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<Vec<turso_core::Value>> {
     let mut stmt = conn.prepare(sql).unwrap();
     let mut rows = Vec::new();
@@ -1648,30 +1634,30 @@ fn collect(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<Vec<turso_core:
     }
 }
 
-/// Step `sql`, counting IO/Yield pauses, and abandon the statement (drop it
-/// mid-flight) once `pause_target` pauses have been observed. Returns whether
-/// the statement was abandoned before completing.
-fn abandon_after_pause(conn: &Arc<turso_core::Connection>, sql: &str, pause_target: usize) -> bool {
+/// Step `sql` and abandon the statement (drop it mid-flight) after the first write to the
+/// database file. In MVCC mode only a checkpoint writes that file, and it does so after its
+/// pager commit. Returns whether the statement was abandoned before completing.
+fn abandon_after_first_database_file_write(
+    conn: &Arc<turso_core::Connection>,
+    io: &QueuedIo,
+    database_path: &str,
+    sql: &str,
+) -> bool {
     let mut stmt = conn.prepare(sql).unwrap();
-    let mut pauses = 0usize;
     loop {
         match stmt.step().unwrap() {
             StepResult::IO => {
-                pauses += 1;
-                stmt._io().step().unwrap();
-                if pauses == pause_target {
+                let Some(event) = io.step_one().unwrap() else {
+                    continue;
+                };
+                let is_write =
+                    matches!(event.kind, QueuedIoOpKind::Pwrite | QueuedIoOpKind::Pwritev);
+                if is_write && event.path == database_path {
                     drop(stmt);
                     return true;
                 }
             }
-            StepResult::Yield => {
-                pauses += 1;
-                if pauses == pause_target {
-                    drop(stmt);
-                    return true;
-                }
-            }
-            StepResult::Row => {}
+            StepResult::Yield | StepResult::Row => {}
             StepResult::Done => return false,
             other => panic!("unexpected step result for {sql}: {other:?}"),
         }
@@ -1689,13 +1675,16 @@ fn abandon_after_pause(conn: &Arc<turso_core::Connection>, sql: &str, pause_targ
 fn test_issue_7638_gc_after_abandoned_checkpoint_does_not_resurrect_row() {
     const ROWS: i64 = 1_500;
     const TARGET: i64 = 1_500;
-    let pause_target = 9;
 
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("gc-witness-indexed.db");
-    let path = path.to_str().unwrap();
-
-    let conn = open_file_conn(path);
+    let io = Arc::new(QueuedIo::new());
+    let path = "mvcc-issue-7638-gc-witness-indexed.db";
+    let db = Database::open(
+        io.clone(),
+        path,
+        OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
         .unwrap();
@@ -1715,8 +1704,10 @@ fn test_issue_7638_gc_after_abandoned_checkpoint_does_not_resurrect_row() {
 
     // COMMIT triggers a post-commit auto-checkpoint (threshold 0); abandon it
     // after CommitPagerTxn has advanced the durable boundary but before the
-    // checkpoint's own chain GC runs.
-    assert!(abandon_after_pause(&conn, "COMMIT", pause_target));
+    // checkpoint removes the row versions from the MVCC store.
+    assert!(abandon_after_first_database_file_write(
+        &conn, &io, path, "COMMIT"
+    ));
     assert_eq!(
         collect(&conn, "SELECT count(*) FROM t")[0][0]
             .as_int()
