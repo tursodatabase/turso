@@ -1522,6 +1522,28 @@ expect {
     1|keep
 }
 
+# Triggers have their own namespace, so a trigger can have the name of a
+# table. Renaming the table keeps the trigger's name, whether the trigger is on
+# another table or on the renamed table itself.
+@cross-check-integrity
+test alter-table-rename-keeps-trigger-with-the-table-name {
+    CREATE TABLE ft(a INTEGER);
+    CREATE TABLE ts(a INTEGER);
+    CREATE TRIGGER ts AFTER INSERT ON ft BEGIN SELECT 1; END;
+    CREATE TRIGGER ft AFTER INSERT ON ts BEGIN SELECT 1; END;
+    ALTER TABLE ts RENAME TO ts2;
+    ALTER TABLE ft RENAME TO ft2;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name;
+    DROP TRIGGER ts;
+    DROP TRIGGER ft;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'trigger';
+}
+expect {
+    ft|ts2
+    ts|ft2
+    0
+}
+
 # Verify trigger body INSERT into a different renamed table
 @cross-check-integrity
 test alter-table-rename-trigger-body-insert-other-table {
