@@ -14,8 +14,9 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -8237,7 +8238,7 @@ impl PgGrantee {
 /// and REVOKE are rejected rather than reported as done.
 pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStmt>, ParseError> {
     use pg_query::protobuf::node::Node;
-    use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
+    use pg_query::protobuf::{GrantTargetType, ObjectType};
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
@@ -8256,26 +8257,7 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
             "GRANT on objects other than tables and sequences",
         ));
     };
-    // pg_query gives `ALL [PRIVILEGES]` as no privileges.
-    let privileges = if grant.privileges.is_empty() {
-        vec![ast::Privilege::All]
-    } else {
-        grant
-            .privileges
-            .iter()
-            .map(|privilege| {
-                let Some(Node::AccessPriv(privilege)) = &privilege.node else {
-                    return Err(ParseError::ParseError(
-                        "GRANT: unexpected privilege node".into(),
-                    ));
-                };
-                if !privilege.cols.is_empty() {
-                    return Err(ParseError::not_supported("GRANT of column privileges"));
-                }
-                relation_privilege(&privilege.priv_name, on_sequences)
-            })
-            .collect::<Result<_, _>>()?
-    };
+    let privileges = grant_privileges(grant, on_sequences)?;
     if grant.grant_option {
         return Err(ParseError::not_supported("GRANT ... WITH GRANT OPTION"));
     }
@@ -8318,26 +8300,182 @@ pub fn try_extract_grant(parse_result: &ParseResult) -> Result<Option<PgGrantStm
     let roles = grant
         .grantees
         .iter()
-        .map(|grantee| {
-            let Some(Node::RoleSpec(role)) = &grantee.node else {
-                return Err(ParseError::ParseError("GRANT: unexpected role node".into()));
-            };
-            match RoleSpecType::try_from(role.roletype) {
-                Ok(RoleSpecType::RolespecPublic) => Ok(PgGrantee::Public),
-                Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
-                    Ok(PgGrantee::CurrentRole)
-                }
-                Ok(RoleSpecType::RolespecSessionUser) => Ok(PgGrantee::SessionUser),
-                Ok(RoleSpecType::RolespecCstring) => Ok(PgGrantee::Role(role.rolename.clone())),
-                _ => Err(ParseError::ParseError("GRANT: unknown role kind".into())),
-            }
-        })
+        .map(grantee_of_node)
         .collect::<Result<_, _>>()?;
     Ok(Some(PgGrantStmt {
         privileges,
         on_sequences,
         tables,
         roles,
+    }))
+}
+
+/// The privileges of a GRANT on tables, or on sequences when
+/// `on_sequences` is set. Column privileges are rejected.
+fn grant_privileges(
+    grant: &pg_query::protobuf::GrantStmt,
+    on_sequences: bool,
+) -> Result<Vec<ast::Privilege>, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    // pg_query gives `ALL [PRIVILEGES]` as no privileges.
+    if grant.privileges.is_empty() {
+        return Ok(vec![ast::Privilege::All]);
+    }
+    grant
+        .privileges
+        .iter()
+        .map(|privilege| {
+            let Some(Node::AccessPriv(privilege)) = &privilege.node else {
+                return Err(ParseError::ParseError(
+                    "GRANT: unexpected privilege node".into(),
+                ));
+            };
+            if !privilege.cols.is_empty() {
+                return Err(ParseError::not_supported("GRANT of column privileges"));
+            }
+            relation_privilege(&privilege.priv_name, on_sequences)
+        })
+        .collect()
+}
+
+/// The role that a role node of a GRANT names.
+fn grantee_of_node(node: &pg_query::protobuf::Node) -> Result<PgGrantee, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::RoleSpecType;
+
+    let Some(Node::RoleSpec(role)) = &node.node else {
+        return Err(ParseError::ParseError("GRANT: unexpected role node".into()));
+    };
+    match RoleSpecType::try_from(role.roletype) {
+        Ok(RoleSpecType::RolespecPublic) => Ok(PgGrantee::Public),
+        Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+            Ok(PgGrantee::CurrentRole)
+        }
+        Ok(RoleSpecType::RolespecSessionUser) => Ok(PgGrantee::SessionUser),
+        Ok(RoleSpecType::RolespecCstring) => Ok(PgGrantee::Role(role.rolename.clone())),
+        _ => Err(ParseError::ParseError("GRANT: unknown role kind".into())),
+    }
+}
+
+/// An `ALTER DEFAULT PRIVILEGES ... GRANT` on tables or sequences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgAlterDefaultPrivilegesStmt {
+    /// `FOR ROLE`: the roles whose relations get the privileges. Empty for
+    /// the current role.
+    pub roles: Vec<ast::RoleSpec>,
+    /// `IN SCHEMA`: the schemas whose relations get the privileges. Empty
+    /// for every schema.
+    pub schemas: Vec<String>,
+    /// `ON SEQUENCES` rather than `ON TABLES`.
+    pub on_sequences: bool,
+    pub privileges: Vec<ast::Privilege>,
+    pub grantees: Vec<PgGrantee>,
+}
+
+/// Extracts an `ALTER DEFAULT PRIVILEGES ... GRANT` on tables or sequences.
+/// REVOKE, other kinds of objects and `WITH GRANT OPTION` are rejected rather
+/// than reported as done.
+pub fn try_extract_alter_default_privileges(
+    parse_result: &ParseResult,
+) -> Result<Option<PgAlterDefaultPrivilegesStmt>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::AlterDefaultPrivilegesStmt(alter), ..)) = nodes.first() else {
+        return Ok(None);
+    };
+    let Some(grant) = &alter.action else {
+        return Err(ParseError::ParseError(
+            "ALTER DEFAULT PRIVILEGES: missing GRANT".into(),
+        ));
+    };
+    if !grant.is_grant {
+        return Err(ParseError::not_supported(
+            "ALTER DEFAULT PRIVILEGES ... REVOKE",
+        ));
+    }
+    let on_sequences = if grant.objtype == ObjectType::ObjectSequence as i32 {
+        true
+    } else if grant.objtype == ObjectType::ObjectTable as i32 {
+        false
+    } else {
+        return Err(ParseError::not_supported(
+            "ALTER DEFAULT PRIVILEGES on objects other than tables and sequences",
+        ));
+    };
+    let privileges = grant_privileges(grant, on_sequences)?;
+    // `ON TABLES` cannot mean a sequence, unlike `ON TABLE`.
+    if !on_sequences && privileges.contains(&ast::Privilege::Usage) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
+            message: "invalid privilege type USAGE for relation".into(),
+        });
+    }
+    if grant.grant_option {
+        return Err(ParseError::not_supported(
+            "ALTER DEFAULT PRIVILEGES ... WITH GRANT OPTION",
+        ));
+    }
+    let grantees = grant
+        .grantees
+        .iter()
+        .map(grantee_of_node)
+        .collect::<Result<_, _>>()?;
+    let mut roles = Vec::new();
+    let mut schemas = Vec::new();
+    for option in &alter.options {
+        let Some(Node::DefElem(option)) = &option.node else {
+            return Err(ParseError::ParseError(
+                "ALTER DEFAULT PRIVILEGES: unexpected option node".into(),
+            ));
+        };
+        let Some(Node::List(list)) = option.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
+            return Err(ParseError::ParseError(
+                "ALTER DEFAULT PRIVILEGES: unexpected option value".into(),
+            ));
+        };
+        match option.defname.as_str() {
+            "roles" => {
+                for role in &list.items {
+                    roles.push(match grantee_of_node(role)? {
+                        PgGrantee::Public => {
+                            return Err(ParseError::Sqlstate {
+                                sqlstate: SQLSTATE_UNDEFINED_OBJECT,
+                                message: "role \"public\" does not exist".into(),
+                            })
+                        }
+                        PgGrantee::CurrentRole => ast::RoleSpec::CurrentRole,
+                        PgGrantee::SessionUser => ast::RoleSpec::SessionUser,
+                        PgGrantee::Role(name) => ast::RoleSpec::Name(name),
+                    });
+                }
+            }
+            "schemas" => {
+                for schema in &list.items {
+                    let Some(Node::String(schema)) = &schema.node else {
+                        return Err(ParseError::ParseError(
+                            "ALTER DEFAULT PRIVILEGES: unexpected schema node".into(),
+                        ));
+                    };
+                    schemas.push(schema.sval.clone());
+                }
+            }
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "ALTER DEFAULT PRIVILEGES: unknown option {other}"
+                )))
+            }
+        }
+    }
+    Ok(Some(PgAlterDefaultPrivilegesStmt {
+        roles,
+        schemas,
+        on_sequences,
+        privileges,
+        grantees,
     }))
 }
 
@@ -8608,6 +8746,7 @@ pub enum FrontendStmt {
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
     Grant(PgGrantStmt),
+    AlterDefaultPrivileges(PgAlterDefaultPrivilegesStmt),
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -8652,6 +8791,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_grant(parse_result)? {
         return Ok(Some(FrontendStmt::Grant(stmt)));
+    }
+    if let Some(stmt) = try_extract_alter_default_privileges(parse_result)? {
+        return Ok(Some(FrontendStmt::AlterDefaultPrivileges(stmt)));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -9368,6 +9510,7 @@ mod tests {
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
                 FrontendStmt::Grant(_) => "grant",
+                FrontendStmt::AlterDefaultPrivileges(_) => "alter default privileges",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -9387,6 +9530,10 @@ mod tests {
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
             ("GRANT SELECT ON t TO alice", "grant"),
+            (
+                "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO alice",
+                "alter default privileges",
+            ),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
             ("COPY t TO STDOUT", "copy to"),
         ] {

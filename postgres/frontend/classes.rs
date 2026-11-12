@@ -56,6 +56,9 @@ use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
+use crate::default_privileges::{
+    schema_default_acls, CREATE_DEFAULT_ACL_TABLE_SQL, DEFAULT_ACL_TABLE_NAME,
+};
 use crate::error::sqlstate_error;
 use crate::policies;
 use crate::roles::{
@@ -234,9 +237,9 @@ impl ClassCatalog {
                 kind,
                 ..
             } => {
-                let [oid, owner] = values else {
+                let [oid, owner, acl] = values else {
                     return Err(LimboError::InternalError(
-                        "a created relation carries its oid and owner".to_string(),
+                        "a created relation carries its oid, owner and list".to_string(),
                     ));
                 };
                 self.add(RelationClass {
@@ -246,7 +249,7 @@ impl ClassCatalog {
                     relkind: *kind,
                     relowner: RoleId::from_stored(read_back_integer(owner)?),
                     relownedby: 0,
-                    relacl: None,
+                    relacl: read_back_acl(acl)?,
                     relrowsecurity: false,
                     relpolicies: Vec::new(),
                 });
@@ -670,6 +673,10 @@ pub(crate) fn translate_catalog_changes(
                     .as_deref()
                     .and_then(|table| relation_owner(schema, *namespace, table))
                     .unwrap_or_else(|| connection.current_role());
+                // What ALTER DEFAULT PRIVILEGES gave the owner's relations
+                // of this kind in this schema.
+                let acl =
+                    schema_default_acls(schema).acl_for_new_relation(owner, *namespace, *kind);
                 emit_class_row_insert(
                     program,
                     &cursors,
@@ -678,6 +685,7 @@ pub(crate) fn translate_catalog_changes(
                     *kind,
                     table.as_deref(),
                     owner,
+                    acl.as_ref(),
                 )
             }
             CatalogChange::Drop { namespace, name } => {
@@ -1004,7 +1012,7 @@ fn relation_object(class: &RelationClass) -> Object {
 
 /// The role oid a `GRANT` stores for `grantee`, [`PUBLIC_OID`] for
 /// everyone. A named role must exist.
-fn resolve_grantee(
+pub(crate) fn resolve_grantee(
     schema: &Schema,
     connection: &Arc<Connection>,
     grantee: &ast::Grantee,
@@ -1040,7 +1048,7 @@ fn resolve_new_owner(
 }
 
 /// The role that `role` names. A named role must exist.
-fn resolve_role(
+pub(crate) fn resolve_role(
     schema: &Schema,
     connection: &Arc<Connection>,
     role: &ast::RoleSpec,
@@ -1136,8 +1144,9 @@ fn open_class_table_for_writing(
 }
 
 /// Inserts the class row of relation `name` of `namespace` under the next
-/// oid, owned by `owner`; `table` is the table an index is on. Engine
-/// relations get no row.
+/// oid, owned by `owner`, with the access control list `acl`; `table` is
+/// the table an index is on. Engine relations get no row.
+#[allow(clippy::too_many_arguments)]
 fn emit_class_row_insert(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -1146,6 +1155,7 @@ fn emit_class_row_insert(
     kind: RelationKind,
     table: Option<&str>,
     owner: RoleId,
+    acl: Option<&Acl>,
 ) {
     if !is_user_relation_name(kind, name) {
         return;
@@ -1211,11 +1221,17 @@ fn emit_class_row_insert(
         value: 0,
         dest: first_column_reg + 5,
     });
-    // No GRANT has touched a new relation, and it has no row-level security.
-    program.emit_insn(Insn::Null {
-        dest: first_column_reg + 6,
-        dest_end: None,
-    });
+    match acl {
+        Some(acl) => program.emit_insn(Insn::String8 {
+            value: acl.stored_text(),
+            dest: first_column_reg + 6,
+        }),
+        None => program.emit_insn(Insn::Null {
+            dest: first_column_reg + 6,
+            dest_end: None,
+        }),
+    }
+    // A new relation has no row-level security.
     program.emit_insn(Insn::Integer {
         value: 0,
         dest: first_column_reg + 7,
@@ -1261,7 +1277,7 @@ fn emit_class_row_insert(
             kind,
             table: table.map(str::to_string),
         }),
-        value_regs: vec![oid_reg, first_column_reg + 4],
+        value_regs: vec![oid_reg, first_column_reg + 4, first_column_reg + 6],
     });
 }
 
@@ -1822,10 +1838,11 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
 }
 
 /// Creates the classes table, its name index, the `sqlite_sequence` table,
-/// the oid watermark row and the roles table in one write transaction,
-/// unless the classes table exists. A classes table made before it had
-/// `relacl`, `relrowsecurity` or `relpolicies` gets the missing columns, and
-/// a database made before the roles table gets an empty one. A database
+/// the oid watermark row, the roles table and the default privileges table
+/// in one write transaction, unless the classes table exists. A classes
+/// table made before it had `relacl`, `relrowsecurity` or `relpolicies` gets
+/// the missing columns, and a database made before the roles or default
+/// privileges table gets an empty one. A database
 /// that already has relations without the table is refused, and a read-only
 /// open can neither create nor need it: the database is empty. After this
 /// returns, every relation the database will ever hold has a class row from
@@ -1836,13 +1853,17 @@ pub(crate) fn ensure_classes_table(
 ) -> crate::Result<()> {
     let conn = db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
     if let Some(table) = classes_table(&conn) {
-        let has_every_column = has_acl_column(&table)
+        let is_complete = has_acl_column(&table)
             && has_row_security_column(&table)
-            && has_policies_column(&table);
-        if (has_every_column && table_exists(&conn, AUTHID_TABLE_NAME)?) || read_only {
+            && has_policies_column(&table)
+            && table_exists(&conn, AUTHID_TABLE_NAME)?
+            && table_exists(&conn, DEFAULT_ACL_TABLE_NAME)?;
+        if is_complete || read_only {
             return Ok(());
         }
-        return in_write_transaction(&conn, add_missing_parts);
+        in_write_transaction(&conn, add_missing_parts)?;
+        // The open loaded the schema state without the tables just added.
+        return conn.reload_dialect_schema().map_err(Into::into);
     }
     refuse_relations_without_catalog(&conn)?;
     if read_only {
@@ -1900,7 +1921,8 @@ fn create_classes_table(conn: &Arc<Connection>) -> crate::Result<()> {
             FIRST_NORMAL_OBJECT_ID - 1
         ),
     )?;
-    create_authid_table(conn)
+    create_authid_table(conn)?;
+    create_default_acl_table(conn)
 }
 
 fn create_authid_table(conn: &Arc<Connection>) -> crate::Result<()> {
@@ -1911,8 +1933,15 @@ fn create_authid_table(conn: &Arc<Connection>) -> crate::Result<()> {
     run_internal(conn, CREATE_AUTHID_NAME_INDEX_SQL)
 }
 
-/// Adds the columns and the roles table that a catalog made by an earlier
-/// version lacks. They are checked again inside the write transaction,
+fn create_default_acl_table(conn: &Arc<Connection>) -> crate::Result<()> {
+    if table_exists(conn, DEFAULT_ACL_TABLE_NAME)? {
+        return Ok(());
+    }
+    run_internal(conn, CREATE_DEFAULT_ACL_TABLE_SQL)
+}
+
+/// Adds the columns, the roles table and the default privileges table that
+/// a catalog made by an earlier version lacks. They are checked again inside the write transaction,
 /// because another process may have added them first.
 fn add_missing_parts(conn: &Arc<Connection>) -> crate::Result<()> {
     let Some(table) = classes_table(conn) else {
@@ -1927,7 +1956,8 @@ fn add_missing_parts(conn: &Arc<Connection>) -> crate::Result<()> {
     if !has_policies_column(&table) {
         run_internal(conn, ADD_POLICIES_COLUMN_SQL)?;
     }
-    create_authid_table(conn)
+    create_authid_table(conn)?;
+    create_default_acl_table(conn)
 }
 
 fn classes_table(conn: &Arc<Connection>) -> Option<Arc<BTreeTable>> {

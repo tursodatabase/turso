@@ -245,6 +245,21 @@ impl Acl {
         }
     }
 
+    /// Adds every entry of `other`, as [`Acl::grant`] adds one.
+    pub(crate) fn merge(&mut self, other: &Acl) {
+        for item in &other.items {
+            self.grant(item.grantee, item.privileges, item.grantor);
+        }
+    }
+
+    /// Orders the entries by grantee, then grantor, then privileges. As in
+    /// PostgreSQL, default privileges, and the lists they give new
+    /// relations, are kept in this order.
+    pub(crate) fn sort(&mut self) {
+        self.items
+            .sort_by_key(|item| (item.grantee, item.grantor, item.privileges.bits()));
+    }
+
     /// Whether the list gives `role`, by oid or through `PUBLIC`, every
     /// privilege of `wanted`.
     pub(crate) fn grants(&self, role: i64, wanted: Privileges) -> bool {
