@@ -791,7 +791,6 @@ fn test_pg_builtin_settings_validate_all_entry_points(db: TempDatabase) {
         ("transaction_timeout", "0", "0", "1"),
         ("row_security", "false", "off", "on"),
         ("quote_all_identifiers", "false", "off", "on"),
-        ("check_function_bodies", "false", "off", "on"),
         ("synchronize_seqscans", "false", "off", "on"),
         ("default_tablespace", "", "", "other"),
         ("default_tablespace", "", "", "   "),

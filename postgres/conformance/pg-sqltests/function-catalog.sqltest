@@ -791,6 +791,72 @@ expect error {
 expect @tursopg {
 }
 
+# pg_dump turns check_function_bodies off, because it writes a function
+# before the tables that the body reads.
+test body-is-not-checked-when-check-function-bodies-is-off {
+    SHOW check_function_bodies;
+    SET check_function_bodies = off;
+    CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT a FROM t LIMIT 1$$;
+    CREATE TABLE t (a integer);
+    SELECT proname FROM pg_proc WHERE proname = 'first_a';
+    SHOW check_function_bodies;
+}
+expect {
+    on
+    first_a
+    off
+}
+
+test body-is-checked-after-check-function-bodies-is-reset {
+    SET check_function_bodies = off;
+    RESET check_function_bodies;
+    CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such table: nosuch
+}
+
+# tursopg reads the body when it stores the function, so it also refuses a
+# body with a syntax error when check_function_bodies is off. PostgreSQL
+# finds the error when the function is called.
+test body-with-a-syntax-error-when-check-function-bodies-is-off {
+    SET check_function_bodies = off;
+    CREATE FUNCTION bad() RETURNS integer LANGUAGE sql AS $$SELEC 1$$;
+    SELECT proname FROM pg_proc WHERE proname = 'bad';
+}
+expect {
+    bad
+}
+@sqlstate 42601
+expect @tursopg error {
+    syntax error at or near "SELEC"
+}
+
+test check-function-bodies-set-local-ends-with-the-transaction {
+    BEGIN;
+    SET LOCAL check_function_bodies = off;
+    SHOW check_function_bodies;
+    COMMIT;
+    SHOW check_function_bodies;
+}
+expect {
+    off
+    on
+}
+
+test check-function-bodies-with-a-value-that-is-not-boolean {
+    SET check_function_bodies = sometimes;
+}
+@sqlstate 22023
+expect error {
+    parameter "check_function_bodies" requires a Boolean value
+}
+
 # PostgreSQL makes the catalog checks before it checks the body.
 test function-that-exists-with-a-body-that-does-not-compile {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;

@@ -525,7 +525,11 @@ Notes on `CREATE FUNCTION`:
   function, and it reports the database as corrupt.
 - The body is checked when the function is created: the query must compile.
   The errors for a missing table, column or function have tursopg's
-  messages, not PostgreSQL's.
+  messages, not PostgreSQL's. `SET check_function_bodies = off` turns the
+  check off, as in PostgreSQL. tursopg then still refuses a body that it
+  cannot parse or that is not a query, because it reads the body when it
+  stores the function. PostgreSQL finds these errors when the function is
+  called.
 - tursopg does not know the type of the body's result, so it accepts a body
   whose result PostgreSQL rejects with `return type mismatch`, such as text
   for a function that returns integer.

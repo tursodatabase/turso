@@ -478,7 +478,11 @@ fn prepare_statement_inner(
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     let created_function = match translated.cmd.stmt() {
-        ast::Stmt::CreateFunction(function) => Some(function.clone()),
+        ast::Stmt::CreateFunction(function)
+            if crate::settings::checks_function_bodies(&pg_conn.conn) =>
+        {
+            Some(function.clone())
+        }
         _ => None,
     };
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
