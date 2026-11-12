@@ -294,7 +294,8 @@ fn sqlstate(error: &LimboError) -> &'static str {
 /// come first, because their messages end with the error that the dependent
 /// object gives, for example "no such column". A duplicate object is checked
 /// before the "no such ..." rules, because its name sits inside the message, for
-/// example a table named "no such table".
+/// example a table named "no such table". A role is not a relation, so a
+/// duplicate role has its own SQLSTATE.
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
@@ -309,6 +310,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_GENERATED_ALWAYS
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
+        SQLSTATE_DUPLICATE_OBJECT
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
@@ -559,6 +562,11 @@ mod tests {
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),
+            (
+                "role \"no such table\" already exists",
+                SQLSTATE_DUPLICATE_OBJECT,
+            ),
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
