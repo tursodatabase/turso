@@ -10,11 +10,12 @@
 use std::sync::Arc;
 
 use turso_parser::ast;
+use turso_parser::parser::MAX_EXPR_DEPTH;
 
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::schema::{
     emit_schema_row, emit_schema_rows_delete, SchemaEntryType, SQLITE_TABLEID,
 };
@@ -157,14 +158,14 @@ pub(crate) fn expand_function_calls(
     if !dialect.expands_function_calls(resolver.schema()) {
         return Ok(false);
     }
-    let mut expanded_a_call = false;
-    let mut expand = |call: &ast::Expr| {
-        let expansion = dialect.expand_function_call(resolver.schema(), connection, call)?;
-        expanded_a_call |= expansion.is_some();
-        Ok(expansion)
+    let mut replacement =
+        |call: &ast::Expr| dialect.expand_function_call(resolver.schema(), connection, call);
+    let mut expand = ExpandCall {
+        replacement: &mut replacement,
+        replaced_calls: 0,
     };
     expand_in_statement(stmt, &mut expand)?;
-    Ok(expanded_a_call)
+    Ok(expand.replaced_calls > 0)
 }
 
 fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<()> {
@@ -190,7 +191,7 @@ fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<
             }
             if let Some(from) = &mut update.from {
                 rewrite_from_clause_expressions(from, &mut |expr| {
-                    expand_call_or_subquery(expr, expand)
+                    expand_in_clause_expr(expr, expand)
                 })?;
             }
             if let Some(where_clause) = &mut update.where_clause {
@@ -258,8 +259,12 @@ fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<
     }
 }
 
-/// The expression that replaces a call, or None to keep the call.
-type ExpandCall<'a> = dyn FnMut(&ast::Expr) -> Result<Option<ast::Expr>> + 'a;
+/// The expansion of the calls of one statement.
+struct ExpandCall<'a> {
+    /// The expression that replaces a call, or None to keep the call.
+    replacement: &'a mut dyn FnMut(&ast::Expr) -> Result<Option<ast::Expr>>,
+    replaced_calls: usize,
+}
 
 fn expand_in_with(with: Option<&mut ast::With>, expand: &mut ExpandCall) -> Result<()> {
     for cte in with.into_iter().flat_map(|with| &mut with.ctes) {
@@ -269,7 +274,7 @@ fn expand_in_with(with: Option<&mut ast::With>, expand: &mut ExpandCall) -> Resu
 }
 
 fn expand_in_select(select: &mut ast::Select, expand: &mut ExpandCall) -> Result<()> {
-    rewrite_select_expressions(select, &mut |expr| expand_call_or_subquery(expr, expand))
+    rewrite_select_expressions(select, &mut |expr| expand_in_clause_expr(expr, expand))
 }
 
 fn expand_in_result_columns(
@@ -307,8 +312,28 @@ fn expand_in_upsert(mut upsert: Option<&mut ast::Upsert>, expand: &mut ExpandCal
     Ok(())
 }
 
-/// Expands the calls in `expr` and in its subqueries.
+/// [`expand_in_expr`] for a walker of the expressions of a clause, which
+/// then does not walk the parts of `expr`.
+fn expand_in_clause_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<WalkControl> {
+    expand_in_expr(expr, expand)?;
+    Ok(WalkControl::SkipChildren)
+}
+
+/// Expands the calls in `expr`, an expression of a clause, and in its
+/// subqueries. Fails when `expr` is then deeper than the parser permits:
+/// the engine walks an expression with recursion.
 fn expand_in_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
+    let replaced_calls_before = expand.replaced_calls;
+    expand_in_part(expr, expand)?;
+    if expand.replaced_calls > replaced_calls_before && is_deeper_than(expr, MAX_EXPR_DEPTH) {
+        return Err(expression_tree_is_too_large());
+    }
+    Ok(())
+}
+
+/// Expands the calls in `expr`, a part of an expression, and in its
+/// subqueries.
+fn expand_in_part(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
     walk_expr_mut(expr, &mut |expr| expand_call_or_subquery(expr, expand))?;
     Ok(())
 }
@@ -330,25 +355,53 @@ fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Res
             ..
         } => {
             for arg in args.iter_mut() {
-                expand_in_expr(arg, expand)?;
+                expand_in_part(arg, expand)?;
             }
             for sorted_column in order_by.iter_mut().chain(within_group.iter_mut()) {
-                expand_in_expr(&mut sorted_column.expr, expand)?;
+                expand_in_part(&mut sorted_column.expr, expand)?;
             }
             if let Some(filter) = &mut filter_over.filter_clause {
-                expand_in_expr(filter, expand)?;
+                expand_in_part(filter, expand)?;
             }
             if let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref_mut() {
                 rewrite_window_expressions(window, &mut |expr| {
                     expand_call_or_subquery(expr, expand)
                 })?;
             }
-            if let Some(expansion) = expand(expr)? {
+            if let Some(expansion) = (expand.replacement)(expr)? {
                 *expr = expansion;
+                expand.replaced_calls += 1;
             }
             return Ok(WalkControl::SkipChildren);
         }
         _ => {}
     }
     Ok(WalkControl::Continue)
+}
+
+/// Whether `expr` has more than `limit` levels. A subquery is one level:
+/// its expressions are expressions of their own clauses.
+fn is_deeper_than(expr: &ast::Expr, limit: usize) -> bool {
+    let mut pending = vec![(expr, 1)];
+    while let Some((expr, depth)) = pending.pop() {
+        if depth > limit {
+            return true;
+        }
+        let mut is_expr = true;
+        let _ = walk_expr(expr, &mut |part: &ast::Expr| {
+            if std::mem::take(&mut is_expr) {
+                return Ok(WalkControl::Continue);
+            }
+            pending.push((part, depth + 1));
+            Ok(WalkControl::SkipChildren)
+        });
+    }
+    false
+}
+
+/// The error of the parser for an expression that is too deep.
+fn expression_tree_is_too_large() -> LimboError {
+    LimboError::ParseError(format!(
+        "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+    ))
 }

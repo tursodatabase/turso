@@ -494,9 +494,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// does not exist. A dialect that wants a clearer error must refuse
     /// these statements.
     ///
-    /// The engine walks an expression with recursion, so the result must not
-    /// have more levels than the parser permits
-    /// ([`turso_parser::parser::MAX_EXPR_DEPTH`]).
+    /// The engine walks an expression with recursion. Thus it refuses a
+    /// statement whose expression has more levels after the expansion than
+    /// the parser permits ([`turso_parser::parser::MAX_EXPR_DEPTH`]).
     fn expand_function_call(
         &self,
         schema: &Schema,
@@ -1057,7 +1057,8 @@ mod tests {
     /// A dialect that defines `twice(x)` as `(x) + (x)`, as a frontend does
     /// for a function that SQL defines. `has_table_added()` is 1 when the
     /// schema has a table `added`, and 0 when it does not: a function whose
-    /// expression changes with the schema.
+    /// expression changes with the schema. `wrapped(x)` is `((x))`: a
+    /// function that makes its argument two levels deeper.
     struct ExpandingDialect;
 
     impl Dialect for ExpandingDialect {
@@ -1085,6 +1086,16 @@ mod tests {
                 return Ok(Some(Expr::Literal(turso_parser::ast::Literal::Numeric(
                     if has_table { "1" } else { "0" }.to_string(),
                 ))));
+            }
+            if name.as_str() == "wrapped" {
+                let [argument] = args.as_slice() else {
+                    return Err(LimboError::ParseError(
+                        "wrapped takes one argument".to_string(),
+                    ));
+                };
+                return Ok(Some(Expr::Parenthesized(vec![Box::new(
+                    Expr::Parenthesized(vec![argument.clone()]),
+                )])));
             }
             if name.as_str() != "twice" {
                 return Ok(None);
@@ -1232,6 +1243,56 @@ mod tests {
         );
         conn.close().unwrap();
         other_conn.close().unwrap();
+    }
+
+    /// `wrapped(x)` nested `calls` times around the constant 1: an
+    /// expression of `2 * calls + 1` levels after the expansion.
+    fn nested_wrapped_calls(calls: usize) -> String {
+        format!("{}1{}", "wrapped(".repeat(calls), ")".repeat(calls))
+    }
+
+    #[test]
+    fn an_expression_that_is_too_deep_after_the_expansion_fails() {
+        // The engine walks an expression with recursion. The depth limit of
+        // the parser is for the stack of a main thread, which is larger than
+        // the stack of a test thread.
+        let on_a_large_stack = std::thread::Builder::new().stack_size(64 << 20);
+        on_a_large_stack
+            .spawn(|| {
+                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                let db =
+                    open_db(&io, "dialect-expand-deep.db", Arc::new(ExpandingDialect)).unwrap();
+                let conn = db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
+                let run = |sql: String| conn.prepare(sql)?.run_collect_rows();
+                let too_large = "Expression tree is too large (maximum depth 100)";
+
+                // 49 calls make 99 levels, and 50 calls make 101 levels.
+                let rows = run(format!("SELECT {}", nested_wrapped_calls(49))).unwrap();
+                assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+                let error = run(format!("SELECT {}", nested_wrapped_calls(50))).unwrap_err();
+                assert!(error.to_string().contains(too_large), "{error}");
+
+                // The expansion of 40 calls has 81 levels. Each `-(` above
+                // it adds two levels: 9 give 99 levels, and 10 give 101.
+                let below_negations = |negations: usize| {
+                    format!(
+                        "SELECT {}{}{}",
+                        "-(".repeat(negations),
+                        nested_wrapped_calls(40),
+                        ")".repeat(negations)
+                    )
+                };
+                let rows = run(below_negations(9)).unwrap();
+                assert_eq!(rows, vec![vec![Value::from_i64(-1)]]);
+                let error = run(below_negations(10)).unwrap_err();
+                assert!(error.to_string().contains(too_large), "{error}");
+                conn.close().unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
