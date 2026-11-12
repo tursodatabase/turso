@@ -164,3 +164,54 @@ test percentile-cont-fraction-changes-across-rows {
 expect error {
     the fraction argument to percentile_cont\(\) is not the same for all input rows
 }
+
+# With GROUP BY the arguments are read back from the sorter, so they are not
+# in consecutive registers either. Each call must get its own fraction.
+
+test percentile-disc-group-by-two-calls {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile_disc(x, 0.5), percentile_disc(y, 0.5) FROM t GROUP BY g;
+}
+expect {
+    a|2.0|200.0
+}
+expect @js {
+    a|2|200
+}
+
+test percentile-disc-group-by-three-fractions {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile_disc(x, 0.25), percentile_disc(x, 0.5), percentile_disc(x, 1.0) FROM t GROUP BY g;
+}
+expect {
+    a|1.0|2.0|4.0
+}
+expect @js {
+    a|1|2|4
+}
+
+test percentile-cont-group-by-three-fractions {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile_cont(x, 0.25), percentile_cont(x, 0.5), percentile_cont(x, 1.0) FROM t GROUP BY g;
+}
+expect {
+    a|1.75|2.5|4.0
+}
+expect @js {
+    a|1.75|2.5|4
+}
+
+test percentile-group-by-three-fractions {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile(x, 25), percentile(x, 50), percentile(x, 100) FROM t GROUP BY g;
+}
+expect {
+    a|1.75|2.5|4.0
+}
+expect @js {
+    a|1.75|2.5|4
+}
