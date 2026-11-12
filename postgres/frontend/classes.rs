@@ -1065,10 +1065,10 @@ fn check_no_function_has_the_name(
 /// Whether a relation of `kind` and a function of the same schema cannot
 /// have the same name: a table or a view.
 pub(crate) fn cannot_have_the_name_of_a_function(kind: RelationKind) -> bool {
-    matches!(
-        kind,
-        RelationKind::Table | RelationKind::View | RelationKind::MaterializedView
-    )
+    match kind {
+        RelationKind::Table | RelationKind::View | RelationKind::MaterializedView => true,
+        RelationKind::Sequence | RelationKind::Index => false,
+    }
 }
 
 /// The relation of `class` as a permission error names it.
