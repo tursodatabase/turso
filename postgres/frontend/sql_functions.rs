@@ -354,9 +354,12 @@ pub(crate) fn translate_create_function(
     let name = create.name.name.as_str();
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
     check_types_are_supported(create)?;
-    // Every built-in name is in lowercase, and PostgreSQL matches the name
-    // of a function exactly. Thus a quoted name with an uppercase letter,
-    // such as "Abs", is not the name of a built-in function or table.
+    // PostgreSQL matches the name of a function exactly, and each built-in
+    // function or table that a statement can use has a name in lowercase.
+    // Thus a quoted name with an uppercase letter, such as "Abs", is not
+    // the name of one. The only built-in names with an uppercase letter are
+    // the trigger functions `RI_FKey_*` of PostgreSQL, which no statement
+    // can call.
     let can_be_a_built_in_name = !name.bytes().any(|byte| byte.is_ascii_uppercase());
     // PostgreSQL looks in pg_catalog first and chooses between functions of
     // one name by the types of the arguments. tursopg does not know these

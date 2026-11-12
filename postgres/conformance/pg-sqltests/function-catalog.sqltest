@@ -1277,9 +1277,10 @@ expect @tursopg error {
     a function with the name of the built-in function "count" is not supported
 }
 
-# PostgreSQL matches the name of a function exactly, and every built-in name
-# is in lowercase. Thus a quoted name with an uppercase letter is not the
-# name of a built-in function or of a built-in table function.
+# PostgreSQL matches the name of a function exactly, and each built-in
+# function that a statement can call has a name in lowercase. Thus a quoted
+# name with an uppercase letter is not the name of a built-in function or of
+# a built-in table function.
 test function-with-the-name-of-a-built-in-function-in-another-case {
     CREATE FUNCTION "Abs"(integer) RETURNS integer LANGUAGE sql AS $$SELECT 42$$;
     CREATE FUNCTION "Count"(integer) RETURNS integer LANGUAGE sql AS $$SELECT 42$$;
