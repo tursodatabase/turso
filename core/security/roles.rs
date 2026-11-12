@@ -20,21 +20,28 @@ use std::collections::{BTreeMap, HashMap};
 use crate::numeric::Numeric;
 use crate::{LimboError, Result, Value};
 
+/// The table that stores the roles created with `CREATE ROLE`.
 pub const ROLES_TABLE_NAME: &str = "__turso_internal_roles";
 
+/// Creates [`ROLES_TABLE_NAME`]. The rowid of a row is the id of its role.
 pub const CREATE_ROLES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_roles (\
     id INTEGER PRIMARY KEY, \
     name TEXT NOT NULL, \
     superuser INTEGER NOT NULL)";
 
+/// The unique index on the role names of [`ROLES_TABLE_NAME`].
 pub const ROLES_NAME_INDEX_NAME: &str = "__turso_internal_roles_name";
 
 /// Keeps role names unique in the stored table, whatever writes it.
 pub const CREATE_ROLES_NAME_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_roles_name ON __turso_internal_roles (name)";
 
+/// Reads the rows of [`ROLES_TABLE_NAME`] in the form that
+/// [`RoleCatalog::new`] takes.
 pub const SELECT_ROLES_SQL: &str = "SELECT id, name, superuser FROM __turso_internal_roles";
 
+/// The id of a role: one of the built-in ids, or the rowid of a role stored
+/// in [`ROLES_TABLE_NAME`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RoleId(i64);
 
@@ -47,17 +54,21 @@ impl RoleId {
     /// run as it.
     pub const PUBLIC: RoleId = RoleId(-1);
 
+    /// The id as stored, such as in an owner column.
     pub fn get(self) -> i64 {
         self.0
     }
 
+    /// The id of the stored role at `rowid`. Panics unless `rowid` is
+    /// positive.
     pub(crate) fn from_rowid(rowid: i64) -> Self {
         assert!(rowid > 0, "role rowid must be positive, got {rowid}");
         RoleId(rowid)
     }
 
     /// A role id read from a stored column, such as `relowner` in the classes
-    /// table: the bootstrap superuser (0) or a stored role's rowid.
+    /// table: the bootstrap superuser (0) or a stored role's rowid. Panics
+    /// for any other value.
     pub fn from_stored(id: i64) -> Self {
         if id == 0 {
             RoleId::SUPERUSER
@@ -67,16 +78,23 @@ impl RoleId {
     }
 }
 
+/// A role stored in [`ROLES_TABLE_NAME`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Role {
+    /// The id of the role, its rowid in the roles table.
     pub id: RoleId,
+    /// The name of the role. Names are case-sensitive and unique.
     pub name: String,
     /// A superuser passes every privilege check.
     pub superuser: bool,
 }
 
-/// The roles stored in the roles table of a database. The built-in role ids
-/// have no entry.
+/// The roles stored in the roles table of a database, in memory. The
+/// built-in role ids have no entry.
+///
+/// Each [`crate::schema::Schema`] holds one, loaded with the schema, so looking up a
+/// role never reads the database. [`crate::Connection::role_catalog`] gives
+/// the catalog of a connection.
 #[derive(Debug, Clone, Default)]
 pub struct RoleCatalog {
     roles: BTreeMap<RoleId, Role>,
@@ -84,8 +102,11 @@ pub struct RoleCatalog {
 }
 
 impl RoleCatalog {
-    /// Returns a catalog of the roles read from the roles table. Each row is
-    /// `(id, name, superuser)`.
+    /// Returns a catalog of the roles read from the roles table with
+    /// [`SELECT_ROLES_SQL`]. Each row is `(id, name, superuser)`.
+    ///
+    /// Fails with [`LimboError::Corrupt`] for a row that is not a valid role,
+    /// or for two rows with the same id or name.
     pub fn new(rows: &[Vec<Value>]) -> Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
@@ -101,11 +122,12 @@ impl RoleCatalog {
         Ok(catalog)
     }
 
+    /// The stored role with id `id`. None for a built-in id.
     pub fn get(&self, id: RoleId) -> Option<&Role> {
         self.roles.get(&id)
     }
 
-    /// Role names are case-sensitive.
+    /// The stored role named `name`. Role names are case-sensitive.
     pub fn get_by_name(&self, name: &str) -> Option<&Role> {
         self.ids_by_name.get(name).and_then(|id| self.roles.get(id))
     }
@@ -115,8 +137,8 @@ impl RoleCatalog {
         self.roles.values()
     }
 
-    /// [RoleId::SUPERUSER] is a superuser. Any other role that is not in the
-    /// catalog is not.
+    /// Whether role `id` passes every privilege check. [RoleId::SUPERUSER]
+    /// does. Any other role that is not in the catalog does not.
     pub fn is_superuser(&self, id: RoleId) -> bool {
         id == RoleId::SUPERUSER || self.get(id).is_some_and(|role| role.superuser)
     }
@@ -129,6 +151,8 @@ impl RoleCatalog {
         role != RoleId::PUBLIC && (member == role || self.is_superuser(member))
     }
 
+    /// Adds `role` to the catalog. Panics if its id or name is already in
+    /// use.
     pub fn add(&mut self, role: Role) {
         assert!(
             !self.roles.contains_key(&role.id),
