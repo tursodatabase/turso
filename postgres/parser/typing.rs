@@ -342,6 +342,12 @@ pub fn type_of(node: &Node, scopes: &Scopes) -> ExprType {
         NodeKind::RowExpr(row) => not_covered("a row value", &types_of(&row.args, scopes)),
         NodeKind::AIndirection(indirection) => {
             let operand = indirection.arg.as_deref().map(|arg| type_of(arg, scopes));
+            if is_one_subscript(&indirection.indirection) {
+                match &operand {
+                    Some(Ok(PgType::Text)) => return Ok(PgType::Char),
+                    _ => {}
+                }
+            }
             not_covered(
                 "a subscript or field selection",
                 &operand.into_iter().collect::<Vec<_>>(),
@@ -449,6 +455,13 @@ pub fn check_values_columns(select: &SelectStmt, scopes: &Scopes) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn is_one_subscript(steps: &[Node]) -> bool {
+    matches!(
+        steps,
+        [Node { node: Some(NodeKind::AIndices(indices)) }] if !indices.is_slice
+    )
 }
 
 fn type_not_known(description: &str) -> ParseError {
@@ -2685,6 +2698,13 @@ mod tests {
     }
 
     #[test]
+    fn a_subscript_of_a_name_is_a_char() {
+        assert_eq!(type_from_t("b[0]"), Some(PgType::Char));
+        assert_eq!(type_from_t("(b)[1]"), Some(PgType::Char));
+        assert_eq!(type_from_t("b[0] = '_'"), Some(PgType::Bool));
+    }
+
+    #[test]
     fn a_slice_or_several_subscripts_of_a_name_are_not_typed() {
         assert_eq!(type_from_t("b[0:1]"), None);
         assert_eq!(type_from_t("b[0][1]"), None);
@@ -2698,6 +2718,7 @@ mod tests {
         );
         assert_eq!(type_from_t("a::pg_catalog.regproc"), Some(PgType::Regproc));
         assert_eq!(type_from_t("0::pg_catalog.int2"), Some(PgType::Int2));
+        assert_eq!(type_from_t("'s'::\"char\""), Some(PgType::Char));
     }
 
     #[test]

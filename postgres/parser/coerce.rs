@@ -28,6 +28,8 @@ pub enum PgType {
     Regnamespace,
     /// A reference to a function: the value passes as it is, whether it is an oid or a name.
     Regproc,
+    /// The one-byte internal type that PostgreSQL writes as "char".
+    Char,
     /// A string literal, NULL or parameter: its type comes from where it is used.
     Unknown,
     /// A type that has a name but no supported casts yet (date, uuid, an enum, ...). Lowercase name.
@@ -68,6 +70,7 @@ impl PgType {
             "regclass" => PgType::Regclass,
             "regnamespace" => PgType::Regnamespace,
             "regproc" => PgType::Regproc,
+            "char" => PgType::Char,
             _ => PgType::Other(spelled),
         }
     }
@@ -102,7 +105,7 @@ impl PgType {
             PgType::Int4 | PgType::Oid | PgType::Regclass | PgType::Regnamespace => "INTEGER",
             PgType::Int8 => "BIGINT",
             PgType::Float8 | PgType::Numeric => "REAL",
-            PgType::Text => "TEXT",
+            PgType::Text | PgType::Char => "TEXT",
             PgType::Bytea => "BLOB",
             PgType::Bool => "boolean",
             PgType::Regproc | PgType::Unknown | PgType::Other(_) => return None,
@@ -137,7 +140,7 @@ impl PgType {
             | PgType::Regclass
             | PgType::Regnamespace
             | PgType::Regproc => TypeCategory::Number,
-            PgType::Text => TypeCategory::String,
+            PgType::Text | PgType::Char => TypeCategory::String,
             PgType::Bytea => TypeCategory::UserDefined,
             PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
         }
@@ -195,6 +198,7 @@ impl fmt::Display for PgType {
             PgType::Regclass => "regclass",
             PgType::Regnamespace => "regnamespace",
             PgType::Regproc => "regproc",
+            PgType::Char => "\"char\"",
             PgType::Unknown => "unknown",
             PgType::Other(name) => name,
         };
@@ -501,7 +505,7 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
     use CastMethod::{EngineCast, Function, Nothing, RoundThenCast};
     use CastRule::{Allowed, NoCast, Unsupported};
     use PgType::{
-        Bool, Bytea, Float8, Int2, Int4, Int8, Numeric, Oid, Other, Regclass, Regnamespace,
+        Bool, Bytea, Char, Float8, Int2, Int4, Int8, Numeric, Oid, Other, Regclass, Regnamespace,
         Regproc, Text,
     };
 
@@ -540,6 +544,7 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
         (Regclass | Regnamespace | Regproc, Text) => Unsupported(Assignment),
         (Text, Regclass) => Allowed(Implicit, Function(TEXT_TO_REGCLASS)),
         (Text, Regproc) => Allowed(Explicit, Nothing),
+        (Char, Text) => Allowed(Implicit, Nothing),
         (alias, Bool | Float8 | Numeric | Bytea) | (Bool | Float8 | Numeric | Bytea, alias)
             if alias.is_oid_alias() =>
         {
@@ -663,6 +668,7 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
         PgType::Bool => return parse_bool(&text, trimmed).map(bool_literal),
         PgType::Bytea => parse_bytea(&text, trimmed)?,
         PgType::Oid => ast::Literal::Numeric(parse_oid(&text)?.to_string()),
+        PgType::Char => parse_char(&text)?,
         PgType::Regclass | PgType::Regnamespace => {
             let reader = target.unknown_reader().expect("an oid alias has a reader");
             return Ok(function_call(
@@ -816,6 +822,36 @@ pub fn parse_oid(text: &str) -> Result<i64, ParseError> {
         return Err(out_of_range());
     }
     Ok(i64::from(wrapped as u32))
+}
+
+fn parse_char(text: &str) -> Result<ast::Literal, ParseError> {
+    let bytes = text.as_bytes();
+    let is_octal = |b: &u8| (b'0'..=b'7').contains(b);
+    let code = if bytes.len() == 4 && bytes[0] == b'\\' && bytes[1..].iter().all(is_octal) {
+        bytes[1..]
+            .iter()
+            .fold(0u32, |total, digit| total * 8 + u32::from(digit - b'0'))
+    } else {
+        text.chars().next().map_or(0, u32::from)
+    };
+    let kept = match u8::try_from(code) {
+        Ok(byte) if byte.is_ascii() => char::from(byte),
+        _ => {
+            return Err(error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("the value \"{text}\" for type \"char\" is not supported"),
+            ))
+        }
+    };
+    let shown = if code == 0 {
+        String::new()
+    } else {
+        kept.to_string()
+    };
+    Ok(ast::Literal::String(format!(
+        "'{}'",
+        shown.replace('\'', "''")
+    )))
 }
 
 fn parse_real(text: &str, trimmed: &str, type_name: &str) -> Result<ast::Literal, ParseError> {
@@ -3236,6 +3272,105 @@ mod tests {
             coerce_operands("||", OperatorKind::Concat, items).unwrap(),
             vec![cast_to(number("1"), &PgType::Text), string("x")]
         );
+    }
+
+    #[test]
+    fn the_internal_char_type_is_not_the_same_as_bpchar() {
+        assert_eq!(PgType::from_name("char"), PgType::Char);
+        assert_eq!(PgType::from_name("CHAR"), PgType::Char);
+        assert_eq!(
+            PgType::from_name("bpchar"),
+            PgType::Other("bpchar".to_string())
+        );
+        assert_eq!(PgType::Char.to_string(), "\"char\"");
+        assert_eq!(PgType::Char.engine_type(), PgType::Text.engine_type());
+    }
+
+    #[test]
+    fn string_literal_becomes_a_char() {
+        for (text, expected) in [
+            ("s", "s"),
+            ("r", "r"),
+            ("abc", "a"),
+            ("", ""),
+            ("\\163", "s"),
+            ("\\000", ""),
+            ("\\1634", "\\"),
+            ("'", "'"),
+        ] {
+            assert_eq!(
+                convert_text(text, &PgType::Char).unwrap(),
+                string(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_that_is_not_one_ascii_byte_as_a_char_is_not_supported() {
+        for text in ["\\377", "\\200", "\u{e9}", "\u{e9}x"] {
+            assert_error(
+                convert_text(text, &PgType::Char),
+                "0A000",
+                &format!("the value \"{text}\" for type \"char\" is not supported"),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_cast_of_a_char_string_literal_adds_one_cast() {
+        assert_eq!(
+            coerce(string("s"), Some(&PgType::Unknown), &PgType::Char, Explicit).unwrap(),
+            cast_to(string("s"), &PgType::Char)
+        );
+    }
+
+    #[test]
+    fn char_converts_to_text_without_changing_the_value() {
+        expect_expr(&PgType::Char, &PgType::Text, Implicit, "nothing");
+    }
+
+    #[test]
+    fn char_has_no_other_supported_cast() {
+        for target in [PgType::Int4, PgType::Bool, PgType::Float8, PgType::Bytea] {
+            assert_error(
+                convert(&PgType::Char, &target, Explicit),
+                "0A000",
+                &format!("a cast from \"char\" to {target} is not supported"),
+            );
+        }
+        assert_error(
+            convert(&PgType::Text, &PgType::Char, Explicit),
+            "0A000",
+            "a cast from text to \"char\" is not supported",
+        );
+    }
+
+    #[test]
+    fn common_type_of_chars_is_char() {
+        assert_eq!(
+            common_type(&[PgType::Char, PgType::Unknown, PgType::Char], "CASE").unwrap(),
+            PgType::Char
+        );
+    }
+
+    #[test]
+    fn comparison_of_char_with_a_string_literal_runs_on_text() {
+        let items = vec![
+            (number("1"), Some(PgType::Char)),
+            (string("x"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+            vec![number("1"), string("x")]
+        );
+    }
+
+    #[test]
+    fn common_type_of_char_and_text_is_text_in_either_order() {
+        for types in [[PgType::Char, PgType::Text], [PgType::Text, PgType::Char]] {
+            assert_eq!(common_type(&types, "CASE").unwrap(), PgType::Text);
+        }
     }
 
     #[test]
