@@ -1,0 +1,2730 @@
+use crate::sqlstate::{
+    SQLSTATE_AMBIGUOUS_FUNCTION, SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_UNDEFINED_FUNCTION,
+};
+use crate::translator::function_call;
+use crate::ParseError;
+use std::fmt;
+use turso_parser::ast;
+
+/// A PostgreSQL type that the translator knows how to convert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgType {
+    Bool,
+    Int4,
+    Int8,
+    Float8,
+    Numeric,
+    Text,
+    Bytea,
+    /// A string literal, NULL or parameter: its type comes from where it is used.
+    Unknown,
+    /// A type that has a name but no supported casts yet (date, uuid, an enum, ...). Lowercase name.
+    Other(String),
+}
+
+/// The kind of an operator, which decides the type its operands are converted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorKind {
+    Arithmetic,
+    Comparison,
+    Concat,
+    Pattern,
+}
+
+/// Where a conversion happens, from the weakest to the strongest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+impl PgType {
+    /// Finds the type with this name, ignoring case; every name of a type gives the same value.
+    pub fn from_name(name: &str) -> PgType {
+        let spelled = one_spelling(name);
+        match spelled.as_str() {
+            "int4" => PgType::Int4,
+            "int8" => PgType::Int8,
+            "float8" => PgType::Float8,
+            "numeric" => PgType::Numeric,
+            "text" | "name" => PgType::Text,
+            "bool" => PgType::Bool,
+            "bytea" => PgType::Bytea,
+            _ => PgType::Other(spelled),
+        }
+    }
+
+    /// The type of a column that the engine's catalog stores under this type name and type parameters.
+    pub fn from_column_type(declared: &str, array_dimensions: u32, parameters: &[i64]) -> PgType {
+        let lowercase = declared.to_lowercase();
+        if array_dimensions > 0 {
+            let brackets = "[]".repeat(array_dimensions as usize);
+            return PgType::from_name(&format!("{lowercase}{brackets}"));
+        }
+        match (lowercase.as_str(), parameters) {
+            ("integer" | "int", _) => PgType::Int4,
+            ("bigint", _) => PgType::Int8,
+            ("real", _) => PgType::Float8,
+            ("text", _) => PgType::Text,
+            ("blob" | "bytea", _) => PgType::Bytea,
+            ("boolean", _) => PgType::Bool,
+            ("numeric", [precision, scale]) => {
+                PgType::from_name(&format!("numeric({precision},{scale})"))
+            }
+            ("numeric", [precision]) => PgType::from_name(&format!("numeric({precision},0)")),
+            ("numeric", _) => PgType::from_name("numeric with a precision"),
+            _ => PgType::from_name(&lowercase),
+        }
+    }
+
+    /// The type the engine uses to store values of this type, if there is one.
+    pub fn engine_type(&self) -> Option<ast::Type> {
+        let name = match self {
+            PgType::Int4 => "INTEGER",
+            PgType::Int8 => "BIGINT",
+            PgType::Float8 | PgType::Numeric => "REAL",
+            PgType::Text => "TEXT",
+            PgType::Bytea => "BLOB",
+            PgType::Bool => "boolean",
+            PgType::Unknown | PgType::Other(_) => return None,
+        };
+        Some(ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        })
+    }
+
+    /// The letter `pg_type.typcategory` has for this type, if this module knows the type.
+    pub fn category_letter(&self) -> Option<&'static str> {
+        match self.category() {
+            TypeCategory::Boolean => Some("B"),
+            TypeCategory::Number => Some("N"),
+            TypeCategory::String => Some("S"),
+            TypeCategory::UserDefined => Some("U"),
+            TypeCategory::Other => None,
+        }
+    }
+
+    fn category(&self) -> TypeCategory {
+        match self {
+            PgType::Bool => TypeCategory::Boolean,
+            PgType::Int4 | PgType::Int8 | PgType::Float8 | PgType::Numeric => TypeCategory::Number,
+            PgType::Text => TypeCategory::String,
+            PgType::Bytea => TypeCategory::UserDefined,
+            PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
+        }
+    }
+
+    fn is_preferred(&self) -> bool {
+        matches!(self, PgType::Bool | PgType::Float8 | PgType::Text)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeCategory {
+    Boolean,
+    Number,
+    String,
+    UserDefined,
+    Other,
+}
+
+impl fmt::Display for PgType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            PgType::Bool => "boolean",
+            PgType::Int4 => "integer",
+            PgType::Int8 => "bigint",
+            PgType::Float8 => "double precision",
+            PgType::Numeric => "numeric",
+            PgType::Text => "text",
+            PgType::Bytea => "bytea",
+            PgType::Unknown => "unknown",
+            PgType::Other(name) => name,
+        };
+        f.write_str(name)
+    }
+}
+
+/// Builds the expression that converts `expr` from `source` (None: a name that does not resolve, which the engine reports) to `target`, or the error PostgreSQL gives.
+pub fn coerce(
+    expr: ast::Expr,
+    source: Option<&PgType>,
+    target: &PgType,
+    context: CastContext,
+) -> Result<ast::Expr, ParseError> {
+    let Some(source) = source else {
+        return coerce_from_unknown_source(expr, target, context);
+    };
+    match cast_decision(source, target, context)? {
+        CastDecision::Keep => Ok(wrap_if_explicit(expr, target, context)),
+        CastDecision::FromUnknown => coerce_from_unknown(expr, target, context),
+        CastDecision::Convert(method) => {
+            let converted = if *target == PgType::Int8 && is_numeric_literal_outside_int8(&expr) {
+                function_call("int8_out_of_range", vec![])
+            } else {
+                match method {
+                    CastMethod::Nothing => expr,
+                    CastMethod::EngineCast => engine_cast(expr, target),
+                    CastMethod::Function(name) => function_call(name, vec![expr]),
+                    CastMethod::RoundThenCast => {
+                        engine_cast(function_call("round", vec![expr]), target)
+                    }
+                }
+            };
+            Ok(wrap_if_explicit(converted, target, context))
+        }
+    }
+}
+
+/// Decides what converting a value from `source` to `target` in `context` takes, or gives the error PostgreSQL gives.
+pub fn cast_decision(
+    source: &PgType,
+    target: &PgType,
+    context: CastContext,
+) -> Result<CastDecision, ParseError> {
+    if *target == PgType::Unknown || source == target {
+        return Ok(CastDecision::Keep);
+    }
+    if *source == PgType::Unknown {
+        return Ok(CastDecision::FromUnknown);
+    }
+    match cast_rule(source, target) {
+        CastRule::NoCast if context < CastContext::Explicit => {
+            Err(cannot_be_used_without_a_cast(source, target))
+        }
+        CastRule::NoCast => Err(error(
+            SQLSTATE_CANNOT_COERCE,
+            format!("cannot cast type {source} to {target}"),
+        )),
+        CastRule::Unsupported(weakest) if context < weakest => {
+            Err(cannot_be_used_without_a_cast(source, target))
+        }
+        CastRule::Unsupported(_) => Err(cast_not_supported(source, target)),
+        CastRule::Allowed(weakest, _) if context < weakest => {
+            Err(cannot_be_used_without_a_cast(source, target))
+        }
+        CastRule::Allowed(_, method) => Ok(CastDecision::Convert(method)),
+    }
+}
+
+/// Like `cast_decision` for a value stored in the column `column`, with the error PostgreSQL gives for that.
+pub fn assignment_decision(
+    source: &PgType,
+    column: &str,
+    target: &PgType,
+) -> Result<CastDecision, ParseError> {
+    cast_decision(source, target, CastContext::Assignment)
+        .map_err(|failure| column_mismatch(failure, column, source, target))
+}
+
+/// Converts `expr` to the type of the column `column` it is stored in, or gives the error PostgreSQL gives.
+pub fn coerce_assignment(
+    expr: ast::Expr,
+    source: Option<&PgType>,
+    column: &str,
+    target: Option<&PgType>,
+) -> Result<ast::Expr, ParseError> {
+    let (Some(source), Some(target)) = (source, target) else {
+        return Ok(expr);
+    };
+    coerce(expr, Some(source), target, CastContext::Assignment)
+        .map_err(|failure| column_mismatch(failure, column, source, target))
+}
+
+/// Converts the values a construct returns one of (the results of CASE, the arguments of COALESCE, ...) to their common type.
+pub fn coerce_to_common(
+    construct: &str,
+    values: Vec<(ast::Expr, Option<PgType>)>,
+) -> Result<Vec<ast::Expr>, ParseError> {
+    let Some(types) = values
+        .iter()
+        .map(|(_, ty)| ty.clone())
+        .collect::<Option<Vec<PgType>>>()
+    else {
+        return Ok(without_types(values));
+    };
+    let target = common_type(&types, construct)?;
+    values
+        .into_iter()
+        .zip(&types)
+        .map(|((expr, _), ty)| coerce(expr, Some(ty), &target, CastContext::Implicit))
+        .collect()
+}
+
+fn coerce_from_unknown_source(
+    expr: ast::Expr,
+    target: &PgType,
+    context: CastContext,
+) -> Result<ast::Expr, ParseError> {
+    match target {
+        PgType::Other(_) => Err(cast_not_supported(&PgType::Unknown, target)),
+        PgType::Unknown => Ok(expr),
+        _ => Ok(wrap_if_explicit(expr, target, context)),
+    }
+}
+
+fn coerce_from_unknown(
+    expr: ast::Expr,
+    target: &PgType,
+    context: CastContext,
+) -> Result<ast::Expr, ParseError> {
+    let converted = match expr {
+        ast::Expr::Literal(ast::Literal::String(quoted)) => {
+            if matches!(target, PgType::Other(_)) {
+                return Err(cast_not_supported(&PgType::Unknown, target));
+            }
+            convert_literal(&quoted, target)?
+        }
+        _ if context == CastContext::Explicit && matches!(target, PgType::Other(_)) => {
+            return Err(cast_not_supported(&PgType::Unknown, target))
+        }
+        other => other,
+    };
+    Ok(wrap_if_explicit(converted, target, context))
+}
+
+/// Converts the operands of `operator` to the type the operator runs on, or gives the error PostgreSQL gives.
+pub fn coerce_operands(
+    operator: &str,
+    kind: OperatorKind,
+    operands: Vec<(ast::Expr, Option<PgType>)>,
+) -> Result<Vec<ast::Expr>, ParseError> {
+    let Some(types) = operands
+        .iter()
+        .map(|(_, ty)| ty.clone())
+        .collect::<Option<Vec<PgType>>>()
+    else {
+        return Ok(without_types(operands));
+    };
+    let Some(target) = operand_target(operator, kind, &types)? else {
+        return Ok(without_types(operands));
+    };
+    let context = match kind {
+        OperatorKind::Concat => CastContext::Assignment,
+        _ => CastContext::Implicit,
+    };
+    operands
+        .into_iter()
+        .zip(&types)
+        .map(|((expr, _), ty)| coerce(expr, Some(ty), &target, context))
+        .collect()
+}
+
+/// Makes `expr` a boolean for `construct` (WHERE, HAVING, ...), or gives the error PostgreSQL gives.
+pub fn coerce_to_boolean(
+    expr: ast::Expr,
+    source: Option<&PgType>,
+    construct: &str,
+) -> Result<ast::Expr, ParseError> {
+    match source {
+        None | Some(PgType::Bool) => Ok(expr),
+        Some(PgType::Unknown) => coerce(
+            expr,
+            Some(&PgType::Unknown),
+            &PgType::Bool,
+            CastContext::Implicit,
+        ),
+        Some(other @ PgType::Other(_)) => Err(cast_not_supported(other, &PgType::Bool)),
+        Some(other) => Err(error(
+            SQLSTATE_DATATYPE_MISMATCH,
+            format!("argument of {construct} must be type boolean, not type {other}"),
+        )),
+    }
+}
+
+/// Checks that a unary `+` or `-` can be applied to a value of type `operand`, or gives the error PostgreSQL gives.
+pub fn check_unary_operand(operator: &str, operand: Option<&PgType>) -> Result<(), ParseError> {
+    match operand {
+        None => Ok(()),
+        Some(ty @ (PgType::Text | PgType::Bool | PgType::Bytea)) => Err(error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            format!("operator does not exist: {operator} {ty}"),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Finds the one type that all of `types` can be converted to; `construct` names the SQL construct in error messages.
+// FIXME: the engine picks a common type again for the translated expression, in
+// core/translate/expr/expr_type.rs, and the two can disagree. Make them one.
+pub fn common_type(types: &[PgType], construct: &str) -> Result<PgType, ParseError> {
+    let known: Vec<&PgType> = types.iter().filter(|t| **t != PgType::Unknown).collect();
+    let Some(first) = known.first() else {
+        return Ok(PgType::Text);
+    };
+    let mut chosen: &PgType = first;
+    for next in &known {
+        if *next == chosen {
+            continue;
+        }
+        if matches!(chosen, PgType::Other(_)) || matches!(next, PgType::Other(_)) {
+            return Err(error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("{construct} with types {chosen} and {next} is not supported"),
+            ));
+        }
+        if chosen.category() != next.category() {
+            return Err(error(
+                SQLSTATE_DATATYPE_MISMATCH,
+                format!("{construct} types {chosen} and {next} cannot be matched"),
+            ));
+        }
+        if !chosen.is_preferred()
+            && converts_implicitly(chosen, next)
+            && !converts_implicitly(next, chosen)
+        {
+            chosen = next;
+        }
+    }
+    if let Some(stuck) = known.iter().find(|t| !converts_implicitly(t, chosen)) {
+        return Err(error(
+            SQLSTATE_CANNOT_COERCE,
+            format!("{construct} could not convert type {stuck} to {chosen}"),
+        ));
+    }
+    Ok(chosen.clone())
+}
+
+fn converts_implicitly(source: &PgType, target: &PgType) -> bool {
+    source == target || cast_decision(source, target, CastContext::Implicit).is_ok()
+}
+
+/// Builds the engine's CAST of `expr` to `type_name`, for the stored SQL that the engine runs as it is.
+pub fn engine_cast_as(expr: ast::Expr, type_name: ast::Type) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(type_name),
+    }
+}
+
+/// A boolean literal.
+pub fn bool_literal(value: bool) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+            if value { "1" } else { "0" }.to_string(),
+        ))),
+        type_name: PgType::Bool.engine_type(),
+    }
+}
+
+/// What converting a value from one type to another takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastDecision {
+    /// The value is already of the target type, or the target is unknown.
+    Keep,
+    /// The value is a string literal, NULL or parameter, which reads as the target type.
+    FromUnknown,
+    Convert(CastMethod),
+}
+
+/// How the engine expression changes a value that converts to another type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastMethod {
+    Nothing,
+    EngineCast,
+    RoundThenCast,
+    Function(&'static str),
+}
+
+enum CastRule {
+    NoCast,
+    Unsupported(CastContext),
+    Allowed(CastContext, CastMethod),
+}
+
+fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
+    use CastContext::{Assignment, Explicit, Implicit};
+    use CastMethod::{EngineCast, Nothing, RoundThenCast};
+    use CastRule::{Allowed, NoCast, Unsupported};
+    use PgType::{Bool, Bytea, Float8, Int4, Int8, Numeric, Other, Text};
+
+    match (source, target) {
+        (Int4, Int8) => Allowed(Implicit, Nothing),
+        (Int4, Float8) => Allowed(Implicit, EngineCast),
+        (Int4, Numeric) => Allowed(Implicit, EngineCast),
+        (Int4, Text) => Allowed(Assignment, EngineCast),
+        (Int4, Bool) => Unsupported(Explicit),
+        (Int8, Int4) => Allowed(Assignment, Nothing),
+        (Int8, Float8) => Allowed(Implicit, EngineCast),
+        (Int8, Numeric) => Allowed(Implicit, EngineCast),
+        (Int8, Text) => Allowed(Assignment, EngineCast),
+        (Float8, Int4) => Allowed(Assignment, RoundThenCast),
+        (Float8, Int8) => Allowed(Assignment, RoundThenCast),
+        (Float8, Numeric) => Allowed(Assignment, Nothing),
+        (Float8, Text) => Unsupported(Assignment),
+        (Numeric, Int4) => Allowed(Assignment, RoundThenCast),
+        (Numeric, Int8) => Allowed(Assignment, RoundThenCast),
+        (Numeric, Float8) => Allowed(Implicit, Nothing),
+        (Numeric, Text) => Unsupported(Assignment),
+        (Bool, Int4) => Allowed(Explicit, EngineCast),
+        (Bool, Text) => Unsupported(Assignment),
+        (Bytea, Text) => Unsupported(Assignment),
+        (Other(_), _) | (_, Other(_)) => Unsupported(Implicit),
+        (Text, _) => Unsupported(Explicit),
+        (Bool, Int8 | Float8 | Numeric) | (Int8 | Float8 | Numeric, Bool) => NoCast,
+        (Bytea, Bool | Float8 | Numeric) | (Bool | Float8 | Numeric, Bytea) => NoCast,
+        _ => Unsupported(Explicit),
+    }
+}
+
+fn without_types(operands: Vec<(ast::Expr, Option<PgType>)>) -> Vec<ast::Expr> {
+    operands.into_iter().map(|(expr, _)| expr).collect()
+}
+
+fn operand_target(
+    operator: &str,
+    kind: OperatorKind,
+    types: &[PgType],
+) -> Result<Option<PgType>, ParseError> {
+    let known: Vec<&PgType> = types.iter().filter(|t| **t != PgType::Unknown).collect();
+    let Some(first) = known.first() else {
+        if kind == OperatorKind::Arithmetic {
+            return Err(error(
+                SQLSTATE_AMBIGUOUS_FUNCTION,
+                format!("operator is not unique: unknown {operator} unknown"),
+            ));
+        }
+        return Ok(None);
+    };
+    let different = known.iter().find(|t| *t != first);
+    if known.iter().any(|t| matches!(t, PgType::Other(_))) {
+        return match different {
+            None => Ok(Some((*first).clone())),
+            Some(different) => Err(error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "the operator {operator} for types {first} and {different} is not supported"
+                ),
+            )),
+        };
+    }
+    let target = match kind {
+        OperatorKind::Arithmetic => operand_type_among(&known, ARITHMETIC_OPERAND_TYPES),
+        OperatorKind::Comparison => match different {
+            None if COMPARISON_OPERAND_TYPES.contains(first) => Some((*first).clone()),
+            _ => operand_type_among(&known, COMPARISON_OPERAND_TYPES),
+        },
+        OperatorKind::Concat if known.iter().all(|t| **t == PgType::Bytea) => Some(PgType::Bytea),
+        OperatorKind::Concat => Some(PgType::Text),
+        OperatorKind::Pattern => known
+            .iter()
+            .all(|t| converts_implicitly(t, &PgType::Text))
+            .then_some(PgType::Text),
+    };
+    match target {
+        Some(target) => Ok(Some(target)),
+        None => Err(operator_does_not_exist(operator, types, different)),
+    }
+}
+
+fn operator_does_not_exist(
+    operator: &str,
+    types: &[PgType],
+    different: Option<&&PgType>,
+) -> ParseError {
+    let (left, right) = match (types.iter().find(|t| **t != PgType::Unknown), different) {
+        (Some(first), Some(different)) => (first, *different),
+        _ => (&types[0], types.get(1).unwrap_or(&types[0])),
+    };
+    error(
+        SQLSTATE_UNDEFINED_FUNCTION,
+        format!("operator does not exist: {left} {operator} {right}"),
+    )
+}
+
+const ARITHMETIC_OPERAND_TYPES: &[PgType] =
+    &[PgType::Int4, PgType::Int8, PgType::Numeric, PgType::Float8];
+
+const COMPARISON_OPERAND_TYPES: &[PgType] = &[
+    PgType::Int4,
+    PgType::Int8,
+    PgType::Numeric,
+    PgType::Float8,
+    PgType::Text,
+    PgType::Bool,
+    PgType::Bytea,
+];
+
+fn operand_type_among(known: &[&PgType], candidates: &[PgType]) -> Option<PgType> {
+    let exact_matches = |candidate: &PgType| known.iter().filter(|t| ***t == *candidate).count();
+    candidates
+        .iter()
+        .filter(|candidate| known.iter().all(|t| converts_implicitly(t, candidate)))
+        .max_by_key(|candidate| (exact_matches(candidate), candidate.is_preferred()))
+        .cloned()
+}
+
+fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseError> {
+    let text = unquote(quoted);
+    let trimmed = text.trim();
+    let literal = match target {
+        PgType::Text => return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string()))),
+        PgType::Int4 => ast::Literal::Numeric(parse_int4(&text)?.to_string()),
+        PgType::Int8 => ast::Literal::Numeric(parse_int8(&text)?.to_string()),
+        PgType::Float8 => parse_real(&text, trimmed, "double precision")?,
+        PgType::Numeric => parse_real(&text, trimmed, "numeric")?,
+        PgType::Bool => return parse_bool(&text, trimmed).map(bool_literal),
+        PgType::Bytea => parse_bytea(&text, trimmed)?,
+        PgType::Unknown | PgType::Other(_) => {
+            return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string())))
+        }
+    };
+    Ok(ast::Expr::Literal(literal))
+}
+
+fn unquote(quoted: &str) -> String {
+    let inner = quoted
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap_or(quoted);
+    inner.replace("''", "'")
+}
+
+/// Reads `text` the way PostgreSQL reads an integer: spaces around, an optional sign, then decimal digits or a 0x, 0o or 0b prefix, with single underscores between digits.
+pub fn parse_int4(text: &str) -> Result<i64, ParseError> {
+    parse_integer(text, "integer", 1 << 31)
+}
+
+/// Reads `text` the way PostgreSQL reads a bigint, with the rules of `parse_int4`.
+pub fn parse_int8(text: &str) -> Result<i64, ParseError> {
+    parse_integer(text, "bigint", 1 << 63)
+}
+
+fn parse_integer(text: &str, type_name: &str, negative_limit: u64) -> Result<i64, ParseError> {
+    let bytes = text.as_bytes();
+    let invalid = || invalid_input(type_name, text);
+    let out_of_range = || {
+        error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            format!("value \"{text}\" is out of range for type {type_name}"),
+        )
+    };
+    let is_space = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let mut position = bytes.iter().take_while(|b| is_space(b)).count();
+    let negative = bytes.get(position) == Some(&b'-');
+    if matches!(bytes.get(position), Some(b'-' | b'+')) {
+        position += 1;
+    }
+    let radix: u32 = match (bytes.get(position), bytes.get(position + 1)) {
+        (Some(b'0'), Some(b'x' | b'X')) => 16,
+        (Some(b'0'), Some(b'o' | b'O')) => 8,
+        (Some(b'0'), Some(b'b' | b'B')) => 2,
+        _ => 10,
+    };
+    if radix != 10 {
+        position += 2;
+    }
+    let first_digit = position;
+    let mut magnitude: u64 = 0;
+    while let Some(byte) = bytes.get(position) {
+        if let Some(digit) = char::from(*byte).to_digit(radix) {
+            if magnitude > negative_limit / u64::from(radix) {
+                return Err(out_of_range());
+            }
+            magnitude = magnitude * u64::from(radix) + u64::from(digit);
+            position += 1;
+        } else if *byte == b'_' {
+            if radix == 10 && position == first_digit {
+                return Err(invalid());
+            }
+            position += 1;
+            let after = bytes
+                .get(position)
+                .and_then(|b| char::from(*b).to_digit(radix));
+            if after.is_none() {
+                return Err(invalid());
+            }
+        } else {
+            break;
+        }
+    }
+    if position == first_digit || !bytes[position..].iter().all(is_space) {
+        return Err(invalid());
+    }
+    if negative && magnitude <= negative_limit {
+        return Ok((magnitude as i128).wrapping_neg() as i64);
+    }
+    if !negative && magnitude < negative_limit {
+        return Ok(magnitude as i64);
+    }
+    Err(out_of_range())
+}
+
+fn parse_real(text: &str, trimmed: &str, type_name: &str) -> Result<ast::Literal, ParseError> {
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    let lowercase = unsigned.to_lowercase();
+    if matches!(lowercase.as_str(), "nan" | "infinity" | "inf") {
+        return Err(error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("the value \"{text}\" for type {type_name} is not supported"),
+        ));
+    }
+    if !is_decimal_number(unsigned) {
+        return Err(invalid_input(type_name, text));
+    }
+    let mut number = trimmed.strip_prefix('+').unwrap_or(trimmed).to_string();
+    if !number.contains(['.', 'e', 'E']) {
+        number.push_str(".0");
+    }
+    Ok(ast::Literal::Numeric(number))
+}
+
+fn is_decimal_number(unsigned: &str) -> bool {
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(whole) || !all_digits(fraction) || (whole.is_empty() && fraction.is_empty()) {
+        return false;
+    }
+    match exponent {
+        None => true,
+        Some(exponent) => {
+            let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+            !digits.is_empty() && all_digits(digits)
+        }
+    }
+}
+
+fn parse_bool(text: &str, trimmed: &str) -> Result<bool, ParseError> {
+    match trimmed.to_lowercase().as_str() {
+        "t" | "true" | "y" | "yes" | "on" | "1" => Ok(true),
+        "f" | "false" | "n" | "no" | "off" | "0" => Ok(false),
+        _ => Err(invalid_input("boolean", text)),
+    }
+}
+
+fn parse_bytea(text: &str, trimmed: &str) -> Result<ast::Literal, ParseError> {
+    let Some(hex) = trimmed.strip_prefix("\\x") else {
+        return Err(error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "the bytea escape format is not supported".to_string(),
+        ));
+    };
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(error(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            format!("invalid hexadecimal data: \"{text}\""),
+        ));
+    }
+    Ok(ast::Literal::Blob(format!("X'{hex}'")))
+}
+
+/// Builds the engine's CAST for a rewrite the translator itself makes; not a PostgreSQL cast.
+pub fn engine_cast(expr: ast::Expr, target: &PgType) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: target.engine_type(),
+    }
+}
+
+fn is_numeric_literal_outside_int8(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => numeric_text_outside_int8(text),
+        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+            is_numeric_literal_outside_int8(inner)
+        }
+        _ => false,
+    }
+}
+
+fn numeric_text_outside_int8(literal: &str) -> bool {
+    let literal = literal.replace('_', "");
+    let (negative, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, literal.as_str()),
+    };
+    let limit = if negative {
+        i64::MIN.unsigned_abs() as u128
+    } else {
+        i64::MAX as u128
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => match exponent.parse::<i64>() {
+            Ok(exponent) => (mantissa, exponent),
+            Err(_) => return false,
+        },
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let all_digits = format!("{int_part}{frac_part}");
+    let digits = all_digits.trim_start_matches('0').as_bytes();
+    if digits.is_empty() {
+        return false;
+    }
+    let int_len = (digits.len() as i64)
+        .saturating_sub(frac_part.len() as i64)
+        .saturating_add(exponent);
+    if int_len > 19 {
+        return true;
+    }
+    if int_len < 0 {
+        return false;
+    }
+    let int_len = int_len as usize;
+    let mut magnitude: u128 = 0;
+    for i in 0..int_len {
+        let digit = digits.get(i).map_or(0, |d| d - b'0');
+        magnitude = magnitude * 10 + digit as u128;
+    }
+    if digits.get(int_len).is_some_and(|&d| d >= b'5') {
+        magnitude += 1;
+    }
+    magnitude > limit
+}
+
+fn wrap_if_explicit(expr: ast::Expr, target: &PgType, context: CastContext) -> ast::Expr {
+    if context != CastContext::Explicit || target.engine_type().is_none() {
+        return expr;
+    }
+    match &expr {
+        ast::Expr::Cast { type_name, .. } if *type_name == target.engine_type() => expr,
+        _ => engine_cast(expr, target),
+    }
+}
+
+fn invalid_input(type_name: &str, text: &str) -> ParseError {
+    error(
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        format!("invalid input syntax for type {type_name}: \"{text}\""),
+    )
+}
+
+fn column_mismatch(
+    failure: ParseError,
+    column: &str,
+    source: &PgType,
+    target: &PgType,
+) -> ParseError {
+    match failure {
+        ParseError::Sqlstate {
+            sqlstate: SQLSTATE_DATATYPE_MISMATCH,
+            ..
+        } => error(
+            SQLSTATE_DATATYPE_MISMATCH,
+            format!("column \"{column}\" is of type {target} but expression is of type {source}"),
+        ),
+        other => other,
+    }
+}
+
+fn cannot_be_used_without_a_cast(source: &PgType, target: &PgType) -> ParseError {
+    error(
+        SQLSTATE_DATATYPE_MISMATCH,
+        format!("a value of type {source} cannot be used as {target} without a cast"),
+    )
+}
+
+fn cast_not_supported(source: &PgType, target: &PgType) -> ParseError {
+    error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("a cast from {source} to {target} is not supported"),
+    )
+}
+
+fn error(sqlstate: &'static str, message: String) -> ParseError {
+    ParseError::Sqlstate { sqlstate, message }
+}
+
+fn one_spelling(name: &str) -> String {
+    let lowercase = name.trim().to_lowercase();
+    let mut base = lowercase.as_str();
+    let mut array_suffix = String::new();
+    while let Some(rest) = base.strip_suffix("[]") {
+        array_suffix.push_str("[]");
+        base = rest.trim_end();
+    }
+    let (word, modifiers) = match base.find('(') {
+        Some(position) => base.split_at(position),
+        None => (base, ""),
+    };
+    let word = word.trim_end();
+    let short = match word {
+        "integer" | "int" => "int4",
+        "bigint" => "int8",
+        "smallint" => "int2",
+        "real" => "float4",
+        "double precision" | "float" => "float8",
+        "decimal" => "numeric",
+        "boolean" => "bool",
+        "character varying" => "varchar",
+        "character" => "bpchar",
+        "bit varying" => "varbit",
+        "timestamp with time zone" => "timestamptz",
+        "timestamp without time zone" => "timestamp",
+        "time with time zone" => "timetz",
+        "time without time zone" => "time",
+        other => other,
+    };
+    format!("{short}{modifiers}{array_suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use CastContext::{Assignment, Explicit, Implicit};
+
+    fn number(text: &str) -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::Numeric(text.to_string()))
+    }
+
+    fn string(text: &str) -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::String(format!(
+            "'{}'",
+            text.replace('\'', "''")
+        )))
+    }
+
+    fn null() -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::Null)
+    }
+
+    fn cast_to(expr: ast::Expr, target: &PgType) -> ast::Expr {
+        ast::Expr::Cast {
+            expr: Box::new(expr),
+            type_name: target.engine_type(),
+        }
+    }
+
+    fn assert_error(result: Result<ast::Expr, ParseError>, code: &str, text: &str) {
+        match result {
+            Err(ParseError::Sqlstate { sqlstate, message }) => {
+                assert_eq!(sqlstate, code);
+                assert_eq!(message, text);
+            }
+            other => panic!("expected error {code} {text:?}, got {other:?}"),
+        }
+    }
+
+    fn convert(
+        source: &PgType,
+        target: &PgType,
+        context: CastContext,
+    ) -> Result<ast::Expr, ParseError> {
+        coerce(number("5"), Some(source), target, context)
+    }
+
+    fn convert_text(text: &str, target: &PgType) -> Result<ast::Expr, ParseError> {
+        coerce(string(text), Some(&PgType::Unknown), target, Implicit)
+    }
+
+    fn expect_expr(source: &PgType, target: &PgType, weakest: CastContext, method: &str) {
+        let expected = |expr: ast::Expr| match method {
+            "nothing" => expr,
+            "cast" => cast_to(expr, target),
+            "round" => cast_to(function_call("round", vec![expr]), target),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            convert(source, target, weakest).unwrap(),
+            expected(number("5")),
+            "{source} to {target}"
+        );
+        assert_eq!(
+            convert(source, target, Explicit).unwrap(),
+            if method == "nothing" {
+                cast_to(number("5"), target)
+            } else {
+                expected(number("5"))
+            },
+            "{source} to {target} explicit"
+        );
+        if weakest > Implicit {
+            let weaker = if weakest == Explicit {
+                Assignment
+            } else {
+                Implicit
+            };
+            assert_error(
+                convert(source, target, weaker),
+                "42804",
+                &format!("a value of type {source} cannot be used as {target} without a cast"),
+            );
+        }
+    }
+
+    #[test]
+    fn int4_converts_to_bigint_without_changing_the_value() {
+        expect_expr(&PgType::Int4, &PgType::Int8, Implicit, "nothing");
+    }
+
+    #[test]
+    fn int4_converts_to_float_and_numeric_with_an_engine_cast() {
+        expect_expr(&PgType::Int4, &PgType::Float8, Implicit, "cast");
+        expect_expr(&PgType::Int4, &PgType::Numeric, Implicit, "cast");
+    }
+
+    #[test]
+    fn int4_converts_to_text_only_on_assignment() {
+        expect_expr(&PgType::Int4, &PgType::Text, Assignment, "cast");
+    }
+
+    #[test]
+    fn int8_converts_to_int4_only_on_assignment() {
+        expect_expr(&PgType::Int8, &PgType::Int4, Assignment, "nothing");
+    }
+
+    #[test]
+    fn int8_converts_to_float_and_numeric_with_an_engine_cast() {
+        expect_expr(&PgType::Int8, &PgType::Float8, Implicit, "cast");
+        expect_expr(&PgType::Int8, &PgType::Numeric, Implicit, "cast");
+    }
+
+    #[test]
+    fn int8_converts_to_text_only_on_assignment() {
+        expect_expr(&PgType::Int8, &PgType::Text, Assignment, "cast");
+    }
+
+    #[test]
+    fn float_and_numeric_round_before_converting_to_integers() {
+        for source in [PgType::Float8, PgType::Numeric] {
+            expect_expr(&source, &PgType::Int4, Assignment, "round");
+            expect_expr(&source, &PgType::Int8, Assignment, "round");
+        }
+    }
+
+    #[test]
+    fn float_converts_to_numeric_only_on_assignment() {
+        expect_expr(&PgType::Float8, &PgType::Numeric, Assignment, "nothing");
+    }
+
+    #[test]
+    fn numeric_converts_to_float_without_changing_the_value() {
+        expect_expr(&PgType::Numeric, &PgType::Float8, Implicit, "nothing");
+    }
+
+    #[test]
+    fn bool_converts_to_int4_only_with_an_explicit_cast() {
+        expect_expr(&PgType::Bool, &PgType::Int4, Explicit, "cast");
+    }
+
+    #[test]
+    fn unsupported_casts_are_rejected_below_the_context_postgresql_needs() {
+        let cases = [
+            (PgType::Int4, PgType::Bool, Explicit),
+            (PgType::Float8, PgType::Text, Assignment),
+            (PgType::Numeric, PgType::Text, Assignment),
+            (PgType::Bool, PgType::Text, Assignment),
+            (PgType::Bytea, PgType::Text, Assignment),
+            (PgType::Text, PgType::Bool, Explicit),
+            (PgType::Text, PgType::Bytea, Explicit),
+            (PgType::Text, PgType::Float8, Explicit),
+            (PgType::Int4, PgType::Bytea, Explicit),
+        ];
+        for (source, target, weakest) in cases {
+            for context in [Implicit, Assignment, Explicit] {
+                let result = convert(&source, &target, context);
+                if context < weakest {
+                    assert_error(
+                        result,
+                        "42804",
+                        &format!(
+                            "a value of type {source} cannot be used as {target} without a cast"
+                        ),
+                    );
+                } else {
+                    assert_error(
+                        result,
+                        "0A000",
+                        &format!("a cast from {source} to {target} is not supported"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn types_without_a_cast_in_postgresql_fail_below_explicit_as_a_mismatch() {
+        let numbers = [PgType::Int8, PgType::Float8, PgType::Numeric];
+        let mut pairs = vec![];
+        for n in &numbers {
+            pairs.push((PgType::Bool, n.clone()));
+            pairs.push((n.clone(), PgType::Bool));
+        }
+        for t in [PgType::Bool, PgType::Float8, PgType::Numeric] {
+            pairs.push((PgType::Bytea, t.clone()));
+            pairs.push((t, PgType::Bytea));
+        }
+        for (source, target) in pairs {
+            for context in [Implicit, Assignment] {
+                assert_error(
+                    convert(&source, &target, context),
+                    "42804",
+                    &format!("a value of type {source} cannot be used as {target} without a cast"),
+                );
+            }
+            assert_error(
+                convert(&source, &target, Explicit),
+                "42846",
+                &format!("cannot cast type {source} to {target}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_of_the_same_type_passes_as_it_is() {
+        for t in [PgType::Int4, PgType::Text, PgType::Bool, PgType::Bytea] {
+            assert_eq!(convert(&t, &t, Implicit).unwrap(), number("5"));
+            assert_eq!(convert(&t, &t, Assignment).unwrap(), number("5"));
+        }
+    }
+
+    #[test]
+    fn casting_to_the_same_type_explicitly_adds_one_engine_cast() {
+        assert_eq!(
+            convert(&PgType::Int4, &PgType::Int4, Explicit).unwrap(),
+            cast_to(number("5"), &PgType::Int4)
+        );
+    }
+
+    #[test]
+    fn explicit_cast_does_not_wrap_an_expression_that_is_already_that_cast() {
+        let already = cast_to(number("5"), &PgType::Int8);
+        let result = coerce(
+            already.clone(),
+            Some(&PgType::Int4),
+            &PgType::Int8,
+            Explicit,
+        )
+        .unwrap();
+        assert_eq!(result, cast_to(number("5"), &PgType::Int8));
+        let again = coerce(
+            already.clone(),
+            Some(&PgType::Int8),
+            &PgType::Int8,
+            Explicit,
+        )
+        .unwrap();
+        assert_eq!(again, already);
+    }
+
+    #[test]
+    fn explicit_cast_wraps_an_expression_that_is_a_different_cast() {
+        let other = cast_to(number("5"), &PgType::Int4);
+        let result = coerce(other.clone(), Some(&PgType::Int4), &PgType::Int4, Explicit).unwrap();
+        assert_eq!(result, other);
+        let result = coerce(other.clone(), Some(&PgType::Int8), &PgType::Int8, Explicit).unwrap();
+        assert_eq!(result, cast_to(other, &PgType::Int8));
+    }
+
+    #[test]
+    fn non_explicit_contexts_never_add_an_extra_cast() {
+        assert_eq!(
+            convert(&PgType::Int4, &PgType::Int8, Assignment).unwrap(),
+            number("5")
+        );
+    }
+
+    #[test]
+    fn a_type_with_no_supported_casts_converts_only_to_itself() {
+        let date = PgType::from_name("DATE");
+        assert_eq!(convert(&date, &date, Explicit).unwrap(), number("5"));
+        assert_error(
+            convert(&date, &PgType::Text, Explicit),
+            "0A000",
+            "a cast from date to text is not supported",
+        );
+        assert_error(
+            convert(&PgType::Int4, &date, Explicit),
+            "0A000",
+            "a cast from integer to date is not supported",
+        );
+        assert_error(
+            coerce(
+                string("2024-01-01"),
+                Some(&PgType::Unknown),
+                &date,
+                Implicit,
+            ),
+            "0A000",
+            "a cast from unknown to date is not supported",
+        );
+    }
+
+    #[test]
+    fn converting_to_unknown_returns_the_expression() {
+        for source in [PgType::Int4, PgType::Unknown, PgType::Text] {
+            assert_eq!(
+                convert(&source, &PgType::Unknown, Explicit).unwrap(),
+                number("5")
+            );
+        }
+    }
+
+    #[test]
+    fn null_and_parameters_of_unknown_type_pass_as_they_are() {
+        assert_eq!(
+            coerce(null(), Some(&PgType::Unknown), &PgType::Int4, Implicit).unwrap(),
+            null()
+        );
+        let parameter = ast::Expr::Variable(ast::Variable::indexed(1.try_into().unwrap()));
+        assert_eq!(
+            coerce(
+                parameter.clone(),
+                Some(&PgType::Unknown),
+                &PgType::Int8,
+                Assignment
+            )
+            .unwrap(),
+            parameter
+        );
+    }
+
+    #[test]
+    fn null_and_parameters_of_unknown_type_get_one_cast_when_explicit() {
+        assert_eq!(
+            coerce(null(), Some(&PgType::Unknown), &PgType::Int4, Explicit).unwrap(),
+            cast_to(null(), &PgType::Int4)
+        );
+        let parameter = ast::Expr::Variable(ast::Variable::indexed(1.try_into().unwrap()));
+        assert_eq!(
+            coerce(
+                parameter.clone(),
+                Some(&PgType::Unknown),
+                &PgType::Text,
+                Explicit
+            )
+            .unwrap(),
+            cast_to(parameter, &PgType::Text)
+        );
+    }
+
+    #[test]
+    fn string_literal_stays_a_string_for_text() {
+        assert_eq!(
+            convert_text("  it's ", &PgType::Text).unwrap(),
+            string("  it's ")
+        );
+        assert_eq!(
+            coerce(string("a"), Some(&PgType::Unknown), &PgType::Text, Explicit).unwrap(),
+            cast_to(string("a"), &PgType::Text)
+        );
+    }
+
+    #[test]
+    fn string_literal_becomes_an_integer() {
+        assert_eq!(convert_text(" 42 ", &PgType::Int4).unwrap(), number("42"));
+        assert_eq!(convert_text("+7", &PgType::Int4).unwrap(), number("7"));
+        assert_eq!(convert_text("-7", &PgType::Int8).unwrap(), number("-7"));
+        assert_eq!(
+            convert_text("9223372036854775807", &PgType::Int8).unwrap(),
+            number("9223372036854775807")
+        );
+        assert_eq!(
+            convert_text("-2147483648", &PgType::Int4).unwrap(),
+            number("-2147483648")
+        );
+    }
+
+    #[test]
+    fn string_literal_that_is_not_an_integer_is_rejected() {
+        for text in ["abc", "", "1.5", "-", "1e3", "0x", "1__0", "_1"] {
+            assert_error(
+                convert_text(text, &PgType::Int4),
+                "22P02",
+                &format!("invalid input syntax for type integer: \"{text}\""),
+            );
+        }
+        assert_error(
+            convert_text("x'y", &PgType::Int8),
+            "22P02",
+            "invalid input syntax for type bigint: \"x'y\"",
+        );
+    }
+
+    #[test]
+    fn string_literal_out_of_integer_range_is_rejected() {
+        assert_error(
+            convert_text("2147483648", &PgType::Int4),
+            "22003",
+            "value \"2147483648\" is out of range for type integer",
+        );
+        assert_error(
+            convert_text("9223372036854775808", &PgType::Int8),
+            "22003",
+            "value \"9223372036854775808\" is out of range for type bigint",
+        );
+        assert_error(
+            convert_text("99999999999999999999999999999999999999999999", &PgType::Int8),
+            "22003",
+            "value \"99999999999999999999999999999999999999999999\" is out of range for type bigint",
+        );
+    }
+
+    #[test]
+    fn string_literal_becomes_a_real_number() {
+        for target in [PgType::Float8, PgType::Numeric] {
+            assert_eq!(convert_text("5", &target).unwrap(), number("5.0"));
+            assert_eq!(convert_text(" +5 ", &target).unwrap(), number("5.0"));
+            assert_eq!(convert_text("-1.5", &target).unwrap(), number("-1.5"));
+            assert_eq!(convert_text(".5", &target).unwrap(), number(".5"));
+            assert_eq!(convert_text("5.", &target).unwrap(), number("5."));
+            assert_eq!(convert_text("1e3", &target).unwrap(), number("1e3"));
+            assert_eq!(convert_text("2.5E-3", &target).unwrap(), number("2.5E-3"));
+        }
+    }
+
+    #[test]
+    fn string_literal_that_is_not_a_real_number_is_rejected() {
+        for text in ["abc", "", ".", "1e", "1e+", "1.2.3", "--1", "1 2"] {
+            assert_error(
+                convert_text(text, &PgType::Float8),
+                "22P02",
+                &format!("invalid input syntax for type double precision: \"{text}\""),
+            );
+            assert_error(
+                convert_text(text, &PgType::Numeric),
+                "22P02",
+                &format!("invalid input syntax for type numeric: \"{text}\""),
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_nan_and_infinity_are_not_supported() {
+        for text in ["NaN", "nan", "Infinity", "-Infinity", "inf", "+INFINITY"] {
+            assert_error(
+                convert_text(text, &PgType::Float8),
+                "0A000",
+                &format!("the value \"{text}\" for type double precision is not supported"),
+            );
+            assert_error(
+                convert_text(text, &PgType::Numeric),
+                "0A000",
+                &format!("the value \"{text}\" for type numeric is not supported"),
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_becomes_a_boolean() {
+        for text in ["t", "TRUE", "y", "Yes", "on", "1", " true "] {
+            assert_eq!(
+                convert_text(text, &PgType::Bool).unwrap(),
+                bool_literal(true)
+            );
+        }
+        for text in ["f", "False", "n", "NO", "off", "0", " f "] {
+            assert_eq!(
+                convert_text(text, &PgType::Bool).unwrap(),
+                bool_literal(false)
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_that_is_not_a_boolean_is_rejected() {
+        for text in ["maybe", "", "2", "tru"] {
+            assert_error(
+                convert_text(text, &PgType::Bool),
+                "22P02",
+                &format!("invalid input syntax for type boolean: \"{text}\""),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_cast_of_a_boolean_string_literal_is_not_wrapped_twice() {
+        assert_eq!(
+            coerce(string("t"), Some(&PgType::Unknown), &PgType::Bool, Explicit).unwrap(),
+            bool_literal(true)
+        );
+    }
+
+    #[test]
+    fn string_literal_becomes_a_blob() {
+        assert_eq!(
+            convert_text("\\x0aFF", &PgType::Bytea).unwrap(),
+            ast::Expr::Literal(ast::Literal::Blob("X'0aFF'".to_string()))
+        );
+        assert_eq!(
+            convert_text(" \\x ", &PgType::Bytea).unwrap(),
+            ast::Expr::Literal(ast::Literal::Blob("X''".to_string()))
+        );
+    }
+
+    #[test]
+    fn string_literal_with_bad_hex_is_rejected() {
+        for text in ["\\xabc", "\\xzz", "\\x0g"] {
+            assert_error(
+                convert_text(text, &PgType::Bytea),
+                "22P02",
+                &format!("invalid hexadecimal data: \"{text}\""),
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_in_the_bytea_escape_format_is_not_supported() {
+        assert_error(
+            convert_text("abc", &PgType::Bytea),
+            "0A000",
+            "the bytea escape format is not supported",
+        );
+    }
+
+    #[test]
+    fn explicit_cast_of_a_converted_string_literal_adds_one_cast() {
+        assert_eq!(
+            coerce(string("5"), Some(&PgType::Unknown), &PgType::Int4, Explicit).unwrap(),
+            cast_to(number("5"), &PgType::Int4)
+        );
+    }
+
+    #[test]
+    fn a_value_whose_name_does_not_resolve_passes_as_it_is() {
+        for target in [PgType::Int4, PgType::Text, PgType::Bool, PgType::Bytea] {
+            for context in [Implicit, Assignment] {
+                assert_eq!(
+                    coerce(number("5"), None, &target, context).unwrap(),
+                    number("5")
+                );
+            }
+            assert_eq!(
+                coerce(number("5"), None, &target, Explicit).unwrap(),
+                cast_to(number("5"), &target)
+            );
+        }
+        assert_eq!(
+            coerce(number("5"), None, &PgType::Unknown, Explicit).unwrap(),
+            number("5")
+        );
+    }
+
+    #[test]
+    fn a_value_whose_name_does_not_resolve_cannot_become_an_unsupported_type() {
+        for context in [Implicit, Assignment, Explicit] {
+            assert_error(
+                coerce(
+                    number("5"),
+                    None,
+                    &PgType::Other("date".to_string()),
+                    context,
+                ),
+                "0A000",
+                "a cast from unknown to date is not supported",
+            );
+        }
+    }
+
+    #[test]
+    fn a_numeric_literal_outside_bigint_raises_instead_of_converting() {
+        let raises = function_call("int8_out_of_range", vec![]);
+        for text in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "9223372036854775807.5",
+            "1e19",
+            "9_223_372_036_854_775_808",
+        ] {
+            assert_eq!(
+                coerce(
+                    number(text),
+                    Some(&PgType::Numeric),
+                    &PgType::Int8,
+                    Assignment
+                )
+                .unwrap(),
+                raises,
+                "{text}"
+            );
+            assert_eq!(
+                coerce(
+                    number(text),
+                    Some(&PgType::Numeric),
+                    &PgType::Int8,
+                    Explicit
+                )
+                .unwrap(),
+                cast_to(raises.clone(), &PgType::Int8),
+                "{text}"
+            );
+        }
+        let plus = ast::Expr::Unary(
+            ast::UnaryOperator::Positive,
+            Box::new(number("9223372036854775808")),
+        );
+        assert_eq!(
+            coerce(plus, Some(&PgType::Numeric), &PgType::Int8, Assignment).unwrap(),
+            raises
+        );
+    }
+
+    #[test]
+    fn a_numeric_literal_inside_bigint_is_rounded_then_cast() {
+        for text in [
+            "9223372036854775807.4",
+            "-9223372036854775808.4",
+            "9.223372036854775807e18",
+            "0e100",
+            "0.0e25",
+        ] {
+            assert_eq!(
+                coerce(
+                    number(text),
+                    Some(&PgType::Numeric),
+                    &PgType::Int8,
+                    Explicit
+                )
+                .unwrap(),
+                cast_to(function_call("round", vec![number(text)]), &PgType::Int8),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_name_finds_every_supported_type_ignoring_case() {
+        let cases = [
+            ("int", PgType::Int4),
+            ("INTEGER", PgType::Int4),
+            ("int4", PgType::Int4),
+            ("bigint", PgType::Int8),
+            ("Int8", PgType::Int8),
+            ("float8", PgType::Float8),
+            ("Double Precision", PgType::Float8),
+            ("numeric", PgType::Numeric),
+            ("DECIMAL", PgType::Numeric),
+            ("text", PgType::Text),
+            ("bool", PgType::Bool),
+            ("Boolean", PgType::Bool),
+            ("bytea", PgType::Bytea),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(PgType::from_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn from_name_keeps_other_names_in_lowercase() {
+        for name in ["Date", "uuid", "float4", "int8range", "bpchar"] {
+            assert_eq!(PgType::from_name(name), PgType::Other(name.to_lowercase()));
+        }
+    }
+
+    #[test]
+    fn from_name_gives_one_value_for_every_name_of_a_type() {
+        let groups: [&[&str]; 9] = [
+            &[
+                "timestamptz",
+                "timestamp with time zone",
+                "TIMESTAMP WITH TIME ZONE",
+            ],
+            &["timestamp", "timestamp without time zone"],
+            &["timetz", "time with time zone"],
+            &["time", "time without time zone"],
+            &["float4", "real"],
+            &["bpchar", "character"],
+            &["int4[]", "integer[]", "int[]"],
+            &["float8", "double precision", "float"],
+            &["numeric", "decimal", "Numeric"],
+        ];
+        for group in groups {
+            let first = PgType::from_name(group[0]);
+            for name in &group[1..] {
+                assert_eq!(PgType::from_name(name), first, "{name}");
+            }
+        }
+        assert_eq!(
+            PgType::from_name("timestamp with time zone"),
+            PgType::Other("timestamptz".to_string())
+        );
+        assert_eq!(
+            PgType::from_name("numeric(10,2)"),
+            PgType::Other("numeric(10,2)".to_string())
+        );
+        assert_eq!(PgType::from_name("float"), PgType::Float8);
+        assert_eq!(PgType::from_name("decimal"), PgType::Numeric);
+    }
+
+    #[test]
+    fn name_is_text() {
+        assert_eq!(PgType::from_name("name"), PgType::Text);
+        assert_eq!(PgType::from_name("NAME"), PgType::Text);
+    }
+
+    #[test]
+    fn display_uses_postgresql_names() {
+        let cases = [
+            (PgType::Bool, "boolean"),
+            (PgType::Int4, "integer"),
+            (PgType::Int8, "bigint"),
+            (PgType::Float8, "double precision"),
+            (PgType::Numeric, "numeric"),
+            (PgType::Text, "text"),
+            (PgType::Bytea, "bytea"),
+            (PgType::Unknown, "unknown"),
+            (PgType::Other("uuid".to_string()), "uuid"),
+        ];
+        for (t, name) in cases {
+            assert_eq!(t.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn engine_type_names_the_engine_storage_type() {
+        let cases = [
+            (PgType::Int4, Some("INTEGER")),
+            (PgType::Int8, Some("BIGINT")),
+            (PgType::Float8, Some("REAL")),
+            (PgType::Numeric, Some("REAL")),
+            (PgType::Text, Some("TEXT")),
+            (PgType::Bytea, Some("BLOB")),
+            (PgType::Bool, Some("boolean")),
+            (PgType::Unknown, None),
+            (PgType::Other("date".to_string()), None),
+        ];
+        for (t, name) in cases {
+            let expected = name.map(|name| ast::Type {
+                name: name.to_string(),
+                size: None,
+                array_dimensions: 0,
+            });
+            assert_eq!(t.engine_type(), expected);
+        }
+    }
+
+    #[test]
+    fn bool_literal_is_a_cast_of_one_or_zero() {
+        assert_eq!(bool_literal(true), cast_to(number("1"), &PgType::Bool));
+        assert_eq!(bool_literal(false), cast_to(number("0"), &PgType::Bool));
+    }
+
+    #[test]
+    fn column_types_come_from_the_catalog_type_name() {
+        for (declared, expected) in [
+            ("INTEGER", PgType::Int4),
+            ("int", PgType::Int4),
+            ("BIGINT", PgType::Int8),
+            ("REAL", PgType::Float8),
+            ("Text", PgType::Text),
+            ("BLOB", PgType::Bytea),
+            ("bytea", PgType::Bytea),
+            ("BOOLEAN", PgType::Bool),
+            ("DATE", PgType::Other("date".to_string())),
+            ("timestamptz", PgType::Other("timestamptz".to_string())),
+        ] {
+            assert_eq!(
+                PgType::from_column_type(declared, 0, &[]),
+                expected,
+                "{declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_numeric_column_is_never_the_plain_numeric_type() {
+        assert_eq!(
+            PgType::from_column_type("numeric", 0, &[10, 2]),
+            PgType::Other("numeric(10,2)".to_string())
+        );
+        assert_eq!(
+            PgType::from_column_type("numeric", 0, &[7]),
+            PgType::Other("numeric(7,0)".to_string())
+        );
+        assert_eq!(
+            PgType::from_column_type("numeric", 0, &[]),
+            PgType::Other("numeric with a precision".to_string())
+        );
+        assert_ne!(
+            PgType::from_column_type("numeric", 0, &[10, 2]),
+            PgType::Numeric
+        );
+    }
+
+    #[test]
+    fn array_columns_are_arrays_of_one_dimension_or_other_types() {
+        assert_eq!(
+            PgType::from_column_type("Text", 2, &[]),
+            PgType::Other("text[][]".to_string())
+        );
+    }
+
+    #[test]
+    fn common_type_of_nothing_or_only_unknown_is_text() {
+        assert_eq!(common_type(&[], "CASE").unwrap(), PgType::Text);
+        assert_eq!(
+            common_type(&[PgType::Unknown, PgType::Unknown], "CASE").unwrap(),
+            PgType::Text
+        );
+    }
+
+    #[test]
+    fn common_type_of_equal_types_is_that_type() {
+        let types = [PgType::Bytea, PgType::Unknown, PgType::Bytea];
+        assert_eq!(common_type(&types, "UNION").unwrap(), PgType::Bytea);
+        let date = PgType::Other("date".to_string());
+        assert_eq!(
+            common_type(&[date.clone(), date.clone()], "UNION").unwrap(),
+            date
+        );
+    }
+
+    #[test]
+    fn common_type_of_numbers_is_the_widest() {
+        let cases = [
+            (vec![PgType::Int4, PgType::Int8], PgType::Int8),
+            (vec![PgType::Int8, PgType::Numeric], PgType::Numeric),
+            (vec![PgType::Numeric, PgType::Float8], PgType::Float8),
+            (
+                vec![
+                    PgType::Float8,
+                    PgType::Unknown,
+                    PgType::Int4,
+                    PgType::Numeric,
+                ],
+                PgType::Float8,
+            ),
+            (vec![PgType::Int4, PgType::Numeric], PgType::Numeric),
+        ];
+        for (types, expected) in cases {
+            assert_eq!(common_type(&types, "COALESCE").unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn common_type_of_types_that_do_not_match_is_an_error() {
+        assert_error(
+            common_type(&[PgType::Int4, PgType::Text], "CASE").map(|_| null()),
+            "42804",
+            "CASE types integer and text cannot be matched",
+        );
+        assert_error(
+            common_type(&[PgType::Int4, PgType::Bool, PgType::Int8], "UNION").map(|_| null()),
+            "42804",
+            "UNION types integer and boolean cannot be matched",
+        );
+    }
+
+    #[test]
+    fn common_type_with_an_unsupported_type_is_not_supported() {
+        let date = PgType::Other("date".to_string());
+        assert_error(
+            common_type(&[PgType::Int4, date.clone()], "COALESCE").map(|_| null()),
+            "0A000",
+            "COALESCE with types integer and date is not supported",
+        );
+        assert_error(
+            common_type(&[date, PgType::Text], "CASE").map(|_| null()),
+            "0A000",
+            "CASE with types date and text is not supported",
+        );
+    }
+
+    fn variable() -> ast::Expr {
+        ast::Expr::Variable(ast::Variable::indexed(1.try_into().unwrap()))
+    }
+
+    fn date() -> PgType {
+        PgType::Other("date".to_string())
+    }
+
+    fn operands_of(items: Vec<(ast::Expr, Option<PgType>)>) -> Vec<(ast::Expr, Option<PgType>)> {
+        items
+    }
+
+    fn assert_operand_error(result: Result<Vec<ast::Expr>, ParseError>, code: &str, text: &str) {
+        assert_error(result.map(|_| null()), code, text);
+    }
+
+    #[test]
+    fn null_literal_of_unknown_type_passes_into_a_type_with_no_supported_casts_unless_explicit() {
+        for context in [Implicit, Assignment] {
+            assert_eq!(
+                coerce(null(), Some(&PgType::Unknown), &date(), context).unwrap(),
+                null()
+            );
+        }
+        assert_error(
+            coerce(null(), Some(&PgType::Unknown), &date(), Explicit),
+            "0A000",
+            "a cast from unknown to date is not supported",
+        );
+    }
+
+    #[test]
+    fn explicit_cast_of_a_parameter_to_a_type_with_no_supported_casts_is_not_supported() {
+        assert_error(
+            coerce(variable(), Some(&PgType::Unknown), &date(), Explicit),
+            "0A000",
+            "a cast from unknown to date is not supported",
+        );
+    }
+
+    #[test]
+    fn string_literal_of_unknown_type_is_rejected_for_a_type_with_no_supported_casts() {
+        for context in [Implicit, Assignment, Explicit] {
+            assert_error(
+                coerce(
+                    string("2024-01-01"),
+                    Some(&PgType::Unknown),
+                    &date(),
+                    context,
+                ),
+                "0A000",
+                "a cast from unknown to date is not supported",
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_of_unknown_type_passes_into_any_type() {
+        for target in [date(), PgType::Int4, PgType::Text, PgType::Bool] {
+            for context in [Implicit, Assignment] {
+                assert_eq!(
+                    coerce(variable(), Some(&PgType::Unknown), &target, context).unwrap(),
+                    variable(),
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_conversion_of_a_parameter_adds_a_cast() {
+        assert_eq!(
+            coerce(variable(), Some(&PgType::Unknown), &PgType::Int4, Explicit).unwrap(),
+            cast_to(variable(), &PgType::Int4)
+        );
+    }
+
+    #[test]
+    fn operands_with_a_name_that_does_not_resolve_pass_as_they_are() {
+        let items = vec![
+            (number("1"), None),
+            (string("x"), Some(PgType::Text)),
+            (number("2"), Some(PgType::Int4)),
+        ];
+        for kind in [
+            OperatorKind::Arithmetic,
+            OperatorKind::Comparison,
+            OperatorKind::Concat,
+            OperatorKind::Pattern,
+        ] {
+            assert_eq!(
+                coerce_operands("+", kind, items.clone()).unwrap(),
+                vec![number("1"), string("x"), number("2")]
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_on_only_unknown_operands_is_ambiguous() {
+        let items = operands_of(vec![
+            (string("1"), Some(PgType::Unknown)),
+            (string("1"), Some(PgType::Unknown)),
+        ]);
+        assert_operand_error(
+            coerce_operands("+", OperatorKind::Arithmetic, items),
+            "42725",
+            "operator is not unique: unknown + unknown",
+        );
+    }
+
+    #[test]
+    fn other_kinds_of_operator_on_only_unknown_operands_pass_as_they_are() {
+        let items = vec![
+            (string("1"), Some(PgType::Unknown)),
+            (null(), Some(PgType::Unknown)),
+        ];
+        for kind in [
+            OperatorKind::Comparison,
+            OperatorKind::Concat,
+            OperatorKind::Pattern,
+        ] {
+            assert_eq!(
+                coerce_operands("=", kind, items.clone()).unwrap(),
+                vec![string("1"), null()]
+            );
+        }
+    }
+
+    #[test]
+    fn operands_of_the_same_unsupported_type_pass_as_they_are() {
+        let items = vec![(number("1"), Some(date())), (number("2"), Some(date()))];
+        for kind in [OperatorKind::Comparison, OperatorKind::Arithmetic] {
+            assert_eq!(
+                coerce_operands("=", kind, items.clone()).unwrap(),
+                vec![number("1"), number("2")]
+            );
+        }
+    }
+
+    #[test]
+    fn operands_of_different_types_where_one_is_unsupported_are_not_supported() {
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (number("2"), Some(PgType::Int4)),
+            (number("3"), Some(date())),
+        ];
+        assert_operand_error(
+            coerce_operands("=", OperatorKind::Comparison, items),
+            "0A000",
+            "the operator = for types integer and date is not supported",
+        );
+        let items = vec![
+            (number("1"), Some(date())),
+            (number("2"), Some(PgType::Text)),
+        ];
+        assert_operand_error(
+            coerce_operands("||", OperatorKind::Concat, items),
+            "0A000",
+            "the operator || for types date and text is not supported",
+        );
+    }
+
+    #[test]
+    fn string_literal_read_as_an_unsupported_type_is_not_supported() {
+        let items = vec![
+            (number("1"), Some(date())),
+            (string("2024-01-01"), Some(PgType::Unknown)),
+        ];
+        assert_operand_error(
+            coerce_operands("=", OperatorKind::Comparison, items),
+            "0A000",
+            "a cast from unknown to date is not supported",
+        );
+    }
+
+    #[test]
+    fn null_read_as_an_unsupported_type_passes() {
+        let items = vec![(number("1"), Some(date())), (null(), Some(PgType::Unknown))];
+        assert_eq!(
+            coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+            vec![number("1"), null()]
+        );
+    }
+
+    #[test]
+    fn arithmetic_on_numbers_converts_to_the_widest() {
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (number("2"), Some(PgType::Int8)),
+            (number("3"), Some(PgType::Float8)),
+            (number("4"), Some(PgType::Numeric)),
+        ];
+        assert_eq!(
+            coerce_operands("+", OperatorKind::Arithmetic, items).unwrap(),
+            vec![
+                cast_to(number("1"), &PgType::Float8),
+                cast_to(number("2"), &PgType::Float8),
+                number("3"),
+                number("4"),
+            ]
+        );
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (number("2"), Some(PgType::Int8)),
+        ];
+        assert_eq!(
+            coerce_operands("-", OperatorKind::Arithmetic, items).unwrap(),
+            vec![number("1"), number("2")]
+        );
+    }
+
+    #[test]
+    fn arithmetic_reads_string_literals_as_the_number_type() {
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (string("1"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("+", OperatorKind::Arithmetic, items).unwrap(),
+            vec![number("1"), number("1")]
+        );
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (string("abc"), Some(PgType::Unknown)),
+        ];
+        assert_operand_error(
+            coerce_operands("+", OperatorKind::Arithmetic, items),
+            "22P02",
+            "invalid input syntax for type integer: \"abc\"",
+        );
+    }
+
+    #[test]
+    fn arithmetic_on_a_value_that_is_not_a_number_does_not_exist() {
+        let cases = [
+            (
+                vec![PgType::Text, PgType::Int4],
+                "operator does not exist: text + integer",
+            ),
+            (
+                vec![PgType::Int4, PgType::Text],
+                "operator does not exist: integer + text",
+            ),
+            (
+                vec![PgType::Text, PgType::Text],
+                "operator does not exist: text + text",
+            ),
+            (
+                vec![PgType::Bool, PgType::Unknown],
+                "operator does not exist: boolean + unknown",
+            ),
+            (
+                vec![PgType::Unknown, PgType::Bytea],
+                "operator does not exist: unknown + bytea",
+            ),
+        ];
+        for (types, message) in cases {
+            let items = types.into_iter().map(|ty| (null(), Some(ty))).collect();
+            assert_operand_error(
+                coerce_operands("+", OperatorKind::Arithmetic, items),
+                "42883",
+                message,
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_of_equal_types_converts_string_literals_to_that_type() {
+        let items = vec![
+            (number("1"), Some(PgType::Bool)),
+            (string("true"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+            vec![number("1"), bool_literal(true)]
+        );
+        let items = vec![
+            (string("x"), Some(PgType::Text)),
+            (string("y"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+            vec![string("x"), string("y")]
+        );
+    }
+
+    #[test]
+    fn comparison_of_numbers_converts_to_the_widest() {
+        let items = vec![
+            (number("1"), Some(PgType::Int8)),
+            (number("2"), Some(PgType::Float8)),
+            (string("3"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("<", OperatorKind::Comparison, items).unwrap(),
+            vec![
+                cast_to(number("1"), &PgType::Float8),
+                number("2"),
+                number("3.0")
+            ]
+        );
+    }
+
+    #[test]
+    fn comparison_of_types_that_do_not_match_does_not_exist() {
+        let cases = [
+            (
+                vec![PgType::Text, PgType::Int4],
+                "operator does not exist: text = integer",
+            ),
+            (
+                vec![PgType::Int4, PgType::Bool, PgType::Int4],
+                "operator does not exist: integer = boolean",
+            ),
+            (
+                vec![PgType::Bytea, PgType::Unknown, PgType::Text],
+                "operator does not exist: bytea = text",
+            ),
+        ];
+        for (types, message) in cases {
+            let items = types.into_iter().map(|ty| (null(), Some(ty))).collect();
+            assert_operand_error(
+                coerce_operands("=", OperatorKind::Comparison, items),
+                "42883",
+                message,
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_of_three_operands_names_the_first_two_types_that_differ() {
+        let items = vec![
+            (number("1"), Some(PgType::Text)),
+            (number("2"), Some(PgType::Int4)),
+            (number("3"), Some(PgType::Int4)),
+        ];
+        assert_operand_error(
+            coerce_operands(">=", OperatorKind::Comparison, items),
+            "42883",
+            "operator does not exist: text >= integer",
+        );
+    }
+
+    #[test]
+    fn concat_converts_every_operand_to_text() {
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (string("x"), Some(PgType::Unknown)),
+            (number("2"), Some(PgType::Int8)),
+            (string("y"), Some(PgType::Text)),
+        ];
+        assert_eq!(
+            coerce_operands("||", OperatorKind::Concat, items).unwrap(),
+            vec![
+                cast_to(number("1"), &PgType::Text),
+                string("x"),
+                cast_to(number("2"), &PgType::Text),
+                string("y"),
+            ]
+        );
+    }
+
+    #[test]
+    fn concat_with_a_value_that_has_no_cast_to_text_is_not_supported() {
+        let items = vec![
+            (string("x"), Some(PgType::Text)),
+            (number("1"), Some(PgType::Bool)),
+        ];
+        assert_operand_error(
+            coerce_operands("||", OperatorKind::Concat, items),
+            "0A000",
+            "a cast from boolean to text is not supported",
+        );
+    }
+
+    #[test]
+    fn pattern_operands_must_be_text_or_unknown() {
+        let items = vec![
+            (string("x"), Some(PgType::Text)),
+            (string("x%"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("~~", OperatorKind::Pattern, items).unwrap(),
+            vec![string("x"), string("x%")]
+        );
+        let items = vec![
+            (number("1"), Some(PgType::Int4)),
+            (string("x"), Some(PgType::Unknown)),
+        ];
+        assert_operand_error(
+            coerce_operands("~~", OperatorKind::Pattern, items),
+            "42883",
+            "operator does not exist: integer ~~ unknown",
+        );
+        let items = vec![
+            (string("x"), Some(PgType::Text)),
+            (number("1"), Some(PgType::Int4)),
+        ];
+        assert_operand_error(
+            coerce_operands("!~~", OperatorKind::Pattern, items),
+            "42883",
+            "operator does not exist: text !~~ integer",
+        );
+    }
+
+    #[test]
+    fn a_value_of_type_boolean_stays_a_condition() {
+        assert_eq!(
+            coerce_to_boolean(number("1"), Some(&PgType::Bool), "WHERE").unwrap(),
+            number("1")
+        );
+    }
+
+    #[test]
+    fn a_value_whose_name_does_not_resolve_stays_a_condition() {
+        assert_eq!(
+            coerce_to_boolean(number("1"), None, "WHERE").unwrap(),
+            number("1")
+        );
+    }
+
+    #[test]
+    fn a_string_literal_becomes_a_boolean_condition() {
+        assert_eq!(
+            coerce_to_boolean(string("true"), Some(&PgType::Unknown), "WHERE").unwrap(),
+            bool_literal(true)
+        );
+        assert_eq!(
+            coerce_to_boolean(variable(), Some(&PgType::Unknown), "WHERE").unwrap(),
+            variable()
+        );
+        assert_error(
+            coerce_to_boolean(string("maybe"), Some(&PgType::Unknown), "WHERE"),
+            "22P02",
+            "invalid input syntax for type boolean: \"maybe\"",
+        );
+    }
+
+    #[test]
+    fn a_condition_of_another_type_is_rejected() {
+        for ty in [PgType::Int4, PgType::Text, PgType::Bytea, PgType::Numeric] {
+            assert_error(
+                coerce_to_boolean(number("1"), Some(&ty), "HAVING"),
+                "42804",
+                &format!("argument of HAVING must be type boolean, not type {ty}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_condition_of_a_type_with_no_supported_casts_is_not_supported() {
+        assert_error(
+            coerce_to_boolean(number("1"), Some(&date()), "WHERE"),
+            "0A000",
+            "a cast from date to boolean is not supported",
+        );
+    }
+
+    #[test]
+    fn a_sign_in_front_of_text_boolean_or_bytea_does_not_exist() {
+        for ty in [PgType::Text, PgType::Bool, PgType::Bytea] {
+            for operator in ["-", "+"] {
+                let result = check_unary_operand(operator, Some(&ty));
+                assert_error(
+                    result.map(|()| null()),
+                    "42883",
+                    &format!("operator does not exist: {operator} {ty}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sign_in_front_of_other_values_is_allowed() {
+        for ty in [
+            Some(PgType::Int4),
+            Some(PgType::Int8),
+            Some(PgType::Float8),
+            Some(PgType::Numeric),
+            Some(PgType::Unknown),
+            Some(date()),
+            None,
+        ] {
+            assert!(check_unary_operand("-", ty.as_ref()).is_ok());
+        }
+    }
+
+    #[test]
+    fn engine_cast_as_wraps_the_expression_in_a_cast_to_the_given_type() {
+        let type_name = ast::Type {
+            name: "jsonb".to_string(),
+            size: None,
+            array_dimensions: 0,
+        };
+        assert_eq!(
+            engine_cast_as(string("{}"), type_name.clone()),
+            ast::Expr::Cast {
+                expr: Box::new(string("{}")),
+                type_name: Some(type_name),
+            }
+        );
+    }
+
+    fn varchar5() -> PgType {
+        PgType::Other("varchar(5)".to_string())
+    }
+
+    #[test]
+    fn a_pair_with_a_type_that_has_no_supported_casts_is_never_a_mismatch() {
+        let timestamp = PgType::Other("timestamp".to_string());
+        let pairs = [
+            (date(), timestamp),
+            (PgType::Int4, date()),
+            (date(), PgType::Int4),
+            (PgType::Text, date()),
+            (date(), PgType::Text),
+            (PgType::Numeric, varchar5()),
+            (PgType::Text, varchar5()),
+            (varchar5(), PgType::Text),
+        ];
+        for (source, target) in pairs {
+            for context in [Implicit, Assignment, Explicit] {
+                assert_error(
+                    convert(&source, &target, context),
+                    "0A000",
+                    &format!("a cast from {source} to {target} is not supported"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concat_of_only_bytea_operands_stays_bytea() {
+        let items = vec![
+            (number("1"), Some(PgType::Bytea)),
+            (string("\\x0102"), Some(PgType::Unknown)),
+            (number("2"), Some(PgType::Bytea)),
+        ];
+        assert_eq!(
+            coerce_operands("||", OperatorKind::Concat, items).unwrap(),
+            vec![
+                number("1"),
+                ast::Expr::Literal(ast::Literal::Blob("X'0102'".to_string())),
+                number("2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn concat_of_bytea_with_text_converts_to_text() {
+        let items = vec![
+            (number("1"), Some(PgType::Bytea)),
+            (string("x"), Some(PgType::Text)),
+        ];
+        assert_operand_error(
+            coerce_operands("||", OperatorKind::Concat, items),
+            "0A000",
+            "a cast from bytea to text is not supported",
+        );
+    }
+
+    fn assert_assignment_error(
+        source: Option<&PgType>,
+        target: Option<&PgType>,
+        expr: ast::Expr,
+        code: &str,
+        text: &str,
+    ) {
+        assert_error(coerce_assignment(expr, source, "col", target), code, text);
+    }
+
+    #[test]
+    fn assignment_without_a_known_source_or_target_returns_the_expression() {
+        assert_eq!(
+            coerce_assignment(string("x"), None, "col", Some(&PgType::Int4)).unwrap(),
+            string("x")
+        );
+        assert_eq!(
+            coerce_assignment(number("5"), Some(&PgType::Int4), "col", None).unwrap(),
+            number("5")
+        );
+        assert_eq!(
+            coerce_assignment(number("5"), None, "col", None).unwrap(),
+            number("5")
+        );
+    }
+
+    #[test]
+    fn assignment_converts_with_the_assignment_context() {
+        assert_eq!(
+            coerce_assignment(
+                string("5"),
+                Some(&PgType::Unknown),
+                "col",
+                Some(&PgType::Int4)
+            )
+            .unwrap(),
+            number("5")
+        );
+        assert_eq!(
+            coerce_assignment(number("5"), Some(&PgType::Int4), "col", Some(&PgType::Text))
+                .unwrap(),
+            cast_to(number("5"), &PgType::Text)
+        );
+        assert_eq!(
+            coerce_assignment(number("5"), Some(&PgType::Int4), "col", Some(&PgType::Int8))
+                .unwrap(),
+            number("5")
+        );
+        assert_eq!(
+            coerce_assignment(null(), Some(&PgType::Unknown), "col", Some(&date())).unwrap(),
+            null()
+        );
+        assert_eq!(
+            coerce_assignment(variable(), Some(&PgType::Unknown), "col", Some(&date())).unwrap(),
+            variable()
+        );
+    }
+
+    #[test]
+    fn assignment_that_needs_a_cast_gives_the_column_message() {
+        assert_assignment_error(
+            Some(&PgType::Text),
+            Some(&PgType::Int4),
+            number("5"),
+            "42804",
+            "column \"col\" is of type integer but expression is of type text",
+        );
+        assert_assignment_error(
+            Some(&PgType::Bool),
+            Some(&PgType::Int4),
+            number("5"),
+            "42804",
+            "column \"col\" is of type integer but expression is of type boolean",
+        );
+        assert_assignment_error(
+            Some(&PgType::Int4),
+            Some(&PgType::Bool),
+            number("5"),
+            "42804",
+            "column \"col\" is of type boolean but expression is of type integer",
+        );
+        assert_assignment_error(
+            Some(&PgType::Bool),
+            Some(&PgType::Float8),
+            number("5"),
+            "42804",
+            "column \"col\" is of type double precision but expression is of type boolean",
+        );
+    }
+
+    #[test]
+    fn assignment_keeps_the_other_errors() {
+        assert_assignment_error(
+            Some(&PgType::Unknown),
+            Some(&PgType::Int4),
+            string("x"),
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+        assert_assignment_error(
+            Some(&PgType::Unknown),
+            Some(&date()),
+            string("2024-01-01"),
+            "0A000",
+            "a cast from unknown to date is not supported",
+        );
+        assert_assignment_error(
+            Some(&date()),
+            Some(&PgType::Other("timestamp".to_string())),
+            number("5"),
+            "0A000",
+            "a cast from date to timestamp is not supported",
+        );
+    }
+
+    fn assert_common_error(
+        construct: &str,
+        values: Vec<(ast::Expr, Option<PgType>)>,
+        code: &str,
+        text: &str,
+    ) {
+        assert_operand_error(coerce_to_common(construct, values), code, text);
+    }
+
+    #[test]
+    fn values_with_a_name_that_does_not_resolve_pass_as_they_are() {
+        let values = vec![
+            (number("1"), None),
+            (string("x"), Some(PgType::Text)),
+            (number("2"), Some(PgType::Int4)),
+        ];
+        assert_eq!(
+            coerce_to_common("CASE", values).unwrap(),
+            vec![number("1"), string("x"), number("2")]
+        );
+    }
+
+    #[test]
+    fn values_of_numbers_convert_to_the_widest() {
+        let values = vec![
+            (number("1"), Some(PgType::Int4)),
+            (number("2"), Some(PgType::Int8)),
+            (number("3"), Some(PgType::Float8)),
+        ];
+        assert_eq!(
+            coerce_to_common("COALESCE", values).unwrap(),
+            vec![
+                cast_to(number("1"), &PgType::Float8),
+                cast_to(number("2"), &PgType::Float8),
+                number("3"),
+            ]
+        );
+        let values = vec![
+            (number("1"), Some(PgType::Int4)),
+            (number("2"), Some(PgType::Int8)),
+        ];
+        assert_eq!(
+            coerce_to_common("GREATEST", values).unwrap(),
+            vec![number("1"), number("2")]
+        );
+    }
+
+    #[test]
+    fn string_literals_read_as_the_common_type() {
+        let values = vec![
+            (number("1"), Some(PgType::Int4)),
+            (string("0"), Some(PgType::Unknown)),
+            (null(), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_to_common("COALESCE", values).unwrap(),
+            vec![number("1"), number("0"), null()]
+        );
+        assert_common_error(
+            "CASE",
+            vec![
+                (number("1"), Some(PgType::Int4)),
+                (string("x"), Some(PgType::Unknown)),
+            ],
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+    }
+
+    #[test]
+    fn values_that_are_all_unknown_stay_as_they_are() {
+        let values = vec![
+            (string("a"), Some(PgType::Unknown)),
+            (null(), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_to_common("CASE", values).unwrap(),
+            vec![string("a"), null()]
+        );
+    }
+
+    #[test]
+    fn values_of_types_that_do_not_match_are_an_error() {
+        assert_common_error(
+            "CASE",
+            vec![
+                (number("1"), Some(PgType::Int4)),
+                (string("x"), Some(PgType::Text)),
+            ],
+            "42804",
+            "CASE types integer and text cannot be matched",
+        );
+        assert_common_error(
+            "LEAST",
+            vec![
+                (number("1"), Some(PgType::Bool)),
+                (number("2"), Some(PgType::Int8)),
+            ],
+            "42804",
+            "LEAST types boolean and bigint cannot be matched",
+        );
+    }
+
+    #[test]
+    fn a_string_literal_read_as_a_type_with_no_supported_casts_is_not_supported() {
+        assert_common_error(
+            "COALESCE",
+            vec![
+                (number("1"), Some(date())),
+                (string("2024-01-01"), Some(PgType::Unknown)),
+            ],
+            "0A000",
+            "a cast from unknown to date is not supported",
+        );
+        let values = vec![(number("1"), Some(date())), (null(), Some(PgType::Unknown))];
+        assert_eq!(
+            coerce_to_common("COALESCE", values).unwrap(),
+            vec![number("1"), null()]
+        );
+    }
+
+    #[test]
+    fn values_of_different_types_where_one_has_no_supported_casts_are_not_supported() {
+        assert_common_error(
+            "GREATEST",
+            vec![
+                (number("1"), Some(PgType::Int4)),
+                (number("2"), Some(date())),
+            ],
+            "0A000",
+            "GREATEST with types integer and date is not supported",
+        );
+    }
+
+    #[test]
+    fn decision_keeps_a_value_of_the_target_type_or_for_an_unknown_target() {
+        for context in [Implicit, Assignment, Explicit] {
+            assert_eq!(
+                cast_decision(&PgType::Int4, &PgType::Int4, context).unwrap(),
+                CastDecision::Keep
+            );
+            assert_eq!(
+                cast_decision(&PgType::Int4, &PgType::Unknown, context).unwrap(),
+                CastDecision::Keep
+            );
+            assert_eq!(
+                cast_decision(&date(), &date(), context).unwrap(),
+                CastDecision::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn decision_reads_an_unknown_value_as_the_target_type() {
+        for context in [Implicit, Assignment, Explicit] {
+            assert_eq!(
+                cast_decision(&PgType::Unknown, &PgType::Int4, context).unwrap(),
+                CastDecision::FromUnknown
+            );
+        }
+    }
+
+    #[test]
+    fn decision_names_the_method_of_a_supported_conversion() {
+        assert_eq!(
+            cast_decision(&PgType::Int4, &PgType::Int8, Implicit).unwrap(),
+            CastDecision::Convert(CastMethod::Nothing)
+        );
+        assert_eq!(
+            cast_decision(&PgType::Int4, &PgType::Float8, Implicit).unwrap(),
+            CastDecision::Convert(CastMethod::EngineCast)
+        );
+        assert_eq!(
+            cast_decision(&PgType::Float8, &PgType::Int4, Assignment).unwrap(),
+            CastDecision::Convert(CastMethod::RoundThenCast)
+        );
+    }
+
+    #[test]
+    fn decision_gives_the_same_errors_as_converting() {
+        let cases = [
+            (PgType::Float8, PgType::Int4, Implicit),
+            (PgType::Int4, PgType::Bool, Explicit),
+            (PgType::Bool, PgType::Int8, Explicit),
+            (PgType::Int4, date(), Explicit),
+        ];
+        for (source, target, context) in cases {
+            let decision = cast_decision(&source, &target, context).unwrap_err();
+            let converted = convert(&source, &target, context).unwrap_err();
+            assert_eq!(format!("{decision:?}"), format!("{converted:?}"));
+        }
+    }
+
+    #[test]
+    fn assignment_decision_gives_the_column_message() {
+        match assignment_decision(&PgType::Text, "col", &PgType::Int4) {
+            Err(ParseError::Sqlstate { sqlstate, message }) => {
+                assert_eq!(sqlstate, "42804");
+                assert_eq!(
+                    message,
+                    "column \"col\" is of type integer but expression is of type text"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            assignment_decision(&PgType::Int8, "col", &PgType::Int4).unwrap(),
+            CastDecision::Convert(CastMethod::Nothing)
+        );
+    }
+
+    #[test]
+    fn common_type_of_a_later_unsupported_type_is_not_supported() {
+        assert_error(
+            common_type(&[PgType::Int4, PgType::Int8, date()], "COALESCE").map(|_| null()),
+            "0A000",
+            "COALESCE with types bigint and date is not supported",
+        );
+    }
+
+    const ACCEPTED_INTEGERS: &[(&str, i64)] = &[
+        ("42", 42),
+        (" 42 ", 42),
+        ("+7", 7),
+        ("-7", -7),
+        ("0", 0),
+        ("007", 7),
+        ("2147483647", 2147483647),
+        ("-2147483648", -2147483648),
+        ("0x1F", 31),
+        ("0X1f", 31),
+        ("0o17", 15),
+        ("0O17", 15),
+        ("0b101", 5),
+        ("0B101", 5),
+        ("1_000", 1000),
+        ("0x1_F", 31),
+        ("0x_1", 1),
+        ("-0x10", -16),
+        ("  +0b1_1  ", 3),
+        ("\t42\n", 42),
+        ("\u{b}\u{c}\r7", 7),
+        ("0_1", 1),
+    ];
+
+    const REJECTED_INTEGERS: &[&str] = &[
+        "abc", "", " ", "1.5", "1e3", "+", "-", "0x", "0xg", "0b2", "0o8", "1__0", "_1", "1_",
+        "0x1__1", "4 2", "--1", "+-1", "- 1", "0x_", "1\u{a0}", "\u{a0}1",
+    ];
+
+    #[test]
+    fn integer_text_reads_what_postgresql_reads() {
+        for (text, expected) in ACCEPTED_INTEGERS {
+            assert_eq!(parse_int4(text).unwrap(), *expected, "{text:?}");
+            assert_eq!(parse_int8(text).unwrap(), *expected, "{text:?}");
+            assert_eq!(
+                convert_text(text, &PgType::Int4).unwrap(),
+                number(&expected.to_string()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_text_that_is_not_a_number_is_invalid_for_every_size() {
+        for text in REJECTED_INTEGERS {
+            for (name, parse) in [
+                ("integer", parse_int4 as fn(&str) -> Result<i64, ParseError>),
+                ("bigint", parse_int8),
+            ] {
+                assert_error(
+                    parse(text).map(|_| null()),
+                    "22P02",
+                    &format!("invalid input syntax for type {name}: \"{text}\""),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integer_text_outside_the_range_is_out_of_range() {
+        for (text, name, parse) in [
+            (
+                "2147483648",
+                "integer",
+                parse_int4 as fn(&str) -> Result<i64, ParseError>,
+            ),
+            ("-2147483649", "integer", parse_int4),
+            ("0x80000000", "integer", parse_int4),
+            ("0b100000000000000000000000000000000", "integer", parse_int4),
+            ("99999999999999999999", "integer", parse_int4),
+            ("9223372036854775808", "bigint", parse_int8),
+            ("-9223372036854775809", "bigint", parse_int8),
+            ("0x8000000000000000", "bigint", parse_int8),
+            ("99999999999999999999999999", "bigint", parse_int8),
+        ] {
+            assert_error(
+                parse(text).map(|_| null()),
+                "22003",
+                &format!("value \"{text}\" is out of range for type {name}"),
+            );
+        }
+    }
+
+    #[test]
+    fn integer_text_at_the_edge_of_the_range_is_accepted() {
+        assert_eq!(parse_int4("-2147483648").unwrap(), i64::from(i32::MIN));
+        assert_eq!(parse_int8("9223372036854775807").unwrap(), i64::MAX);
+        assert_eq!(parse_int8("-9223372036854775808").unwrap(), i64::MIN);
+        assert_eq!(parse_int8("0x7FFFFFFFFFFFFFFF").unwrap(), i64::MAX);
+        assert_eq!(parse_int8("-0x8000000000000000").unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn integer_text_that_is_too_big_is_out_of_range_even_when_garbage_follows() {
+        assert_error(
+            parse_int4("99999999999x").map(|_| null()),
+            "22003",
+            "value \"99999999999x\" is out of range for type integer",
+        );
+        assert_error(
+            parse_int4("2147483649x").map(|_| null()),
+            "22P02",
+            "invalid input syntax for type integer: \"2147483649x\"",
+        );
+    }
+}

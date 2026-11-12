@@ -4,6 +4,7 @@ use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
 
+pub mod coerce;
 pub mod sqlstate;
 pub mod translator;
 

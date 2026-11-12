@@ -8029,7 +8029,7 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
-fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+pub(crate) fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     ast::Expr::FunctionCall {
         name: exact_name(name),
         distinctness: None,
