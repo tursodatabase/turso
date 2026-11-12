@@ -1,6 +1,6 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
-use crate::error::sqlstate_error;
+use crate::error::{parse_error_to_core, sqlstate_error};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
@@ -10,6 +10,7 @@ use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
+use turso_pg_parser::coerce::parse_oid;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
@@ -386,50 +387,13 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
     let value = args[i].get_value();
     match value {
         Value::Null => Ok(None),
-        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        Value::Text(text) => parse_oid(text.as_str())
+            .map(Some)
+            .map_err(parse_error_to_core),
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
     }
-}
-
-fn parse_oid(text: &str) -> Result<i64> {
-    let invalid =
-        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
-    let out_of_range =
-        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
-    let number = text.trim_matches(is_space);
-    let (negative, unsigned) = match number.as_bytes().first() {
-        Some(b'-') => (true, &number[1..]),
-        Some(b'+') => (false, &number[1..]),
-        _ => (false, number),
-    };
-    let (radix, digits) = if let Some(hex) = unsigned
-        .strip_prefix("0x")
-        .or_else(|| unsigned.strip_prefix("0X"))
-        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
-    {
-        (16, hex)
-    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
-        (8, &unsigned[1..])
-    } else {
-        (10, unsigned)
-    };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return Err(invalid());
-    }
-    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
-    let value = if negative {
-        magnitude.wrapping_neg()
-    } else {
-        magnitude
-    };
-    let oid = value as u32;
-    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
-        return Err(out_of_range());
-    }
-    Ok(i64::from(oid))
 }
 
 fn text_arg(args: &[Register], i: usize) -> String {
@@ -988,10 +952,7 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
         .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
     match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
         Ok(regex) => Ok(Some(regex)),
-        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message))
-        }
-        Err(error) => Err(LimboError::ParseError(error.to_string())),
+        Err(error) => Err(parse_error_to_core(error)),
     }
 }
 

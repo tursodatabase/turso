@@ -20,6 +20,8 @@ pub enum PgType {
     Numeric,
     Text,
     Bytea,
+    /// An object id, kept as an integer from 0 to 4294967295.
+    Oid,
     /// A string literal, NULL or parameter: its type comes from where it is used.
     Unknown,
     /// A type that has a name but no supported casts yet (date, uuid, an enum, ...). Lowercase name.
@@ -56,6 +58,7 @@ impl PgType {
             "text" | "name" => PgType::Text,
             "bool" => PgType::Bool,
             "bytea" => PgType::Bytea,
+            "oid" => PgType::Oid,
             _ => PgType::Other(spelled),
         }
     }
@@ -87,7 +90,7 @@ impl PgType {
     pub fn engine_type(&self) -> Option<ast::Type> {
         let name = match self {
             PgType::Int2 => "smallint",
-            PgType::Int4 => "INTEGER",
+            PgType::Int4 | PgType::Oid => "INTEGER",
             PgType::Int8 => "BIGINT",
             PgType::Float8 | PgType::Numeric => "REAL",
             PgType::Text => "TEXT",
@@ -116,17 +119,27 @@ impl PgType {
     fn category(&self) -> TypeCategory {
         match self {
             PgType::Bool => TypeCategory::Boolean,
-            PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Float8 | PgType::Numeric => {
-                TypeCategory::Number
-            }
+            PgType::Int2
+            | PgType::Int4
+            | PgType::Int8
+            | PgType::Float8
+            | PgType::Numeric
+            | PgType::Oid => TypeCategory::Number,
             PgType::Text => TypeCategory::String,
             PgType::Bytea => TypeCategory::UserDefined,
             PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
         }
     }
 
+    fn is_oid_alias(&self) -> bool {
+        matches!(self, PgType::Oid)
+    }
+
     fn is_preferred(&self) -> bool {
-        matches!(self, PgType::Bool | PgType::Float8 | PgType::Text)
+        matches!(
+            self,
+            PgType::Bool | PgType::Float8 | PgType::Oid | PgType::Text
+        )
     }
 }
 
@@ -152,6 +165,7 @@ impl fmt::Display for PgType {
             PgType::Numeric => "numeric",
             PgType::Text => "text",
             PgType::Bytea => "bytea",
+            PgType::Oid => "oid",
             PgType::Unknown => "unknown",
             PgType::Other(name) => name,
         };
@@ -350,7 +364,7 @@ pub fn coerce_to_boolean(
 pub fn check_unary_operand(operator: &str, operand: Option<&PgType>) -> Result<(), ParseError> {
     match operand {
         None => Ok(()),
-        Some(ty @ (PgType::Text | PgType::Bool | PgType::Bytea)) => Err(error(
+        Some(ty @ (PgType::Text | PgType::Bool | PgType::Bytea | PgType::Oid)) => Err(error(
             SQLSTATE_UNDEFINED_FUNCTION,
             format!("operator does not exist: {operator} {ty}"),
         )),
@@ -450,13 +464,15 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
     use CastContext::{Assignment, Explicit, Implicit};
     use CastMethod::{EngineCast, Function, Nothing, RoundThenCast};
     use CastRule::{Allowed, NoCast, Unsupported};
-    use PgType::{Bool, Bytea, Float8, Int2, Int4, Int8, Numeric, Other, Text};
+    use PgType::{Bool, Bytea, Float8, Int2, Int4, Int8, Numeric, Oid, Other, Text};
 
     match (source, target) {
         (Int2, Int4 | Int8) => Allowed(Implicit, Nothing),
         (Int2, Float8 | Numeric) => Allowed(Implicit, EngineCast),
         (Int2, Text) => Allowed(Assignment, EngineCast),
         (Int4 | Int8 | Float8 | Numeric, Int2) => Allowed(Assignment, Function(NUMBER_TO_INT2)),
+        (Int2, alias) if alias.is_oid_alias() => Allowed(Implicit, Nothing),
+        (alias, Int2) if alias.is_oid_alias() => NoCast,
         (Bool | Bytea, Int2) | (Int2, Bool | Bytea) => NoCast,
         (Int4, Int8) => Allowed(Implicit, Nothing),
         (Int4, Float8) => Allowed(Implicit, EngineCast),
@@ -478,6 +494,16 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
         (Bool, Int4) => Allowed(Explicit, EngineCast),
         (Bool, Text) => Unsupported(Assignment),
         (Bytea, Text) => Unsupported(Assignment),
+        (Int4 | Int8, alias) if alias.is_oid_alias() => Allowed(Implicit, Nothing),
+        (alias, Int4 | Int8) if alias.is_oid_alias() => Allowed(Assignment, Nothing),
+        (Oid, alias) | (alias, Oid) if alias.is_oid_alias() => Allowed(Implicit, Nothing),
+        (Oid, Text) => Allowed(Assignment, EngineCast),
+        (alias, Bool | Float8 | Numeric | Bytea) | (Bool | Float8 | Numeric | Bytea, alias)
+            if alias.is_oid_alias() =>
+        {
+            NoCast
+        }
+        (first, second) if first.is_oid_alias() && second.is_oid_alias() => NoCast,
         (Other(_), _) | (_, Other(_)) => Unsupported(Implicit),
         (Text, _) => Unsupported(Explicit),
         (Bool, Int8 | Float8 | Numeric) | (Int8 | Float8 | Numeric, Bool) => NoCast,
@@ -565,6 +591,7 @@ const COMPARISON_OPERAND_TYPES: &[PgType] = &[
     PgType::Int8,
     PgType::Numeric,
     PgType::Float8,
+    PgType::Oid,
     PgType::Text,
     PgType::Bool,
     PgType::Bytea,
@@ -591,6 +618,7 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
         PgType::Numeric => parse_real(&text, trimmed, "numeric")?,
         PgType::Bool => return parse_bool(&text, trimmed).map(bool_literal),
         PgType::Bytea => parse_bytea(&text, trimmed)?,
+        PgType::Oid => ast::Literal::Numeric(parse_oid(&text)?.to_string()),
         PgType::Unknown | PgType::Other(_) => {
             return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string())))
         }
@@ -679,6 +707,64 @@ fn parse_integer(text: &str, type_name: &str, negative_limit: u64) -> Result<i64
         return Ok(magnitude as i64);
     }
     Err(out_of_range())
+}
+
+/// Reads `text` the way PostgreSQL reads an oid: C-style number with an optional sign, from -2147483648 to 4294967295, where a negative number wraps around.
+pub fn parse_oid(text: &str) -> Result<i64, ParseError> {
+    let bytes = text.as_bytes();
+    let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let mut position = bytes.iter().take_while(|b| is_space(**b)).count();
+    let negative = bytes.get(position) == Some(&b'-');
+    if matches!(bytes.get(position), Some(b'-' | b'+')) {
+        position += 1;
+    }
+    let (radix, digits_start) = match (bytes.get(position), bytes.get(position + 1)) {
+        (Some(b'0'), Some(b'x' | b'X'))
+            if bytes.get(position + 2).is_some_and(u8::is_ascii_hexdigit) =>
+        {
+            (16, position + 2)
+        }
+        (Some(b'0'), _) => (8, position),
+        _ => (10, position),
+    };
+    let digits: Vec<u32> = bytes[digits_start..]
+        .iter()
+        .map_while(|b| char::from(*b).to_digit(radix))
+        .collect();
+    if digits.is_empty() {
+        return Err(invalid_input("oid", text));
+    }
+    let magnitude = digits.iter().try_fold(0u64, |total, digit| {
+        total
+            .checked_mul(u64::from(radix))
+            .and_then(|total| total.checked_add(u64::from(*digit)))
+    });
+    let out_of_range = || {
+        error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            format!("value \"{text}\" is out of range for type oid"),
+        )
+    };
+    let Some(magnitude) = magnitude else {
+        return Err(out_of_range());
+    };
+    if !bytes[digits_start + digits.len()..]
+        .iter()
+        .all(|b| is_space(*b))
+    {
+        return Err(invalid_input("oid", text));
+    }
+    let wrapped = if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    };
+    let fits_unsigned = wrapped <= u64::from(u32::MAX);
+    let fits_signed = i64::from(wrapped as u32 as i32) as u64 == wrapped;
+    if !fits_unsigned && !fits_signed {
+        return Err(out_of_range());
+    }
+    Ok(i64::from(wrapped as u32))
 }
 
 fn parse_real(text: &str, trimmed: &str, type_name: &str) -> Result<ast::Literal, ParseError> {
@@ -2641,6 +2727,202 @@ mod tests {
     }
 
     #[test]
+    fn oid_and_regclass_are_found_by_name_and_shown_by_name() {
+        assert_eq!(PgType::from_name("oid"), PgType::Oid);
+        assert_eq!(PgType::from_name("OID"), PgType::Oid);
+        assert_eq!(PgType::Oid.to_string(), "oid");
+        assert_eq!(
+            PgType::from_name("regtype"),
+            PgType::Other("regtype".to_string())
+        );
+    }
+
+    #[test]
+    fn oid_and_regclass_are_stored_as_integers() {
+        let integer = PgType::Int4.engine_type();
+        assert_eq!(PgType::Oid.engine_type(), integer);
+    }
+
+    #[test]
+    fn integers_convert_to_oid_and_regclass_without_changing_the_value() {
+        for source in [PgType::Int4, PgType::Int8] {
+            for target in [PgType::Oid] {
+                expect_expr(&source, &target, Implicit, "nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn oid_and_regclass_convert_to_integers_only_on_assignment() {
+        for source in [PgType::Oid] {
+            for target in [PgType::Int4, PgType::Int8] {
+                expect_expr(&source, &target, Assignment, "nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn oid_converts_to_text_only_on_assignment() {
+        expect_expr(&PgType::Oid, &PgType::Text, Assignment, "cast");
+    }
+
+    #[test]
+    fn text_to_oid_is_not_supported() {
+        assert_error(
+            convert(&PgType::Text, &PgType::Oid, Explicit),
+            "0A000",
+            "a cast from text to oid is not supported",
+        );
+        assert_error(
+            convert(&PgType::Text, &PgType::Oid, Assignment),
+            "42804",
+            "a value of type text cannot be used as oid without a cast",
+        );
+    }
+
+    #[test]
+    fn oid_and_regclass_have_no_cast_to_or_from_boolean_float_numeric_or_bytea() {
+        for other in [PgType::Bool, PgType::Float8, PgType::Numeric, PgType::Bytea] {
+            for special in [PgType::Oid] {
+                for (source, target) in [
+                    (special.clone(), other.clone()),
+                    (other.clone(), special.clone()),
+                ] {
+                    assert_error(
+                        convert(&source, &target, Implicit),
+                        "42804",
+                        &format!(
+                            "a value of type {source} cannot be used as {target} without a cast"
+                        ),
+                    );
+                    assert_error(
+                        convert(&source, &target, Explicit),
+                        "42846",
+                        &format!("cannot cast type {source} to {target}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn string_literal_becomes_an_oid() {
+        for (text, expected) in [
+            ("0", "0"),
+            ("16384", "16384"),
+            (" 42 ", "42"),
+            ("+7", "7"),
+            ("4294967295", "4294967295"),
+            ("0x10", "16"),
+            ("0X1f", "31"),
+            ("010", "8"),
+            ("-1", "4294967295"),
+            ("-2147483648", "2147483648"),
+            ("\t5\n", "5"),
+        ] {
+            assert_eq!(
+                convert_text(text, &PgType::Oid).unwrap(),
+                number(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_outside_the_oid_range_is_rejected() {
+        for text in [
+            "4294967296",
+            "-2147483649",
+            "99999999999999999999",
+            "99999999999999999999x",
+            "0x100000000",
+        ] {
+            assert_error(
+                convert_text(text, &PgType::Oid),
+                "22003",
+                &format!("value \"{text}\" is out of range for type oid"),
+            );
+        }
+    }
+
+    #[test]
+    fn string_literal_that_is_not_an_oid_is_rejected() {
+        for text in [
+            "", " ", "abc", "-", "+", "1 2", "1.5", "08", "0x", "0xg", "1x", "--1",
+        ] {
+            assert_error(
+                convert_text(text, &PgType::Oid),
+                "22P02",
+                &format!("invalid input syntax for type oid: \"{text}\""),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_cast_of_an_oid_string_literal_adds_one_cast() {
+        assert_eq!(
+            coerce(string("5"), Some(&PgType::Unknown), &PgType::Oid, Explicit).unwrap(),
+            cast_to(number("5"), &PgType::Oid)
+        );
+    }
+
+    #[test]
+    fn a_sign_in_front_of_an_oid_or_regclass_does_not_exist() {
+        for ty in [PgType::Oid] {
+            assert_error(
+                check_unary_operand("-", Some(&ty)).map(|()| null()),
+                "42883",
+                &format!("operator does not exist: - {ty}"),
+            );
+        }
+    }
+
+    #[test]
+    fn common_type_of_oid_and_integers_is_oid() {
+        for types in [
+            vec![PgType::Int4, PgType::Oid],
+            vec![PgType::Oid, PgType::Int4],
+            vec![PgType::Int8, PgType::Oid],
+            vec![PgType::Oid, PgType::Int8, PgType::Int4],
+            vec![PgType::Int4, PgType::Unknown, PgType::Oid, PgType::Int8],
+        ] {
+            assert_eq!(
+                common_type(&types, "CASE").unwrap(),
+                PgType::Oid,
+                "{types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_type_of_oid_and_a_float_or_numeric_cannot_convert() {
+        assert_error(
+            common_type(&[PgType::Oid, PgType::Float8], "COALESCE").map(|_| null()),
+            "42846",
+            "COALESCE could not convert type double precision to oid",
+        );
+        assert_error(
+            common_type(&[PgType::Float8, PgType::Oid], "COALESCE").map(|_| null()),
+            "42846",
+            "COALESCE could not convert type oid to double precision",
+        );
+        assert_error(
+            common_type(&[PgType::Int4, PgType::Oid, PgType::Numeric], "CASE").map(|_| null()),
+            "42846",
+            "CASE could not convert type numeric to oid",
+        );
+    }
+
+    #[test]
+    fn common_type_of_oid_and_another_category_does_not_match() {
+        assert_error(
+            common_type(&[PgType::Oid, PgType::Text], "CASE").map(|_| null()),
+            "42804",
+            "CASE types oid and text cannot be matched",
+        );
+    }
+
+    #[test]
     fn common_type_of_a_later_unsupported_type_is_not_supported() {
         assert_error(
             common_type(&[PgType::Int4, PgType::Int8, date()], "COALESCE").map(|_| null()),
@@ -2720,6 +3002,64 @@ mod tests {
     }
 
     #[test]
+    fn comparison_of_oid_with_integers_and_regclass_converts_to_oid() {
+        for other in [PgType::Int4, PgType::Int8, PgType::Oid] {
+            let items = vec![
+                (number("1"), Some(PgType::Oid)),
+                (number("2"), Some(other.clone())),
+                (string("3"), Some(PgType::Unknown)),
+            ];
+            assert_eq!(
+                coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+                vec![number("1"), number("2"), number("3")],
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn oid_does_not_compare_with_float_numeric_text_or_boolean() {
+        for other in [PgType::Float8, PgType::Numeric, PgType::Text, PgType::Bool] {
+            let items = vec![
+                (number("1"), Some(PgType::Oid)),
+                (number("2"), Some(other.clone())),
+            ];
+            assert_operand_error(
+                coerce_operands("=", OperatorKind::Comparison, items),
+                "42883",
+                &format!("operator does not exist: oid = {other}"),
+            );
+        }
+    }
+
+    #[test]
+    fn oid_has_no_arithmetic() {
+        for other in [PgType::Int4, PgType::Oid, PgType::Unknown] {
+            let items = vec![
+                (number("1"), Some(PgType::Oid)),
+                (number("2"), Some(other.clone())),
+            ];
+            assert_operand_error(
+                coerce_operands("+", OperatorKind::Arithmetic, items),
+                "42883",
+                &format!("operator does not exist: oid + {other}"),
+            );
+        }
+    }
+
+    #[test]
+    fn concat_converts_an_oid_to_text() {
+        let items = vec![
+            (number("1"), Some(PgType::Oid)),
+            (string("x"), Some(PgType::Text)),
+        ];
+        assert_eq!(
+            coerce_operands("||", OperatorKind::Concat, items).unwrap(),
+            vec![cast_to(number("1"), &PgType::Text), string("x")]
+        );
+    }
+
+    #[test]
     fn smallint_is_found_by_name_and_stored_as_a_smallint() {
         for name in ["int2", "smallint", "SMALLINT"] {
             assert_eq!(PgType::from_name(name), PgType::Int2, "{name}");
@@ -2754,12 +3094,18 @@ mod tests {
                 &format!("a value of type {source} cannot be used as smallint without a cast"),
             );
         }
+        for target in [PgType::Oid] {
+            expect_expr(&PgType::Int2, &target, Implicit, "nothing");
+        }
     }
 
     #[test]
     fn smallint_has_no_cast_to_or_from_boolean_bytea_or_an_oid_type() {
-        for other in [PgType::Bool, PgType::Bytea] {
+        for other in [PgType::Bool, PgType::Bytea, PgType::Oid] {
             for (source, target) in [(PgType::Int2, other.clone()), (other.clone(), PgType::Int2)] {
+                if matches!(other, PgType::Oid) && source == PgType::Int2 {
+                    continue;
+                }
                 assert_error(
                     convert(&source, &target, Explicit),
                     "42846",

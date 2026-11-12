@@ -650,6 +650,7 @@ fn binary_operator_type(operator: &str, left: &ExprType, right: &ExprType) -> Ex
                         | PgType::Int8
                         | PgType::Numeric
                         | PgType::Float8
+                        | PgType::Oid
                         | PgType::Bool
                 )
             };
@@ -2635,6 +2636,48 @@ mod tests {
         );
         let typed = vec![Ok(PgType::Int4), not_covered_because("the function f")];
         assert!(require_types(typed).is_err());
+    }
+
+    #[test]
+    fn a_cast_to_oid_or_regclass_has_that_type() {
+        for (expr, expected) in [
+            ("a::oid", PgType::Oid),
+            ("a::pg_catalog.oid", PgType::Oid),
+            ("'1'::OID", PgType::Oid),
+        ] {
+            assert_eq!(type_from_t(expr), Some(expected), "{expr}");
+        }
+    }
+
+    #[test]
+    fn comparisons_of_oid_are_boolean() {
+        assert_eq!(type_from_t("a::oid = 5"), Some(PgType::Bool));
+    }
+
+    #[test]
+    fn concatenating_an_oid_with_text_is_text() {
+        assert_eq!(type_from_t("a::oid || b"), Some(PgType::Text));
+        assert_eq!(type_from_t("b || a::oid"), Some(PgType::Text));
+    }
+
+    #[test]
+    fn coalesce_and_case_of_oid_and_integers_are_oid() {
+        assert_eq!(type_from_t("COALESCE(a, a::oid)"), Some(PgType::Oid));
+        assert_eq!(type_from_t("COALESCE(e, a::oid, NULL)"), Some(PgType::Oid));
+        assert_eq!(
+            type_from_t("CASE WHEN d THEN a ELSE 5::oid END"),
+            Some(PgType::Oid)
+        );
+    }
+
+    #[test]
+    fn coalesce_of_oid_and_a_float_is_not_typed() {
+        assert_eq!(type_from_t("COALESCE(a::oid, c)"), None);
+    }
+
+    #[test]
+    fn oid_has_no_unary_sign_so_it_is_not_typed() {
+        assert_eq!(type_from_t("-a::oid"), None);
     }
 
     #[test]

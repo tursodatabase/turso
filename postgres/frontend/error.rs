@@ -1,6 +1,7 @@
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
+use turso_pg_parser::ParseError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -49,6 +50,14 @@ impl From<LimboError> for Error {
             report: ErrorReport::from(&source),
             source,
         }))
+    }
+}
+
+/// The engine error for an error of the translator that has no schema-qualified name.
+pub(crate) fn parse_error_to_core(error: ParseError) -> LimboError {
+    match error {
+        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
+        other => LimboError::ParseError(other.to_string()),
     }
 }
 
