@@ -530,6 +530,10 @@ Notes on `CREATE FUNCTION`:
   cannot parse or that is not a query, because it reads the body when it
   stores the function. PostgreSQL finds these errors when the function is
   called.
+- When a body has two errors, PostgreSQL gives the one that comes first in
+  the query. tursopg gives the error of a table, column or function that
+  does not exist before the error of a parameter that the function does not
+  have.
 - The check refuses a body that PostgreSQL accepts when the query uses a
   feature that tursopg does not have, such as `FOR UPDATE`, `DISTINCT ON` or
   the function `pg_typeof`. The error is the one that the query gets as a

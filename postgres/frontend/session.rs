@@ -576,6 +576,10 @@ fn validate_function_body(
     function: &ast::CreateFunction,
 ) -> Result<()> {
     let body = function.body.trim();
+    // PostgreSQL gives the first error that it finds in the query, and it
+    // reads the FROM clause first. Thus the error of a table that does not
+    // exist comes before the error of a parameter.
+    let query = prepare_statement_inner(pg_conn, body)?;
     if let Some(number) = parameter_numbers(body)?
         .into_iter()
         .find(|number| *number < 1 || *number as usize > function.parameter_types.len())
@@ -585,7 +589,6 @@ fn validate_function_body(
             format!("there is no parameter ${number}"),
         ));
     }
-    let query = prepare_statement_inner(pg_conn, body)?;
     // PostgreSQL says in the DETAIL of the error that the final statement
     // must return exactly one column.
     if query.num_columns() != 1 {
