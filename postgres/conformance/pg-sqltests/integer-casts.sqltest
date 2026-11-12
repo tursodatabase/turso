@@ -10,6 +10,133 @@ expect {
     15
     10
 }
+test cast-literal-radix-prefix-variants {
+    SELECT '0x10'::int8;
+    SELECT '0X10'::int8;
+    SELECT '0o17'::int8;
+    SELECT '0O17'::int8;
+    SELECT '0b1010'::int8;
+    SELECT '0B1010'::int8;
+    SELECT '+0x10'::int8;
+    SELECT '-0x10'::int8;
+    SELECT '+0o17'::int8;
+    SELECT '-0o17'::int8;
+    SELECT '+0b1010'::int8;
+    SELECT '-0b1010'::int8;
+}
+expect {
+    16
+    16
+    15
+    15
+    10
+    10
+    16
+    -16
+    15
+    -15
+    10
+    -10
+}
+test cast-literal-radix-prefix-underscore-variants {
+    SELECT '0x_FF'::int8;
+    SELECT '0X_FF'::int8;
+    SELECT '0o_77'::int8;
+    SELECT '0O_77'::int8;
+    SELECT '0b_101'::int8;
+    SELECT '0B_101'::int8;
+    SELECT '-0x_FF'::int8;
+    SELECT '+0o_17'::int8;
+}
+expect {
+    255
+    255
+    63
+    63
+    5
+    5
+    -255
+    15
+}
+test cast-literal-decimal-underscore-variants {
+    SELECT '1_000'::int8;
+    SELECT '12_34'::int8;
+    SELECT '1_2_3_4'::int8;
+    SELECT '-1_000'::int8;
+    SELECT '+1_000'::int8;
+}
+expect {
+    1000
+    1234
+    1234
+    -1000
+    1000
+}
+test cast-literal-whitespace {
+    SELECT '  123  '::int8;
+    SELECT '  +123  '::int8;
+    SELECT '  -123  '::int8;
+    SELECT E'\t123\t'::int8;
+    SELECT E'\n123\n'::int8;
+}
+expect {
+    123
+    123
+    -123
+    123
+    123
+}
+
+test cast-radix-all-widths {
+    SELECT '0x7f'::int2;
+    SELECT '0o177'::int2;
+    SELECT '0b1111111'::int2;
+    SELECT '0x7fff'::int2;
+    SELECT '0o77777'::int2;
+    SELECT '0b111111111111111'::int2;
+    SELECT '0x7fffffff'::int4;
+    SELECT '0o17777777777'::int4;
+    SELECT '0b1111111111111111111111111111111'::int4;
+    SELECT '0x7fffffffffffffff'::int8;
+    SELECT '0o777777777777777777777'::int8;
+    SELECT '0b111111111111111111111111111111111111111111111111111111111111111'::int8;
+}
+expect {
+    127
+    127
+    127
+    32767
+    32767
+    32767
+    2147483647
+    2147483647
+    2147483647
+    9223372036854775807
+    9223372036854775807
+    9223372036854775807
+}
+test cast-negative-radix-minimum-boundaries {
+    SELECT '-0x8000'::int2;
+    SELECT '-0o100000'::int2;
+    SELECT '-0b1000000000000000'::int2;
+    SELECT '-0x80000000'::int4;
+    SELECT '-0o20000000000'::int4;
+    SELECT '-0b10000000000000000000000000000000'::int4;
+    SELECT '-0x8000000000000000'::int8;
+    SELECT '-0o1000000000000000000000'::int8;
+    SELECT '-0b1000000000000000000000000000000000000000000000000000000000000000'::int8;
+}
+expect {
+    -32768
+    -32768
+    -32768
+    -2147483648
+    -2147483648
+    -2147483648
+    -9223372036854775808
+    -9223372036854775808
+    -9223372036854775808
+}
 
 test cast-runtime-text-to-integer {
     CREATE TABLE integer_cast_values (value text);
@@ -22,15 +149,12 @@ expect {
     15
     16
 }
-
 test cast-runtime-text-to-all-integer-types {
     CREATE TABLE integer_cast_values (value text);
     INSERT INTO integer_cast_values VALUES ('123'), ('456'), ('789');
-
     SELECT value::int2 FROM integer_cast_values ORDER BY value;
     SELECT value::int4 FROM integer_cast_values ORDER BY value;
     SELECT value::int8 FROM integer_cast_values ORDER BY value;
-
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -44,15 +168,12 @@ expect {
     456
     789
 }
-
 test cast-runtime-prefixed-text-to-all-integer-types {
     CREATE TABLE integer_cast_values (value text);
     INSERT INTO integer_cast_values VALUES ('0x10'), ('0o17'), ('0b1010');
-
     SELECT value::int2 FROM integer_cast_values ORDER BY value;
     SELECT value::int4 FROM integer_cast_values ORDER BY value;
     SELECT value::int8 FROM integer_cast_values ORDER BY value;
-
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -65,6 +186,69 @@ expect {
     10
     15
     16
+}
+test cast-runtime-text-radix-variants {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES
+        ('0x10'), ('0X10'),
+        ('0o17'), ('0O17'),
+        ('0b1010'), ('0B1010'),
+        ('-0x10'), ('+0o17'), ('-0b1010');
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    16
+    16
+    15
+    15
+    10
+    10
+    -16
+    15
+    -10
+}
+test cast-runtime-text-underscore-variants {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES
+        ('1_000'), ('12_34'), ('1_2_3_4'),
+        ('0x_FF'), ('0X_FF'),
+        ('0o_77'), ('0O_77'),
+        ('0b_101'), ('0B_101'),
+        ('-1_000'), ('-0x_FF'), ('+0o_17');
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    1000
+    1234
+    1234
+    255
+    255
+    63
+    63
+    5
+    5
+    -1000
+    -255
+    15
+}
+test cast-runtime-text-boundaries-all-widths {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES
+        ('32767'), ('-32768'),
+        ('2147483647'), ('-2147483648'),
+        ('9223372036854775807'), ('-9223372036854775808');
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
 }
 
 test cast-function-style-integer {
@@ -76,6 +260,66 @@ expect {
     123
     456
     789
+}
+test cast-function-style-radix-variants {
+    SELECT int2('0x10');
+    SELECT int2('0o17');
+    SELECT int2('0b1010');
+    SELECT int4('0x10');
+    SELECT int4('0o17');
+    SELECT int4('0b1010');
+    SELECT int8('0x10');
+    SELECT int8('0o17');
+    SELECT int8('0b1010');
+    SELECT int8('-0x10');
+    SELECT int8('+0o17');
+    SELECT int8('-0b1010');
+}
+expect {
+    16
+    15
+    10
+    16
+    15
+    10
+    16
+    15
+    10
+    -16
+    15
+    -10
+}
+test cast-function-style-underscore-variants {
+    SELECT int8('1_000');
+    SELECT int8('12_34');
+    SELECT int8('0x_FF');
+    SELECT int8('0o_77');
+    SELECT int8('0b_101');
+    SELECT int8('-0x_FF');
+}
+expect {
+    1000
+    1234
+    255
+    63
+    5
+    -255
+}
+test cast-function-style-integer-boundaries {
+    SELECT int2('32767');
+    SELECT int2('-32768');
+    SELECT int4('2147483647');
+    SELECT int4('-2147483648');
+    SELECT int8('9223372036854775807');
+    SELECT int8('-9223372036854775808');
+}
+expect {
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
 }
 
 test cast-integer-range-boundaries {
@@ -94,6 +338,122 @@ expect {
     9223372036854775807
     -9223372036854775808
 }
+test cast-numeric-integer-literals-all-widths {
+    SELECT 123::int2;
+    SELECT 123::int4;
+    SELECT 123::int8;
+    SELECT int2(123);
+    SELECT int4(123);
+    SELECT int8(123);
+}
+expect {
+    123
+    123
+    123
+    123
+    123
+    123
+}
+test cast-numeric-integer-literal-boundaries {
+    SELECT 32767::int2;
+    SELECT (-32768)::int2;
+    SELECT 2147483647::int4;
+    SELECT (-2147483648)::int4;
+    SELECT 9223372036854775807::int8;
+    SELECT (-9223372036854775808)::int8;
+    SELECT int2(32767);
+    SELECT int2(-32768);
+    SELECT int4(2147483647);
+    SELECT int4(-2147483648);
+    SELECT int8(9223372036854775807);
+    SELECT int8(-9223372036854775808);
+}
+expect {
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
+}
+test cast-numeric-literal-unary-minus-precedence {
+    SELECT (-9223372036854775808)::int8;
+}
+expect {
+    -9223372036854775808
+}
+
+test cast-numeric-int2-positive-overflow {
+    SELECT 32768::int2;
+}
+expect error {
+}
+test cast-numeric-int2-negative-overflow {
+    SELECT (-32769)::int2;
+}
+expect error {
+}
+test cast-numeric-int4-positive-overflow {
+    SELECT 2147483648::int4;
+}
+expect error {
+}
+test cast-numeric-int4-negative-overflow {
+    SELECT (-2147483649)::int4;
+}
+expect error {
+}
+test cast-numeric-int8-positive-overflow {
+    SELECT 9223372036854775808::int8;
+}
+expect error {
+}
+test cast-numeric-int8-negative-overflow {
+    SELECT (-9223372036854775809)::int8;
+}
+expect error {
+}
+test cast-function-numeric-int2-positive-overflow {
+    SELECT int2(32768);
+}
+expect error {
+}
+test cast-function-numeric-int2-negative-overflow {
+    SELECT int2(-32769);
+}
+expect error {
+}
+test cast-function-numeric-int4-positive-overflow {
+    SELECT int4(2147483648);
+}
+expect error {
+}
+test cast-function-numeric-int4-negative-overflow {
+    SELECT int4(-2147483649);
+}
+expect error {
+}
+test cast-function-numeric-int8-positive-overflow {
+    SELECT int8(9223372036854775808);
+}
+expect error {
+}
+test cast-function-numeric-int8-negative-overflow {
+    SELECT int8(-9223372036854775809);
+}
+expect error {
+}
+test cast-numeric-int8-unary-minus-precedence {
+    SELECT -9223372036854775808::int8;
+}
+expect error {
+}
 
 test cast-prefixed-integer-range-boundaries {
     SELECT '0x7fff'::int2;
@@ -105,57 +465,124 @@ expect {
     2147483647
     9223372036854775807
 }
+test cast-int2-positive-hex-overflow {
+    SELECT '0x8000'::int2;
+}
+expect error {
+}
+test cast-int2-positive-octal-overflow {
+    SELECT '0o100000'::int2;
+}
+expect error {
+}
+test cast-int2-positive-binary-overflow {
+    SELECT '0b1000000000000000'::int2;
+}
+expect error {
+}
+test cast-int2-negative-hex-overflow {
+    SELECT '-0x8001'::int2;
+}
+expect error {
+}
+test cast-int2-negative-octal-overflow {
+    SELECT '-0o100001'::int2;
+}
+expect error {
+}
+test cast-int2-negative-binary-overflow {
+    SELECT '-0b1000000000000001'::int2;
+}
+expect error {
+}
+test cast-int4-positive-hex-overflow {
+    SELECT '0x80000000'::int4;
+}
+expect error {
+}
+test cast-int4-positive-octal-overflow {
+    SELECT '0o20000000000'::int4;
+}
+expect error {
+}
+test cast-int4-positive-binary-overflow {
+    SELECT '0b10000000000000000000000000000000'::int4;
+}
+expect error {
+}
+test cast-int4-negative-hex-overflow {
+    SELECT '-0x80000001'::int4;
+}
+expect error {
+}
+test cast-int4-negative-octal-overflow {
+    SELECT '-0o20000000001'::int4;
+}
+expect error {
+}
+test cast-int4-negative-binary-overflow {
+    SELECT '-0b10000000000000000000000000000001'::int4;
+}
+expect error {
+}
+test cast-int8-positive-hex-overflow {
+    SELECT '0x8000000000000000'::int8;
+}
+expect error {
+}
+test cast-int8-positive-octal-overflow {
+    SELECT '0o1000000000000000000000'::int8;
+}
+expect error {
+}
+test cast-int8-positive-binary-overflow {
+    SELECT '0b1000000000000000000000000000000000000000000000000000000000000000'::int8;
+}
+expect error {
+}
+test cast-int8-negative-hex-overflow {
+    SELECT '-0x8000000000000001'::int8;
+}
+expect error {
+}
+test cast-int8-negative-octal-overflow {
+    SELECT '-0o1000000000000000000001'::int8;
+}
+expect error {
+}
+test cast-int8-negative-binary-overflow {
+    SELECT '-0b1000000000000000000000000000000000000000000000000000000000000001'::int8;
+}
+expect error {
+}
 
 test cast-int2-positive-decimal-overflow {
     SELECT '32768'::int2;
 }
 expect error {
 }
-
 test cast-int2-negative-decimal-overflow {
     SELECT '-32769'::int2;
 }
 expect error {
 }
-
-test cast-int2-positive-hex-overflow {
-    SELECT '0x8000'::int2;
-}
-expect error {
-}
-
 test cast-int4-positive-decimal-overflow {
     SELECT '2147483648'::int4;
 }
 expect error {
 }
-
 test cast-int4-negative-decimal-overflow {
     SELECT '-2147483649'::int4;
 }
 expect error {
 }
-
-test cast-int4-positive-hex-overflow {
-    SELECT '0x80000000'::int4;
-}
-expect error {
-}
-
 test cast-int8-positive-decimal-overflow {
     SELECT '9223372036854775808'::int8;
 }
 expect error {
 }
-
 test cast-int8-negative-decimal-overflow {
     SELECT '-9223372036854775809'::int8;
-}
-expect error {
-}
-
-test cast-int8-positive-hex-overflow {
-    SELECT '0x8000000000000000'::int8;
 }
 expect error {
 }
@@ -163,9 +590,471 @@ expect error {
 test cast-runtime-text-overflow {
     CREATE TABLE integer_cast_values (value text);
     INSERT INTO integer_cast_values VALUES ('32768');
-
     SELECT value::int2 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int2-negative-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('-32769');
+    SELECT value::int2 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int4-positive-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('2147483648');
+    SELECT value::int4 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int4-negative-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('-2147483649');
+    SELECT value::int4 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int8-positive-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('9223372036854775808');
+    SELECT value::int8 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int8-negative-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('-9223372036854775809');
+    SELECT value::int8 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int8-function-overflow {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('-9223372036854775809');
+    SELECT int8(value) FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
 
+test cast-invalid-text-empty {
+    SELECT ''::int8;
+}
+expect error {
+}
+test cast-invalid-text-whitespace-only {
+    SELECT '   '::int8;
+}
+expect error {
+}
+test cast-invalid-text-alpha {
+    SELECT 'abc'::int8;
+}
+expect error {
+}
+test cast-invalid-text-decimal-fraction {
+    SELECT '1.5'::int8;
+}
+expect error {
+}
+test cast-invalid-text-trailing-characters {
+    SELECT '12abc'::int8;
+}
+expect error {
+}
+test cast-invalid-text-sign-only {
+    SELECT '+'::int8;
+}
+expect error {
+}
+test cast-invalid-text-negative-sign-only {
+    SELECT '-'::int8;
+}
+expect error {
+}
+test cast-invalid-text-multiple-signs {
+    SELECT '--1'::int8;
+}
+expect error {
+}
+test cast-invalid-text-sign-after-prefix {
+    SELECT '0x-1'::int8;
+}
+expect error {
+}
+test cast-invalid-text-sign-with-whitespace {
+    SELECT '+ 1'::int8;
+}
+expect error {
+}
+test cast-invalid-text-empty-hex-prefix {
+    SELECT '0x'::int8;
+}
+expect error {
+}
+test cast-invalid-text-empty-octal-prefix {
+    SELECT '0o'::int8;
+}
+expect error {
+}
+test cast-invalid-text-empty-binary-prefix {
+    SELECT '0b'::int8;
+}
+expect error {
+}
+test cast-invalid-text-invalid-hex-digit {
+    SELECT '0xG'::int8;
+}
+expect error {
+}
+test cast-invalid-text-invalid-octal-digit {
+    SELECT '0o8'::int8;
+}
+expect error {
+}
+test cast-invalid-text-invalid-binary-digit {
+    SELECT '0b2'::int8;
+}
+expect error {
+}
+test cast-invalid-text-invalid-prefix {
+    SELECT '0z10'::int8;
+}
+expect error {
+}
+test cast-invalid-text-leading-underscore {
+    SELECT '_12'::int8;
+}
+expect error {
+}
+test cast-invalid-text-trailing-underscore {
+    SELECT '12_'::int8;
+}
+expect error {
+}
+test cast-invalid-text-consecutive-underscores {
+    SELECT '1__2'::int8;
+}
+expect error {
+}
+test cast-invalid-text-prefix-double-underscore {
+    SELECT '0x__FF'::int8;
+}
+expect error {
+}
+test cast-invalid-text-octal-prefix-double-underscore {
+    SELECT '0o__77'::int8;
+}
+expect error {
+}
+test cast-invalid-text-binary-prefix-double-underscore {
+    SELECT '0b__101'::int8;
+}
+expect error {
+}
+test cast-invalid-text-trailing-radix-underscore {
+    SELECT '0xFF_'::int8;
+}
+expect error {
+}
+test cast-invalid-text-underscore-before-sign {
+    SELECT '_-12'::int8;
+}
+expect error {
+}
+test cast-invalid-text-underscore-after-sign {
+    SELECT '-_12'::int8;
+}
+expect error {
+}
+
+test cast-function-invalid-text {
+    SELECT int8('abc');
+}
+expect error {
+}
+test cast-function-invalid-empty-text {
+    SELECT int8('');
+}
+expect error {
+}
+test cast-function-invalid-empty-prefix {
+    SELECT int8('0x');
+}
+expect error {
+}
+test cast-function-invalid-digit {
+    SELECT int8('0b2');
+}
+expect error {
+}
+test cast-function-invalid-leading-underscore {
+    SELECT int8('_12');
+}
+expect error {
+}
+test cast-function-invalid-trailing-underscore {
+    SELECT int8('12_');
+}
+expect error {
+}
+test cast-function-invalid-consecutive-underscore {
+    SELECT int8('1__2');
+}
+expect error {
+}
+test cast-function-invalid-prefix-underscore {
+    SELECT int8('0x__FF');
+}
+expect error {
+}
+
+test cast-float-literal-rounding {
+    SELECT 123.4::int8;
+    SELECT 123.5::int8;
+    SELECT 123.6::int8;
+    SELECT -123.4::int8;
+    SELECT -123.5::int8;
+    SELECT -123.6::int8;
+    SELECT int8(123.4);
+    SELECT int8(123.5);
+    SELECT int8(123.6);
+    SELECT int8(-123.4);
+    SELECT int8(-123.5);
+    SELECT int8(-123.6);
+}
+expect {
+    123
+    124
+    124
+    -123
+    -124
+    -124
+    123
+    124
+    124
+    -123
+    -124
+    -124
+}
+test cast-float-literal-all-widths {
+    SELECT 123.5::int2;
+    SELECT 123.5::int4;
+    SELECT 123.5::int8;
+    SELECT int2(123.5);
+    SELECT int4(123.5);
+    SELECT int8(123.5);
+}
+expect {
+    124
+    124
+    124
+    124
+    124
+    124
+}
+test cast-float-literal-int2-overflow {
+    SELECT 32768.0::int2;
+}
+expect error {
+}
+test cast-float-literal-int4-overflow {
+    SELECT 2147483648.0::int4;
+}
+expect error {
+}
+test cast-float-literal-int8-positive-overflow {
+    SELECT 9223372036854775808.0::int8;
+}
+expect error {
+}
+test cast-float-literal-int8-negative-boundary {
+    SELECT (-9223372036854775808.0)::int8;
+}
+expect {
+    -9223372036854775808
+}
+
+test cast-runtime-integer-values-all-widths {
+    CREATE TABLE integer_cast_values (value bigint);
+    INSERT INTO integer_cast_values VALUES
+        (123), (-123), (32767), (-32768);
+    SELECT value::int2 FROM integer_cast_values ORDER BY rowid;
+    SELECT value::int4 FROM integer_cast_values ORDER BY rowid;
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    SELECT int2(value) FROM integer_cast_values ORDER BY rowid;
+    SELECT int4(value) FROM integer_cast_values ORDER BY rowid;
+    SELECT int8(value) FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    123
+    -123
+    32767
+    -32768
+    123
+    -123
+    32767
+    -32768
+    123
+    -123
+    32767
+    -32768
+    123
+    -123
+    32767
+    -32768
+    123
+    -123
+    32767
+    -32768
+    123
+    -123
+    32767
+    -32768
+}
+test cast-runtime-integer-int2-overflow {
+    CREATE TABLE integer_cast_values (value bigint);
+    INSERT INTO integer_cast_values VALUES (32768);
+    SELECT value::int2 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-integer-int4-overflow {
+    CREATE TABLE integer_cast_values (value bigint);
+    INSERT INTO integer_cast_values VALUES (2147483648);
+    SELECT value::int4 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-integer-int8-boundaries {
+    CREATE TABLE integer_cast_values (value bigint);
+    INSERT INTO integer_cast_values VALUES
+        (9223372036854775807),
+        (-9223372036854775808);
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    9223372036854775807
+    -9223372036854775808
+}
+
+test cast-runtime-float-rounding {
+    CREATE TABLE integer_cast_values (value double precision);
+    INSERT INTO integer_cast_values VALUES
+        (123.4), (123.5), (123.6),
+        (-123.4), (-123.5), (-123.6);
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    123
+    124
+    124
+    -123
+    -124
+    -124
+}
+test cast-runtime-float-all-widths {
+    CREATE TABLE integer_cast_values (value double precision);
+    INSERT INTO integer_cast_values VALUES (123.5), (-123.5);
+    SELECT value::int2 FROM integer_cast_values ORDER BY rowid;
+    SELECT value::int4 FROM integer_cast_values ORDER BY rowid;
+    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+    SELECT int2(value) FROM integer_cast_values ORDER BY rowid;
+    SELECT int4(value) FROM integer_cast_values ORDER BY rowid;
+    SELECT int8(value) FROM integer_cast_values ORDER BY rowid;
+    DROP TABLE integer_cast_values;
+}
+expect {
+    124
+    -124
+    124
+    -124
+    124
+    -124
+    124
+    -124
+    124
+    -124
+    124
+    -124
+}
+test cast-runtime-float-int2-overflow {
+    CREATE TABLE integer_cast_values (value double precision);
+    INSERT INTO integer_cast_values VALUES (32768.0);
+    SELECT value::int2 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-float-int4-overflow {
+    CREATE TABLE integer_cast_values (value double precision);
+    INSERT INTO integer_cast_values VALUES (2147483648.0);
+    SELECT value::int4 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-float-int8-overflow {
+    CREATE TABLE integer_cast_values (value double precision);
+    INSERT INTO integer_cast_values VALUES (9223372036854775808.0);
+    SELECT value::int8 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+
+test cast-null-literal-all-widths {
+    SELECT NULL::int2;
+    SELECT NULL::int4;
+    SELECT NULL::int8;
+    SELECT int2(NULL);
+    SELECT int4(NULL);
+    SELECT int8(NULL);
+}
+expect {
+
+
+
+
+
+
+}
+test cast-runtime-null-all-widths {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES (NULL);
+    SELECT value::int2 FROM integer_cast_values;
+    SELECT value::int4 FROM integer_cast_values;
+    SELECT value::int8 FROM integer_cast_values;
+    SELECT int2(value) FROM integer_cast_values;
+    SELECT int4(value) FROM integer_cast_values;
+    SELECT int8(value) FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect {
+
+
+
+
+
+
+}
+
+test cast-runtime-text-int8-precision-preservation {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('-9223372036854775809');
+    SELECT int8(value) FROM integer_cast_values;
     DROP TABLE integer_cast_values;
 }
 expect error {
