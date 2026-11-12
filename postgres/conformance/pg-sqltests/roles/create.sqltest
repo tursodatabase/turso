@@ -58,6 +58,31 @@ expect error {
     conflicting or redundant options
 }
 
+test create-role-with-nologin-cannot-log-in {
+    CREATE ROLE cr_nologin NOLOGIN;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'cr_nologin' AND NOT rolcanlogin;
+}
+expect {
+    1
+}
+
+test create-role-with-nologin-and-bypassrls {
+    CREATE ROLE cr_nologin_bypassrls WITH NOLOGIN BYPASSRLS;
+    SELECT count(*) FROM pg_roles
+    WHERE rolname = 'cr_nologin_bypassrls' AND NOT rolcanlogin AND rolbypassrls;
+}
+expect {
+    1
+}
+
+test create-role-with-nologin-twice-fails {
+    CREATE ROLE cr_nologin_twice NOLOGIN NOLOGIN;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
 test create-role-named-postgres-fails {
     CREATE ROLE postgres;
 }

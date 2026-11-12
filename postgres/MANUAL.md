@@ -208,7 +208,12 @@ DROP POLICY own_docs ON docs;
 **Synopsis:**
 
 ```sql
-CREATE ROLE name
+CREATE ROLE name [ [ WITH ] option [ ... ] ]
+
+where option can be:
+
+      BYPASSRLS | NOBYPASSRLS
+    | NOLOGIN
 ```
 
 **Description:**
@@ -221,6 +226,12 @@ and cannot log in. Roles are listed in the `pg_roles` catalog.
 - `name`: The name of the new role. Unquoted names are converted to lowercase,
   and quoted names keep their case. Names that start with `pg_` are reserved
   and cannot be used.
+- `BYPASSRLS`, `NOBYPASSRLS`: Whether row-level security limits the role. A
+  role with `BYPASSRLS` reads and writes every row of a table with row-level
+  security, but still needs privileges on the table. The default is
+  `NOBYPASSRLS`.
+- `NOLOGIN`: The role cannot log in. This is the default, and the only choice:
+  `LOGIN` is not supported.
 
 **Notes:**
 
@@ -234,7 +245,8 @@ another, and copying the file copies its roles.
 `CREATE ROLE` works inside a transaction. If the transaction is rolled back,
 the role is not created.
 
-Options such as `LOGIN`, `PASSWORD`, or `SUPERUSER` are not supported yet.
+Other options, such as `LOGIN`, `PASSWORD`, or `SUPERUSER`, are not supported
+yet. Giving an option twice is an error.
 
 **Examples:**
 

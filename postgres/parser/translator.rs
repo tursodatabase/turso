@@ -6449,6 +6449,9 @@ fn translate_create_role(
         }
         match elem.defname.as_str() {
             "bypassrls" => options.bypassrls = extract_def_elem_bool(elem),
+            // A role cannot log in unless it is the built-in superuser, so
+            // NOLOGIN changes nothing.
+            "canlogin" if !extract_def_elem_bool(elem) => {}
             _ => {
                 return Err(ParseError::not_supported(format!(
                     "CREATE ROLE option {}",
@@ -12203,10 +12206,9 @@ mod tests {
     }
 
     #[test]
-    fn create_role_refuses_options_other_than_bypassrls() {
+    fn create_role_refuses_options_it_does_not_support() {
         for (sql, keyword) in [
             ("CREATE ROLE r LOGIN", "LOGIN"),
-            ("CREATE ROLE r NOLOGIN", "NOLOGIN"),
             ("CREATE ROLE r NOINHERIT", "NOINHERIT"),
             ("CREATE ROLE r SUPERUSER", "SUPERUSER"),
             ("CREATE ROLE r CREATEDB", "CREATEDB"),
@@ -12219,6 +12221,28 @@ mod tests {
             ("CREATE ROLE r BYPASSRLS LOGIN", "LOGIN"),
         ] {
             assert_not_supported(sql, &format!("CREATE ROLE option {keyword} "));
+        }
+    }
+
+    #[test]
+    fn create_role_accepts_nologin() {
+        for sql in [
+            "CREATE ROLE r NOLOGIN",
+            "CREATE ROLE r WITH NOLOGIN",
+            "CREATE ROLE r NOLOGIN BYPASSRLS",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .unwrap();
+            assert!(
+                matches!(
+                    &translated.cmd,
+                    ast::Cmd::Stmt(ast::Stmt::CreateRole { role_name, .. }) if role_name == "r"
+                ),
+                "{sql}: {:?}",
+                translated.cmd
+            );
         }
     }
 
