@@ -914,10 +914,6 @@ expect @tursopg error {
     a named argument in a function call is not supported
 }
 
-# Statements on functions and triggers. tursopg cannot drop a function yet,
-# and no procedure or trigger can exist. To give PostgreSQL's errors, tursopg
-# would have to look the functions and triggers up.
-
 test drop-function {
     DROP FUNCTION nosuch;
 }
@@ -925,10 +921,10 @@ test drop-function {
 expect error {
     could not find a function named "nosuch"
 }
-@sqlstate 0A000
-expect @tursopg error {
-    DROP FUNCTION is not supported
-}
+
+# Statements on procedures and triggers. No procedure or trigger can exist,
+# so PostgreSQL rejects them too. To give PostgreSQL's errors, tursopg would
+# have to look the procedures and triggers up.
 
 test drop-procedure {
     DROP PROCEDURE nosuch;

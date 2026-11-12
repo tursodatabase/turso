@@ -27,18 +27,21 @@ use turso_core::{
     RelationChange, Value, MAIN_DB_ID,
 };
 use turso_parser::ast;
-use turso_pg_parser::display_signature_type_name;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DUPLICATE_FUNCTION, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
-    SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_AMBIGUOUS_FUNCTION, SQLSTATE_DUPLICATE_FUNCTION, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_FUNCTION_DEFINITION,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
 };
+use turso_pg_parser::{display_signature_type_name, is_base_type_name};
 
 use crate::catalog::pg_base_type_oid;
 use crate::classes::{
-    class_catalog, corrupt_row, emit_class_row_insert_of_kind, open_class_table_for_writing,
-    read_back_integer, FIRST_NORMAL_OBJECT_ID,
+    class_catalog, corrupt_row, emit_class_row_insert_of_kind, emit_class_row_removal,
+    open_class_table_for_writing, read_back_integer, FIRST_NORMAL_OBJECT_ID,
 };
 use crate::error::sqlstate_error;
+use crate::pg_type::type_exists;
+use crate::session::check_schema_exists;
 
 /// The `type` of the `sqlite_schema` row that stores a function. The
 /// version is part of the type, so that a later format gets a type of its
@@ -86,6 +89,16 @@ impl SqlFunction {
 /// rows name it, such as `add_one(int4)`.
 fn signature(name: &str, parameter_types: &[String]) -> String {
     format!("{name}({})", parameter_types.join(","))
+}
+
+/// The function as PostgreSQL writes it in errors, such as
+/// `add_one(integer)`.
+fn display_signature(name: &str, parameter_types: &[String]) -> String {
+    let parameter_types: Vec<_> = parameter_types
+        .iter()
+        .map(|parameter_type| display_signature_type_name(parameter_type))
+        .collect();
+    format!("{name}({})", parameter_types.join(", "))
 }
 
 /// The functions of a database.
@@ -186,6 +199,9 @@ impl FunctionCatalog {
                 let replaced = self.by_oid.insert(function.oid, function.clone());
                 assert!(replaced.is_some(), "a replaced function exists");
             }
+            FunctionChange::Drop { oid } => {
+                self.by_oid.remove(oid);
+            }
         }
         Ok(())
     }
@@ -200,6 +216,9 @@ pub(crate) enum FunctionChange {
     /// `CREATE OR REPLACE` of a function that exists keeps its oid and
     /// owner.
     Replace(SqlFunction),
+    Drop {
+        oid: i64,
+    },
 }
 
 fn function_from_rows(
@@ -364,6 +383,122 @@ pub(crate) fn translate_create_function(
     );
     emit_function_change(program, change.0, change.1);
     Ok(())
+}
+
+/// [`turso_core::Dialect::translate_drop_function`] for the PostgreSQL
+/// frontend. With PostgreSQL's errors: a function that does not exist
+/// (42883), a name that several functions have (42725), a role that does
+/// not own the function (42501). Nothing checks whether another object uses
+/// the function.
+pub(crate) fn translate_drop_function(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    drop: &ast::DropFunction,
+) -> turso_core::Result<()> {
+    let functions = function_catalog(schema).ok_or_else(no_catalog)?;
+    let name = drop.name.name.as_str();
+    let Some(function) = find_function_to_drop(connection, functions, drop)? else {
+        if drop.if_exists {
+            return Ok(());
+        }
+        let function = match &drop.parameter_types {
+            Some(parameter_types) => display_signature(name, parameter_types),
+            None => name.to_string(),
+        };
+        return Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            match &drop.parameter_types {
+                Some(_) => format!("function {function} does not exist"),
+                None => format!("could not find a function named \"{function}\""),
+            },
+        ));
+    };
+    check_ownership(connection, function)?;
+
+    let stored_name = function.stored_name();
+    let schema_cursor_id = open_schema_table_for_dialect_rows(program, schema)?;
+    emit_dialect_schema_row_delete(
+        program,
+        schema_cursor_id,
+        FUNCTION_SCHEMA_ROW_TYPE,
+        &mangle_name(function.namespace, &stored_name),
+    );
+    let cursors = open_class_table_for_writing(program, schema, false)?.ok_or_else(no_catalog)?;
+    emit_class_row_removal(program, &cursors, function.namespace, &stored_name);
+    emit_function_change(program, FunctionChange::Drop { oid: function.oid }, vec![]);
+    Ok(())
+}
+
+/// The function that `drop` names. A statement with parameter types names
+/// the function of the named schema, or of the first schema of the search
+/// path that has it. A statement without parameter types names the only
+/// function of the name in the named schema, or in the search path.
+fn find_function_to_drop<'a>(
+    connection: &Arc<Connection>,
+    functions: &'a FunctionCatalog,
+    drop: &ast::DropFunction,
+) -> turso_core::Result<Option<&'a SqlFunction>> {
+    let name = drop.name.name.as_str();
+    let namespaces = match &drop.name.namespace {
+        Some(_) => match function_namespace(connection, &drop.name) {
+            Ok(namespace) => namespace.into_iter().collect(),
+            // PostgreSQL skips a function of a schema that does not exist.
+            Err(_) if drop.if_exists => vec![],
+            Err(error) => return Err(error),
+        },
+        None => search_path_namespaces(connection),
+    };
+    let Some(parameter_types) = &drop.parameter_types else {
+        // The name must be the name of one function in all of the schemas
+        // that the statement looks in.
+        let mut named = namespaces
+            .into_iter()
+            .flat_map(|namespace| functions.named(namespace, name));
+        let function = named.next();
+        if named.next().is_some() {
+            return Err(sqlstate_error(
+                SQLSTATE_AMBIGUOUS_FUNCTION,
+                format!("function name \"{name}\" is not unique"),
+            ));
+        }
+        return Ok(function);
+    };
+    for parameter_type in parameter_types {
+        if let Err(error) = check_type_exists(connection, parameter_type) {
+            // PostgreSQL only warns when the statement has IF EXISTS.
+            if drop.if_exists {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+    Ok(namespaces
+        .into_iter()
+        .find_map(|namespace| functions.get(namespace, name, parameter_types)))
+}
+
+/// Fails with PostgreSQL's error when `type_name`, as a signature names a
+/// type, names no type: a built-in type, or a type of the named schema or
+/// of the search path.
+fn check_type_exists(connection: &Arc<Connection>, type_name: &str) -> turso_core::Result<()> {
+    let element = type_name.trim_end_matches("[]");
+    let (schema_name, name) = match element.split_once('.') {
+        Some((schema_name, name)) => (Some(schema_name), name),
+        None => (None, element),
+    };
+    if let Some(schema_name) = schema_name {
+        check_schema_exists(connection, schema_name)?;
+    }
+    if (schema_name.is_none() && is_base_type_name(name))
+        || type_exists(connection, schema_name, name)
+    {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_UNDEFINED_OBJECT,
+        format!("type \"{type_name}\" does not exist"),
+    ))
 }
 
 /// The namespace of the schema that `name` puts a function in: the schema

@@ -1,5 +1,5 @@
-# The catalog of SQL functions: CREATE FUNCTION, CREATE OR REPLACE FUNCTION
-# and pg_proc.
+# The catalog of SQL functions: CREATE FUNCTION, CREATE OR REPLACE FUNCTION,
+# DROP FUNCTION and pg_proc.
 #
 # tursopg stores a function but cannot call it yet. The tests that call a
 # function are in create-function.sqltest.
@@ -220,6 +220,190 @@ expect error {
     cannot change return type of existing function
 }
 
+# DROP FUNCTION
+
+test drop-function-without-parameter-types {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    0
+}
+
+test drop-function-with-parameter-types {
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
+    CREATE FUNCTION show(text) RETURNS text LANGUAGE sql AS $$SELECT 'text'$$;
+    DROP FUNCTION show(int);
+    SELECT proargtypes FROM pg_proc WHERE proname = 'show';
+}
+expect {
+    25
+}
+
+test drop-function-with-a-name-that-is-not-unique {
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
+    CREATE FUNCTION show(text) RETURNS text LANGUAGE sql AS $$SELECT 'text'$$;
+    DROP FUNCTION show;
+}
+@sqlstate 42725
+expect error {
+    function name "show" is not unique
+}
+
+test drop-function-with-a-name-that-is-not-unique-in-the-search-path {
+    CREATE SCHEMA app;
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
+    CREATE FUNCTION app.show(text) RETURNS text LANGUAGE sql AS $$SELECT 'text'$$;
+    SET search_path = app, public;
+    DROP FUNCTION show;
+}
+@sqlstate 42725
+expect error {
+    function name "show" is not unique
+}
+
+test drop-function-that-does-not-exist {
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
+    DROP FUNCTION show(text, bigint);
+}
+@sqlstate 42883
+expect error {
+    function show\(text, bigint\) does not exist
+}
+
+test drop-function-if-exists {
+    DROP FUNCTION IF EXISTS nosuch;
+    DROP FUNCTION IF EXISTS nosuch(integer);
+    DROP FUNCTION IF EXISTS nosuch.one();
+    DROP FUNCTION IF EXISTS nosuch(nosuch_type);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-function-in-a-schema {
+    CREATE SCHEMA app;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 10$$;
+    DROP FUNCTION app.one();
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'one';
+}
+expect {
+    public
+}
+
+test drop-function-in-a-schema-that-does-not-exist {
+    DROP FUNCTION nosuch.one();
+}
+@sqlstate 3F000
+expect error {
+    schema "nosuch" does not exist
+}
+
+test drop-function-uses-the-search-path {
+    CREATE SCHEMA app;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 10$$;
+    SET search_path = app, public;
+    DROP FUNCTION one();
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'one';
+}
+expect {
+    public
+}
+
+test drop-function-with-a-parameter-type-that-does-not-exist {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one(nosuch);
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+# A parameter type without a schema is a type of the search path.
+test drop-function-with-a-parameter-type-that-is-not-on-the-search-path {
+    CREATE SCHEMA app;
+    CREATE TABLE app.item (a integer);
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one(item);
+}
+@sqlstate 42704
+expect error {
+    type "item" does not exist
+}
+
+test drop-function-with-a-parameter-type-of-a-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.item (a integer);
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one(app.item);
+}
+@sqlstate 42883
+expect error {
+    function one\(app\.item\) does not exist
+}
+
+test drop-function-with-a-parameter-type-that-the-schema-does-not-have {
+    CREATE SCHEMA app;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one(app.nosuch);
+}
+@sqlstate 42704
+expect error {
+    type "app\.nosuch" does not exist
+}
+
+test drop-function-with-a-parameter-type-of-a-schema-that-does-not-exist {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one(nosuch.item);
+}
+@sqlstate 3F000
+expect error {
+    schema "nosuch" does not exist
+}
+
+test function-name-is-free-after-drop {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one();
+    CREATE FUNCTION one() RETURNS text LANGUAGE sql AS $$SELECT 'one'$$;
+    SELECT prorettype FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    25
+}
+
+test drop-several-functions {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    DROP FUNCTION one(), two();
+    SELECT count(*) FROM pg_proc WHERE proname IN ('one', 'two');
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP FUNCTION of several objects is not supported
+}
+
+test drop-function-cascade {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION one() CASCADE;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP FUNCTION \.\.\. CASCADE is not supported
+}
+
 # Transactions
 
 test rollback-removes-a-created-function {
@@ -232,6 +416,19 @@ test rollback-removes-a-created-function {
 expect {
     1
     0
+}
+
+test rollback-restores-a-dropped-function {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    BEGIN;
+    DROP FUNCTION one();
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+    ROLLBACK;
+    SELECT prosrc FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    0
+    SELECT 1
 }
 
 test rollback-restores-a-replaced-function {
@@ -424,4 +621,15 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     DROP SCHEMA \.\.\. CASCADE of a schema with functions is not supported
+}
+
+test drop-schema-after-its-function {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP FUNCTION app.one();
+    DROP SCHEMA app;
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'app';
+}
+expect {
+    0
 }
