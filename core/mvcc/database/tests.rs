@@ -433,9 +433,9 @@ fn mv_store_skiplist_allocations_are_fallible() {
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
-    let result = store.insert_version(row_id, row_version);
+    let result = store.insert_version(&store.row_store(), row_id, row_version);
     assert!(matches!(result, Err(crate::alloc::TryReserveError)));
-    assert!(store.rows.is_empty());
+    assert!(store.row_store().rows.is_empty());
 }
 
 #[cfg(nightly)]
@@ -496,7 +496,7 @@ fn seqcompact_tombstone_payload_uses_store_allocator() {
     .unwrap();
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
     let versions = store
-        .get_or_create_table_row_versions(row_id.clone())
+        .get_or_create_table_row_versions(&store.row_store(), row_id.clone())
         .unwrap();
     versions.write().try_reserve(1).unwrap();
 
@@ -529,7 +529,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let result = store.insert(tx_id, row);
     assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
-    assert!(store.rows.get(&row_id).is_none());
+    assert!(store.row_store().rows.get(&row_id).is_none());
     assert_eq!(allocator.max_rowid.load(Ordering::SeqCst), 0);
 
     let tx = store.txs.get(&tx_id).unwrap();
@@ -1591,6 +1591,7 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
 
     let empty_row_ids = db
         .mvcc_store
+        .row_store()
         .rows
         .iter()
         .filter(|entry| entry.value().read().is_empty())
@@ -1598,6 +1599,7 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
         .collect::<Vec<_>>();
     let empty_index_ids = db
         .mvcc_store
+        .row_store()
         .index_rows
         .iter()
         .filter(|entry| {
@@ -1629,13 +1631,17 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
 
     for row_id in empty_row_ids {
         assert!(
-            db.mvcc_store.rows.get(&row_id).is_none(),
+            db.mvcc_store.row_store().rows.get(&row_id).is_none(),
             "empty table row buckets must be cleared across VACUUM reset"
         );
     }
     for index_id in empty_index_ids {
         assert!(
-            db.mvcc_store.index_rows.get(&index_id).is_none(),
+            db.mvcc_store
+                .row_store()
+                .index_rows
+                .get(&index_id)
+                .is_none(),
             "empty index buckets must be cleared across VACUUM reset"
         );
     }
@@ -5490,12 +5496,12 @@ fn test_checkpoint_empties_mv_store_after_interrupted_checkpoint() {
     interrupted_checkpoint
         .cleanup_after_external_io_error(LimboError::Interrupt)
         .unwrap();
-    assert!(!mvcc_store.rows.is_empty());
+    assert!(!mvcc_store.row_store().rows.is_empty());
 
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    assert!(mvcc_store.rows.is_empty());
-    for index in mvcc_store.index_rows.iter() {
+    assert!(mvcc_store.row_store().rows.is_empty());
+    for index in mvcc_store.row_store().index_rows.iter() {
         assert!(index.value().is_empty());
     }
     let rows = get_rows(&conn, "SELECT id, v FROM t");
@@ -5547,7 +5553,7 @@ fn test_blocking_checkpoint_skips_row_gc_and_dirty_key_states() {
             TransitionResult::Done(_) => break,
         }
     }
-    assert!(mvcc_store.rows.is_empty());
+    assert!(mvcc_store.row_store().rows.is_empty());
 }
 
 /// A blocking checkpoint clears the whole MV store, so each key in the store changed since
@@ -5570,7 +5576,7 @@ fn test_blocking_store_records_no_dirty_keys() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     // The MV store is empty, so these rows come from the B-tree.
-    assert!(mvcc_store.rows.is_empty());
+    assert!(mvcc_store.row_store().rows.is_empty());
     let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][1].as_int().unwrap(), 10);
@@ -8658,7 +8664,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         >>::new_in(crate::alloc::DynAllocator::default());
     tombstone_versions.push(tombstone);
     store
-        .get_or_create_index_rows(table_id)
+        .get_or_create_index_rows(&store.row_store(), table_id)
         .unwrap()
         .value()
         .insert(key20, Arc::new(RwLock::new(tombstone_versions)));
@@ -8667,12 +8673,12 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
     assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(10))
+        .btree_row_is_valid(store, &store.row_store(), table_id, reader_id, &idx_key(10))
         .unwrap());
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
     assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(30))
+        .btree_row_is_valid(store, &store.row_store(), table_id, reader_id, &idx_key(30))
         .unwrap());
 
     let reader = store.txs.get(&reader_id).unwrap();
@@ -9003,7 +9009,7 @@ fn test_commit_dep_threaded_commit_resolves() {
         let writer_tx = writer_tx.value();
 
         // Convert TxID→Timestamp in row versions (Hekaton §3.3 postprocessing)
-        for entry in mvcc_store.rows.iter() {
+        for entry in mvcc_store.row_store().rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
                 if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
@@ -9255,7 +9261,7 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
     {
         let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
         let writer_tx = writer_tx.value();
-        for entry in mvcc_store.rows.iter() {
+        for entry in mvcc_store.row_store().rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
                 if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
@@ -9419,7 +9425,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     {
         let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
         let writer_tx = writer_tx.value();
-        for entry in mvcc_store.rows.iter() {
+        for entry in mvcc_store.row_store().rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
                 if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
@@ -11442,7 +11448,8 @@ fn test_update_multiple_unique_columns_partial_rollback() {
 // ─── GC helpers ───────────────────────────────────────────────────────────
 
 fn unique_index_btree_is_allocated(mv: &crate::MvStore) -> bool {
-    mv.index_rows
+    mv.row_store()
+        .index_rows
         .iter()
         .any(|idx| mv.is_btree_allocated(idx.key()))
 }
@@ -11450,7 +11457,7 @@ fn unique_index_btree_is_allocated(mv: &crate::MvStore) -> bool {
 /// An index current that no checkpoint has written to the B-tree yet. GC must
 /// keep it: the SkipMap is the only copy of that key.
 fn skipmap_has_unmaterialized_index_current(mv: &crate::MvStore) -> bool {
-    mv.index_rows.iter().any(|idx| {
+    mv.row_store().index_rows.iter().any(|idx| {
         idx.value().iter().any(|e| {
             e.value().read().iter().any(|rv| {
                 rv.end().is_none() && rv.materialized_at() == crate::mvcc::database::WalPos::ORIGIN
@@ -11460,7 +11467,11 @@ fn skipmap_has_unmaterialized_index_current(mv: &crate::MvStore) -> bool {
 }
 
 fn skipmap_version_count(mv: &crate::MvStore) -> usize {
-    mv.rows.iter().map(|e| e.value().read().len()).sum()
+    mv.row_store()
+        .rows
+        .iter()
+        .map(|e| e.value().read().len())
+        .sum()
 }
 
 fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowVersion {
@@ -12132,13 +12143,13 @@ fn test_gc_integration_insert_commit_gc() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // Row should be in the MvStore.
-    assert!(!db.mvcc_store.rows.is_empty());
+    assert!(!db.mvcc_store.row_store().rows.is_empty());
 
     // No active transactions → LWM = u64::MAX.
     // ckpt_max = 0 (no checkpoint yet), so rule 3 won't fire (b > ckpt_max).
     let dropped = db.mvcc_store.drop_unused_row_versions();
     assert_eq!(dropped, 0);
-    assert!(!db.mvcc_store.rows.is_empty());
+    assert!(!db.mvcc_store.row_store().rows.is_empty());
 }
 
 #[test]
@@ -12161,7 +12172,8 @@ fn transaction_rollback_removes_created_versions_immediately() {
         );
     }
 
-    let entry = db.mvcc_store.rows.get(&row_id);
+    let row_store = db.mvcc_store.row_store();
+    let entry = row_store.rows.get(&row_id);
     assert!(entry.is_some());
     assert!(entry.unwrap().value().read().is_empty());
     assert_eq!(db.mvcc_store.live_version_count_approx(), 0);
@@ -12188,6 +12200,7 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
 
     let index_slots = || -> usize {
         db.mvcc_store
+            .row_store()
             .index_rows
             .iter()
             .map(|index| index.value().len())
@@ -12195,6 +12208,7 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
     };
     let table_slots = || -> usize {
         db.mvcc_store
+            .row_store()
             .rows
             .iter()
             .filter(|entry| entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
@@ -12453,7 +12467,8 @@ fn test_short_version_chain_has_no_unused_capacity() {
         .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
         .unwrap();
     let chain_len_and_capacity = || {
-        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let row_store = db.mvcc_store.row_store();
+        let entry = row_store.rows.get(&row_id).unwrap();
         let versions = entry.value().read();
         (versions.len(), versions.capacity())
     };
@@ -12482,7 +12497,8 @@ fn test_one_version_is_stored_inside_its_chain() {
     db.mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
         .unwrap();
-    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    let row_store = db.mvcc_store.row_store();
+    let entry = row_store.rows.get(&row_id).unwrap();
     let versions = entry.value().read();
     let chain_start = std::ptr::addr_of!(*versions) as usize;
     let chain = chain_start..chain_start + std::mem::size_of_val(&*versions);
@@ -12557,14 +12573,15 @@ fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
         RowKey::Int(1),
     );
     let schema_row = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(schema_rowid));
-    assert!(db.mvcc_store.rows.get(&user_row).is_none());
-    assert!(db.mvcc_store.rows.get(&schema_row).is_none());
+    assert!(db.mvcc_store.row_store().rows.get(&user_row).is_none());
+    assert!(db.mvcc_store.row_store().rows.get(&schema_row).is_none());
 
     db.conn.execute("BEGIN").unwrap();
     db.conn.execute("DELETE FROM t WHERE id = 1").unwrap();
     db.conn.execute("DROP TABLE dropped").unwrap();
     let tombstone_payload_len = |row_id: &RowID| {
-        let entry = db.mvcc_store.rows.get(row_id).unwrap();
+        let row_store = db.mvcc_store.row_store();
+        let entry = row_store.rows.get(row_id).unwrap();
         let versions = entry.value().read();
         let [tombstone] = versions.as_slice() else {
             panic!("expected one tombstone, got {versions:?}");
@@ -12699,7 +12716,8 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
     );
 
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
-    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    let row_store = db.mvcc_store.row_store();
+    let entry = row_store.rows.get(&row_id).unwrap();
     db.mvcc_store
         .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
         .unwrap();
@@ -12709,7 +12727,7 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
     let dropped = db.mvcc_store.drop_unused_row_versions_and_slots();
     assert_eq!(dropped, 1);
     assert!(
-        db.mvcc_store.rows.get(&row_id).is_none(),
+        db.mvcc_store.row_store().rows.get(&row_id).is_none(),
         "empty chain slot should be removed from the SkipMap"
     );
 }
@@ -12760,7 +12778,8 @@ fn test_gc_active_reader_pins_lwm() {
         "GC should not remove versions visible to active reader"
     );
     {
-        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let row_store = db.mvcc_store.row_store();
+        let entry = row_store.rows.get(&row_id).unwrap();
         let versions = entry.value().read();
         assert_eq!(versions.len(), 2, "both versions should be retained");
     }
@@ -12785,7 +12804,8 @@ fn test_gc_active_reader_pins_lwm() {
         "superseded version should be reclaimed after reader closes"
     );
     {
-        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let row_store = db.mvcc_store.row_store();
+        let entry = row_store.rows.get(&row_id).unwrap();
         let versions = entry.value().read();
         assert_eq!(versions.len(), 1, "only current version should remain");
     }
@@ -12971,8 +12991,8 @@ fn test_gc_incremental_reclaims_like_full_sweep() {
 
     // Each chain keeps exactly its surviving current version.
     for i in 1..=n {
-        let entry = db
-            .mvcc_store
+        let row_store = db.mvcc_store.row_store();
+        let entry = row_store
             .rows
             .get(&RowID::new(table_id, RowKey::Int(i)))
             .unwrap();
@@ -13041,8 +13061,8 @@ fn test_gc_incremental_concurrent_is_safe() {
     // version — concurrent GC reclaimed precisely what one sweep would.
     assert_eq!(db.mvcc_store.drop_unused_row_versions(), 0);
     for i in 1..=n {
-        let entry = db
-            .mvcc_store
+        let row_store = db.mvcc_store.row_store();
+        let entry = row_store
             .rows
             .get(&RowID::new(table_id, RowKey::Int(i)))
             .unwrap();
@@ -13053,12 +13073,14 @@ fn test_gc_incremental_concurrent_is_safe() {
     // no decrement was lost or double-applied under concurrency.
     let table_live: usize = db
         .mvcc_store
+        .row_store()
         .rows
         .iter()
         .map(|e| e.value().read().len())
         .sum();
     let index_live: usize = db
         .mvcc_store
+        .row_store()
         .index_rows
         .iter()
         .map(|outer| {
@@ -13106,7 +13128,7 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
 
     // Populate the empty slots with stale versions to exercise the GC cursor
     // directly rather than relying on rollback to manufacture garbage.
-    for outer in db.mvcc_store.index_rows.iter() {
+    for outer in db.mvcc_store.row_store().index_rows.iter() {
         for inner in outer.value().iter() {
             let mut versions = inner.value().write();
             if versions.is_empty() {
@@ -13119,6 +13141,7 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
 
     let count_index_versions = || -> usize {
         db.mvcc_store
+            .row_store()
             .index_rows
             .iter()
             .map(|outer| {
@@ -13224,6 +13247,7 @@ fn test_gc_incremental_skips_while_checkpoint_holds_write_lock() {
     );
     assert_eq!(
         db.mvcc_store
+            .row_store()
             .rows
             .get(&row_id)
             .unwrap()
@@ -13244,6 +13268,7 @@ fn test_gc_incremental_skips_while_checkpoint_holds_write_lock() {
     );
     assert_eq!(
         db.mvcc_store
+            .row_store()
             .rows
             .get(&row_id)
             .unwrap()
@@ -13272,7 +13297,8 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    let entry = mvcc_store.rows.get(&row_id).unwrap();
+    let row_store = mvcc_store.row_store();
+    let entry = row_store.rows.get(&row_id).unwrap();
     mvcc_store
         .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
         .unwrap();
@@ -13282,7 +13308,8 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
         mvcc_store.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
     }
 
-    let entry = mvcc_store.rows.get(&row_id);
+    let row_store = mvcc_store.row_store();
+    let entry = row_store.rows.get(&row_id);
     assert!(
         entry.is_some(),
         "Passive lazy path keeps the SkipMap slot in place"
@@ -13332,6 +13359,7 @@ fn test_gc_incremental_respects_held_snapshot() {
     );
     assert_eq!(
         db.mvcc_store
+            .row_store()
             .rows
             .get(&row_id)
             .unwrap()
@@ -13354,6 +13382,7 @@ fn test_gc_incremental_respects_held_snapshot() {
     );
     assert_eq!(
         db.mvcc_store
+            .row_store()
             .rows
             .get(&row_id)
             .unwrap()
@@ -13959,7 +13988,8 @@ fn test_gc_incremental_keeps_held_reader_row() {
         row,
         "held reader still reads the current version"
     );
-    let versions = db.mvcc_store.rows.get(&row_id).unwrap();
+    let row_store = db.mvcc_store.row_store();
+    let versions = row_store.rows.get(&row_id).unwrap();
     let versions = versions.value().read();
     assert_eq!(versions.len(), 1);
     assert_eq!(
@@ -18026,7 +18056,7 @@ fn test_speculative_delete_hides_committed_version() {
     // simulate the UPSERT code path that bypasses eager conflict detection).
     let row_v2 = generate_simple_string_row(table_id, 1, "v2");
     db.mvcc_store
-        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .insert_btree_resident_to_table_or_index(&db.mvcc_store.row_store(), tx2, row_v2, None)
         .unwrap();
 
     // T2: commit → must fail with WriteWriteConflict.
@@ -18082,7 +18112,7 @@ fn test_committed_delete_tombstone_conflict() {
     // T2: insert_btree_resident for the same row.
     let row_v2 = generate_simple_string_row(table_id, 1, "v2");
     db.mvcc_store
-        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .insert_btree_resident_to_table_or_index(&db.mvcc_store.row_store(), tx2, row_v2, None)
         .unwrap();
 
     // T2: commit → must detect conflict with Td.
@@ -18136,7 +18166,7 @@ fn test_committed_update_version_conflict() {
     // T2: insert_btree_resident for the same row.
     let row_v2 = generate_simple_string_row(table_id, 1, "v2");
     db.mvcc_store
-        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .insert_btree_resident_to_table_or_index(&db.mvcc_store.row_store(), tx2, row_v2, None)
         .unwrap();
 
     // T2: commit → must detect conflict with Td.
@@ -21245,7 +21275,7 @@ fn test_delete_of_btree_row_conflicts_with_committed_concurrent_delete() {
         .unwrap();
     let row_id = RowID::new(store.get_table_id_from_root_page(root_page), RowKey::Int(1));
     assert!(
-        store.rows.get(&row_id).is_none(),
+        store.row_store().rows.get(&row_id).is_none(),
         "the row must live only in the B-tree for this test to mean anything"
     );
     setup.close().unwrap();
@@ -21288,7 +21318,7 @@ fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
         .as_int()
         .unwrap();
     let row_id = RowID::new(store.get_table_id_from_root_page(root_page), RowKey::Int(1));
-    assert!(store.rows.get(&row_id).is_none());
+    assert!(store.row_store().rows.get(&row_id).is_none());
     setup.close().unwrap();
 
     let first = db.connect();
@@ -24711,7 +24741,8 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         table_id: (-2).into(),
         row_id: RowKey::Int(1),
     };
-    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    let row_store = db.mvcc_store.row_store();
+    let entry = row_store.rows.get(&row_id).unwrap();
     entry.value().write().push(RowVersion {
         id: 0,
         begin: PackedTs::pack(None),
@@ -24725,7 +24756,7 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
     // The evicted writer committed, so T2 must lose with a write-write
     // conflict — not a panic.
     assert!(matches!(
-        commit_tx(db.mvcc_store.clone(), &conn2, tx2),
+        commit_tx(db.mvcc_store, &conn2, tx2),
         Err(LimboError::WriteWriteConflict)
     ));
 }

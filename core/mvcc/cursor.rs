@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowStore,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -36,7 +36,7 @@ enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
         /// Indicates whether the rowid is pointing BTreeCursor or MVCC index.
         in_btree: bool,
         /// Resolved MVCC version chain for this row, captured from the range
-        /// iterator so `read_mvcc_current_row` can skip a second `self.rows.get`.
+        /// iterator so `read_mvcc_current_row` can skip a second `RowStore::rows` lookup.
         /// `Some` only for MVCC table rows reached via the scan path; `None`
         /// (btree rows, index rows, seek/insert positions) falls back to a lookup.
         versions: Option<RowVersions<A>>,
@@ -374,11 +374,11 @@ pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
 /// # Safety
 ///
 /// The caller must ensure that the underlying `SkipMap` from which the iterator was created
-/// outlives the returned iterator. This is guaranteed when:
-/// - For table iterators: The `MvStore.rows` SkipMap is held in an `Arc<MvStore>` that
-///   outlives the cursor.
-/// - For index iterators: The `MvStore.index_rows` SkipMap is held in an `Arc<MvStore>`
-///   that outlives the cursor.
+/// outlives the returned iterator. The `SkipMap` is in a [`RowStore`]. A cursor holds an
+/// `Arc` to the `RowStore` that its iterators read, in a field that drops after them:
+/// - For table iterators: `RowStore.rows`.
+/// - For index iterators: a map in `RowStore.index_rows`, which stays there as long as
+///   the `RowStore` lives.
 macro_rules! static_iterator_hack {
     ($iter:expr, $key_type:ty) => {
         static_iterator_hack!($iter, $key_type, crate::alloc::TursoAllocator)
@@ -472,6 +472,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
     pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
         &mut self,
         db: &MvStore<Clock, A>,
+        store: &RowStore<A>,
         table_id: MVTableId,
         tx_id: u64,
         key: &Arc<SortableIndexKey>,
@@ -487,7 +488,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
             // Scoped so the skiplist guard drops before later `db` borrows.
             let iter = {
                 // Avoid allocating skiplist here with `try_get_or_insert_with`
-                let index_rows = db.index_rows.get(&table_id);
+                let index_rows = store.index_rows.get(&table_id);
                 // Seed at the first index key >= the B-tree key rather than at
                 // the start of `index_rows`, so a seek-initiated scan does not
                 // re-walk every preceding version on its first row check.
@@ -578,6 +579,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// type, read before the MVCC peek was taken.
     /// See [`Self::reseek_mvcc_if_rows_changed`].
     mvcc_peek_epoch: u64,
+    /// The row store that `table_iterator`, `index_iterator` and `index_shadow_scan` read.
+    /// It is the last field, so that it drops after them.
+    row_store: Arc<RowStore<A>>,
 }
 
 pub enum NextRowidResult {
@@ -622,6 +626,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        let row_store = Arc::clone(&db.row_store());
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -647,6 +652,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
+            row_store,
         })
     }
 
@@ -656,15 +662,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let RowKey::Record(rec) = key else {
             return self.query_btree_version_is_valid(key);
         };
-        let valid =
-            self.index_shadow_scan
-                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec)?;
+        let valid = self.index_shadow_scan.btree_row_is_valid(
+            &self.db,
+            &self.row_store,
+            self.table_id,
+            self.tx_id,
+            rec,
+        )?;
         // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             valid,
             self.db.query_btree_version_is_valid(
+                &self.row_store,
                 self.table_id,
                 &RowKey::Record(rec.clone()),
                 self.tx_id
@@ -708,10 +719,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
-                    match self
-                        .db
-                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
-                    {
+                    match self.db.read_from_table_or_index(
+                        &self.row_store,
+                        self.tx_id,
+                        row_id,
+                        maybe_index_id,
+                    )? {
                         Some(row) => {
                             record.invalidate();
                             record.start_serialization(row.payload())?;
@@ -763,7 +776,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+            .read_from_table_or_index(&self.row_store, self.tx_id, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -859,7 +872,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
         self.db
-            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+            .query_btree_version_is_valid(&self.row_store, self.table_id, key, self.tx_id)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -913,6 +926,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             RowKey::Int(_) => self
                 .db
                 .seek_rowid(
+                    &self.row_store,
                     row_id.clone(),
                     false,
                     false,
@@ -923,6 +937,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 )
                 .map(|(row_id, versions, _)| (row_id, versions)),
             RowKey::Record(current_key) => self.db.seek_index(
+                &self.row_store,
                 self.table_id,
                 current_key.as_ref().clone(),
                 false,
@@ -1337,11 +1352,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 };
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
-                let iter_box = Box::new(self.db.rows.range(range));
+                let iter_box = Box::new(self.row_store.rows.range(range));
                 self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
             }
             MvccCursorType::Index(_) => {
-                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
+                let index_rows = self
+                    .db
+                    .get_or_create_index_rows(&self.row_store, self.table_id)?;
                 let index_rows = index_rows.value();
                 let iter_box: Box<
                     dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
@@ -1399,6 +1416,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // Initialize MVCC iterator to last position
         match &self.mv_cursor_type {
             MvccCursorType::Table => match self.db.get_last_table_rowid(
+                &self.row_store,
                 self.table_id,
                 &mut self.table_iterator,
                 self.tx_id,
@@ -1415,6 +1433,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
             },
             MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
+                &self.row_store,
                 self.table_id,
                 self.tx_id,
                 &mut self.index_iterator,
@@ -1726,7 +1745,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.query_btree_version_is_valid(&row_id.row_id)?
                     } else {
                         self.db
-                            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                            .read_from_table_or_index(
+                                &self.row_store,
+                                self.tx_id,
+                                row_id,
+                                maybe_index_id,
+                            )?
                             .is_some()
                     };
                     if visible {
@@ -1766,6 +1790,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_rowid(
+                                &self.row_store,
                                 rowid.clone(),
                                 inclusive,
                                 op.eq_only(),
@@ -1810,6 +1835,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
+                                &self.row_store,
                                 self.table_id,
                                 sortable_key.clone(),
                                 inclusive,
@@ -1983,12 +2009,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+            .read_from_table_or_index(&self.row_store, self.tx_id, &row.id, maybe_index_id)?
             .is_some()
         {
             let updated = self
                 .db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .update_to_table_or_index(&self.row_store, self.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -2000,13 +2026,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
             self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_btree_resident_to_table_or_index(
+                    &self.row_store,
+                    self.tx_id,
+                    row,
+                    maybe_index_id,
+                )
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         } else {
             self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_to_table_or_index(&self.row_store, self.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -2049,6 +2080,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             None
         };
         self.db.delete_from_table_or_index(
+            &self.row_store,
             self.tx_id,
             rowid,
             maybe_index_id,
@@ -2083,6 +2115,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // eq-only: bound the skiplist walk to the single rowid instead of
             // scanning forward over invisible concurrent rows.
             let rowid = self.db.seek_rowid(
+                &self.row_store,
                 RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(*int_key),
@@ -2310,12 +2343,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     std::ops::Bound::Included(start_rowid),
                     std::ops::Bound::Unbounded,
                 );
-                let iter_box = Box::new(self.db.rows.range(range));
+                let iter_box = Box::new(self.row_store.rows.range(range));
                 self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
-                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
+                let index_rows = self
+                    .db
+                    .get_or_create_index_rows(&self.row_store, self.table_id)?;
                 let index_rows = index_rows.value();
                 let iter_box: Box<
                     dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
