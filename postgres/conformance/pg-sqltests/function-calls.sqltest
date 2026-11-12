@@ -486,6 +486,21 @@ expect error {
     OVER specified, but add_one is not a window function nor an aggregate function
 }
 
+# PostgreSQL computes a constant argument before it inlines the function, so
+# an argument that fails is an error also when the body does not compute it.
+# tursopg computes the argument where the body uses it.
+test constant-argument-that-fails-and-that-the-body-does-not-compute {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    SELECT choose(1 / 0, true);
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+expect @tursopg {
+    0
+}
+
 # Arguments that the body does not use
 #
 # PostgreSQL reads each argument before it inlines the function. tursopg

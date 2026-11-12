@@ -619,6 +619,11 @@ Notes on calls of SQL functions:
   before it inlines the function: an aggregate makes the statement group
   its rows, and a column that does not exist is an error. tursopg gives the
   engine only the arguments that the body uses.
+- PostgreSQL computes a constant argument before it inlines the function.
+  Thus an argument that fails, such as `1 / 0`, is an error also when the
+  body does not compute it, such as in a `CASE` branch that does not run.
+  tursopg computes the argument where the body uses it, so the call returns
+  a result.
 - PostgreSQL chooses between functions of one name by the types of the
   arguments. tursopg does not know these types, so it rejects a call of a
   name that several functions of the searched schemas have.
