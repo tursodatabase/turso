@@ -855,3 +855,53 @@ test revoke-on-an-engine-table-is-not-supported {
 expect error {
     REVOKE on internal table __turso_internal_authid is not supported
 }
+
+# Every role reads the catalog views, which have no list that a REVOKE
+# could change, so a REVOKE on one is refused rather than leaving every role
+# reading it.
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-a-catalog-view-is-not-supported {
+    REVOKE SELECT ON pg_roles FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on system catalog pg_roles is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-an-information-schema-view-is-not-supported {
+    REVOKE SELECT ON information_schema.schemata FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on system catalog information_schema.schemata is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-all-tables-in-pg-catalog-is-not-supported {
+    REVOKE SELECT ON ALL TABLES IN SCHEMA pg_catalog FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on the system catalogs of schema pg_catalog is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-all-tables-in-information-schema-is-not-supported {
+    REVOKE SELECT ON ALL TABLES IN SCHEMA information_schema FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on the system catalogs of schema information_schema is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test a-role-still-reads-a-catalog-view-after-a-refused-revoke {
+    CREATE ROLE rv_catalog_reader;
+    SET ROLE rv_catalog_reader;
+    SELECT count(*) > 0 FROM pg_roles;
+}
+expect {
+    1
+}

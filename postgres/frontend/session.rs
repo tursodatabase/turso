@@ -1880,6 +1880,21 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
             for schema in schemas {
                 check_schema_exists(conn, schema)?;
                 let schema = schema.to_lowercase();
+                // The catalog views are not listed among the schema's
+                // objects. A GRANT on them changes nothing, since every role
+                // reads them, but a REVOKE would leave every role reading
+                // them.
+                if stmt.revoke
+                    && !stmt.on_sequences
+                    && matches!(schema.as_str(), "pg_catalog" | "information_schema")
+                {
+                    return Err(sqlstate_error(
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        format!(
+                            "REVOKE on the system catalogs of schema {schema} is not supported"
+                        ),
+                    ));
+                }
                 relations.extend(
                     schema_objects(conn, &schema)
                         .into_iter()

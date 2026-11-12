@@ -804,11 +804,12 @@ pub(crate) fn translate_catalog_changes(
                     .map(|grantee| resolve_grantee(schema, connection, grantee))
                     .collect::<turso_core::Result<Vec<_>>>()?;
                 // A relation without a class row has no list to store the
-                // privileges in. Every role reads the pg_catalog views
-                // already, so a GRANT or REVOKE on one changes nothing. Only
-                // a superuser uses the engine's own tables, so a GRANT or
-                // REVOKE on one would claim a change it does not make, and is
-                // refused.
+                // privileges in. Only a superuser uses the engine's own
+                // tables, so a GRANT or REVOKE on one would claim a change it
+                // does not make, and is refused. Every role reads the catalog
+                // views, such as pg_class, so a GRANT on one changes nothing,
+                // but a REVOKE would leave every role reading it, and is
+                // refused too.
                 let Some(class) =
                     class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
                 else {
@@ -816,6 +817,15 @@ pub(crate) fn translate_catalog_changes(
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
                             format!("{statement} on internal table {name} is not supported"),
+                        ));
+                    }
+                    if *revoke {
+                        return Err(sqlstate_error(
+                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            format!(
+                                "REVOKE on system catalog {} is not supported",
+                                catalog_view_name(name)
+                            ),
                         ));
                     }
                     continue;
@@ -973,6 +983,15 @@ pub(crate) fn translate_catalog_changes(
         }
     }
     Ok(())
+}
+
+/// The name a catalog view has in PostgreSQL: the engine names
+/// `information_schema.schemata` `pg_information_schema_schemata`.
+fn catalog_view_name(name: &str) -> String {
+    match name.strip_prefix("pg_information_schema_") {
+        Some(view) => format!("information_schema.{view}"),
+        None => name.to_string(),
+    }
 }
 
 /// The class row of table `name` of `namespace`, which row-level security
