@@ -14,7 +14,9 @@
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
-use turso_core::{walk_expr, walk_expr_mut, Connection, Func, LimboError, WalkControl};
+use turso_core::{
+    expr_is_deeper_than, walk_expr, walk_expr_mut, Connection, Func, LimboError, WalkControl,
+};
 use turso_parser::ast;
 use turso_parser::parser::MAX_EXPR_DEPTH;
 use turso_pg_parser::sqlstate::{
@@ -202,7 +204,7 @@ impl<'a> Expansion<'a> {
         expanded?;
         // The engine walks an expression with recursion. Its parser does
         // not make an expression with more levels than this.
-        if height(&expression) > MAX_EXPR_DEPTH {
+        if expr_is_deeper_than(&expression, MAX_EXPR_DEPTH) {
             return Err(stack_depth_limit_exceeded());
         }
         Ok(Some(expression))
@@ -590,21 +592,6 @@ fn size(expression: &ast::Expr) -> usize {
         Ok(WalkControl::Continue)
     });
     size
-}
-
-/// The number of levels of `expression`: 1 for an expression that has no
-/// expression in it.
-fn height(expression: &ast::Expr) -> usize {
-    let mut is_the_expression = true;
-    let mut tallest_part = 0;
-    let _ = walk_expr(expression, &mut |part: &ast::Expr| {
-        if std::mem::take(&mut is_the_expression) {
-            return Ok(WalkControl::Continue);
-        }
-        tallest_part = tallest_part.max(height(part));
-        Ok(WalkControl::SkipChildren)
-    });
-    1 + tallest_part
 }
 
 /// PostgreSQL's error for a statement that needs more stack than
