@@ -886,8 +886,9 @@ expect error {
 
 # Features that tursopg does not support
 
-# PostgreSQL creates a function that calls itself. tursopg rejects it, also
-# when CREATE OR REPLACE makes an existing function call itself.
+# PostgreSQL stores a function before it checks the body, so the check finds
+# a call of the new function. tursopg checks the body before it stores the
+# function.
 test function-that-calls-itself {
     CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT forever($1)$$;
     SELECT count(*) FROM pg_proc WHERE proname = 'forever';
@@ -895,12 +896,36 @@ test function-that-calls-itself {
 expect {
     1
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
-    a function that calls a function of its own name is not supported
+    no such function: forever
 }
 
-# The body calls the function of another schema, not the new function.
+# tursopg cannot call a stored function yet, so the check of a body that
+# calls one fails.
+test body-that-calls-a-stored-function {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT one() + 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname IN ('one', 'two');
+}
+expect {
+    2
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: one
+}
+
+test body-that-calls-a-stored-function-when-check-function-bodies-is-off {
+    SET check_function_bodies = off;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT one() + 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname IN ('one', 'two');
+}
+expect {
+    2
+}
+
 # tursopg cannot call a function of a schema yet.
 test function-that-calls-a-function-of-its-name-in-another-schema {
     CREATE SCHEMA app;
@@ -916,18 +941,6 @@ expect @tursopg error {
     a schema-qualified function name is not supported
 }
 
-test function-that-calls-itself-in-limit {
-    CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT 1 LIMIT forever($1)$$;
-    SELECT count(*) FROM pg_proc WHERE proname = 'forever';
-}
-expect {
-    1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a function that calls a function of its own name is not supported
-}
-
 test replaced-function-that-calls-itself {
     CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
     CREATE OR REPLACE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT forever($1)$$;
@@ -936,9 +949,9 @@ test replaced-function-that-calls-itself {
 expect {
     SELECT forever($1)
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
-    a function that calls a function of its own name is not supported
+    no such function: forever
 }
 
 # A relation can have the text of a function's signature as its name.

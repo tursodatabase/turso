@@ -561,33 +561,13 @@ fn validate_function_body(
     function: &ast::CreateFunction,
 ) -> Result<()> {
     let body = function.body.trim();
-    let (parameter_numbers, called_functions) = parameters_and_calls(body)?;
-    if let Some(number) = parameter_numbers
+    if let Some(number) = parameter_numbers(body)?
         .into_iter()
         .find(|number| *number < 1 || *number as usize > function.parameter_types.len())
     {
         return Err(sqlstate_error(
             SQLSTATE_UNDEFINED_PARAMETER,
             format!("there is no parameter ${number}"),
-        ));
-    }
-    // PostgreSQL accepts a function that calls itself. tursopg cannot run
-    // one: a call takes the place of the function's body.
-    let schema_of_function = match &function.name.namespace {
-        Some(schema) => Some(schema.as_str().to_lowercase()),
-        None => current_schema(&pg_conn.conn),
-    };
-    let names_the_function = |called: &turso_pg_parser::CalledFunction| {
-        called.name == function.name.name.as_str()
-            && called
-                .schema
-                .as_ref()
-                .is_none_or(|schema| Some(schema.to_lowercase()) == schema_of_function)
-    };
-    if called_functions.iter().any(names_the_function) {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "a function that calls a function of its own name is not supported",
         ));
     }
     let query = prepare_statement_inner(pg_conn, body)?;
@@ -604,18 +584,14 @@ fn validate_function_body(
     Ok(())
 }
 
-/// The numbers of the parameters that the query `sql` uses and the
-/// functions that it calls.
-fn parameters_and_calls(sql: &str) -> Result<(Vec<i32>, Vec<turso_pg_parser::CalledFunction>)> {
+/// The numbers of the parameters that the query `sql` uses.
+fn parameter_numbers(sql: &str) -> Result<Vec<i32>> {
     let parsed = turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     let translator = PostgreSQLTranslator::new();
     // A query that the translator rejects fails when it is compiled, with
     // the error that a statement of the session gets.
     let _ = translator.translate_with_prereqs(&parsed);
-    Ok((
-        translator.parameter_numbers(),
-        translator.called_functions(),
-    ))
+    Ok(translator.parameter_numbers())
 }
 
 /// Connection and session state changes that must follow a statement's

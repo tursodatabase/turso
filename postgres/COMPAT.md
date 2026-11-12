@@ -533,8 +533,12 @@ Notes on `CREATE FUNCTION`:
 - tursopg does not know the type of the body's result, so it accepts a body
   whose result PostgreSQL rejects with `return type mismatch`, such as text
   for a function that returns integer.
-- A function whose body calls a function of the same name is rejected, also
-  with `CREATE OR REPLACE`. PostgreSQL accepts such a function.
+- tursopg cannot call a stored function, so the check of a body that calls
+  one fails with `no such function`. With `check_function_bodies = off`,
+  such a function can be created.
+- PostgreSQL stores a function before it checks the body, so a body can call
+  the new function. tursopg checks the body before it stores the function,
+  so the check does not find the new function.
 - The name of a function or of its schema cannot have a dot, and a function
   cannot be created in `pg_catalog`. When `pg_catalog` is the first schema
   of the search path, PostgreSQL creates a function without a schema name

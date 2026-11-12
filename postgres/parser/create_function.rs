@@ -68,13 +68,6 @@ pub(crate) fn translate_drop_function(drop: &DropStmt) -> Result<ast::Stmt, Pars
     }))
 }
 
-/// A function that a statement calls, as the statement names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CalledFunction {
-    pub schema: Option<String>,
-    pub name: String,
-}
-
 /// The parameter types that DROP FUNCTION names the function with, or None
 /// when it names the function without its parameters.
 fn dropped_parameter_types(function: &ObjectWithArgs) -> Result<Option<Vec<String>>, ParseError> {
