@@ -202,6 +202,11 @@ impl ClassCatalog {
         Ok(catalog)
     }
 
+    /// The class rows, ordered by oid.
+    pub(crate) fn classes(&self) -> impl Iterator<Item = &RelationClass> {
+        self.by_oid.values()
+    }
+
     pub(crate) fn get_by_name(&self, namespace: NamespaceId, name: &str) -> Option<&RelationClass> {
         self.oids_by_name
             .get(&(namespace, name.to_string()))

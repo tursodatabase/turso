@@ -13,6 +13,7 @@ use turso_core::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
         AUTOINCREMENT_SEQ_PREFIX,
     },
+    security::policy::RowPolicy,
     security::roles::RoleId,
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
@@ -424,11 +425,17 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
 fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+    pg_type_oid(ty_str).unwrap_or(25) // default to text
+}
+
+/// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
+/// for a type name tursopg does not know.
+pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
     };
-    match base.to_uppercase().as_str() {
+    let oid = match base.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" => 23,
         "SMALLINT" | "INT2" => 21,
         "BIGINT" | "INT8" => 20,
@@ -451,8 +458,9 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
-        _ => 25, // default to text
-    }
+        _ => return None,
+    };
+    Some(oid)
 }
 
 /// The oid of relation `name` of `namespace`, from its stored class row.
@@ -1419,6 +1427,100 @@ impl SnapshotRows for PgTablesTable {
 
         rows
     }
+}
+
+#[derive(Debug)]
+struct PgPolicyTable;
+
+impl SnapshotRows for PgPolicyTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_policy (
+            oid INTEGER,
+            polname TEXT,
+            polrelid INTEGER,
+            polcmd TEXT,
+            polpermissive BOOLEAN,
+            polroles INTEGER[],
+            polqual TEXT,
+            polwithcheck TEXT,
+            tableoid INTEGER HIDDEN
+        )";
+    /// PostgreSQL's oid of pg_policy.
+    const TABLE_OID: Option<i64> = Some(3256);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    /// `polqual` and `polwithcheck` hold the conditions as text, which
+    /// `pg_get_expr` returns as it is.
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        catalog_policies(&schema)
+            .into_iter()
+            .map(|policy| {
+                let roles = policy
+                    .policy
+                    .roles
+                    .iter()
+                    .map(|role| role_oid(*role).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    Value::from_i64(policy.oid),
+                    Value::build_text(policy.policy.name.clone()),
+                    Value::from_i64(policy.table_oid),
+                    Value::build_text(
+                        crate::policies::command_letter(policy.policy.command).to_string(),
+                    ),
+                    Value::from_i64(i64::from(policy.policy.permissive)),
+                    Value::build_text(format!("{{{roles}}}")),
+                    policy.qual.map_or(Value::Null, Value::build_text),
+                    policy.with_check.map_or(Value::Null, Value::build_text),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// A row-level security policy as the catalogs show it.
+struct CatalogPolicy<'a> {
+    oid: i64,
+    table_oid: i64,
+    policy: &'a RowPolicy,
+    /// The `USING` condition as PostgreSQL prints it.
+    qual: Option<String>,
+    /// The `WITH CHECK` condition as PostgreSQL prints it.
+    with_check: Option<String>,
+}
+
+/// The policies of every table, ordered by table oid and then as created.
+fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
+    let Some(catalog) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
+    let mut policies = Vec::new();
+    for class in catalog.classes() {
+        if class.relpolicies.is_empty() {
+            continue;
+        }
+        let Some(table) = schema.get_btree_table(class.relnamespace, &class.relname) else {
+            continue;
+        };
+        let condition_text = |condition: &Option<ast::Expr>| {
+            condition.as_ref().map(|condition| {
+                crate::deparse::condition_text(condition, &table)
+                    .unwrap_or_else(|| render_expr(condition))
+            })
+        };
+        for (oid, policy) in class.relpolicies.iter() {
+            policies.push(CatalogPolicy {
+                oid,
+                table_oid: class.oid,
+                policy,
+                qual: condition_text(&policy.using_expr),
+                with_check: condition_text(&policy.check_expr),
+            });
+        }
+    }
+    policies
 }
 
 #[derive(Debug)]
@@ -2632,7 +2734,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        SnapshotCatalog::<PgPolicyTable>(PhantomData),
     );
     options = options.native_module(
         "pg_trigger",

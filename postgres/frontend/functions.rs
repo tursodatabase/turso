@@ -652,19 +652,21 @@ fn exec_version() -> String {
 /// form so the result reads back identically regardless of
 /// standard_conforming_strings.
 fn exec_quote_literal(value: &Value) -> Option<String> {
-    if matches!(value, Value::Null) {
-        return None;
+    match value {
+        Value::Null => None,
+        Value::Text(t) => Some(quote_literal(t.as_str())),
+        other => Some(quote_literal(&other.to_string())),
     }
-    let text = match value {
-        Value::Text(t) => t.as_str().to_string(),
-        other => other.to_string(),
-    };
-    let quoted = if text.contains('\\') {
+}
+
+/// `text` as PostgreSQL's quote_literal() writes it: in single quotes, with
+/// quotes doubled, and as an escape string when it has a backslash.
+pub(crate) fn quote_literal(text: &str) -> String {
+    if text.contains('\\') {
         format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
     } else {
         format!("'{}'", text.replace('\'', "''"))
-    };
-    Some(quoted)
+    }
 }
 
 /// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
