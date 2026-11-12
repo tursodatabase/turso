@@ -10,7 +10,7 @@ use turso_core::Connection;
 // name is:
 //
 // - the built-in lists of turso_pg_parser (`BASE_TYPES`, `PSEUDO_TYPES` and
-//   `POLYMORPHIC_TYPES` in create_function.rs),
+//   `POLYMORPHIC_TYPES` in type_names.rs),
 // - the custom type registry (`get_type_def_unchecked`),
 // - the relations of a schema (`relation_kind`), which give the row types.
 //
