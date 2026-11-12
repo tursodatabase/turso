@@ -27,8 +27,8 @@ use crate::{
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{
-    self, Cmd, CreateFunction, CreateTableBody, DropFunction, Grantee, Privilege, QualifiedName,
-    RoleSpec, Stmt,
+    self, Cmd, CreateFunction, CreateTableBody, DropFunction, Expr, Grantee, Privilege,
+    QualifiedName, RoleSpec, Stmt,
 };
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -470,6 +470,30 @@ pub trait Dialect: Send + Sync + 'static {
         Err(LimboError::ParseError(
             "DROP FUNCTION is not supported".to_string(),
         ))
+    }
+
+    /// Whether `schema` has a function whose calls
+    /// [`Dialect::expand_function_call`] can replace. The engine only looks
+    /// for calls in a statement when it does.
+    fn expands_function_calls(&self, schema: &Schema) -> bool {
+        let _ = schema;
+        false
+    }
+
+    /// The expression that `call`, an [`Expr::FunctionCall`], stands for,
+    /// when the dialect defines the called function as an expression of its
+    /// arguments, as PostgreSQL does for an SQL function that it inlines.
+    /// None for every other function. The calls in the arguments of `call`
+    /// are expanded already, and the result must not have a call that the
+    /// dialect expands.
+    fn expand_function_call(
+        &self,
+        schema: &Schema,
+        connection: &Connection,
+        call: &Expr,
+    ) -> Result<Option<Expr>> {
+        let _ = (schema, connection, call);
+        Ok(None)
     }
 
     /// Whether relations can be created, renamed or dropped in an attached
@@ -1016,6 +1040,147 @@ mod tests {
         });
         let error = conn.prepare_ast_stmt(drop).err().unwrap();
         assert_eq!(error.to_string(), "DROP FUNCTION is not supported");
+        conn.close().unwrap();
+    }
+
+    /// A dialect that defines `twice(x)` as `(x) + (x)`, as a frontend does
+    /// for a function that SQL defines.
+    struct ExpandingDialect;
+
+    impl Dialect for ExpandingDialect {
+        fn name(&self) -> &'static str {
+            "expanding"
+        }
+
+        fn expands_function_calls(&self, _schema: &Schema) -> bool {
+            true
+        }
+
+        fn expand_function_call(
+            &self,
+            _schema: &Schema,
+            _connection: &Connection,
+            call: &Expr,
+        ) -> Result<Option<Expr>> {
+            let Expr::FunctionCall { name, args, .. } = call else {
+                unreachable!("the engine expands function calls only");
+            };
+            if name.as_str() != "twice" {
+                return Ok(None);
+            }
+            let [argument] = args.as_slice() else {
+                return Err(LimboError::ParseError(
+                    "twice takes one argument".to_string(),
+                ));
+            };
+            let mut argument_calls_twice = false;
+            crate::translate::expr::walk_expr(argument, &mut |expr| {
+                argument_calls_twice |= matches!(
+                    expr,
+                    Expr::FunctionCall { name, .. } if name.as_str() == "twice"
+                );
+                Ok(crate::translate::expr::WalkControl::Continue)
+            })?;
+            assert!(
+                !argument_calls_twice,
+                "the calls in the arguments are expanded before the call"
+            );
+            let operand = || Box::new(Expr::Parenthesized(vec![argument.clone()]));
+            Ok(Some(Expr::Parenthesized(vec![Box::new(Expr::Binary(
+                operand(),
+                turso_parser::ast::Operator::Add,
+                operand(),
+            ))])))
+        }
+    }
+
+    #[test]
+    fn dialect_expands_function_calls_in_queries_and_data_changes() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-expand.db", Arc::new(ExpandingDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let integers = |sql: &str| -> Vec<Vec<i64>> {
+            conn.prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|row| row.iter().map(|value| value.as_int().unwrap()).collect())
+                .collect()
+        };
+
+        assert_eq!(integers("SELECT twice(21)"), [[42]]);
+        assert_eq!(integers("SELECT twice(twice(1)) + abs(twice(-1))"), [[6]]);
+
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (twice(1), 1), (twice(2), 2), (twice(3), 3)")
+            .unwrap();
+        assert_eq!(
+            integers("SELECT a FROM t WHERE a > twice(1) ORDER BY twice(a) DESC LIMIT twice(1)"),
+            [[6], [4]]
+        );
+        assert_eq!(
+            integers(
+                "WITH doubled AS (SELECT twice(b) AS c FROM t) \
+                 SELECT (SELECT max(twice(c)) FROM doubled), \
+                        EXISTS (SELECT 1 FROM t WHERE a = twice(b)), \
+                        twice(2) IN (SELECT a FROM t)"
+            ),
+            [[12, 1, 1]]
+        );
+        assert_eq!(
+            integers(
+                "SELECT t.b FROM t JOIN t AS other ON other.a = twice(t.a) \
+                 GROUP BY t.b HAVING count(*) = twice(1) - 1"
+            ),
+            [[1]]
+        );
+        assert_eq!(
+            integers("UPDATE t SET b = twice(b) WHERE a = twice(1) RETURNING twice(b)"),
+            [[4]]
+        );
+        assert_eq!(
+            integers(
+                "INSERT INTO t VALUES (2, 0) \
+                 ON CONFLICT (a) DO UPDATE SET b = twice(excluded.a) RETURNING b"
+            ),
+            [[4]]
+        );
+        assert_eq!(
+            integers("DELETE FROM t WHERE a = twice(3) RETURNING twice(a)"),
+            [[12]]
+        );
+
+        // The argument is one variable of the statement, used two times.
+        let mut statement = conn.prepare("SELECT twice(?)").unwrap();
+        assert_eq!(statement.parameters_count(), 1);
+        statement
+            .bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(5))
+            .unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(10)]]
+        );
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn a_dialect_without_function_expansion_keeps_the_call() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-no-expand.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let error = conn.prepare("SELECT twice(21)").err().unwrap();
+        assert!(error.to_string().contains("no such function: twice"));
         conn.close().unwrap();
     }
 

@@ -179,7 +179,7 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::collate::CollationSeq;
-pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 pub use translate::function::{
     emit_dialect_schema_row_delete, emit_dialect_schema_row_insert,
     open_schema_table_for_dialect_rows,

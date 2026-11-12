@@ -1,9 +1,11 @@
-//! `CREATE FUNCTION` and `DROP FUNCTION`.
+//! Functions that SQL defines: `CREATE FUNCTION`, `DROP FUNCTION` and calls.
 //!
 //! The engine has no functions that SQL defines. The database's dialect
 //! decides whether it has them, what it stores for one and what a call does.
-//! The engine opens the write transaction, lets the dialect emit the writes,
-//! and sets the new schema version, as for every other schema change.
+//! For the two statements, the engine opens the write transaction, lets the
+//! dialect emit the writes, and sets the new schema version, as for every
+//! other schema change. For a call, the engine asks the dialect for the
+//! expression that the call stands for, before it translates the statement.
 
 use std::sync::Arc;
 
@@ -12,8 +14,12 @@ use turso_parser::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::schema::{
     emit_schema_row, emit_schema_rows_delete, SchemaEntryType, SQLITE_TABLEID,
+};
+use crate::translate::trigger_exec::{
+    rewrite_from_clause_expressions, rewrite_select_expressions, rewrite_window_expressions,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Cookie, Insn};
@@ -131,4 +137,170 @@ pub fn emit_dialect_schema_row_delete(
         SchemaEntryType::Dialect(row_type),
         name,
     );
+}
+
+/// Replaces each call of a function that the dialect defines as an
+/// expression of the call's arguments with that expression
+/// ([`crate::Dialect::expand_function_call`]), in the queries and the
+/// data-changing statements. The rest of translation only sees the
+/// expression. Returns whether it replaced a call.
+pub(crate) fn expand_function_calls(
+    stmt: &mut ast::Stmt,
+    resolver: &Resolver,
+    connection: &Connection,
+) -> Result<bool> {
+    let dialect = &resolver.catalog.dialect;
+    if !dialect.expands_function_calls(resolver.schema()) {
+        return Ok(false);
+    }
+    let mut expanded_a_call = false;
+    let mut expand = |call: &ast::Expr| {
+        let expansion = dialect.expand_function_call(resolver.schema(), connection, call)?;
+        expanded_a_call |= expansion.is_some();
+        Ok(expansion)
+    };
+    expand_in_statement(stmt, &mut expand)?;
+    Ok(expanded_a_call)
+}
+
+fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<()> {
+    match stmt {
+        ast::Stmt::Select(select) => expand_in_select(select, expand),
+        ast::Stmt::Insert {
+            with,
+            body,
+            returning,
+            ..
+        } => {
+            expand_in_with(with.as_mut(), expand)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                expand_in_select(select, expand)?;
+                expand_in_upsert(upsert.as_deref_mut(), expand)?;
+            }
+            expand_in_result_columns(returning, expand)
+        }
+        ast::Stmt::Update(update) => {
+            expand_in_with(update.with.as_mut(), expand)?;
+            for set in &mut update.sets {
+                expand_in_expr(&mut set.expr, expand)?;
+            }
+            if let Some(from) = &mut update.from {
+                rewrite_from_clause_expressions(from, &mut |expr| {
+                    expand_call_or_subquery(expr, expand)
+                })?;
+            }
+            if let Some(where_clause) = &mut update.where_clause {
+                expand_in_expr(where_clause, expand)?;
+            }
+            expand_in_result_columns(&mut update.returning, expand)
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            expand_in_with(with.as_mut(), expand)?;
+            if let Some(where_clause) = where_clause {
+                expand_in_expr(where_clause, expand)?;
+            }
+            expand_in_result_columns(returning, expand)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The expression that replaces a call, or None to keep the call.
+type ExpandCall<'a> = dyn FnMut(&ast::Expr) -> Result<Option<ast::Expr>> + 'a;
+
+fn expand_in_with(with: Option<&mut ast::With>, expand: &mut ExpandCall) -> Result<()> {
+    for cte in with.into_iter().flat_map(|with| &mut with.ctes) {
+        expand_in_select(&mut cte.select, expand)?;
+    }
+    Ok(())
+}
+
+fn expand_in_select(select: &mut ast::Select, expand: &mut ExpandCall) -> Result<()> {
+    rewrite_select_expressions(select, &mut |expr| expand_call_or_subquery(expr, expand))
+}
+
+fn expand_in_result_columns(
+    columns: &mut [ast::ResultColumn],
+    expand: &mut ExpandCall,
+) -> Result<()> {
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            expand_in_expr(expr, expand)?;
+        }
+    }
+    Ok(())
+}
+
+fn expand_in_upsert(mut upsert: Option<&mut ast::Upsert>, expand: &mut ExpandCall) -> Result<()> {
+    while let Some(clause) = upsert {
+        if let Some(index) = &mut clause.index {
+            for target in &mut index.targets {
+                expand_in_expr(&mut target.expr, expand)?;
+            }
+            if let Some(where_clause) = &mut index.where_clause {
+                expand_in_expr(where_clause, expand)?;
+            }
+        }
+        if let ast::UpsertDo::Set { sets, where_clause } = &mut clause.do_clause {
+            for set in sets {
+                expand_in_expr(&mut set.expr, expand)?;
+            }
+            if let Some(where_clause) = where_clause {
+                expand_in_expr(where_clause, expand)?;
+            }
+        }
+        upsert = clause.next.as_deref_mut();
+    }
+    Ok(())
+}
+
+/// Expands the calls in `expr` and in its subqueries.
+fn expand_in_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr| expand_call_or_subquery(expr, expand))?;
+    Ok(())
+}
+
+/// Expands the calls in the subquery that `expr` is, or the call that `expr`
+/// is. The arguments of a call are expanded before the call, so the dialect
+/// sees the arguments as they will run.
+fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<WalkControl> {
+    match expr {
+        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+            expand_in_select(select, expand)?;
+        }
+        ast::Expr::InSelect { rhs, .. } => expand_in_select(rhs, expand)?,
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            within_group,
+            filter_over,
+            ..
+        } => {
+            for arg in args.iter_mut() {
+                expand_in_expr(arg, expand)?;
+            }
+            for sorted_column in order_by.iter_mut().chain(within_group.iter_mut()) {
+                expand_in_expr(&mut sorted_column.expr, expand)?;
+            }
+            if let Some(filter) = &mut filter_over.filter_clause {
+                expand_in_expr(filter, expand)?;
+            }
+            if let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref_mut() {
+                rewrite_window_expressions(window, &mut |expr| {
+                    expand_call_or_subquery(expr, expand)
+                })?;
+            }
+            if let Some(expansion) = expand(expr)? {
+                *expr = expansion;
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
+        _ => {}
+    }
+    Ok(WalkControl::Continue)
 }

@@ -163,6 +163,17 @@ pub fn translate(
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
+    // Before the variables are registered: the parameters of an expanded
+    // function are not variables of the statement.
+    let mut stmt = stmt;
+    if function::expand_function_calls(&mut stmt, &resolver, &connection)? {
+        // The expression of a function comes from the schema, so the
+        // statement must be prepared again when the schema changes, also
+        // when it reads no table, such as `SELECT f()`. A read transaction
+        // checks the schema version.
+        program.begin_read_operation()?;
+    }
+
     walk_stmt_expressions(&stmt, &mut |expr| {
         if let ast::Expr::Variable(variable) = expr {
             program.register_variable(variable);
