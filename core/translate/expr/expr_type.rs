@@ -42,9 +42,9 @@ pub(crate) enum ExprType {
     /// Parameters (`?`) should be untyped too, but are `Builtin(Any)` for now.
     Untyped,
     Null,
-    /// A value whose type nothing declares, such as `array_column + 1`, or that
-    /// has no type because it is an error, such as `date_column * 2` when no
-    /// function runs `*` for a date.
+    /// A value whose type nothing declares, or that has no type because it is
+    /// an error, such as `date_column * 2` when no function runs `*` for a date,
+    /// or `array_column + 1`.
     Unknown,
     /// An expression whose type is known only once its statement is bound and
     /// planned: a name, a subquery, or DEFAULT. `(SELECT s FROM t)` is this

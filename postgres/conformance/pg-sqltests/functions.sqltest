@@ -1639,6 +1639,25 @@ expect error {
     operator does not exist: boolean \+ integer
 }
 
+test an-array-divided-by-an-integer-errors {
+    CREATE TABLE array_division (b text[]);
+    INSERT INTO array_division VALUES (ARRAY['x']);
+    SELECT b / 2 FROM array_division;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text\[\] / integer
+}
+
+test an-index-on-an-integer-divided-by-an-array-errors {
+    CREATE TABLE array_index (a int, b text[]);
+    CREATE INDEX ON array_index ((1 / b));
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer / text\[\]
+}
+
 # booleq() returns boolean, so the client sees t and f, not 1 and 0.
 test booleq-prints-as-a-boolean {
     SELECT booleq(true, true), booleq(true, false);

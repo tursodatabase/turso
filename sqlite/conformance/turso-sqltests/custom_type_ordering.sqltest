@@ -789,12 +789,12 @@ expect {
 
 # Nothing says that an array plus a number is text.
 @requires strict "uses STRICT tables"
-test false-where-term-rejects-collate-on-value-of-unknown-type {
+test false-where-term-rejects-arithmetic-on-array-under-collate {
     CREATE TABLE t(a integer[]) STRICT;
     SELECT count(*) FROM t WHERE 0 AND (a + 1) COLLATE NOCASE = 'x';
 }
 expect error {
-    collations are not supported by type unknown
+    operator does not exist: integer\[\] \+ integer
 }
 
 # A COLLATE inside a row value applies to one of its values.
