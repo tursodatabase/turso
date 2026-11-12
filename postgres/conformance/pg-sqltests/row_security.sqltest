@@ -128,3 +128,13 @@ expect {
     public|0
     rls_schema|1
 }
+
+@skip-if postgres "PostgreSQL says the action cannot be performed on the view"
+test enable-on-a-view-is-rejected {
+    CREATE TABLE rls_view_table (id INT);
+    CREATE VIEW rls_view AS SELECT id FROM rls_view_table;
+    ALTER TABLE rls_view ENABLE ROW LEVEL SECURITY;
+}
+expect error {
+    "rls_view" is not a table
+}

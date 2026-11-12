@@ -9,8 +9,7 @@
 # whole server, so every test uses its own role and table names.
 #
 # A view reads its tables as the view's owner, so a view shows its readers
-# the rows its owner sees. RIGHT and FULL JOIN are not tested, because Turso
-# rejects them for a role on a table with row-level security.
+# the rows its owner sees.
 
 @database :memory:
 

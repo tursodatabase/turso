@@ -67,6 +67,46 @@ fn row_security_is_kept_after_reopening_the_database() {
 }
 
 #[test]
+fn policies_are_visible_to_another_connection_and_kept_after_reopening() {
+    let db = TempDatabase::builder().build();
+    let conn = connect_with_documents(&db);
+    let alice = db.connect_postgres();
+    alice.execute("SET ROLE alice").unwrap();
+    assert!(rows(&alice, "SELECT id FROM documents").is_empty());
+
+    conn.execute("CREATE POLICY first ON documents USING (id = 1)")
+        .unwrap();
+    conn.execute("CREATE POLICY second ON documents USING (id = 2)")
+        .unwrap();
+    conn.execute("DROP POLICY second ON documents").unwrap();
+
+    assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["1"]]);
+    conn.close().unwrap();
+    alice.close().unwrap();
+    drop(conn);
+    drop(alice);
+
+    let db = db.reopen();
+    let alice = db.connect_postgres();
+    alice.execute("SET ROLE alice").unwrap();
+    assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["1"]]);
+}
+
+#[test]
+fn policy_is_dropped_when_its_statement_rolls_back() {
+    let db = TempDatabase::builder().build();
+    let conn = connect_with_documents(&db);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE POLICY everything ON documents USING (true)")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    assert!(rows(&conn, "SELECT id FROM documents").is_empty());
+}
+
+#[test]
 fn schema_is_read_again_after_enabling_row_security() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
@@ -84,6 +124,19 @@ fn schema_is_read_again_after_enabling_row_security() {
         .inner()
         .dialect()
         .table_rls_enabled(&schema, public, "t"));
+}
+
+#[test]
+fn policies_are_read_again_while_a_role_is_set() {
+    let db = TempDatabase::builder().build();
+    let conn = connect_with_documents(&db);
+    conn.execute("CREATE POLICY first ON documents USING (id = 1)")
+        .unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+
+    assert_eq!(rows(&conn, "SELECT id FROM documents"), vec![vec!["1"]]);
 }
 
 #[test]
@@ -270,27 +323,25 @@ fn subqueries_ctes_and_views_see_no_hidden_rows() {
 }
 
 #[test]
-fn right_and_full_join_with_table_with_row_security_are_rejected() {
+fn right_and_full_join_show_no_hidden_rows() {
     let db = TempDatabase::builder().build();
     let conn = connect_with_documents(&db);
     conn.execute("CREATE TABLE notes (id int)").unwrap();
+    conn.execute("INSERT INTO notes VALUES (1), (3)").unwrap();
     conn.execute("GRANT SELECT ON notes TO alice").unwrap();
     conn.execute("SET ROLE alice").unwrap();
 
-    let right = conn
-        .execute("SELECT * FROM notes n RIGHT JOIN documents d ON d.id = n.id")
-        .unwrap_err();
-    let full = conn
-        .execute("SELECT * FROM documents d FULL JOIN notes n ON d.id = n.id")
-        .unwrap_err();
-
+    assert!(rows(
+        &conn,
+        "SELECT d.id FROM notes n RIGHT JOIN documents d ON d.id = n.id"
+    )
+    .is_empty());
     assert_eq!(
-        right.to_string(),
-        "RIGHT JOIN with table \"documents\" that has row-level security is not supported"
-    );
-    assert_eq!(
-        full.to_string(),
-        "FULL JOIN with table \"documents\" that has row-level security is not supported"
+        rows(
+            &conn,
+            "SELECT n.id, d.id FROM documents d FULL JOIN notes n ON d.id = n.id ORDER BY n.id"
+        ),
+        vec![vec!["1", ""], vec!["3", ""]]
     );
 }
 

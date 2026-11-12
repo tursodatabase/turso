@@ -260,6 +260,8 @@ fn translate_statement(
             | ast::Stmt::AlterSequenceOwnedBy { .. }
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
+            | ast::Stmt::CreatePolicy(_)
+            | ast::Stmt::DropPolicy { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -588,6 +590,23 @@ fn translate_statement(
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;
         }
+        ast::Stmt::CreatePolicy(policy) => {
+            row_security::translate_create_policy(&policy, resolver, program, connection)?;
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => {
+            row_security::translate_drop_policy(
+                &policy_name,
+                &tbl_name,
+                if_exists,
+                resolver,
+                program,
+                connection,
+            )?;
+        }
     };
 
     if is_write {
@@ -679,6 +698,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::AlterSequenceOwnedBy { .. } => "alter_sequence_owned_by",
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
+        ast::Stmt::CreatePolicy(_) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 

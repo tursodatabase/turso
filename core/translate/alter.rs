@@ -760,6 +760,7 @@ fn emit_column_constraints_validation(
                 namespace,
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );
@@ -941,6 +942,12 @@ pub fn translate_alter_table(
         }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
+            row_security::reject_change_of_policy_column(
+                resolver,
+                namespace,
+                table_name,
+                column_name,
+            )?;
 
             // Tables always have at least one column.
             turso_assert_ne!(btree.columns().len(), 0);
@@ -1869,6 +1876,7 @@ pub fn translate_alter_table(
 
             let from = from.as_str();
             let col_name = col_name.as_str();
+            row_security::reject_change_of_policy_column(resolver, namespace, table_name, from)?;
 
             let Some((column_index, _)) = btree.get_column(from) else {
                 return Err(LimboError::ParseError(format!(

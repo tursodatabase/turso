@@ -1184,6 +1184,12 @@ pub enum Insn {
         on_error: Option<ResolveType>, // p2
     },
 
+    /// Fail the statement because a row it writes fails a condition of a
+    /// row-level security policy.
+    RowSecurityViolation {
+        denial: Box<crate::security::permission::PermissionDenied>,
+    },
+
     /// Start a transaction.
     Transaction {
         db: usize,                // p1
@@ -2517,6 +2523,7 @@ impl InsnVariants {
             InsnVariants::Prev => execute::op_prev,
             InsnVariants::Halt => execute::op_halt,
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
+            InsnVariants::RowSecurityViolation => execute::op_row_security_violation,
             InsnVariants::Transaction => execute::op_transaction,
             InsnVariants::AutoCommit => execute::op_auto_commit,
             InsnVariants::Savepoint => execute::op_savepoint,

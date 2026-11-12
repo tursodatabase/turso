@@ -4228,6 +4228,16 @@ pub fn op_halt_if_null(
     }
 }
 
+pub fn op_row_security_violation(
+    _program: &Program,
+    _state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(RowSecurityViolation { denial }, insn);
+    Err(LimboError::PermissionDenied(denial.clone()).into())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,

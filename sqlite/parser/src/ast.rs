@@ -393,6 +393,17 @@ pub enum Stmt {
         /// schema name
         name: Name,
     },
+    /// `CREATE POLICY`, built only by a frontend with row-level security.
+    CreatePolicy(Box<CreatePolicy>),
+    /// `DROP POLICY`, built only by a frontend with row-level security.
+    DropPolicy {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// policy name
+        policy_name: Name,
+        /// table the policy belongs to
+        tbl_name: QualifiedName,
+    },
 }
 
 #[repr(transparent)]
@@ -1571,13 +1582,49 @@ pub enum Privilege {
     All,
 }
 
-/// Whom a `GRANT` gives privileges to.
+/// Whom a `GRANT` gives privileges to, or whom a policy applies to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Grantee {
     /// `PUBLIC`: every role.
     Public,
     Role(RoleSpec),
+}
+
+/// `CREATE POLICY`: which rows of a table the roles it applies to may access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreatePolicy {
+    /// policy name
+    pub policy_name: Name,
+    /// table the policy belongs to
+    pub tbl_name: QualifiedName,
+    /// `AS PERMISSIVE` (true) or `AS RESTRICTIVE` (false)
+    pub permissive: bool,
+    /// `FOR` command
+    pub command: PolicyCommand,
+    /// `TO` roles
+    pub roles: Vec<Grantee>,
+    /// `USING`: which existing rows the policy lets the roles access
+    pub using_expr: Option<Box<Expr>>,
+    /// `WITH CHECK`: which new rows the policy lets the roles write
+    pub check_expr: Option<Box<Expr>>,
+}
+
+/// The command a policy applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PolicyCommand {
+    /// `FOR ALL`
+    All,
+    /// `FOR SELECT`
+    Select,
+    /// `FOR INSERT`
+    Insert,
+    /// `FOR UPDATE`
+    Update,
+    /// `FOR DELETE`
+    Delete,
 }
 
 /// Operator mapping in a `CREATE TYPE` body

@@ -228,6 +228,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
+            NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -966,6 +967,47 @@ impl PostgreSQLTranslator {
         }
     }
 
+    fn translate_create_policy(
+        &self,
+        policy: &pg_query::protobuf::CreatePolicyStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let table = policy
+            .table
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("CREATE POLICY: missing table".into()))?;
+        let command = match policy.cmd_name.as_str() {
+            "all" => ast::PolicyCommand::All,
+            "select" => ast::PolicyCommand::Select,
+            "insert" => ast::PolicyCommand::Insert,
+            "update" => ast::PolicyCommand::Update,
+            "delete" => ast::PolicyCommand::Delete,
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "CREATE POLICY: unknown command {other}"
+                )))
+            }
+        };
+        let using_expr = policy
+            .qual
+            .as_ref()
+            .map(|expr| self.translate_expr(expr).map(Box::new))
+            .transpose()?;
+        let check_expr = policy
+            .with_check
+            .as_ref()
+            .map(|expr| self.translate_expr(expr).map(Box::new))
+            .transpose()?;
+        Ok(ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
+            policy_name: ast::Name::exact(policy.policy_name.clone()),
+            tbl_name: self.qualified_name_from_range_var(table)?,
+            permissive: policy.permissive,
+            command,
+            roles: policy_roles(&policy.roles)?,
+            using_expr,
+            check_expr,
+        })))
+    }
+
     fn translate_alter_table(
         &self,
         alter: &pg_query::protobuf::AlterTableStmt,
@@ -1403,6 +1445,9 @@ impl PostgreSQLTranslator {
 
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
+        if remove_type == ObjectType::ObjectPolicy {
+            return translate_drop_policy(drop);
+        }
 
         if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
             return Err(not_supported(format!(
@@ -6321,6 +6366,74 @@ pub fn role_keyword(function_name: &str) -> Option<&'static str> {
         .iter()
         .find(|(function, _)| function.eq_ignore_ascii_case(function_name))
         .map(|(_, keyword)| *keyword)
+}
+
+/// `DROP POLICY name ON table`. A policy has no schema of its own; its name
+/// list is the table's name followed by the policy's.
+fn translate_drop_policy(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
+        return Err(not_supported("DROP POLICY ... CASCADE"));
+    }
+    let [object] = drop.objects.as_slice() else {
+        return Err(ParseError::ParseError("DROP POLICY: invalid name".into()));
+    };
+    let Some(Node::List(list)) = &object.node else {
+        return Err(ParseError::ParseError("DROP POLICY: invalid name".into()));
+    };
+    let names = extract_key_columns(&list.items)?;
+    let (tbl_name, policy_name) = match names.as_slice() {
+        [table, policy] => (
+            ast::QualifiedName::single(exact_name(table.clone())),
+            policy,
+        ),
+        [schema, table, policy] => (
+            ast::QualifiedName::fullname(
+                exact_name(schema_qualifier(schema)?),
+                exact_name(table.clone()),
+            ),
+            policy,
+        ),
+        _ => return Err(ParseError::ParseError("DROP POLICY: invalid name".into())),
+    };
+    Ok(ast::Stmt::DropPolicy {
+        if_exists: drop.missing_ok,
+        policy_name: ast::Name::exact(policy_name.clone()),
+        tbl_name,
+    })
+}
+
+/// The roles of a policy's TO clause.
+fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::RoleSpecType;
+
+    roles
+        .iter()
+        .map(|role| {
+            let Some(Node::RoleSpec(spec)) = &role.node else {
+                return Err(ParseError::ParseError(
+                    "CREATE POLICY: unexpected role node".into(),
+                ));
+            };
+            match RoleSpecType::try_from(spec.roletype) {
+                Ok(RoleSpecType::RolespecPublic) => Ok(ast::Grantee::Public),
+                Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                    Ok(ast::Grantee::Role(ast::RoleSpec::CurrentRole))
+                }
+                Ok(RoleSpecType::RolespecSessionUser) => {
+                    Ok(ast::Grantee::Role(ast::RoleSpec::SessionUser))
+                }
+                Ok(RoleSpecType::RolespecCstring) => Ok(ast::Grantee::Role(ast::RoleSpec::Name(
+                    spec.rolename.clone(),
+                ))),
+                _ => Err(ParseError::ParseError(
+                    "CREATE POLICY: unknown role kind".into(),
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with

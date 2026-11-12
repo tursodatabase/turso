@@ -7,7 +7,6 @@ use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
-use crate::translate::plan::NonFromClauseSubquery;
 use crate::translate::{roles, row_security};
 use crate::turso_debug_assert;
 use crate::{
@@ -344,7 +343,6 @@ pub fn translate_insert(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    row_security::check_insert(&btree_table, namespace, resolver)?;
 
     let BoundInsertResult {
         mut values,
@@ -391,6 +389,7 @@ pub fn translate_insert(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
@@ -426,14 +425,37 @@ pub fn translate_insert(
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
-    check_upsert_and_returning_privileges(
+    let updates_on_conflict = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    let reads_columns = updates_on_conflict
+        || upsert_actions
+            .iter()
+            .any(|(_, _, upsert)| upsert.index.is_some())
+        || roles::reads_columns_of(
+            table_references.joined_tables()[0].internal_id,
+            result_columns.iter().map(|column| &column.expr),
+            &returning_subqueries,
+        )?;
+    check_upsert_privileges(
         &table_references,
-        &result_columns,
-        &returning_subqueries,
         &upsert_actions,
+        reads_columns,
         resolver,
         connection,
     )?;
+    let row_checks = row_security::new_row_checks(
+        resolver,
+        namespace,
+        table_name.as_str(),
+        crate::security::policy::Command::Insert,
+        reads_columns,
+    );
+    let upsert_row_checks = if updates_on_conflict {
+        crate::translate::row_security::upsert_row_checks(resolver, namespace, table_name.as_str())
+    } else {
+        Default::default()
+    };
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| {
             s.has_child_fks(namespace.id, table_name.as_str())
@@ -858,6 +880,25 @@ pub fn translate_insert(
         )?;
     }
 
+    // Rows that row-level security does not let the role write fail before
+    // the CHECK constraints, as in PostgreSQL, and before ON CONFLICT looks
+    // for a conflicting row, so that every row proposed is checked.
+    crate::translate::row_security::emit_row_checks(
+        program,
+        resolver,
+        &row_checks,
+        &table_references,
+        insertion.key_register(),
+        insertion.col_mappings.iter().map(|m| {
+            let reg = if m.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                m.register
+            };
+            (m.column, reg)
+        }),
+    )?;
+
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     let check_halt_on_error = program.constraint_halt_on_error(ctx.on_conflict);
     emit_check_constraints(
@@ -1191,6 +1232,7 @@ pub fn translate_insert(
             connection,
             &mut table_references,
             tbl_name.alias.as_ref().map(|alias| alias.as_str()),
+            &upsert_row_checks,
         )?;
     }
 
@@ -1695,6 +1737,7 @@ fn resolve_upserts(
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
+    row_checks: &crate::translate::row_security::UpsertRowChecks,
 ) -> Result<()> {
     for (position, (_, label, upsert)) in upsert_actions.iter_mut().enumerate() {
         // Like SQLite, only compile an action that some constraint check can
@@ -1738,6 +1781,7 @@ fn resolve_upserts(
                 connection,
                 table_references,
                 table_alias,
+                row_checks,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -2047,14 +2091,13 @@ fn emit_notnulls(
 }
 
 /// Checks the privileges an INSERT needs besides INSERT, as in PostgreSQL:
-/// UPDATE for ON CONFLICT DO UPDATE, and SELECT when RETURNING reads the
-/// table's columns or ON CONFLICT names the columns that conflict. DO UPDATE
-/// also needs SELECT, because its SET and WHERE read the row that conflicts.
-fn check_upsert_and_returning_privileges(
+/// UPDATE for ON CONFLICT DO UPDATE, and SELECT when `reads_columns` says
+/// that RETURNING reads the table's columns, ON CONFLICT names the columns
+/// that conflict, or DO UPDATE reads the row that conflicts.
+fn check_upsert_privileges(
     table_references: &TableReferences,
-    result_columns: &[ResultSetColumn],
-    returning_subqueries: &[NonFromClauseSubquery],
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    reads_columns: bool,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
@@ -2074,15 +2117,6 @@ fn check_upsert_and_returning_privileges(
             object(),
         )?;
     }
-    let reads_columns = updates
-        || upsert_actions
-            .iter()
-            .any(|(_, _, upsert)| upsert.index.is_some())
-        || roles::reads_columns_of(
-            target.internal_id,
-            result_columns.iter().map(|column| &column.expr),
-            returning_subqueries,
-        )?;
     if reads_columns {
         roles::check_privilege(
             resolver,

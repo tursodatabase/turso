@@ -287,6 +287,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
+        || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if is_duplicate_object_error(msg) {
@@ -308,7 +309,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("aggregate functions are not allowed")
     {
         SQLSTATE_GROUPING_ERROR
-    } else if msg.starts_with("misuse of window function") {
+    } else if msg.starts_with("misuse of window function")
+        || msg.starts_with("window functions are not allowed")
+    {
         SQLSTATE_WINDOWING_ERROR
     } else if msg.starts_with("invalid reference to FROM-clause entry") {
         SQLSTATE_INVALID_COLUMN_REFERENCE
@@ -326,11 +329,14 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_WRONG_OBJECT_TYPE
     } else if msg.starts_with("cannot change owner of sequence \"") {
         SQLSTATE_FEATURE_NOT_SUPPORTED
-    } else if msg.starts_with("column \"")
-        && msg.contains("\" of relation \"")
-        && msg.ends_with("\" does not exist")
-    {
+    } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
         SQLSTATE_UNDEFINED_COLUMN
+    } else if msg.starts_with("function ") && msg.ends_with(" does not exist") {
+        SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.starts_with("there is no parameter $") {
+        SQLSTATE_UNDEFINED_PARAMETER
+    } else if msg == "subqueries in policies are not supported" {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
@@ -408,10 +414,26 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
 }
 
 fn permission_denied_message(denial: &PermissionDenied) -> String {
-    match (denial.reason, &denial.object) {
+    match (&denial.reason, &denial.object) {
         (Reason::Owner, object) => return format!("must be owner of {}", object_name(object)),
-        (Reason::Policy, Object::Table(name)) => {
-            return format!("new row violates row-level security policy for table \"{name}\"")
+        (
+            Reason::Policy {
+                policy,
+                using_condition,
+            },
+            Object::Table(name),
+        ) => {
+            let policy = policy
+                .as_ref()
+                .map_or(String::new(), |policy| format!(" \"{policy}\""));
+            let condition = if *using_condition {
+                " (USING expression)"
+            } else {
+                ""
+            };
+            return format!(
+                "new row violates row-level security policy{policy}{condition} for table \"{name}\""
+            );
         }
         _ => {}
     }
@@ -524,6 +546,21 @@ mod tests {
             (
                 "column \"c\" of relation \"t\" does not exist",
                 SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            ("column \"c\" does not exist", SQLSTATE_UNDEFINED_COLUMN),
+            ("function f does not exist", SQLSTATE_UNDEFINED_FUNCTION),
+            ("there is no parameter $1", SQLSTATE_UNDEFINED_PARAMETER),
+            (
+                "window functions are not allowed in policy expressions",
+                SQLSTATE_WINDOWING_ERROR,
+            ),
+            (
+                "subqueries in policies are not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "cannot change column \"c\" of table \"t\" because policy \"p\" uses it",
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
             ),
             (
                 "sequence must have same owner as table it is linked to",

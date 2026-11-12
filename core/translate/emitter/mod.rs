@@ -2446,40 +2446,78 @@ pub(crate) fn emit_check_constraints<'a>(
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
     }
+    with_columns_in_registers(
+        program,
+        resolver,
+        table,
+        rowid_reg,
+        stored_columns,
+        referenced_tables,
+        |col_name| {
+            let normalized_name = normalize_ident(col_name);
+            check_constraints
+                .iter()
+                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
+        },
+        |program, resolver, stored_column_mappings| {
+            emit_check_constraint_bytecode(
+                program,
+                check_constraints,
+                resolver,
+                or_conflict,
+                halt_on_error,
+                skip_row_label,
+                referenced_tables,
+                table.name.as_str(),
+                stored_column_mappings,
+            )
+        },
+    )
+}
 
+/// Runs `emit` with the resolver reading the columns of a row of `table`
+/// from registers instead of a cursor: the rowid from `rowid_reg`, and each
+/// column from the register `stored_columns` gives, which holds its stored
+/// value, after ENCODE. A custom-type column that `is_read` names is DECODEd
+/// into a new register first, so that expressions see the value a SELECT
+/// reads. `emit` gets each column's name and stored register.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn with_columns_in_registers<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table: &BTreeTable,
+    rowid_reg: usize,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
+    referenced_tables: Option<&TableReferences>,
+    is_read: impl Fn(&str) -> bool,
+    emit: impl FnOnce(&mut ProgramBuilder, &mut Resolver, &[(&'a str, usize)]) -> Result<()>,
+) -> Result<()> {
     let table_name = table.name.as_str();
     let mut stored_column_mappings = Vec::new();
-    // A CHECK sees the values a SELECT reads, so it reads a custom-type column
-    // after DECODE, as `ceil(n)` on a numeric must compute from 4.50, not
-    // from the stored blob. Only the columns the CHECKs name are decoded.
+    // An expression sees the values a SELECT reads, so it reads a custom-type
+    // column after DECODE, as `ceil(n)` on a numeric must compute from 4.50,
+    // not from the stored blob. Only the columns it reads are decoded.
     let mut column_mappings = Vec::new();
     for (column, stored_reg) in stored_columns {
         let Some(col_name) = column.name.as_deref() else {
             continue;
         };
         stored_column_mappings.push((col_name, stored_reg));
-        let is_named_by_a_check = || {
-            let normalized_name = normalize_ident(col_name);
-            check_constraints
-                .iter()
-                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
-        };
-        let register = if resolver.schema().column_has_decode(column, table.is_strict)
-            && is_named_by_a_check()
-        {
-            let decoded_reg = program.alloc_register();
-            emit_user_facing_column_value(
-                program,
-                stored_reg,
-                decoded_reg,
-                column,
-                table.is_strict,
-                resolver,
-            )?;
-            decoded_reg
-        } else {
-            stored_reg
-        };
+        let register =
+            if resolver.schema().column_has_decode(column, table.is_strict) && is_read(col_name) {
+                let decoded_reg = program.alloc_register();
+                emit_user_facing_column_value(
+                    program,
+                    stored_reg,
+                    decoded_reg,
+                    column,
+                    table.is_strict,
+                    resolver,
+                )?;
+                decoded_reg
+            } else {
+                stored_reg
+            };
         column_mappings.push((col_name, register));
     }
     let initial_cache_size = resolver.expr_to_reg_cache.len();
@@ -2541,17 +2579,7 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        halt_on_error,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-        &stored_column_mappings,
-    );
+    let result = emit(program, resolver, &stored_column_mappings);
 
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);

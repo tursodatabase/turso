@@ -1070,7 +1070,9 @@ fn find_best_access_method_for_btree(
 
         // Multi-index scans do not record matched rowids for a RIGHT or FULL JOIN,
         // so the unmatched-row pass would emit matched right rows again.
-        if keeps_right_rows {
+        // They also check each branch's conditions on rows before the loop
+        // checks their row-level security filter.
+        if keeps_right_rows || rhs_table.row_filter.is_some() {
             return Ok(Some(best_access_method));
         }
 
