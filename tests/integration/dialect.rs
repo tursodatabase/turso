@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use turso_core::ast::Cmd;
 use turso_core::ast::CreateTableBody;
+use turso_core::ast::Expr;
 use turso_core::ast::QualifiedName;
 use turso_core::ast::Stmt;
 use turso_core::dialect::*;
@@ -124,6 +125,38 @@ impl Dialect for TestDialect {
             return Ok(Some(Func::Dialect("test_add_one".to_string())));
         }
         turso_core::dialect::resolve_builtin_function(name, arg_count)
+    }
+
+    fn expand_function_call(
+        &self,
+        _scope: &FunctionScope<'_>,
+        name: &str,
+        args: &[Box<Expr>],
+    ) -> Result<Option<Expr>> {
+        let [arg] = args else {
+            return Ok(None);
+        };
+        if name.eq_ignore_ascii_case("test_forever") {
+            return Ok(Some(Expr::FunctionCall {
+                name: turso_core::ast::Name::exact("test_forever".to_string()),
+                distinctness: None,
+                args: args.to_vec(),
+                order_by: Vec::new(),
+                within_group: Vec::new(),
+                filter_over: turso_core::ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }));
+        }
+        if !name.eq_ignore_ascii_case("test_twice") {
+            return Ok(None);
+        }
+        Ok(Some(Expr::Binary(
+            arg.clone(),
+            turso_core::ast::Operator::Add,
+            arg.clone(),
+        )))
     }
 
     fn exec_scalar_function(
@@ -744,6 +777,133 @@ fn dialect_scalar_function_resolves_and_executes() {
     // Unknown names still error.
     let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
     assert!(err.to_string().contains("no such function"));
+    conn.close().unwrap();
+}
+
+#[test]
+fn dialect_expands_a_function_call_into_an_expression() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-expand.db", Arc::new(TestDialect::default())).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let query = |sql: &str| conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER DEFAULT (test_twice(4)))")
+        .unwrap();
+    conn.execute("INSERT INTO t (a) VALUES (1), (2), (3)")
+        .unwrap();
+
+    assert_eq!(
+        query("SELECT test_twice(a), b FROM t WHERE a = test_twice(1)"),
+        vec![vec![Value::from_i64(4), Value::from_i64(8)]]
+    );
+    // The expansion is compiled like any expression, so its arguments
+    // can be aggregates, subqueries and other expanded calls.
+    assert_eq!(
+        query("SELECT test_twice(count(*)), test_twice((SELECT max(a) FROM t)) FROM t"),
+        vec![vec![Value::from_i64(6), Value::from_i64(6)]]
+    );
+    assert_eq!(
+        query("SELECT test_twice(test_twice(a)) FROM t ORDER BY test_twice(a) DESC LIMIT 1"),
+        vec![vec![Value::from_i64(12)]]
+    );
+    conn.execute("CREATE VIEW v AS SELECT test_twice(a) AS doubled FROM t")
+        .unwrap();
+    assert_eq!(
+        query("SELECT doubled FROM v WHERE doubled > 2 ORDER BY doubled"),
+        vec![vec![Value::from_i64(4)], vec![Value::from_i64(6)]]
+    );
+
+    // A CHECK constraint can call the function too.
+    conn.execute("CREATE TABLE c (a INTEGER CHECK (a = test_twice(2)))")
+        .unwrap();
+    conn.execute("INSERT INTO c VALUES (4)").unwrap();
+    let err = conn.execute("INSERT INTO c VALUES (5)").unwrap_err();
+    assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+
+    // The optimizer sees the expansion: the comparison with the primary
+    // key is a seek, not a scan.
+    let plan = query("EXPLAIN QUERY PLAN SELECT b FROM t WHERE a = test_twice(1)");
+    let detail = plan[0].last().unwrap().to_string();
+    assert!(detail.contains("SEARCH"), "{detail}");
+
+    // The dialect expands the call only with one argument.
+    let err = conn.prepare("SELECT test_twice(1, 2)").unwrap_err();
+    assert!(err.to_string().contains("no such function"), "{err}");
+
+    // The function is a scalar function, so the clauses of an aggregate or
+    // a window function are errors.
+    for (sql, message) in [
+        (
+            "SELECT test_twice(a) OVER () FROM t",
+            "test_twice may not be used as a window function",
+        ),
+        (
+            "SELECT test_twice(DISTINCT a) FROM t",
+            "DISTINCT may not be used with non-aggregate test_twice()",
+        ),
+        (
+            "SELECT test_twice(a ORDER BY a) FROM t",
+            "ORDER BY may not be used with non-aggregate test_twice()",
+        ),
+        (
+            "SELECT test_twice(a) FILTER (WHERE a > 1) FROM t",
+            "FILTER may not be used with non-aggregate test_twice()",
+        ),
+    ] {
+        let err = conn.prepare(sql).unwrap_err();
+        assert!(err.to_string().contains(message), "{sql}: {err}");
+    }
+
+    // An index and a generated column keep values that the function
+    // computed, which would not match a later definition of it.
+    for (sql, message) in [
+        (
+            "CREATE INDEX t_twice ON t (test_twice(a))",
+            "function test_twice is not supported in an index",
+        ),
+        (
+            "CREATE INDEX t_partial ON t (a) WHERE test_twice(a) > 2",
+            "function test_twice is not supported in an index",
+        ),
+        (
+            "CREATE TABLE g (a INTEGER, b INTEGER AS (test_twice(a)))",
+            "function test_twice is not supported in a generated column",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN g INTEGER AS (test_twice(a))",
+            "function test_twice is not supported in a generated column",
+        ),
+    ] {
+        let err = conn
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.run_ignore_rows())
+            .unwrap_err();
+        assert!(err.to_string().contains(message), "{sql}: {err}");
+    }
+
+    // A statement can have any number of calls; only how deeply expansions
+    // nest is limited.
+    conn.execute("CREATE TABLE many (a INTEGER)").unwrap();
+    let values = vec!["(test_twice(1))"; 1500].join(", ");
+    conn.execute(format!("INSERT INTO many VALUES {values}"))
+        .unwrap();
+    assert_eq!(
+        query("SELECT count(*), sum(a) FROM many"),
+        vec![vec![Value::from_i64(1500), Value::from_i64(3000)]]
+    );
+
+    // An expansion that calls the function again is an error instead of
+    // a statement that never finishes compiling.
+    let err = conn.prepare("SELECT test_forever(1)").unwrap_err();
+    assert!(err.to_string().contains("does it call itself"), "{err}");
+    let err = conn
+        .prepare("CREATE TABLE u (a INTEGER DEFAULT (test_forever(1)))")
+        .and_then(|mut stmt| stmt.run_ignore_rows())
+        .and_then(|()| conn.execute("INSERT INTO u DEFAULT VALUES"))
+        .unwrap_err();
+    assert!(err.to_string().contains("does it call itself"), "{err}");
     conn.close().unwrap();
 }
 

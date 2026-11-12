@@ -1067,8 +1067,8 @@ pub fn translate_alter_table(
                 for c in &col_def.constraints {
                     match &c.constraint {
                         ast::ColumnConstraint::Generated { expr, .. } => {
-                            crate::schema::validate_generated_expr(expr)?;
                             validate_generated_function_calls(expr, &resolver.catalog)?;
+                            crate::schema::validate_generated_expr(expr)?;
                         }
                         ast::ColumnConstraint::Default(_) => {
                             return Err(LimboError::ParseError(format!(
@@ -1650,8 +1650,8 @@ pub fn translate_alter_table(
 
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
                         validate_generated_function_calls(expr, &resolver.catalog)?;
+                        crate::schema::validate_generated_expr(expr)?;
                     }
                 }
 

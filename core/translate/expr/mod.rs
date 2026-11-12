@@ -42,7 +42,7 @@ mod affinity;
 mod arrays;
 mod binary;
 mod binding;
-pub(crate) use binding::validate_function_tail;
+pub(crate) use binding::{non_aggregate_clause_error, validate_function_tail};
 mod columns;
 mod condition;
 mod custom_type_operators;

@@ -46,6 +46,22 @@ pub(crate) struct CatalogContext<'a> {
     search_order: Vec<NamespaceRef>,
 }
 
+/// How deeply calls that a dialect expands may nest, a call inside the
+/// expansion of another being one level deeper. A function whose expansion
+/// calls the function again would otherwise expand forever.
+const MAX_FUNCTION_EXPANSION_DEPTH: usize = 100;
+
+/// The clauses of a function call that only an aggregate or a window
+/// function takes.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AggregateClauses {
+    pub distinct: bool,
+    pub order_by: bool,
+    pub within_group: bool,
+    pub filter: bool,
+    pub over: bool,
+}
+
 /// Context for restricting table resolution while compiling the body of a
 /// database object (a trigger or a view). Mirrors SQLite's view/trigger
 /// schema fixer (`sqlite3FixSelect`/`DbFixer` in `src/fix.c`): unqualified
@@ -184,6 +200,93 @@ impl<'a> CatalogContext<'a> {
                 .resolve_function(func_name, arg_count)
                 .map(Func::External)),
         }
+    }
+
+    /// The expression that the dialect compiles in place of a call of
+    /// function `name` with `args`, or None when the dialect has none: the
+    /// call is of a built-in function, an extension function, or no function
+    /// at all. A function of the dialect's own comes first, then a function
+    /// that the dialect expands, then an extension function, so callers ask
+    /// for the expansion before they look the name up. The calls inside the
+    /// expansion that the dialect expands are expanded too, but not the ones
+    /// inside its subqueries, which are compiled on their own.
+    pub(crate) fn expand_function_call(
+        &self,
+        name: &str,
+        args: &[Box<ast::Expr>],
+        clauses: AggregateClauses,
+    ) -> Result<Option<ast::Expr>> {
+        self.expand_function_call_at_depth(name, args, clauses, 0)
+    }
+
+    fn expand_function_call_at_depth(
+        &self,
+        name: &str,
+        args: &[Box<ast::Expr>],
+        clauses: AggregateClauses,
+        depth: usize,
+    ) -> Result<Option<ast::Expr>> {
+        // A name with the wrong number of arguments for a built-in function
+        // is still that function's name.
+        if !matches!(self.dialect.resolve_function(name, args.len()), Ok(None)) {
+            return Ok(None);
+        }
+        let scope = crate::dialect::FunctionScope {
+            schema: self.schema,
+            qualifiers: self.qualifiers,
+            search_order: &self.search_order,
+        };
+        let Some(mut expansion) = self.dialect.expand_function_call(&scope, name, args)? else {
+            return Ok(None);
+        };
+        clauses.check_scalar_function(name)?;
+        if depth == MAX_FUNCTION_EXPANSION_DEPTH {
+            crate::bail_parse_error!(
+                "function {name} is nested in more than {MAX_FUNCTION_EXPANSION_DEPTH} \
+                 function calls that are expanded; does it call itself?"
+            );
+        }
+        crate::translate::expr::walk_expr_mut(&mut expansion, &mut |expr| {
+            let ast::Expr::FunctionCall { name, args, .. } = &*expr else {
+                return Ok(crate::translate::expr::WalkControl::Continue);
+            };
+            let clauses = AggregateClauses::of(expr);
+            let inner =
+                self.expand_function_call_at_depth(name.as_str(), args, clauses, depth + 1)?;
+            Ok(match inner {
+                Some(inner) => {
+                    *expr = ast::Expr::Parenthesized(vec![Box::new(inner)]);
+                    crate::translate::expr::WalkControl::SkipChildren
+                }
+                None => crate::translate::expr::WalkControl::Continue,
+            })
+        })?;
+        Ok(Some(expansion))
+    }
+
+    /// Fails when `expr` calls a function that the dialect expands, for
+    /// `place`, such as "an index", which keeps the values that `expr`
+    /// computes. They would be computed with the function as it is defined
+    /// now, and would not match a later definition of it.
+    pub(crate) fn check_no_expanded_function_calls(
+        &self,
+        expr: &ast::Expr,
+        place: &str,
+    ) -> Result<()> {
+        crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
+            if let ast::Expr::FunctionCall { name, args, .. } = expr {
+                let expansion =
+                    self.expand_function_call(name.as_str(), args, AggregateClauses::of(expr))?;
+                if expansion.is_some() {
+                    return Err(crate::LimboError::NotSupported(format!(
+                        "function {} is not supported in {place}",
+                        name.as_str()
+                    )));
+                }
+            }
+            Ok(crate::translate::expr::WalkControl::Continue)
+        })?;
+        Ok(())
     }
 
     pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
@@ -613,5 +716,61 @@ impl<'a> CatalogContext<'a> {
     /// else the name the namespace was added under.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.qualifiers.name_of(namespace)
+    }
+}
+
+impl AggregateClauses {
+    /// The clauses of `call`, which is a function call.
+    pub(crate) fn of(call: &ast::Expr) -> Self {
+        let ast::Expr::FunctionCall {
+            distinctness,
+            order_by,
+            within_group,
+            filter_over,
+            ..
+        } = call
+        else {
+            panic!("AggregateClauses::of expects a function call, got {call:?}");
+        };
+        Self::new(distinctness, order_by, within_group, filter_over)
+    }
+
+    /// The clauses of a function call with these parts.
+    pub(crate) fn new(
+        distinctness: &Option<ast::Distinctness>,
+        order_by: &[ast::SortedColumn],
+        within_group: &[ast::SortedColumn],
+        filter_over: &ast::FunctionTail,
+    ) -> Self {
+        Self {
+            distinct: distinctness.is_some(),
+            order_by: !order_by.is_empty(),
+            within_group: !within_group.is_empty(),
+            filter: filter_over.filter_clause.is_some(),
+            over: filter_over.over_clause.is_some(),
+        }
+    }
+
+    /// Fails when the call of scalar function `name` has one of the clauses.
+    /// The clauses that a call of a built-in function can have are checked
+    /// as for a built-in function, by
+    /// [`crate::translate::expr::non_aggregate_clause_error`].
+    fn check_scalar_function(self, name: &str) -> Result<()> {
+        let clause = if self.distinct {
+            "DISTINCT"
+        } else if self.within_group {
+            "WITHIN GROUP"
+        } else if self.order_by || self.over || self.filter {
+            return Err(crate::translate::expr::non_aggregate_clause_error(
+                name,
+                self.order_by,
+                self.over,
+            ));
+        } else {
+            return Ok(());
+        };
+        Err(crate::LimboError::WrongObjectType(format!(
+            "{clause} may not be used with non-aggregate {name}()"
+        )))
     }
 }

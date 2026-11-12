@@ -99,10 +99,11 @@ pub(crate) fn validate_check_expr(
             }
             ast::Expr::FunctionCall {
                 name,
+                distinctness,
                 args,
                 filter_over,
                 order_by,
-                ..
+                within_group,
             } => {
                 super::expr::validate_function_tail(
                     name.as_str(),
@@ -114,7 +115,19 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
+                let clauses = super::catalog::AggregateClauses::new(
+                    distinctness,
+                    order_by,
+                    within_group,
+                    filter_over,
+                );
+                if resolver
+                    .expand_function_call(name.as_str(), args, clauses)?
+                    .is_some()
+                {
+                    // The dialect compiles an expression of its own in
+                    // place of the call.
+                } else if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if func.is_aggregate() {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
@@ -406,7 +419,10 @@ fn resolve_check_expr_type(
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
         ast::Expr::FunctionCall { name, args, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
+            let clauses = super::catalog::AggregateClauses::of(expr);
+            if let Some(expansion) = resolver.expand_function_call(name.as_str(), args, clauses)? {
+                resolve_check_expr_type(&expansion, columns, resolver)
+            } else if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                 resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
             } else {
                 bail_parse_error!(
@@ -897,12 +913,14 @@ pub(crate) fn check_column_type(
 }
 
 /// Rejects a function call in a generated column expression whose argument
-/// count the function does not take. `validate_generated_expr` does not check
-/// counts because it also runs when the schema loads.
+/// count the function does not take, or of a function that the dialect
+/// expands. `validate_generated_expr` does not check counts because it also
+/// runs when the schema loads.
 pub(crate) fn validate_generated_function_calls(
     expr: &ast::Expr,
     resolver: &CatalogContext,
 ) -> Result<()> {
+    resolver.check_no_expanded_function_calls(expr, "a generated column")?;
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::FunctionCall { name, args, .. } = e {
             resolver.resolve_function(name.as_str(), args.len())?;
