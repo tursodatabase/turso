@@ -624,7 +624,9 @@ Notes on calls of SQL functions:
   takes its place has more than 100 levels. Each function body adds about
   3 levels for its casts, so a call can go through about 33 function
   bodies. `CREATE FUNCTION` fails with the same error when the calls of its
-  body pass the limit, because the check of the body expands them.
+  body pass the limit, because the check of the body expands them. The
+  limit is also for the complete expression that has the call: the error
+  is then `Expression tree is too large`, with the same SQLSTATE 54001.
   PostgreSQL limits the size of the stack (`max_stack_depth`), which
   permits more.
 

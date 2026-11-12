@@ -664,6 +664,21 @@ expect @tursopg error {
     stack depth limit exceeded
 }
 
+# The limit is for the complete expression. Here the expression of the calls
+# is below the limit, and the engine finds that the expression around them
+# is not.
+test call-in-an-expression-that-is-above-the-depth-limit {
+    CREATE FUNCTION add_twenty(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1$$;
+    SELECT -(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(add_twenty(add_twenty(1))))))))))))))))))))));
+}
+expect {
+    41
+}
+@sqlstate 54001
+expect @tursopg error {
+    Expression tree is too large \(maximum depth 100\)
+}
+
 # Bodies that CREATE FUNCTION did not check
 
 test call-of-a-function-that-is-created-after-the-function-that-calls-it {

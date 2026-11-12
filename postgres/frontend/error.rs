@@ -333,6 +333,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("window functions are not allowed")
     {
         SQLSTATE_WINDOWING_ERROR
+    } else if msg.starts_with("Expression tree is too large") {
+        SQLSTATE_STATEMENT_TOO_COMPLEX
     } else if msg.starts_with("invalid reference to FROM-clause entry") {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
