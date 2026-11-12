@@ -135,6 +135,30 @@ expect {
     1|6
 }
 
+# CREATE TABLE AS stores the rows of the query, not the query. The column
+# gets the return type of the function: 23 is the oid of integer.
+test call-in-create-table-as {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE TABLE t AS SELECT one() AS a;
+    SELECT a FROM t;
+    SELECT atttypid FROM pg_attribute JOIN pg_class ON pg_class.oid = attrelid WHERE relname = 't' AND attname = 'a';
+}
+expect {
+    1
+    23
+}
+
+test call-in-select-into {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT one() AS a INTO t;
+    SELECT a FROM t;
+    SELECT atttypid FROM pg_attribute JOIN pg_class ON pg_class.oid = attrelid WHERE relname = 't' AND attname = 'a';
+}
+expect {
+    1
+    23
+}
+
 test call-in-the-transaction-that-creates-the-function {
     BEGIN;
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
@@ -819,18 +843,6 @@ expect @tursopg error {
     a call of the user-defined function "one" in CREATE MATERIALIZED VIEW is not supported
 }
 
-test call-in-create-table-as {
-    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
-    CREATE TABLE t AS SELECT one() AS a;
-    SELECT a FROM t;
-}
-expect {
-    1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a call of the user-defined function "one" in CREATE TABLE AS is not supported
-}
 
 test call-in-a-column-default {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;

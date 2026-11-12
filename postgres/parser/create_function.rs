@@ -80,14 +80,19 @@ pub struct CalledFunction {
 
 /// The name of the statement of `parsed` when tursopg cannot expand the
 /// calls of user-defined functions in it: any statement but a query, a
-/// data-changing statement, or EXPLAIN of one.
+/// data-changing statement, CREATE TABLE AS, or EXPLAIN of one.
 pub fn statement_without_function_expansion(
     parsed: &pg_query::ParseResult,
 ) -> Option<&'static str> {
     fn expands_calls(statement: &NodeEnum) -> bool {
         match statement {
-            NodeEnum::SelectStmt(select) => select.into_clause.is_none(),
-            NodeEnum::InsertStmt(_) | NodeEnum::UpdateStmt(_) | NodeEnum::DeleteStmt(_) => true,
+            NodeEnum::SelectStmt(_)
+            | NodeEnum::InsertStmt(_)
+            | NodeEnum::UpdateStmt(_)
+            | NodeEnum::DeleteStmt(_) => true,
+            // CREATE TABLE AS stores the rows of the query. A materialized
+            // view stores the query.
+            NodeEnum::CreateTableAsStmt(create) => !is_materialized_view(create),
             NodeEnum::ExplainStmt(explain) => explain
                 .query
                 .as_ref()
@@ -101,15 +106,13 @@ pub fn statement_without_function_expansion(
         return None;
     }
     Some(match statement {
-        NodeEnum::SelectStmt(_) => "SELECT INTO",
-        NodeEnum::CreateTableAsStmt(create)
-            if create.objtype() == pg_query::protobuf::ObjectType::ObjectMatview =>
-        {
-            "CREATE MATERIALIZED VIEW"
-        }
-        NodeEnum::CreateTableAsStmt(_) => "CREATE TABLE AS",
+        NodeEnum::CreateTableAsStmt(_) => "CREATE MATERIALIZED VIEW",
         _ => CommandTag::of(parsed).name(),
     })
+}
+
+fn is_materialized_view(create: &pg_query::protobuf::CreateTableAsStmt) -> bool {
+    create.objtype() == pg_query::protobuf::ObjectType::ObjectMatview
 }
 
 /// The parameter types that DROP FUNCTION names the function with, or None

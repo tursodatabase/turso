@@ -600,9 +600,10 @@ Notes on calls of SQL functions:
   cast to the type of its parameter and the result cast to the return type.
   The names in the body are bound when the statement that calls the function
   is prepared, with the search path of that time, as in PostgreSQL.
-- A call is supported in SELECT, INSERT, UPDATE and DELETE. A call is
-  rejected in a FROM clause and in a statement that stores it: CREATE VIEW,
-  CREATE TABLE AS, a column default, a CHECK constraint and an index.
+- A call is supported in SELECT, INSERT, UPDATE, DELETE, CREATE TABLE AS
+  and SELECT INTO. A call is rejected in a FROM clause and in a statement
+  that stores it: CREATE VIEW, CREATE MATERIALIZED VIEW, a column default,
+  a CHECK constraint and an index.
 - A call of a function that PostgreSQL does not inline is rejected: the body
   is not a plain `SELECT` of one expression (it has FROM, WHERE, GROUP BY,
   ORDER BY, LIMIT, a set operation, a subquery or an aggregate).
