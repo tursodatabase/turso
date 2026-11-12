@@ -226,6 +226,11 @@ and cannot log in. Roles are listed in the `pg_roles` catalog.
 
 The database always has one superuser role named `postgres`.
 
+In PostgreSQL, roles belong to the whole server, and every database on it
+sees the same roles. In Turso, a database is one file, and its roles belong
+to that file alone: a role created in one database does not exist in
+another, and copying the file copies its roles.
+
 `CREATE ROLE` works inside a transaction. If the transaction is rolled back,
 the role is not created.
 
@@ -328,7 +333,7 @@ nothing, as in PostgreSQL, which warns. `ALL TABLES IN SCHEMA` grants
 on the tables, views and materialized views of the schema, not on its
 sequences, and `ALL SEQUENCES IN SCHEMA` only on its sequences. A catalog view such as `pg_catalog.pg_class` can be named, but
 nothing is stored for it, since every role reads it already. `GRANT` on one
-of the engine's own tables, such as `pg_catalog.__turso_internal_roles`,
+of the engine's own tables, such as `pg_catalog.__turso_internal_authid`,
 fails as not supported (SQLSTATE 0A000). `ALTER ... OWNER TO` puts the new owner in the
 new owner's place in the list, and a rename keeps it.
 
