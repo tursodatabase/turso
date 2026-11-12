@@ -557,7 +557,10 @@ Notes on `CREATE FUNCTION`:
   PostgreSQL 18, such as `abs` or `to_hex`. PostgreSQL chooses between the
   two by the types of the arguments, which tursopg does not know. A function
   cannot have the name of a built-in table or table function of tursopg
-  either, such as `pg_class` or `json_tree`. The check uses the functions
+  either, such as `pg_class` or `json_tree`. In schema `auth`, a function
+  cannot have the name `uid`, `email` or `jwt`: tursopg has the built-in
+  functions `auth.uid`, `auth.email` and `auth.jwt`, which PostgreSQL does
+  not have, and a call with the schema finds them. The check uses the functions
   that tursopg has when the function is created: an extension that is
   loaded later can add a built-in function with the name of a stored
   function.

@@ -375,6 +375,21 @@ pub(crate) fn translate_create_function(
             ),
         ));
     }
+    // The frontend has built-in functions with the name of a schema, such
+    // as `auth.uid`. A call with this schema finds the built-in function.
+    let name_in_schema = function_schema_name(connection, &create.name)
+        .map(|schema_name| format!("{schema_name}.{name}"));
+    if let Some(name_in_schema) = name_in_schema.filter(|name_in_schema| {
+        can_be_a_built_in_name && is_built_in_function(connection, name_in_schema)
+    }) {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a function with the name of the built-in function \"{name_in_schema}\" is not \
+                 supported"
+            ),
+        ));
+    }
     // A call in FROM finds a built-in table function, such as json_tree, by
     // its name alone, in every schema.
     if can_be_a_built_in_name && is_built_in_table(schema, connection, name) {
@@ -754,6 +769,20 @@ fn function_namespace(
                 format!("schema \"{schema_name}\" does not exist"),
             )
         })
+}
+
+/// The name of the schema that `name` puts a function in: the schema it
+/// names, or the first schema of the search path, None when no schema of the
+/// search path exists.
+fn function_schema_name(connection: &Connection, name: &ast::QualifiedName) -> Option<String> {
+    match &name.namespace {
+        Some(schema_name) => Some(schema_name.as_str().to_lowercase()),
+        None => connection
+            .search_order()
+            .into_iter()
+            .find(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
+            .map(|qualifier| qualifier.name),
+    }
 }
 
 /// The namespaces of the schemas of the search path that exist, in order.

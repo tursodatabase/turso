@@ -1277,6 +1277,47 @@ expect @tursopg error {
     a function with the name of the built-in function "count" is not supported
 }
 
+# tursopg has the built-in functions auth.uid, auth.email and auth.jwt, which
+# PostgreSQL does not have. A call with the schema finds the built-in
+# function, so tursopg does not create a function that has such a name.
+test function-with-the-name-of-a-built-in-function-of-a-schema {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.email() RETURNS text LANGUAGE sql AS $$SELECT 'mine'$$;
+    SELECT n.nspname, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'email';
+}
+expect {
+    auth|email
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "auth.email" is not supported
+}
+
+test function-with-the-name-of-a-built-in-function-of-the-first-schema-of-the-search-path {
+    CREATE SCHEMA auth;
+    SET search_path = auth, public;
+    CREATE FUNCTION uid() RETURNS text LANGUAGE sql AS $$SELECT 'mine'$$;
+    SELECT n.nspname, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'uid';
+}
+expect {
+    auth|uid
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "auth.uid" is not supported
+}
+
+test function-with-the-name-of-a-built-in-function-of-another-schema {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION email() RETURNS text LANGUAGE sql AS $$SELECT 'mine'$$;
+    CREATE FUNCTION auth.other() RETURNS text LANGUAGE sql AS $$SELECT 'mine'$$;
+    SELECT n.nspname, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname IN ('email', 'other') ORDER BY p.proname;
+}
+expect {
+    public|email
+    auth|other
+}
+
 # PostgreSQL matches the name of a function exactly, and each built-in
 # function that a statement can call has a name in lowercase. Thus a quoted
 # name with an uppercase letter is not the name of a built-in function or of
