@@ -1081,8 +1081,8 @@ impl Database {
 
     #[cfg(feature = "fs")]
     #[cfg(host_shared_wal)]
-    fn reject_live_legacy_wal_for_multiprocess_open(
-        io: &Arc<dyn IO>,
+    fn lock_database_file_for_multiprocess_open(
+        file: &Arc<dyn crate::io::File>,
         path: &str,
         flags: OpenFlags,
         opts: DatabaseOpts,
@@ -1090,19 +1090,14 @@ impl Database {
         if !opts.enable_multiprocess_wal || flags.contains(OpenFlags::ReadOnly) {
             return Ok(());
         }
-
-        // `open_file` takes no database file lock when this is set, so neither
-        // does the probe.
+        // `open_file` takes no database file lock when this is set, so
+        // neither does a multiprocess open.
         if std::env::var(crate::io::common::ENV_DISABLE_FILE_LOCK).is_ok() {
             return Ok(());
         }
-        // Shared, so concurrent multiprocess openers do not reject each other.
-        let probe_flags = (flags | OpenFlags::Create | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
-        let probe = io
-            .open_file(path, probe_flags, true)
-            .and_then(|file| file.lock_file(false).map(|()| file));
-        match probe {
-            Ok(_probe_file) => Ok(()),
+        // Shared, so multiprocess openers do not reject each other.
+        match file.lock_file(false) {
+            Ok(()) => Ok(()),
             Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
                 "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
             ))),
@@ -1112,8 +1107,8 @@ impl Database {
 
     #[cfg(feature = "fs")]
     #[cfg(not(host_shared_wal))]
-    fn reject_live_legacy_wal_for_multiprocess_open(
-        _io: &Arc<dyn IO>,
+    fn lock_database_file_for_multiprocess_open(
+        _file: &Arc<dyn crate::io::File>,
         _path: &str,
         _flags: OpenFlags,
         _opts: DatabaseOpts,
@@ -1268,14 +1263,17 @@ impl Database {
         let effective_flags =
             Self::effective_open_flags_for_path(io, path, options.flags, options.db_opts)?;
 
-        // 2. multiprocess open rejects an already-live legacy DB-file lock
-        Self::reject_live_legacy_wal_for_multiprocess_open(
-            io,
+        let file = io.open_file(path, effective_flags, true)?;
+        // 2. multiprocess open takes a shared lock on the database file and
+        //    keeps it for the life of the file, so it fails while a legacy
+        //    process holds its exclusive lock, and a legacy open fails while
+        //    any multiprocess process is open, even before the `-tshm` exists
+        Self::lock_database_file_for_multiprocess_open(
+            &file,
             path,
             options.flags,
             options.db_opts,
         )?;
-        let file = io.open_file(path, effective_flags, true)?;
 
         // 3. legacy open re-checks after `open_file()` in case a multiprocess
         //    authority appeared between the initial probe and the actual open
