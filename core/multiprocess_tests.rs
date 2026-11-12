@@ -980,6 +980,9 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 
     authority.install_snapshot(stale_snapshot);
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn_a);
     drop(db_a);
     remove_file_from_database_registry(db_path_str);
@@ -1105,6 +1108,9 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     );
     authority.clear_backfill_proof();
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn);
     drop(db);
     remove_file_from_database_registry(db_path_str);
@@ -1241,6 +1247,9 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         "DB-header mismatch coverage requires live WAL frames beyond the backfill point"
     );
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn);
     drop(db);
     flip_db_header_reserved_byte(&db_path);
@@ -1788,6 +1797,9 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
         "test setup should mark the shared frame index incomplete before reopen"
     );
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn_a);
     drop(db_a);
     remove_file_from_database_registry(db_path_str);
