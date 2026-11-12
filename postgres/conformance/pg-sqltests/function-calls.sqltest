@@ -1221,6 +1221,31 @@ expect @tursopg error {
     a call of function "never_reads" with an argument that can fail, for a parameter that the body does not always compute, is not supported
 }
 
+# The copies of an argument
+
+# PostgreSQL computes the constant argument of each call when it plans the
+# statement. tursopg copies the argument, so the expression of the outer call
+# has 3 copies of the expression of the call in it.
+test nested-calls-with-a-constant-argument-that-the-body-uses-three-times {
+    CREATE FUNCTION same(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + $1 - $1$$;
+    SELECT same(same(same(same(same(1)))));
+}
+expect {
+    1
+}
+
+test nested-calls-that-copy-their-arguments-too-many-times {
+    CREATE FUNCTION same(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + $1 - $1$$;
+    SELECT same(same(same(same(same(same(same(same(same(same(same(same(same(same(1))))))))))))));
+}
+expect {
+    1
+}
+@sqlstate 54001
+expect @tursopg error {
+    the expression that takes the place of the call of function "same" is too large
+}
+
 # Functions that PostgreSQL does not inline
 
 test body-reads-a-table {
@@ -1590,6 +1615,24 @@ expect {
 @sqlstate 54001
 expect @tursopg error {
     the expression that takes the place of the call of function "k1" is too large
+}
+
+# Each body gives its parameter to the next function 7 times, so the
+# expression of the call has 2801 function bodies.
+test call-whose-expression-has-too-many-function-bodies-that-use-a-parameter-seven-times {
+    CREATE FUNCTION p5(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE FUNCTION p4(integer) RETURNS integer LANGUAGE sql AS $$SELECT p5($1) + p5($1) + p5($1) + p5($1) - p5($1) - p5($1) - p5($1)$$;
+    CREATE FUNCTION p3(integer) RETURNS integer LANGUAGE sql AS $$SELECT p4($1) + p4($1) + p4($1) + p4($1) - p4($1) - p4($1) - p4($1)$$;
+    CREATE FUNCTION p2(integer) RETURNS integer LANGUAGE sql AS $$SELECT p3($1) + p3($1) + p3($1) + p3($1) - p3($1) - p3($1) - p3($1)$$;
+    CREATE FUNCTION p1(integer) RETURNS integer LANGUAGE sql AS $$SELECT p2($1) + p2($1) + p2($1) + p2($1) - p2($1) - p2($1) - p2($1)$$;
+    SELECT p1(1);
+}
+expect {
+    1
+}
+@sqlstate 54001
+expect @tursopg error {
+    the expression that takes the place of the call of function "p1" is too large
 }
 
 # Functions with the same name

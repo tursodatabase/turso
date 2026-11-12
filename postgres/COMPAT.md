@@ -630,6 +630,11 @@ Notes on calls of SQL functions:
   rule for a constant argument that can fail (see below) also applies to
   each argument of a parameter that the body uses more than once.
   PostgreSQL inlines such a call when the argument is not expensive.
+- tursopg copies an argument to each place where the body uses the
+  parameter, where PostgreSQL copies the result of a constant argument. The
+  copies for the second and later uses of a parameter count in the limit of
+  10000 expressions that a call can add. Nested calls of a function that
+  uses its parameter more than once can pass this limit.
 - tursopg does not have the STABLE class of PostgreSQL. A function is
   volatile when `pg_proc.provolatile` of tursopg shows `v`, which includes
   functions that PostgreSQL calls STABLE or IMMUTABLE, such as `now()` and

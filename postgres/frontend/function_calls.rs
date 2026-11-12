@@ -203,7 +203,7 @@ impl<'a> Expansion<'a> {
             )));
         }
         self.add_expressions(size(&inlined.result))?;
-        let mut expression = with_arguments(inlined, args);
+        let mut expression = self.with_arguments(inlined, args)?;
         self.active.push(function.oid);
         let expanded = self.expand_calls_in(&mut expression, level);
         self.active.pop();
@@ -238,6 +238,38 @@ impl<'a> Expansion<'a> {
             )));
         }
         Ok(Some(expression))
+    }
+
+    /// The expression of `inlined` with `arguments` in the place of the
+    /// parameters. Each parameter of the expression is a parameter of the
+    /// function, as [`parameter_use_counts`] makes sure. A copy of an
+    /// argument for the second and later uses of its parameter counts in
+    /// the expressions that the call adds.
+    fn with_arguments(
+        &mut self,
+        inlined: InlinedFunction,
+        arguments: &[Box<ast::Expr>],
+    ) -> turso_core::Result<ast::Expr> {
+        let mut is_in_expression = vec![false; arguments.len()];
+        let mut expression = inlined.result;
+        walk_expr_mut(
+            &mut expression,
+            &mut |expression: &mut ast::Expr| -> turso_core::Result<WalkControl> {
+                let ast::Expr::Variable(parameter) = expression else {
+                    return Ok(WalkControl::Continue);
+                };
+                let position = parameter.index.get() as usize - 1;
+                let argument = &arguments[position];
+                // The first use has the argument that the statement has.
+                if std::mem::replace(&mut is_in_expression[position], true) {
+                    self.add_expressions(size(argument))?;
+                }
+                *expression = cast_argument(inlined.parameters[position].clone(), argument);
+                // A variable in the argument is a variable of the statement.
+                Ok(WalkControl::SkipChildren)
+            },
+        )?;
+        Ok(expression)
     }
 
     /// Counts `count` expressions that a body adds to the statement. Fails
@@ -527,26 +559,6 @@ fn in_list_left_copies(left: &ast::Expr, items: &[Box<ast::Expr>]) -> usize {
         ast::Expr::Parenthesized(columns) if columns.len() > 1 => items.len(),
         _ => 1,
     }
-}
-
-/// The expression of `inlined` with `arguments` in the place of the
-/// parameters. Each parameter of the expression is a parameter of the
-/// function, as [`parameter_use_counts`] makes sure.
-fn with_arguments(inlined: InlinedFunction, arguments: &[Box<ast::Expr>]) -> ast::Expr {
-    let mut expression = inlined.result;
-    let _ = walk_expr_mut(
-        &mut expression,
-        &mut |expression: &mut ast::Expr| -> turso_core::Result<WalkControl> {
-            let ast::Expr::Variable(parameter) = expression else {
-                return Ok(WalkControl::Continue);
-            };
-            let position = parameter.index.get() as usize - 1;
-            *expression = cast_argument(inlined.parameters[position].clone(), &arguments[position]);
-            // A variable in the argument is a variable of the statement.
-            Ok(WalkControl::SkipChildren)
-        },
-    );
-    expression
 }
 
 /// Whether `argument` is a literal or a variable of the statement, also with

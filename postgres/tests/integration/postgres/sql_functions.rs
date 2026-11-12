@@ -461,6 +461,34 @@ fn a_parameter_in_many_nested_in_lists_of_rows_is_used_more_than_once() {
     );
 }
 
+/// PostgreSQL does not inline a function that would compute a volatile
+/// argument more than once. tursopg says so also when the copies of the
+/// argument would make the expression too large.
+#[test]
+fn a_large_volatile_argument_that_the_body_uses_many_times_is_not_supported() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE SEQUENCE ids").unwrap();
+    let body = vec!["$1"; 30].join(" + ");
+    pg.execute(format!(
+        "CREATE FUNCTION thirty_times(bigint) RETURNS bigint LANGUAGE sql AS $$SELECT {body}$$"
+    ))
+    .unwrap();
+    let ones = vec!["1"; 400].join(", ");
+
+    let error = pg
+        .execute(format!(
+            "SELECT thirty_times(nextval('ids') + greatest({ones}))"
+        ))
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "0A000");
+    assert_eq!(
+        error.to_string(),
+        "a call of function \"thirty_times\" with a volatile argument or a subquery that the \
+         body uses more than once is not supported"
+    );
+}
+
 /// The walk of a body also uses the stack. With deep bodies, a call fails
 /// before the stack of a server thread is full, which is 2 MiB.
 #[test]
