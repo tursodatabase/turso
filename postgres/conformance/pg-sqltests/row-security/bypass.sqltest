@@ -209,3 +209,35 @@ test view-owned-by-role-shows-no-rows {
 expect {
     0
 }
+
+test view-reads-with-the-policies-of-its-owner {
+    CREATE ROLE rp_alice_13;
+    CREATE TABLE rp_docs_13 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_13 VALUES (1, 'rp_alice_13'), (2, 'someone else');
+    ALTER TABLE rp_docs_13 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_13 USING (owner = current_user);
+    CREATE VIEW rp_view_13 AS SELECT id FROM rp_docs_13;
+    GRANT SELECT ON rp_view_13 TO rp_alice_13;
+    SET ROLE rp_alice_13;
+    SELECT id FROM rp_view_13;
+}
+expect {
+    1
+    2
+}
+
+test owner-writes-every-row-of-its-table-with-row-security {
+    CREATE ROLE rw_owner_20;
+    CREATE TABLE rw_docs_20 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_20 VALUES (1, 'someone else');
+    ALTER TABLE rw_docs_20 ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rw_docs_20 OWNER TO rw_owner_20;
+    SET ROLE rw_owner_20;
+    INSERT INTO rw_docs_20 VALUES (2, 'someone else');
+    UPDATE rw_docs_20 SET owner = 'x' WHERE id = 1;
+    DELETE FROM rw_docs_20 WHERE id = 2;
+    SELECT id, owner FROM rw_docs_20;
+}
+expect {
+    1|x
+}
