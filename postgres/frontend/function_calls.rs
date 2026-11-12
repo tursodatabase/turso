@@ -174,8 +174,7 @@ impl<'a> Expansion<'a> {
         )?;
         check_body_has_no_column(&inlined.result)?;
 
-        self.add_expressions(size(&inlined.result))?;
-        let (mut expression, use_counts) = with_arguments(inlined, args)?;
+        let use_counts = parameter_use_counts(&inlined.result, args.len())?;
         // PostgreSQL does not inline a function that would compute a
         // volatile or an expensive argument more than once. tursopg cannot
         // tell such an argument yet.
@@ -199,6 +198,8 @@ impl<'a> Expansion<'a> {
                  parameter that the body does not use,"
             )));
         }
+        self.add_expressions(size(&inlined.result))?;
+        let mut expression = with_arguments(inlined, args);
         self.active.push(function.oid);
         let expanded = self.expand_calls_in(&mut expression, level);
         self.active.pop();
@@ -403,38 +404,102 @@ fn reject_aggregate_syntax(name: &str, call: &ast::Expr) -> turso_core::Result<(
     ))
 }
 
+/// How many times PostgreSQL has each of the `parameter_count` parameters
+/// of a function in its body `body`. Fails with PostgreSQL's error when the
+/// body has a parameter that the function does not have.
+fn parameter_use_counts(
+    body: &ast::Expr,
+    parameter_count: usize,
+) -> turso_core::Result<Vec<usize>> {
+    let mut use_counts = vec![0; parameter_count];
+    add_parameter_uses(body, 1, &mut use_counts)?;
+    Ok(use_counts)
+}
+
+/// Adds to `use_counts` the parameters of `expression`, which PostgreSQL has
+/// `copies` times.
+///
+/// The parser of PostgreSQL writes `a BETWEEN b AND c` as
+/// `a >= b AND a <= c`, and it can write `a IN (b, c)` as `a = b OR a = c`.
+/// Thus PostgreSQL has these left sides more than once, where the expression
+/// of tursopg has them one time.
+fn add_parameter_uses(
+    expression: &ast::Expr,
+    copies: usize,
+    use_counts: &mut [usize],
+) -> turso_core::Result<()> {
+    walk_expr(
+        expression,
+        &mut |part: &ast::Expr| -> turso_core::Result<WalkControl> {
+            match part {
+                ast::Expr::Variable(parameter) => {
+                    // CREATE FUNCTION refuses a body that uses a parameter
+                    // that the function does not have, unless
+                    // check_function_bodies is off.
+                    let position = parameter.index.get() as usize - 1;
+                    let Some(use_count) = use_counts.get_mut(position) else {
+                        return Err(sqlstate_error(
+                            SQLSTATE_UNDEFINED_PARAMETER,
+                            format!("there is no parameter ${}", parameter.index),
+                        ));
+                    };
+                    *use_count = use_count.saturating_add(copies);
+                    Ok(WalkControl::Continue)
+                }
+                ast::Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    add_parameter_uses(lhs, copies.saturating_mul(2), use_counts)?;
+                    add_parameter_uses(start, copies, use_counts)?;
+                    add_parameter_uses(end, copies, use_counts)?;
+                    Ok(WalkControl::SkipChildren)
+                }
+                ast::Expr::InList { lhs, rhs, .. } => {
+                    let left_copies = copies.saturating_mul(in_list_left_copies(lhs, rhs));
+                    add_parameter_uses(lhs, left_copies, use_counts)?;
+                    for item in rhs {
+                        add_parameter_uses(item, copies, use_counts)?;
+                    }
+                    Ok(WalkControl::SkipChildren)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        },
+    )?;
+    Ok(())
+}
+
+/// How many times PostgreSQL has `left`, the left side of `IN`, when no item
+/// of the list `items` has a column, as in the body of a function.
+///
+/// PostgreSQL makes one array of the items and compares `left` with this
+/// array. It makes no array of rows: it compares a row with each item on its
+/// own.
+fn in_list_left_copies(left: &ast::Expr, items: &[Box<ast::Expr>]) -> usize {
+    match left {
+        ast::Expr::Parenthesized(columns) if columns.len() > 1 => items.len(),
+        _ => 1,
+    }
+}
+
 /// The expression of `inlined` with `arguments` in the place of the
-/// parameters, and how many times the expression uses each parameter.
-fn with_arguments(
-    inlined: InlinedFunction,
-    arguments: &[Box<ast::Expr>],
-) -> turso_core::Result<(ast::Expr, Vec<usize>)> {
-    let mut use_counts = vec![0; arguments.len()];
+/// parameters. Each parameter of the expression is a parameter of the
+/// function, as [`parameter_use_counts`] makes sure.
+fn with_arguments(inlined: InlinedFunction, arguments: &[Box<ast::Expr>]) -> ast::Expr {
     let mut expression = inlined.result;
-    walk_expr_mut(
+    let _ = walk_expr_mut(
         &mut expression,
         &mut |expression: &mut ast::Expr| -> turso_core::Result<WalkControl> {
             let ast::Expr::Variable(parameter) = expression else {
                 return Ok(WalkControl::Continue);
             };
             let position = parameter.index.get() as usize - 1;
-            // CREATE FUNCTION refuses a body that uses a parameter that the
-            // function does not have, unless check_function_bodies is off.
-            let (Some(argument), Some(cast)) =
-                (arguments.get(position), inlined.parameters.get(position))
-            else {
-                return Err(sqlstate_error(
-                    SQLSTATE_UNDEFINED_PARAMETER,
-                    format!("there is no parameter ${}", parameter.index),
-                ));
-            };
-            use_counts[position] += 1;
-            *expression = cast_argument(cast.clone(), argument);
+            *expression = cast_argument(inlined.parameters[position].clone(), &arguments[position]);
             // A variable in the argument is a variable of the statement.
             Ok(WalkControl::SkipChildren)
         },
-    )?;
-    Ok((expression, use_counts))
+    );
+    expression
 }
 
 /// Whether `argument` is a literal or a variable of the statement, also with

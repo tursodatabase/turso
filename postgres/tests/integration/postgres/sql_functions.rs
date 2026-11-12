@@ -434,6 +434,33 @@ fn a_call_through_too_many_function_bodies_fails() {
     assert_eq!(error.to_string(), "stack depth limit exceeded");
 }
 
+/// PostgreSQL compares a row on the left side of IN with each item of the
+/// list on its own. With 9 such lists of 256 items, one in the other, it has
+/// the parameter 256^9 times. That is more than a count can be.
+#[test]
+fn a_parameter_in_many_nested_in_lists_of_rows_is_used_more_than_once() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("SET check_function_bodies = off").unwrap();
+    let items = vec!["(true, 1)"; 256].join(", ");
+    let mut body = "$1".to_string();
+    for _ in 0..9 {
+        body = format!("(({body}, 1) IN ({items}))");
+    }
+    pg.execute(format!(
+        "CREATE FUNCTION nested(boolean) RETURNS boolean LANGUAGE sql AS $$SELECT {body}$$"
+    ))
+    .unwrap();
+
+    let error = pg.execute("SELECT nested(true)").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000");
+    assert_eq!(
+        error.to_string(),
+        "a call of function \"nested\", whose body uses a parameter more than once, is not \
+         supported"
+    );
+}
+
 /// The walk of a body also uses the stack. With deep bodies, a call fails
 /// before the stack of a server thread is full, which is 2 MiB.
 #[test]

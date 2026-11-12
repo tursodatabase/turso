@@ -616,7 +616,10 @@ Notes on calls of SQL functions:
   ORDER BY, LIMIT, a set operation, a subquery or an aggregate).
 - A call of a function whose body uses a parameter more than once is
   rejected. PostgreSQL inlines such a function unless the argument is
-  volatile or expensive.
+  volatile or expensive. The uses are counted as PostgreSQL has them: its
+  parser writes `a BETWEEN b AND c` as `a >= b AND a <= c`, which uses `a`
+  twice, and it compares a row on the left side of `IN` with each item of
+  the list on its own, which uses the row one time for each item.
 - For a parameter that the body does not use, the argument of a call must
   be a constant or a parameter of the statement (`$1`), also with a sign or
   a cast. Other arguments are rejected. PostgreSQL reads such an argument
