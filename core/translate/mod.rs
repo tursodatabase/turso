@@ -21,6 +21,7 @@ pub(crate) mod expr;
 pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
+pub(crate) mod function;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
@@ -262,6 +263,8 @@ fn translate_statement(
             | ast::Stmt::DropSchema { .. }
             | ast::Stmt::CreatePolicy(_)
             | ast::Stmt::DropPolicy { .. }
+            | ast::Stmt::CreateFunction(_)
+            | ast::Stmt::DropFunction(_)
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -607,6 +610,12 @@ fn translate_statement(
                 connection,
             )?;
         }
+        ast::Stmt::CreateFunction(create) => {
+            function::translate_create_function(&create, resolver, program, connection, input)?;
+        }
+        ast::Stmt::DropFunction(drop) => {
+            function::translate_drop_function(&drop, resolver, program, connection)?;
+        }
     };
 
     if is_write {
@@ -700,6 +709,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::DropSchema { .. } => "drop_schema",
         ast::Stmt::CreatePolicy(_) => "create_policy",
         ast::Stmt::DropPolicy { .. } => "drop_policy",
+        ast::Stmt::CreateFunction(_) => "create_function",
+        ast::Stmt::DropFunction(_) => "drop_function",
     }
 }
 

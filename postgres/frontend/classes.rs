@@ -354,6 +354,8 @@ impl ClassCatalog {
                     "CREATE ROLE reached the relation catalog".to_string(),
                 ));
             }
+            // The frontend has no objects of its own that are not relations.
+            CatalogChange::DialectObject(_) => {}
         }
         Ok(())
     }
@@ -962,6 +964,8 @@ pub(crate) fn translate_catalog_changes(
                     "CREATE ROLE reached the relation catalog".to_string(),
                 ));
             }
+            // The frontend has no objects of its own that are not relations.
+            CatalogChange::DialectObject(_) => {}
         }
     }
     Ok(())

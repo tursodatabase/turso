@@ -1841,6 +1841,10 @@ pub enum SchemaEntryType {
     Index,
     View,
     Trigger,
+    /// A row of a type that only the dialect knows, such as the PostgreSQL
+    /// frontend's functions. The engine skips such rows when it loads the
+    /// schema.
+    Dialect(&'static str),
 }
 
 impl SchemaEntryType {
@@ -1850,6 +1854,7 @@ impl SchemaEntryType {
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
             SchemaEntryType::Trigger => "trigger",
+            SchemaEntryType::Dialect(row_type) => row_type,
         }
     }
 }
