@@ -44,7 +44,13 @@ pub(crate) struct CatalogContext<'a> {
     /// The first one is where CREATE puts an object whose name has no
     /// qualifier.
     search_order: Vec<NamespaceRef>,
+    /// How many function calls the dialect has expanded for the statement.
+    function_expansions: std::cell::Cell<usize>,
 }
+
+/// The most function calls a dialect may expand in one statement. A function
+/// whose expansion calls the function again would otherwise expand forever.
+const MAX_FUNCTION_EXPANSIONS: usize = 1000;
 
 /// Context for restricting table resolution while compiling the body of a
 /// database object (a trigger or a view). Mirrors SQLite's view/trigger
@@ -98,6 +104,7 @@ impl<'a> CatalogContext<'a> {
                 .into_iter()
                 .map(|namespace| namespace.target)
                 .collect(),
+            function_expansions: std::cell::Cell::new(0),
         }
     }
 
@@ -115,6 +122,7 @@ impl<'a> CatalogContext<'a> {
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             search_order: self.search_order.clone(),
+            function_expansions: self.function_expansions.clone(),
         }
     }
 
@@ -184,6 +192,40 @@ impl<'a> CatalogContext<'a> {
                 .resolve_function(func_name, arg_count)
                 .map(Func::External)),
         }
+    }
+
+    /// The expression that the dialect compiles in place of a call of
+    /// function `name` with `args`, or None when the dialect has none: the
+    /// call is of a built-in function, an extension function, or no function
+    /// at all. A function of the dialect's own comes first, then a function
+    /// that the dialect expands, then an extension function, so callers ask
+    /// for the expansion before they look the name up.
+    pub(crate) fn expand_function_call(
+        &self,
+        name: &str,
+        args: &[Box<ast::Expr>],
+    ) -> Result<Option<ast::Expr>> {
+        // A name with the wrong number of arguments for a built-in function
+        // is still that function's name.
+        if !matches!(self.dialect.resolve_function(name, args.len()), Ok(None)) {
+            return Ok(None);
+        }
+        let scope = crate::dialect::FunctionScope {
+            schema: self.schema,
+            qualifiers: self.qualifiers,
+            search_order: &self.search_order,
+        };
+        let expansion = self.dialect.expand_function_call(&scope, name, args)?;
+        if expansion.is_some() {
+            let expansions = self.function_expansions.get() + 1;
+            if expansions > MAX_FUNCTION_EXPANSIONS {
+                crate::bail_parse_error!(
+                    "function {name} expands into too many function calls; does it call itself?"
+                );
+            }
+            self.function_expansions.set(expansions);
+        }
+        Ok(expansion)
     }
 
     pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {

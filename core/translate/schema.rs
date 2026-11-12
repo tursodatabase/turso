@@ -105,7 +105,13 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
+                if resolver
+                    .expand_function_call(name.as_str(), args)?
+                    .is_some()
+                {
+                    // The dialect compiles an expression of its own in
+                    // place of the call.
+                } else if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
@@ -396,7 +402,9 @@ fn resolve_check_expr_type(
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
         ast::Expr::FunctionCall { name, args, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
+            if let Some(expansion) = resolver.expand_function_call(name.as_str(), args)? {
+                resolve_check_expr_type(&expansion, columns, resolver)
+            } else if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                 resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
             } else {
                 bail_parse_error!(

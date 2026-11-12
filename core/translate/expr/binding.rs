@@ -589,6 +589,15 @@ pub fn bind_and_rewrite_expr<'a>(
                     order_by,
                     ..
                 } => {
+                    if let Some(expansion) =
+                        resolver.catalog.expand_function_call(name.as_str(), args)?
+                    {
+                        // The walk goes on with the children of the
+                        // expression it is at, so the parentheses make it
+                        // bind the whole expansion.
+                        *expr = Expr::Parenthesized(vec![Box::new(expansion)]);
+                        return Ok(WalkControl::Continue);
+                    }
                     validate_function_tail(
                         name.as_str(),
                         args.len(),
