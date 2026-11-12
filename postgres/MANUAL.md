@@ -431,8 +431,10 @@ in PostgreSQL:
 - `CASCADE` and `RESTRICT` revoke the same, because no privilege depends on
   another when `WITH GRANT OPTION` is not supported.
 
-Statements prepared before the `REVOKE`, on any connection, are checked
-against the new list when they run.
+Statements prepared before the `REVOKE` are checked against the new list
+when they run. A transaction that is already open on another connection
+keeps the old list until it ends, as it does after `GRANT`; PostgreSQL
+applies the change to its next statement.
 
 **Notes:**
 
@@ -442,7 +444,11 @@ gets `permission denied for table` (SQLSTATE 42501), unless the list gives
 it a privilege on the table, when the statement succeeds and changes
 nothing, as in PostgreSQL, which warns. `REVOKE GRANT OPTION FOR`, `GRANTED
 BY`, column privileges, `REVOKE` on other kinds of objects, and `REVOKE
-role_name FROM role_name` fail as not supported (SQLSTATE 0A000).
+role_name FROM role_name` fail as not supported (SQLSTATE 0A000). So does
+`REVOKE` on a catalog view such as `pg_catalog.pg_roles` or
+`information_schema.schemata`, and `ON ALL TABLES IN SCHEMA` `pg_catalog` or
+`information_schema`: every role reads the catalog views, and they have no
+list that a `REVOKE` could change.
 
 **Examples:**
 
