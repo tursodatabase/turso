@@ -393,6 +393,14 @@ pub enum Stmt {
         /// schema name
         name: Name,
     },
+    /// `CREATE FUNCTION`: a function that SQL defines. The database's
+    /// dialect stores the function and decides what a call of it does. Only
+    /// a frontend whose dialect has such functions builds this statement;
+    /// the SQLite parser has no such syntax.
+    CreateFunction(CreateFunction),
+    /// `DROP FUNCTION`, built only by a frontend whose dialect has functions
+    /// that SQL defines.
+    DropFunction(DropFunction),
 }
 
 #[repr(transparent)]
@@ -1538,6 +1546,31 @@ pub enum RoleSpec {
     CurrentRole,
     /// `SESSION_USER`: the role the session logged in as.
     SessionUser,
+}
+
+/// `CREATE [OR REPLACE] FUNCTION name(parameter types) RETURNS type AS body`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateFunction {
+    pub or_replace: bool,
+    pub name: QualifiedName,
+    /// The name of each parameter's type, as the dialect writes it.
+    pub parameter_types: Vec<String>,
+    /// The name of the result type, as the dialect writes it.
+    pub return_type: String,
+    /// The function body, in the SQL of the dialect.
+    pub body: String,
+}
+
+/// `DROP FUNCTION [IF EXISTS] name [(parameter types)]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DropFunction {
+    pub if_exists: bool,
+    pub name: QualifiedName,
+    /// The name of each parameter's type, as the dialect writes it. None
+    /// when the statement names the function without its parameters.
+    pub parameter_types: Option<Vec<String>>,
 }
 
 /// `GRANT privileges ON relations TO grantees`. The relations are named one

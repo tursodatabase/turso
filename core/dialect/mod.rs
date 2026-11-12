@@ -26,7 +26,10 @@ use crate::{
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
-use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
+use turso_parser::ast::{
+    Cmd, CreateFunction, CreateTableBody, DropFunction, Grantee, Privilege, QualifiedName,
+    RoleSpec, Stmt,
+};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -76,6 +79,13 @@ pub enum RelationChange {
         name: String,
         enabled: bool,
     },
+    /// A change to an object that is not a relation and that only the
+    /// dialect knows, such as a function that SQL defines. The engine never
+    /// builds one: the dialect's own bytecode carries it from
+    /// [`Dialect::translate_create_function`] or
+    /// [`Dialect::translate_drop_function`] to
+    /// [`Dialect::apply_relation_change`].
+    DialectObject(Arc<dyn Any + Send + Sync>),
 }
 
 /// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
@@ -403,6 +413,40 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Result<()> {
         let _ = (schema, change, values);
         Ok(())
+    }
+
+    /// Emits the writes that store the function of `CREATE FUNCTION`, such
+    /// as rows of `sqlite_schema` (see
+    /// [`crate::open_schema_table_for_dialect_rows`]) and of the dialect's
+    /// own schema state. `input` is the statement as the user wrote it. The
+    /// engine has no functions that SQL defines, so a dialect without them
+    /// refuses the statement.
+    fn translate_create_function(
+        &self,
+        program: &mut ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        function: &CreateFunction,
+        input: &str,
+    ) -> Result<()> {
+        let _ = (program, schema, connection, function, input);
+        Err(LimboError::ParseError(
+            "CREATE FUNCTION is not supported".to_string(),
+        ))
+    }
+
+    /// Emits the writes that remove the function of `DROP FUNCTION`.
+    fn translate_drop_function(
+        &self,
+        program: &mut ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        function: &DropFunction,
+    ) -> Result<()> {
+        let _ = (program, schema, connection, function);
+        Err(LimboError::ParseError(
+            "DROP FUNCTION is not supported".to_string(),
+        ))
     }
 
     /// Whether relations can be created, renamed or dropped in an attached
@@ -867,6 +911,40 @@ mod tests {
 
         conn1.close().unwrap();
         conn2.close().unwrap();
+    }
+
+    #[test]
+    fn a_dialect_without_sql_functions_refuses_their_statements() {
+        use turso_parser::ast::{CreateFunction, DropFunction, Name};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-functions.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let name = QualifiedName::single(Name::exact("one".to_string()));
+
+        let create = Stmt::CreateFunction(CreateFunction {
+            or_replace: false,
+            name: name.clone(),
+            parameter_types: vec![],
+            return_type: "int4".to_string(),
+            body: "SELECT 1".to_string(),
+        });
+        let error = conn.prepare_ast_stmt(create).err().unwrap();
+        assert_eq!(error.to_string(), "CREATE FUNCTION is not supported");
+
+        let drop = Stmt::DropFunction(DropFunction {
+            if_exists: false,
+            name,
+            parameter_types: None,
+        });
+        let error = conn.prepare_ast_stmt(drop).err().unwrap();
+        assert_eq!(error.to_string(), "DROP FUNCTION is not supported");
+        conn.close().unwrap();
     }
 
     #[test]

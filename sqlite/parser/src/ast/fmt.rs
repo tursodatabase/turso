@@ -910,6 +910,8 @@ impl ToTokens for Stmt {
                 name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::CreateFunction(create) => create.to_tokens(s, context),
+            Self::DropFunction(drop) => drop.to_tokens(s, context),
             Self::DropDomain {
                 if_exists,
                 domain_name,
@@ -1758,6 +1760,66 @@ impl ToTokens for RoleSpec {
             Self::SessionUser => s.append(TK_ID, Some("SESSION_USER")),
         }
     }
+}
+
+impl_display_for_to_tokens!(CreateFunction);
+impl ToTokens for CreateFunction {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_CREATE, None)?;
+        if self.or_replace {
+            s.append(TK_OR, None)?;
+            s.append(TK_REPLACE, None)?;
+        }
+        s.append(TK_ID, Some("FUNCTION"))?;
+        self.name.to_tokens(s, context)?;
+        function_parameter_types(&self.parameter_types, s)?;
+        s.append(TK_ID, Some("RETURNS"))?;
+        s.append(TK_ID, Some(&self.return_type))?;
+        s.append(TK_AS, None)?;
+        s.append(
+            TK_STRING,
+            Some(&format!("'{}'", self.body.replace('\'', "''"))),
+        )
+    }
+}
+
+impl_display_for_to_tokens!(DropFunction);
+impl ToTokens for DropFunction {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_DROP, None)?;
+        s.append(TK_ID, Some("FUNCTION"))?;
+        if self.if_exists {
+            s.append(TK_IF, None)?;
+            s.append(TK_EXISTS, None)?;
+        }
+        self.name.to_tokens(s, context)?;
+        match &self.parameter_types {
+            Some(parameter_types) => function_parameter_types(parameter_types, s),
+            None => Ok(()),
+        }
+    }
+}
+
+fn function_parameter_types<S: TokenStream + ?Sized>(
+    parameter_types: &[String],
+    s: &mut S,
+) -> Result<(), S::Error> {
+    s.append(TK_LP, None)?;
+    for (i, parameter_type) in parameter_types.iter().enumerate() {
+        if i != 0 {
+            s.append(TK_COMMA, None)?;
+        }
+        s.append(TK_ID, Some(parameter_type))?;
+    }
+    s.append(TK_RP, None)
 }
 
 impl_display_for_to_tokens!(Grant);

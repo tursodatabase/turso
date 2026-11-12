@@ -189,6 +189,10 @@ pub fn check_statement_privileges(
                 Object::Sequence(seq_name.name.as_str().to_string()),
             )
         }
+        ast::Stmt::CreateFunction(create) => create_in_schema_denial(&create.name),
+        // The dialect decides who may drop a function, from the owner it
+        // stores.
+        ast::Stmt::DropFunction(_) => return Ok(()),
         ast::Stmt::CreateSchema { .. } => database_denial(Action::Create),
         ast::Stmt::DropSchema { name } => {
             PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string()))

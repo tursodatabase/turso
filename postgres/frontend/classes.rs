@@ -289,6 +289,8 @@ impl ClassCatalog {
                         .relrowsecurity = *enabled;
                 }
             }
+            // The frontend has no objects of its own that are not relations.
+            RelationChange::DialectObject(_) => {}
         }
         Ok(())
     }
@@ -805,6 +807,8 @@ pub(crate) fn translate_relation_changes(
                 }
                 emit_class_row_set_row_security(program, &cursors, *namespace, name, change);
             }
+            // The frontend has no objects of its own that are not relations.
+            RelationChange::DialectObject(_) => {}
         }
     }
     Ok(())
