@@ -1055,7 +1055,9 @@ mod tests {
     }
 
     /// A dialect that defines `twice(x)` as `(x) + (x)`, as a frontend does
-    /// for a function that SQL defines.
+    /// for a function that SQL defines. `has_table_added()` is 1 when the
+    /// schema has a table `added`, and 0 when it does not: a function whose
+    /// expression changes with the schema.
     struct ExpandingDialect;
 
     impl Dialect for ExpandingDialect {
@@ -1069,13 +1071,21 @@ mod tests {
 
         fn expand_function_call(
             &self,
-            _schema: &Schema,
+            schema: &Schema,
             _connection: &Connection,
             call: &Expr,
         ) -> Result<Option<Expr>> {
             let Expr::FunctionCall { name, args, .. } = call else {
                 unreachable!("the engine expands function calls only");
             };
+            if name.as_str() == "has_table_added" {
+                let has_table = schema
+                    .get_table(crate::namespace::NamespaceId::ROOT, "added")
+                    .is_some();
+                return Ok(Some(Expr::Literal(turso_parser::ast::Literal::Numeric(
+                    if has_table { "1" } else { "0" }.to_string(),
+                ))));
+            }
             if name.as_str() != "twice" {
                 return Ok(None);
             }
@@ -1124,6 +1134,20 @@ mod tests {
 
         assert_eq!(integers("SELECT twice(21)"), [[42]]);
         assert_eq!(integers("SELECT twice(twice(1)) + abs(twice(-1))"), [[6]]);
+
+        // The expression of a call comes from the schema. A statement with
+        // an expanded call opens a read transaction, which checks the schema
+        // version, also when the statement reads no table.
+        let plan = |sql: &str| {
+            let rows = conn
+                .prepare(format!("EXPLAIN {sql}"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            format!("{rows:?}")
+        };
+        assert!(plan("SELECT twice(21)").contains("Transaction"));
+        assert!(!plan("SELECT abs(21)").contains("Transaction"));
 
         conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER)")
             .unwrap();
@@ -1179,6 +1203,35 @@ mod tests {
             vec![vec![Value::from_i64(10)]]
         );
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn a_prepared_statement_uses_the_expression_of_a_call_as_it_is_at_each_run() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-expand-again.db", Arc::new(ExpandingDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let other_conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+
+        let mut statement = conn.prepare("SELECT has_table_added()").unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(0)]]
+        );
+
+        other_conn
+            .execute("CREATE TABLE added (a INTEGER)")
+            .unwrap();
+        statement.reset().unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)]]
+        );
+        conn.close().unwrap();
+        other_conn.close().unwrap();
     }
 
     #[test]
