@@ -86,12 +86,19 @@ pub fn open_schema_table_for_dialect_rows(
     Ok(cursor_id)
 }
 
-/// Inserts the `sqlite_schema` row `(row_type, name, name, 0, sql)` through
-/// the cursor that [`open_schema_table_for_dialect_rows`] opened.
+/// The `tbl_name` of each `sqlite_schema` row that a dialect stores. The
+/// engine keeps the names with this prefix for itself, so no table has this
+/// name. `DROP TABLE` deletes the rows whose `tbl_name` is the name of its
+/// table. With this `tbl_name`, a dialect row is never one of them, also
+/// when it has the name of a table.
+const DIALECT_ROW_TABLE_NAME: &str = "__turso_internal_dialect_row";
+
+/// Inserts the `sqlite_schema` row
+/// `(row_type, name, DIALECT_ROW_TABLE_NAME, 0, sql)` through the cursor
+/// that [`open_schema_table_for_dialect_rows`] opened.
 ///
-/// The parser of the dialect must accept `sql`. The engine skips the row
-/// when it loads the schema, but a statement that renames a table or a
-/// column parses the SQL of each row.
+/// The engine skips the row when it loads the schema, and the `ALTER TABLE`
+/// statements do not change it.
 pub fn emit_dialect_schema_row_insert(
     program: &mut ProgramBuilder,
     schema_cursor_id: usize,
@@ -104,7 +111,7 @@ pub fn emit_dialect_schema_row_insert(
         schema_cursor_id,
         SchemaEntryType::Dialect(row_type),
         name,
-        name,
+        DIALECT_ROW_TABLE_NAME,
         0,
         Some(sql.to_string()),
     );

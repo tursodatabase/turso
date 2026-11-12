@@ -10575,7 +10575,13 @@ pub fn op_function(
 
             let sql = &state.registers[*start_reg + 4].get_value().clone();
 
+            // A row of a type that only the dialect knows is not a part of a
+            // table. No ALTER TABLE statement changes it, also when it has
+            // the name of the table.
+            let is_engine_row =
+                matches!(entry_type.as_str(), "table" | "index" | "view" | "trigger");
             let (new_name, new_tbl_name, new_sql) = match alter_func {
+                _ if !is_engine_row => (name, tbl_name, None),
                 AlterTableFunc::RenameTable => {
                     let rename_from = {
                         match &state.registers[*start_reg + 5].get_value() {

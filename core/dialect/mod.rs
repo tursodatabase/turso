@@ -1163,6 +1163,115 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// A dialect that stores a function as a row of `sqlite_schema`, with
+    /// the name of the function as the name of the row.
+    struct FunctionStoringDialect;
+
+    impl Dialect for FunctionStoringDialect {
+        fn name(&self) -> &'static str {
+            "function-storing"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            engine::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+            engine::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            engine::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            _input: &str,
+            tbl_name: &QualifiedName,
+            body: &CreateTableBody,
+        ) -> Result<String> {
+            Ok(format!(
+                "CREATE TABLE {} {}",
+                tbl_name.name.as_ident(),
+                body
+            ))
+        }
+
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
+            engine::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn translate_create_function(
+            &self,
+            program: &mut ProgramBuilder,
+            schema: &Schema,
+            _connection: &Arc<Connection>,
+            function: &CreateFunction,
+            input: &str,
+        ) -> Result<()> {
+            let cursor_id = crate::open_schema_table_for_dialect_rows(program, schema)?;
+            crate::emit_dialect_schema_row_insert(
+                program,
+                cursor_id,
+                "test_function",
+                function.name.name.as_str(),
+                input,
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_table_statement_does_not_change_a_dialect_row_with_the_name_of_the_table() {
+        use turso_parser::ast::Name;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-rows.db", Arc::new(FunctionStoringDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let create = Stmt::CreateFunction(CreateFunction {
+            or_replace: false,
+            name: QualifiedName::single(Name::exact("one".to_string())),
+            parameter_types: vec![],
+            return_type: "int4".to_string(),
+            body: "SELECT 1".to_string(),
+        });
+        conn.prepare_translated_stmt(create, "SELECT 1")
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+        let dialect_rows = || -> Vec<String> {
+            conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'test_function'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].to_string())
+                .collect()
+        };
+        assert_eq!(dialect_rows(), ["one"]);
+
+        conn.execute("CREATE TABLE one (a INTEGER)").unwrap();
+        conn.execute("ALTER TABLE one RENAME TO two").unwrap();
+        assert_eq!(dialect_rows(), ["one"]);
+
+        conn.execute("CREATE TABLE one (a INTEGER)").unwrap();
+        conn.execute("DROP TABLE one").unwrap();
+        assert_eq!(dialect_rows(), ["one"]);
+
+        // No table can have the `tbl_name` of the dialect rows.
+        let error = conn
+            .execute("CREATE TABLE __turso_internal_dialect_row (a INTEGER)")
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+        conn.close().unwrap();
+    }
+
     /// A dialect that resolves no functions at all, proving the dialect —
     /// not the engine — owns the function name surface of user SQL.
     struct NoFunctionsDialect;
