@@ -63,7 +63,7 @@ pub(crate) fn expand_function_call(
         active: Vec::new(),
         added_expressions: 0,
     }
-    .expand(call)
+    .expand(call, 1)
 }
 
 /// Fails when one of `called_functions`, the functions that the statement
@@ -120,8 +120,9 @@ struct Expansion<'a> {
 
 impl<'a> Expansion<'a> {
     /// The expression that `call` stands for, or None when `call` does not
-    /// call a function that a user defined.
-    fn expand(&mut self, call: &ast::Expr) -> turso_core::Result<Option<ast::Expr>> {
+    /// call a function that a user defined. `call` is at level `level` of
+    /// the expression that takes the place of the call of the statement.
+    fn expand(&mut self, call: &ast::Expr, level: usize) -> turso_core::Result<Option<ast::Expr>> {
         let ast::Expr::FunctionCall { name, args, .. } = call else {
             return Ok(None);
         };
@@ -199,7 +200,7 @@ impl<'a> Expansion<'a> {
             )));
         }
         self.active.push(function.oid);
-        let expanded = self.expand_calls_in(&mut expression);
+        let expanded = self.expand_calls_in(&mut expression, level);
         self.active.pop();
         expanded?;
         // The engine walks an expression with recursion. Its parser does
@@ -228,23 +229,34 @@ impl<'a> Expansion<'a> {
     }
 
     /// Expands the calls in `expression`, the arguments of a call before the
-    /// call.
-    fn expand_calls_in(&mut self, expression: &mut ast::Expr) -> turso_core::Result<()> {
+    /// call. `expression` is at level `level` of the expression that takes
+    /// the place of the call of the statement.
+    ///
+    /// The expansion of a body in a body uses the stack, and so does the
+    /// walk of an expression. A level above the limit thus fails here, on
+    /// the way down, and not only when the complete expression is known.
+    fn expand_calls_in(
+        &mut self,
+        expression: &mut ast::Expr,
+        level: usize,
+    ) -> turso_core::Result<()> {
+        if level > MAX_EXPR_DEPTH {
+            return Err(stack_depth_limit_exceeded());
+        }
+        let mut is_expression = true;
         walk_expr_mut(
             expression,
-            &mut |expression: &mut ast::Expr| -> turso_core::Result<WalkControl> {
-                let ast::Expr::FunctionCall { args, .. } = expression else {
+            &mut |part: &mut ast::Expr| -> turso_core::Result<WalkControl> {
+                if std::mem::take(&mut is_expression) {
                     return Ok(WalkControl::Continue);
-                };
-                for argument in args.iter_mut() {
-                    self.expand_calls_in(argument)?;
                 }
-                if let Some(expansion) = self.expand(expression)? {
-                    *expression = expansion;
-                }
+                self.expand_calls_in(part, level + 1)?;
                 Ok(WalkControl::SkipChildren)
             },
         )?;
+        if let Some(expansion) = self.expand(expression, level)? {
+            *expression = expansion;
+        }
         Ok(())
     }
 

@@ -433,3 +433,39 @@ fn a_call_through_too_many_function_bodies_fails() {
     assert_eq!(error.sqlstate, "54001");
     assert_eq!(error.to_string(), "stack depth limit exceeded");
 }
+
+/// The walk of a body also uses the stack. With deep bodies, a call fails
+/// before the stack of a server thread is full, which is 2 MiB.
+#[test]
+fn a_call_through_many_deep_function_bodies_fails_on_a_small_stack() {
+    let on_a_server_stack = std::thread::Builder::new().stack_size(2 << 20);
+    on_a_server_stack
+        .spawn(|| {
+            let db = TempDatabase::builder().build();
+            let pg = db.connect_postgres();
+            pg.execute("SET check_function_bodies = off").unwrap();
+            pg.execute("CREATE FUNCTION deep0() RETURNS integer LANGUAGE sql AS $$SELECT 1$$")
+                .unwrap();
+            for function in 1..=85 {
+                // The call of the function below is 30 levels down in the body.
+                let body = format!(
+                    "{}deep{}(){}",
+                    "(1 + ".repeat(30),
+                    function - 1,
+                    ")".repeat(30)
+                );
+                pg.execute(format!(
+                    "CREATE FUNCTION deep{function}() RETURNS integer LANGUAGE sql AS \
+                     $$SELECT {body}$$"
+                ))
+                .unwrap();
+            }
+
+            let error = pg.execute("SELECT deep85()").unwrap_err();
+            assert_eq!(error.sqlstate, "54001");
+            assert_eq!(error.to_string(), "stack depth limit exceeded");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
