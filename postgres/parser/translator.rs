@@ -5498,7 +5498,9 @@ fn function_arguments_subquery(
     (subquery, arg_refs)
 }
 
-fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, ParseError> {
+pub(crate) fn alias_column_names(
+    alias: &pg_query::protobuf::Alias,
+) -> Result<Vec<String>, ParseError> {
     alias
         .colnames
         .iter()
@@ -5804,7 +5806,7 @@ pub fn is_catalog_view_name(name: &str) -> bool {
 /// expression they wrap, and a field selection is named after the field. Only
 /// when the wrapped expression has no name is a cast named after its outermost
 /// target type and a CASE `case`, so `1::int::text` is named `text`.
-fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+pub(crate) fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
     expression_name(node).or_else(|| cast_or_case_name(node))
 }
 
@@ -6077,7 +6079,7 @@ fn column_qualifier<'a>(node: &pg_query::NodeRef<'a>) -> Option<&'a str> {
     }
 }
 
-fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
+pub(crate) fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
     names
         .iter()
         .filter_map(|n| match &n.node {
@@ -6556,7 +6558,7 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
 /// decimal digits. Turso's numeric literal parser reads only decimal and hex
 /// text, and reads hex the SQLite way, so a value above i64 wraps around.
 /// Returns `None` for a decimal literal.
-fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
+pub(crate) fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     let literal = literal.replace('_', "");
     let (sign, unsigned) = match literal.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -6720,7 +6722,9 @@ fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
     Ok(())
 }
 
-fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
+pub(crate) fn extract_key_columns(
+    keys: &[pg_query::protobuf::Node],
+) -> Result<Vec<String>, ParseError> {
     use pg_query::protobuf::node::Node;
 
     let mut cols = Vec::new();

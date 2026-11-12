@@ -7,6 +7,7 @@ use thiserror::Error;
 pub mod coerce;
 pub mod sqlstate;
 pub mod translator;
+pub mod typing;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
