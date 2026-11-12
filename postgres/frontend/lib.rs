@@ -14,7 +14,7 @@ mod unnest;
 
 pub use catalog::PostgresDialect;
 pub use copy::CopyTextEncoder;
-pub use error::{Error, ErrorReport, Result};
+pub use error::{sql_parse_error, Error, ErrorReport, Result};
 pub use session::PgConnection as Connection;
 pub use session::{
     open_database, open_database_with_io, split_statements, PgConnection, PgQueryRunner,

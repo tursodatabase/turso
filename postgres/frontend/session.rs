@@ -378,8 +378,7 @@ fn prepare_statement_inner(
 ) -> Result<crate::Statement> {
     reject_sqlite_catalog_access(sql)?;
 
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let parse_result = turso_pg_parser::parse(sql).map_err(crate::error::sql_parse_error)?;
 
     // In an aborted transaction block PostgreSQL accepts only the statements
     // that end it and rejects everything else with 25P02.

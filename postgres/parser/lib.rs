@@ -27,7 +27,30 @@ pub enum ParseError {
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::parse(sql).map_err(parse_error)
+}
+
+/// The error for SQL that pg_query refuses. pg_query gives only the message
+/// of PostgreSQL's error, not its SQLSTATE, so the errors that PostgreSQL
+/// does not report as syntax errors are recognized by their message.
+fn parse_error(error: pg_query::Error) -> ParseError {
+    match &error {
+        pg_query::Error::Parse(message) if is_reserved_role_name_error(message) => {
+            ParseError::Sqlstate {
+                sqlstate: sqlstate::SQLSTATE_RESERVED_NAME,
+                message: message.clone(),
+            }
+        }
+        _ => ParseError::ParseError(error.to_string()),
+    }
+}
+
+/// Whether the message is PostgreSQL's error for a role name that the
+/// grammar refuses, such as `role name "none" is reserved` or
+/// `CURRENT_USER cannot be used as a role name here`.
+fn is_reserved_role_name_error(message: &str) -> bool {
+    (message.starts_with("role name \"") && message.ends_with("\" is reserved"))
+        || message.ends_with(" cannot be used as a role name here")
 }
 
 /// Whether the first statement in `parsed` sends rows to the client.
