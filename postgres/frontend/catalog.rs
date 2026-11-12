@@ -4264,7 +4264,20 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
     use turso_core::ConnectOpts;
+    use turso_pg_parser::coerce::PgType;
     use turso_sqlite::SqliteDialect;
+
+    #[test]
+    fn cast_rules_and_pg_type_give_each_type_the_same_category() {
+        let different: Vec<_> = PG_BASE_TYPES
+            .iter()
+            .filter_map(|ty| {
+                let letter = PgType::from_name(ty.name).category_letter()?;
+                (letter != ty.typcategory).then_some((ty.name, letter, ty.typcategory))
+            })
+            .collect();
+        assert_eq!(different, Vec::new());
+    }
 
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
