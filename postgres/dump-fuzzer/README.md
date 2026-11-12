@@ -71,10 +71,9 @@ make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
 ## Feature configuration
 
 The hard-coded compatible configuration is in `src/generation/config.rs`. It disables
-`defaults`, `mixed-case-identifiers`, `descending-indexes`, `rls`, `policies`,
-`grants`, and `default-privileges` by default,
-including the dependent operations described below. Tables, data, and indexes
-remain enabled.
+`rls`, `policies`, `grants`, and `default-privileges` by default,
+including the dependent operations described below. Tables, column defaults,
+data, and indexes remain enabled.
 
 Use `fuzz --enable-features` to opt features back in, and `--disable-features`
 for additional exclusions. Both accept comma-separated names and can be
@@ -125,8 +124,7 @@ metadata records how the original SQL was generated; it does not filter replay.
 
 ### Frontend observations
 
-Feature-isolated campaigns against PostgreSQL 18.4 and the current `tursopg`,
-with seed 42 and up to 30 cases each, found:
+Feature-isolated campaigns against PostgreSQL 18 and `tursopg` found:
 
 | Feature | Observed result |
 | --- | --- |
@@ -136,29 +134,17 @@ with seed 42 and up to 30 cases each, found:
 | Policies | Turso rejects CREATE POLICY |
 | Grants | Turso rejects GRANT |
 | Default privileges | Turso rejects ALTER DEFAULT PRIVILEGES |
-| Column defaults | Both engines accept the SQL; negative defaults produce different dump ASTs |
+| Column defaults | 200 cases passed |
+| Mixed-case identifiers | 200 cases passed |
+| DESC index keys | 200 cases passed |
 
-The expanded schema campaign on October 28 also found that a quoted table name
-`"Table 1"` is dumped as `"table 1"` by Turso. Replaying the same SQL with the
-lowercase name passed. The compatible profile excludes `mixed-case-identifiers`
-by default; enable it explicitly to retest this discrepancy. This changes only
-generation, not comparison or replay.
-
-The same expanded campaign found DESC index keys dumped without DESC by Turso.
-Replaying that case with ASC keys passed, including composite and unique indexes.
-The compatible profile excludes `descending-indexes` by default; use
-`--enable-features descending-indexes` to reproduce the discrepancy.
-Composite and unique indexes remain enabled. With these compatible defaults,
-100 cases at seed 42 generated 251 tables spanning all widths from 1–8 columns,
-326 indexes (199 composite and 45 unique), and 1,300 VALUES rows. Both engines
-loaded and dumped all 1,300 rows successfully.
+Column defaults, mixed-case identifiers, and DESC index keys failed in earlier
+campaigns and now pass, so the compatible profile enables them.
 
 Child operations were not reached independently after their parent failed.
 These observations are campaign results, not an exhaustive compatibility claim.
-Defaults are a separate comparison limitation, not unsupported SQL: PostgreSQL
-emits a string cast for a negative integer default where Turso emits a literal.
-The hard-coded compatible defaults exclude that known structural difference and
-the unsupported access-control generators. Run the remaining surface with:
+The hard-coded compatible defaults exclude the unsupported access-control
+generators. Run the remaining surface with:
 
 ```sh
 make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 1000 --seed 42 --fail-fast'
@@ -384,10 +370,10 @@ foreign keys, custom schemas, transactional migrations, and concurrent writers
 are not yet generated. PUBLIC policies exercise catalog serialization but do
 not validate role-specific authorization or policy enforcement.
 
-AST differences may still be semantically equivalent. For example, the first
-table-profile campaign found PostgreSQL emitting `DEFAULT '-1'::integer` where
-Turso emits `DEFAULT -1`. Both remain distinct ASTs for inspection; the fuzzer
-does not erase casts to make the campaign pass.
+AST differences may still be semantically equivalent. For example, an earlier
+campaign found PostgreSQL emitting `DEFAULT '-1'::integer` where Turso emitted
+`DEFAULT -1`. The fuzzer reports such differences rather than erasing casts to
+make the campaign pass.
 
 ## Failures and replay
 
