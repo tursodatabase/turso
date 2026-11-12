@@ -1643,8 +1643,18 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
 
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
+        Self::new_in_memory_with_opts(DatabaseOpts::new())
+    }
+
+    /// Opens an in-memory database with the experimental passive checkpoint enabled.
+    pub fn new_passive() -> Self {
+        Self::new_in_memory_with_opts(
+            DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        )
+    }
+
+    fn new_in_memory_with_opts(opts: DatabaseOpts) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let opts = DatabaseOpts::new();
         let db = Database::open_file_with_flags(
             io,
             ":memory:",
@@ -5495,9 +5505,10 @@ fn test_checkpoint_empties_mv_store_after_interrupted_checkpoint() {
 }
 
 /// A blocking checkpoint clears the whole MV store in Finalize, so it must not do the
-/// stamp and GC work on single rows first.
+/// stamp and GC work on single rows first. The store records no dirty keys, so the
+/// checkpoint has none to remove.
 #[test]
-fn test_blocking_checkpoint_skips_row_gc_states() {
+fn test_blocking_checkpoint_skips_row_gc_and_dirty_key_states() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -5524,9 +5535,11 @@ fn test_blocking_checkpoint_skips_row_gc_states() {
         assert!(
             !matches!(
                 checkpoint.state_for_test(),
-                CheckpointState::GcTableRows { .. } | CheckpointState::GcIndexRows { .. }
+                CheckpointState::GcTableRows { .. }
+                    | CheckpointState::GcIndexRows { .. }
+                    | CheckpointState::PruneDirtyKeys
             ),
-            "blocking checkpoint entered a row GC state"
+            "blocking checkpoint entered a row GC state or the dirty key state"
         );
         match checkpoint.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
@@ -5535,6 +5548,36 @@ fn test_blocking_checkpoint_skips_row_gc_states() {
         }
     }
     assert!(mvcc_store.rows.is_empty());
+}
+
+/// A blocking checkpoint clears the whole MV store, so each key in the store changed since
+/// the last checkpoint. The store does not record dirty keys, and the checkpoint must write
+/// every row without them.
+#[test]
+fn test_blocking_store_records_no_dirty_keys() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+    let mvcc_store = db.get_mvcc_store();
+    assert!(mvcc_store.checkpoint_dirty_table_keys.is_empty());
+    assert!(mvcc_store.checkpoint_dirty_index_keys.is_empty());
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // The MV store is empty, so these rows come from the B-tree.
+    assert!(mvcc_store.rows.is_empty());
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 10);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 20");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
 /// A pager reader at an older WAL position than the checkpoint cannot find the checkpointed
