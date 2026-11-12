@@ -57,3 +57,577 @@ test role-without-privileges-cannot-truncate-rows {
 expect error {
     permission denied for table rw_truncate
 }
+
+# What GRANT allows: reading the table.
+
+test role-without-select-cannot-read-the-table {
+    CREATE ROLE gs_denied;
+    CREATE TABLE gs_closed (id INT);
+    SET ROLE gs_denied;
+    SELECT id FROM gs_closed;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed
+}
+
+test role-without-select-cannot-read-the-table-in-a-join {
+    CREATE ROLE gs_denied_join;
+    CREATE TABLE gs_open_j (id INT);
+    CREATE TABLE gs_closed_j (id INT);
+    GRANT SELECT ON gs_open_j TO gs_denied_join;
+    SET ROLE gs_denied_join;
+    SELECT o.id FROM gs_open_j o JOIN gs_closed_j c ON c.id = o.id;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_j
+}
+
+test role-without-select-cannot-read-the-table-in-a-subquery {
+    CREATE ROLE gs_denied_sub;
+    CREATE TABLE gs_closed_sub (id INT);
+    SET ROLE gs_denied_sub;
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM gs_closed_sub);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_sub
+}
+
+test role-without-select-cannot-read-the-table-in-a-cte {
+    CREATE ROLE gs_denied_cte;
+    CREATE TABLE gs_closed_cte (id INT);
+    SET ROLE gs_denied_cte;
+    WITH c AS (SELECT id FROM gs_closed_cte) SELECT id FROM c;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_cte
+}
+
+test role-without-select-cannot-read-the-view {
+    CREATE ROLE gs_denied_view;
+    CREATE TABLE gs_view_closed_base (id INT);
+    CREATE VIEW gs_closed_view AS SELECT id FROM gs_view_closed_base;
+    SET ROLE gs_denied_view;
+    SELECT id FROM gs_closed_view;
+}
+@sqlstate 42501
+expect error {
+    permission denied for view gs_closed_view
+}
+
+test select-on-the-view-is-enough-when-its-owner-reads-the-table {
+    CREATE ROLE gs_view_only;
+    CREATE TABLE gs_view_only_base (id INT);
+    INSERT INTO gs_view_only_base VALUES (7);
+    CREATE VIEW gs_view_only_view AS SELECT id FROM gs_view_only_base;
+    GRANT SELECT ON gs_view_only_view TO gs_view_only;
+    SET ROLE gs_view_only;
+    SELECT id FROM gs_view_only_view;
+}
+expect {
+    7
+}
+
+test select-on-the-view-is-not-enough-when-its-owner-cannot-read-the-table {
+    CREATE ROLE gs_view_owner;
+    CREATE ROLE gs_view_reader2;
+    CREATE TABLE gs_view_private_base (id INT);
+    CREATE VIEW gs_view_of_private AS SELECT id FROM gs_view_private_base;
+    ALTER VIEW gs_view_of_private OWNER TO gs_view_owner;
+    GRANT SELECT ON gs_view_of_private TO gs_view_reader2;
+    SET ROLE gs_view_reader2;
+    SELECT id FROM gs_view_of_private;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_view_private_base
+}
+
+test the-owner-reads-its-table-without-a-grant {
+    CREATE ROLE gs_owner_reads;
+    CREATE TABLE gs_owned_by_reader (id INT);
+    INSERT INTO gs_owned_by_reader VALUES (3);
+    ALTER TABLE gs_owned_by_reader OWNER TO gs_owner_reads;
+    SET ROLE gs_owner_reads;
+    SELECT id FROM gs_owned_by_reader;
+}
+expect {
+    3
+}
+
+test select-granted-to-public-lets-a-role-made-later-read {
+    CREATE TABLE gs_for_all (id INT);
+    INSERT INTO gs_for_all VALUES (5);
+    GRANT SELECT ON gs_for_all TO PUBLIC;
+    CREATE ROLE gs_latecomer;
+    SET ROLE gs_latecomer;
+    SELECT id FROM gs_for_all;
+}
+expect {
+    5
+}
+
+test select-granted-to-another-role-does-not-let-this-one-read {
+    CREATE ROLE gs_granted_other;
+    CREATE ROLE gs_not_granted;
+    CREATE TABLE gs_for_other (id INT);
+    GRANT SELECT ON gs_for_other TO gs_granted_other;
+    SET ROLE gs_not_granted;
+    SELECT id FROM gs_for_other;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_for_other
+}
+
+test reset-role-reads-again {
+    CREATE ROLE gs_back_to_super;
+    CREATE TABLE gs_after_reset (id INT);
+    INSERT INTO gs_after_reset VALUES (9);
+    SET ROLE gs_back_to_super;
+    RESET ROLE;
+    SELECT id FROM gs_after_reset;
+}
+expect {
+    9
+}
+
+test role-without-select-cannot-count-the-table {
+    CREATE ROLE gs_denied_count;
+    CREATE TABLE gs_closed_count (id INT);
+    SET ROLE gs_denied_count;
+    SELECT count(*) FROM gs_closed_count;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gs_closed_count
+}
+
+# What the write privileges let a role do. As in PostgreSQL, a write that
+# reads the table's columns, in WHERE, SET, RETURNING or ON CONFLICT, also
+# needs SELECT.
+
+test role-without-insert-cannot-insert {
+    CREATE ROLE gw_no_insert;
+    CREATE TABLE gw_no_insert_docs (id INT);
+    GRANT SELECT ON gw_no_insert_docs TO gw_no_insert;
+    SET ROLE gw_no_insert;
+    INSERT INTO gw_no_insert_docs VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_no_insert_docs
+}
+
+test grant-insert-lets-a-role-insert {
+    CREATE ROLE gw_inserter;
+    CREATE TABLE gw_inserted (id INT, body TEXT);
+    GRANT INSERT ON gw_inserted TO gw_inserter;
+    SET ROLE gw_inserter;
+    INSERT INTO gw_inserted VALUES (1, 'a'), (2, 'b');
+    INSERT INTO gw_inserted (id) SELECT 3;
+    RESET ROLE;
+    SELECT id, coalesce(body, 'null') FROM gw_inserted ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|null
+}
+
+test grant-insert-to-public-lets-every-role-insert {
+    CREATE ROLE gw_public_inserter;
+    CREATE TABLE gw_public_inserted (id INT);
+    GRANT INSERT ON gw_public_inserted TO PUBLIC;
+    SET ROLE gw_public_inserter;
+    INSERT INTO gw_public_inserted VALUES (1);
+    RESET ROLE;
+    SELECT id FROM gw_public_inserted;
+}
+expect {
+    1
+}
+
+test insert-returning-a-column-needs-select {
+    CREATE ROLE gw_returning;
+    CREATE TABLE gw_returning_docs (id INT);
+    GRANT INSERT ON gw_returning_docs TO gw_returning;
+    SET ROLE gw_returning;
+    INSERT INTO gw_returning_docs VALUES (1) RETURNING id;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_returning_docs
+}
+
+test insert-returning-a-column-with-select {
+    CREATE ROLE gw_returning_reader;
+    CREATE TABLE gw_returning_read (id INT);
+    GRANT INSERT, SELECT ON gw_returning_read TO gw_returning_reader;
+    SET ROLE gw_returning_reader;
+    INSERT INTO gw_returning_read VALUES (7) RETURNING id;
+}
+expect {
+    7
+}
+
+test insert-on-conflict-with-a-target-needs-select {
+    CREATE ROLE gw_conflict_target;
+    CREATE TABLE gw_conflict_target_docs (id INT PRIMARY KEY);
+    GRANT INSERT ON gw_conflict_target_docs TO gw_conflict_target;
+    SET ROLE gw_conflict_target;
+    INSERT INTO gw_conflict_target_docs VALUES (1) ON CONFLICT (id) DO NOTHING;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_conflict_target_docs
+}
+
+test insert-on-conflict-do-nothing-without-a-target-needs-only-insert {
+    CREATE ROLE gw_conflict_any;
+    CREATE TABLE gw_conflict_any_docs (id INT PRIMARY KEY);
+    INSERT INTO gw_conflict_any_docs VALUES (1);
+    GRANT INSERT ON gw_conflict_any_docs TO gw_conflict_any;
+    SET ROLE gw_conflict_any;
+    INSERT INTO gw_conflict_any_docs VALUES (1), (2) ON CONFLICT DO NOTHING;
+    RESET ROLE;
+    SELECT id FROM gw_conflict_any_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test insert-on-conflict-do-update-needs-update {
+    CREATE ROLE gw_upsert_no_update;
+    CREATE TABLE gw_upsert_no_update_docs (id INT PRIMARY KEY, n INT);
+    GRANT INSERT, SELECT ON gw_upsert_no_update_docs TO gw_upsert_no_update;
+    SET ROLE gw_upsert_no_update;
+    INSERT INTO gw_upsert_no_update_docs VALUES (1, 1)
+        ON CONFLICT (id) DO UPDATE SET n = excluded.n;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_upsert_no_update_docs
+}
+
+@skip-if postgres "PostgreSQL rejects DO UPDATE without a conflict target as a syntax error"
+test insert-on-conflict-do-update-without-a-target-needs-select {
+    CREATE ROLE gw_upsert_no_target;
+    CREATE TABLE gw_upsert_no_target_docs (id INT PRIMARY KEY, secret INT, n INT);
+    INSERT INTO gw_upsert_no_target_docs VALUES (1, 42, 0);
+    GRANT INSERT, UPDATE ON gw_upsert_no_target_docs TO gw_upsert_no_target;
+    SET ROLE gw_upsert_no_target;
+    INSERT INTO gw_upsert_no_target_docs VALUES (1, 0, 0)
+        ON CONFLICT DO UPDATE SET n = 1 WHERE gw_upsert_no_target_docs.secret = 42;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_upsert_no_target_docs
+}
+
+test insert-on-conflict-do-update-with-insert-select-and-update {
+    CREATE ROLE gw_upserter;
+    CREATE TABLE gw_upserted (id INT PRIMARY KEY, n INT);
+    INSERT INTO gw_upserted VALUES (1, 1);
+    GRANT INSERT, SELECT, UPDATE ON gw_upserted TO gw_upserter;
+    SET ROLE gw_upserter;
+    INSERT INTO gw_upserted VALUES (1, 10), (2, 20)
+        ON CONFLICT (id) DO UPDATE SET n = gw_upserted.n + excluded.n;
+    RESET ROLE;
+    SELECT id, n FROM gw_upserted ORDER BY id;
+}
+expect {
+    1|11
+    2|20
+}
+
+test role-without-update-cannot-update {
+    CREATE ROLE gw_no_update;
+    CREATE TABLE gw_no_update_docs (id INT);
+    GRANT SELECT, INSERT ON gw_no_update_docs TO gw_no_update;
+    SET ROLE gw_no_update;
+    UPDATE gw_no_update_docs SET id = 2;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_no_update_docs
+}
+
+test grant-update-lets-a-role-update-every-row {
+    CREATE ROLE gw_updater;
+    CREATE TABLE gw_updated (id INT, body TEXT);
+    INSERT INTO gw_updated VALUES (1, 'a'), (2, 'b');
+    GRANT UPDATE ON gw_updated TO gw_updater;
+    SET ROLE gw_updater;
+    UPDATE gw_updated SET body = 'x';
+    RESET ROLE;
+    SELECT id, body FROM gw_updated ORDER BY id;
+}
+expect {
+    1|x
+    2|x
+}
+
+test update-with-where-needs-select {
+    CREATE ROLE gw_update_where;
+    CREATE TABLE gw_update_where_docs (id INT, body TEXT);
+    GRANT UPDATE ON gw_update_where_docs TO gw_update_where;
+    SET ROLE gw_update_where;
+    UPDATE gw_update_where_docs SET body = 'x' WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_where_docs
+}
+
+test update-that-reads-a-column-in-set-needs-select {
+    CREATE ROLE gw_update_set;
+    CREATE TABLE gw_update_set_docs (id INT, n INT);
+    GRANT UPDATE ON gw_update_set_docs TO gw_update_set;
+    SET ROLE gw_update_set;
+    UPDATE gw_update_set_docs SET n = n + 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_set_docs
+}
+
+test update-with-where-and-returning-with-select {
+    CREATE ROLE gw_update_reader;
+    CREATE TABLE gw_update_read (id INT, n INT);
+    INSERT INTO gw_update_read VALUES (1, 1), (2, 2);
+    GRANT SELECT, UPDATE ON gw_update_read TO gw_update_reader;
+    SET ROLE gw_update_reader;
+    UPDATE gw_update_read SET n = n + 10 WHERE id = 2 RETURNING id, n;
+}
+expect {
+    2|12
+}
+
+test role-without-delete-cannot-delete {
+    CREATE ROLE gw_no_delete;
+    CREATE TABLE gw_no_delete_docs (id INT);
+    GRANT SELECT, INSERT, UPDATE ON gw_no_delete_docs TO gw_no_delete;
+    SET ROLE gw_no_delete;
+    DELETE FROM gw_no_delete_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_no_delete_docs
+}
+
+test grant-delete-lets-a-role-delete-every-row {
+    CREATE ROLE gw_deleter;
+    CREATE TABLE gw_deleted (id INT);
+    INSERT INTO gw_deleted VALUES (1), (2);
+    GRANT DELETE ON gw_deleted TO gw_deleter;
+    SET ROLE gw_deleter;
+    DELETE FROM gw_deleted;
+    RESET ROLE;
+    SELECT count(*) FROM gw_deleted;
+}
+expect {
+    0
+}
+
+test truncate-needs-truncate-not-delete {
+    CREATE ROLE gw_truncate_delete;
+    CREATE TABLE gw_truncate_delete_docs (id INT);
+    GRANT DELETE ON gw_truncate_delete_docs TO gw_truncate_delete;
+    SET ROLE gw_truncate_delete;
+    TRUNCATE gw_truncate_delete_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_truncate_delete_docs
+}
+
+test grant-truncate-lets-a-role-truncate {
+    CREATE ROLE gw_truncater;
+    CREATE TABLE gw_truncated (id INT);
+    INSERT INTO gw_truncated VALUES (1), (2);
+    GRANT TRUNCATE ON gw_truncated TO gw_truncater;
+    SET ROLE gw_truncater;
+    TRUNCATE gw_truncated;
+    RESET ROLE;
+    SELECT count(*) FROM gw_truncated;
+}
+expect {
+    0
+}
+
+# Row-level security does not apply to TRUNCATE, as in PostgreSQL.
+test truncate-empties-a-table-with-row-level-security {
+    CREATE ROLE gw_truncate_rls;
+    CREATE TABLE gw_truncated_rls (id INT);
+    INSERT INTO gw_truncated_rls VALUES (1), (2);
+    ALTER TABLE gw_truncated_rls ENABLE ROW LEVEL SECURITY;
+    GRANT TRUNCATE ON gw_truncated_rls TO gw_truncate_rls;
+    SET ROLE gw_truncate_rls;
+    TRUNCATE gw_truncated_rls;
+    RESET ROLE;
+    SELECT count(*) FROM gw_truncated_rls;
+}
+expect {
+    0
+}
+
+test grant-truncate-does-not-let-a-role-delete {
+    CREATE ROLE gw_truncate_only;
+    CREATE TABLE gw_truncate_only_docs (id INT);
+    GRANT TRUNCATE ON gw_truncate_only_docs TO gw_truncate_only;
+    SET ROLE gw_truncate_only;
+    DELETE FROM gw_truncate_only_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_truncate_only_docs
+}
+
+test delete-with-where-needs-select {
+    CREATE ROLE gw_delete_where;
+    CREATE TABLE gw_delete_where_docs (id INT);
+    GRANT DELETE ON gw_delete_where_docs TO gw_delete_where;
+    SET ROLE gw_delete_where;
+    DELETE FROM gw_delete_where_docs WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_delete_where_docs
+}
+
+test delete-with-where-with-select {
+    CREATE ROLE gw_delete_reader;
+    CREATE TABLE gw_delete_read (id INT);
+    INSERT INTO gw_delete_read VALUES (1), (2);
+    GRANT SELECT, DELETE ON gw_delete_read TO gw_delete_reader;
+    SET ROLE gw_delete_reader;
+    DELETE FROM gw_delete_read WHERE id = 1 RETURNING id;
+    RESET ROLE;
+    SELECT id FROM gw_delete_read;
+}
+expect {
+    1
+    2
+}
+
+# A subquery needs SELECT on the table that is written only when it reads a
+# column of that table.
+test update-with-subqueries-that-do-not-read-the-table-needs-no-select {
+    CREATE ROLE gw_update_subquery;
+    CREATE TABLE gw_update_subquery_docs (id INT, n INT);
+    INSERT INTO gw_update_subquery_docs VALUES (1, 1), (2, 2);
+    GRANT UPDATE ON gw_update_subquery_docs TO gw_update_subquery;
+    SET ROLE gw_update_subquery;
+    UPDATE gw_update_subquery_docs SET n = (SELECT 10) WHERE EXISTS (SELECT 1) RETURNING (SELECT 'ok');
+    RESET ROLE;
+    SELECT id, n FROM gw_update_subquery_docs ORDER BY id;
+}
+expect {
+    ok
+    ok
+    1|10
+    2|10
+}
+
+test update-with-a-subquery-that-reads-the-table-needs-select {
+    CREATE ROLE gw_update_correlated;
+    CREATE TABLE gw_update_correlated_docs (id INT, n INT);
+    CREATE TABLE gw_update_correlated_src (id INT, n INT);
+    GRANT UPDATE ON gw_update_correlated_docs TO gw_update_correlated;
+    GRANT SELECT ON gw_update_correlated_src TO gw_update_correlated;
+    SET ROLE gw_update_correlated;
+    UPDATE gw_update_correlated_docs SET n = (SELECT s.n FROM gw_update_correlated_src s WHERE s.id = gw_update_correlated_docs.id);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_correlated_docs
+}
+
+test update-with-a-nested-subquery-that-reads-the-table-needs-select {
+    CREATE ROLE gw_update_nested;
+    CREATE TABLE gw_update_nested_docs (id INT, n INT);
+    GRANT UPDATE ON gw_update_nested_docs TO gw_update_nested;
+    SET ROLE gw_update_nested;
+    UPDATE gw_update_nested_docs SET n = (SELECT (SELECT gw_update_nested_docs.id));
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_update_nested_docs
+}
+
+test delete-with-subqueries-that-do-not-read-the-table-needs-no-select {
+    CREATE ROLE gw_delete_subquery;
+    CREATE TABLE gw_delete_subquery_docs (id INT);
+    CREATE TABLE gw_delete_subquery_src (id INT);
+    INSERT INTO gw_delete_subquery_docs VALUES (1), (2);
+    INSERT INTO gw_delete_subquery_src VALUES (1);
+    GRANT DELETE ON gw_delete_subquery_docs TO gw_delete_subquery;
+    GRANT SELECT ON gw_delete_subquery_src TO gw_delete_subquery;
+    SET ROLE gw_delete_subquery;
+    DELETE FROM gw_delete_subquery_docs WHERE EXISTS (SELECT 1 FROM gw_delete_subquery_src) RETURNING (SELECT 'ok');
+    RESET ROLE;
+    SELECT count(*) FROM gw_delete_subquery_docs;
+}
+expect {
+    ok
+    ok
+    0
+}
+
+test delete-with-a-subquery-that-reads-the-table-needs-select {
+    CREATE ROLE gw_delete_correlated;
+    CREATE TABLE gw_delete_correlated_docs (id INT);
+    CREATE TABLE gw_delete_correlated_src (id INT);
+    GRANT DELETE ON gw_delete_correlated_docs TO gw_delete_correlated;
+    GRANT SELECT ON gw_delete_correlated_src TO gw_delete_correlated;
+    SET ROLE gw_delete_correlated;
+    DELETE FROM gw_delete_correlated_docs WHERE EXISTS (SELECT 1 FROM gw_delete_correlated_src s WHERE s.id = gw_delete_correlated_docs.id);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table gw_delete_correlated_docs
+}
+
+test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-select {
+    CREATE ROLE gw_insert_subquery;
+    CREATE TABLE gw_insert_subquery_docs (id INT);
+    GRANT INSERT ON gw_insert_subquery_docs TO gw_insert_subquery;
+    SET ROLE gw_insert_subquery;
+    INSERT INTO gw_insert_subquery_docs VALUES (1) RETURNING (SELECT 'ok');
+}
+expect {
+    ok
+}
+
+test grant-all-lets-a-role-write {
+    CREATE ROLE gw_all;
+    CREATE TABLE gw_all_docs (id INT, n INT);
+    GRANT ALL ON gw_all_docs TO gw_all;
+    SET ROLE gw_all;
+    INSERT INTO gw_all_docs VALUES (1, 1), (2, 2);
+    UPDATE gw_all_docs SET n = n * 10 WHERE id = 2;
+    DELETE FROM gw_all_docs WHERE id = 1;
+    SELECT id, n FROM gw_all_docs;
+}
+expect {
+    2|20
+}
+
+test owner-writes-its-own-table {
+    CREATE ROLE gw_owner;
+    CREATE TABLE gw_owned (id INT, n INT);
+    ALTER TABLE gw_owned OWNER TO gw_owner;
+    SET ROLE gw_owner;
+    INSERT INTO gw_owned VALUES (1, 1), (2, 2);
+    UPDATE gw_owned SET n = n + 1 WHERE id = 1;
+    DELETE FROM gw_owned WHERE id = 2;
+    SELECT id, n FROM gw_owned;
+}
+expect {
+    1|2
+}
