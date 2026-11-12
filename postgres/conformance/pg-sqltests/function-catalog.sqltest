@@ -335,6 +335,31 @@ expect {
     public
 }
 
+# anyelement is a type of PostgreSQL, so the error is for the function.
+test drop-function-with-a-polymorphic-parameter-type {
+    DROP FUNCTION one(anyelement);
+}
+@sqlstate 42883
+expect error {
+    function one\(anyelement\) does not exist
+}
+
+test drop-built-in-function {
+    DROP FUNCTION upper(text);
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop function upper\(text\) because it is required by the database system
+}
+
+test drop-built-in-function-if-exists {
+    DROP FUNCTION IF EXISTS lower(text);
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop function lower\(text\) because it is required by the database system
+}
+
 test drop-function-with-a-parameter-type-that-does-not-exist {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
     DROP FUNCTION one(nosuch);

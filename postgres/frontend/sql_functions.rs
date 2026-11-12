@@ -28,11 +28,12 @@ use turso_core::{
 };
 use turso_parser::ast;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_AMBIGUOUS_FUNCTION, SQLSTATE_DUPLICATE_FUNCTION, SQLSTATE_FEATURE_NOT_SUPPORTED,
-    SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_FUNCTION_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_AMBIGUOUS_FUNCTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+    SQLSTATE_DUPLICATE_FUNCTION, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
+    SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
 };
-use turso_pg_parser::{display_signature_type_name, is_base_type_name};
+use turso_pg_parser::{display_signature_type_name, is_base_type_name, is_pseudo_type_name};
 
 use crate::catalog::pg_base_type_oid;
 use crate::classes::{
@@ -414,6 +415,14 @@ pub(crate) fn translate_drop_function(
 ) -> turso_core::Result<()> {
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
     let Some(function) = find_function_to_drop(connection, functions, drop)? else {
+        if let Some(built_in) = built_in_function_signature(drop) {
+            return Err(sqlstate_error(
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                format!(
+                    "cannot drop function {built_in} because it is required by the database system"
+                ),
+            ));
+        }
         if drop.if_exists {
             return Ok(());
         }
@@ -449,6 +458,24 @@ pub(crate) fn translate_drop_function(
     emit_function_class_row_removal(program, &cursors, function.namespace, &stored_name);
     emit_function_change(program, FunctionChange::Drop { oid: function.oid }, vec![]);
     Ok(())
+}
+
+/// The signature of the built-in function of tursopg that `drop` names, as
+/// PostgreSQL shows it. tursopg does not know the parameter types of its
+/// built-in functions, so the function is one with the name and the number
+/// of parameters of the statement.
+fn built_in_function_signature(drop: &ast::DropFunction) -> Option<String> {
+    let name = drop.name.name.as_str();
+    let parameter_types = drop.parameter_types.as_ref()?;
+    // The engine finds its functions without regard to case, and each of
+    // them has a name in lowercase.
+    let is_built_in = drop.name.namespace.is_none()
+        && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+        && matches!(
+            turso_core::Func::resolve_function(name, parameter_types.len()),
+            Ok(Some(_))
+        );
+    is_built_in.then(|| display_signature(name, parameter_types))
 }
 
 /// The function that `drop` names. A statement with parameter types names
@@ -511,7 +538,7 @@ fn check_type_exists(connection: &Arc<Connection>, type_name: &str) -> turso_cor
     if let Some(schema_name) = schema_name {
         check_schema_exists(connection, schema_name)?;
     }
-    if (schema_name.is_none() && is_base_type_name(name))
+    if (schema_name.is_none() && (is_base_type_name(name) || is_pseudo_type_name(name)))
         || type_exists(connection, schema_name, name)
     {
         return Ok(());

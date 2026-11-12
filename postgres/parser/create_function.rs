@@ -784,6 +784,12 @@ pub fn is_base_type_name(name: &str) -> bool {
     BASE_TYPES.contains(&name)
 }
 
+/// Whether a signature names a built-in pseudo-type `name`, such as
+/// `anyelement` or `record`.
+pub fn is_pseudo_type_name(name: &str) -> bool {
+    POLYMORPHIC_TYPES.contains(&name) || PSEUDO_TYPES.contains(&name)
+}
+
 // FIXME: the three lists that follow are written by hand, and they must
 // follow the PostgreSQL version of pg_query. They are also one of three
 // places that say what a type name is. The FIXME in

@@ -534,6 +534,11 @@ Notes on `CREATE FUNCTION`:
   them.
 - pg_dump fails on a database that has a function: it reads each function
   with a `PREPARE` statement, which tursopg does not support.
+- `DROP FUNCTION` of a built-in function fails as in PostgreSQL: the
+  database system requires the function. tursopg finds its built-in
+  functions by their name and their number of parameters, not by the types
+  of the parameters. For a built-in function that only PostgreSQL has, the
+  error is that the function does not exist.
 - `pg_proc` shows a function with its `proname` and `prosrc` as in
   PostgreSQL. `pronamespace` is the oid of the schema in `pg_namespace`: the
   oid of `public` is PostgreSQL's 2200, the oid of any other schema is
