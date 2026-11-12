@@ -901,16 +901,12 @@ expect @tursopg error {}
 
 # E-86: DEFAULT auth.uid() in pg_attrdef
 @setup auth_uid_from_claims_on_postgres
-@compat-gap "function:pg_get_expr"
 test default-auth-uid-in-pg-attrdef {
     CREATE TABLE t (owner uuid DEFAULT auth.uid());
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
     auth.uid()
-}
-expect @tursopg {
-    "auth.uid" ()
 }
 
 # E-87: CHECK calling auth.uid()

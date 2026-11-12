@@ -3,7 +3,7 @@ use crate::pg_type::{built_in_type, BuiltInType, BUILT_IN_TYPES};
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use std::fmt::{self, Debug, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter, Write as _};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::ast::{self, RefAct, SortOrder};
@@ -4650,7 +4650,89 @@ fn render_expr(expr: &ast::Expr) -> String {
         Ok(WalkControl::Continue)
     })
     .expect("rewriting role functions and collations does not fail");
-    expr.to_string()
+    let mut sql = String::new();
+    let mut writer = SchemaFunctionCallWriter {
+        sql: &mut sql,
+        held: None,
+    };
+    write!(writer, "{expr}")
+        .and_then(|()| writer.finish())
+        .expect("writing to a string does not fail");
+    sql
+}
+
+/// Writes the SQL text of an expression as the engine's printer writes it,
+/// except for the call of a function of a schema. Its name is the schema and
+/// the function in one name, which the engine prints as one quoted
+/// identifier: `"auth.uid" ()`. PostgreSQL prints `auth.uid()`. The printer
+/// writes each token with its own call, so a quoted identifier is held until
+/// the next token shows whether it names a function, followed by `(`, or
+/// something else.
+// FIXME(pg-function-schema): ast::Expr::FunctionCall has no schema, so the
+// translator joins the schema and the function into one name. A schema in
+// FunctionCall, which the printer writes as `schema.function`, would
+// replace this writer.
+struct SchemaFunctionCallWriter<'a> {
+    sql: &'a mut String,
+    /// The quoted name of a function of a schema that the printer wrote
+    /// last, as it wrote it, and whether a space came after it.
+    held: Option<(String, bool)>,
+}
+
+impl fmt::Write for SchemaFunctionCallWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if let Some((held, space)) = self.held.take() {
+            match text {
+                " " if !space => {
+                    self.held = Some((held, true));
+                    return Ok(());
+                }
+                "(" => {
+                    let name = ast::Name::from_string(&held);
+                    let (schema, function) =
+                        turso_pg_parser::translator::split_function_name(name.as_str());
+                    let schema = schema.expect("only a name with a schema is held");
+                    self.sql.push_str(&quote_identifier(schema));
+                    self.sql.push('.');
+                    self.sql.push_str(&quote_identifier(function));
+                    self.sql.push('(');
+                    return Ok(());
+                }
+                _ => self.write_held(&held, space),
+            }
+        }
+        if text.starts_with('"') {
+            let name = ast::Name::from_string(text);
+            if turso_pg_parser::translator::split_function_name(name.as_str())
+                .0
+                .is_some()
+            {
+                self.held = Some((text.to_string(), false));
+                return Ok(());
+            }
+        }
+        self.sql.push_str(text);
+        Ok(())
+    }
+}
+
+impl SchemaFunctionCallWriter<'_> {
+    /// Writes the name that the expression may end with.
+    fn finish(&mut self) -> fmt::Result {
+        if let Some((held, space)) = self.held.take() {
+            self.write_held(&held, space);
+        }
+        Ok(())
+    }
+
+    /// Writes a held name that turned out not to name a function, as the
+    /// printer wrote it.
+    fn write_held(&mut self, held: &str, space: bool) {
+        self.sql.push_str(held);
+        if space {
+            self.sql.push(' ');
+        }
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
