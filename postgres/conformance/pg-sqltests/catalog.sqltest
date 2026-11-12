@@ -1321,6 +1321,28 @@ expect {
     42|f
 }
 
+# nextval is not transactional, so a transaction sees the values it hands
+# out, and pg_dump's read-only transaction can read the state.
+test pg-get-sequence-data-in-a-transaction {
+    CREATE SEQUENCE sd_txn START 5;
+    BEGIN;
+    SELECT nextval('sd_txn');
+    SELECT nextval('sd_txn');
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_txn';
+    COMMIT;
+    BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_txn';
+    COMMIT;
+}
+expect {
+    5
+    6
+    6|t
+    6|t
+}
+
 test pg-get-sequence-data-has-two-columns {
     CREATE SEQUENCE sd_columns START 3;
     SELECT d.* FROM pg_class c, pg_get_sequence_data(c.oid) d WHERE c.relname = 'sd_columns';

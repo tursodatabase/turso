@@ -6,7 +6,6 @@ use std::sync::Arc;
 use turso_core::{
     namespace::{mangle_name, NamespaceRef},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    sequence_backing_table_name,
     types::IOResultOr,
     Connection, IOResult, LimboError, Result, Statement, Value, MAIN_DB_ID,
 };
@@ -108,14 +107,14 @@ impl VirtualTableCursor for SequenceDataCursor {
         };
         if self.statement.is_none() {
             self.sequence_oid = sequence_oid.clone();
-            let Some(read) = self.state_read(sequence_oid) else {
+            let Some(sql) = self.state_read_sql(sequence_oid) else {
                 // As in PostgreSQL, a relation that is not a sequence, or a
                 // sequence the role may not read, gives a row of NULLs.
                 self.row = Some([Value::Null, Value::Null]);
                 return Ok(IOResult::Done(true));
             };
-            self.row = Some([read.start_value, Value::from_i64(0)]);
-            self.statement = Some(self.conn.prepare_internal(read.sql)?);
+            self.row = None;
+            self.statement = Some(self.conn.prepare_internal(sql)?);
         }
         let row = &mut self.row;
         if let IOResult::IO(completions) = self
@@ -133,22 +132,19 @@ impl VirtualTableCursor for SequenceDataCursor {
             return Ok(IOResult::IO(completions));
         }
         self.statement = None;
+        assert!(self.row.is_some(), "a sequence state read returns one row");
         Ok(IOResult::Done(true))
     }
 }
 
-/// How to read the stored state of one sequence.
-struct SequenceStateRead {
-    /// The query of the sequence's current `(value, is_called)`.
-    sql: String,
-    /// The value of a sequence that has not handed out any value.
-    start_value: Value,
-}
-
 impl SequenceDataCursor {
-    /// The read of the sequence with oid `sequence_oid`, or None when no
-    /// sequence has that oid or the current role may not read it.
-    fn state_read(&self, sequence_oid: &Value) -> Option<SequenceStateRead> {
+    /// The query of the current `(value, is_called)` of the sequence with
+    /// oid `sequence_oid`, or None when no sequence has that oid or the
+    /// current role may not read it. sequence_state_experimental reads the
+    /// state the way nextval does, so inside a transaction it also sees the
+    /// values that nextval handed out after the transaction's snapshot, as
+    /// PostgreSQL does.
+    fn state_read_sql(&self, sequence_oid: &Value) -> Option<String> {
         let oid = sequence_oid.as_int()?;
         let schema = self.conn.current_schema();
         let (_, namespace, sequence) = sequence_catalog_entries(&schema)
@@ -161,21 +157,10 @@ impl SequenceDataCursor {
         if !self.conn.may_read_sequence(namespace_ref, &sequence.name) {
             return None;
         }
-        let backing_table = sequence_backing_table_name(&mangle_name(namespace, &sequence.name));
-        // Every nextval adds a row keyed by its value, so the current one is
-        // the highest value of an ascending sequence and the lowest of a
-        // descending one.
-        let order = if sequence.increment_by >= 0 {
-            "DESC"
-        } else {
-            "ASC"
-        };
-        Some(SequenceStateRead {
-            sql: format!(
-                "SELECT value, is_called FROM \"{}\" ORDER BY value {order} LIMIT 1",
-                backing_table.replace('"', "\"\"")
-            ),
-            start_value: Value::from_i64(sequence.start_value),
-        })
+        let name = mangle_name(namespace, &sequence.name).replace('\'', "''");
+        Some(format!(
+            "SELECT state[1], state[2] \
+             FROM (SELECT sequence_state_experimental('{name}') AS state) AS sequence_state"
+        ))
     }
 }
