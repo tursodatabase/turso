@@ -25,6 +25,16 @@ pub enum ParseError {
     SchemaQualifiedName { kind: String, schema: String },
 }
 
+impl ParseError {
+    /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
+    pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
+        Self::Sqlstate {
+            sqlstate: sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: format!("{what} is not supported"),
+        }
+    }
+}
+
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql).map_err(parse_error)
