@@ -3405,11 +3405,14 @@ impl PostgreSQLTranslator {
                 }
                 let type_name = extract_type_name_from_typename(pg_type_name)?;
                 if type_name.eq_ignore_ascii_case("int2") {
-                    return Ok(function_call("pg_cast_int2", vec![*expr]));
+                    let operand = int_cast_operand(arg, (*expr).clone(), IntegerType::Int2);
+                    return Ok(function_call("pg_cast_int2", vec![operand]));
                 } else if type_name.eq_ignore_ascii_case("int4") {
-                    return Ok(function_call("pg_cast_int4", vec![*expr]));
+                    let operand = int_cast_operand(arg, (*expr).clone(), IntegerType::Int4);
+                    return Ok(function_call("pg_cast_int4", vec![operand]));
                 } else if type_name.eq_ignore_ascii_case("int8") {
-                    return Ok(function_call("pg_cast_int8", vec![*expr]));
+                    let operand = int_cast_operand(arg, (*expr).clone(), IntegerType::Int8);
+                    return Ok(function_call("pg_cast_int8", vec![operand]));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -4413,11 +4416,17 @@ impl PostgreSQLTranslator {
                 }
                 let operand = args.into_iter().next().unwrap();
                 if func_name.eq_ignore_ascii_case("int2") {
-                    return Ok(function_call("pg_cast_int2", vec![*operand]));
+                    let operand =
+                        int_cast_operand(&func_call.args[0], (*operand).clone(), IntegerType::Int2);
+                    return Ok(function_call("pg_cast_int2", vec![operand]));
                 } else if func_name.eq_ignore_ascii_case("int4") {
-                    return Ok(function_call("pg_cast_int4", vec![*operand]));
+                    let operand =
+                        int_cast_operand(&func_call.args[0], (*operand).clone(), IntegerType::Int4);
+                    return Ok(function_call("pg_cast_int4", vec![operand]));
                 } else if func_name.eq_ignore_ascii_case("int8") {
-                    return Ok(function_call("pg_cast_int8", vec![*operand]));
+                    let operand =
+                        int_cast_operand(&func_call.args[0], (*operand).clone(), IntegerType::Int8);
+                    return Ok(function_call("pg_cast_int8", vec![operand]));
                 }
                 return Ok(ast::Expr::Cast {
                     expr: operand,
