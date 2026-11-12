@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::connection::MaybeReparseSchemaState;
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
 use crate::security::roles::SELECT_ROLES_SQL;
@@ -538,6 +539,11 @@ impl ConnectOpts {
 /// connect and pass it to every call until `IOResult::Done`.
 #[derive(Default)]
 pub struct ConnectAsyncState {
+    /// The settings from the first call, kept until the connection is created.
+    opts: Option<ConnectOpts>,
+    /// A connection reading the schema again because the cached schema does
+    /// not have the session role, and the state of that read.
+    role_reload: Option<(Arc<Connection>, MaybeReparseSchemaState)>,
     /// The connection, once created; handed out when the stats refresh ends.
     conn: Option<Arc<Connection>>,
     /// The in-flight `sqlite_stat1` scan.
@@ -2624,6 +2630,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
+        self.read_schema_if_session_role_is_missing(&opts)?;
         self._connect(opts, context, false, None, StatsRefresh::Blocking)
     }
 
@@ -2647,8 +2654,9 @@ impl Database {
     /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
     /// logged and the connection is returned without stats.
     ///
-    /// Only the first call, which creates the connection, uses `opts`; later
-    /// calls with the same `state` only resume the stats refresh.
+    /// Only the first call uses `opts`; later calls with the same `state`
+    /// resume the connect. Connecting as a role that the cached schema does
+    /// not have reads the schema again first, which can also wait on I/O.
     pub fn connect_async(
         self: &Arc<Database>,
         opts: ConnectOpts,
@@ -2657,6 +2665,13 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
+                let opts = state.opts.get_or_insert(opts);
+                crate::return_if_io!(self
+                    .read_schema_if_session_role_is_missing_nonblock(opts, &mut state.role_reload));
+                let opts = state
+                    .opts
+                    .take()
+                    .expect("the settings are kept until connecting");
                 let conn = self._connect(
                     opts,
                     ConnectionContext::default(),
@@ -2746,6 +2761,63 @@ impl Database {
                 "role \"{name}\" does not exist"
             ))),
         }
+    }
+
+    fn read_schema_if_session_role_is_missing(
+        self: &Arc<Database>,
+        opts: &ConnectOpts,
+    ) -> Result<()> {
+        let mut reload = None;
+        let result = self
+            .io
+            .block(|| self.read_schema_if_session_role_is_missing_nonblock(opts, &mut reload));
+        // A failed I/O completion stops io.block() without calling the reload
+        // again, so the reload is still open here.
+        if let Some((conn, mut state)) = reload.take() {
+            conn.end_maybe_reparse_schema(&mut state);
+        }
+        result
+    }
+
+    /// Another process may have created the session role after this process
+    /// read the schema, so the schema is read again when the cached schema
+    /// does not have the role.
+    fn read_schema_if_session_role_is_missing_nonblock(
+        self: &Arc<Database>,
+        opts: &ConnectOpts,
+        reload: &mut Option<(Arc<Connection>, MaybeReparseSchemaState)>,
+    ) -> IOResultOr<()> {
+        if reload.is_none() {
+            let SessionRole::Named(name) = &opts.role else {
+                return Ok(IOResult::Done(()));
+            };
+            if self.schema.lock().roles.get_by_name(name).is_some() {
+                return Ok(IOResult::Done(()));
+            }
+            let superuser_opts = ConnectOpts {
+                role: SessionRole::Superuser,
+                ..opts.clone()
+            };
+            let conn = self._connect(
+                superuser_opts,
+                ConnectionContext::default(),
+                false,
+                None,
+                StatsRefresh::Deferred,
+            )?;
+            *reload = Some((conn, MaybeReparseSchemaState::default()));
+        }
+        let (conn, state) = reload.as_mut().expect("the reload was started above");
+        let result = conn.maybe_reparse_schema_nonblock(state);
+        if let Ok(IOResult::IO(io)) = result {
+            return Ok(IOResult::IO(io));
+        }
+        let (conn, mut state) = reload.take().expect("the reload was started above");
+        if result.is_err() {
+            conn.end_maybe_reparse_schema(&mut state);
+        }
+        conn.close()?;
+        result
     }
 
     /// Create a connection and run the blocking connect-time stats refresh.

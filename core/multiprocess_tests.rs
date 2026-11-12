@@ -30,6 +30,8 @@ const MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_db_file_reader_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
+const MULTIPROCESS_SHM_CREATE_ROLE_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_create_role_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
@@ -1366,6 +1368,136 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     }
 
     assert_eq!(count_test_rows(&conn), 3);
+}
+
+#[test]
+fn multiprocess_shm_create_role_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_with_roles(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+        role_name: "alice".to_string(),
+    });
+    conn.prepare_translated_cmd(create_role, "CREATE ROLE alice")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+}
+
+#[test]
+fn subprocess_database_open_connects_as_role_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-peer-role.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_with_roles(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+    create_role_alice_in_another_process(db_path_str);
+
+    let alice = db
+        .connect(ConnectOpts::new(SessionRole::Named("alice".to_string())))
+        .unwrap();
+    assert!(!alice.current_role_is_superuser());
+    let Err(missing) = db.connect(ConnectOpts::new(SessionRole::Named("bob".to_string()))) else {
+        panic!("connecting as a missing role must fail");
+    };
+    assert!(
+        matches!(missing, LimboError::InvalidArgument(ref message) if message == "role \"bob\" does not exist"),
+        "expected an error about a missing role, got {missing:?}"
+    );
+
+    // Reading the schema again held a read transaction, which must have
+    // ended, or the checkpoint could not truncate the WAL.
+    conn.execute("insert into t values (1)").unwrap();
+    let mut checkpoint = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = checkpoint.run_collect_rows().unwrap();
+    assert_eq!(rows[0][0], Value::from_i64(0), "checkpoint was busy");
+}
+
+#[test]
+fn subprocess_connect_async_hands_back_io_while_reading_a_role_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-peer-role-async.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_with_roles(io.clone(), db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+    create_role_alice_in_another_process(db_path_str);
+
+    let mut state = ConnectAsyncState::new();
+    let mut handed_back_io = false;
+    let alice = loop {
+        match db
+            .connect_async(
+                ConnectOpts::new(SessionRole::Named("alice".to_string())),
+                &mut state,
+            )
+            .unwrap()
+        {
+            IOResult::Done(conn) => break conn,
+            IOResult::IO(completion) => {
+                handed_back_io = true;
+                completion.wait(&*io).unwrap();
+            }
+        }
+    };
+
+    assert!(handed_back_io);
+    assert!(!alice.current_role_is_superuser());
+}
+
+fn create_role_alice_in_another_process(db_path: &str) {
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_CREATE_ROLE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child role process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+/// Like [open_multiprocess_db], with a dialect that has roles.
+fn open_multiprocess_db_with_roles(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+        Arc::new(EngineDialectWithRoles),
+    )
+}
+
+/// The engine dialect, with roles.
+struct EngineDialectWithRoles;
+
+impl Dialect for EngineDialectWithRoles {
+    fn name(&self) -> &'static str {
+        "engine_with_roles"
+    }
+
+    fn supports_roles(&self) -> bool {
+        true
+    }
 }
 
 #[test]
