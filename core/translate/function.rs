@@ -214,7 +214,47 @@ fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<
             body: ast::CreateTableBody::AsSelect(select),
             ..
         } => expand_in_select(select, expand),
-        _ => Ok(()),
+        // The engine does not expand the calls of the other statements.
+        // Those that have expressions store them in the schema, or use them
+        // for a name or a setting (ATTACH, PRAGMA, VACUUM INTO).
+        ast::Stmt::AlterTable(_)
+        | ast::Stmt::Analyze { .. }
+        | ast::Stmt::Attach { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateIndex { .. }
+        | ast::Stmt::CreateTable { .. }
+        | ast::Stmt::CreateTrigger { .. }
+        | ast::Stmt::CreateView { .. }
+        | ast::Stmt::CreatePolicy(_)
+        | ast::Stmt::DropPolicy { .. }
+        | ast::Stmt::CreateMaterializedView { .. }
+        | ast::Stmt::CreateVirtualTable(_)
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::Detach { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Pragma { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Vacuum { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::AlterSequenceOwnedBy { .. }
+        | ast::Stmt::CreateSchema { .. }
+        | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::Grant(_)
+        | ast::Stmt::DropSchema { .. }
+        | ast::Stmt::CreateFunction(_)
+        | ast::Stmt::DropFunction(_) => Ok(()),
     }
 }
 
