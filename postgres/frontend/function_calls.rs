@@ -171,6 +171,21 @@ impl Expansion<'_> {
                 "a call of function \"{name}\", whose body uses a parameter more than once,"
             )));
         }
+        // The expression has no place for the argument of a parameter that
+        // the body does not use, so the engine does not see this argument.
+        // PostgreSQL reads each argument before it inlines the function: an
+        // aggregate in the argument makes the statement group its rows, and
+        // a column or a function that does not exist is an error.
+        let has_unread_argument = args
+            .iter()
+            .zip(&use_counts)
+            .any(|(argument, use_count)| *use_count == 0 && !is_constant_or_variable(argument));
+        if has_unread_argument {
+            return Err(not_supported(format!(
+                "a call of function \"{name}\" with an argument that is not a constant, for a \
+                 parameter that the body does not use,"
+            )));
+        }
         self.active.push(function.oid);
         let expanded = self.expand_calls_in(&mut expression);
         self.active.pop();
@@ -379,6 +394,21 @@ fn with_arguments(
         },
     )?;
     Ok((expression, use_counts))
+}
+
+/// Whether `argument` is a literal or a variable of the statement, also with
+/// a sign, a cast or parentheses. The statement gives the same result and
+/// the same errors with or without such an argument.
+fn is_constant_or_variable(argument: &ast::Expr) -> bool {
+    match argument {
+        ast::Expr::Literal(_) | ast::Expr::Variable(_) => true,
+        ast::Expr::Parenthesized(parts) => {
+            matches!(parts.as_slice(), [part] if is_constant_or_variable(part))
+        }
+        ast::Expr::Unary(_, operand) => is_constant_or_variable(operand),
+        ast::Expr::Cast { expr, .. } => is_constant_or_variable(expr),
+        _ => false,
+    }
 }
 
 /// `cast`, the cast of a parameter to its type, with `argument` in the

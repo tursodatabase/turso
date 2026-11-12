@@ -351,6 +351,24 @@ fn the_parameters_of_a_function_are_not_parameters_of_the_statement() {
 }
 
 #[test]
+fn a_parameter_of_the_statement_can_be_an_argument_that_the_body_does_not_use() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute(
+        "CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$",
+    )
+    .unwrap();
+
+    // The expression of the call has $2 only. $1 keeps its number.
+    let mut call = pg.prepare("SELECT first_of($2, $1)").unwrap();
+    call.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(5))
+        .unwrap();
+    call.bind_at(std::num::NonZero::new(2).unwrap(), Value::from_i64(6))
+        .unwrap();
+    assert_eq!(integers(&mut call), [6]);
+}
+
+#[test]
 fn another_connection_calls_a_new_function() {
     let db = TempDatabase::builder().build();
     let writer = db.connect_postgres();

@@ -613,6 +613,12 @@ Notes on calls of SQL functions:
 - A call of a function whose body uses a parameter more than once is
   rejected. PostgreSQL inlines such a function unless the argument is
   volatile or expensive.
+- For a parameter that the body does not use, the argument of a call must
+  be a constant or a parameter of the statement (`$1`), also with a sign or
+  a cast. Other arguments are rejected. PostgreSQL reads such an argument
+  before it inlines the function: an aggregate makes the statement group
+  its rows, and a column that does not exist is an error. tursopg gives the
+  engine only the arguments that the body uses.
 - PostgreSQL chooses between functions of one name by the types of the
   arguments. tursopg does not know these types, so it rejects a call of a
   name that several functions of the searched schemas have.

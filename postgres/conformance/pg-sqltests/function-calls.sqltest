@@ -486,6 +486,96 @@ expect error {
     OVER specified, but add_one is not a window function nor an aggregate function
 }
 
+# Arguments that the body does not use
+#
+# PostgreSQL reads each argument before it inlines the function. tursopg
+# gives the engine only the arguments that the body uses. Thus it refuses an
+# argument that the engine must read: one that is not a constant.
+
+test constant-for-a-parameter-that-the-body-does-not-use {
+    CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    SELECT first_of(1, 2), first_of(1, NULL), first_of(1, -2), first_of(1, ('2'::integer));
+}
+expect {
+    1|1|1|1
+}
+
+# The aggregate makes the statement return one row for the table.
+test aggregate-for-a-parameter-that-the-body-does-not-use {
+    CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT first_of(1, count(*)::integer) FROM t;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_of" with an argument that is not a constant, for a parameter that the body does not use, is not supported
+}
+
+test column-for-a-parameter-that-the-body-does-not-use {
+    CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT first_of(a, a) FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_of" with an argument that is not a constant, for a parameter that the body does not use, is not supported
+}
+
+test column-that-does-not-exist-for-a-parameter-that-the-body-does-not-use {
+    CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE TABLE t (a integer);
+    SELECT first_of(1, nosuch) FROM t;
+}
+@sqlstate 42703
+expect error {
+    column "nosuch" does not exist
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_of" with an argument that is not a constant, for a parameter that the body does not use, is not supported
+}
+
+test division-by-zero-for-a-parameter-that-the-body-does-not-use {
+    CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    SELECT first_of(1, 1 / 0);
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_of" with an argument that is not a constant, for a parameter that the body does not use, is not supported
+}
+
+# The argument of the inner call is the argument of the outer call.
+test argument-of-a-body-for-a-parameter-that-the-body-of-the-called-function-does-not-use {
+    CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE FUNCTION one_and(integer) RETURNS integer LANGUAGE sql AS $$SELECT first_of(1, $1)$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (5);
+    SELECT one_and(2);
+    SELECT one_and(a) FROM t;
+}
+expect {
+    1
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_of" with an argument that is not a constant, for a parameter that the body does not use, is not supported
+}
+
 # Arguments that the body uses more than once
 
 # PostgreSQL inlines the function unless the argument is volatile or
