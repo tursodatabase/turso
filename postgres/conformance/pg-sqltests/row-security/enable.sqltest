@@ -209,3 +209,25 @@ test role-that-does-not-own-the-table-cannot-enable-row-security {
 expect error {
     must be owner of table rp_docs_17
 }
+
+test owner-may-enable-row-security {
+    CREATE ROLE en_owner;
+    CREATE TABLE en_owned (id INT);
+    ALTER TABLE en_owned OWNER TO en_owner;
+    SET ROLE en_owner;
+    ALTER TABLE en_owned ENABLE ROW LEVEL SECURITY;
+    SELECT relrowsecurity FROM pg_class WHERE relname = 'en_owned';
+}
+expect {
+    t
+}
+
+@skip-if postgres "PostgreSQL supports FORCE ROW LEVEL SECURITY"
+test force-row-level-security-is-not-supported {
+    CREATE TABLE en_forced (id INT);
+    ALTER TABLE en_forced FORCE ROW LEVEL SECURITY;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TABLE ... FORCE ROW LEVEL SECURITY is not supported
+}
