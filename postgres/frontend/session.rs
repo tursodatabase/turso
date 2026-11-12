@@ -504,11 +504,12 @@ fn prepare_statement_inner(
             Err(error) => {
                 // PostgreSQL creates a function that tursopg refuses as not
                 // supported, and it checks the body. An error of the body
-                // thus comes before the refusal.
-                if let Some(function) = created_function
-                    .as_ref()
-                    .filter(|_| is_feature_not_supported(&error))
-                {
+                // thus comes before the refusal. For a function that exists,
+                // PostgreSQL gives an error before it checks the body.
+                if let Some(function) = created_function.as_ref().filter(|function| {
+                    is_feature_not_supported(&error)
+                        && !crate::sql_functions::created_function_exists(&pg_conn.conn, function)
+                }) {
                     validate_function_body(pg_conn, function)?;
                 }
                 return Err(error);

@@ -960,6 +960,35 @@ expect @tursopg error {
     no such table: nosuch
 }
 
+# PostgreSQL does not check the body of a function that exists already: it
+# gives an error for the function first. Thus tursopg does not give the error
+# of the body. It refuses the type.
+test function-that-exists-with-a-result-type-that-is-not-supported-and-a-body-that-does-not-compile {
+    CREATE FUNCTION far() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION far() RETURNS point LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42723
+expect error {
+    function "far" already exists with same argument types
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function result of type point is not supported
+}
+
+test replaced-function-with-a-result-type-that-is-not-supported-and-a-body-that-does-not-compile {
+    CREATE FUNCTION far() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE OR REPLACE FUNCTION far() RETURNS point LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P13
+expect error {
+    cannot change return type of existing function
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function result of type point is not supported
+}
+
 test function-with-a-type-that-is-not-supported-when-check-function-bodies-is-off {
     SET check_function_bodies = off;
     CREATE FUNCTION far(point) RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;

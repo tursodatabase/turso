@@ -311,6 +311,27 @@ pub(crate) fn function_catalog(schema: &Schema) -> Option<&FunctionCatalog> {
     class_catalog(schema).map(|catalog| &catalog.functions)
 }
 
+/// Whether the function of `create` exists: its schema has a function with
+/// its name and its parameter types.
+pub(crate) fn created_function_exists(
+    connection: &Arc<Connection>,
+    create: &ast::CreateFunction,
+) -> bool {
+    let Ok(Some(namespace)) = function_namespace(connection, &create.name) else {
+        return false;
+    };
+    let schema = connection.current_schema();
+    function_catalog(&schema).is_some_and(|functions| {
+        functions
+            .get(
+                namespace,
+                create.name.name.as_str(),
+                &create.parameter_types,
+            )
+            .is_some()
+    })
+}
+
 /// [`turso_core::Dialect::translate_create_function`] for the PostgreSQL
 /// frontend. With PostgreSQL's errors: a schema that does not exist (3F000),
 /// a function with the same parameter types (42723), `OR REPLACE` by a role
