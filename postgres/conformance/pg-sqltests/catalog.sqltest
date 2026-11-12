@@ -1887,3 +1887,17 @@ test regclass-in-the-pg-dump-sequence-owner-query {
 expect {
     rc_owner_id_seq|rc_owner|1
 }
+
+test serial-sequence-names-are-shortened-like-postgresql {
+    CREATE SEQUENCE rd_a_table_with_a_name_long_e_a_column_with_a_name_long_eno_seq;
+    CREATE TABLE rd_a_table_with_a_name_long_enough_to_shorten (
+        a_column_with_a_name_long_enough_to_shorten serial);
+    CREATE TABLE rd_another_table_with_a_long_enough_name (
+        a_column_with_a_name_long_enough_to_shorten serial);
+    SELECT relname FROM pg_class WHERE relkind = 'S' AND relname LIKE 'rd_a%' ORDER BY relname;
+}
+expect {
+    rd_a_table_with_a_name_long_e_a_column_with_a_name_long_en_seq1
+    rd_a_table_with_a_name_long_e_a_column_with_a_name_long_eno_seq
+    rd_another_table_with_a_long__a_column_with_a_name_long_eno_seq
+}

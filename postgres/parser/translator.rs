@@ -869,12 +869,17 @@ impl PostgreSQLTranslator {
     /// relation of the table's schema has that name; then it is the first
     /// of `<table>_<column>_seq1`, `<table>_<column>_seq2`, ... that none
     /// has, as PostgreSQL names it.
+    /// PostgreSQL's ChooseRelationName for the sequence of a serial column:
+    /// `<table>_<column>_seq`, shortened as makeObjectName does, with a
+    /// number after `seq` when the name is taken. The name of a schema's
+    /// table keeps its mangling prefix.
     fn serial_sequence_name(&self, tbl_name: &ast::QualifiedName, column: &str) -> (String, bool) {
-        let name = format!(
-            "{}_{}_seq",
-            tbl_name.name.as_str().to_lowercase(),
-            column.to_lowercase()
-        );
+        let stored_table = tbl_name.name.as_str();
+        let bare_table = bare_table_name(stored_table);
+        let prefix = &stored_table[..stored_table.len() - bare_table.len()];
+        let name_with_label =
+            |label: &str| format!("{prefix}{}", make_object_name(bare_table, column, label));
+        let name = name_with_label("seq");
         let Some(is_taken) = &self.relation_name_is_taken else {
             return (name, true);
         };
@@ -883,7 +888,7 @@ impl PostgreSQLTranslator {
             return (name, true);
         }
         let free_name = (1..)
-            .map(|n| format!("{name}{n}"))
+            .map(|n| name_with_label(&format!("seq{n}")))
             .find(|name| !is_taken(&schema, name))
             .expect("the numbers never run out");
         (free_name, false)
