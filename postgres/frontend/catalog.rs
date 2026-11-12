@@ -254,7 +254,7 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        if let [turso_core::CatalogChange::CreateRole { name }] = changes {
+        if let [turso_core::CatalogChange::CreateRole { name, .. }] = changes {
             return crate::roles::translate_create_role(program, schema, name);
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)

@@ -278,6 +278,7 @@ pub(crate) fn translate_create_role(
         db: MAIN_DB_ID,
         change: Box::new(CatalogChange::CreateRole {
             name: name.to_string(),
+            options: turso_parser::ast::RoleOptions::default(),
         }),
         value_regs: vec![id_reg],
     });

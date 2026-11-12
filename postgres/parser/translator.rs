@@ -6441,6 +6441,7 @@ fn translate_create_role(
     }
     Ok(ast::Stmt::CreateRole {
         role_name: stmt.role.clone(),
+        options: ast::RoleOptions::default(),
     })
 }
 

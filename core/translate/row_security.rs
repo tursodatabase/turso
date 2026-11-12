@@ -307,7 +307,7 @@ pub(crate) fn check_blob_open(
             dialect.as_ref(),
             schema,
             role,
-            dialect.role_is_superuser(schema, role),
+            dialect.role_bypass_rls(schema, role),
             NamespaceId::ROOT,
             table_name,
             command,
@@ -342,13 +342,13 @@ fn policy(
     } else {
         roles::table_reader(resolver, resolver.row_security_role)
     };
-    let role_is_superuser = is_superuser(role);
+    let bypass_rls = dialect.role_bypass_rls(resolver.schema(), role);
     resolver.with_schema(namespace.database_id, |schema| {
         policy_for(
             dialect,
             schema,
             role,
-            role_is_superuser,
+            bypass_rls,
             namespace.id,
             table_name,
             command,
@@ -359,20 +359,21 @@ fn policy(
 /// Whether row-level security limits the rows of table `table_name` of
 /// `namespace` in `schema` that `role` may access for `command`, and the
 /// policies that then decide. As in PostgreSQL's `check_enable_rls`,
-/// row-level security does not limit superusers or the table's owner.
-/// Whether `role` is a superuser comes from the main database, which the
-/// role was set from, and `schema` may be another one.
+/// row-level security does not limit a role that bypasses it, such as a
+/// superuser, or the table's owner. Whether `role` bypasses row-level
+/// security comes from the main database, which the role was set from, and
+/// `schema` may be another one.
 fn policy_for(
     dialect: &dyn Dialect,
     schema: &Schema,
     role: RoleId,
-    role_is_superuser: bool,
+    bypass_rls: bool,
     namespace: NamespaceId,
     table_name: &str,
     command: Command,
 ) -> Policy {
     let table_name = normalize_ident(table_name);
-    if role_is_superuser
+    if bypass_rls
         || !dialect.table_rls_enabled(schema, namespace, &table_name)
         || dialect.relation_owner(schema, namespace, &table_name) == Some(role)
     {
