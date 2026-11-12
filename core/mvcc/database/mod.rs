@@ -8259,7 +8259,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// checkpoint snapshot. No transaction is open then, and the B-tree holds every
     /// committed row.
     pub(crate) fn clear_row_versions(&self) {
-        let store = self.row_store();
         turso_assert!(
             self.txs.is_empty(),
             "MVCC row versions cleared while transactions are still active"
@@ -8267,24 +8266,40 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         #[cfg(debug_assertions)]
         self.debug_assert_no_version_is_newer_than_the_last_checkpoint();
 
-        // The skip map frees a removed entry only during later operations, and it frees the
-        // entries of `SkipMap::clear` more slowly. Free the versions now and remove the
-        // entries one at a time.
-        for entry in store.rows.iter() {
-            entry.value().write().clear();
-            entry.remove();
-        }
         self.bump_index_rows_epoch();
-        for index in store.index_rows.iter() {
-            for entry in index.value().iter() {
-                entry.value().write().clear();
-                entry.remove();
-            }
+        let cleared = self
+            .row_store
+            .swap(Arc::new(RowStore::new_in(self.alloc.clone())));
+        match Arc::try_unwrap(cleared) {
+            // No cursor reads the row store, so the skip maps free all their entries here.
+            Ok(row_store) => drop(row_store),
+            // The cursors of a statement that is not reset still keep the row store. Their
+            // transaction is complete, so they do not read a row again.
+            Err(row_store) => Self::remove_all_entries(&row_store),
         }
         for entry in self.finalized_tx_states.iter() {
             entry.remove();
         }
         self.live_version_count_approx.store(0, Ordering::Relaxed);
+    }
+
+    /// Frees every row version and removes every row slot of a row store that cursors
+    /// still read.
+    ///
+    /// A skip map that is in use frees a removed entry only during later operations, and
+    /// it frees the entries of `SkipMap::clear` more slowly than entries that are removed
+    /// one at a time.
+    fn remove_all_entries(row_store: &RowStore<A>) {
+        for entry in row_store.rows.iter() {
+            entry.value().write().clear();
+            entry.remove();
+        }
+        for index in row_store.index_rows.iter() {
+            for entry in index.value().iter() {
+                entry.value().write().clear();
+                entry.remove();
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
