@@ -964,6 +964,38 @@ expect {
     3
 }
 
+test pg-get-expr-constant-defaults {
+    CREATE TABLE constant_defaults (
+        int_positive INTEGER DEFAULT 5,
+        int_negative INTEGER DEFAULT -2048,
+        int_min INTEGER DEFAULT -2147483648,
+        bigint_small BIGINT DEFAULT -5,
+        bigint_positive BIGINT DEFAULT 5000000000,
+        bigint_negative BIGINT DEFAULT -5000000000,
+        numeric_integer NUMERIC DEFAULT 99999999999999999999,
+        numeric_positive NUMERIC DEFAULT 1.50,
+        numeric_negative NUMERIC DEFAULT -1.5,
+        flag_true BOOLEAN DEFAULT true,
+        flag_false BOOLEAN DEFAULT false);
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 'constant_defaults' ORDER BY d.adnum;
+}
+expect {
+    int_positive|5
+    int_negative|'-2048'::integer
+    int_min|'-2147483648'::integer
+    bigint_small|'-5'::integer
+    bigint_positive|'5000000000'::bigint
+    bigint_negative|'-5000000000'::bigint
+    numeric_integer|'99999999999999999999'::numeric
+    numeric_positive|1.50
+    numeric_negative|'-1.5'::numeric
+    flag_true|true
+    flag_false|false
+}
+
 test pg-attribute-created-table-columns {
     CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT);
     SELECT a.attname, t.typname FROM pg_attribute a

@@ -4044,7 +4044,80 @@ fn render_expr(expr: &ast::Expr) -> String {
         Ok(WalkControl::Continue)
     })
     .expect("rewriting role functions does not fail");
-    expr.to_string()
+    render_pg_constant(&expr).unwrap_or_else(|| expr.to_string())
+}
+
+/// Renders a constant the way PostgreSQL's pg_get_expr() prints it, or returns
+/// None if the expression is not a constant.
+fn render_pg_constant(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => render_pg_number(text),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, operand) => match operand.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(text)) if !text.starts_with('-') => {
+                render_pg_number(&format!("-{text}"))
+            }
+            _ => None,
+        },
+        ast::Expr::Cast {
+            expr,
+            type_name: Some(type_name),
+        } if type_name.name.eq_ignore_ascii_case("boolean")
+            && type_name.size.is_none()
+            && type_name.array_dimensions == 0 =>
+        {
+            match expr.as_ref() {
+                ast::Expr::Literal(ast::Literal::Numeric(value)) if value == "1" => {
+                    Some("true".to_string())
+                }
+                ast::Expr::Literal(ast::Literal::Numeric(value)) if value == "0" => {
+                    Some("false".to_string())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// PostgreSQL gives a number the smallest of the integer, bigint and numeric
+/// types that holds it. pg_get_expr() adds a cast wherever the bare number would
+/// read back as a different type, or, for a negative number, as a minus
+/// operator applied to a constant.
+fn render_pg_number(text: &str) -> Option<String> {
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(match i32::try_from(value) {
+            Ok(value) if value >= 0 => value.to_string(),
+            Ok(value) => format!("'{value}'::integer"),
+            Err(_) => format!("'{value}'::bigint"),
+        });
+    }
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, text),
+    };
+    let (integer_part, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let is_digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if !is_digits(integer_part) || !is_digits(fraction) || integer_part.len() + fraction.len() == 0
+    {
+        return None;
+    }
+    let integer_part = match integer_part.trim_start_matches('0') {
+        "" => "0",
+        trimmed => trimmed,
+    };
+    let value = if fraction.is_empty() {
+        integer_part.to_string()
+    } else {
+        format!("{integer_part}.{fraction}")
+    };
+    let is_zero = value.bytes().all(|byte| byte == b'0' || byte == b'.');
+    if negative && !is_zero {
+        Some(format!("'-{value}'::numeric"))
+    } else if fraction.is_empty() {
+        Some(format!("'{value}'::numeric"))
+    } else {
+        Some(value)
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
