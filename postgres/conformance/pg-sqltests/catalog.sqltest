@@ -1811,3 +1811,79 @@ test constraint-oids-are-not-relation-oids {
 expect {
     0
 }
+
+# regclass and regnamespace turn a name into an oid. The tests compare oids
+# rather than print a regclass, which PostgreSQL shows as a name.
+test regclass-of-system-catalogs {
+    SELECT 'pg_class'::regclass::oid, 'pg_catalog.pg_proc'::regclass::oid,
+           'pg_extension'::regclass::oid, 'PG_CONSTRAINT'::regclass::oid;
+}
+expect {
+    1259|1255|3079|2606
+}
+
+test regclass-of-user-relations {
+    CREATE SCHEMA rc_schema;
+    CREATE TABLE rc_items (id serial);
+    CREATE TABLE "RC Mixed" (id int);
+    CREATE TABLE rc_schema.inner_items (id int);
+    CREATE SEQUENCE rc_seq;
+    SELECT relname FROM pg_class
+    WHERE oid IN ('rc_items'::regclass, 'public.rc_items'::regclass, '"RC Mixed"'::regclass,
+                  'rc_schema.inner_items'::regclass, 'rc_seq'::regclass)
+    ORDER BY relname;
+}
+expect {
+    RC Mixed
+    inner_items
+    rc_items
+    rc_seq
+}
+
+test regclass-keeps-an-oid {
+    CREATE TABLE rc_by_oid (id int);
+    SELECT relname FROM pg_class WHERE oid = (SELECT oid FROM pg_class WHERE relname = 'rc_by_oid')::regclass;
+}
+expect {
+    rc_by_oid
+}
+
+test regclass-of-a-missing-relation-fails {
+    SELECT 'rc_missing'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "rc_missing" does not exist
+}
+
+test regnamespace-of-schemas {
+    CREATE SCHEMA rn_schema;
+    SELECT 'pg_catalog'::regnamespace::oid, 'public'::regnamespace::oid;
+    SELECT nspname FROM pg_namespace WHERE oid = 'rn_schema'::regnamespace;
+}
+expect {
+    11|2200
+    rn_schema
+}
+
+test regnamespace-of-a-missing-schema-fails {
+    SELECT 'rn_missing'::regnamespace;
+}
+@sqlstate 3F000
+expect error {
+    schema "rn_missing" does not exist
+}
+
+# pg_dump finds the table that owns a serial column's sequence this way.
+test regclass-in-the-pg-dump-sequence-owner-query {
+    CREATE TABLE rc_owner (id serial, v int);
+    SELECT c.relname, t.relname, d.refobjsubid FROM pg_class c
+    LEFT JOIN pg_depend d ON (c.relkind = 'S' AND d.classid = 'pg_class'::regclass
+        AND d.objid = c.oid AND d.objsubid = 0 AND d.refclassid = 'pg_class'::regclass
+        AND d.deptype IN ('a', 'i'))
+    LEFT JOIN pg_class t ON t.oid = d.refobjid
+    WHERE c.relname = 'rc_owner_id_seq';
+}
+expect {
+    rc_owner_id_seq|rc_owner|1
+}

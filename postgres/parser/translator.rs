@@ -3342,7 +3342,26 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
+                // An oid alias type turns a name into an oid when its input
+                // function runs, which the frontend function of the same name
+                // does.
+                let target = extract_type_name_from_typename(pg_type_name)?;
+                if target.eq_ignore_ascii_case("regclass")
+                    || target.eq_ignore_ascii_case("regnamespace")
+                {
+                    return Ok(ast::Expr::FunctionCall {
+                        name: exact_name(target.to_ascii_lowercase()),
+                        distinctness: None,
+                        args: vec![expr],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    });
+                }
+                if target.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;

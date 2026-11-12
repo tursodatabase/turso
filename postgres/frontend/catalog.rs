@@ -395,7 +395,7 @@ const PUBLIC_NAMESPACE_OID: i64 = 2200;
 /// schema.
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
-fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
     if schema.namespace_name(namespace) == Some("public") {
         return PUBLIC_NAMESPACE_OID;
     }
@@ -448,7 +448,11 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
 /// Every relation has one: the frontend refuses a database whose relations
 /// predate the catalog, so None means the schema and the catalog are out of
 /// step, and the caller serves 0 rather than inventing an oid.
-fn stored_relation_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> Option<i64> {
+pub(crate) fn stored_relation_oid(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Option<i64> {
     Some(
         crate::classes::class_catalog(schema)?
             .get_by_name(namespace, name)?
@@ -801,6 +805,14 @@ impl SnapshotRows for PgDescriptionTable {
 
 /// The schemas that PostgreSQL always has, with their fixed OIDs.
 const BUILTIN_SCHEMAS: [(i64, &str); 2] = [(11, "pg_catalog"), (11394, "information_schema")];
+
+/// The oid of `name` if it is one of [`BUILTIN_SCHEMAS`].
+pub(crate) fn builtin_schema_oid(name: &str) -> Option<i64> {
+    BUILTIN_SCHEMAS
+        .iter()
+        .find(|(_, schema)| *schema == name)
+        .map(|(oid, _)| *oid)
+}
 
 /// Whether pg_namespace lists schema `name`: one of the schemas that
 /// PostgreSQL always has, or a namespace stored in the main database,
@@ -3220,8 +3232,76 @@ impl SnapshotRows for PgDependTable {
                 DependencyKind::Auto,
             ));
         }
+
+        // A sequence that a column owns, such as the sequence of a serial
+        // column, automatically depends on that column.
+        let schema = conn.current_schema();
+        for (sequence_oid, owner_oid, column_number) in sequence_owner_columns(&schema) {
+            rows.push(dependency_row(
+                ObjectAddress::whole::<PgClassTable>(sequence_oid),
+                ObjectAddress::column(owner_oid, column_number),
+                DependencyKind::Auto,
+            ));
+        }
         rows
     }
+}
+
+/// `(sequence oid, table oid, column number)` for each sequence that a
+/// table owns, with the column whose default takes values from it. The
+/// relation catalog records only the owning table, so a sequence that no
+/// column of its table takes values from is left out.
+fn sequence_owner_columns(schema: &Schema) -> Vec<(i64, i64, i64)> {
+    let tables = user_tables_with_oids(schema);
+    let mut owners = Vec::new();
+    for (sequence_oid, namespace, sequence) in sequence_catalog_entries(schema) {
+        let Some(owner_oid) = crate::classes::class_catalog(schema)
+            .and_then(|catalog| catalog.get_by_name(namespace, &sequence.name))
+            .map(|class| class.relownedby)
+            .filter(|owner_oid| *owner_oid != 0)
+        else {
+            continue;
+        };
+        let Some((.., table, _)) = tables.iter().find(|(.., oid)| *oid == owner_oid) else {
+            continue;
+        };
+        let mangled = mangle_name(namespace, &sequence.name);
+        let column = table.columns().iter().position(|column| {
+            column
+                .default
+                .as_deref()
+                .and_then(nextval_sequence_name)
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case(&mangled) || name.eq_ignore_ascii_case(&sequence.name)
+                })
+        });
+        if let Some(position) = column {
+            owners.push((sequence_oid, owner_oid, position as i64 + 1));
+        }
+    }
+    owners
+}
+
+/// The bare name of the sequence in a default of the form
+/// `nextval('sequence')`.
+fn nextval_sequence_name(default: &ast::Expr) -> Option<String> {
+    let ast::Expr::FunctionCall { name, args, .. } = default else {
+        return None;
+    };
+    if !name.as_str().eq_ignore_ascii_case("nextval") {
+        return None;
+    }
+    let [argument] = args.as_slice() else {
+        return None;
+    };
+    let ast::Expr::Literal(ast::Literal::String(quoted)) = argument.as_ref() else {
+        return None;
+    };
+    let text = quoted
+        .strip_prefix('\'')?
+        .strip_suffix('\'')?
+        .replace("''", "'");
+    Some(turso_core::split_sequence_name(&text).1)
 }
 
 /// The column numbers of a catalog row, from `int2vector` text such as

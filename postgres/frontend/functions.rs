@@ -46,6 +46,12 @@ macro_rules! scalar_functions {
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
+        "regclass"(FunctionArity::Exact(1), false) => {
+            crate::regclass::regclass_oid(connection, args[0].get_value())?
+        },
+        "regnamespace"(FunctionArity::Exact(1), false) => {
+            crate::regclass::regnamespace_oid(connection, args[0].get_value())?
+        },
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
