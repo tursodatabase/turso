@@ -69,6 +69,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
+        "array_to_json"(FunctionArity::OneOf(&[1, 2]), true) => exec_array_to_json(args)?,
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| exec_pg_format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -658,6 +659,53 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     let mut stripped = String::with_capacity(json.len());
     copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
     Ok(Some(stripped))
+}
+
+/// `array_to_json(array [, pretty])`: the array as a JSON array, with line
+/// feeds between its elements when `pretty` is true.
+fn exec_array_to_json(args: &[Register]) -> Result<Option<String>> {
+    let array = args[0].get_value();
+    if matches!(array, Value::Null) {
+        return Ok(None);
+    }
+    let pretty = match args.get(1).map(Register::get_value) {
+        None => false,
+        Some(Value::Null) => return Ok(None),
+        Some(pretty) => matches!(pretty, Value::Numeric(Numeric::Integer(1))),
+    };
+    let mut json = String::new();
+    write_json_array(array, if pretty { ",\n " } else { "," }, &mut json)?;
+    Ok(Some(json))
+}
+
+fn write_json_array(array: &Value, separator: &str, json: &mut String) -> Result<()> {
+    let elements = turso_core::array_values_from_any(array)
+        .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
+    json.push('[');
+    for (i, element) in elements.iter().enumerate() {
+        if i > 0 {
+            json.push_str(separator);
+        }
+        match element {
+            Value::Null => json.push_str("null"),
+            Value::Numeric(Numeric::Integer(number)) => json.push_str(&number.to_string()),
+            // JSON has no infinity, so PostgreSQL writes it as a string.
+            Value::Numeric(Numeric::Float(number)) if number.is_infinite() => {
+                json.push_str(if number.is_sign_positive() {
+                    "\"Infinity\""
+                } else {
+                    "\"-Infinity\""
+                })
+            }
+            Value::Numeric(number) => json.push_str(&Value::Numeric(*number).to_string()),
+            Value::Text(text) => {
+                json.push_str(&serde_json::to_string(text.as_str()).expect("a string serializes"))
+            }
+            Value::Blob(_) => write_json_array(element, ",", json)?,
+        }
+    }
+    json.push(']');
+    Ok(())
 }
 
 /// The nesting limit of the walk below, the same as core's jsonb parser. Past
@@ -1749,5 +1797,21 @@ mod tests {
             role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
             "postgres"
         );
+    }
+
+    #[test]
+    fn array_to_json_writes_infinite_floats_as_strings() {
+        let record = turso_core::types::ImmutableRecord::from_values(
+            &[
+                Value::from_f64(f64::INFINITY),
+                Value::from_f64(f64::NEG_INFINITY),
+                Value::from_f64(1.5),
+            ],
+            3,
+        )
+        .unwrap();
+        let mut json = String::new();
+        write_json_array(&Value::Blob(record.as_blob().clone()), ",", &mut json).unwrap();
+        assert_eq!(json, r#"["Infinity","-Infinity",1.5]"#);
     }
 }

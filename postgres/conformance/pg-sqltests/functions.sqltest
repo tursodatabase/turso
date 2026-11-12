@@ -1663,3 +1663,29 @@ test random-divisor-is-not-an-integer {
 expect {
     ok
 }
+
+test array-to-json-of-integers-texts-and-nulls {
+    SELECT array_to_json(ARRAY[1, 5, 99]),
+           array_to_json(ARRAY['a', 'b "c"', NULL]),
+           array_to_json(string_to_array('public', '')::name[]),
+           array_to_json(ARRAY[]::int[]),
+           coalesce(array_to_json(NULL::int[])::text, 'none');
+}
+expect {
+    [1,5,99]|["a","b \"c\"",null]|["public"]|[]|none
+}
+
+test array-to-json-pretty-puts-line-feeds-between-elements {
+    SELECT replace(array_to_json(ARRAY[1, 2, 3], true)::text, chr(10), '|'),
+           replace(array_to_json(ARRAY[1, 2, 3], false)::text, chr(10), '|');
+}
+expect {
+    [1,| 2,| 3]|[1,2,3]
+}
+
+test array-to-json-with-null-pretty-is-null {
+    SELECT coalesce(array_to_json(ARRAY[1, 2], NULL)::text, 'none');
+}
+expect {
+    none
+}
