@@ -638,4 +638,8 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    fn cast_to_integer(&self, value: &Value) -> Result<Value> {
+        Ok(value.exec_cast("INTEGER")?)
+    }
 }
