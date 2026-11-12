@@ -399,8 +399,10 @@ struct Condition {
 /// The conditions that `policies`, the policies of one command that apply
 /// to a role, put on rows, as PostgreSQL builds them: the conditions of the
 /// permissive policies combined with OR, and the condition of each
-/// restrictive policy. Without a permissive policy that has a condition, no
-/// row passes. `condition_of` gives a policy's condition, if it has one.
+/// restrictive policy, in the order of the policies' names, so that a row
+/// that fails several restrictive policies names the same one in its error.
+/// Without a permissive policy that has a condition, no row passes.
+/// `condition_of` gives a policy's condition, if it has one.
 fn conditions_of(
     policies: &[RowPolicy],
     condition_of: fn(&RowPolicy) -> Option<&ast::Expr>,
@@ -417,15 +419,17 @@ fn conditions_of(
             policy: None,
         }];
     };
-    let restrictive = policies
+    let mut restrictive: Vec<&RowPolicy> = policies
         .iter()
         .filter(|policy| !policy.permissive)
-        .filter_map(|policy| {
-            condition_of(policy).map(|expr| Condition {
-                expr: expr.clone(),
-                policy: Some(policy.name.clone()),
-            })
-        });
+        .collect();
+    restrictive.sort_by(|left, right| left.name.cmp(&right.name));
+    let restrictive = restrictive.into_iter().filter_map(|policy| {
+        condition_of(policy).map(|expr| Condition {
+            expr: expr.clone(),
+            policy: Some(policy.name.clone()),
+        })
+    });
     std::iter::once(Condition {
         expr: permissive,
         policy: None,

@@ -725,6 +725,24 @@ expect error {
     new row violates row-level security policy "positive_ids" for table "rw_docs_5"
 }
 
+# A row that fails several restrictive policies names the first of them by
+# name, not the first that was created, as in PostgreSQL.
+test insert-of-a-row-that-fails-several-restrictive-policies-names-the-first-by-name {
+    CREATE ROLE rw_alice_31;
+    CREATE TABLE rw_docs_31 (id INT PRIMARY KEY, owner TEXT);
+    ALTER TABLE rw_docs_31 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY anything ON rw_docs_31 FOR INSERT WITH CHECK (true);
+    CREATE POLICY small_ids ON rw_docs_31 AS RESTRICTIVE FOR INSERT WITH CHECK (id < 100);
+    CREATE POLICY even_ids ON rw_docs_31 AS RESTRICTIVE FOR INSERT WITH CHECK (id % 2 = 0);
+    GRANT INSERT ON rw_docs_31 TO rw_alice_31;
+    SET ROLE rw_alice_31;
+    INSERT INTO rw_docs_31 VALUES (501, 'a');
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy "even_ids" for table "rw_docs_31"
+}
+
 test insert-of-a-row-whose-check-is-null-fails {
     CREATE ROLE rw_alice_6;
     CREATE TABLE rw_docs_6 (id INT PRIMARY KEY, owner TEXT);
