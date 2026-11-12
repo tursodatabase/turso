@@ -402,7 +402,7 @@ fn check_blob_privileges(
     read_write: bool,
 ) -> Result<()> {
     let role = conn.current_role();
-    if schema.roles.is_superuser(role) {
+    if conn.dialect().role_is_superuser(schema, role) {
         return Ok(());
     }
     let denied = |action| {

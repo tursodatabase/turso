@@ -34,13 +34,14 @@ use turso_parser::ast::{
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
-/// A change a statement makes to a relation of the main database. DDL
-/// translation tells the dialect about it through
-/// [`Dialect::translate_relation_changes`], and the dialect's own bytecode
-/// tells it back through [`Dialect::apply_relation_change`] once the change
+/// A change a statement makes to the dialect's catalog of the main
+/// database: to a relation, or to the roles. Translation tells the dialect
+/// about it through
+/// [`Dialect::translate_catalog_changes`], and the dialect's own bytecode
+/// tells it back through [`Dialect::apply_catalog_change`] once the change
 /// is written.
 #[derive(Debug, Clone)]
-pub enum RelationChange {
+pub enum CatalogChange {
     Create {
         namespace: NamespaceId,
         name: String,
@@ -92,9 +93,11 @@ pub enum RelationChange {
         policy_name: String,
         if_exists: bool,
     },
+    /// `CREATE ROLE name`: a role that is not a superuser and cannot log in.
+    CreateRole { name: String },
 }
 
-/// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
+/// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
 #[derive(Debug, Clone)]
 pub enum NewOwner {
     /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
@@ -328,32 +331,25 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a database of this dialect stores roles in the roles table.
-    ///
-    /// SQLite has no roles, so a table named like the roles table is an
-    /// ordinary table.
-    fn supports_roles(&self) -> bool {
-        false
-    }
-
-    /// SQL that reads the dialect's own schema state, such as the PostgreSQL
-    /// frontend's relation catalog table, or None when this database keeps
-    /// none. The statement runs with engine semantics after the schema rows
-    /// load, and its rows go to [`Dialect::build_schema_state`].
-    fn schema_state_query(&self, schema: &Schema) -> Option<String> {
+    /// SQL statements that read the dialect's own schema state, such as the
+    /// PostgreSQL frontend's relation catalog table, or none when this
+    /// database keeps none. The statements run with engine semantics after
+    /// the schema rows load, and their rows go to
+    /// [`Dialect::build_schema_state`].
+    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
         let _ = schema;
-        None
+        Vec::new()
     }
 
-    /// Builds [`Schema::dialect_schema`] from the rows that
-    /// [`Dialect::schema_state_query`] returned. `schema` is the schema the
-    /// state is built for, already holding every other object.
+    /// Builds [`Schema::dialect_schema`] from the rows of each statement of
+    /// [`Dialect::schema_state_queries`], in the same order. `schema` is the
+    /// schema the state is built for, already holding every other object.
     fn build_schema_state(
         &self,
         schema: &Schema,
-        rows: &[Vec<Value>],
+        results: &[Vec<Vec<Value>>],
     ) -> Result<Arc<dyn Any + Send + Sync>> {
-        let _ = (schema, rows);
+        let _ = (schema, results);
         Err(LimboError::InternalError(
             "the dialect queried schema state it cannot build".to_string(),
         ))
@@ -364,21 +360,21 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership, privileges or row-level security and refuses
-    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
-    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY` and
-    /// `DROP POLICY`.
-    fn translate_relation_changes(
+    /// has no roles, ownership, privileges or row-level security and refuses
+    /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
+    /// `GRANT`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`
+    /// and `DROP POLICY`.
+    fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[RelationChange],
+        changes: &[CatalogChange],
     ) -> Result<()> {
         let _ = (program, schema, connection);
         for change in changes {
             match change {
-                RelationChange::ChangeOwner {
+                CatalogChange::ChangeOwner {
                     owner: NewOwner::Role(_),
                     ..
                 } => {
@@ -386,7 +382,7 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER ... OWNER TO is not supported".to_string(),
                     ));
                 }
-                RelationChange::ChangeOwner {
+                CatalogChange::ChangeOwner {
                     owner: NewOwner::Table(_),
                     ..
                 } => {
@@ -394,14 +390,19 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
                 }
-                RelationChange::Grant { .. } => {
+                CatalogChange::Grant { .. } => {
                     return Err(LimboError::ParseError("GRANT is not supported".to_string()));
                 }
-                RelationChange::SetRowSecurity { .. }
-                | RelationChange::CreatePolicy { .. }
-                | RelationChange::DropPolicy { .. } => {
+                CatalogChange::SetRowSecurity { .. }
+                | CatalogChange::CreatePolicy { .. }
+                | CatalogChange::DropPolicy { .. } => {
                     return Err(LimboError::ParseError(
                         "row-level security is not supported".to_string(),
+                    ));
+                }
+                CatalogChange::CreateRole { .. } => {
+                    return Err(LimboError::ParseError(
+                        "CREATE ROLE is not supported".to_string(),
                     ));
                 }
                 _ => {}
@@ -414,10 +415,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// schema state, to the in-memory copy in `schema`. `values` are the
     /// registers the dialect named when it emitted the instruction, such as
     /// the id its state gave a created relation.
-    fn apply_relation_change(
+    fn apply_catalog_change(
         &self,
         schema: &mut Schema,
-        change: &RelationChange,
+        change: &CatalogChange,
         values: &[Value],
     ) -> Result<()> {
         let _ = (schema, change, values);
@@ -430,6 +431,28 @@ pub trait Dialect: Send + Sync + 'static {
     /// made while it was attached could not be opened later.
     fn supports_relation_ddl_in_attached_databases(&self) -> bool {
         true
+    }
+
+    /// The id of the role named `name`, case-sensitively, when the dialect
+    /// stores roles. A dialect without roles has none, so a connection can
+    /// run only as the superuser.
+    fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
+        let _ = (schema, name);
+        None
+    }
+
+    /// Whether `role` passes every privilege check. [`RoleId::SUPERUSER`]
+    /// does in every dialect.
+    fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
+        let _ = schema;
+        role == RoleId::SUPERUSER
+    }
+
+    /// Whether a session whose current role is `member` may switch to `role`
+    /// with `SET ROLE`. A superuser may switch to any role, any role may
+    /// switch to itself, and no session may switch to [`RoleId::PUBLIC`].
+    fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        role != RoleId::PUBLIC && (member == role || self.role_is_superuser(schema, member))
     }
 
     /// The role that owns relation `name` of `namespace`, when the dialect

@@ -7,6 +7,7 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
+use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
     SettingScope,
@@ -1882,7 +1883,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
     if relations.is_empty() {
         // With nothing to grant on, the roles are still checked, as in
         // PostgreSQL; otherwise the dialect checks them.
-        let roles = conn.role_catalog();
+        let roles = connection_roles(conn);
         for grantee in &stmt.roles {
             if let PgGrantee::Role(name) = grantee {
                 if catalog::role_oid_by_name(&roles, name).is_none() {
@@ -2069,7 +2070,7 @@ pub(crate) fn set_role(
     let role = match value.filter(|name| *name != "none") {
         None => None,
         Some(name) => {
-            let roles = conn.role_catalog();
+            let roles = connection_roles(conn);
             let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
                 return Err(sqlstate_error(
                     SQLSTATE_UNDEFINED_OBJECT,

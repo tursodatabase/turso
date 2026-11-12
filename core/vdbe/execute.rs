@@ -13966,47 +13966,14 @@ pub fn op_add_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_add_role(
+pub fn op_catalog_change(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
-        AddRole {
-            db,
-            id_reg,
-            name,
-            superuser,
-        },
-        insn
-    );
-    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[*id_reg].get_value() else {
-        return Err(LimboError::InternalError(format!(
-            "AddRole: role rowid register r[{id_reg}] does not hold an integer"
-        ))
-        .into());
-    };
-    let role = crate::security::roles::Role {
-        id: crate::security::roles::RoleId::from_rowid(*rowid),
-        name: name.clone(),
-        superuser: *superuser,
-    };
-    program
-        .connection
-        .with_database_schema_mut(*db, |schema| Arc::make_mut(&mut schema.roles).add(role))?;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-pub fn op_relation_change(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        RelationChange {
+        CatalogChange {
             db,
             change,
             value_regs
@@ -14021,7 +13988,7 @@ pub fn op_relation_change(
     program
         .connection
         .with_database_schema_mut(*db, |schema| {
-            dialect.apply_relation_change(schema, change, &values)
+            dialect.apply_catalog_change(schema, change, &values)
         })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

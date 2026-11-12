@@ -8,7 +8,7 @@
 //!
 //! Which tables have row-level security, and their policies, are the
 //! dialect's schema state, like the owner of a table. The module compiles the
-//! statements that change them into a [`RelationChange`] for the dialect to
+//! statements that change them into a [`CatalogChange`] for the dialect to
 //! record.
 
 use std::sync::Arc;
@@ -17,13 +17,13 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::RelationChange,
+    dialect::CatalogChange,
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
     security::permission::{Action, Object, PermissionDenied},
     security::policy::{Command, Policy, RowPolicy},
-    security::roles::{RoleCatalog, RoleId},
+    security::roles::RoleId,
     translate::{
         emitter::{with_columns_in_registers, Resolver},
         expr::{
@@ -301,12 +301,13 @@ pub(crate) fn check_blob_open(
         (Command::Select, Action::Read)
     };
     let dialect = connection.dialect();
+    let role = connection.current_role();
     let policy = connection.with_schema(MAIN_DB_ID, |schema| {
         policy_for(
             dialect.as_ref(),
-            &schema.roles,
             schema,
-            connection.current_role(),
+            role,
+            dialect.role_is_superuser(schema, role),
             NamespaceId::ROOT,
             table_name,
             command,
@@ -332,20 +333,22 @@ fn policy(
     table_name: &str,
     command: Command,
 ) -> Policy {
-    let roles = resolver.schema().roles.clone();
+    let dialect = resolver.catalog.dialect.as_ref();
+    let is_superuser = |role| dialect.role_is_superuser(resolver.schema(), role);
     // A statement the engine compiles as the superuser stays unlimited
     // inside a view.
-    let role = if roles.is_superuser(resolver.row_security_role) {
+    let role = if is_superuser(resolver.row_security_role) {
         resolver.row_security_role
     } else {
         roles::table_reader(resolver, resolver.row_security_role)
     };
+    let role_is_superuser = is_superuser(role);
     resolver.with_schema(namespace.database_id, |schema| {
         policy_for(
-            resolver.catalog.dialect.as_ref(),
-            &roles,
+            dialect,
             schema,
             role,
+            role_is_superuser,
             namespace.id,
             table_name,
             command,
@@ -357,17 +360,19 @@ fn policy(
 /// `namespace` in `schema` that `role` may access for `command`, and the
 /// policies that then decide. As in PostgreSQL's `check_enable_rls`,
 /// row-level security does not limit superusers or the table's owner.
+/// Whether `role` is a superuser comes from the main database, which the
+/// role was set from, and `schema` may be another one.
 fn policy_for(
     dialect: &dyn Dialect,
-    roles: &RoleCatalog,
     schema: &Schema,
     role: RoleId,
+    role_is_superuser: bool,
     namespace: NamespaceId,
     table_name: &str,
     command: Command,
 ) -> Policy {
     let table_name = normalize_ident(table_name);
-    if roles.is_superuser(role)
+    if role_is_superuser
         || !dialect.table_rls_enabled(schema, namespace, &table_name)
         || dialect.relation_owner(schema, namespace, &table_name) == Some(role)
     {
@@ -580,7 +585,7 @@ pub(crate) fn translate_set_row_security(
 ) -> Result<()> {
     let (namespace, table) = row_security_table(qualified_name, resolver)?;
     translate_change(
-        RelationChange::SetRowSecurity {
+        CatalogChange::SetRowSecurity {
             namespace: namespace.id,
             name: normalize_ident(&table.declared_name),
             enabled,
@@ -630,7 +635,7 @@ pub(crate) fn translate_create_policy(
         prepare_policy_expr(expr, namespace, &table, resolver)?;
     }
     translate_change(
-        RelationChange::CreatePolicy {
+        CatalogChange::CreatePolicy {
             namespace: namespace.id,
             name: normalize_ident(&table.declared_name),
             policy: Box::new(stored),
@@ -665,7 +670,7 @@ pub(crate) fn translate_drop_policy(
     }
     let (namespace, table) = row_security_table(tbl_name, resolver)?;
     translate_change(
-        RelationChange::DropPolicy {
+        CatalogChange::DropPolicy {
             namespace: namespace.id,
             name: normalize_ident(&table.declared_name),
             policy_name: policy_name.as_str().to_string(),
@@ -750,8 +755,8 @@ fn row_security_table(
 
 /// Records `change` through the dialect, in a write transaction that bumps
 /// the schema cookie so that other connections load it.
-fn translate_change(
-    change: RelationChange,
+pub(crate) fn translate_change(
+    change: CatalogChange,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -761,7 +766,7 @@ fn translate_change(
     resolver
         .catalog
         .dialect
-        .translate_relation_changes(program, schema, connection, &[change])?;
+        .translate_catalog_changes(program, schema, connection, &[change])?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }
@@ -928,9 +933,9 @@ mod tests {
     use crate::namespace::{NamespaceId, NamespaceRef};
     use crate::schema::{BTreeTable, Schema};
     use crate::security::policy::RowPolicy;
-    use crate::security::roles::{RoleCatalog, RoleId};
+    use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::{Database, DatabaseCatalog, MemoryIO, Qualifiers, RwLock, SymbolTable, Value};
+    use crate::{Database, DatabaseCatalog, MemoryIO, Qualifiers, RwLock, SymbolTable};
 
     /// The engine dialect, except that every table of a schema with dialect
     /// schema state has row-level security, and table `documents` has a
@@ -1137,15 +1142,8 @@ mod tests {
     /// A main database whose tables have row-level security, and the role
     /// alice, who is not a superuser.
     fn main_schema_with_role_alice() -> (Schema, RoleId) {
-        let roles = RoleCatalog::new(&[vec![
-            Value::from_i64(1),
-            Value::build_text("alice"),
-            Value::from_i64(0),
-        ]])
-        .unwrap();
-        let alice = roles.get_by_name("alice").unwrap().id;
+        let alice = RoleId::from_stored(1);
         let mut main = Schema::default();
-        main.roles = Arc::new(roles);
         main.dialect_schema = Some(Arc::new(()));
         (main, alice)
     }

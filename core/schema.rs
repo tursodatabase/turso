@@ -114,7 +114,6 @@ impl Trigger {
     }
 }
 
-use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -1303,9 +1302,6 @@ pub struct Schema {
     /// loaded, built once they are.
     pending_materialized_views: Option<PendingMaterializedViews>,
 
-    /// The roles of the database. Copies of the schema share them.
-    pub roles: Arc<RoleCatalog>,
-
     /// Schema state of the database's dialect, opaque to core: what the
     /// dialect's [`crate::Dialect::build_schema_state`] built from its own
     /// schema table, such as the PostgreSQL frontend's relation catalog.
@@ -1567,7 +1563,6 @@ impl Schema {
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
-            roles: Arc::default(),
             dialect_schema: None,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
@@ -5117,7 +5112,6 @@ impl TryClone for Schema {
             default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
-            roles: self.roles.clone(),
             dialect_schema: self.dialect_schema.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
@@ -9502,15 +9496,6 @@ mod tests {
     }
 
     use crate::alloc::vec;
-
-    #[test]
-    fn schema_clones_share_the_role_catalog() {
-        let schema = Schema::new();
-
-        let clone = schema.try_clone().unwrap();
-
-        assert!(Arc::ptr_eq(&schema.roles, &clone.roles));
-    }
 
     #[test]
     fn test_column_definition_flag_conversion() {

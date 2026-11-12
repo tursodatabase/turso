@@ -858,17 +858,13 @@ fn blob_boundary_read_write_sweep() {
     blob.close().unwrap();
 }
 
-/// A dialect with roles whose privileges let no role read the table `secret`.
+/// A dialect whose privileges let no role read the table `secret`.
 /// Every other table may be read by every role, as with the default dialect.
 struct SecretTableDialect;
 
 impl Dialect for SecretTableDialect {
     fn name(&self) -> &'static str {
         "secret-table-test"
-    }
-
-    fn supports_roles(&self) -> bool {
-        true
     }
 
     fn role_has_privilege(
@@ -897,8 +893,7 @@ fn blob_open_checks_the_privileges_of_the_current_role() {
     exec(&conn, "INSERT INTO secret VALUES (1, zeroblob(8))");
     exec(&conn, "INSERT INTO shared VALUES (1, zeroblob(8))");
 
-    // The role catalog has no entry for this role, and a role it does not
-    // know is not a superuser.
+    // Only the built-in superuser is a superuser under this dialect.
     conn.set_current_role(RoleId::from_stored(7));
 
     let err = conn.blob_open("secret", "data", 1, false).unwrap_err();

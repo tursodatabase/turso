@@ -44,7 +44,7 @@ expect error {
 @skip-if postgres "PostgreSQL has no __turso_internal_* tables"
 test superuser-reads-the-engine-catalog-tables {
     CREATE ROLE gs_catalog_listed;
-    SELECT name FROM pg_catalog.__turso_internal_roles WHERE name = 'gs_catalog_listed';
+    SELECT rolname FROM pg_catalog.__turso_internal_authid WHERE rolname = 'gs_catalog_listed';
 }
 expect {
     gs_catalog_listed

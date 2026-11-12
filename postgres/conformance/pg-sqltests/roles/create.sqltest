@@ -87,6 +87,7 @@ test create-role-twice-fails {
     CREATE ROLE cr_twice;
     CREATE ROLE cr_twice;
 }
+@sqlstate 42710
 expect error {
     role "cr_twice" already exists
 }

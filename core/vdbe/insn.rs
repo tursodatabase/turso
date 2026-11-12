@@ -1940,21 +1940,13 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
-    /// Add a role to the in-memory role catalog after its row was inserted
-    AddRole {
-        db: usize,
-        /// Register holding the rowid of the role in the roles table
-        id_reg: usize,
-        name: String,
-        superuser: bool,
-    },
-    /// Tell the dialect that a relation of database `db` changed, after the
+    /// Tell the dialect that its catalog of database `db` changed, after the
     /// statement wrote the dialect's own schema state for it, so the
     /// in-memory copy follows. `value_regs` name the registers the dialect
     /// reads back, such as the id its state gave a created relation.
-    RelationChange {
+    CatalogChange {
         db: usize,
-        change: Box<crate::dialect::RelationChange>,
+        change: Box<crate::dialect::CatalogChange>,
         value_regs: Vec<usize>,
     },
 
@@ -2611,8 +2603,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
-            InsnVariants::AddRole => execute::op_add_role,
-            InsnVariants::RelationChange => execute::op_relation_change,
+            InsnVariants::CatalogChange => execute::op_catalog_change,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2759,8 +2750,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
-            | Self::AddRole { .. }
-            | Self::RelationChange { .. }
+            | Self::CatalogChange { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

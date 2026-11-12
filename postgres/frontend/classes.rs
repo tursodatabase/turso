@@ -11,14 +11,15 @@
 //! table becomes `pg_class`, by renaming and adding columns.
 //!
 //! Core knows nothing of this table. [`crate::catalog::PostgresDialect`]
-//! maintains it through the engine's relation hooks: every statement that
+//! maintains it through the engine's catalog hooks: every statement that
 //! adds, renames or removes a relation calls back here to write the matching
 //! row in the same transaction as its `sqlite_schema` rows, so the two can
-//! never disagree after a crash, and the engine loads the rows back as its
-//! opaque dialect schema state whenever it loads the schema.
+//! never disagree after a crash, and the engine loads the rows back with
+//! the rest of the frontend's schema state, see [`crate::schema_state`],
+//! whenever it loads the schema.
 //!
 //! The frontend creates the table when it opens a database, before it holds
-//! any relation. A database that already has relations but no catalog was
+//! any relation, together with the roles table of [`crate::roles`]. A database that already has relations but no catalog was
 //! written by an earlier tursopg; the frontend refuses such files instead of
 //! migrating them: tursopg has made no compatibility promises yet, and a
 //! refusal is better than inventing oids and owners for relations it did not
@@ -29,7 +30,6 @@
 //! highest oid ever used is kept in `sqlite_sequence` under the catalog's
 //! own name, like an AUTOINCREMENT table's watermark.
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -40,9 +40,10 @@ use turso_core::schema::{
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CmpInsFlags,
-    CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn, LimboError, NewOwner,
-    Numeric, ProgramBuilder, RegisterOrLiteral, RelationChange, Value, SQLITE_CONSTRAINT_UNIQUE,
+    emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CatalogChange,
+    CmpInsFlags, CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn,
+    LimboError, NewOwner, Numeric, ProgramBuilder, RegisterOrLiteral, Value,
+    SQLITE_CONSTRAINT_UNIQUE,
 };
 use turso_parser::ast;
 
@@ -57,6 +58,10 @@ use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
 use crate::policies;
+use crate::roles::{
+    schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
+};
+use crate::schema_state::schema_state;
 use turso_core::{security::policy::RowPolicy, SessionRole};
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
@@ -163,6 +168,22 @@ pub(crate) struct ClassCatalog {
 }
 
 impl ClassCatalog {
+    /// Returns the catalog of the rows read from the classes table for
+    /// `schema`, after checking that every user relation of `schema` has a
+    /// row.
+    pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
+        let catalog = Self::new(rows)?;
+        for (namespace, name, _) in schema.user_relations() {
+            if catalog.get_by_name(namespace, &name).is_none() {
+                return Err(LimboError::Corrupt(format!(
+                    "relation \"{name}\" of namespace {} has no row in {CLASSES_TABLE_NAME}",
+                    namespace.as_u32()
+                )));
+            }
+        }
+        Ok(catalog)
+    }
+
     /// Returns a catalog of the rows read from the classes table. Each row is
     /// `(oid, relname, relnamespace, relkind, relowner, relownedby, relacl,
     /// relrowsecurity, relpolicies)`.
@@ -201,9 +222,13 @@ impl ClassCatalog {
     /// Applies what a statement wrote to the stored rows. `values` are what
     /// the emitted instruction read back: a created relation's oid and
     /// owner, a changed owner with the list it leaves, or a granted list.
-    fn apply(&mut self, change: &RelationChange, values: &[Value]) -> turso_core::Result<()> {
+    pub(crate) fn apply(
+        &mut self,
+        change: &CatalogChange,
+        values: &[Value],
+    ) -> turso_core::Result<()> {
         match change {
-            RelationChange::Create {
+            CatalogChange::Create {
                 namespace,
                 name,
                 kind,
@@ -226,7 +251,7 @@ impl ClassCatalog {
                     relpolicies: Vec::new(),
                 });
             }
-            RelationChange::Drop { namespace, name } => {
+            CatalogChange::Drop { namespace, name } => {
                 // What the dropped relation owned is nobody's now.
                 if let Some(dropped) = self.remove(*namespace, name) {
                     for class in self.by_oid.values_mut() {
@@ -236,7 +261,7 @@ impl ClassCatalog {
                     }
                 }
             }
-            RelationChange::ChangeOwner {
+            CatalogChange::ChangeOwner {
                 namespace,
                 name,
                 owner: NewOwner::Table(table),
@@ -253,7 +278,7 @@ impl ClassCatalog {
                         .relownedby = table_oid;
                 }
             }
-            RelationChange::Rename {
+            CatalogChange::Rename {
                 namespace,
                 old_name,
                 new_name,
@@ -263,7 +288,7 @@ impl ClassCatalog {
                     self.add(class);
                 }
             }
-            RelationChange::ChangeOwner {
+            CatalogChange::ChangeOwner {
                 namespace,
                 name,
                 owner: NewOwner::Role(_),
@@ -279,7 +304,7 @@ impl ClassCatalog {
                     class.relacl = read_back_acl(acl)?;
                 }
             }
-            RelationChange::Grant {
+            CatalogChange::Grant {
                 namespace, name, ..
             } => {
                 let [acl] = values else {
@@ -294,7 +319,7 @@ impl ClassCatalog {
                         .relacl = read_back_acl(acl)?;
                 }
             }
-            RelationChange::SetRowSecurity {
+            CatalogChange::SetRowSecurity {
                 namespace,
                 name,
                 enabled,
@@ -306,10 +331,10 @@ impl ClassCatalog {
                         .relrowsecurity = *enabled;
                 }
             }
-            RelationChange::CreatePolicy {
+            CatalogChange::CreatePolicy {
                 namespace, name, ..
             }
-            | RelationChange::DropPolicy {
+            | CatalogChange::DropPolicy {
                 namespace, name, ..
             } => {
                 let [relpolicies] = values else {
@@ -323,6 +348,11 @@ impl ClassCatalog {
                         .expect("both maps hold the row")
                         .relpolicies = read_back_policies(relpolicies)?;
                 }
+            }
+            CatalogChange::CreateRole { .. } => {
+                return Err(LimboError::InternalError(
+                    "CREATE ROLE reached the relation catalog".to_string(),
+                ));
             }
         }
         Ok(())
@@ -416,14 +446,14 @@ fn corrupt_row(row: &[Value]) -> LimboError {
     LimboError::Corrupt(format!("{CLASSES_TABLE_NAME} has an invalid row: {row:?}"))
 }
 
-/// The catalog that the engine loaded as this database's dialect schema
-/// state, or None when it is not loaded, as in a read-only open of an empty
-/// database.
+/// The catalog that the engine loaded with the frontend's schema state, or
+/// None when it is not loaded, as in a read-only open of an empty database.
 pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
-    schema.dialect_schema.as_ref()?.downcast_ref()
+    schema_state(schema).map(|state| state.classes.as_ref())
 }
 
-/// [`turso_core::Dialect::schema_state_query`] for the PostgreSQL frontend.
+/// The query of the relation catalog for
+/// [`turso_core::Dialect::schema_state_queries`].
 /// A catalog made before it had `relacl`, `relrowsecurity` or `relpolicies`
 /// and opened read-only, which cannot add them, reads as having no grants,
 /// no row-level security and no policies.
@@ -462,43 +492,6 @@ fn has_policies_column(table: &BTreeTable) -> bool {
     table.get_column(POLICIES_COLUMN_NAME).is_some()
 }
 
-/// [`turso_core::Dialect::build_schema_state`] for the PostgreSQL frontend:
-/// the loaded catalog, after checking that every user relation has a row.
-pub(crate) fn build_schema_state(
-    schema: &Schema,
-    rows: &[Vec<Value>],
-) -> turso_core::Result<Arc<dyn Any + Send + Sync>> {
-    let catalog = ClassCatalog::new(rows)?;
-    for (namespace, name, _) in schema.user_relations() {
-        if catalog.get_by_name(namespace, &name).is_none() {
-            return Err(LimboError::Corrupt(format!(
-                "relation \"{name}\" of namespace {} has no row in {CLASSES_TABLE_NAME}",
-                namespace.as_u32()
-            )));
-        }
-    }
-    Ok(Arc::new(catalog))
-}
-
-/// [`turso_core::Dialect::apply_relation_change`] for the PostgreSQL
-/// frontend: keeps the in-memory catalog in step with the stored rows the
-/// running statement wrote.
-pub(crate) fn apply_relation_change(
-    schema: &mut Schema,
-    change: &RelationChange,
-    values: &[Value],
-) -> turso_core::Result<()> {
-    let Some(state) = schema.dialect_schema.take() else {
-        return Ok(());
-    };
-    let mut catalog: Arc<ClassCatalog> = state.downcast().map_err(|_| {
-        LimboError::InternalError("the dialect schema state is not the relation catalog".into())
-    })?;
-    Arc::make_mut(&mut catalog).apply(change, values)?;
-    schema.dialect_schema = Some(catalog);
-    Ok(())
-}
-
 /// [`turso_core::Dialect::relation_owner`] for the PostgreSQL frontend.
 pub(crate) fn relation_owner(
     schema: &Schema,
@@ -515,7 +508,7 @@ pub(crate) fn relation_owner(
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// the owner has every privilege, and another role has the ones the list
 /// gives it, by oid or through PUBLIC. A table without a class row is one of
-/// the engine's own, such as `__turso_internal_roles` or `sqlite_sequence`,
+/// the engine's own, such as `__turso_internal_authid` or `sqlite_sequence`,
 /// and only a superuser uses it, because nothing says who else may.
 pub(crate) fn role_has_privilege(
     schema: &Schema,
@@ -612,7 +605,7 @@ fn read_back_policies(value: &Value) -> turso_core::Result<Vec<RowPolicy>> {
     }
 }
 
-/// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
+/// [`turso_core::Dialect::translate_catalog_changes`] for the PostgreSQL
 /// frontend: a class row per created relation, owned by the current role,
 /// which is what PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row
 /// for a dropped one; a rename keeps the oid and owner; `ALTER ... OWNER TO`
@@ -624,25 +617,25 @@ fn read_back_policies(value: &Value) -> turso_core::Result<Vec<RowPolicy>> {
 /// nothing, as in PostgreSQL, which only warns. `ALTER TABLE ... ENABLE ROW
 /// LEVEL SECURITY` sets `relrowsecurity` of the table's row, which a catalog
 /// table does not have (42501).
-pub(crate) fn translate_relation_changes(
+pub(crate) fn translate_catalog_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
     connection: &Arc<Connection>,
-    changes: &[RelationChange],
+    changes: &[CatalogChange],
 ) -> turso_core::Result<()> {
     let allocates_oids = changes
         .iter()
-        .any(|change| matches!(change, RelationChange::Create { .. }));
+        .any(|change| matches!(change, CatalogChange::Create { .. }));
     let changes_owner_or_privileges = changes.iter().any(|change| {
         matches!(
             change,
-            RelationChange::ChangeOwner {
+            CatalogChange::ChangeOwner {
                 owner: NewOwner::Role(_),
                 ..
-            } | RelationChange::Grant { .. }
-                | RelationChange::SetRowSecurity { .. }
-                | RelationChange::CreatePolicy { .. }
-                | RelationChange::DropPolicy { .. }
+            } | CatalogChange::Grant { .. }
+                | CatalogChange::SetRowSecurity { .. }
+                | CatalogChange::CreatePolicy { .. }
+                | CatalogChange::DropPolicy { .. }
         )
     });
     let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
@@ -655,7 +648,7 @@ pub(crate) fn translate_relation_changes(
     };
     for change in changes {
         match change {
-            RelationChange::Create {
+            CatalogChange::Create {
                 namespace,
                 name,
                 kind,
@@ -687,7 +680,7 @@ pub(crate) fn translate_relation_changes(
                     owner,
                 )
             }
-            RelationChange::Drop { namespace, name } => {
+            CatalogChange::Drop { namespace, name } => {
                 // An engine relation has no row and nothing to do.
                 let Some(owned) = class_catalog(schema).and_then(|catalog| {
                     let class = catalog.get_by_name(*namespace, name)?;
@@ -707,7 +700,7 @@ pub(crate) fn translate_relation_changes(
                 }
                 emit_class_row_delete(program, &cursors, *namespace, name)
             }
-            RelationChange::ChangeOwner {
+            CatalogChange::ChangeOwner {
                 namespace,
                 name,
                 owner: NewOwner::Table(table),
@@ -722,13 +715,13 @@ pub(crate) fn translate_relation_changes(
                     None => 0,
                 };
                 emit_class_row_set_owned_by(program, &cursors, *namespace, name, table_oid);
-                program.emit_insn(Insn::RelationChange {
+                program.emit_insn(Insn::CatalogChange {
                     db: MAIN_DB_ID,
                     change: Box::new(change.clone()),
                     value_regs: vec![],
                 });
             }
-            RelationChange::Rename {
+            CatalogChange::Rename {
                 namespace,
                 old_name,
                 new_name,
@@ -739,7 +732,7 @@ pub(crate) fn translate_relation_changes(
                     emit_class_row_rename(program, &cursors, *namespace, old_name, new_name);
                 }
             }
-            RelationChange::ChangeOwner {
+            CatalogChange::ChangeOwner {
                 namespace,
                 name,
                 owner: NewOwner::Role(new_owner),
@@ -799,7 +792,7 @@ pub(crate) fn translate_relation_changes(
                     );
                 }
             }
-            RelationChange::Grant {
+            CatalogChange::Grant {
                 namespace,
                 name,
                 privileges,
@@ -869,7 +862,7 @@ pub(crate) fn translate_relation_changes(
                 }
                 emit_class_row_set_acl(program, &cursors, *namespace, name, &acl, change);
             }
-            RelationChange::SetRowSecurity {
+            CatalogChange::SetRowSecurity {
                 namespace,
                 name,
                 enabled,
@@ -886,7 +879,7 @@ pub(crate) fn translate_relation_changes(
                 }
                 emit_class_row_set_row_security(program, &cursors, *namespace, name, change);
             }
-            RelationChange::CreatePolicy {
+            CatalogChange::CreatePolicy {
                 namespace,
                 name,
                 policy,
@@ -935,7 +928,7 @@ pub(crate) fn translate_relation_changes(
                     change,
                 );
             }
-            RelationChange::DropPolicy {
+            CatalogChange::DropPolicy {
                 namespace,
                 name,
                 policy_name,
@@ -963,6 +956,11 @@ pub(crate) fn translate_relation_changes(
                     .collect();
                 let stored = (!relpolicies.is_empty()).then(|| policies::stored_text(&relpolicies));
                 emit_class_row_set_policies(program, &cursors, *namespace, name, stored, change);
+            }
+            CatalogChange::CreateRole { .. } => {
+                return Err(LimboError::InternalError(
+                    "CREATE ROLE reached the relation catalog".to_string(),
+                ));
             }
         }
     }
@@ -1015,8 +1013,10 @@ fn resolve_grantee(
         ast::Grantee::Public => PUBLIC_OID,
         ast::Grantee::Role(ast::RoleSpec::CurrentRole) => role_oid(connection.current_role()),
         ast::Grantee::Role(ast::RoleSpec::SessionUser) => role_oid(connection.session_role()),
-        ast::Grantee::Role(ast::RoleSpec::Name(name)) => role_oid_by_name(&schema.roles, name)
-            .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
+        ast::Grantee::Role(ast::RoleSpec::Name(name)) => {
+            role_oid_by_name(schema_roles(schema), name)
+                .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?
+        }
     })
 }
 
@@ -1049,8 +1049,7 @@ fn resolve_role(
         ast::RoleSpec::CurrentRole => connection.current_role(),
         ast::RoleSpec::SessionUser => connection.session_role(),
         ast::RoleSpec::Name(name) if name == BOOTSTRAP_SUPERUSER_NAME => RoleId::SUPERUSER,
-        ast::RoleSpec::Name(name) => schema
-            .roles
+        ast::RoleSpec::Name(name) => schema_roles(schema)
             .get_by_name(name)
             .map(|role| role.id)
             .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
@@ -1254,9 +1253,9 @@ fn emit_class_row_insert(
         oid_reg,
     );
 
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(RelationChange::Create {
+        change: Box::new(CatalogChange::Create {
             namespace,
             name: name.to_string(),
             kind,
@@ -1308,9 +1307,9 @@ fn emit_class_row_delete(
             is_part_of_update: true,
         });
     });
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(RelationChange::Drop {
+        change: Box::new(CatalogChange::Drop {
             namespace,
             name: name.to_string(),
         }),
@@ -1343,9 +1342,9 @@ fn emit_class_row_rename(
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(RelationChange::Rename {
+        change: Box::new(CatalogChange::Rename {
             namespace,
             old_name: old_name.to_string(),
             new_name: new_name.to_string(),
@@ -1385,9 +1384,9 @@ fn emit_class_row_set_owner(
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(RelationChange::ChangeOwner {
+        change: Box::new(CatalogChange::ChangeOwner {
             namespace,
             name: name.to_string(),
             owner: NewOwner::Role(new_owner.clone()),
@@ -1404,7 +1403,7 @@ fn emit_class_row_set_acl(
     namespace: NamespaceId,
     name: &str,
     acl: &Acl,
-    change: &RelationChange,
+    change: &CatalogChange,
 ) {
     let acl_reg = emit_acl(program, Some(acl));
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
@@ -1421,7 +1420,7 @@ fn emit_class_row_set_acl(
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
         change: Box::new(change.clone()),
         value_regs: vec![acl_reg],
@@ -1435,9 +1434,9 @@ fn emit_class_row_set_row_security(
     cursors: &ClassTableCursors,
     namespace: NamespaceId,
     name: &str,
-    change: &RelationChange,
+    change: &CatalogChange,
 ) {
-    let RelationChange::SetRowSecurity { enabled, .. } = change else {
+    let CatalogChange::SetRowSecurity { enabled, .. } = change else {
         unreachable!("the caller passes a row-level security change");
     };
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
@@ -1454,7 +1453,7 @@ fn emit_class_row_set_row_security(
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
         change: Box::new(change.clone()),
         value_regs: vec![],
@@ -1469,7 +1468,7 @@ fn emit_class_row_set_policies(
     namespace: NamespaceId,
     name: &str,
     stored: Option<String>,
-    change: &RelationChange,
+    change: &CatalogChange,
 ) {
     let policies_reg = program.alloc_register();
     match stored {
@@ -1496,7 +1495,7 @@ fn emit_class_row_set_policies(
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
-    program.emit_insn(Insn::RelationChange {
+    program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
         change: Box::new(change.clone()),
         value_regs: vec![policies_reg],
@@ -1822,10 +1821,11 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
     watermark_reg
 }
 
-/// Creates the classes table, its name index, the `sqlite_sequence` table
-/// and the oid watermark row in one write transaction, unless the table
-/// exists. A table made before it had `relacl`, `relrowsecurity` or
-/// `relpolicies` gets the missing columns. A database
+/// Creates the classes table, its name index, the `sqlite_sequence` table,
+/// the oid watermark row and the roles table in one write transaction,
+/// unless the classes table exists. A classes table made before it had
+/// `relacl`, `relrowsecurity` or `relpolicies` gets the missing columns, and
+/// a database made before the roles table gets an empty one. A database
 /// that already has relations without the table is refused, and a read-only
 /// open can neither create nor need it: the database is empty. After this
 /// returns, every relation the database will ever hold has a class row from
@@ -1839,10 +1839,10 @@ pub(crate) fn ensure_classes_table(
         let has_every_column = has_acl_column(&table)
             && has_row_security_column(&table)
             && has_policies_column(&table);
-        if has_every_column || read_only {
+        if (has_every_column && table_exists(&conn, AUTHID_TABLE_NAME)?) || read_only {
             return Ok(());
         }
-        return in_write_transaction(&conn, add_missing_columns);
+        return in_write_transaction(&conn, add_missing_parts);
     }
     refuse_relations_without_catalog(&conn)?;
     if read_only {
@@ -1899,13 +1899,22 @@ fn create_classes_table(conn: &Arc<Connection>) -> crate::Result<()> {
             "INSERT INTO sqlite_sequence (name, seq) VALUES ('{CLASSES_TABLE_NAME}', {})",
             FIRST_NORMAL_OBJECT_ID - 1
         ),
-    )
+    )?;
+    create_authid_table(conn)
 }
 
-/// Adds the columns that a catalog made by an earlier version lacks. The
-/// columns are checked again inside the write transaction, because another
-/// process may have added them first.
-fn add_missing_columns(conn: &Arc<Connection>) -> crate::Result<()> {
+fn create_authid_table(conn: &Arc<Connection>) -> crate::Result<()> {
+    if table_exists(conn, AUTHID_TABLE_NAME)? {
+        return Ok(());
+    }
+    run_internal(conn, CREATE_AUTHID_TABLE_SQL)?;
+    run_internal(conn, CREATE_AUTHID_NAME_INDEX_SQL)
+}
+
+/// Adds the columns and the roles table that a catalog made by an earlier
+/// version lacks. They are checked again inside the write transaction,
+/// because another process may have added them first.
+fn add_missing_parts(conn: &Arc<Connection>) -> crate::Result<()> {
     let Some(table) = classes_table(conn) else {
         return Ok(());
     };
@@ -1918,7 +1927,7 @@ fn add_missing_columns(conn: &Arc<Connection>) -> crate::Result<()> {
     if !has_policies_column(&table) {
         run_internal(conn, ADD_POLICIES_COLUMN_SQL)?;
     }
-    Ok(())
+    create_authid_table(conn)
 }
 
 fn classes_table(conn: &Arc<Connection>) -> Option<Arc<BTreeTable>> {
