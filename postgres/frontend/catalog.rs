@@ -9,8 +9,8 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
-        generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
-        AUTOINCREMENT_SEQ_PREFIX,
+        generated_expr_with_names, BTreeTable, CheckConstraint, Column, ForeignKey, GeneratedType,
+        Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
     },
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
@@ -2018,334 +2018,315 @@ impl SnapshotRows for PgConstraintTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        let tables = user_tables_sorted(&schema);
         let tbl_oid_map = table_oid_map(&schema);
         let indexes = catalog_indexes(&schema);
-        let mut constraint_oid = CONSTRAINT_OID_START;
 
-        for (namespace, table_name, table) in &tables {
-            let btree = match table.as_ref() {
-                Table::BTree(bt) => bt,
-                _ => continue,
-            };
+        for constraint in catalog_constraints(&schema) {
+            let btree = constraint.table;
+            let constraint_oid = constraint.oid;
             let table_oid = tbl_oid_map
-                .get(&(*namespace, (*table_name).to_string()))
+                .get(&(constraint.namespace, constraint.table_name.to_string()))
                 .copied()
                 .unwrap_or(0);
 
             let table_name = &btree.declared_name;
-            if btree.get_rowid_alias_column().is_some() {
-                let index = indexes
-                    .iter()
-                    .find(|index| index.table_oid == table_oid && index.primary)
-                    .expect("rowid primary keys have a catalog index");
-                let conname = btree
-                    .primary_key_constraint_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_pkey"));
-                let conkey: String = btree
-                    .primary_key_columns
-                    .iter()
-                    .map(|(name, _)| {
-                        btree
-                            .get_column(name)
-                            .map(|(pos, _)| (pos + 1).to_string())
-                            .unwrap_or_else(|| "0".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let contype: &'static str = ConstraintKind::PrimaryKey.into();
-                rows.push(vec![
-                    Value::from_i64(constraint_oid),
-                    Value::build_text(conname),
-                    Value::from_i64(2200),
-                    Value::build_text(contype),
-                    Value::from_i64(0), // condeferrable
-                    Value::from_i64(0), // condeferred
-                    Value::from_i64(1), // conenforced
-                    Value::from_i64(1), // convalidated
-                    Value::from_i64(table_oid),
-                    Value::from_i64(0),
-                    Value::from_i64(index.oid),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::from_i64(1), // conislocal
-                    Value::from_i64(0), // coninhcount
-                    Value::from_i64(0), // connoinherit
-                    Value::from_i64(0), // conperiod
-                    Value::build_text(format!("{{{conkey}}}")),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                ]);
-                constraint_oid += 1;
-            }
-
-            // PK / UNIQUE constraints from unique_sets
-            for us in &btree.unique_sets {
-                let primary = unique_set_is_primary_key(btree, us);
-                let contype = if primary {
-                    ConstraintKind::PrimaryKey
-                } else {
-                    ConstraintKind::Unique
-                };
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let conname = if primary {
-                    btree
+            match constraint.kind {
+                TableConstraint::RowidPrimaryKey => {
+                    let index = indexes
+                        .iter()
+                        .find(|index| index.table_oid == table_oid && index.primary)
+                        .expect("rowid primary keys have a catalog index");
+                    let conname = btree
                         .primary_key_constraint_name
                         .clone()
-                        .unwrap_or_else(|| format!("{table_name}_pkey"))
-                } else {
-                    us.constraint_name.clone().unwrap_or_else(|| {
-                        let cols_str = col_names.join("_");
-                        format!("{table_name}_{cols_str}_key")
-                    })
-                };
-
-                // Build conkey: the 1-based attnums
-                let conkey: String = col_names
-                    .iter()
-                    .map(|name| {
-                        btree
-                            .get_column(name)
-                            .map(|(pos, _)| (pos + 1).to_string())
-                            .unwrap_or_else(|| "0".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let positions: Vec<usize> = col_names
-                    .iter()
-                    .map(|name| btree.get_column(name).expect("constraint columns exist").0)
-                    .collect();
-                let conindid = indexes
-                    .iter()
-                    .find(|index| {
-                        index.table_oid == table_oid
-                            && index.unique
-                            && index
-                                .name
-                                .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-                            && index.where_clause.is_none()
-                            && index
-                                .columns
-                                .iter()
-                                .all(|column| column.expression.is_none())
-                            && index.primary == primary
-                            && index
-                                .columns
-                                .iter()
-                                .map(|column| column.position)
-                                .eq(positions.iter().copied())
-                    })
-                    .expect("unique constraints have a catalog index")
-                    .oid;
-
-                let contype: &'static str = contype.into();
-                rows.push(vec![
-                    Value::from_i64(constraint_oid),            // oid
-                    Value::build_text(conname),                 // conname
-                    Value::from_i64(2200),                      // connamespace (public)
-                    Value::build_text(contype),                 // contype
-                    Value::from_i64(0),                         // condeferrable
-                    Value::from_i64(0),                         // condeferred
-                    Value::from_i64(1),                         // conenforced
-                    Value::from_i64(1),                         // convalidated
-                    Value::from_i64(table_oid),                 // conrelid
-                    Value::from_i64(0),                         // contypid
-                    Value::from_i64(conindid),                  // conindid
-                    Value::from_i64(0),                         // conparentid
-                    Value::from_i64(0),                         // confrelid
-                    Value::Null,                                // confupdtype
-                    Value::Null,                                // confdeltype
-                    Value::Null,                                // confmatchtype
-                    Value::from_i64(1),                         // conislocal
-                    Value::from_i64(0),                         // coninhcount
-                    Value::from_i64(0),                         // connoinherit
-                    Value::from_i64(0),                         // conperiod
-                    Value::build_text(format!("{{{conkey}}}")), // conkey
-                    Value::Null,                                // confkey
-                    Value::Null,                                // conpfeqop
-                    Value::Null,                                // conppeqop
-                    Value::Null,                                // conffeqop
-                    Value::Null,                                // conexclop
-                    Value::Null,                                // conbin
-                ]);
-                constraint_oid += 1;
-            }
-
-            // FK constraints from foreign_keys
-            for fk in &btree.foreign_keys {
-                let child_cols = fk.child_columns.join("_");
-                let conname = fk
-                    .constraint_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_{child_cols}_fkey"));
-
-                let conkey: String = fk
-                    .child_columns
-                    .iter()
-                    .map(|name| {
-                        btree
-                            .get_column(name)
-                            .map(|(pos, _)| (pos + 1).to_string())
-                            .unwrap_or_else(|| "0".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let confrelid = tbl_oid_map
-                    .get(&(fk.parent_namespace, fk.parent_table.clone()))
-                    .copied()
-                    .unwrap_or(0);
-
-                let confkey: String = fk
-                    .parent_columns
-                    .iter()
-                    .map(|name| {
-                        schema
-                            .get_btree_table(fk.parent_namespace, &fk.parent_table)
-                            .and_then(|parent_bt| {
-                                parent_bt
-                                    .get_column(name)
-                                    .map(|(pos, _)| (pos + 1).to_string())
-                            })
-                            .unwrap_or_else(|| "0".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let contype: &'static str = ConstraintKind::ForeignKey.into();
-                rows.push(vec![
-                    Value::from_i64(constraint_oid),                   // oid
-                    Value::build_text(conname),                        // conname
-                    Value::from_i64(2200),                             // connamespace
-                    Value::build_text(contype),                        // contype
-                    Value::from_i64(i64::from(fk.deferred)),           // condeferrable
-                    Value::from_i64(i64::from(fk.deferred)),           // condeferred
-                    Value::from_i64(1),                                // conenforced
-                    Value::from_i64(1),                                // convalidated
-                    Value::from_i64(table_oid),                        // conrelid
-                    Value::from_i64(0),                                // contypid
-                    Value::from_i64(0),                                // conindid
-                    Value::from_i64(0),                                // conparentid
-                    Value::from_i64(confrelid),                        // confrelid
-                    Value::build_text(ref_act_to_char(&fk.on_update)), // confupdtype
-                    Value::build_text(ref_act_to_char(&fk.on_delete)), // confdeltype
-                    Value::build_text("s"),                            // confmatchtype (simple)
-                    Value::from_i64(1),                                // conislocal
-                    Value::from_i64(0),                                // coninhcount
-                    Value::from_i64(0),                                // connoinherit
-                    Value::from_i64(0),                                // conperiod
-                    Value::build_text(format!("{{{conkey}}}")),        // conkey
-                    Value::build_text(format!("{{{confkey}}}")),       // confkey
-                    Value::Null,                                       // conpfeqop
-                    Value::Null,                                       // conppeqop
-                    Value::Null,                                       // conffeqop
-                    Value::Null,                                       // conexclop
-                    Value::Null,                                       // conbin
-                ]);
-                constraint_oid += 1;
-            }
-
-            // CHECK constraints from check_constraints
-            for chk in &btree.check_constraints {
-                let conname = chk
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_check"));
-
-                let conkey = chk
-                    .column
-                    .as_ref()
-                    .and_then(|col_name| {
-                        btree
-                            .get_column(col_name)
-                            .map(|(pos, _)| (pos + 1).to_string())
-                    })
-                    .unwrap_or_default();
-
-                let contype: &'static str = ConstraintKind::Check.into();
-                rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // conenforced
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(0),              // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
-                    Value::from_i64(0),              // conperiod
-                    if conkey.is_empty() {
-                        Value::Null
-                    } else {
-                        Value::build_text(format!("{{{conkey}}}"))
-                    }, // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::build_text(render_expr(&chk.expr)), // conbin
-                ]);
-                constraint_oid += 1;
-            }
-
-            // As in PostgreSQL 18, each NOT NULL column has a constraint of
-            // its own, primary key columns included.
-            for (position, column) in btree.columns().iter().enumerate() {
-                if !column.notnull() {
-                    continue;
+                        .unwrap_or_else(|| format!("{table_name}_pkey"));
+                    let conkey: String = btree
+                        .primary_key_columns
+                        .iter()
+                        .map(|(name, _)| {
+                            btree
+                                .get_column(name)
+                                .map(|(pos, _)| (pos + 1).to_string())
+                                .unwrap_or_else(|| "0".to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let contype: &'static str = ConstraintKind::PrimaryKey.into();
+                    rows.push(vec![
+                        Value::from_i64(constraint_oid),
+                        Value::build_text(conname),
+                        Value::from_i64(2200),
+                        Value::build_text(contype),
+                        Value::from_i64(0), // condeferrable
+                        Value::from_i64(0), // condeferred
+                        Value::from_i64(1), // conenforced
+                        Value::from_i64(1), // convalidated
+                        Value::from_i64(table_oid),
+                        Value::from_i64(0),
+                        Value::from_i64(index.oid),
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::from_i64(1), // conislocal
+                        Value::from_i64(0), // coninhcount
+                        Value::from_i64(0), // connoinherit
+                        Value::from_i64(0), // conperiod
+                        Value::build_text(format!("{{{conkey}}}")),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]);
                 }
-                let column_name = column.name.as_deref().expect("table columns have names");
-                let contype: &'static str = ConstraintKind::NotNull.into();
-                rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(make_object_name(table_name, column_name, "not_null")), // conname
-                    Value::from_i64(2200),      // connamespace
-                    Value::build_text(contype), // contype
-                    Value::from_i64(0),         // condeferrable
-                    Value::from_i64(0),         // condeferred
-                    Value::from_i64(1),         // conenforced
-                    Value::from_i64(1),         // convalidated
-                    Value::from_i64(table_oid), // conrelid
-                    Value::from_i64(0),         // contypid
-                    Value::from_i64(0),         // conindid
-                    Value::from_i64(0),         // conparentid
-                    Value::from_i64(0),         // confrelid
-                    Value::Null,                // confupdtype
-                    Value::Null,                // confdeltype
-                    Value::Null,                // confmatchtype
-                    Value::from_i64(1),         // conislocal
-                    Value::from_i64(0),         // coninhcount
-                    Value::from_i64(0),         // connoinherit
-                    Value::from_i64(0),         // conperiod
-                    Value::build_text(format!("{{{}}}", position + 1)), // conkey
-                    Value::Null,                // confkey
-                    Value::Null,                // conpfeqop
-                    Value::Null,                // conppeqop
-                    Value::Null,                // conffeqop
-                    Value::Null,                // conexclop
-                    Value::Null,                // conbin
-                ]);
-                constraint_oid += 1;
+                TableConstraint::UniqueSet(us) => {
+                    let primary = unique_set_is_primary_key(btree, us);
+                    let contype = if primary {
+                        ConstraintKind::PrimaryKey
+                    } else {
+                        ConstraintKind::Unique
+                    };
+                    let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
+                    let conname = if primary {
+                        btree
+                            .primary_key_constraint_name
+                            .clone()
+                            .unwrap_or_else(|| format!("{table_name}_pkey"))
+                    } else {
+                        us.constraint_name.clone().unwrap_or_else(|| {
+                            let cols_str = col_names.join("_");
+                            format!("{table_name}_{cols_str}_key")
+                        })
+                    };
+
+                    // Build conkey: the 1-based attnums
+                    let conkey: String = col_names
+                        .iter()
+                        .map(|name| {
+                            btree
+                                .get_column(name)
+                                .map(|(pos, _)| (pos + 1).to_string())
+                                .unwrap_or_else(|| "0".to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let positions: Vec<usize> = col_names
+                        .iter()
+                        .map(|name| btree.get_column(name).expect("constraint columns exist").0)
+                        .collect();
+                    let conindid = indexes
+                        .iter()
+                        .find(|index| {
+                            index.table_oid == table_oid
+                                && index.unique
+                                && index
+                                    .name
+                                    .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                                && index.where_clause.is_none()
+                                && index
+                                    .columns
+                                    .iter()
+                                    .all(|column| column.expression.is_none())
+                                && index.primary == primary
+                                && index
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.position)
+                                    .eq(positions.iter().copied())
+                        })
+                        .expect("unique constraints have a catalog index")
+                        .oid;
+
+                    let contype: &'static str = contype.into();
+                    rows.push(vec![
+                        Value::from_i64(constraint_oid),            // oid
+                        Value::build_text(conname),                 // conname
+                        Value::from_i64(2200),                      // connamespace (public)
+                        Value::build_text(contype),                 // contype
+                        Value::from_i64(0),                         // condeferrable
+                        Value::from_i64(0),                         // condeferred
+                        Value::from_i64(1),                         // conenforced
+                        Value::from_i64(1),                         // convalidated
+                        Value::from_i64(table_oid),                 // conrelid
+                        Value::from_i64(0),                         // contypid
+                        Value::from_i64(conindid),                  // conindid
+                        Value::from_i64(0),                         // conparentid
+                        Value::from_i64(0),                         // confrelid
+                        Value::Null,                                // confupdtype
+                        Value::Null,                                // confdeltype
+                        Value::Null,                                // confmatchtype
+                        Value::from_i64(1),                         // conislocal
+                        Value::from_i64(0),                         // coninhcount
+                        Value::from_i64(0),                         // connoinherit
+                        Value::from_i64(0),                         // conperiod
+                        Value::build_text(format!("{{{conkey}}}")), // conkey
+                        Value::Null,                                // confkey
+                        Value::Null,                                // conpfeqop
+                        Value::Null,                                // conppeqop
+                        Value::Null,                                // conffeqop
+                        Value::Null,                                // conexclop
+                        Value::Null,                                // conbin
+                    ]);
+                }
+                TableConstraint::ForeignKey(fk) => {
+                    let child_cols = fk.child_columns.join("_");
+                    let conname = fk
+                        .constraint_name
+                        .clone()
+                        .unwrap_or_else(|| format!("{table_name}_{child_cols}_fkey"));
+
+                    let conkey: String = fk
+                        .child_columns
+                        .iter()
+                        .map(|name| {
+                            btree
+                                .get_column(name)
+                                .map(|(pos, _)| (pos + 1).to_string())
+                                .unwrap_or_else(|| "0".to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let confrelid = tbl_oid_map
+                        .get(&(fk.parent_namespace, fk.parent_table.clone()))
+                        .copied()
+                        .unwrap_or(0);
+
+                    let confkey: String = fk
+                        .parent_columns
+                        .iter()
+                        .map(|name| {
+                            schema
+                                .get_btree_table(fk.parent_namespace, &fk.parent_table)
+                                .and_then(|parent_bt| {
+                                    parent_bt
+                                        .get_column(name)
+                                        .map(|(pos, _)| (pos + 1).to_string())
+                                })
+                                .unwrap_or_else(|| "0".to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let contype: &'static str = ConstraintKind::ForeignKey.into();
+                    rows.push(vec![
+                        Value::from_i64(constraint_oid),                   // oid
+                        Value::build_text(conname),                        // conname
+                        Value::from_i64(2200),                             // connamespace
+                        Value::build_text(contype),                        // contype
+                        Value::from_i64(i64::from(fk.deferred)),           // condeferrable
+                        Value::from_i64(i64::from(fk.deferred)),           // condeferred
+                        Value::from_i64(1),                                // conenforced
+                        Value::from_i64(1),                                // convalidated
+                        Value::from_i64(table_oid),                        // conrelid
+                        Value::from_i64(0),                                // contypid
+                        Value::from_i64(0),                                // conindid
+                        Value::from_i64(0),                                // conparentid
+                        Value::from_i64(confrelid),                        // confrelid
+                        Value::build_text(ref_act_to_char(&fk.on_update)), // confupdtype
+                        Value::build_text(ref_act_to_char(&fk.on_delete)), // confdeltype
+                        Value::build_text("s"),                            // confmatchtype (simple)
+                        Value::from_i64(1),                                // conislocal
+                        Value::from_i64(0),                                // coninhcount
+                        Value::from_i64(0),                                // connoinherit
+                        Value::from_i64(0),                                // conperiod
+                        Value::build_text(format!("{{{conkey}}}")),        // conkey
+                        Value::build_text(format!("{{{confkey}}}")),       // confkey
+                        Value::Null,                                       // conpfeqop
+                        Value::Null,                                       // conppeqop
+                        Value::Null,                                       // conffeqop
+                        Value::Null,                                       // conexclop
+                        Value::Null,                                       // conbin
+                    ]);
+                }
+                TableConstraint::Check(chk) => {
+                    let conname = chk
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{table_name}_check"));
+
+                    let conkey = chk
+                        .column
+                        .as_ref()
+                        .and_then(|col_name| {
+                            btree
+                                .get_column(col_name)
+                                .map(|(pos, _)| (pos + 1).to_string())
+                        })
+                        .unwrap_or_default();
+
+                    let contype: &'static str = ConstraintKind::Check.into();
+                    rows.push(vec![
+                        Value::from_i64(constraint_oid), // oid
+                        Value::build_text(conname),      // conname
+                        Value::from_i64(2200),           // connamespace
+                        Value::build_text(contype),      // contype
+                        Value::from_i64(0),              // condeferrable
+                        Value::from_i64(0),              // condeferred
+                        Value::from_i64(1),              // conenforced
+                        Value::from_i64(1),              // convalidated
+                        Value::from_i64(table_oid),      // conrelid
+                        Value::from_i64(0),              // contypid
+                        Value::from_i64(0),              // conindid
+                        Value::from_i64(0),              // conparentid
+                        Value::from_i64(0),              // confrelid
+                        Value::Null,                     // confupdtype
+                        Value::Null,                     // confdeltype
+                        Value::Null,                     // confmatchtype
+                        Value::from_i64(1),              // conislocal
+                        Value::from_i64(0),              // coninhcount
+                        Value::from_i64(0),              // connoinherit
+                        Value::from_i64(0),              // conperiod
+                        if conkey.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::build_text(format!("{{{conkey}}}"))
+                        }, // conkey
+                        Value::Null,                     // confkey
+                        Value::Null,                     // conpfeqop
+                        Value::Null,                     // conppeqop
+                        Value::Null,                     // conffeqop
+                        Value::Null,                     // conexclop
+                        Value::build_text(render_expr(&chk.expr)), // conbin
+                    ]);
+                }
+                TableConstraint::NotNull { position, column } => {
+                    let column_name = column.name.as_deref().expect("table columns have names");
+                    let contype: &'static str = ConstraintKind::NotNull.into();
+                    rows.push(vec![
+                        Value::from_i64(constraint_oid), // oid
+                        Value::build_text(make_object_name(table_name, column_name, "not_null")), // conname
+                        Value::from_i64(2200),      // connamespace
+                        Value::build_text(contype), // contype
+                        Value::from_i64(0),         // condeferrable
+                        Value::from_i64(0),         // condeferred
+                        Value::from_i64(1),         // conenforced
+                        Value::from_i64(1),         // convalidated
+                        Value::from_i64(table_oid), // conrelid
+                        Value::from_i64(0),         // contypid
+                        Value::from_i64(0),         // conindid
+                        Value::from_i64(0),         // conparentid
+                        Value::from_i64(0),         // confrelid
+                        Value::Null,                // confupdtype
+                        Value::Null,                // confdeltype
+                        Value::Null,                // confmatchtype
+                        Value::from_i64(1),         // conislocal
+                        Value::from_i64(0),         // coninhcount
+                        Value::from_i64(0),         // connoinherit
+                        Value::from_i64(0),         // conperiod
+                        Value::build_text(format!("{{{}}}", position + 1)), // conkey
+                        Value::Null,                // confkey
+                        Value::Null,                // conpfeqop
+                        Value::Null,                // conppeqop
+                        Value::Null,                // conffeqop
+                        Value::Null,                // conexclop
+                        Value::Null,                // conbin
+                    ]);
+                }
             }
         }
         rows
@@ -3928,157 +3909,190 @@ fn ref_act_to_sql(code: &str) -> &'static str {
 }
 
 /// Look up a constraint by OID and return its definition string.
-/// Uses the same OID assignment as [PgConstraintTable].
+/// The OIDs are those of [catalog_constraints], as in [PgConstraintTable].
 pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
     let indexes = catalog_indexes(&schema);
-    let mut constraint_oid = CONSTRAINT_OID_START;
-
-    for (_, _, table) in &tables {
-        let btree = match table.as_ref() {
-            Table::BTree(bt) => bt,
-            _ => continue,
-        };
-
-        if btree.get_rowid_alias_column().is_some() {
-            if constraint_oid == target_oid {
-                let cols: Vec<String> = btree
-                    .primary_key_columns
-                    .iter()
-                    .map(|(name, _)| {
-                        let (_, column) =
-                            btree.get_column(name).expect("primary key columns exist");
-                        quote_identifier(
-                            column
-                                .name
-                                .as_deref()
-                                .expect("primary key columns have names"),
-                        )
-                    })
-                    .collect();
-                return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
-            }
-            constraint_oid += 1;
+    let constraint = catalog_constraints(&schema)
+        .into_iter()
+        .find(|constraint| constraint.oid == target_oid)?;
+    let btree = constraint.table;
+    match constraint.kind {
+        TableConstraint::RowidPrimaryKey => {
+            let cols: Vec<String> = btree
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| {
+                    let (_, column) = btree.get_column(name).expect("primary key columns exist");
+                    quote_identifier(
+                        column
+                            .name
+                            .as_deref()
+                            .expect("primary key columns have names"),
+                    )
+                })
+                .collect();
+            Some(format!("PRIMARY KEY ({})", cols.join(", ")))
         }
-
-        // PK / UNIQUE from unique_sets
-        for us in &btree.unique_sets {
-            if constraint_oid == target_oid {
-                let col_names: Vec<String> = us
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        let (_, column) = btree
-                            .get_column(&column.name)
-                            .expect("constraint columns exist");
-                        quote_identifier(
-                            column
-                                .name
-                                .as_deref()
-                                .expect("constraint columns have names"),
-                        )
-                    })
-                    .collect();
-                let kw = if unique_set_is_primary_key(btree, us) {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                };
-                return Some(format!("{kw} ({})", col_names.join(", ")));
-            }
-            constraint_oid += 1;
+        TableConstraint::UniqueSet(us) => {
+            let col_names: Vec<String> = us
+                .columns
+                .iter()
+                .map(|column| {
+                    let (_, column) = btree
+                        .get_column(&column.name)
+                        .expect("constraint columns exist");
+                    quote_identifier(
+                        column
+                            .name
+                            .as_deref()
+                            .expect("constraint columns have names"),
+                    )
+                })
+                .collect();
+            let kw = if unique_set_is_primary_key(btree, us) {
+                "PRIMARY KEY"
+            } else {
+                "UNIQUE"
+            };
+            Some(format!("{kw} ({})", col_names.join(", ")))
         }
-
-        // FK constraints
-        for fk in &btree.foreign_keys {
-            if constraint_oid == target_oid {
-                let parent = schema.get_btree_table(fk.parent_namespace, &fk.parent_table);
-                let child_cols = constraint_column_list(
-                    Some(btree),
-                    fk.child_columns.iter().map(String::as_str),
-                );
-                let parent_cols = if fk.parent_columns.is_empty() {
-                    parent.as_ref().map_or_else(String::new, |parent| {
-                        constraint_column_list(
-                            Some(parent),
-                            parent
-                                .primary_key_columns
-                                .iter()
-                                .map(|(name, _)| name.as_str()),
-                        )
-                    })
-                } else {
+        TableConstraint::ForeignKey(fk) => {
+            let parent = schema.get_btree_table(fk.parent_namespace, &fk.parent_table);
+            let child_cols =
+                constraint_column_list(Some(btree), fk.child_columns.iter().map(String::as_str));
+            let parent_cols = if fk.parent_columns.is_empty() {
+                parent.as_ref().map_or_else(String::new, |parent| {
                     constraint_column_list(
-                        parent.as_deref(),
-                        fk.parent_columns.iter().map(String::as_str),
+                        Some(parent),
+                        parent
+                            .primary_key_columns
+                            .iter()
+                            .map(|(name, _)| name.as_str()),
                     )
-                };
-                let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
-                    parent.declared_name.as_str()
-                });
-                let visible = conn
-                    .search_order()
-                    .into_iter()
-                    .find(|namespace| {
-                        schema
-                            .get_table(namespace.target.id, &fk.parent_table)
+                })
+            } else {
+                constraint_column_list(
+                    parent.as_deref(),
+                    fk.parent_columns.iter().map(String::as_str),
+                )
+            };
+            let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
+                parent.declared_name.as_str()
+            });
+            let visible = conn
+                .search_order()
+                .into_iter()
+                .find(|namespace| {
+                    schema
+                        .get_table(namespace.target.id, &fk.parent_table)
+                        .is_some()
+                        || schema
+                            .get_view(namespace.target.id, &fk.parent_table)
                             .is_some()
-                            || schema
-                                .get_view(namespace.target.id, &fk.parent_table)
-                                .is_some()
-                            || schema
-                                .get_sequence(namespace.target.id, &fk.parent_table)
-                                .is_some()
-                            || indexes.iter().any(|index| {
-                                index.namespace == namespace.target.id
-                                    && index.name == fk.parent_table
-                            })
-                    })
-                    .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
-                let parent_name = if visible {
-                    quote_identifier(parent_name)
-                } else {
-                    format!(
-                        "{}.{}",
-                        quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
-                        quote_identifier(parent_name),
-                    )
-                };
-                let mut def =
-                    format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
-                let on_update = ref_act_to_char(&fk.on_update);
-                let on_delete = ref_act_to_char(&fk.on_delete);
-                if on_update != "a" {
-                    def.push_str(&format!(" ON UPDATE {}", ref_act_to_sql(on_update)));
-                }
-                if on_delete != "a" {
-                    def.push_str(&format!(" ON DELETE {}", ref_act_to_sql(on_delete)));
-                }
-                return Some(def);
+                        || schema
+                            .get_sequence(namespace.target.id, &fk.parent_table)
+                            .is_some()
+                        || indexes.iter().any(|index| {
+                            index.namespace == namespace.target.id && index.name == fk.parent_table
+                        })
+                })
+                .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
+            let parent_name = if visible {
+                quote_identifier(parent_name)
+            } else {
+                format!(
+                    "{}.{}",
+                    quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
+                    quote_identifier(parent_name),
+                )
+            };
+            let mut def =
+                format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
+            let on_update = ref_act_to_char(&fk.on_update);
+            let on_delete = ref_act_to_char(&fk.on_delete);
+            if on_update != "a" {
+                def.push_str(&format!(" ON UPDATE {}", ref_act_to_sql(on_update)));
             }
-            constraint_oid += 1;
+            if on_delete != "a" {
+                def.push_str(&format!(" ON DELETE {}", ref_act_to_sql(on_delete)));
+            }
+            Some(def)
         }
-
-        // CHECK constraints
-        for chk in &btree.check_constraints {
-            if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
-            }
-            constraint_oid += 1;
-        }
-
-        // NOT NULL constraints, one per column
-        for column in btree.columns().iter().filter(|column| column.notnull()) {
-            if constraint_oid == target_oid {
-                let column_name = column.name.as_deref().expect("table columns have names");
-                return Some(format!("NOT NULL {}", quote_identifier(column_name)));
-            }
-            constraint_oid += 1;
+        TableConstraint::Check(chk) => Some(format!("CHECK ({})", render_expr(&chk.expr))),
+        TableConstraint::NotNull { column, .. } => {
+            let column_name = column.name.as_deref().expect("table columns have names");
+            Some(format!("NOT NULL {}", quote_identifier(column_name)))
         }
     }
+}
 
-    None
+/// A constraint of a user table, with the oid that pg_constraint lists it
+/// under. The oids count up from [CONSTRAINT_OID_START] over the tables in
+/// [user_tables_sorted] order and, within a table, in the order of
+/// [TableConstraint]'s variants.
+struct CatalogConstraint<'a> {
+    oid: i64,
+    namespace: NamespaceId,
+    table_name: &'a str,
+    table: &'a BTreeTable,
+    kind: TableConstraint<'a>,
+}
+
+enum TableConstraint<'a> {
+    /// The primary key of a table whose key is its rowid alias column.
+    RowidPrimaryKey,
+    /// A PRIMARY KEY or UNIQUE constraint.
+    UniqueSet(&'a UniqueSet),
+    ForeignKey(&'a ForeignKey),
+    Check(&'a CheckConstraint),
+    /// As in PostgreSQL 18, each NOT NULL column has a constraint of its
+    /// own, primary key columns included.
+    NotNull {
+        position: usize,
+        column: &'a Column,
+    },
+}
+
+fn catalog_constraints(schema: &Schema) -> Vec<CatalogConstraint<'_>> {
+    let mut constraints = Vec::new();
+    for (namespace, table_name, table) in user_tables_sorted(schema) {
+        let Table::BTree(btree) = table.as_ref() else {
+            continue;
+        };
+        let rowid_primary_key = btree
+            .get_rowid_alias_column()
+            .map(|_| TableConstraint::RowidPrimaryKey);
+        let unique_sets = btree.unique_sets.iter().map(TableConstraint::UniqueSet);
+        let foreign_keys = btree
+            .foreign_keys
+            .iter()
+            .map(|fk| TableConstraint::ForeignKey(fk));
+        let checks = btree.check_constraints.iter().map(TableConstraint::Check);
+        let not_nulls = btree
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.notnull())
+            .map(|(position, column)| TableConstraint::NotNull { position, column });
+        for kind in rowid_primary_key
+            .into_iter()
+            .chain(unique_sets)
+            .chain(foreign_keys)
+            .chain(checks)
+            .chain(not_nulls)
+        {
+            let oid = CONSTRAINT_OID_START + constraints.len() as i64;
+            constraints.push(CatalogConstraint {
+                oid,
+                namespace,
+                table_name,
+                table: btree,
+                kind,
+            });
+        }
+    }
+    constraints
 }
 
 fn constraint_column_list<'a>(
