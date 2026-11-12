@@ -861,6 +861,76 @@ expect error {
 }
 
 @cross-check-integrity
+test drop-column-removes-its-references-constraint {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (parent_id INTEGER REFERENCES parent (id), keep INTEGER);
+    ALTER TABLE c DROP COLUMN parent_id;
+    INSERT INTO c VALUES (1);
+    SELECT * FROM c;
+    SELECT count(*) FROM pragma_foreign_key_list('c');
+}
+expect {
+    1
+    0
+}
+
+@cross-check-integrity
+test drop-column-after-renaming-a-column-with-a-references-constraint {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (parent_id INTEGER REFERENCES parent (id), keep INTEGER);
+    ALTER TABLE c RENAME COLUMN parent_id TO renamed_parent_id;
+    ALTER TABLE c DROP COLUMN renamed_parent_id;
+    SELECT name FROM pragma_table_info('c');
+}
+expect {
+    keep
+}
+
+# DROP COLUMN rewrites the CREATE TABLE text. A REFERENCES constraint on
+# another column must stay a column constraint, so that column can be
+# dropped later.
+@cross-check-integrity
+test drop-column-keeps-references-constraints-of-other-columns {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, k INTEGER UNIQUE);
+    CREATE TABLE c (a INTEGER REFERENCES parent (id), b INTEGER CONSTRAINT fk_b REFERENCES parent (k) ON DELETE CASCADE, x INTEGER);
+    ALTER TABLE c DROP COLUMN x;
+    SELECT sql LIKE '%FOREIGN KEY%' FROM sqlite_schema WHERE name = 'c';
+    SELECT "from", "to", on_delete FROM pragma_foreign_key_list('c') ORDER BY "from";
+    ALTER TABLE c DROP COLUMN a;
+    SELECT "from", "to", on_delete FROM pragma_foreign_key_list('c');
+}
+expect {
+    0
+    a|id|NO ACTION
+    b|k|CASCADE
+    b|k|CASCADE
+}
+
+@cross-check-integrity
+test drop-column-removes-a-references-constraint-added-by-add-column {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (keep INTEGER);
+    ALTER TABLE c ADD COLUMN parent_id INTEGER REFERENCES parent (id);
+    ALTER TABLE c DROP COLUMN parent_id;
+    SELECT count(*) FROM pragma_foreign_key_list('c');
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fail-drop-column-in-a-table-level-foreign-key {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (a INTEGER REFERENCES parent (id), b INTEGER, FOREIGN KEY (a) REFERENCES parent (id));
+    ALTER TABLE c DROP COLUMN a;
+}
+expect error {
+    error in table c after drop column: unknown column "a" in foreign key definition
+}
+
+@cross-check-integrity
 test strict-alter-add-column-invalid-varchar {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b FAKETYPE;
