@@ -609,18 +609,33 @@ expect @tursopg error {
     cannot drop schema "app" because other objects depend on it
 }
 
-test drop-schema-cascade-with-a-function {
+test drop-schema-cascade-with-functions {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (a integer);
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION app.one(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP SCHEMA app CASCADE;
+    SELECT n.nspname, p.pronargs FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'one';
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'app';
+}
+expect {
+    public|0
+    0
+}
+
+# The names of the functions of a dropped schema are free again.
+test create-function-in-a-schema-that-was-dropped-with-its-functions {
     CREATE SCHEMA app;
     CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
     DROP SCHEMA app CASCADE;
-    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    SELECT prosrc FROM pg_proc WHERE proname = 'one';
 }
 expect {
-    0
-}
-@sqlstate 0A000
-expect @tursopg error {
-    DROP SCHEMA \.\.\. CASCADE of a schema with functions is not supported
+    SELECT 2
 }
 
 test drop-schema-after-its-function {

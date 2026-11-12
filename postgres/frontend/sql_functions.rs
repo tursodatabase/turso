@@ -279,13 +279,29 @@ fn parse_stored_function(sql: &str) -> turso_core::Result<ast::CreateFunction> {
     }
 }
 
-/// Whether schema `schema_name` has a function.
-pub(crate) fn schema_has_functions(connection: &Connection, schema_name: &str) -> bool {
+/// A `DROP FUNCTION` statement for each function of schema `schema_name`.
+pub(crate) fn drops_of_schema_functions(
+    connection: &Connection,
+    schema_name: &str,
+) -> Vec<ast::DropFunction> {
     let Some(namespace) = connection.qualifier(schema_name) else {
-        return false;
+        return Vec::new();
     };
-    function_catalog(&connection.current_schema())
-        .is_some_and(|functions| functions.in_namespace(namespace.target.id).next().is_some())
+    let schema = connection.current_schema();
+    let Some(functions) = function_catalog(&schema) else {
+        return Vec::new();
+    };
+    functions
+        .in_namespace(namespace.target.id)
+        .map(|function| ast::DropFunction {
+            if_exists: false,
+            name: ast::QualifiedName::fullname(
+                ast::Name::exact(schema_name.to_string()),
+                ast::Name::exact(function.name.clone()),
+            ),
+            parameter_types: Some(function.parameter_types.clone()),
+        })
+        .collect()
 }
 
 /// The functions that the engine loaded with the relation catalog, or None
