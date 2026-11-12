@@ -330,6 +330,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn checks_string_defaults_at_create(&self) -> bool {
+        true
+    }
+
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         true
     }

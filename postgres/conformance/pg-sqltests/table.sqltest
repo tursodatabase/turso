@@ -273,6 +273,83 @@ expect {
     1|2024-05-06
 }
 
+test table-string-default-rejected-by-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (m mood DEFAULT 'bad', id int);
+}
+@sqlstate 22P02
+expect error {}
+
+test table-string-default-rejected-by-uuid {
+    CREATE TABLE t (u uuid DEFAULT 'nope', id int);
+}
+expect error {}
+
+test table-string-default-rejected-by-boolean {
+    CREATE TABLE t (b boolean DEFAULT 'maybe', id int);
+}
+expect error {}
+
+test table-string-default-rejected-by-integer {
+    CREATE TABLE t (n int DEFAULT 'abc', id int);
+}
+expect error {}
+
+test table-string-default-rejected-by-json {
+    CREATE TABLE t (j json DEFAULT 'nope', id int);
+}
+@sqlstate 22P02
+expect error {}
+
+test table-string-default-rejected-by-array-element {
+    CREATE TABLE t (a int[] DEFAULT '{1,x}', id int);
+}
+expect error {}
+
+test table-string-default-out-of-range-for-smallint {
+    CREATE TABLE t (n smallint DEFAULT '99999', id int);
+}
+expect error {}
+
+test table-string-default-in-parentheses-rejected {
+    CREATE TABLE t (n int DEFAULT ('abc'), id int);
+}
+expect error {}
+
+test table-string-defaults-accepted-by-their-types {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE TABLE t (
+        m mood DEFAULT 'happy',
+        u uuid DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        b boolean DEFAULT 'yes',
+        a int[] DEFAULT '{1,2}',
+        n smallint DEFAULT '12',
+        id int
+    );
+    INSERT INTO t (id) VALUES (1);
+    SELECT m, u, CASE WHEN b THEN 'yes' ELSE 'no' END, a, n FROM t;
+}
+expect {
+    happy|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|yes|{1,2}|12
+}
+
+# PostgreSQL applies type modifiers and domain CHECKs to a default when a
+# row uses it, not when the table is created.
+test table-string-default-checked-without-type-modifiers {
+    CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+    CREATE TABLE t (
+        v varchar(2) DEFAULT 'abcd',
+        n numeric(3,1) DEFAULT '12345',
+        p positive DEFAULT '-1',
+        id int
+    );
+    INSERT INTO t VALUES ('ab', 1.5, 1, 1);
+    SELECT v, n, p, id FROM t;
+}
+expect {
+    ab|1.5|1|1
+}
+
 test table-cast-timestamp-column-to-date-and-time {
     CREATE TABLE events (ts timestamp);
     INSERT INTO events VALUES ('2024-01-15 10:30:00');
