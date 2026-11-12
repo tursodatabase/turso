@@ -106,6 +106,27 @@ expect {
     p7|((n <> ALL (ARRAY[(1)::bigint, (2)::bigint])) AND (abs(id) > 1) AND ((- n) > 1))
 }
 
+# A condition that tursopg cannot print as pg_get_expr does is shown as
+# CREATE POLICY wrote it, which PostgreSQL reads back, rather than as the
+# engine's SQL.
+test pg-policy-shows-conditions-it-cannot-print-as-written {
+    CREATE TABLE pp_docs_10 (id INT, owner TEXT, v VARCHAR(10));
+    CREATE POLICY p1 ON pp_docs_10 USING (owner LIKE 'a%' AND v IN ('a', 'b'));
+    CREATE POLICY p2 ON pp_docs_10 USING (owner ILIKE 'A%') WITH CHECK (id::text = owner);
+    SELECT polname, pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_10')
+    ORDER BY polname;
+}
+expect {
+    p1|((owner ~~ 'a%'::text) AND ((v)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])))|
+    p2|(owner ~~* 'A%'::text)|((id)::text = owner)
+}
+expect @tursopg {
+    p1|owner LIKE 'a%' AND v IN ('a', 'b')|
+    p2|owner ILIKE 'A%'|id::text = owner
+}
+
 test pg-policy-shows-quoted-and-mixed-case-names {
     CREATE TABLE "PP Docs 3" ("Owner" TEXT, id INT);
     CREATE POLICY "Own Rows" ON "PP Docs 3" FOR SELECT
