@@ -6,6 +6,7 @@ CREATE TABLE items (
 INSERT INTO items VALUES (7, 'alice'), (19, 'bob');
 
 CREATE TABLE empty_items (id INTEGER, name TEXT);
+CREATE INDEX empty_items_expression_keys ON empty_items ((id + 1), lower(name));
 
 CREATE TABLE "Mixed Table" (
     "Mixed Key" TEXT,

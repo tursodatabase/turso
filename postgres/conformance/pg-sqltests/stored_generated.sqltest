@@ -727,7 +727,7 @@ test stored-generated-column-pg-get-expr-returns-pg-syntax {
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
 }
 expect {
-    greatest (a, 2)
+    greatest(a, 2)
 }
 
 @skip-if postgres "real postgres prints adbin differently"

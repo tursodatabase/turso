@@ -964,6 +964,17 @@ expect {
     CREATE INDEX idx_cols_b_c|b|c
 }
 
+test pg-get-indexdef-of-expression-keys {
+    CREATE TABLE idx_exprs (a int, b text);
+    CREATE INDEX idx_exprs_keys ON idx_exprs ((a + 1), lower(b));
+    SELECT pg_get_indexdef(oid, 1, true), pg_get_indexdef(oid, 2, true),
+           '[' || pg_get_indexdef(oid, 3, true) || ']'
+    FROM pg_class WHERE relname = 'idx_exprs_keys';
+}
+expect {
+    (a + 1)|lower(b)|[]
+}
+
 test pg-database-has-datlocale {
     SELECT count(datlocale) FROM pg_database WHERE datname = current_database();
 }

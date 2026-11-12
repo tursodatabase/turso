@@ -17,7 +17,9 @@ use turso_core::{
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+use turso_parser::ast::fmt::{BlankContext, ToTokens, TokenStream};
 use turso_parser::ast::{self, RefAct, SortOrder};
+use turso_parser::token::TokenType;
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::translator::make_object_name;
 
@@ -1945,7 +1947,7 @@ impl SnapshotRows for PgIndexTable {
                 let exprs: Vec<String> = index
                     .columns
                     .iter()
-                    .filter_map(|column| column.expression.clone())
+                    .filter_map(|column| column.expression.as_deref().map(render_expr))
                     .collect();
                 Value::build_text(exprs.join(", "))
             } else {
@@ -4118,7 +4120,67 @@ fn render_expr(expr: &ast::Expr) -> String {
         Ok(WalkControl::Continue)
     })
     .expect("rewriting role functions does not fail");
-    expr.to_string()
+    let mut text = String::new();
+    expr.to_tokens(&mut PgTokenWriter::new(&mut text), &BlankContext)
+        .expect("writing to a String does not fail");
+    text
+}
+
+/// Writes SQL tokens the way PostgreSQL prints expressions: like the
+/// parser's `WriteTokenStream`, but with no space between a function name
+/// and its argument list (`lower(b)`, not `lower (b)`).
+struct PgTokenWriter<'a> {
+    out: &'a mut String,
+    spaced: bool,
+    after_name: bool,
+}
+
+impl<'a> PgTokenWriter<'a> {
+    fn new(out: &'a mut String) -> Self {
+        Self {
+            out,
+            spaced: true,
+            after_name: false,
+        }
+    }
+}
+
+impl TokenStream for PgTokenWriter<'_> {
+    type Error = fmt::Error;
+
+    fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
+        let call_parenthesis = ty == TokenType::TK_LP && self.after_name;
+        self.after_name = ty == TokenType::TK_ID;
+        let attaches_to_previous = matches!(
+            ty,
+            TokenType::TK_COMMA
+                | TokenType::TK_SEMI
+                | TokenType::TK_RP
+                | TokenType::TK_DOT
+                | TokenType::TK_LBRACKET
+                | TokenType::TK_RBRACKET
+        );
+        if !self.spaced && !attaches_to_previous && !call_parenthesis {
+            self.out.push(' ');
+        }
+        if ty == TokenType::TK_BLOB {
+            self.out.push_str(value.unwrap_or("X''"));
+            self.spaced = false;
+            return Ok(());
+        }
+        if let Some(keyword) = ty.as_str() {
+            self.out.push_str(keyword);
+            self.spaced = matches!(
+                ty,
+                TokenType::TK_LP | TokenType::TK_DOT | TokenType::TK_LBRACKET
+            );
+        }
+        if let Some(value) = value {
+            self.out.push_str(value);
+            self.spaced = value.bytes().all(|b| b.is_ascii_whitespace());
+        }
+        Ok(())
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...),
@@ -4132,14 +4194,11 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64, column: i64) -
     if column == 0 {
         return Some(index_definition(&schema, index));
     }
-    let key = index
-        .columns
-        .get(usize::try_from(column).ok()?.checked_sub(1)?)?;
-    Some(
-        key.expression
-            .clone()
-            .unwrap_or_else(|| quote_identifier(&key.name)),
-    )
+    let key = usize::try_from(column)
+        .ok()
+        .and_then(|column| column.checked_sub(1))
+        .and_then(|position| index.columns.get(position));
+    Some(key.map(CatalogIndexColumn::key_text).unwrap_or_default())
 }
 
 fn index_definition(schema: &Schema, index: &CatalogIndex) -> String {
@@ -4180,10 +4239,7 @@ impl Display for IndexDefinition<'_> {
             if position != 0 {
                 f.write_str(", ")?;
             }
-            match column.expression.as_deref() {
-                Some(expression) => f.write_str(expression)?,
-                None => f.write_str(&quote_identifier(&column.name))?,
-            }
+            f.write_str(&column.key_text())?;
             match column.order {
                 SortOrder::Asc => {}
                 SortOrder::Desc => f.write_str(" DESC")?,
@@ -4299,7 +4355,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(ToString::to_string),
+                        expression: column.expr.clone(),
                         order: column.order,
                     })
                     .collect(),
@@ -4315,8 +4371,22 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
 struct CatalogIndexColumn {
     name: String,
     position: usize,
-    expression: Option<String>,
+    expression: Option<Box<ast::Expr>>,
     order: SortOrder,
+}
+
+impl CatalogIndexColumn {
+    /// The key as CREATE INDEX writes it. Like PostgreSQL, an expression
+    /// is in parentheses unless it is a function call.
+    fn key_text(&self) -> String {
+        match self.expression.as_deref() {
+            None => quote_identifier(&self.name),
+            Some(call @ (ast::Expr::FunctionCall { .. } | ast::Expr::FunctionCallStar { .. })) => {
+                render_expr(call)
+            }
+            Some(expression) => format!("({})", render_expr(expression)),
+        }
+    }
 }
 
 fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
