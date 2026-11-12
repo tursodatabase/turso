@@ -410,6 +410,15 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// The oid of the PostgreSQL type of `column`, of a table that is STRICT
+/// when `strict`.
+fn column_type_oid(schema: &Schema, strict: bool, column: &turso_core::schema::Column) -> i64 {
+    match schema.get_type_def(&column.ty_str, strict) {
+        Some(type_def) if !type_def.is_builtin => user_type_oid(&type_def.name),
+        _ => sqlite_type_to_pg_oid(&column.ty_str),
+    }
+}
+
 /// PostgreSQL's `atttypmod` of a column of type `type_oid`: the length of a
 /// `varchar(n)` and the precision and scale of a `numeric(p, s)`, encoded as
 /// PostgreSQL encodes them, or -1 for a column without a modifier.
@@ -935,10 +944,7 @@ impl SnapshotRows for PgAttributeTable {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
-                    _ => sqlite_type_to_pg_oid(&col.ty_str),
-                };
+                let type_oid = column_type_oid(&schema, table.is_strict(), col);
                 let storage = if col.is_array() {
                     "x"
                 } else {
@@ -2435,7 +2441,12 @@ impl SnapshotRows for PgAttrdefTable {
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 let adbin = match (&col.default, col.generated_type()) {
-                    (Some(default_expr), _) => render_default(conn, &schema, default_expr),
+                    (Some(default_expr), _) => render_default(
+                        conn,
+                        &schema,
+                        default_expr,
+                        column_type_oid(&schema, btree.is_strict, col),
+                    ),
                     (None, GeneratedType::Stored { expr, .. }) => {
                         let named = generated_expr_with_names(expr, btree.columns())
                             .expect("stored generated column expression resolves its columns");
@@ -3389,10 +3400,20 @@ fn nextval_argument(default: &ast::Expr) -> Option<String> {
     )
 }
 
-/// The default of a column as `pg_get_expr` shows it. A `nextval` default
-/// names its sequence as a regclass constant, qualified with its schema
-/// when the search path does not find it, as PostgreSQL does.
-fn render_default(conn: &Connection, schema: &Schema, default: &ast::Expr) -> String {
+/// The default of a column of type `type_oid` as `pg_get_expr` shows it.
+/// A `nextval` default names its sequence as a regclass constant, qualified
+/// with its schema when the search path does not find it, and a string
+/// constant is shown as a constant of the column's type, as PostgreSQL
+/// does.
+fn render_default(
+    conn: &Connection,
+    schema: &Schema,
+    default: &ast::Expr,
+    type_oid: i64,
+) -> String {
+    if let Some(constant) = render_typed_string_constant(default, type_oid) {
+        return constant;
+    }
     let Some(sequence) = default_sequence(conn, schema, default) else {
         return render_expr(default);
     };
@@ -4316,6 +4337,60 @@ fn render_expr(expr: &ast::Expr) -> String {
     })
     .expect("rewriting role functions does not fail");
     render_pg_constant(&expr).unwrap_or_else(|| expr.to_string())
+}
+
+/// A string constant as PostgreSQL shows it after reading it as a value of
+/// type `type_oid`, which it does with a column default: numbers and
+/// booleans by the rules of [`render_pg_constant`], anything else as the
+/// string with a cast to the type. None for any other expression, and for
+/// a string that is not a valid number or boolean of a numeric or boolean
+/// type. The string is shown as written, where PostgreSQL shows the type's
+/// output form, such as `2020-01-01 10:00:00` for `2020-01-01 10:00`.
+fn render_typed_string_constant(expr: &ast::Expr, type_oid: i64) -> Option<String> {
+    const BOOLEAN_OID: i64 = 16;
+    const BIGINT_OID: i64 = 20;
+    const SMALLINT_OID: i64 = 21;
+    const INTEGER_OID: i64 = 23;
+    let ast::Expr::Literal(ast::Literal::String(quoted)) = expr else {
+        return None;
+    };
+    let text = quoted
+        .strip_prefix('\'')?
+        .strip_suffix('\'')?
+        .replace("''", "'");
+    let trimmed = text.trim();
+    match type_oid {
+        BOOLEAN_OID => {
+            let value = match trimmed.to_ascii_lowercase().as_str() {
+                "t" | "true" | "y" | "yes" | "on" | "1" => true,
+                "f" | "false" | "n" | "no" | "off" | "0" => false,
+                _ => return None,
+            };
+            Some(value.to_string())
+        }
+        INTEGER_OID => render_pg_number(&trimmed.parse::<i32>().ok()?.to_string()),
+        BIGINT_OID | SMALLINT_OID => {
+            let value: i64 = trimmed.parse().ok()?;
+            Some(format!(
+                "'{value}'::{}",
+                crate::functions::format_type(type_oid, -1)
+            ))
+        }
+        NUMERIC_OID => {
+            let rendered = render_pg_number(trimmed)?;
+            // An integer is rendered as an integer constant, where a numeric
+            // column holds a numeric one.
+            if trimmed.contains('.') || rendered.ends_with("::numeric") {
+                Some(rendered)
+            } else {
+                Some(format!("'{}'::numeric", rendered.trim_matches('\'')))
+            }
+        }
+        _ => Some(format!(
+            "{quoted}::{}",
+            crate::functions::format_type(type_oid, -1)
+        )),
+    }
 }
 
 /// Renders a constant the way PostgreSQL's pg_get_expr() prints it, or returns

@@ -1952,3 +1952,36 @@ expect {
     d|524295|numeric(8,3)
     e|-1|integer
 }
+
+# PostgreSQL reads a string default as a value of the column's type, and
+# pg_get_expr shows it as a constant of that type.
+test pg-get-expr-of-string-defaults {
+    CREATE TABLE sd_defaults (
+        a text DEFAULT 'hello', b varchar(20) DEFAULT 'x', d int DEFAULT '5',
+        f boolean DEFAULT 'true', g date DEFAULT '2020-01-01',
+        i uuid DEFAULT '00000000-0000-0000-0000-000000000000', j json DEFAULT '{}',
+        k bytea DEFAULT '\x00', l text DEFAULT 5, m bigint DEFAULT '7',
+        o text DEFAULT 'it''s', p text DEFAULT '', q int DEFAULT '-3',
+        r numeric(10,2) DEFAULT '2.5', s jsonb DEFAULT '[]');
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    WHERE d.adrelid = (SELECT oid FROM pg_class WHERE relname = 'sd_defaults')
+    ORDER BY d.adnum;
+}
+expect {
+    a|'hello'::text
+    b|'x'::character varying
+    d|5
+    f|true
+    g|'2020-01-01'::date
+    i|'00000000-0000-0000-0000-000000000000'::uuid
+    j|'{}'::json
+    k|'\x00'::bytea
+    l|5
+    m|'7'::bigint
+    o|'it''s'::text
+    p|''::text
+    q|'-3'::integer
+    r|2.5
+    s|'[]'::jsonb
+}

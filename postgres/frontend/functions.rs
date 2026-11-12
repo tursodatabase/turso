@@ -991,7 +991,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
 }
 
 /// The name of a type as `format_type` prints it.
-fn format_type(type_oid: i64, typemod: i64) -> String {
+pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),
