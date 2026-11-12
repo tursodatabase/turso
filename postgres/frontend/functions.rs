@@ -606,10 +606,10 @@ fn exec_pg_is_visible(_oid: i64) -> Boolean {
     Boolean(true)
 }
 
-/// PostgreSQL version advertised by version(). The major version matches the
-/// server_version startup parameter pgwire's DefaultServerParameterProvider
-/// sends, so the two claims agree.
-const SERVER_VERSION: &str = "16.6";
+/// The PostgreSQL version that tursopg claims to be, in version() and in the
+/// server_version startup parameter. Clients such as pg_dump choose their
+/// catalog queries by it.
+pub const SERVER_VERSION: &str = "18.0";
 
 /// Clients sometimes gate connection setup on this string: knex and TypeORM regex
 /// parse it as `^PostgreSQL ([\d.]+)`, so it must lead with a numeric version.

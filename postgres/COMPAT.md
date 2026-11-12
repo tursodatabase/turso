@@ -80,7 +80,9 @@ Basics not enumerated by the official feature matrix.
 
 ## Backend
 
-As in PostgreSQL 18, every NOT NULL
+tursopg reports itself as PostgreSQL 18.0, in `version()` and in the
+`server_version` startup parameter, so clients such as pg_dump and psql send
+the catalog queries of PostgreSQL 18. As in PostgreSQL 18, every NOT NULL
 column has a NOT NULL constraint (`contype = 'n'`) in `pg_constraint`, and
 `conkey` and `confkey` are arrays such as `{1,2}`.
 
