@@ -8,7 +8,10 @@ use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    schema::{
+        generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
+        AUTOINCREMENT_SEQ_PREFIX,
+    },
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
@@ -893,7 +896,8 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
+                let has_def = i64::from(col.default.is_some() || col.is_stored_generated());
+                let generated = if col.is_stored_generated() { "s" } else { "" };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -909,19 +913,19 @@ impl SnapshotRows for PgAttributeTable {
                     Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
                     Value::Text("".into()),
-                    Value::from_i64(notnull), // attnotnull
-                    Value::from_i64(has_def), // atthasdef
-                    Value::from_i64(0),       // atthasmissing
-                    Value::Text("".into()),   // attidentity
-                    Value::Text("".into()),   // attgenerated
-                    Value::from_i64(0),       // attisdropped
-                    Value::from_i64(1),       // attislocal
-                    Value::from_i64(0),       // attinhcount
-                    Value::from_i64(0),       // attcollation
-                    Value::Null,              // attacl
-                    Value::Null,              // attoptions
-                    Value::Null,              // attfdwoptions
-                    Value::Null,              // attmissingval
+                    Value::from_i64(notnull),      // attnotnull
+                    Value::from_i64(has_def),      // atthasdef
+                    Value::from_i64(0),            // atthasmissing
+                    Value::Text("".into()),        // attidentity
+                    Value::Text(generated.into()), // attgenerated
+                    Value::from_i64(0),            // attisdropped
+                    Value::from_i64(1),            // attislocal
+                    Value::from_i64(0),            // attinhcount
+                    Value::from_i64(0),            // attcollation
+                    Value::Null,                   // attacl
+                    Value::Null,                   // attoptions
+                    Value::Null,                   // attfdwoptions
+                    Value::Null,                   // attmissingval
                 ]);
             }
         }
@@ -2330,15 +2334,22 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
-                if let Some(default_expr) = &col.default {
-                    rows.push(vec![
-                        Value::from_i64(attrdef_oid),                 // oid
-                        Value::from_i64(table_oid),                   // adrelid
-                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
-                        Value::build_text(render_expr(default_expr)), // adbin
-                    ]);
-                    attrdef_oid += 1;
-                }
+                let adbin = match (&col.default, col.generated_type()) {
+                    (Some(default_expr), _) => render_expr(default_expr),
+                    (None, GeneratedType::Stored { expr, .. }) => {
+                        let named = generated_expr_with_names(expr, btree.columns())
+                            .expect("stored generated column expression resolves its columns");
+                        render_expr(&named)
+                    }
+                    (None, _) => continue,
+                };
+                rows.push(vec![
+                    Value::from_i64(attrdef_oid),        // oid
+                    Value::from_i64(table_oid),          // adrelid
+                    Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
+                    Value::build_text(adbin),            // adbin
+                ]);
+                attrdef_oid += 1;
             }
         }
         rows
@@ -4018,6 +4029,15 @@ fn render_expr(expr: &ast::Expr) -> String {
             if args.is_empty() {
                 if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
                     *expr = ast::Expr::Id(ast::Name::from_string(keyword));
+                }
+            } else if args.len() > 1 {
+                let pg_name = match name.as_str().to_ascii_uppercase().as_str() {
+                    "MAX" => Some("greatest"),
+                    "MIN" => Some("least"),
+                    _ => None,
+                };
+                if let Some(pg_name) = pg_name {
+                    *name = ast::Name::from_string(pg_name);
                 }
             }
         }

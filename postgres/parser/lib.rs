@@ -1,5 +1,6 @@
 pub mod cmdtag;
 pub mod copy;
+pub mod functions;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
@@ -194,6 +195,53 @@ pub fn create_table_name(parse_result: &ParseResult) -> Option<(Option<String>, 
         return None;
     };
     let relation = create.relation.as_ref()?;
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// The schema, if the statement names one, and name of the table being
+/// altered, when the statement is `ALTER TABLE t ADD COLUMN`. Returns None
+/// for all other statements.
+pub fn alter_table_add_column_table(
+    parse_result: &ParseResult,
+) -> Option<(Option<String>, String)> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::AlterTableType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::AlterTableStmt(alter), ..) = nodes.first()? else {
+        return None;
+    };
+    let relation = alter.relation.as_ref()?;
+    let cmd = alter.cmds.first()?;
+    let Some(Node::AlterTableCmd(cmd)) = &cmd.node else {
+        return None;
+    };
+    if AlterTableType::try_from(cmd.subtype).ok()? != AlterTableType::AtAddColumn {
+        return None;
+    }
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// Returns the (schema, table) of a positional VALUES INSERT (no explicit column list).
+/// Returns None for any other statement, for INSERT with a column list, or for DEFAULT VALUES.
+pub fn positional_insert_table(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::InsertStmt(insert), ..) = nodes.first()? else {
+        return None;
+    };
+    if !insert.cols.is_empty() || insert.select_stmt.is_none() {
+        return None;
+    }
+    let relation = insert.relation.as_ref()?;
     Some((
         (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
         relation.relname.clone(),

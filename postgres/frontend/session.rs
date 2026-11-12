@@ -426,10 +426,49 @@ fn prepare_statement_inner(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
+    let existing_generated = turso_pg_parser::alter_table_add_column_table(&parse_result)
+        .and_then(|(schema, table)| {
+            relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
+                .into_iter()
+                .find_map(|ns| {
+                    pg_conn.conn.with_schema(ns.database_id(), |s| {
+                        s.get_btree_table(ns.target.id, &table).map(|t| {
+                            t.columns()
+                                .iter()
+                                .filter(|c| c.is_generated())
+                                .filter_map(|c| c.name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                })
+        })
+        .unwrap_or_default();
+    if let Some((schema, table)) = turso_pg_parser::positional_insert_table(&parse_result) {
+        let has_generated = relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
+            .into_iter()
+            .find_map(|ns| {
+                pg_conn.conn.with_schema(ns.database_id(), |s| {
+                    s.get_btree_table(ns.target.id, &table)
+                        .map(|t| t.columns().iter().any(|c| c.is_generated()))
+                })
+            })
+            .unwrap_or(false);
+        if has_generated {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "positional INSERT into table \"{table}\" with generated columns \
+                     requires an explicit column list"
+                ),
+            ));
+        }
+    }
     let conn_for_names = Arc::clone(&pg_conn.conn);
-    let translator = PostgreSQLTranslator::new().with_relation_name_check(move |schema, name| {
-        schema_has_relation(&conn_for_names, schema, name)
-    });
+    let translator = PostgreSQLTranslator::new()
+        .with_relation_name_check(move |schema, name| {
+            schema_has_relation(&conn_for_names, schema, name)
+        })
+        .with_existing_generated_columns(existing_generated);
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
