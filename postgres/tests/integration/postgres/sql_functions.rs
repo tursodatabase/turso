@@ -273,4 +273,10 @@ fn a_role_that_is_not_a_superuser_cannot_change_functions() {
     let drop = pg.execute("DROP FUNCTION one()").unwrap_err();
     assert_eq!(drop.sqlstate, "42501");
     assert_eq!(drop.to_string(), "must be owner of function one");
+
+    // PostgreSQL looks for the function before it checks the owner, so a
+    // role that owns nothing gets the results for a missing function.
+    pg.execute("DROP FUNCTION IF EXISTS nosuch()").unwrap();
+    let missing = pg.execute("DROP FUNCTION nosuch()").unwrap_err();
+    assert_eq!(missing.sqlstate, "42883");
 }
