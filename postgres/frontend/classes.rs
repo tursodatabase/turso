@@ -1383,15 +1383,43 @@ fn emit_class_row_delete(
     });
 }
 
-/// Deletes the class row named `name` of `namespace`. The caller tells the
-/// in-memory catalog.
+/// Deletes the class row of the relation `name` of `namespace`. The caller
+/// tells the in-memory catalog.
 pub(crate) fn emit_class_row_removal(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
     namespace: NamespaceId,
     name: &str,
 ) {
-    emit_find_class_row(program, cursors, namespace, name, |program, row| {
+    emit_class_row_removal_with_collation(program, cursors, namespace, name, CollationSeq::NOCASE);
+}
+
+/// Deletes the class row of a function, which has the stored name `name` in
+/// `namespace`. The name of a function keeps its case, so `"One"` and `one`
+/// are two rows, and the row is found with an exact comparison.
+pub(crate) fn emit_function_class_row_removal(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+) {
+    emit_class_row_removal_with_collation(
+        program,
+        cursors,
+        namespace,
+        name,
+        CollationSeq::for_internal_values(),
+    );
+}
+
+fn emit_class_row_removal_with_collation(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+    name_collation: CollationSeq,
+) {
+    let delete_row = |program: &mut ProgramBuilder, row: &FoundClassRow| {
         emit_class_name_index_delete(program, cursors, namespace, name, row.rowid_reg);
         // Marked as part of an update so that changes() does not count it.
         program.emit_insn(Insn::Delete {
@@ -1399,7 +1427,15 @@ pub(crate) fn emit_class_row_removal(
             table_name: CLASSES_TABLE_NAME.to_string(),
             is_part_of_update: true,
         });
-    });
+    };
+    emit_find_class_row_with_collation(
+        program,
+        cursors,
+        namespace,
+        name,
+        name_collation,
+        delete_row,
+    );
 }
 
 /// Renames the class row of relation `old_name` of `namespace` to
@@ -1615,12 +1651,33 @@ struct FoundClassRow {
 
 /// Scans the classes table for the row of relation `name` of `namespace` and
 /// runs `found` with the cursor on it. Emits nothing after the scan when the
-/// row does not exist, so a relation without a row is tolerated.
+/// row does not exist, so a relation without a row is tolerated. The stored
+/// name of a relation is in lowercase, and `name` can be in another case.
 fn emit_find_class_row(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
     namespace: NamespaceId,
     name: &str,
+    found: impl FnOnce(&mut ProgramBuilder, &FoundClassRow),
+) {
+    emit_find_class_row_with_collation(
+        program,
+        cursors,
+        namespace,
+        name,
+        CollationSeq::NOCASE,
+        found,
+    );
+}
+
+/// [`emit_find_class_row`], with `name_collation` for the comparison of the
+/// stored name with `name`.
+fn emit_find_class_row_with_collation(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+    name_collation: CollationSeq,
     found: impl FnOnce(&mut ProgramBuilder, &FoundClassRow),
 ) {
     let name_reg = program.emit_string8_new_reg(name.to_string());
@@ -1655,7 +1712,7 @@ fn emit_find_class_row(
         rhs: name_reg,
         target_pc: next,
         flags: CmpInsFlags::default().jump_if_null(),
-        collation: CollationSeq::NOCASE,
+        collation: name_collation,
     });
 
     let row = FoundClassRow {

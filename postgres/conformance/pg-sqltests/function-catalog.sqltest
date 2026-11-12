@@ -377,6 +377,17 @@ expect {
     25
 }
 
+# The name of a function keeps its case, so "One" and one are two functions.
+test drop-function-whose-name-differs-in-case-from-another-function {
+    CREATE FUNCTION "One"() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    DROP FUNCTION one();
+    SELECT proname, prosrc FROM pg_proc WHERE proname IN ('One', 'one');
+}
+expect {
+    One|SELECT 1
+}
+
 test drop-several-functions {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
     CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;

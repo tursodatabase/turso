@@ -36,7 +36,7 @@ use turso_pg_parser::{display_signature_type_name, is_base_type_name};
 
 use crate::catalog::pg_base_type_oid;
 use crate::classes::{
-    class_catalog, corrupt_row, emit_class_row_insert_of_kind, emit_class_row_removal,
+    class_catalog, corrupt_row, emit_class_row_insert_of_kind, emit_function_class_row_removal,
     open_class_table_for_writing, read_back_integer, FIRST_NORMAL_OBJECT_ID,
 };
 use crate::error::sqlstate_error;
@@ -441,7 +441,7 @@ pub(crate) fn translate_drop_function(
         &mangle_name(function.namespace, &stored_name),
     );
     let cursors = open_class_table_for_writing(program, schema, false)?.ok_or_else(no_catalog)?;
-    emit_class_row_removal(program, &cursors, function.namespace, &stored_name);
+    emit_function_class_row_removal(program, &cursors, function.namespace, &stored_name);
     emit_function_change(program, FunctionChange::Drop { oid: function.oid }, vec![]);
     Ok(())
 }
