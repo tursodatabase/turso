@@ -294,6 +294,16 @@ impl Dialect for PostgresDialect {
         )
     }
 
+    fn translate_drop_function(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        function: &ast::DropFunction,
+    ) -> turso_core::Result<()> {
+        crate::sql_functions::translate_drop_function(program, schema, connection, function)
+    }
+
     fn relation_owner(
         &self,
         schema: &Schema,

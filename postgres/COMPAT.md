@@ -502,6 +502,7 @@ Upgrade is not supported.
 | CALL syntax for executing procedures | ❌ Not supported | |
 | ALTER FUNCTION / ALTER ROUTINE | ❌ Not supported | |
 | CREATE FUNCTION | 🟡 Partial | Stores a function of `LANGUAGE sql` whose body is one query in a dollar-quoted string, and whose parameters and result have base types that `pg_type` shows. The function cannot be called yet. `CREATE OR REPLACE FUNCTION` is supported. A function that PostgreSQL rejects gets PostgreSQL's error; any other unsupported function gets an error that names the first unsupported feature, such as the language, RETURNS SETOF or an option. See the notes below this table |
+| DROP FUNCTION | 🟡 Partial | One function for each statement; CASCADE is not supported. Nothing checks whether another object uses the function. `DROP PROCEDURE` and `DROP ROUTINE` are not supported |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
 | Event triggers | ❌ Not supported | |

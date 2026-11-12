@@ -1927,7 +1927,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
     }])
 }
 
-fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
+pub(crate) fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
     if catalog::namespace_exists(conn, schema) {
         return Ok(());
     }

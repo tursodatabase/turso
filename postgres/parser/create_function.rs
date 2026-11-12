@@ -14,8 +14,8 @@ use crate::sqlstate::{
 };
 use crate::{FunctionTypeUse, ParseError};
 use pg_query::protobuf::{
-    node::Node, CreateFunctionStmt, DefElem, FunctionParameter, FunctionParameterMode, TypeName,
-    VariableSetKind,
+    node::Node, CreateFunctionStmt, DefElem, DropStmt, FunctionParameter, FunctionParameterMode,
+    ObjectWithArgs, TypeName, VariableSetKind,
 };
 use pg_query::NodeEnum;
 use std::collections::HashMap;
@@ -44,6 +44,47 @@ pub(crate) fn check_create_function(
     stmt: &CreateFunctionStmt,
 ) -> Result<(), ParseError> {
     checked_function(Some(sql), stmt).map(|_| ())
+}
+
+/// The statement that `drop`, a DROP FUNCTION statement, translates to.
+pub(crate) fn translate_drop_function(drop: &DropStmt) -> Result<ast::Stmt, ParseError> {
+    if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
+        return Err(ParseError::not_supported("DROP FUNCTION ... CASCADE"));
+    }
+    let [object] = drop.objects.as_slice() else {
+        return Err(ParseError::not_supported(
+            "DROP FUNCTION of several objects",
+        ));
+    };
+    let Some(Node::ObjectWithArgs(function)) = &object.node else {
+        return Err(ParseError::ParseError(
+            "DROP FUNCTION: expected a function name".to_string(),
+        ));
+    };
+    Ok(ast::Stmt::DropFunction(ast::DropFunction {
+        if_exists: drop.missing_ok,
+        name: function_name(&function.objname)?,
+        parameter_types: dropped_parameter_types(function)?,
+    }))
+}
+
+/// The parameter types that DROP FUNCTION names the function with, or None
+/// when it names the function without its parameters.
+fn dropped_parameter_types(function: &ObjectWithArgs) -> Result<Option<Vec<String>>, ParseError> {
+    if function.args_unspecified {
+        return Ok(None);
+    }
+    function
+        .objargs
+        .iter()
+        .map(|argument| match &argument.node {
+            Some(Node::TypeName(type_name)) => signature_type_name(type_name),
+            _ => Err(ParseError::ParseError(
+                "DROP FUNCTION: expected a parameter type".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// The name of `type_name` in the signature of a function: the name
@@ -738,6 +779,11 @@ pub fn display_signature_type_name(name: &str) -> String {
     format!("{display}{}", &name[element.len()..])
 }
 
+/// Whether a signature names a built-in base type `name`.
+pub fn is_base_type_name(name: &str) -> bool {
+    BASE_TYPES.contains(&name)
+}
+
 // FIXME: the three lists that follow are written by hand, and they must
 // follow the PostgreSQL version of pg_query. They are also one of three
 // places that say what a type name is. The FIXME in
@@ -892,11 +938,47 @@ mod tests {
     }
 
     #[test]
+    fn drop_function_tells_no_parameters_from_no_parameter_list() {
+        let ast::Stmt::DropFunction(without_list) = translate("DROP FUNCTION one") else {
+            panic!("expected DROP FUNCTION");
+        };
+        assert_eq!(without_list.parameter_types, None);
+        assert!(!without_list.if_exists);
+
+        let ast::Stmt::DropFunction(without_parameters) =
+            translate("DROP FUNCTION IF EXISTS app.one()")
+        else {
+            panic!("expected DROP FUNCTION");
+        };
+        assert_eq!(without_parameters.parameter_types, Some(vec![]));
+        assert!(without_parameters.if_exists);
+        assert_eq!(without_parameters.name.namespace.unwrap().as_str(), "app");
+
+        let ast::Stmt::DropFunction(with_parameters) =
+            translate("DROP FUNCTION one(integer, text[], app.item)")
+        else {
+            panic!("expected DROP FUNCTION");
+        };
+        assert_eq!(
+            with_parameters.parameter_types,
+            Some(vec![
+                "int4".to_string(),
+                "text[]".to_string(),
+                "app.item".to_string()
+            ])
+        );
+    }
+
+    #[test]
     fn a_function_statement_formats_as_sql() {
         assert_eq!(
             translate("CREATE FUNCTION greet(text) RETURNS text LANGUAGE sql AS $$SELECT 'hi'$$")
                 .to_string(),
             "CREATE FUNCTION greet (text) RETURNS text AS 'SELECT ''hi'''"
+        );
+        assert_eq!(
+            translate("DROP FUNCTION IF EXISTS greet(text)").to_string(),
+            "DROP FUNCTION IF EXISTS greet (text)"
         );
     }
 }

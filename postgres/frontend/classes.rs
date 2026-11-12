@@ -1372,6 +1372,25 @@ fn emit_class_row_delete(
     namespace: NamespaceId,
     name: &str,
 ) {
+    emit_class_row_removal(program, cursors, namespace, name);
+    program.emit_insn(Insn::CatalogChange {
+        db: MAIN_DB_ID,
+        change: Box::new(CatalogChange::Drop {
+            namespace,
+            name: name.to_string(),
+        }),
+        value_regs: vec![],
+    });
+}
+
+/// Deletes the class row named `name` of `namespace`. The caller tells the
+/// in-memory catalog.
+pub(crate) fn emit_class_row_removal(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+) {
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         emit_class_name_index_delete(program, cursors, namespace, name, row.rowid_reg);
         // Marked as part of an update so that changes() does not count it.
@@ -1380,14 +1399,6 @@ fn emit_class_row_delete(
             table_name: CLASSES_TABLE_NAME.to_string(),
             is_part_of_update: true,
         });
-    });
-    program.emit_insn(Insn::CatalogChange {
-        db: MAIN_DB_ID,
-        change: Box::new(CatalogChange::Drop {
-            namespace,
-            name: name.to_string(),
-        }),
-        value_regs: vec![],
     });
 }
 

@@ -1539,9 +1539,12 @@ impl PostgreSQLTranslator {
         if remove_type == ObjectType::ObjectPolicy {
             return translate_drop_policy(drop);
         }
+        if remove_type == ObjectType::ObjectFunction {
+            return crate::create_function::translate_drop_function(drop);
+        }
         if matches!(
             remove_type,
-            ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine
+            ObjectType::ObjectProcedure | ObjectType::ObjectRoutine
         ) {
             return Err(ParseError::not_supported(format!(
                 "DROP {}",

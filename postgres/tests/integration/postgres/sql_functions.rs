@@ -120,6 +120,11 @@ fn create_function_stores_a_schema_row_and_a_class_row() {
             ),
         ]
     );
+
+    pg.execute("DROP FUNCTION add_one(integer)").unwrap();
+    pg.execute("DROP FUNCTION app.pad").unwrap();
+    assert_eq!(function_schema_rows(&conn), vec![]);
+    assert_eq!(function_class_rows(&conn), vec![]);
 }
 
 #[test]
@@ -155,6 +160,7 @@ fn functions_survive_a_reopen() {
             .unwrap();
         pg.execute("CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT 2$$")
             .unwrap();
+        pg.execute("DROP FUNCTION one").unwrap();
         pg.close().unwrap();
     }
 
@@ -162,11 +168,9 @@ fn functions_survive_a_reopen() {
     let pg = db.connect_postgres();
     assert_eq!(
         user_functions(&pg),
-        vec![
-            (16384, "one".to_string(), "SELECT 1".to_string()),
-            (16385, "two".to_string(), "SELECT 2".to_string())
-        ]
+        vec![(16385, "two".to_string(), "SELECT 2".to_string())]
     );
+    // The oid of a dropped function is not used again.
     pg.execute("CREATE FUNCTION three() RETURNS integer LANGUAGE sql AS $$SELECT 3$$")
         .unwrap();
     assert_eq!(
@@ -227,6 +231,9 @@ fn another_connection_sees_function_changes() {
         user_functions(&reader),
         vec![(16384, "one".to_string(), "SELECT 2".to_string())]
     );
+
+    writer.execute("DROP FUNCTION one()").unwrap();
+    assert_eq!(user_functions(&reader), vec![]);
 }
 
 #[test]
@@ -263,4 +270,7 @@ fn a_role_that_is_not_a_superuser_cannot_change_functions() {
         .execute("CREATE OR REPLACE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 2$$")
         .unwrap_err();
     assert_eq!(replace.sqlstate, "42501");
+    let drop = pg.execute("DROP FUNCTION one()").unwrap_err();
+    assert_eq!(drop.sqlstate, "42501");
+    assert_eq!(drop.to_string(), "must be owner of function one");
 }
