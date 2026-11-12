@@ -47,12 +47,14 @@ fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
 }
 
 /// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// The parser knows that the semicolons in the BEGIN ATOMIC body of CREATE
+/// FUNCTION do not end the statement. Text with a syntax error is an error,
+/// because PostgreSQL runs none of the statements in it.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     let parts =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     Ok(parts
         .into_iter()
         .map(|s| s.trim().to_string())

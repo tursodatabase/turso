@@ -285,6 +285,8 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
         Ok(stmts) => Ok(stmts),
+        // Preparing the whole text reports its syntax error, and none of its
+        // statements run.
         Err(_) => Ok(vec![sql.trim().to_string()]),
     }
 }
