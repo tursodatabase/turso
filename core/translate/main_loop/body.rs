@@ -285,19 +285,7 @@ fn emit_loop_source<'a>(
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
-                    let filter_reg = program.alloc_register();
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        filter_expr,
-                        filter_reg,
-                        &t_ctx.resolver,
-                    )?;
-                    program.emit_insn(Insn::IfNot {
-                        reg: filter_reg,
-                        target_pc: label,
-                        jump_if_null: true,
-                    });
+                    emit_aggregate_filter_jump(program, plan, filter_expr, label, &t_ctx.resolver)?;
                     Some(label)
                 } else {
                     None

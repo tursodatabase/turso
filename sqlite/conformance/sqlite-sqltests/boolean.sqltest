@@ -341,3 +341,709 @@ test where-string-float-prefix {
 expect {
     1
 }
+
+# SQLite replaces `x AND 0` with 0 when one operand is the integer literal 0,
+# so the other operand never runs. The shapes below behave the same in the
+# SQLite these tests run against (3.50.4) and in the current SQLite; the ones
+# only newer SQLite folds (a function call operand, OR with 1, TRUE/FALSE)
+# are in turso-sqltests/and-or-constant-fold.sqltest.
+
+test and-with-a-constant-false-operand-never-runs-the-other-operand {
+    SELECT 0 AND (SELECT abs(-9223372036854775807 - 1)), (SELECT abs(-9223372036854775807 - 1)) AND 0, typeof((SELECT abs(-9223372036854775807 - 1)) AND 0);
+    SELECT CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 THEN 'y' ELSE 'n' END, CASE (SELECT abs(-9223372036854775807 - 1)) AND 0 WHEN 0 THEN 'z' END;
+    SELECT 0x0 AND (SELECT abs(-9223372036854775807 - 1)), ((0)) AND (SELECT abs(-9223372036854775807 - 1)), 00 AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT NOT ((SELECT abs(-9223372036854775807 - 1)) AND 0), ((SELECT abs(-9223372036854775807 - 1)) AND 0) OR 1.5, 0 AND (1 OR (SELECT abs(-9223372036854775807 - 1))), (SELECT abs(-9223372036854775807 - 1)) AND 1 AND 0;
+    SELECT coalesce(NULL, (SELECT abs(-9223372036854775807 - 1)) AND 0), iif(0 AND (SELECT abs(-9223372036854775807 - 1)), 'y', 'n');
+    SELECT 0 AND -(SELECT abs(-9223372036854775807 - 1)), 0 AND ((SELECT abs(-9223372036854775807 - 1)) + 1), 0 AND CAST((SELECT abs(-9223372036854775807 - 1)) AS TEXT), 0 AND (SELECT abs(-9223372036854775807 - 1)) IN (1, 2), 0 AND EXISTS (SELECT abs(-9223372036854775807 - 1));
+}
+expect {
+    0|0|integer
+    n|z
+    0|0|0
+    1|1|0|0
+    0|n
+    0|0|0|0|0
+}
+
+test and-with-a-constant-false-operand-folds-in-every-clause {
+    CREATE TABLE fold(a);
+    INSERT INTO fold VALUES (5);
+    SELECT a AND 0, a OR 1, 0 AND a, 1 OR a, a AND 1, a OR 0 FROM fold;
+    SELECT 0 AND (SELECT abs(-9223372036854775807 - 1)) FROM fold;
+    SELECT 1 FROM fold WHERE a OR 1;
+    SELECT 1 FROM fold WHERE (SELECT abs(-9223372036854775807 - 1)) OR 1;
+    SELECT 1 FROM fold WHERE (SELECT abs(-9223372036854775807 - 1)) AND 0;
+    SELECT 1 WHERE (SELECT abs(-9223372036854775807 - 1)) AND 0;
+    SELECT a FROM fold WHERE CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 THEN 1 ELSE 1 END;
+    SELECT 1 OR a FROM fold ORDER BY a OR 1;
+    UPDATE fold SET a = (SELECT abs(-9223372036854775807 - 1)) AND 0 RETURNING a;
+    INSERT INTO fold VALUES ((SELECT abs(-9223372036854775807 - 1)) AND 0) RETURNING a;
+}
+expect {
+    0|1|0|1|1|1
+    0
+    1
+    1
+    5
+    1
+    0
+    0
+}
+
+# A float, a string, NULL, a COLLATE, a unary sign or an integer that does not
+# fit in 32 bits is not folded, so the other operand runs.
+
+test and-or-with-a-float-operand-runs-the-other-operand {
+    SELECT 1.5 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-large-integer-operand-runs-the-other-operand {
+    SELECT 2147483648 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-long-hex-operand-runs-the-other-operand {
+    SELECT 0xffffffffffffffff OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-collated-operand-runs-the-other-operand {
+    SELECT (0 COLLATE NOCASE) AND json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-signed-operand-runs-the-other-operand {
+    SELECT -1 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-null-operand-runs-the-other-operand {
+    SELECT NULL AND json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+# An integer literal with a digit separator is not folded either: SQLite only
+# reads the value of a plain digit string when it builds the literal.
+
+test and-with-a-digit-separator-operand-runs-the-other-operand {
+    SELECT 0_0 AND json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test or-with-a-digit-separator-operand-runs-the-other-operand {
+    SELECT 1_0 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+# An aggregate where none is allowed is still a misuse, even next to the
+# constant that would decide the AND or OR.
+
+test and-or-with-a-constant-operand-still-rejects-a-misused-aggregate {
+    CREATE TABLE misuse(a);
+    CREATE TABLE misuse_other(b);
+    SELECT a, b FROM misuse LEFT JOIN misuse_other ON sum(a) AND 0;
+}
+expect error {
+    misuse of aggregate
+}
+
+# A constant false term does not hide a misused aggregate in the terms after
+# it: SQLite rejects the query before it plans anything.
+
+test and-chain-with-a-constant-false-operand-still-rejects-a-misused-aggregate {
+    CREATE TABLE misuse_after(a);
+    SELECT a FROM misuse_after WHERE 0 AND sum(a);
+}
+expect error {
+    misuse of aggregate function sum()
+}
+
+test and-chain-with-a-constant-false-operand-still-rejects-a-misused-window-function {
+    CREATE TABLE misuse_after_window(a);
+    SELECT a FROM misuse_after_window WHERE 0 AND row_number() OVER ();
+}
+expect error {
+    misuse of window function row_number()
+}
+
+test and-chain-with-a-constant-false-operand-still-rejects-a-misused-aggregate-in-on {
+    CREATE TABLE misuse_after_on(a);
+    CREATE TABLE misuse_after_on_other(b);
+    SELECT a, b FROM misuse_after_on JOIN misuse_after_on_other ON 0 AND count(*);
+}
+expect error {
+    misuse of aggregate function count
+}
+
+# SQLite resolves every name before it drops an operand of `x OR 1`, so a
+# wrong column name inside a subquery of that operand is still an error.
+
+test or-with-a-constant-operand-still-checks-a-name-inside-a-dropped-subquery {
+    CREATE TABLE dropped_sub(a);
+    SELECT (SELECT nosuchcol) OR 1 FROM dropped_sub;
+}
+expect error {
+    no such column: nosuchcol
+}
+
+test and-with-a-constant-false-operand-still-checks-a-name-inside-a-dropped-subquery {
+    CREATE TABLE dropped_sub(a);
+    INSERT INTO dropped_sub VALUES (1);
+    UPDATE dropped_sub SET a = EXISTS (SELECT 1 WHERE nosuchcol = 1) AND FALSE;
+}
+expect error {
+    no such column: nosuchcol
+}
+
+# `x AND 0` is decided before names are resolved, as in SQLite's parser.
+
+test and-with-integer-zero-drops-an-unknown-column-name-like-the-parser {
+    CREATE TABLE unknown_name(a);
+    INSERT INTO unknown_name VALUES (1);
+    SELECT 0 AND nosuchcol, a FROM unknown_name;
+    UPDATE unknown_name SET a = 2 WHERE 0 AND nosuchcol;
+    SELECT a FROM unknown_name;
+    SELECT 0 AND (SELECT nosuchfunc(1));
+}
+expect {
+    0|1
+    1
+    0
+}
+
+# A function call keeps `x AND 0` out of the parser's fold, and the code
+# generator resolves every name before it folds, so a function that does not
+# exist is an error in the operand that `x AND 0` or `x OR 1` drops, in a
+# subquery of that operand too.
+
+test and-or-with-a-constant-operand-still-checks-a-function-name {
+    SELECT 1 OR nosuchfunc(1);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+test and-or-with-a-constant-operand-still-checks-the-likelihood-argument {
+    CREATE TABLE likely(a);
+    SELECT 0 AND likelihood(a, 2) FROM likely;
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0\.0 and 1\.0
+}
+
+# A generated column and a CHECK constraint are resolved when the table is
+# created, before anything folds them.
+
+test a-generated-column-checks-the-likelihood-argument-when-the-table-is-created {
+    CREATE TABLE likely(a, c AS (likelihood(a, 2) AND 0));
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0\.0 and 1\.0
+}
+
+test a-check-constraint-checks-the-likelihood-argument-when-the-table-is-created {
+    CREATE TABLE likely(a CHECK (1 OR likelihood(a, 2)));
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0\.0 and 1\.0
+}
+
+# The likelihood argument is checked once the names are resolved, so a
+# subquery in the same expression is reported first.
+
+test a-check-constraint-reports-a-subquery-before-the-likelihood-argument {
+    CREATE TABLE likely(a CHECK (likelihood(a, 2) AND (SELECT 1)));
+}
+expect error {
+    subqueries prohibited in CHECK constraints
+}
+
+test a-generated-column-reports-a-subquery-before-the-likelihood-argument {
+    CREATE TABLE likely(a, c AS (likelihood(a, 2) AND (SELECT 1)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+test and-with-integer-zero-still-checks-a-function-name-in-where {
+    CREATE TABLE unknown_function(a);
+    INSERT INTO unknown_function VALUES (1);
+    SELECT a FROM unknown_function WHERE 0 AND nosuchfunc(a);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+test or-with-a-constant-operand-still-checks-a-function-name-inside-a-dropped-subquery {
+    SELECT 1 OR (SELECT nosuchfunc(1));
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+test and-with-integer-zero-still-checks-a-function-name-in-an-outer-join-on {
+    CREATE TABLE unknown_function(a);
+    INSERT INTO unknown_function VALUES (1);
+    SELECT l.a FROM unknown_function AS l LEFT JOIN unknown_function AS r ON 0 AND nosuchfunc(r.a);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+# SQLite checks the sizes of compared row values when it resolves names,
+# so they still fail in the operand `x OR 1` drops.
+
+test or-with-a-constant-operand-still-checks-compared-row-value-sizes {
+    SELECT 1 OR (1, 2) = (1, 2, 3);
+}
+expect error {
+    row value misused
+}
+
+test or-with-a-constant-operand-still-checks-the-row-value-size-of-a-subquery {
+    CREATE TABLE row_value_sub(a);
+    SELECT 1 OR a = (SELECT 1, 2) FROM row_value_sub;
+}
+expect error {
+    row value misused
+}
+
+test or-with-a-constant-operand-still-checks-in-list-element-sizes {
+    SELECT 1 OR (1, 2) IN ((1, 2, 3));
+}
+expect error {
+    IN\(\.\.\.\) element has 3 terms - expected 2
+}
+
+# SQLite looks a collation up on the expression as written when it sorts,
+# groups or compares by it, so a collation name still fails in the operand
+# `x OR 1` drops there.
+
+test or-with-a-constant-operand-still-checks-a-collation-name {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT a FROM unknown_collation ORDER BY 1 OR a COLLATE nosuch;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-when-compared {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT (1 OR a COLLATE nosuch) = 1 FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-under-distinct {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT DISTINCT 1 OR a COLLATE nosuch FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-a-union {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch FROM unknown_collation UNION SELECT 2;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+# A select that becomes a table, a view or a CTE gives each of its columns a
+# collation, as does the subquery of an IN, and a sort key that names a
+# result column by alias or number takes that column's collation.
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-a-subquery-in-from {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT c FROM (SELECT 1 OR a COLLATE nosuch AS c FROM unknown_collation);
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-a-cte {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    WITH c AS (SELECT 1 OR a COLLATE nosuch AS v FROM unknown_collation) SELECT v FROM c;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-an-in-subquery {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT a FROM unknown_collation WHERE a IN (SELECT 1 OR a COLLATE nosuch FROM unknown_collation);
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-in-values {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT a FROM unknown_collation WHERE a IN (VALUES (1 OR a COLLATE nosuch));
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-named-by-a-sort-key {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS c FROM unknown_collation ORDER BY c;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-named-by-a-compound-sort-key {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch FROM unknown_collation UNION ALL SELECT 2 ORDER BY 1;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+# The lookup walks through NOT, arithmetic and function arguments.
+
+test or-with-a-constant-operand-still-checks-a-collation-name-under-not-when-compared {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT (NOT (a COLLATE nosuch = 1 OR 1)) = 1 FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-inside-a-compared-function {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT abs(1 OR a COLLATE nosuch) = 1 FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+# Where nothing sorts or compares by the expression, the collation is never
+# looked up, so the operand `x OR 1` drops may name one that does not exist.
+
+test or-with-a-constant-operand-leaves-an-unused-collation-name-alone {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch, abs(1 OR a COLLATE nosuch) FROM unknown_collation;
+    SELECT a FROM unknown_collation WHERE 1 OR a COLLATE nosuch = 1;
+    SELECT 1 OR a COLLATE nosuch FROM unknown_collation UNION ALL SELECT 2;
+}
+expect {
+    1|1
+    1
+    1
+    2
+}
+
+# SQLite's WHERE clause analysis checks the column count of `x IN (SELECT
+# ...)` before any fold, through AND and OR but not under NOT IN.
+
+test or-with-a-constant-operand-in-where-still-checks-the-in-subquery-column-count {
+    CREATE TABLE in_columns(a);
+    INSERT INTO in_columns VALUES (1);
+    SELECT a FROM in_columns WHERE 1 OR a IN (SELECT 1, 2);
+}
+expect error {
+    sub-select returns 2 columns - expected 1
+}
+
+test or-with-a-constant-operand-in-where-leaves-not-in-alone {
+    CREATE TABLE in_columns(a);
+    INSERT INTO in_columns VALUES (1);
+    SELECT a FROM in_columns WHERE 1 OR a NOT IN (SELECT 1, 2);
+    SELECT a FROM in_columns WHERE 1 OR (a, a) IN (SELECT 1, 2);
+}
+expect {
+    1
+    1
+}
+
+# A column name that is only resolved when the statement runs, as in a
+# trigger WHEN clause or an UPSERT DO UPDATE, is still checked.
+
+test and-or-with-a-constant-operand-still-checks-a-name-in-a-trigger-when {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN nosuchcol OR 1 BEGIN INSERT INTO later_log VALUES (1); END;
+    INSERT INTO later VALUES (1);
+}
+expect error {
+    no such column
+}
+
+test and-or-with-a-constant-operand-still-checks-a-function-name-in-a-trigger-when {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN 1 OR nosuchfunc(new.a) BEGIN INSERT INTO later_log VALUES (1); END;
+    INSERT INTO later VALUES (1);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+# Names are resolved in source order, so a column the WHEN clause cannot
+# resolve is reported before a function after it.
+
+test a-trigger-when-reports-an-unknown-column-before-a-function-after-it {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN g = 2 AND 1 AND nosuchfunc(new.a) BEGIN INSERT INTO later_log VALUES (1); END;
+    INSERT INTO later VALUES (1);
+}
+expect error {
+    no such column: g
+}
+
+# `x AND 0` is decided by SQLite's parser, so a trigger WHEN clause drops an
+# unknown column name there too, and the row is inserted.
+
+test and-with-integer-zero-drops-an-unknown-column-name-in-a-trigger-when {
+    CREATE TABLE later(a);
+    CREATE TABLE later_log(x);
+    CREATE TRIGGER later_tr AFTER INSERT ON later WHEN 0 AND nosuchcol BEGIN INSERT INTO later_log VALUES (1); END;
+    CREATE TRIGGER later_tr2 AFTER INSERT ON later WHEN new.nosuchcol AND 0 AND new.a BEGIN INSERT INTO later_log VALUES (2); END;
+    INSERT INTO later VALUES (1);
+    SELECT a FROM later;
+    SELECT count(*) FROM later_log;
+}
+expect {
+    1
+    0
+}
+
+test and-or-with-a-constant-operand-still-checks-a-name-in-an-upsert {
+    CREATE TABLE later(a PRIMARY KEY, b);
+    INSERT INTO later VALUES (1, 1);
+    INSERT INTO later VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = 2 WHERE nosuchcol OR 1;
+}
+expect error {
+    no such column
+}
+
+# An aggregate in the operand that `x AND 0` or `x OR 1` drops still makes the
+# query an aggregate query, so it gives one row.
+
+test and-or-with-a-constant-operand-keeps-an-aggregate-query {
+    CREATE TABLE agg(a, g);
+    INSERT INTO agg VALUES (1, 1), (3, 1), (5, 2);
+    CREATE TABLE agg_empty(a);
+    SELECT count(*) OR 1 FROM agg;
+    SELECT sum(a) AND 0 FROM agg;
+    SELECT sum(a) AND 0 FROM agg_empty;
+    SELECT CASE WHEN count(*) OR 1 THEN 'y' END FROM agg;
+    SELECT (SELECT count(*) AND 0 FROM agg_empty);
+    SELECT g, sum(a) AND 0 FROM agg GROUP BY g ORDER BY g;
+    INSERT INTO agg_empty SELECT sum(a) OR 1 FROM agg;
+    SELECT count(*) FROM agg_empty;
+}
+expect {
+    1
+    0
+    0
+    y
+    0
+    1|0
+    2|0
+    1
+}
+
+# In a chain such as `5 AND 0 AND x`, the inner `5 AND 0` is folded to 0
+# first, so `x` never runs either, in the result columns and in WHERE and
+# HAVING, which keep the whole chain as one term.
+
+test and-chain-with-a-constant-false-operand-never-runs-the-other-operands {
+    CREATE TABLE chain(a, g);
+    INSERT INTO chain VALUES (1, 1), (3, 2);
+    SELECT 5 AND 0 AND (SELECT abs(-9223372036854775807 - 1)), (SELECT abs(-9223372036854775807 - 1)) AND (0 AND 5);
+    SELECT a FROM chain WHERE a AND 0 AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT a FROM chain WHERE g = 1 AND (a AND 0) AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT g FROM chain GROUP BY g HAVING g AND 0 AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT count(*) FROM chain;
+}
+expect {
+    0|0
+    2
+}
+
+# The folded value is the 0 or 1 the AND or OR would have given, not the
+# literal operand that decided it.
+
+test and-or-with-a-constant-operand-gives-0-or-1 {
+    SELECT 0 OR 5, 5 OR 0, (3) AND 0, 0 AND (3), 5 AND 0 AND 7, 0 OR 5 OR 7, typeof(0 OR 5), typeof(5 AND 0);
+}
+expect {
+    1|1|0|0|0|1|integer|integer
+}
+
+# With two operands that depend on the row, SQLite decides an AND or OR
+# with jumps where the expression is a condition (sqlite3ExprIfFalse): a
+# CASE WHEN without a base, iif(), an aggregate's FILTER clause and WHERE.
+# The other operand is skipped once the first has decided the result.
+
+test case-when-condition-skips-the-operand-the-other-decides {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT CASE WHEN a = 0 AND json_extract(b, '$.a') THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN a = 1 OR json_extract(b, '$.a') THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN a = 0 AND json_extract(b, '$.a') AND a = 5 THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN (a = 1 OR json_extract(b, '$.a')) AND a = 1 THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN a = 1 THEN 'first' WHEN a = 0 AND json_extract(b, '$.a') THEN 'y' ELSE 'n' END FROM row_cond;
+}
+expect {
+    n
+    y
+    n
+    y
+    first
+}
+
+test iif-condition-skips-the-operand-the-other-decides {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT iif(a = 0 AND json_extract(b, '$.a'), 'y', 'n'), iif(a = 1 OR json_extract(b, '$.a'), 'y', 'n') FROM row_cond;
+    SELECT iif(a = 0 AND json_extract(b, '$.a'), 'y', a = 1 OR json_extract(b, '$.a'), 'z', 'n') FROM row_cond;
+}
+expect {
+    n|y
+    z
+}
+
+test filter-condition-skips-the-operand-the-other-decides {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare'), (2, 'bare');
+    SELECT count(*) FILTER (WHERE a = 0 AND json_extract(b, '$.a')) FROM row_cond;
+    SELECT count(*) FILTER (WHERE a = 1 OR json_extract(b, '$.a')) FROM row_cond WHERE a = 1;
+    SELECT a, count(*) FILTER (WHERE a = 0 AND json_extract(b, '$.a')) FROM row_cond GROUP BY a;
+}
+expect {
+    0
+    1
+    1|0
+    2|0
+}
+
+# As a value, an AND or OR of two such operands still evaluates both, as
+# SQLite's OP_And and OP_Or do.
+
+test and-or-as-a-value-still-runs-both-row-operands {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT a = 0 AND json_extract(b, '$.a') FROM row_cond;
+}
+expect error {
+    malformed JSON
+}
+
+test case-with-a-base-still-runs-both-row-operands {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT CASE a = 0 AND json_extract(b, '$.a') WHEN 0 THEN 'z' ELSE 'e' END FROM row_cond;
+}
+expect error {
+    malformed JSON
+}
+
+# A CHECK constraint, a trigger WHEN clause and a partial index WHERE are
+# conditions, so SQLite decides an AND or OR in them with jumps and skips the
+# operand the other decides (sqlite3ExprIfTrue/IfFalse). A function in the
+# skipped operand never runs.
+
+test check-constraint-or-skips-the-operand-that-is-not-reached {
+    CREATE TABLE check_or(a, b TEXT CHECK (a > 0 OR json_extract(b, '$.a')));
+    INSERT INTO check_or VALUES (1, 'bare');
+    SELECT a FROM check_or;
+}
+expect {
+    1
+}
+
+test check-constraint-and-skips-the-operand-that-is-not-reached {
+    CREATE TABLE check_and(a, b TEXT CHECK (a = 0 AND json_extract(b, '$.a')));
+    INSERT INTO check_and VALUES (1, 'bare');
+}
+expect error {
+    CHECK constraint failed
+}
+
+test trigger-when-or-skips-the-operand-that-is-not-reached {
+    CREATE TABLE trig_or(x, y TEXT);
+    CREATE TABLE trig_log(n);
+    CREATE TRIGGER trig_or_t AFTER INSERT ON trig_or WHEN new.x > 0 OR json_extract(new.y, '$.a') BEGIN INSERT INTO trig_log VALUES (1); END;
+    INSERT INTO trig_or VALUES (1, 'bare');
+    SELECT count(*) FROM trig_log;
+}
+expect {
+    1
+}
+
+test partial-index-where-or-skips-the-operand-that-is-not-reached {
+    CREATE TABLE part_or(a, b TEXT);
+    CREATE INDEX part_or_idx ON part_or(a) WHERE a > 0 OR json_extract(b, '$.a');
+    INSERT INTO part_or VALUES (1, 'bare');
+    SELECT a FROM part_or;
+}
+expect {
+    1
+}
+
+# An ORDER BY or GROUP BY term that names a result column through parentheses
+# or a leading `+` is still that column, so SQLite looks its collation up.
+
+test order-by-a-parenthesized-alias-looks-the-result-column-collation-up {
+    CREATE TABLE ob_collate(a);
+    INSERT INTO ob_collate VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS k FROM ob_collate ORDER BY (k);
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test order-by-a-signed-number-looks-the-result-column-collation-up {
+    CREATE TABLE ob_collate(a);
+    INSERT INTO ob_collate VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS k FROM ob_collate ORDER BY +1;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test order-by-a-parenthesized-number-looks-the-result-column-collation-up {
+    CREATE TABLE ob_collate(a);
+    INSERT INTO ob_collate VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS k FROM ob_collate ORDER BY (1);
+}
+expect error {
+    no such collation sequence: nosuch
+}

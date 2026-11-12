@@ -24,10 +24,10 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
-            emit_returning_scan_back, process_returning_clause,
+            emit_returning_scan_back, expr_contains_subquery, process_returning_clause,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
-            translate_expr, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
-            NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            translate_expr, translate_expr_no_constant_opt, BindingBehavior, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
@@ -1485,22 +1485,30 @@ fn emit_partial_index_check(
             }
         })
         .collect();
-    let reg = program.alloc_register();
-    crate::translate::expr::emit_dml_expr_index_value(
-        program,
-        resolver,
-        expr,
-        &columns,
-        &column_regs,
-        table,
-        reg,
-    )?;
+    // The row is indexed only when the partial WHERE is true, so an AND or OR
+    // in it short-circuits (sqlite3ExprIfFalse with JUMPIFNULL): a function in
+    // a decided-away operand never runs. Each leaf keeps its DML index-value
+    // encoding.
     let skip_label = program.allocate_label();
-    program.emit_insn(Insn::IfNot {
-        reg,
-        target_pc: skip_label,
-        jump_if_null: true,
-    });
+    let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+        let reg = program.alloc_register();
+        crate::translate::expr::emit_dml_expr_index_value(
+            program,
+            resolver,
+            leaf.clone(),
+            &columns,
+            &column_regs,
+            table,
+            reg,
+        )?;
+        Ok(reg)
+    };
+    crate::translate::expr::emit_jump_to_skip_unless_true(
+        program,
+        &expr,
+        skip_label,
+        &mut emit_leaf,
+    )?;
     Ok(Some(skip_label))
 }
 
@@ -2135,24 +2143,6 @@ struct BoundInsertResult {
     values: Vec<Box<Expr>>,
     upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
     inserting_multiple_rows: bool,
-}
-
-/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
-/// This is used to detect when single-row VALUES should be routed through the
-/// multi-row path which has proper subquery handling.
-pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
-    let mut found_subquery = false;
-    let _ = walk_expr(expr, &mut |e| {
-        if matches!(
-            e,
-            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
-        ) {
-            found_subquery = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    });
-    found_subquery
 }
 
 /// Resolve `Expr::Default` in a VALUES row by replacing it with the column's

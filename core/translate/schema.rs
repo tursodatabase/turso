@@ -141,6 +141,9 @@ pub(crate) fn validate_check_expr(
         }
         Ok(WalkControl::Continue)
     })?;
+    super::expr::check_likelihood_calls(expr, |name, nargs| {
+        resolver.resolve_function(name, nargs)
+    })?;
     Ok(())
 }
 
@@ -920,6 +923,7 @@ fn derive_ctas_schema(
         &[],
         QueryDestination::ResultRows,
         connection,
+        true,
     )?;
 
     // For compound selects, use the leftmost select's columns for naming (matching SQLite).

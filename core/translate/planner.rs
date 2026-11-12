@@ -4,7 +4,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::walk_expr,
     plan::{
         alias_or_stored_name, left_using_column_sources, merge_columns, query_output_columns,
         resolve_unqualified_column, Aggregate, ColumnUsedMask, Distinctness, EvalAt,
@@ -19,9 +19,10 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
-        expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        apply_static_rewrites, expr_contains_function_that_changes_within_statement,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size,
+        is_aggregate_or_window_function, select_column_count, unwrap_parens, walk_function_calls,
+        AndWithIntegerZero, BetweenToComparisons, BindingBehavior, FunctionCalls, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -1295,6 +1296,7 @@ fn plan_cte(
             &outer_query_refs,
             QueryDestination::placeholder_for_subquery(),
             connection,
+            true,
         );
         program.pop_cte_being_defined();
         plan?
@@ -1431,6 +1433,7 @@ fn prepare_recursive_cte_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        true,
     )?;
 
     let explicit_columns = (!cte_definition.explicit_columns.is_empty())
@@ -1492,6 +1495,7 @@ fn prepare_recursive_cte_plan(
         &recursive_query_outer_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        true,
     )?;
 
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
@@ -1694,6 +1698,7 @@ fn parse_from_clause_table(
                     &outer_query_refs_for_subquery,
                     QueryDestination::placeholder_for_subquery(),
                     connection,
+                    true,
                 )?
             };
             match &subplan {
@@ -1987,6 +1992,7 @@ fn prepare_lateral_subquery_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        true,
     );
     let aggregates_of_the_enclosing_query = resolver.take_aggregates_from_subqueries();
     let plan = plan?;
@@ -2101,6 +2107,7 @@ fn parse_table(
                     table_references.outer_query_refs(),
                     QueryDestination::placeholder_for_subquery(),
                     connection,
+                    true,
                 )?;
                 let explicit_columns = if cte_explicit_columns.is_empty() {
                     None
@@ -2250,6 +2257,7 @@ fn parse_table(
                     table_references.outer_query_refs(),
                     QueryDestination::placeholder_for_subquery(),
                     connection,
+                    true,
                 )
             })
         })?;
@@ -2651,9 +2659,9 @@ pub fn parse_where(
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+        break_predicate_at_and_boundaries(where_expr, out_where_clause)?;
         for expr in out_where_clause[start_idx..].iter_mut() {
-            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
+            apply_static_rewrites(&mut expr.expr, &[&BetweenToComparisons], Some(resolver))?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2661,6 +2669,8 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+            reject_aggregate_in_predicate(&expr.expr, resolver)?;
+            reject_in_subquery_column_mismatch(&expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -2674,7 +2684,7 @@ pub fn parse_where(
             ) {
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                break_predicate_at_and_boundaries(&term.expr, &mut new_terms)?;
                 // Preserve the source from the original term.
                 for new_term in new_terms.iter_mut() {
                     new_term.origin = term.origin;
@@ -2691,90 +2701,6 @@ pub fn parse_where(
         Ok(())
     } else {
         Ok(())
-    }
-}
-
-pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        if let Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            if is_literal_between_bound(start) && is_literal_between_bound(end) {
-                let mut lhs_has_subquery = false;
-                walk_expr(lhs, &mut |expr| {
-                    if matches!(
-                        expr,
-                        Expr::Subquery(_)
-                            | Expr::Exists(_)
-                            | Expr::InSelect { .. }
-                            | Expr::SubqueryResult { .. }
-                    ) {
-                        lhs_has_subquery = true;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    Ok(WalkControl::Continue)
-                })?;
-                let lhs_is_nondeterministic = match resolver {
-                    Some(resolver) => {
-                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
-                    }
-                    None => false,
-                };
-                if lhs_has_subquery || lhs_is_nondeterministic {
-                    return Ok(WalkControl::Continue);
-                }
-            }
-
-            let lhs_expr = std::mem::take(lhs.as_mut());
-            let start_expr = std::mem::take(start.as_mut());
-            let end_expr = std::mem::take(end.as_mut());
-
-            let (lower, upper, combine_op) = if *not {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::Less,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::Greater,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::Or,
-                )
-            } else {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::GreaterEquals,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::LessEquals,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::And,
-                )
-            };
-            *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-fn is_literal_between_bound(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(_) => true,
-        Expr::Unary(_, inner) => is_literal_between_bound(inner),
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
-        _ => false,
     }
 }
 
@@ -3175,7 +3101,7 @@ fn parse_join(
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
                 let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
+                break_predicate_at_and_boundaries(expr, out_where_clause)?;
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.origin = WhereTermOrigin::Join(join_origin);
                     bind_and_rewrite_expr(
@@ -3185,6 +3111,8 @@ fn parse_join(
                         resolver,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
+                    reject_aggregate_in_predicate(&predicate.expr, resolver)?;
+                    reject_in_subquery_column_mismatch(&predicate.expr)?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
@@ -3374,10 +3302,20 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
         _ => None,
     }
 }
+/// Splits a WHERE, HAVING or ON predicate into its AND terms. SQLite's
+/// parser has already replaced `x AND 0` by 0 when it splits a predicate
+/// (see [AndWithIntegerZero]), so that fold comes first here too.
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     predicate: &Expr,
     out_predicates: &mut Vec<T>,
-) {
+) -> Result<()> {
+    let mut predicate = predicate.clone();
+    apply_static_rewrites(&mut predicate, &[&AndWithIntegerZero], None)?;
+    split_predicate_at_and_boundaries(&predicate, out_predicates);
+    Ok(())
+}
+
+fn split_predicate_at_and_boundaries<T: From<Expr>>(predicate: &Expr, out_predicates: &mut Vec<T>) {
     // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
     // This is semantically equivalent since single-element Parenthesized is purely
     // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
@@ -3385,12 +3323,82 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
+            split_predicate_at_and_boundaries(left, out_predicates);
+            split_predicate_at_and_boundaries(right, out_predicates);
         }
         _ => {
             out_predicates.push(predicate.clone().into());
         }
+    }
+}
+
+/// SQLite's resolver rejects an aggregate or window function in a WHERE or
+/// ON clause before anything is planned (NC_AllowAgg is not set there).
+/// Binding is that point here: a term after a constant false term is never
+/// emitted, so `WHERE 0 AND sum(a)` has to fail now, not when `sum(a)` is
+/// emitted. A function inside a subquery belongs to that subquery.
+fn reject_aggregate_in_predicate(expr: &Expr, resolver: &Resolver) -> Result<()> {
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::OfThisQuery,
+        &mut |call, func| {
+            let Some(func) = func else {
+                return Ok(WalkControl::Continue);
+            };
+            if !is_aggregate_or_window_function(func) {
+                return Ok(WalkControl::Continue);
+            }
+            let (name, args, has_over) = match call {
+                Expr::FunctionCall {
+                    name, filter_over, ..
+                } => (name, "()", filter_over.over_clause.is_some()),
+                Expr::FunctionCallStar { name, filter_over } => {
+                    (name, "(*)", filter_over.over_clause.is_some())
+                }
+                _ => unreachable!("walk_function_calls visits function calls only"),
+            };
+            let kind = if matches!(func, Func::Window(_)) || has_over {
+                "window"
+            } else {
+                "aggregate"
+            };
+            crate::bail_parse_error!("misuse of {kind} function {}{args}", name.as_str())
+        },
+    )
+}
+
+/// SQLite's WHERE clause analysis (exprAnalyze) checks that the subquery of
+/// an `x IN (SELECT ...)` term returns as many columns as `x` has, before
+/// any fold or constant false term can make the planner skip the term. It
+/// looks through AND, OR and parentheses only, and not at NOT IN. A `*` in
+/// the subquery is counted when the subquery is planned.
+fn reject_in_subquery_column_mismatch(expr: &Expr) -> Result<()> {
+    let expr = unwrap_parens(expr).unwrap_or(expr);
+    match expr {
+        Expr::Binary(lhs, ast::Operator::And | ast::Operator::Or, rhs) => {
+            reject_in_subquery_column_mismatch(lhs)?;
+            reject_in_subquery_column_mismatch(rhs)
+        }
+        Expr::InSelect {
+            lhs,
+            not: false,
+            rhs,
+        } => {
+            let lhs_column_count = match unwrap_parens(lhs).unwrap_or(lhs) {
+                Expr::Parenthesized(exprs) => exprs.len(),
+                _ => 1,
+            };
+            match select_column_count(rhs) {
+                Some(count) if count != lhs_column_count => {
+                    crate::bail_parse_error!(
+                        "sub-select returns {count} columns - expected {lhs_column_count}"
+                    )
+                }
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
     }
 }
 

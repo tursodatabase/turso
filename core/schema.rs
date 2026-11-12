@@ -6992,6 +6992,14 @@ fn string_literal_eq(value: &str, expected: &str) -> bool {
 }
 
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
+    validate_generated_expr_node(expr)?;
+    crate::translate::expr::check_likelihood_calls(expr, |name, nargs| {
+        Func::resolve_function(name, nargs)
+    })?;
+    Ok(())
+}
+
+fn validate_generated_expr_node(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -7032,7 +7040,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {
-                validate_generated_expr(arg)?;
+                validate_generated_expr_node(arg)?;
             }
         }
 
@@ -7056,15 +7064,15 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
         }
 
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
+            validate_generated_expr_node(lhs)?;
+            validate_generated_expr_node(rhs)?;
         }
         Expr::Unary(_, inner) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr_node(inner)?;
         }
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr(e)?;
+                validate_generated_expr_node(e)?;
             }
         }
         Expr::Case {
@@ -7074,46 +7082,46 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr(b)?;
+                validate_generated_expr_node(b)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr(w)?;
-                validate_generated_expr(t)?;
+                validate_generated_expr_node(w)?;
+                validate_generated_expr_node(t)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr(e)?;
+                validate_generated_expr_node(e)?;
             }
         }
         Expr::Cast { expr, .. } => {
-            validate_generated_expr(expr)?;
+            validate_generated_expr_node(expr)?;
         }
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr(lhs)?;
+            validate_generated_expr_node(lhs)?;
             for e in rhs {
-                validate_generated_expr(e)?;
+                validate_generated_expr_node(e)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(start)?;
-            validate_generated_expr(end)?;
+            validate_generated_expr_node(lhs)?;
+            validate_generated_expr_node(start)?;
+            validate_generated_expr_node(end)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
+            validate_generated_expr_node(lhs)?;
+            validate_generated_expr_node(rhs)?;
             if let Some(e) = escape {
-                validate_generated_expr(e)?;
+                validate_generated_expr_node(e)?;
             }
         }
         Expr::Collate(inner, _) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr_node(inner)?;
         }
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr_node(inner)?;
         }
         // CURRENT_TIME/DATE/TIMESTAMP parse as literals but evaluate to a
         // different value on every read; SQLite rejects them like any other

@@ -756,12 +756,13 @@ mod tests {
             ));
         }
 
+        // SQLite only fails MATCH when the statement runs and no table
+        // overloads it; Turso rejects it when it prepares the statement, so
+        // only Turso fails the EXPLAIN.
         let stmt = GeneratedStatement {
-            sql: "WITH cte(x) AS (SELECT 1, 2) \
-                  UPDATE t SET a = 2 WHERE 0 AND EXISTS (SELECT * FROM cte)"
-                .to_string(),
+            sql: "SELECT a FROM t WHERE a MATCH 'x'".to_string(),
             is_ddl: false,
-            mutates_data: true,
+            mutates_data: false,
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,

@@ -50,6 +50,7 @@ mod custom_types;
 mod emission;
 pub(crate) mod expr_type;
 pub(crate) mod functions;
+mod rewrite;
 mod translator;
 mod utils;
 mod vectors;
@@ -97,12 +98,15 @@ pub(crate) use arrays::{
     emit_custom_type_encode_columns, ArrayInput,
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
-pub(crate) use binding::check_custom_types;
-pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub(crate) use binding::{apply_binding_rewrites, check_bound_expr, check_custom_types};
+pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
-pub use condition::translate_condition_expr;
+pub use condition::{
+    emit_jump_to_skip_unless_true, emit_jump_when_check_passes, translate_and_or_condition_jump,
+    translate_condition_expr,
+};
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
@@ -121,19 +125,30 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
+pub(crate) use rewrite::{
+    apply_static_rewrites, reject_unknown_compared_collation_at,
+    replace_and_or_with_deciding_operand, AndWithIntegerZero, BetweenToComparisons,
+    BINDING_REWRITES,
+};
 pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
-    unwrap_parens_owned,
+    as_binary_components, integer_literal_truth_value, maybe_apply_affinity, sanitize_string,
+    truth_test_rhs, unwrap_parens, unwrap_parens_owned,
 };
-pub use vectors::expr_vector_size;
-pub(crate) use walk::expression_can_fail_on_input;
+pub(crate) use vectors::select_column_count;
+pub use vectors::{expr_vector_size, reject_row_value_misuse_at};
+pub(crate) use walk::{
+    check_function_calls, check_likelihood_arguments, check_likelihood_calls,
+    expression_can_fail_on_input, is_aggregate_or_window_function, reject_disallowed_function_call,
+    reject_unknown_collation, walk_function_calls, FunctionCalls,
+};
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
-    expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_outer_query, expr_references_subquery_id, walk_expr, walk_expr_mut,
-    WalkControl,
+    expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
+    expr_contains_unplanned_subquery, expr_contains_unresolved_column_name,
+    expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
+    walk_expr, walk_expr_mut, WalkControl,
 };

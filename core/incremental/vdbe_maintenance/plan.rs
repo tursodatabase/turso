@@ -994,6 +994,7 @@ pub(crate) fn plan_view(
         &[],
         QueryDestination::ResultRows,
         connection,
+        true,
     )?;
     unnest_correlated_subqueries(&mut relational_plan, resolver)?;
     // Lower the same optimized plan regular execution runs. Maintenance does

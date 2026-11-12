@@ -207,6 +207,43 @@ pub fn expr_references_subquery_id(expr: &ast::Expr, subquery_id: TableInternalI
     found
 }
 
+/// Returns true if this expression holds a subquery, planned or not.
+/// True if the expression has a subquery the subquery planner has not
+/// planned yet (an EXISTS, a scalar subquery or an IN subquery still in its
+/// AST form), as against one already replaced by [ast::Expr::SubqueryResult].
+pub fn expr_contains_unplanned_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. }
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+pub fn expr_contains_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_)
+                | ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+                | ast::Expr::SubqueryResult { .. }
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
@@ -309,6 +346,57 @@ pub fn expr_contains_function_that_changes_within_statement(
     })
 }
 
+/// Returns true if this expression still names a column (`a`, `t.a` or
+/// `db.t.a`) that binding has not resolved. A name inside a subquery belongs
+/// to that subquery and does not count.
+pub fn expr_contains_unresolved_column_name(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            ast::Expr::Id(_) | ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..)
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression with an infallible visitor cannot fail");
+    found
+}
+
+/// Returns true if this expression calls an aggregate or window function of
+/// its own query. A call inside a subquery belongs to that subquery and does
+/// not count.
+pub fn expr_contains_aggregate_or_window_function(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    let mut found = false;
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::OfThisQuery,
+        &mut |_, func| {
+            if func.is_some_and(is_aggregate_or_window_function) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(found)
+}
+
+/// True for an aggregate or window function, built in or from an extension.
+pub(crate) fn is_aggregate_or_window_function(func: &Func) -> bool {
+    match func {
+        Func::Agg(_) | Func::Window(_) => true,
+        Func::External(external) => external.func.is_aggregate(),
+        _ => false,
+    }
+}
+
 fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
     match func {
         // Aggregate and window function calls themselves are not flagged
@@ -337,11 +425,139 @@ fn expr_contains_function(
     matches_function: impl Fn(&Func) -> bool,
 ) -> Result<bool> {
     let mut found = false;
-    crate::util::walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
-        if found {
-            return Ok(WalkControl::SkipChildren);
-        }
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::WithSubqueries,
+        &mut |_, func| {
+            // If the name is unknown here, leave the error to the normal resolver.
+            if func.is_some_and(&matches_function) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(found)
+}
 
+/// Fails for a function call of this expression, or of a subquery in it,
+/// that SQLite's resolver rejects: a name no function resolves to, or a
+/// likelihood() whose second argument is not a constant between 0.0 and
+/// 1.0. SQLite resolves every name of an expression before it folds or
+/// drops any part of it.
+pub(crate) fn check_function_calls(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::WithSubqueries,
+        &mut |call, func| {
+            reject_disallowed_function_call(call, func)?;
+            Ok(WalkControl::Continue)
+        },
+    )
+}
+
+/// Fails for a function call SQLite's resolver rejects: a name no function
+/// has, or a likelihood() with a bad second argument. `func` is what the
+/// name resolved to, or None.
+pub(crate) fn reject_disallowed_function_call(call: &ast::Expr, func: Option<&Func>) -> Result<()> {
+    let (name, args) = match call {
+        ast::Expr::FunctionCall { name, args, .. } => (name, args.as_slice()),
+        ast::Expr::FunctionCallStar { name, .. } => (name, &[][..]),
+        _ => unreachable!("reject_disallowed_function_call takes a function call only"),
+    };
+    match func {
+        None => crate::bail_parse_error!("no such function: {}", name.as_str()),
+        Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// Checks the argument of every likelihood() call in `expr`, resolving each
+/// name with `resolve`. SQLite makes this check once names are resolved and
+/// no subquery or parameter is left, so a CHECK or generated-column
+/// expression runs it as a last pass over the whole tree.
+pub(crate) fn check_likelihood_calls(
+    expr: &ast::Expr,
+    resolve: impl Fn(&str, usize) -> Result<Option<Func>>,
+) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            if let Some(Func::Scalar(ScalarFunc::Likelihood)) = resolve(name.as_str(), args.len())?
+            {
+                check_likelihood_arguments(args)?;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// likelihood(x, p) takes a floating point constant p between 0.0 and 1.0,
+/// which SQLite checks when it resolves the call.
+pub(crate) fn check_likelihood_arguments(args: &[Box<ast::Expr>]) -> Result<()> {
+    if args.len() != 2 {
+        crate::bail_parse_error!("likelihood() function must have exactly 2 arguments");
+    }
+    let ast::Expr::Literal(ast::Literal::Numeric(value)) = args[1].as_ref() else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    };
+    let Ok(probability) = value.parse::<f64>() else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point constant"
+        );
+    };
+    if !(0.0..=1.0).contains(&probability) {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    }
+    if !value.contains('.') {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point number with decimal point"
+        );
+    }
+    Ok(())
+}
+
+/// Fails with "no such collation sequence" when this expression names a
+/// collation that does not exist. SQLite looks a collation up when it needs
+/// one to sort or compare, on the expression as written, so an operand the
+/// AND/OR fold drops still gets this check. A COLLATE inside a subquery
+/// belongs to that subquery.
+pub(crate) fn reject_unknown_collation(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+    walk_expr(expr, &mut |e| {
+        if let ast::Expr::Collate(_, name) = e {
+            resolver.resolve_collation(name.as_str())?;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Which function calls [walk_function_calls] visits.
+#[derive(Clone, Copy)]
+pub(crate) enum FunctionCalls {
+    /// The calls of this query only: a call inside a subquery belongs to
+    /// that subquery.
+    OfThisQuery,
+    /// The calls of this query and of every subquery in it.
+    WithSubqueries,
+}
+
+/// Gives `visit` every function call of this expression together with the
+/// function it names, or None when no function has that name.
+pub(crate) fn walk_function_calls(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+    calls: FunctionCalls,
+    visit: &mut dyn FnMut(&ast::Expr, Option<&Func>) -> Result<WalkControl>,
+) -> Result<()> {
+    let mut visit_call = |e: &ast::Expr| -> Result<WalkControl> {
         let func = match e {
             ast::Expr::FunctionCall { name, args, .. } => {
                 resolver.resolve_function(name.as_str(), args.len())?
@@ -349,19 +565,19 @@ fn expr_contains_function(
             ast::Expr::FunctionCallStar { name, .. } => {
                 resolver.resolve_function(name.as_str(), 0)?
             }
-            _ => None,
+            _ => return Ok(WalkControl::Continue),
         };
-
-        // If the name is unknown here, leave the error to the normal resolver.
-        if func.as_ref().is_some_and(&matches_function) {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
+        visit(e, func.as_ref())
+    };
+    match calls {
+        FunctionCalls::OfThisQuery => {
+            walk_expr(expr, &mut visit_call)?;
         }
-
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(found)
+        FunctionCalls::WithSubqueries => {
+            crate::util::walk_expr_with_subqueries(expr, &mut visit_call)?;
+        }
+    }
+    Ok(())
 }
 
 /// Walks a mutable expression, applying a function to each sub-expression.
