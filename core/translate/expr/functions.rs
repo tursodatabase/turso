@@ -353,6 +353,44 @@ pub(super) fn translate_sequence_function(
     Ok(target_register)
 }
 
+/// **sequence_state_experimental(name)**: the array `{value, is_called}`
+/// of the sequence's watermark row. The read runs in the same autonomous
+/// inner transaction that nextval uses, so it sees every value that
+/// nextval has handed out, also those that a snapshot older than the
+/// nextval does not show.
+pub(super) fn translate_sequence_state(
+    program: &mut ProgramBuilder,
+    args: &[Box<ast::Expr>],
+    resolver: &Resolver,
+    target_register: usize,
+) -> Result<usize> {
+    let seq_name_raw = extract_string_literal(&args[0])?;
+    let (namespace, normalized_name) =
+        crate::translate::sequence::resolve_sequence_name(&seq_name_raw, resolver).ok_or_else(
+            || LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist")),
+        )?;
+    roles::check_sequence_state_read(resolver, namespace, &normalized_name)?;
+    let database_id = namespace.database_id;
+    let sequence = resolver
+        .with_schema(database_id, |s| {
+            s.get_sequence(namespace.id, &normalized_name).cloned()
+        })
+        .ok_or_else(|| {
+            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
+        })?;
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_read_on_database(database_id, schema_cookie)?;
+    crate::translate::sequence::emit_sequence_state_read(
+        program,
+        resolver,
+        namespace,
+        &normalized_name,
+        &sequence,
+        target_register,
+    )?;
+    Ok(target_register)
+}
+
 /// `args` of nextval, currval or setval with the sequence name in the first
 /// argument qualified with the database it resolves to. The handlers look
 /// the sequence up again by that string when the statement runs, and the

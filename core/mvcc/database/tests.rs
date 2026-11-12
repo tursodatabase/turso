@@ -7488,6 +7488,26 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
 }
 
 #[test]
+fn test_sequence_state_sees_nextval_after_the_transaction_snapshot() {
+    let db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s START WITH 5").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&conn, "SELECT count(*) FROM sqlite_schema");
+    get_rows(&conn, "SELECT nextval('s')");
+    get_rows(&conn, "SELECT nextval('s')");
+    let rows = get_rows(
+        &conn,
+        "SELECT array_to_string(sequence_state_experimental('s'), ',')",
+    );
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(rows[0][0].to_string(), "6,1");
+}
+
+#[test]
 fn test_sequence_watermark_tracks_nextval_allocations() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();

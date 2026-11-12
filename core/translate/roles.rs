@@ -326,6 +326,38 @@ pub(crate) fn check_sequence_change(
     )))
 }
 
+/// Fails if the statement is compiled for a role that may not read the
+/// state of `sequence` of `namespace`, which needs SELECT or USAGE on it.
+pub(crate) fn check_sequence_state_read(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    sequence: &str,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let schema = resolver.schema();
+    let role = resolver.row_security_role;
+    let may_read = [ast::Privilege::Select, ast::Privilege::Usage]
+        .into_iter()
+        .any(|privilege| {
+            resolver.catalog.dialect.role_has_privilege(
+                schema,
+                namespace.id,
+                sequence,
+                role,
+                privilege,
+            )
+        });
+    if may_read {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        Object::Sequence(sequence.to_string()),
+    )))
+}
+
 /// Fails if the current role of `connection` may not read the value of
 /// `sequence` of `namespace` with `currval()`. `currval()` checks this when
 /// it runs, because its argument may be a sequence name that is only known

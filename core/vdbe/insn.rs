@@ -1859,6 +1859,9 @@ pub enum Insn {
         db: usize,
         path_kind_reg: usize,
         saved_outer_reg: usize,
+        /// The inner tx only reads the sequence, so a read-only outer
+        /// tx may start it.
+        read_only: bool,
     },
     /// Commit the autonomous inner transaction started by a matching
     /// `SequenceBeginInnerTx`. Multi-step: drives the inner's

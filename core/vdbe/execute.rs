@@ -14378,12 +14378,13 @@ pub fn op_sequence_begin_inner_tx(
             db,
             path_kind_reg,
             saved_outer_reg,
+            read_only,
         },
         insn
     );
 
     let conn = program.connection.clone();
-    if conn.is_tx_read_only() {
+    if !*read_only && conn.is_tx_read_only() {
         return Err(LimboError::ReadOnly.into());
     }
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
