@@ -288,6 +288,40 @@ expect {
     12|12
 }
 
+@cross-check-integrity
+test check_constraint_strict_collate_on_text_column {
+    CREATE TABLE t (s TEXT, CHECK (s COLLATE nocase = 'a')) STRICT;
+    INSERT INTO t VALUES ('A');
+    INSERT INTO t VALUES ('a');
+    SELECT s FROM t ORDER BY s;
+}
+expect {
+    A
+    a
+}
+
+@cross-check-integrity
+test check_constraint_strict_collate_on_text_column_violation {
+    CREATE TABLE t (s TEXT, CHECK (s COLLATE nocase = 'a')) STRICT;
+    INSERT INTO t VALUES ('b');
+}
+expect error {
+    CHECK constraint failed: s COLLATE nocase = 'a'
+}
+
+@cross-check-integrity
+test check_constraint_strict_collate_in_between_and_in_list {
+    CREATE TABLE t (
+        s TEXT CHECK ((s COLLATE nocase) BETWEEN 'a' AND 'c'),
+        u TEXT CHECK (u COLLATE nocase IN ('x', 'y'))
+    ) STRICT;
+    INSERT INTO t VALUES ('B', 'Y');
+    SELECT s, u FROM t;
+}
+expect {
+    B|Y
+}
+
 # Regular (non-STRICT) tables with type affinity
 @cross-check-integrity
 test check_constraint_regular_table_numeric_string {
