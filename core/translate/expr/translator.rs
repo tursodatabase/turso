@@ -1131,6 +1131,22 @@ fn translate_function_call_expr(
 
             Ok(target_register)
         }
+        Func::DialectInPlace(_) => {
+            assert_eq!(args_count, 1);
+
+            translate_expr(
+                program,
+                referenced_tables,
+                &args[0],
+                target_register,
+                resolver,
+            )?;
+
+            let arg_registers = vec![target_register];
+            emit_function_call(program, func_ctx, &arg_registers, target_register)?;
+
+            Ok(target_register)
+        }
         #[cfg(feature = "json")]
         Func::Json(j) => match j {
             JsonFunc::Json | JsonFunc::Jsonb => {

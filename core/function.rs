@@ -1824,6 +1824,7 @@ pub enum Func {
     /// PostgreSQL catalog function). Resolved and executed through
     /// [`crate::dialect::Dialect`]; the engine only carries the name.
     Dialect(String),
+    DialectInPlace(String),
 }
 
 impl Display for Func {
@@ -1840,7 +1841,7 @@ impl Display for Func {
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
             Self::AlterTable(alter_func) => write!(f, "{alter_func}"),
-            Self::Dialect(name) => write!(f, "{name}"),
+            Self::Dialect(name) | Self::DialectInPlace(name) => write!(f, "{name}"),
         }
     }
 }
@@ -1871,7 +1872,7 @@ impl Deterministic for Func {
             // Dialect scalars are catalog readers (stable within a
             // statement); a dialect that adds a nondeterministic function
             // should register it as an extension function instead.
-            Self::Dialect(_) => true,
+            Self::Dialect(_) | Self::DialectInPlace(_) => true,
         }
     }
 }
@@ -1952,9 +1953,11 @@ impl Func {
             Self::Agg(AggFunc::Min | AggFunc::Max) => ResultType::OneOfTheArguments,
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             Self::Fts(_) => ResultType::Unknown,
-            Self::Agg(_) | Self::Window(_) | Self::AlterTable(_) | Self::Dialect(_) => {
-                ResultType::Unknown
-            }
+            Self::Agg(_)
+            | Self::Window(_)
+            | Self::AlterTable(_)
+            | Self::Dialect(_)
+            | Self::DialectInPlace(_) => ResultType::Unknown,
         }
     }
 
