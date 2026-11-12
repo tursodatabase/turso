@@ -612,6 +612,78 @@ mod tests {
         assert_eq!(b_info.kind, ColumnTypeKind::Builtin);
     }
 
+    /// `get_column_decltype` reports the declared type of the table column
+    /// behind a result column also when the column is read through a
+    /// FROM-clause subquery, a view or a CTE, like `sqlite3_column_decltype`.
+    /// Drivers pick the value type from it, e.g. a time value for `datetime`.
+    #[test]
+    fn decltype_through_subqueries_views_and_ctes() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER, created_at datetime, note)")
+            .unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+        let decltypes = |sql: &str| -> Vec<Option<String>> {
+            let stmt = conn.prepare(sql).unwrap();
+            (0..stmt.num_columns())
+                .map(|i| stmt.get_column_decltype(i))
+                .collect()
+        };
+        let declared = |types: &[Option<&str>]| -> Vec<Option<String>> {
+            types.iter().map(|t| t.map(str::to_string)).collect()
+        };
+
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT * FROM (SELECT * FROM t) s",
+            "SELECT * FROM (SELECT * FROM (SELECT id, created_at, note FROM t))",
+            "SELECT * FROM v",
+            "WITH c AS (SELECT * FROM t) SELECT * FROM c",
+        ] {
+            assert_eq!(
+                decltypes(sql),
+                declared(&[Some("INTEGER"), Some("datetime"), None]),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            decltypes("SELECT * FROM (SELECT *, row_number() OVER (ORDER BY id) AS rn FROM t) WHERE rn <= 2"),
+            declared(&[Some("INTEGER"), Some("datetime"), None, None])
+        );
+
+        // An expression has no declared type, also through a subquery.
+        assert_eq!(
+            decltypes("SELECT x FROM (SELECT created_at || '' AS x FROM t)"),
+            declared(&[None])
+        );
+        // A compound SELECT reports the types of its right-most SELECT.
+        assert_eq!(
+            decltypes("SELECT a FROM (SELECT id AS a FROM t UNION ALL SELECT created_at FROM t)"),
+            declared(&[Some("datetime")])
+        );
+        assert_eq!(
+            decltypes("SELECT r FROM (SELECT rowid AS r FROM t)"),
+            declared(&[Some("INTEGER")])
+        );
+        assert_eq!(
+            decltypes("SELECT rowid FROM t"),
+            declared(&[Some("INTEGER")])
+        );
+        // The self-reference of a recursive CTE has the types of the initial SELECT.
+        assert_eq!(
+            decltypes(
+                "WITH RECURSIVE r(d) AS (SELECT created_at FROM t UNION ALL SELECT d FROM r LIMIT 3) SELECT d FROM r"
+            ),
+            declared(&[Some("datetime")])
+        );
+        assert_eq!(
+            decltypes(
+                "WITH RECURSIVE r(n) AS (SELECT id FROM t UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r"
+            ),
+            declared(&[None])
+        );
+    }
+
     /// `chr(n)` is the SQL standard / PostgreSQL spelling of SQLite's
     /// `char(n)`. Both must produce identical results.
     #[test]

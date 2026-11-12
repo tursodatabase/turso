@@ -1218,26 +1218,8 @@ impl Statement {
             return Some(column_types.get(idx).expect("No column").to_string());
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
-                }
-            }
-            _ => None,
-        }
+        translate::result_column_types::declared_type(&column.expr, &self.program.table_references)
+            .map(str::to_string)
     }
 
     /// Returns rich type information for a result column.
