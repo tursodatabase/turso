@@ -1,35 +1,47 @@
-# Trace replay harness (design, not built)
+# Trace replay test
 
 This file describes a test that replays Quint traces on the engine. A trace is
 a list of spec actions with the state after each one. The test runs the same
-actions on a real database and compares the state after each step. The code
-for this test does not exist yet. The traces exist: `make traces` and
-`make bug-traces` write them (see README.md).
+actions on a real database and compares the state after each step.
+`make traces` and `make bug-traces` write the traces (see README.md).
 
 The test can show two things:
 
 - For a trace of a main configuration, the engine follows the design. Every
-  check must hold.
+  check must hold (`Expect::Conforms`).
 - For a trace of a bug variant, the engine has the bug that the model
   predicts. The engine must fail at the same step, with the same kind of
-  error. After the fix, the test changes to expect no error.
+  failure (`Expect::Violation`). After the fix, the test fails, and the fix
+  changes it to `Expect::Conforms`.
 
 ## Where the test lives
 
-The test is a `#[cfg(test)]` module under `core/mvcc/database/mbt_tests/`.
-Only a module inside `turso_core` can read the private `MvStore` fields, the
+The test is a `#[cfg(test)]` module in `core/mvcc/database/mbt_tests/`. Only
+a module inside `turso_core` can read the private `MvStore` fields, the
 `pub(crate)` yield point enums and `CheckpointStateMachine::state_for_test()`.
-A crate under `testing/` needs these as public API. The existing
-`cargo nextest run --workspace --all-features` job runs the module, so CI needs
-no new job. Quint runs only offline, from this Makefile.
+The `cargo nextest run --workspace --all-features` job runs the module, so CI
+needs no new job. Quint runs only offline, from this Makefile.
 
 | File | Content |
 |---|---|
-| `mbt_tests/mod.rs` | The test driver, the replay loop and the crash probe |
+| `mbt_tests/mod.rs` | The replay loop, the yield injector, the checkpoint driver and the crash probe |
 | `mbt_tests/itf.rs` | The ITF parser, with `serde_json` |
 | `mbt_tests/rows.rs` | The actions of `MvccPassiveCheckpoint` |
-| `mbt_tests/schema.rs` | The actions of `MvccPassiveSchema` |
+| `mbt_tests/schema.rs` | The actions of `MvccPassiveSchema` that the bug traces use |
 | `mbt_tests/traces/*.itf.json` | The committed traces |
+
+To run it:
+
+```bash
+cargo test -p turso_core --lib mbt_tests
+```
+
+To replay a folder of new row traces from `make traces`:
+
+```bash
+MBT_TRACES=$PWD/quint/mvcc-passive-checkpoint/traces \
+  cargo test -p turso_core --lib mbt_tests::rows::row_traces_from_folder -- --ignored --nocapture
+```
 
 ## How a step maps to the engine
 
@@ -39,74 +51,103 @@ and runs one engine operation.
 
 - A writer uses its own connection with `BEGIN CONCURRENT`, one write and
   `COMMIT`. The test driver steps the `COMMIT` statement to a named
-  `CommitYieldPoint` and stops there.
-- A reader uses `BEGIN` and a `SELECT`. The first statement stops at
-  `TransactionYieldPoint::BeforeMvccBegin`. At that point, the reader holds
-  the WAL read lock but has no MVCC transaction. This is the spec action
-  `ReaderPin`.
+  `CommitYieldPoint` and stops there: `CommitValidation` for `WritePrepare`,
+  `LogRecordMarkedWritten` for `WriteLogAppend`.
+- A reader uses `BEGIN` and a `SELECT`, and ends with `ROLLBACK`. A read-only
+  `COMMIT` waits for commit dependencies, so it cannot end a reader that
+  read a Preparing writer.
 - The checkpoint is a `CheckpointStateMachine` on its own connection. The test
   driver steps it until `state_for_test()` reaches the state that ends the
   spec action. `PRAGMA wal_checkpoint` does not work for this, because it
   runs the whole checkpoint inside one opcode.
-- At open, each connection gets one `StopAt` yield injector. `StopAt`
-  yields once at one yield point and one selection key, and then never again.
+- A test-only collect threshold of 1 makes the checkpoint yield after each
+  key. A spec key that is not dirty in the engine is a no-op.
+- Each connection has one `StopAt` yield injector. `StopAt` yields once at
+  one yield point and one selection key.
 
 Engine timestamps and WAL frame numbers differ from the spec values. The test
 driver keeps a map from each spec commit to its engine timestamp, and from each
-spec frame to the engine WAL position. It compares order through these maps,
+spec frame to the engine WAL frame. It compares order through these maps,
 never raw numbers. A writer writes its spec commit timestamp as the row value,
-so a read compares directly with the spec oracle.
+so a read compares directly with the spec oracle. A passive WAL restarts at
+frame 1 after a full backfill, so the driver counts frames across checkpoint
+sequences.
 
 ## Checks after each step
 
 | Spec value | Engine value |
 |---|---|
 | `ReadsCorrect` | The `SELECT` result in the reader transaction equals the spec oracle |
-| `RecoveryCorrect` | The crash probe recovers the rows that the spec expects |
-| `durable` | `MvStore::durable_txid_max`, through the timestamp map |
-| `backfillFloor`, `nBackfill` | `MvStore::backfill_floor` and the WAL backfill frame, through the frame map |
-| `bind`, `pub`, `cookie` | `table_id_to_rootpage`, the `sqlite_schema` rows and the header schema cookie |
+| `RecoveryCorrect` | The crash probe recovers the rows that the spec logged |
+| `ck.snap`, `durable` | The checkpoint snapshot and `MvStore::durable_txid_max`, through the timestamp map |
+| `wal`, `nBackfill`, `backfillFloor` | The WAL max frame, the backfilled frame and `MvStore::backfill_floor`, through the frame map |
+| `llog = {}` | The logical log offset is 0 |
+| `CookieNotBehind` | The global header cookie is at least the shared schema version (schema driver) |
 
 The crash probe copies the database file, the `-wal` file and the `.db-log`
 file to a new folder. Then it opens the copy with a new `Database` inside
 `catch_unwind`. The running database does not change, so the probe can run
 after any step. The probe models a process crash, not a power loss, which
-matches `RecoveryCorrect`. All I/O must be complete before the copy.
+matches `RecoveryCorrect`.
 
-## Engine changes for the test
+## Trace replay constants
 
-All changes compile out of release builds.
+Random traces of the row spec take steps that the engine never takes. Four
+constants of `MvccPassiveCheckpoint.qnt` make the spec take only engine steps.
+They are false in every model-checked module, which then has the same states
+as before. The `mbt` module sets them, and `make traces` uses it.
 
-1. A `#[cfg(test)]` collect threshold for each `CheckpointStateMachine`. The
-   spec action `CheckpointCollect` visits one key, but the engine yields only
-   after `COLLECT_PREEMPTION_THRESHOLD` keys. A threshold of 1 makes each
-   step visit one key. A new `CheckpointYieldPoint` is not a good choice,
-   because it changes the point count, and every existing simulator seed then
-   gives a different schedule.
-2. Optional: a `CommitYieldPoint::DirtyKeysMarked` between the dirty mark and
-   the log write. Only the dirty-key variants need it. It changes the commit
-   yield point count, so it goes in its own commit.
+| Constant | Engine behavior |
+|---|---|
+| `BackfillToLimit` | The passive backfill copies every frame up to the lowest read mark |
+| `LogAppendOneAtATime` | A writer holds `pager_commit_lock` from its log write to its commit end |
+| `WriterBeginTicks` | A writer takes a begin timestamp before its commit timestamp, so the snapshot below a Preparing writer is above the previous commit |
+| `WritersPinMarks` | A `BEGIN CONCURRENT` writer holds a WAL read mark until its commit ends, and the backfill stops at it |
+
+## Refused traces
+
+Some engine steps contain several spec actions. The test driver refuses a
+trace that splits such a step, and the test asserts a minimum number of
+replayed traces. Of 200 traces of the `mbt` module, 146 replay and 54 are
+refused, for these reasons:
+
+- A reader pins its WAL mark and begins in one engine step
+  (`begin_fresh_mvcc_tx`). The driver pins at `ReaderBegin`, so it refuses a
+  trace with a frame commit or a backfill between `ReaderPin` and
+  `ReaderBegin`.
+
+The schema driver runs the whole collection at the last `CheckpointObj` of a
+pass. A commit between two `CheckpointObj` steps is above the snapshot, so it
+changes nothing that the pass collects.
+
+## Bug traces
+
+| Variant | Trace | Engine result |
+|---|---|---|
+| `issue11502` | 8 steps | Fails at step 8: after a crash, `t2` exists without its row |
+| `issue11499` | 11 steps | Fails at step 11: the publish writes the header cookie 1 while the shared schema has version 2 |
+
+On a fresh database, the engine gives a new table the temporary id -P and
+then the page P. Recovery then finds the table by chance. The schema driver
+setup frees two pages first. This keeps ids and pages apart, as the
+`FixDisjointIds` rule of the spec does.
+
+The shortest `issue11499` trace of `make bug-traces` has an empty checkpoint
+pass. In the spec, `CheckpointPublish` writes the staged header cookie for
+every pass. In the engine, a pass with an empty write set skips the header
+and the publish. So that trace conforms in the engine, and the model
+over-approximates the empty pass. The committed trace has a pass that writes
+a frame. To find such a trace, check `CookieNotBehind or ck.frame == 0`
+instead of `CookieNotBehind`.
 
 ## Limits
 
-- Some engine steps contain several spec actions. Examples: the two looks of a
-  read, all prune candidates, the GC inside `GcTableRows`, and an empty
-  checkpoint that skips the commit and the publish. The test driver refuses a
-  trace that splits such a step. The test counts refused traces and must
-  assert a minimum number of replayed traces.
-- The spec picks any key to collect and any backfill target. The engine
-  collects in rowid order and backfills as far as it can. The traces for the
-  test need constants that make the spec do the same.
-- The engine picks page numbers from the freelist. A schema trace replays only
-  if the engine picks the same page as the spec. The test driver reports a
-  different page as "not replayable", not as a failure.
-- The lost INSERT of #11499 comes from the statement retry loop, which the spec
-  does not model. Its Rust test in the issue stays.
-
-## Order of work
-
-1. The ITF parser and the test driver, with one row trace written by hand.
-2. The collect threshold and the collect of one key per step.
-3. Row traces from `make traces`.
-4. The crash probe and `RecoveryCorrect`.
-5. The schema driver and the bug traces of #11499, #11501 and #11502.
+- The schema driver supports DDL CREATE and DROP, row writes and the
+  checkpoint. It does not map readers, ALTER and GC yet. So it does not
+  replay the main configuration of the schema spec, or the bug traces that
+  need readers (`issue11501`, `issue11500`).
+- The sequence spec has no driver yet (`setvalRace`).
+- The engine picks page numbers and table ids itself. The schema driver
+  compares what recovery sees, not the numbers.
+- The lost INSERT of #11499 comes from the statement retry loop, which the
+  spec does not model. Its Rust test in the issue stays.

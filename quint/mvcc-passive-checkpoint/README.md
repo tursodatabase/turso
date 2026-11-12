@@ -58,7 +58,7 @@ make variants
 # Run the Quint simulator on each main configuration
 make simulate
 
-# Write random traces of each main configuration to traces/
+# Write random traces of each spec to traces/
 make traces
 
 # Write one failing trace for each variant that must fail to traces/bugs/
@@ -126,8 +126,10 @@ two more fields:
 - `mbt::nondetPicks`: the values that the action picked, under the names of
   the action parameters, for example `k` and `isDelete`.
 
-A test can replay a trace against the Rust code with these two fields.
-`HARNESS.md` describes that test. The test is not built yet.
+The test in `core/mvcc/database/mbt_tests/` replays a trace against the
+Rust code with these two fields. `HARNESS.md` describes that test. For a
+spec with a module named `mbt`, `make traces` uses that module, which takes
+only the steps that the engine can take.
 
 `make bug-traces` runs the simulator on each variant that must fail, until it
 finds the violation, and writes that trace to `traces/bugs/<Spec>-<module>.itf.json`.
