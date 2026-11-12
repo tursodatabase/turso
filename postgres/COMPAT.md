@@ -621,9 +621,12 @@ Notes on calls of SQL functions:
   `check_function_bodies = off` can make such functions. PostgreSQL fails
   with `stack depth limit exceeded` when the calls do not stop.
 - A call fails with `stack depth limit exceeded` when the expression that
-  takes its place has more than 100 levels, or when the call goes through
-  more than 100 function bodies. PostgreSQL limits the size of the stack
-  (`max_stack_depth`), which permits more.
+  takes its place has more than 100 levels. Each function body adds about
+  3 levels for its casts, so a call can go through about 33 function
+  bodies. `CREATE FUNCTION` fails with the same error when the calls of its
+  body pass the limit, because the check of the body expands them.
+  PostgreSQL limits the size of the stack (`max_stack_depth`), which
+  permits more.
 
 ## Procedural Languages
 
