@@ -108,6 +108,9 @@ func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) { ...
 
 // Checkpoint local WAL of the database
 func (d *TursoSyncDb) Checkpoint(ctx context.Context) error { ... }
+
+// Close releases the native sync database once every connection opened through Connect is closed
+func (d *TursoSyncDb) Close() error { ... }
 ```
 - STREAM data from the http request to the completion in chunks and spin async operation in between in order to prevent loading whole response in memory
 - AVOID unnecessary FFI calls as their cost is non zero

@@ -426,6 +426,62 @@ func TestSyncRollbackReadTxnAfterCommit(t *testing.T) {
 	require.Nil(t, err)
 }
 
+func TestSyncCloseReleasesNativeDatabase(t *testing.T) {
+	ctx := context.Background()
+	bootstrapIfEmpty := false
+	sdb, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+		Path:             path.Join(t.TempDir(), "local.db"),
+		BootstrapIfEmpty: &bootstrapIfEmpty,
+	})
+	require.Nil(t, err)
+	db, err := sdb.Connect(ctx)
+	require.Nil(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE t(x)")
+	require.Nil(t, err)
+	require.Nil(t, db.Close())
+
+	require.Nil(t, sdb.Close())
+	require.Nil(t, sdb.db)
+	require.Nil(t, sdb.Close())
+
+	_, err = sdb.Pull(ctx)
+	require.ErrorIs(t, err, ErrTursoSyncDbClosed)
+	require.ErrorIs(t, sdb.Push(ctx), ErrTursoSyncDbClosed)
+	require.ErrorIs(t, sdb.Checkpoint(ctx), ErrTursoSyncDbClosed)
+	_, err = sdb.Stats(ctx)
+	require.ErrorIs(t, err, ErrTursoSyncDbClosed)
+	db, err = sdb.Connect(ctx)
+	require.Nil(t, err)
+	require.ErrorIs(t, db.PingContext(ctx), ErrTursoSyncDbClosed)
+}
+
+func TestSyncCloseKeepsOpenConnectionsWorking(t *testing.T) {
+	ctx := context.Background()
+	bootstrapIfEmpty := false
+	sdb, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+		Path:             path.Join(t.TempDir(), "local.db"),
+		BootstrapIfEmpty: &bootstrapIfEmpty,
+	})
+	require.Nil(t, err)
+	db, err := sdb.Connect(ctx)
+	require.Nil(t, err)
+	db.SetMaxOpenConns(1)
+	_, err = db.ExecContext(ctx, "CREATE TABLE t(x)")
+	require.Nil(t, err)
+
+	require.Nil(t, sdb.Close())
+	require.NotNil(t, sdb.db)
+
+	_, err = db.ExecContext(ctx, "INSERT INTO t VALUES (1)")
+	require.Nil(t, err)
+	var count int
+	require.Nil(t, db.QueryRowContext(ctx, "SELECT count(*) FROM t").Scan(&count))
+	require.Equal(t, 1, count)
+
+	require.Nil(t, db.Close())
+	require.Nil(t, sdb.db)
+}
+
 func TestSyncConfigPersistence(t *testing.T) {
 	server, err := NewTursoServer()
 	require.Nil(t, err)
