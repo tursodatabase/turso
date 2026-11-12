@@ -800,3 +800,18 @@ expect {
 expect @tursopg error {
     a call of the user-defined function "add_one" in CREATE POLICY is not supported
 }
+
+# The engine matches the names of built-in functions without regard to case,
+# so tursopg reads a call of a quoted name with an uppercase letter as a call
+# of no function. Thus it does not create such a function.
+test function-name-with-an-uppercase-letter {
+    CREATE FUNCTION "One"() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT "One"();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function name with an uppercase letter is not supported
+}

@@ -195,6 +195,14 @@ fn checked_function(
         return Err(ParseError::not_supported("CREATE PROCEDURE"));
     }
     let name = function_name(&stmt.funcname)?;
+    // The engine matches the names of built-in functions without regard to
+    // case, so the translator reads a call of a quoted name with an
+    // uppercase letter, such as "LOWER", as a call of no function.
+    if name.name.as_str().bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(ParseError::not_supported(
+            "a function name with an uppercase letter",
+        ));
+    }
     let options = function_options(&stmt.options)?;
     let language = function_language(&options, stmt)?;
     let is_sql = language == "sql";

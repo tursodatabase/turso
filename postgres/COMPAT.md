@@ -545,11 +545,11 @@ Notes on `CREATE FUNCTION`:
 - PostgreSQL stores a function before it checks the body, so a body can call
   the new function. tursopg checks the body before it stores the function,
   so the check does not find the new function.
+- A function name with an uppercase letter is rejected.
 - A function and a table or view of the same schema cannot have the same
-  name. PostgreSQL accepts this. The name of a function keeps its case, and
-  tursopg stores the name of a relation in lowercase. Thus the function
-  `"Item"` and the table `item` are two names, and the function `thing` and
-  the table `"Thing"` are one name.
+  name. PostgreSQL accepts this. tursopg stores the name of a relation in
+  lowercase, so the function `thing` and the table `"Thing"` have the same
+  name.
 - A function cannot have the name of a built-in function of tursopg or of
   PostgreSQL 18, such as `abs` or `to_hex`. PostgreSQL chooses between the
   two by the types of the arguments, which tursopg does not know. A function
