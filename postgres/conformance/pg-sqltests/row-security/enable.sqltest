@@ -199,3 +199,13 @@ expect {
     4
     0
 }
+
+test role-that-does-not-own-the-table-cannot-enable-row-security {
+    CREATE ROLE rp_alice_17;
+    CREATE TABLE rp_docs_17 (id INT PRIMARY KEY);
+    SET ROLE rp_alice_17;
+    ALTER TABLE rp_docs_17 ENABLE ROW LEVEL SECURITY;
+}
+expect error {
+    must be owner of table rp_docs_17
+}
