@@ -17,9 +17,8 @@ use turso_core::{
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::fmt::{BlankContext, ToTokens, TokenStream};
+use turso_parser::ast::fmt::{BlankContext, ToTokens, WriteTokenStream};
 use turso_parser::ast::{self, RefAct, SortOrder};
-use turso_parser::token::TokenType;
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::translator::make_object_name;
 
@@ -4135,66 +4134,12 @@ fn render_expr(expr: &ast::Expr) -> String {
     })
     .expect("rewriting role functions does not fail");
     let mut text = String::new();
-    expr.to_tokens(&mut PgTokenWriter::new(&mut text), &BlankContext)
-        .expect("writing to a String does not fail");
+    expr.to_tokens(
+        &mut WriteTokenStream::new(&mut text).without_space_before_call_arguments(),
+        &BlankContext,
+    )
+    .expect("writing to a String does not fail");
     text
-}
-
-/// Writes SQL tokens the way PostgreSQL prints expressions: like the
-/// parser's `WriteTokenStream`, but with no space between a function name
-/// and its argument list (`lower(b)`, not `lower (b)`).
-struct PgTokenWriter<'a> {
-    out: &'a mut String,
-    spaced: bool,
-    after_name: bool,
-}
-
-impl<'a> PgTokenWriter<'a> {
-    fn new(out: &'a mut String) -> Self {
-        Self {
-            out,
-            spaced: true,
-            after_name: false,
-        }
-    }
-}
-
-impl TokenStream for PgTokenWriter<'_> {
-    type Error = fmt::Error;
-
-    fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
-        let call_parenthesis = ty == TokenType::TK_LP && self.after_name;
-        self.after_name = ty == TokenType::TK_ID;
-        let attaches_to_previous = matches!(
-            ty,
-            TokenType::TK_COMMA
-                | TokenType::TK_SEMI
-                | TokenType::TK_RP
-                | TokenType::TK_DOT
-                | TokenType::TK_LBRACKET
-                | TokenType::TK_RBRACKET
-        );
-        if !self.spaced && !attaches_to_previous && !call_parenthesis {
-            self.out.push(' ');
-        }
-        if ty == TokenType::TK_BLOB {
-            self.out.push_str(value.unwrap_or("X''"));
-            self.spaced = false;
-            return Ok(());
-        }
-        if let Some(keyword) = ty.as_str() {
-            self.out.push_str(keyword);
-            self.spaced = matches!(
-                ty,
-                TokenType::TK_LP | TokenType::TK_DOT | TokenType::TK_LBRACKET
-            );
-        }
-        if let Some(value) = value {
-            self.out.push_str(value);
-            self.spaced = value.bytes().all(|b| b.is_ascii_whitespace());
-        }
-        Ok(())
-    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...),

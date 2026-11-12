@@ -51,6 +51,9 @@ pub trait ToSqlContext {
 pub struct WriteTokenStream<'a, T: Write> {
     write: &'a mut T,
     spaced: bool,
+    /// Write a function call as `f(x)` rather than `f (x)`.
+    no_space_before_call_arguments: bool,
+    previous_was_name: bool,
 }
 
 impl<'a, T: Write> WriteTokenStream<'a, T> {
@@ -59,7 +62,16 @@ impl<'a, T: Write> WriteTokenStream<'a, T> {
         Self {
             write,
             spaced: true,
+            no_space_before_call_arguments: false,
+            previous_was_name: false,
         }
+    }
+
+    /// Write function calls with no space before the argument list, as
+    /// `lower(b)` rather than `lower (b)`.
+    pub fn without_space_before_call_arguments(mut self) -> Self {
+        self.no_space_before_call_arguments = true;
+        self
     }
 }
 
@@ -67,7 +79,10 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
     type Error = fmt::Error;
 
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
-        if !self.spaced {
+        let call_arguments =
+            self.no_space_before_call_arguments && self.previous_was_name && ty == TK_LP;
+        self.previous_was_name = ty == TK_ID;
+        if !self.spaced && !call_arguments {
             match ty {
                 TK_COMMA | TK_SEMI | TK_RP | TK_DOT | TK_LBRACKET | TK_RBRACKET => {}
                 _ => {
