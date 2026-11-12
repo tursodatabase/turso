@@ -72,6 +72,17 @@ pub enum CatalogChange {
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
+    /// `ALTER DEFAULT PRIVILEGES`: the privileges that relations get when
+    /// one of `roles` creates them later in one of `namespaces`.
+    DefaultPrivileges {
+        /// Empty for the current role.
+        roles: Vec<RoleSpec>,
+        /// Empty for every namespace.
+        namespaces: Vec<NamespaceId>,
+        on_sequences: bool,
+        privileges: Vec<Privilege>,
+        grantees: Vec<Grantee>,
+    },
     /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
     /// `enabled` is false.
     SetRowSecurity {
@@ -365,8 +376,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// dialect without schema state of its own, except that such a dialect
     /// has no roles, ownership, privileges or row-level security and refuses
     /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
-    /// `GRANT`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`
-    /// and `DROP POLICY`.
+    /// `GRANT`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`,
+    /// `DROP POLICY` and `ALTER DEFAULT PRIVILEGES`.
     fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -395,6 +406,11 @@ pub trait Dialect: Send + Sync + 'static {
                 }
                 CatalogChange::Grant { .. } => {
                     return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                }
+                CatalogChange::DefaultPrivileges { .. } => {
+                    return Err(LimboError::ParseError(
+                        "ALTER DEFAULT PRIVILEGES is not supported".to_string(),
+                    ));
                 }
                 CatalogChange::SetRowSecurity { .. }
                 | CatalogChange::CreatePolicy { .. }

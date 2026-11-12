@@ -701,6 +701,7 @@ impl ToTokens for Stmt {
                 Ok(())
             }
             Self::Grant(grant) => grant.to_tokens(s, context),
+            Self::AlterDefaultPrivileges(alter) => alter.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -1794,6 +1795,42 @@ impl ToTokens for Grant {
             s.append(TK_ID, Some("SEQUENCE"))?;
         }
         s.comma(&self.relations, context)?;
+        s.append(TK_TO, None)?;
+        s.comma(&self.grantees, context)
+    }
+}
+
+impl_display_for_to_tokens!(AlterDefaultPrivileges);
+impl ToTokens for AlterDefaultPrivileges {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ALTER, None)?;
+        s.append(TK_DEFAULT, None)?;
+        s.append(TK_ID, Some("PRIVILEGES"))?;
+        if !self.roles.is_empty() {
+            s.append(TK_ID, Some("FOR"))?;
+            s.append(TK_ID, Some("ROLE"))?;
+            s.comma(&self.roles, context)?;
+        }
+        if !self.schemas.is_empty() {
+            s.append(TK_IN, None)?;
+            s.append(TK_ID, Some("SCHEMA"))?;
+            s.comma(&self.schemas, context)?;
+        }
+        s.append(TK_ID, Some("GRANT"))?;
+        s.comma(&self.privileges, context)?;
+        s.append(TK_ON, None)?;
+        s.append(
+            TK_ID,
+            Some(if self.on_sequences {
+                "SEQUENCES"
+            } else {
+                "TABLES"
+            }),
+        )?;
         s.append(TK_TO, None)?;
         s.comma(&self.grantees, context)
     }

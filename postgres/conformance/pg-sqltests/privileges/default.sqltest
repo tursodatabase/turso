@@ -1,0 +1,313 @@
+# ALTER DEFAULT PRIVILEGES through the PostgreSQL frontend: the privileges
+# that tables, views and sequences get when a role creates them later.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+#
+# pg_default_acl shows what is stored. As in PostgreSQL, an entry for every
+# schema holds the owner's own privileges too, an entry for one schema holds
+# only what was granted, and both list PUBLIC first, then the roles in the
+# order they were created.
+
+@database :memory:
+
+test default-select-lets-a-role-read-a-table-created-later {
+    CREATE ROLE dp_reader;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_reader;
+    CREATE TABLE dp_docs (id INT);
+    INSERT INTO dp_docs VALUES (1), (2);
+    SET ROLE dp_reader;
+    SELECT id FROM dp_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test default-select-is-stored-in-relacl-of-a-table-created-later {
+    CREATE ROLE dp_acl_reader;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_acl_reader;
+    CREATE TABLE dp_acl (id INT);
+    SELECT relacl FROM pg_class WHERE relname = 'dp_acl';
+}
+expect {
+    {postgres=arwdDxtm/postgres,dp_acl_reader=r/postgres}
+}
+
+test default-privileges-leave-existing-tables-alone {
+    CREATE ROLE dp_late_reader;
+    CREATE TABLE dp_before (id INT);
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_late_reader;
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'dp_before';
+}
+expect {
+    null
+}
+
+test role-without-default-privileges-cannot-read-a-table-created-before {
+    CREATE ROLE dp_too_late;
+    CREATE TABLE dp_earlier (id INT);
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_too_late;
+    SET ROLE dp_too_late;
+    SELECT id FROM dp_earlier;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table dp_earlier
+}
+
+test default-privileges-are-stored-in-pg-default-acl {
+    CREATE ROLE dp_listed;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT, INSERT ON TABLES TO dp_listed;
+    SELECT pg_get_userbyid(defaclrole), defaclnamespace, defaclobjtype, defaclacl
+    FROM pg_default_acl;
+}
+expect {
+    postgres|0|r|{postgres=arwdDxtm/postgres,dp_listed=ar/postgres}
+}
+
+test default-privileges-add-up {
+    CREATE ROLE dp_first;
+    CREATE ROLE dp_second;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_first;
+    ALTER DEFAULT PRIVILEGES GRANT INSERT ON TABLES TO dp_first, dp_second;
+    SELECT defaclacl FROM pg_default_acl;
+    CREATE TABLE dp_added (id INT);
+    SELECT relacl FROM pg_class WHERE relname = 'dp_added';
+}
+expect {
+    {postgres=arwdDxtm/postgres,dp_first=ar/postgres,dp_second=a/postgres}
+    {postgres=arwdDxtm/postgres,dp_first=ar/postgres,dp_second=a/postgres}
+}
+
+test default-privileges-for-public-list-public-first {
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC;
+    SELECT defaclacl FROM pg_default_acl;
+    CREATE TABLE dp_for_everyone (id INT);
+    SELECT relacl FROM pg_class WHERE relname = 'dp_for_everyone';
+}
+expect {
+    {=r/postgres,postgres=arwdDxtm/postgres}
+    {=r/postgres,postgres=arwdDxtm/postgres}
+}
+
+test default-privileges-that-change-nothing-are-not-stored {
+    ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO CURRENT_USER;
+    SELECT count(*) FROM pg_default_acl;
+    CREATE TABLE dp_unchanged (id INT);
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'dp_unchanged';
+}
+expect {
+    0
+    null
+}
+
+test default-privileges-in-a-schema-apply-only-in-that-schema {
+    CREATE ROLE dp_schema_reader;
+    CREATE SCHEMA dp_reports;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA dp_reports GRANT SELECT ON TABLES TO dp_schema_reader;
+    CREATE TABLE dp_reports.dp_in_schema (id INT);
+    CREATE TABLE dp_outside_schema (id INT);
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+    WHERE relname IN ('dp_in_schema', 'dp_outside_schema') ORDER BY relname;
+}
+expect {
+    dp_in_schema|{postgres=arwdDxtm/postgres,dp_schema_reader=r/postgres}
+    dp_outside_schema|null
+}
+
+test default-privileges-in-a-schema-hold-only-what-was-granted {
+    CREATE ROLE dp_schema_listed;
+    CREATE SCHEMA dp_listed_schema;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA dp_listed_schema
+        GRANT SELECT ON TABLES TO dp_schema_listed;
+    SELECT n.nspname, d.defaclobjtype, d.defaclacl
+    FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace;
+}
+expect {
+    dp_listed_schema|r|{dp_schema_listed=r/postgres}
+}
+
+test default-privileges-in-a-schema-add-to-those-of-every-schema {
+    CREATE ROLE dp_everywhere;
+    CREATE ROLE dp_here;
+    CREATE SCHEMA dp_both;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_everywhere;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA dp_both GRANT INSERT ON TABLES TO dp_here;
+    CREATE TABLE dp_both.dp_merged (id INT);
+    SELECT relacl FROM pg_class WHERE relname = 'dp_merged';
+}
+expect {
+    {postgres=arwdDxtm/postgres,dp_everywhere=r/postgres,dp_here=a/postgres}
+}
+
+test default-privileges-in-a-schema-that-does-not-exist-fail {
+    CREATE ROLE dp_nowhere;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA dp_missing_schema GRANT SELECT ON TABLES TO dp_nowhere;
+}
+@sqlstate 3F000
+expect error {
+    schema "dp_missing_schema" does not exist
+}
+
+test default-privileges-on-sequences-apply-to-sequences {
+    CREATE ROLE dp_sequence_user;
+    ALTER DEFAULT PRIVILEGES GRANT USAGE ON SEQUENCES TO dp_sequence_user;
+    CREATE SEQUENCE dp_counter;
+    CREATE TABLE dp_not_a_sequence (id INT);
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+    WHERE relname IN ('dp_counter', 'dp_not_a_sequence') ORDER BY relname;
+    SELECT defaclobjtype, defaclacl FROM pg_default_acl;
+}
+expect {
+    dp_counter|{postgres=rwU/postgres,dp_sequence_user=U/postgres}
+    dp_not_a_sequence|null
+    S|{postgres=rwU/postgres,dp_sequence_user=U/postgres}
+}
+
+test default-privileges-on-sequences-apply-to-serial-sequences {
+    CREATE ROLE dp_serial_user;
+    ALTER DEFAULT PRIVILEGES GRANT USAGE ON SEQUENCES TO dp_serial_user;
+    CREATE TABLE dp_serial (id SERIAL, body TEXT);
+    SELECT relacl FROM pg_class WHERE relname = 'dp_serial_id_seq';
+}
+expect {
+    {postgres=rwU/postgres,dp_serial_user=U/postgres}
+}
+
+test default-privileges-on-tables-apply-to-views {
+    CREATE ROLE dp_view_reader;
+    CREATE TABLE dp_view_base (id INT);
+    INSERT INTO dp_view_base VALUES (1);
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_view_reader;
+    CREATE VIEW dp_view AS SELECT id FROM dp_view_base;
+    SET ROLE dp_view_reader;
+    SELECT id FROM dp_view;
+}
+expect {
+    1
+}
+
+test default-privileges-for-another-role-leave-own-tables-alone {
+    CREATE ROLE dp_other_owner;
+    CREATE ROLE dp_other_reader;
+    ALTER DEFAULT PRIVILEGES FOR ROLE dp_other_owner GRANT SELECT ON TABLES TO dp_other_reader;
+    CREATE TABLE dp_mine (id INT);
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'dp_mine';
+    SELECT pg_get_userbyid(defaclrole), defaclacl FROM pg_default_acl;
+}
+expect {
+    null
+    dp_other_owner|{dp_other_owner=arwdDxtm/dp_other_owner,dp_other_reader=r/dp_other_owner}
+}
+
+test role-may-change-its-own-default-privileges {
+    CREATE ROLE dp_self;
+    CREATE ROLE dp_self_reader;
+    SET ROLE dp_self;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_self_reader;
+    SELECT pg_get_userbyid(defaclrole), defaclacl FROM pg_default_acl;
+}
+expect {
+    dp_self|{dp_self=arwdDxtm/dp_self,dp_self_reader=r/dp_self}
+}
+
+test role-may-not-change-default-privileges-of-another-role {
+    CREATE ROLE dp_intruder;
+    SET ROLE dp_intruder;
+    ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT SELECT ON TABLES TO dp_intruder;
+}
+@sqlstate 42501
+expect error {
+    permission denied to change default privileges
+}
+
+test default-privileges-for-a-role-that-does-not-exist-fail {
+    CREATE ROLE dp_orphan_reader;
+    ALTER DEFAULT PRIVILEGES FOR ROLE dp_no_such_owner GRANT SELECT ON TABLES TO dp_orphan_reader;
+}
+@sqlstate 42704
+expect error {
+    role "dp_no_such_owner" does not exist
+}
+
+test default-privileges-to-a-role-that-does-not-exist-fail {
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_no_such_grantee;
+}
+@sqlstate 42704
+expect error {
+    role "dp_no_such_grantee" does not exist
+}
+
+test default-usage-on-tables-fails {
+    CREATE ROLE dp_table_usage;
+    ALTER DEFAULT PRIVILEGES GRANT USAGE ON TABLES TO dp_table_usage;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type USAGE for relation
+}
+
+test default-insert-on-sequences-fails {
+    CREATE ROLE dp_sequence_insert;
+    ALTER DEFAULT PRIVILEGES GRANT INSERT ON SEQUENCES TO dp_sequence_insert;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type INSERT for sequence
+}
+
+test rolled-back-default-privileges-are-gone {
+    CREATE ROLE dp_rolled_back;
+    BEGIN;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_rolled_back;
+    ROLLBACK;
+    SELECT count(*) FROM pg_default_acl;
+    CREATE TABLE dp_after_rollback (id INT);
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'dp_after_rollback';
+}
+expect {
+    0
+    null
+}
+
+test default-privileges-apply-later-in-the-same-transaction {
+    CREATE ROLE dp_same_transaction;
+    BEGIN;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_same_transaction;
+    CREATE TABLE dp_in_transaction (id INT);
+    COMMIT;
+    SELECT relacl FROM pg_class WHERE relname = 'dp_in_transaction';
+}
+expect {
+    {postgres=arwdDxtm/postgres,dp_same_transaction=r/postgres}
+}
+
+@skip-if postgres "PostgreSQL supports ALTER DEFAULT PRIVILEGES ... REVOKE"
+test default-privileges-revoke-is-not-supported {
+    CREATE ROLE dp_revoked;
+    ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM dp_revoked;
+}
+@sqlstate 0A000
+expect error {
+    ALTER DEFAULT PRIVILEGES ... REVOKE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports default privileges on functions"
+test default-privileges-on-functions-are-not-supported {
+    CREATE ROLE dp_function_user;
+    ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO dp_function_user;
+}
+@sqlstate 0A000
+expect error {
+    ALTER DEFAULT PRIVILEGES on objects other than tables and sequences is not supported
+}
+
+@skip-if postgres "PostgreSQL supports WITH GRANT OPTION"
+test default-privileges-with-grant-option-are-not-supported {
+    CREATE ROLE dp_grant_option;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dp_grant_option WITH GRANT OPTION;
+}
+@sqlstate 0A000
+expect error {
+    ALTER DEFAULT PRIVILEGES ... WITH GRANT OPTION is not supported
+}

@@ -586,16 +586,6 @@ expect error {
     GRANT on objects other than tables and sequences is not supported
 }
 
-@skip-if postgres "PostgreSQL supports ALTER DEFAULT PRIVILEGES"
-test alter-default-privileges-is-not-supported {
-    CREATE ROLE un_default_grantee;
-    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO un_default_grantee;
-}
-@sqlstate 0A000
-expect error {
-    ALTER DEFAULT PRIVILEGES is not supported
-}
-
 # Views are granted on too, which the Rust integration tests cover, because
 # pg_class does not list views yet.
 test grant-select-on-all-tables-in-schema-is-stored-on-each-table-but-not-sequences {

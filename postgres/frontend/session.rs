@@ -31,9 +31,9 @@ use turso_pg_parser::sqlstate::{
 use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
-    PostgreSQLTranslator, SerialSequence,
+    FrontendStmt, PgAlterDefaultPrivilegesStmt, PgCommentTarget, PgCopyFromStmt,
+    PgCreateSchemaStmt, PgDropSchemaStmt, PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt,
+    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
 
@@ -1160,6 +1160,12 @@ impl DeferredOperation {
                         }
                         grant_commands(conn, stmt)?
                     }
+                    FrontendStmt::AlterDefaultPrivileges(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        alter_default_privileges_commands(stmt)
+                    }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
                     | FrontendStmt::Show(_)
@@ -1757,7 +1763,8 @@ fn try_prepare_special(
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
         | FrontendStmt::CommentOn(_)
-        | FrontendStmt::Grant(_)) => crate::Statement::with_deferred(
+        | FrontendStmt::Grant(_)
+        | FrontendStmt::AlterDefaultPrivileges(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1840,6 +1847,9 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         // Who may grant on each table is decided from its stored privileges
         // when the engine's GRANT runs.
         FrontendStmt::Grant(_) => return Ok(()),
+        // Whose default privileges a role may change is decided when the
+        // engine's statement runs.
+        FrontendStmt::AlterDefaultPrivileges(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),
@@ -1925,6 +1935,29 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
         })),
         context: CommandContext::Default,
     }])
+}
+
+/// The engine statement that stores an `ALTER DEFAULT PRIVILEGES`. The
+/// dialect checks the roles and the engine the schemas.
+fn alter_default_privileges_commands(
+    stmt: &PgAlterDefaultPrivilegesStmt,
+) -> Vec<DeferredStatement> {
+    vec![DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::AlterDefaultPrivileges(
+            ast::AlterDefaultPrivileges {
+                roles: stmt.roles.clone(),
+                schemas: stmt
+                    .schemas
+                    .iter()
+                    .map(|schema| ast::Name::exact(schema.clone()))
+                    .collect(),
+                on_sequences: stmt.on_sequences,
+                privileges: stmt.privileges.clone(),
+                grantees: stmt.grantees.iter().map(PgGrantee::to_ast).collect(),
+            },
+        )),
+        context: CommandContext::Default,
+    }]
 }
 
 fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {

@@ -489,10 +489,18 @@ fn write_catalog_without_relpolicies(path: &str) {
     write_old_catalog(path, "relrowsecurity");
 }
 
+/// Writes a database at `path` with the catalog as tursopg made it before
+/// default privileges: every column of the classes table, but no
+/// `__turso_internal_default_acl` table.
+fn write_catalog_without_default_privileges(path: &str) {
+    write_old_catalog(path, "relpolicies");
+}
+
 /// Writes a database at `path` with a catalog that has the columns of the
 /// first catalog and the later ones up to `last_column`: none for "",
-/// `relacl`, or `relacl` and `relrowsecurity`. It has a class row for the
-/// table `app.t`, written by hand.
+/// `relacl`, `relacl` and `relrowsecurity`, or all three with
+/// `relpolicies`. It has a class row for the table `app.t`, written by
+/// hand, and no default privileges table.
 fn write_old_catalog(path: &str, last_column: &str) {
     let db = open_without_catalog(path);
     let conn = db
@@ -506,6 +514,10 @@ fn write_old_catalog(path: &str, last_column: &str) {
         "relrowsecurity" => (
             ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0",
             ", NULL, 0",
+        ),
+        "relpolicies" => (
+            ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0, relpolicies TEXT",
+            ", NULL, 0, NULL",
         ),
         _ => unreachable!("unknown catalog column {last_column}"),
     };
@@ -732,6 +744,58 @@ fn a_catalog_made_before_relpolicies_opens_read_only_without_the_column() {
     assert!(!relrowsecurity(&pg, "t"));
     let error = pg
         .execute("CREATE POLICY one ON app.t USING (x = 1)")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("readonly"), "{error}");
+}
+
+#[test]
+fn a_catalog_made_before_default_privileges_gets_the_table_when_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-default-privileges.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_default_privileges(path);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO reader")
+        .unwrap();
+    pg.close().unwrap();
+    drop(pg);
+    drop(db);
+
+    // The stored default privileges load when the database opens again.
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    pg.execute("CREATE TABLE app.u (x int)").unwrap();
+    assert_eq!(
+        relacl(&pg, "u").as_deref(),
+        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}")
+    );
+}
+
+#[test]
+fn a_catalog_made_before_default_privileges_opens_read_only_without_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-default-privileges-read-only.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_default_privileges(path);
+
+    let db = open_pg_database(
+        path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    let rows = pg
+        .query("SELECT count(*) FROM pg_default_acl")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].as_int(), Some(0));
+    let error = pg
+        .execute("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO postgres")
         .unwrap_err()
         .to_string();
     assert!(error.contains("readonly"), "{error}");

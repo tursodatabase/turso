@@ -254,8 +254,16 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        if let [turso_core::CatalogChange::CreateRole { name, options }] = changes {
-            return crate::roles::translate_create_role(program, schema, name, options);
+        match changes {
+            [turso_core::CatalogChange::CreateRole { name, options }] => {
+                return crate::roles::translate_create_role(program, schema, name, options);
+            }
+            [change @ turso_core::CatalogChange::DefaultPrivileges { .. }] => {
+                return crate::default_privileges::translate_alter_default_privileges(
+                    program, schema, connection, change,
+                );
+            }
+            _ => {}
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
@@ -722,6 +730,49 @@ impl SnapshotRows for PgClassTable {
         }
 
         rows
+    }
+}
+
+/// pg_catalog.pg_default_acl: the privileges that ALTER DEFAULT PRIVILEGES
+/// gives relations created later.
+#[derive(Debug)]
+struct PgDefaultAclTable;
+
+impl SnapshotRows for PgDefaultAclTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_default_acl (
+            oid INTEGER,
+            defaclrole INTEGER,
+            defaclnamespace INTEGER,
+            defaclobjtype TEXT,
+            defaclacl TEXT[],
+            tableoid INTEGER HIDDEN
+        )";
+    const TABLE_OID: Option<i64> = Some(826);
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 5;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let roles = connection_roles(conn);
+        let schema = conn.current_schema();
+        crate::default_privileges::schema_default_acls(&schema)
+            .iter()
+            .map(|entry| {
+                vec![
+                    Value::from_i64(entry.oid),
+                    Value::from_i64(role_oid(entry.role)),
+                    // 0 for every schema, as in PostgreSQL.
+                    Value::from_i64(
+                        entry
+                            .namespace
+                            .map_or(0, |namespace| namespace_oid(&schema, namespace)),
+                    ),
+                    Value::build_text(crate::classes::relkind_letter(entry.kind)),
+                    Value::build_text(entry.acl.display_text(&|oid| {
+                        role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
+                    })),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -2526,6 +2577,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgNamespaceTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_default_acl",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgDefaultAclTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_attribute",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgAttributeTable>(PhantomData),
@@ -2831,13 +2887,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             "CREATE TABLE pg_foreign_server (
             oid INTEGER, srvname TEXT, srvowner INTEGER, srvfdw INTEGER, srvtype TEXT,
             srvversion TEXT, srvacl TEXT[], srvoptions TEXT[], tableoid INTEGER HIDDEN
-        )",
-        ),
-        (
-            "pg_default_acl",
-            "CREATE TABLE pg_default_acl (
-            oid INTEGER, defaclrole INTEGER, defaclnamespace INTEGER, defaclobjtype TEXT,
-            defaclacl TEXT[], tableoid INTEGER HIDDEN
         )",
         ),
         (

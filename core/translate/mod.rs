@@ -245,6 +245,7 @@ fn translate_statement(
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
             | ast::Stmt::Grant(_)
+            | ast::Stmt::AlterDefaultPrivileges(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -442,6 +443,9 @@ fn translate_statement(
             roles::translate_create_role(role_name, options, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
+        ast::Stmt::AlterDefaultPrivileges(alter) => {
+            roles::translate_alter_default_privileges(&alter, resolver, program, connection)?
+        }
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -675,6 +679,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
         ast::Stmt::Grant(_) => "grant",
+        ast::Stmt::AlterDefaultPrivileges(_) => "alter_default_privileges",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",

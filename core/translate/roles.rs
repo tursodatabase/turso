@@ -88,6 +88,8 @@ pub fn check_statement_privileges(
         // The dialect decides who may grant on each relation, from the
         // privileges it stores.
         ast::Stmt::Grant(_) => return Ok(()),
+        // The dialect decides whose default privileges a role may change.
+        ast::Stmt::AlterDefaultPrivileges(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
         // exists, as for CREATE TABLE.
@@ -581,6 +583,35 @@ pub fn translate_grant(
     )?;
     emit_schema_cookie(resolver, program);
     Ok(())
+}
+
+/// `ALTER DEFAULT PRIVILEGES`: the dialect stores the privileges and gives
+/// them to the relations created later.
+pub fn translate_alter_default_privileges(
+    alter: &ast::AlterDefaultPrivileges,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let namespaces = alter
+        .schemas
+        .iter()
+        .map(|schema| {
+            let name = crate::util::normalize_ident(schema.as_str());
+            resolver
+                .schema()
+                .namespace_named(&name)
+                .ok_or_else(|| LimboError::ParseError(format!("schema \"{name}\" does not exist")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let change = CatalogChange::DefaultPrivileges {
+        roles: alter.roles.clone(),
+        namespaces,
+        on_sequences: alter.on_sequences,
+        privileges: alter.privileges.clone(),
+        grantees: alter.grantees.clone(),
+    };
+    translate_change(change, resolver, program, connection)
 }
 
 /// `CREATE ROLE`: the dialect stores the role, through the same hook as its

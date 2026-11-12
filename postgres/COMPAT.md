@@ -420,7 +420,7 @@ Upgrade is not supported.
 | Client can require SCRAM channel binding | ❌ Not supported | |
 | Client-specified requirements for authentication | ❌ Not supported | |
 | Column level permissions | ❌ Not supported | |
-| Default permissions | ❌ Not supported | |
+| Default permissions | 🟡 Partial | `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] GRANT ... ON TABLES` and `ON SEQUENCES` give the privileges to the tables, views, materialized views and sequences created later, and `pg_default_acl` shows them; `REVOKE`, `WITH GRANT OPTION`, and functions, routines, types, schemas and large objects are not supported |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
 | GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT ... ON ALL TABLES IN SCHEMA` and `GRANT ... ON ALL SEQUENCES IN SCHEMA` store the privileges in each relation's `pg_class.relacl`; functions and REVOKE are not supported |

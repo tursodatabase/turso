@@ -8,6 +8,7 @@ use pg_query::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandTag {
     Unknown,
+    AlterDefaultPrivileges,
     AlterDomain,
     AlterExtension,
     AlterFunction,
@@ -143,6 +144,7 @@ impl CommandTag {
             NodeEnum::AlterSeqStmt(_) => Self::AlterSequence,
             NodeEnum::AlterEnumStmt(_) => Self::AlterType,
             NodeEnum::AlterDomainStmt(_) => Self::AlterDomain,
+            NodeEnum::AlterDefaultPrivilegesStmt(_) => Self::AlterDefaultPrivileges,
             NodeEnum::AlterTableStmt(alter) => Self::alter(alter.objtype()),
             // Renaming a column alters the relation that has it.
             NodeEnum::RenameStmt(rename) => Self::alter(match rename.rename_type() {
@@ -181,6 +183,7 @@ impl CommandTag {
     pub fn name(self) -> &'static str {
         match self {
             Self::Unknown => "???",
+            Self::AlterDefaultPrivileges => "ALTER DEFAULT PRIVILEGES",
             Self::AlterDomain => "ALTER DOMAIN",
             Self::AlterExtension => "ALTER EXTENSION",
             Self::AlterFunction => "ALTER FUNCTION",
