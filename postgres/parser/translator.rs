@@ -4,8 +4,9 @@
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
 use crate::coerce::{
-    bool_literal, check_unary_operand, coerce, coerce_operands, coerce_to_boolean, engine_cast,
-    engine_cast_as, CastContext, OperatorKind, PgType,
+    assignment_decision, bool_literal, check_unary_operand, coerce, coerce_assignment,
+    coerce_operands, coerce_to_boolean, engine_cast, engine_cast_as, CastContext, CastDecision,
+    CastMethod, OperatorKind, PgType,
 };
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
@@ -15,7 +16,7 @@ use crate::sqlstate::{
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
 };
 use crate::typing::{
-    self, declared_type, require_type, require_types, ColumnLookup, ExprType, Scopes,
+    self, declared_type, require_type, require_types, ColumnLookup, ExprType, Scopes, TargetColumns,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -695,6 +696,10 @@ impl PostgreSQLTranslator {
         let mut is_unique = false;
         let mut unique_conname: Option<ast::Name> = None;
         let mut default_expr: Option<ast::Expr> = None;
+        let column_type = col_def
+            .type_name
+            .as_ref()
+            .and_then(|type_name| declared_type(type_name, true));
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
 
@@ -724,7 +729,12 @@ impl PostgreSQLTranslator {
                     let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
                         ParseError::ParseError("DEFAULT missing expression".into())
                     })?;
-                    default_expr = Some(self.translate_expr(raw_expr)?);
+                    default_expr = Some(self.coerce_assignment_of(
+                        self.translate_expr(raw_expr)?,
+                        raw_expr,
+                        &col_def.colname,
+                        column_type.as_ref(),
+                    )?);
                 }
                 ConstrType::ConstrCheck => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
@@ -1261,6 +1271,10 @@ impl PostgreSQLTranslator {
         let typmods = extract_integer_typmods(col_def)?;
         let mapping = map_column_type(&pg_type, &typmods)?;
         let col_type = Some(mapping.to_ast_type());
+        let column_type = col_def
+            .type_name
+            .as_ref()
+            .and_then(|type_name| declared_type(type_name, false));
 
         let mut constraints = Vec::new();
         for constraint_node in &col_def.constraints {
@@ -1281,7 +1295,12 @@ impl PostgreSQLTranslator {
                         ParseError::ParseError("DEFAULT missing expression".into())
                     })?;
                     Some(ast::ColumnConstraint::Default(Box::new(
-                        self.translate_expr(raw_expr)?,
+                        self.coerce_assignment_of(
+                            self.translate_expr(raw_expr)?,
+                            raw_expr,
+                            &col_def.colname,
+                            column_type.as_ref(),
+                        )?,
                     )))
                 }
                 ConstrType::ConstrNull
@@ -1802,8 +1821,10 @@ impl PostgreSQLTranslator {
             }
         };
 
+        let targets = self.insert_targets(relation, &columns);
+
         // Translate ON CONFLICT clause (upsert)
-        let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
+        let upsert = self.translate_on_conflict(&insert.on_conflict_clause, relation)?;
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
             if !select_stmt.sort_clause.is_empty()
@@ -1816,7 +1837,8 @@ impl PostgreSQLTranslator {
                 ));
             }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
-            let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
+            let (rows, default_mask) =
+                self.translate_values(&select_stmt.values_lists, &targets)?;
             if !has_explicit_columns && default_mask.iter().any(|d| *d) {
                 return Err(not_supported(
                     "DEFAULT in INSERT ... VALUES without a column list",
@@ -1858,6 +1880,7 @@ impl PostgreSQLTranslator {
             }
         } else {
             // INSERT ... SELECT
+            self.check_insert_select_conversions(select_stmt, &targets)?;
             let select = self.translate_select(select_stmt)?;
             (ast::InsertBody::Select(select, upsert), columns)
         };
@@ -1884,6 +1907,7 @@ impl PostgreSQLTranslator {
     fn translate_values(
         &self,
         values_lists: &[pg_query::protobuf::Node],
+        targets: &[(String, Option<PgType>)],
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
@@ -1932,7 +1956,11 @@ impl PostgreSQLTranslator {
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !default_mask.get(*i).copied().unwrap_or(false))
-                        .map(|(_, item)| Ok(Box::new(self.translate_expr(item)?)))
+                        .map(|(i, item)| {
+                            Ok(Box::new(
+                                self.translate_assigned_value(item, targets.get(i))?,
+                            ))
+                        })
                         .collect::<Result<Vec<_>, ParseError>>()?;
                     rows.push(row);
                 }
@@ -1963,6 +1991,7 @@ impl PostgreSQLTranslator {
 
         // Extract SET assignments from target_list
         // Each ResTarget has name (column) and val (expression)
+        let columns = self.scopes.borrow().target_columns(relation);
         let mut sets = Vec::new();
         for target_node in &update.target_list {
             match &target_node.node {
@@ -1975,7 +2004,12 @@ impl PostgreSQLTranslator {
                     let val = res_target.val.as_ref().ok_or_else(|| {
                         ParseError::ParseError("SET assignment missing value".into())
                     })?;
-                    self.push_set(&mut sets, exact_name(&res_target.name), val)?;
+                    self.push_set(
+                        &mut sets,
+                        exact_name(&res_target.name),
+                        val,
+                        columns.as_deref(),
+                    )?;
                 }
                 _ => {
                     return Err(ParseError::ParseError(
@@ -4940,6 +4974,7 @@ impl PostgreSQLTranslator {
     fn translate_on_conflict(
         &self,
         on_conflict: &Option<Box<pg_query::protobuf::OnConflictClause>>,
+        target: &pg_query::protobuf::RangeVar,
     ) -> Result<Option<Box<ast::Upsert>>, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::OnConflictAction;
@@ -4956,6 +4991,7 @@ impl PostgreSQLTranslator {
             OnConflictAction::OnconflictNothing => ast::UpsertDo::Nothing,
             OnConflictAction::OnconflictUpdate => {
                 // Translate SET assignments from target_list
+                let columns = self.scopes.borrow().target_columns(target);
                 let mut sets = Vec::new();
                 for target_node in &clause.target_list {
                     match &target_node.node {
@@ -4968,7 +5004,12 @@ impl PostgreSQLTranslator {
                             let val = res_target.val.as_ref().ok_or_else(|| {
                                 ParseError::ParseError("ON CONFLICT SET missing value".into())
                             })?;
-                            self.push_set(&mut sets, exact_name(&res_target.name), val)?;
+                            self.push_set(
+                                &mut sets,
+                                exact_name(&res_target.name),
+                                val,
+                                columns.as_deref(),
+                            )?;
                         }
                         _ => {
                             return Err(ParseError::ParseError(
@@ -5059,13 +5100,16 @@ impl PostgreSQLTranslator {
         sets: &mut Vec<ast::Set>,
         col_name: ast::Name,
         val: &pg_query::protobuf::Node,
+        columns: Option<&[(String, Option<PgType>)]>,
     ) -> Result<(), ParseError> {
         use pg_query::protobuf::node::Node;
 
         let Some(Node::MultiAssignRef(multi_assign)) = &val.node else {
+            let target = columns
+                .and_then(|columns| columns.iter().find(|(name, _)| name == col_name.as_str()));
             sets.push(ast::Set {
+                expr: Box::new(self.translate_assigned_value(val, target)?),
                 col_names: vec![col_name],
-                expr: Box::new(self.translate_expr(val)?),
             });
             return Ok(());
         };
@@ -5392,6 +5436,105 @@ impl PostgreSQLTranslator {
             Err(_) if self.for_stored_sql => Ok(value),
             converted => converted,
         }
+    }
+
+    fn insert_targets(
+        &self,
+        table: &pg_query::protobuf::RangeVar,
+        columns: &[ast::Name],
+    ) -> TargetColumns {
+        let table_columns = self.scopes.borrow().target_columns(table);
+        if columns.is_empty() {
+            return table_columns.unwrap_or_default();
+        }
+        columns
+            .iter()
+            .map(|column| {
+                let ty = table_columns
+                    .iter()
+                    .flatten()
+                    .find(|(name, _)| name == column.as_str())
+                    .and_then(|(_, ty)| ty.clone());
+                (column.as_str().to_string(), ty)
+            })
+            .collect()
+    }
+
+    fn translate_assigned_value(
+        &self,
+        node: &pg_query::protobuf::Node,
+        target: Option<&(String, Option<PgType>)>,
+    ) -> Result<ast::Expr, ParseError> {
+        let expr = self.translate_expr(node)?;
+        let Some((column, target_type)) = target else {
+            return Ok(expr);
+        };
+        if matches!(
+            node.node,
+            Some(pg_query::protobuf::node::Node::SetToDefault(_))
+        ) {
+            return Ok(expr);
+        }
+        self.coerce_assignment_of(expr, node, column, target_type.as_ref())
+    }
+
+    fn coerce_assignment_of(
+        &self,
+        expr: ast::Expr,
+        node: &pg_query::protobuf::Node,
+        column: &str,
+        target: Option<&PgType>,
+    ) -> Result<ast::Expr, ParseError> {
+        let stored = self.for_stored_sql.then(|| expr.clone());
+        let result = match target {
+            None => Ok(expr),
+            Some(_) => self
+                .known_type(self.type_of(node))
+                .and_then(|source| coerce_assignment(expr, source.as_ref(), column, target)),
+        };
+        match (result, stored) {
+            (Err(_), Some(expr)) => Ok(expr),
+            (result, _) => result,
+        }
+    }
+
+    fn check_insert_select_conversions(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+        targets: &[(String, Option<PgType>)],
+    ) -> Result<(), ParseError> {
+        let output = match typing::select_output_columns(select, &self.scopes.borrow()) {
+            Ok(output) => output,
+            Err(failure) => {
+                if targets.iter().any(|(_, target)| target.is_some()) {
+                    self.known_type(Err(failure))?;
+                }
+                return Ok(());
+            }
+        };
+        for ((_, source), (column, target)) in output.into_iter().zip(targets) {
+            let Some(target) = target else {
+                continue;
+            };
+            let Some(source) = self.known_type(source)? else {
+                continue;
+            };
+            let rejection = match assignment_decision(&source, column, target) {
+                Err(error) => error,
+                Ok(
+                    CastDecision::Keep
+                    | CastDecision::FromUnknown
+                    | CastDecision::Convert(CastMethod::Nothing),
+                ) => continue,
+                Ok(CastDecision::Convert(_)) => not_supported(format!(
+                    "INSERT ... SELECT that converts {source} to {target}"
+                )),
+            };
+            if !self.for_stored_sql {
+                return Err(rejection);
+            }
+        }
+        Ok(())
     }
 
     fn known_type(&self, typed: ExprType) -> Result<Option<PgType>, ParseError> {
@@ -13331,6 +13474,287 @@ mod tests {
 
     fn assert_translates_to(translator: &PostgreSQLTranslator, sql: &str, expected: &str) {
         assert_eq!(translated_sql(translator, sql), expected, "{sql}");
+    }
+
+    #[test]
+    fn insert_values_convert_each_cell_to_the_type_of_its_column() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t (a, b) VALUES ('5', 7)",
+            "INSERT INTO t (a, b) VALUES (5, CAST (7 AS TEXT))",
+        );
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t (a) VALUES ('1'), (2)",
+            "INSERT INTO t (a) VALUES (1), (2)",
+        );
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t (b, a) VALUES (7, '5')",
+            "INSERT INTO t (b, a) VALUES (CAST (7 AS TEXT), 5)",
+        );
+    }
+
+    #[test]
+    fn insert_values_without_a_column_list_use_the_columns_in_order() {
+        assert_translates_to(
+            &operand_translator(),
+            "INSERT INTO t VALUES ('5', 7, 'true', 3, NULL)",
+            "INSERT INTO t VALUES (5, CAST (7 AS TEXT), CAST (1 AS boolean), CAST (3 AS REAL), NULL)",
+        );
+    }
+
+    #[test]
+    fn insert_values_that_cannot_be_stored_give_the_error_postgresql_gives() {
+        let translator = operand_translator();
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a) VALUES ('x')",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a) VALUES (true)",
+            "42804",
+            "column \"a\" is of type integer but expression is of type boolean",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (d) VALUES (1)",
+            "42804",
+            "column \"d\" is of type boolean but expression is of type integer",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (ts) VALUES ('2024-01-01')",
+            "0A000",
+            "a cast from unknown to timestamp is not supported",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a) VALUES (1), ('x')",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+    }
+
+    #[test]
+    fn insert_values_of_null_and_parameters_pass_into_any_column() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL)",
+            "INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL)",
+        );
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t (a, ts) VALUES ($1, $2)",
+            "INSERT INTO t (a, ts) VALUES (?1, ?2)",
+        );
+    }
+
+    #[test]
+    fn insert_values_into_a_table_that_is_not_known_pass_as_they_are() {
+        assert_translates_to(
+            &operand_translator(),
+            "INSERT INTO missing (a) VALUES ('x')",
+            "INSERT INTO missing (a) VALUES ('x')",
+        );
+    }
+
+    #[test]
+    fn insert_values_with_default_keep_the_default() {
+        assert_translates_to(
+            &operand_translator(),
+            "INSERT INTO t (a, b) VALUES (DEFAULT, 7)",
+            "INSERT INTO t (b) VALUES (CAST (7 AS TEXT))",
+        );
+    }
+
+    #[test]
+    fn update_set_converts_each_value_to_the_type_of_its_column() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "UPDATE t SET a = '5', b = 7",
+            "UPDATE t SET a = 5, b = CAST (7 AS TEXT)",
+        );
+        assert_translates_to(
+            &translator,
+            "UPDATE t SET a = NULL, ts = $1",
+            "UPDATE t SET a = NULL, ts = ?1",
+        );
+        assert_rejected(
+            &translator,
+            "UPDATE t SET a = b",
+            "42804",
+            "column \"a\" is of type integer but expression is of type text",
+        );
+        assert_rejected(
+            &translator,
+            "UPDATE t SET a = 'x'",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+        assert_rejected(
+            &translator,
+            "UPDATE t SET ts = '2024-01-01'",
+            "0A000",
+            "a cast from unknown to timestamp is not supported",
+        );
+    }
+
+    #[test]
+    fn update_set_of_several_columns_at_once_is_not_converted() {
+        assert_translates_to(
+            &operand_translator(),
+            "UPDATE t SET (a, b) = ('x', 1)",
+            "UPDATE t SET (a, b) = ('x', 1)",
+        );
+    }
+
+    #[test]
+    fn on_conflict_update_set_converts_each_value_to_the_type_of_its_column() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = '9', b = excluded.a",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 9, b = CAST (excluded.a AS TEXT)",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.b",
+            "42804",
+            "column \"a\" is of type integer but expression is of type text",
+        );
+    }
+
+    #[test]
+    fn column_default_converts_to_the_declared_type_of_the_column() {
+        let translator = PostgreSQLTranslator::new();
+        assert_translates_to(
+            &translator,
+            "CREATE TABLE n (x int DEFAULT '7', y text DEFAULT 5)",
+            "CREATE TABLE n (x INTEGER DEFAULT 7, y TEXT DEFAULT (CAST (5 AS TEXT))) STRICT",
+        );
+        assert_translates_to(
+            &translator,
+            "ALTER TABLE t ADD COLUMN x int DEFAULT '7'",
+            "ALTER TABLE t ADD COLUMN x INTEGER DEFAULT 7",
+        );
+        for (sql, code, message) in [
+            (
+                "CREATE TABLE n (x int DEFAULT 'x')",
+                "22P02",
+                "invalid input syntax for type integer: \"x\"",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN x int DEFAULT 'x'",
+                "22P02",
+                "invalid input syntax for type integer: \"x\"",
+            ),
+            (
+                "CREATE TABLE n (x int DEFAULT true)",
+                "42804",
+                "column \"x\" is of type integer but expression is of type boolean",
+            ),
+            (
+                "CREATE TABLE n (x timestamp DEFAULT '2024-01-01')",
+                "0A000",
+                "a cast from unknown to timestamp is not supported",
+            ),
+        ] {
+            assert_rejected(&translator, sql, code, message);
+        }
+    }
+
+    #[test]
+    fn column_default_of_a_function_result_of_the_same_type_is_unchanged() {
+        assert_translates_to(
+            &PostgreSQLTranslator::new(),
+            "CREATE TABLE n (x timestamptz DEFAULT now(), y text DEFAULT NULL)",
+            "CREATE TABLE n (x timestamptz DEFAULT (now ()), y TEXT DEFAULT NULL) STRICT",
+        );
+    }
+
+    #[test]
+    fn insert_select_of_columns_that_need_no_conversion_passes() {
+        let translator = operand_translator();
+        for sql in [
+            "INSERT INTO t (a) SELECT a FROM t",
+            "INSERT INTO t (b, a) SELECT b, a FROM t",
+            "INSERT INTO t SELECT a, b, d, f, ts FROM t",
+            "INSERT INTO t (a) SELECT NULL",
+            "INSERT INTO t (ts) SELECT $1",
+            "INSERT INTO t (a) SELECT 1 UNION SELECT 2",
+        ] {
+            assert_cast_accepted(&translator, sql);
+        }
+    }
+
+    #[test]
+    fn insert_select_of_a_column_that_cannot_be_stored_gives_the_error_postgresql_gives() {
+        let translator = operand_translator();
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a) SELECT b FROM t",
+            "42804",
+            "column \"a\" is of type integer but expression is of type text",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a, b) SELECT a, d FROM t",
+            "0A000",
+            "a cast from boolean to text is not supported",
+        );
+    }
+
+    #[test]
+    fn insert_select_that_would_change_a_value_is_not_supported() {
+        let translator = operand_translator();
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (f) SELECT a FROM t",
+            "0A000",
+            "INSERT ... SELECT that converts integer to double precision is not supported",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (b) SELECT a FROM t",
+            "0A000",
+            "INSERT ... SELECT that converts integer to text is not supported",
+        );
+        assert_rejected(
+            &translator,
+            "INSERT INTO t (a) SELECT 1.5",
+            "0A000",
+            "INSERT ... SELECT that converts numeric to integer is not supported",
+        );
+    }
+
+    #[test]
+    fn stored_sql_keeps_loading_an_assignment_that_is_rejected() {
+        let translator = operand_translator().for_stored_sql();
+        assert_translates_to(
+            &translator,
+            "INSERT INTO t (a) VALUES ('x')",
+            "INSERT INTO t (a) VALUES ('x')",
+        );
+        assert_translates_to(&translator, "UPDATE t SET a = b", "UPDATE t SET a = b");
+        assert_translates_to(
+            &translator,
+            "CREATE TABLE n (x int DEFAULT 'x')",
+            "CREATE TABLE n (x INTEGER DEFAULT 'x') STRICT",
+        );
+        for sql in [
+            "INSERT INTO t (a) SELECT b FROM t",
+            "INSERT INTO t (f) SELECT a FROM t",
+            "SELECT age('2024-01-01')",
+        ] {
+            assert_cast_accepted(&translator, sql);
+        }
     }
 
     #[test]
