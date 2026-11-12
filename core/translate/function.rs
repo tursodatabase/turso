@@ -339,7 +339,7 @@ fn expand_in_clause_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Resul
 fn expand_in_expr(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Result<()> {
     let replaced_calls_before = expand.replaced_calls;
     walk_expr_mut(expr, &mut |expr| expand_call_or_subquery(expr, expand))?;
-    if expand.replaced_calls > replaced_calls_before && is_deeper_than(expr, MAX_EXPR_DEPTH) {
+    if expand.replaced_calls > replaced_calls_before && expr_is_deeper_than(expr, MAX_EXPR_DEPTH) {
         return Err(expression_tree_is_too_large());
     }
     Ok(())
@@ -378,7 +378,7 @@ fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Res
                 })?;
             }
             if let Some(expansion) = (expand.replacement)(expr)? {
-                if is_deeper_than(&expansion, MAX_EXPR_DEPTH) {
+                if expr_is_deeper_than(&expansion, MAX_EXPR_DEPTH) {
                     return Err(expression_tree_is_too_large());
                 }
                 *expr = expansion;
@@ -393,7 +393,11 @@ fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Res
 
 /// Whether `expr` has more than `limit` levels. The expressions of a
 /// subquery are one level below the subquery, as the parser counts them.
-fn is_deeper_than(expr: &ast::Expr, limit: usize) -> bool {
+///
+/// A dialect that puts an expression in an expression, for example the
+/// expression of a call in the expression of another call, can use this
+/// before it walks the result with recursion.
+pub fn expr_is_deeper_than(expr: &ast::Expr, limit: usize) -> bool {
     has_level_above(expr, 1, limit)
 }
 

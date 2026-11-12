@@ -181,7 +181,7 @@ pub use storage::{
 pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 pub use translate::function::{
-    emit_dialect_schema_row_delete, emit_dialect_schema_row_insert,
+    emit_dialect_schema_row_delete, emit_dialect_schema_row_insert, expr_is_deeper_than,
     open_schema_table_for_dialect_rows,
 };
 pub use translate::sequence::{emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write};
