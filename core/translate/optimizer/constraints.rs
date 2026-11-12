@@ -7,8 +7,8 @@ use crate::{
     translate::{
         collate::{comparison_collation, in_list_collation, CollationSeq},
         expr::{
-            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
-            WalkControl,
+            as_binary_components, expr_references_outer_query, get_expr_affinity, truth_test_rhs,
+            unwrap_parens, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -398,6 +398,7 @@ fn estimate_selectivity(
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
+    is_join_probe: bool,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
     let table_stats = schema.analyze_stats.table_stats(
@@ -448,6 +449,19 @@ fn estimate_selectivity(
                         }
                     }
                 } else {
+                    // Without stats SQLite assumes 10 rows per key on the first
+                    // column of any index (sqlite3DefaultRowEst); `index` always
+                    // has this column first. Use that for a join probe, so every
+                    // index on the probed column gets the same estimate and a
+                    // scan of the other table does not look cheaper than the
+                    // seek. A constant or parameter equality keeps
+                    // `sel_eq_indexed`: the leading column may have few distinct
+                    // values, and an IN seek on (a, b) must still beat a prefix
+                    // seek on a.
+                    if is_join_probe {
+                        return (params.rows_per_join_probe_key / params.rows_per_table_fallback)
+                            .min(1.0);
+                    }
                     return params.sel_eq_indexed;
                 }
                 // Fallback: use hardcoded selectivity for non-indexed columns
@@ -484,6 +498,7 @@ fn estimate_constraint_selectivity(
     index: Option<&Index>,
     params: &CostModelParams,
     is_rowid: bool,
+    is_join_probe: bool,
 ) -> f64 {
     // `a IS 5` filters exactly like `a = 5` — the key is never NULL — so give
     // it the `=` estimate. Only a NULL-matching `IS` keeps its own, much less
@@ -501,6 +516,7 @@ fn estimate_constraint_selectivity(
         operator,
         params,
         is_rowid,
+        is_join_probe,
     )
 }
 
@@ -906,13 +922,16 @@ pub fn table_constraints_from_where_clause(
                 ast::Expr::Column { table, column, .. } => {
                     if *table == table_reference.internal_id {
                         let table_column = &table_reference.table.columns()[*column];
+                        let lhs_mask = table_mask_from_expr(rhs, table_references, subqueries)?;
+                        let is_join_probe = !lhs_mask.is_empty()
+                            || expr_references_outer_query(rhs, table_references);
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
                             table_col_pos: Some(*column),
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                            lhs_mask,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -922,6 +941,7 @@ pub fn table_constraints_from_where_clause(
                                 index_for_column(*column),
                                 params,
                                 false,
+                                is_join_probe,
                             ),
                             usable: true,
                             outer_join_compatible,
@@ -939,13 +959,16 @@ pub fn table_constraints_from_where_clause(
                         } else {
                             (None, None)
                         };
+                        let lhs_mask = table_mask_from_expr(rhs, table_references, subqueries)?;
+                        let is_join_probe = !lhs_mask.is_empty()
+                            || expr_references_outer_query(rhs, table_references);
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
                             table_col_pos: col_pos,
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                            lhs_mask,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -955,6 +978,7 @@ pub fn table_constraints_from_where_clause(
                                 None,
                                 params,
                                 true,
+                                is_join_probe,
                             ),
                             usable: true,
                             outer_join_compatible,
@@ -972,6 +996,9 @@ pub fn table_constraints_from_where_clause(
                     subqueries,
                 ) =>
                 {
+                    let lhs_mask = table_mask_from_expr(rhs, table_references, subqueries)?;
+                    let is_join_probe =
+                        !lhs_mask.is_empty() || expr_references_outer_query(rhs, table_references);
                     let selectivity = estimate_constraint_selectivity(
                         schema,
                         table_reference,
@@ -981,12 +1008,13 @@ pub fn table_constraints_from_where_clause(
                         None,
                         params,
                         false,
+                        is_join_probe,
                     );
                     tracing::debug!(
                         table = table_reference.table.get_name(),
                         where_clause_pos = i,
                         operator = ?operator,
-                        lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
+                        lhs_mask = ?lhs_mask,
                         selectivity,
                         "expr constraint (lhs matches table)"
                     );
@@ -996,7 +1024,7 @@ pub fn table_constraints_from_where_clause(
                         table_col_pos: None,
                         expr: Some(lhs.clone()),
                         constraining_expr: None,
-                        lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                        lhs_mask,
                         selectivity,
                         usable: true,
                         outer_join_compatible,
@@ -1012,13 +1040,16 @@ pub fn table_constraints_from_where_clause(
                 ast::Expr::Column { table, column, .. } => {
                     if *table == table_reference.internal_id {
                         let table_column = &table_reference.table.columns()[*column];
+                        let lhs_mask = table_mask_from_expr(lhs, table_references, subqueries)?;
+                        let is_join_probe = !lhs_mask.is_empty()
+                            || expr_references_outer_query(lhs, table_references);
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
                             table_col_pos: Some(*column),
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                            lhs_mask,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -1028,6 +1059,7 @@ pub fn table_constraints_from_where_clause(
                                 index_for_column(*column),
                                 params,
                                 false,
+                                is_join_probe,
                             ),
                             usable: true,
                             outer_join_compatible,
@@ -1045,13 +1077,16 @@ pub fn table_constraints_from_where_clause(
                         } else {
                             (None, None)
                         };
+                        let lhs_mask = table_mask_from_expr(lhs, table_references, subqueries)?;
+                        let is_join_probe = !lhs_mask.is_empty()
+                            || expr_references_outer_query(lhs, table_references);
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
                             table_col_pos: col_pos,
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                            lhs_mask,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -1061,6 +1096,7 @@ pub fn table_constraints_from_where_clause(
                                 None,
                                 params,
                                 true,
+                                is_join_probe,
                             ),
                             usable: true,
                             outer_join_compatible,
@@ -1078,6 +1114,9 @@ pub fn table_constraints_from_where_clause(
                     subqueries,
                 ) =>
                 {
+                    let lhs_mask = table_mask_from_expr(lhs, table_references, subqueries)?;
+                    let is_join_probe =
+                        !lhs_mask.is_empty() || expr_references_outer_query(lhs, table_references);
                     let selectivity = estimate_constraint_selectivity(
                         schema,
                         table_reference,
@@ -1087,12 +1126,13 @@ pub fn table_constraints_from_where_clause(
                         None,
                         params,
                         false,
+                        is_join_probe,
                     );
                     tracing::debug!(
                         table = table_reference.table.get_name(),
                         where_clause_pos = i,
                         operator = ?operator,
-                        lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
+                        lhs_mask = ?lhs_mask,
                         selectivity,
                         "expr constraint (rhs matches table)"
                     );
@@ -1102,7 +1142,7 @@ pub fn table_constraints_from_where_clause(
                         table_col_pos: None,
                         expr: Some(rhs.clone()),
                         constraining_expr: None,
-                        lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                        lhs_mask,
                         selectivity,
                         usable: true,
                         outer_join_compatible,
@@ -1976,6 +2016,7 @@ fn estimate_bound_expr_selectivity(
             index,
             params,
             is_rowid,
+            false,
         )
     };
 
@@ -2052,6 +2093,7 @@ fn estimate_bound_expr_selectivity(
                 index,
                 params,
                 is_rowid,
+                false,
             )
         }
         Expr::Like { not, .. } => {
@@ -2381,6 +2423,8 @@ pub(crate) fn analyze_binary_term_for_index(
     // See [Constraint::null_matching].
     let null_matching = operator.as_ast_operator() == Some(ast::Operator::Is)
         && !is_non_null_literal(constraining_expr);
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
     let selectivity = estimate_constraint_selectivity(
         schema,
         table_reference,
@@ -2390,10 +2434,8 @@ pub(crate) fn analyze_binary_term_for_index(
         best_index.as_deref(),
         params,
         is_rowid,
+        !lhs_mask.is_empty(),
     );
-
-    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
-        .unwrap_or_else(|_| TableMask::default());
 
     // Cannot use index seek if the constraining expression references the same table
     // being scanned, since the expression value varies per row and cannot be evaluated

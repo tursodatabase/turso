@@ -110,3 +110,67 @@ test equality-on-all-composite-primary-key-columns-is-one-seek {
 expect pattern {
     \d+\|0\|0\|SEARCH cpk USING INDEX sqlite_autoindex_cpk_1 \(a=\? AND b=\?\)
 }
+
+# Without ANALYZE stats a join probe on the first column of any index (the key
+# comes from another table) is estimated at 10 rows per key (SQLite's default),
+# so a join that filters one table by a secondary index and reaches the other
+# through an index prefix keeps that order instead of scanning the second table.
+# This holds for a composite PRIMARY KEY and for a plain non-unique index alike.
+# A constant equality keeps the generic estimate, as
+# in-list-after-eq-prefix-on-composite-primary-key above shows.
+setup composite_pk_join {
+    CREATE TABLE p (id INTEGER, k TEXT, PRIMARY KEY (id, k));
+    CREATE INDEX p_k ON p(k);
+    CREATE TABLE c (id INTEGER, x TEXT, t TEXT, PRIMARY KEY (id, x));
+    INSERT INTO p VALUES (1, 'k1'), (2, 'k1'), (3, 'k2');
+    INSERT INTO c VALUES (1, 'a', 'u'), (1, 'b', 'z'), (2, 'c', 'w'), (3, 'd', 'u');
+}
+
+@setup composite_pk_join
+test join-reaches-composite-primary-key-by-its-prefix {
+    EXPLAIN QUERY PLAN
+    SELECT c.x FROM p JOIN c ON c.id = p.id
+    WHERE p.k = 'k1' AND c.t IN ('u', 'w');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH p USING INDEX p_k \(k=\?\)\n\d+\|0\|0\|SEARCH c USING INDEX sqlite_autoindex_c_1 \(id=\?\)
+}
+
+@setup composite_pk_join
+test join-over-composite-primary-key-prefix-returns-matching-rows {
+    SELECT c.x FROM p JOIN c ON c.id = p.id
+    WHERE p.k = 'k1' AND c.t IN ('u', 'w') ORDER BY c.x;
+}
+expect {
+    a
+    c
+}
+
+setup non_unique_index_join {
+    CREATE TABLE p (id INTEGER, k TEXT, PRIMARY KEY (id, k));
+    CREATE INDEX p_k ON p(k);
+    CREATE TABLE c (id INTEGER, x TEXT, t TEXT);
+    CREATE INDEX c_id_x ON c(id, x);
+    INSERT INTO p VALUES (1, 'k1'), (2, 'k1'), (3, 'k2');
+    INSERT INTO c VALUES (1, 'a', 'u'), (1, 'b', 'z'), (2, 'c', 'w'), (3, 'd', 'u');
+}
+
+@setup non_unique_index_join
+test join-reaches-non-unique-index-by-its-prefix {
+    EXPLAIN QUERY PLAN
+    SELECT c.x FROM p JOIN c ON c.id = p.id
+    WHERE p.k = 'k1' AND c.t IN ('u', 'w');
+}
+expect pattern {
+    \d+\|0\|0\|SEARCH p USING INDEX p_k \(k=\?\)\n\d+\|0\|0\|SEARCH c USING INDEX c_id_x \(id=\?\)
+}
+
+@setup non_unique_index_join
+test join-over-non-unique-index-prefix-returns-matching-rows {
+    SELECT c.x FROM p JOIN c ON c.id = p.id
+    WHERE p.k = 'k1' AND c.t IN ('u', 'w') ORDER BY c.x;
+}
+expect {
+    a
+    c
+}
