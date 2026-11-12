@@ -50,7 +50,7 @@ Basics not enumerated by the official feature matrix.
 |---------|--------|-------|
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
-| UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
+| UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds and INTERSECT ALL / EXCEPT ALL (rejected inside a view); a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error; an EXISTS subquery may select no columns (`EXISTS (SELECT FROM t)`), but a SELECT with no columns anywhere else is rejected |
 | INSERT (column lists, multi-row VALUES, DEFAULT, DEFAULT VALUES, INSERT ... SELECT) | ✅ Supported | Without a column list, `INSERT ... SELECT *` must give a value for every column that is not generated; duplicate target columns, array-element/field targets, OVERRIDING and ON CONFLICT with DEFAULT VALUES are rejected |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |

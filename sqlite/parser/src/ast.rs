@@ -1090,6 +1090,10 @@ pub enum CompoundOperator {
     Except,
     /// `INTERSECT`
     Intersect,
+    /// `EXCEPT ALL`: only the PostgreSQL frontend produces it, SQLite has no such syntax
+    ExceptAll,
+    /// `INTERSECT ALL`: only the PostgreSQL frontend produces it, SQLite has no such syntax
+    IntersectAll,
 }
 
 /// `SELECT` core
