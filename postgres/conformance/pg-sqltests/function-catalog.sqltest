@@ -1259,6 +1259,20 @@ expect @tursopg error {
     a function with the name of the built-in function "generate_series" is not supported
 }
 
+# json_tree is a table function that only tursopg has. A call in FROM finds
+# it by its name alone.
+test function-with-the-name-of-a-table-function-of-tursopg {
+    CREATE FUNCTION json_tree(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    SELECT proname FROM pg_proc WHERE proname = 'json_tree';
+}
+expect {
+    json_tree
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in table or table function "json_tree" is not supported
+}
+
 # The translator turns int4(x) into a cast.
 test function-with-the-name-of-a-type {
     CREATE FUNCTION int4(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;

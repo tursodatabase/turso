@@ -368,6 +368,17 @@ pub(crate) fn translate_create_function(
             ),
         ));
     }
+    // A call in FROM finds a built-in table function, such as json_tree, by
+    // its name alone, in every schema.
+    if is_built_in_table(schema, connection, name) {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "a function with the name of the built-in table or table function \"{name}\" \
+                 is not supported"
+            ),
+        ));
+    }
     // PostgreSQL lets a table and a function have the same name. tursopg
     // does not yet.
     if schema
@@ -761,6 +772,17 @@ pub(crate) fn is_built_in_function(connection: &Connection, name: &str) -> bool 
             .iter()
             .any(|(function_name, ..)| function_name.eq_ignore_ascii_case(name))
         || is_postgres_built_in_function(name)
+}
+
+/// Whether tursopg has a built-in table or table function `name`: a table
+/// of the engine's own namespace, or a table module that the frontend or an
+/// extension registered.
+fn is_built_in_table(schema: &Schema, connection: &Connection, name: &str) -> bool {
+    schema.get_table(NamespaceId::ROOT, name).is_some()
+        || connection
+            .get_syms_vtab_mods()
+            .iter()
+            .any(|module| module.eq_ignore_ascii_case(name))
 }
 
 /// Whether PostgreSQL 18 has a function `name` in pg_catalog.

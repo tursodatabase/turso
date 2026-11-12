@@ -552,7 +552,9 @@ Notes on `CREATE FUNCTION`:
   name. PostgreSQL accepts this.
 - A function cannot have the name of a built-in function of tursopg or of
   PostgreSQL 18, such as `abs` or `to_hex`. PostgreSQL chooses between the
-  two by the types of the arguments, which tursopg does not know.
+  two by the types of the arguments, which tursopg does not know. A function
+  cannot have the name of a built-in table or table function of tursopg
+  either, such as `pg_class` or `json_tree`.
 - The name of a function or of its schema cannot have a dot, and a function
   cannot be created in `pg_catalog`. When `pg_catalog` is the first schema
   of the search path, PostgreSQL creates a function without a schema name
