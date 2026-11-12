@@ -141,9 +141,10 @@ pub fn emit_dialect_schema_row_delete(
 
 /// Replaces each call of a function that the dialect defines as an
 /// expression of the call's arguments with that expression
-/// ([`crate::Dialect::expand_function_call`]), in the queries and the
-/// data-changing statements. The rest of translation only sees the
-/// expression. Returns whether it replaced a call.
+/// ([`crate::Dialect::expand_function_call`]), in the statements that run a
+/// query or change data: SELECT, INSERT, UPDATE, DELETE and CREATE TABLE AS.
+/// The rest of translation only sees the expression. Returns whether it
+/// replaced a call.
 pub(crate) fn expand_function_calls(
     stmt: &mut ast::Stmt,
     resolver: &Resolver,
@@ -206,6 +207,10 @@ fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<
             }
             expand_in_result_columns(returning, expand)
         }
+        ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::AsSelect(select),
+            ..
+        } => expand_in_select(select, expand),
         _ => Ok(()),
     }
 }

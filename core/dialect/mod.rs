@@ -1153,6 +1153,9 @@ mod tests {
             integers("DELETE FROM t WHERE a = twice(3) RETURNING twice(a)"),
             [[12]]
         );
+        conn.execute("CREATE TABLE copied AS SELECT twice(a) AS doubled FROM t WHERE a = twice(1)")
+            .unwrap();
+        assert_eq!(integers("SELECT doubled FROM copied"), [[4]]);
 
         // The argument is one variable of the statement, used two times.
         let mut statement = conn.prepare("SELECT twice(?)").unwrap();
