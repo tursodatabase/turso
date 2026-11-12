@@ -5608,6 +5608,31 @@ fn test_blocking_store_records_no_dirty_keys() {
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
+/// The skip map frees a removed transaction only during later operations. A removed
+/// transaction must not keep the version chains that it wrote, or a checkpoint cannot
+/// free them.
+#[test]
+fn test_removed_transaction_does_not_keep_version_chains() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let row_store = db.get_mvcc_store().row_store();
+    assert!(!row_store.rows.is_empty());
+    for entry in row_store.rows.iter() {
+        assert_eq!(
+            Arc::strong_count(entry.value()),
+            1,
+            "a removed transaction keeps the version chain of {:?}",
+            entry.key()
+        );
+    }
+}
+
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
