@@ -352,6 +352,21 @@ expect @tursopg error {
     no such function: twice
 }
 
+# tursopg stores the name of a schema in lowercase and finds a schema
+# without regard to case, for a function as for a table.
+test call-with-a-schema-name-in-another-case {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT "APP".one();
+}
+@sqlstate 3F000
+expect error {
+    schema "APP" does not exist
+}
+expect @tursopg {
+    1
+}
+
 test call-in-a-schema-that-does-not-exist {
     SELECT nosuch.twice(21);
 }

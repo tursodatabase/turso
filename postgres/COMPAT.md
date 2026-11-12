@@ -606,7 +606,11 @@ Notes on calls of SQL functions:
 - A call is supported in SELECT, INSERT, UPDATE, DELETE, CREATE TABLE AS
   and SELECT INTO. A call is rejected in a FROM clause and in a statement
   that stores it: CREATE VIEW, CREATE MATERIALIZED VIEW, a column default,
-  a CHECK constraint and an index.
+  a generated column, a CHECK constraint, an index and a policy.
+- tursopg stores the name of a schema in lowercase and finds a schema
+  without regard to case, for a function as for a table. Thus `"APP".f()`
+  calls the function `f` of schema `app`, where PostgreSQL finds no schema
+  `"APP"`.
 - A call of a function that PostgreSQL does not inline is rejected: the body
   is not a plain `SELECT` of one expression (it has FROM, WHERE, GROUP BY,
   ORDER BY, LIMIT, a set operation, a subquery or an aggregate).
