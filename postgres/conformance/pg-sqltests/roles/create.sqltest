@@ -36,6 +36,7 @@ expect {
 test create-role-named-postgres-fails {
     CREATE ROLE postgres;
 }
+@sqlstate 42710
 expect error {
     role "postgres" already exists
 }
