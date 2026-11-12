@@ -73,6 +73,43 @@ pub(crate) fn translate_drop_function(drop: &DropStmt) -> Result<ast::Stmt, Pars
 pub struct CalledFunction {
     pub schema: Option<String>,
     pub name: String,
+    /// Whether the statement calls the function as a table in a FROM
+    /// clause.
+    pub in_from: bool,
+}
+
+/// The name of the statement of `parsed` when tursopg cannot expand the
+/// calls of user-defined functions in it: any statement but a query, a
+/// data-changing statement, or EXPLAIN of one.
+pub fn statement_without_function_expansion(
+    parsed: &pg_query::ParseResult,
+) -> Option<&'static str> {
+    fn expands_calls(statement: &NodeEnum) -> bool {
+        match statement {
+            NodeEnum::SelectStmt(select) => select.into_clause.is_none(),
+            NodeEnum::InsertStmt(_) | NodeEnum::UpdateStmt(_) | NodeEnum::DeleteStmt(_) => true,
+            NodeEnum::ExplainStmt(explain) => explain
+                .query
+                .as_ref()
+                .and_then(|query| query.node.as_ref())
+                .is_some_and(expands_calls),
+            _ => false,
+        }
+    }
+    let statement = crate::first_statement(parsed)?;
+    if expands_calls(statement) {
+        return None;
+    }
+    Some(match statement {
+        NodeEnum::SelectStmt(_) => "SELECT INTO",
+        NodeEnum::CreateTableAsStmt(create)
+            if create.objtype() == pg_query::protobuf::ObjectType::ObjectMatview =>
+        {
+            "CREATE MATERIALIZED VIEW"
+        }
+        NodeEnum::CreateTableAsStmt(_) => "CREATE TABLE AS",
+        _ => CommandTag::of(parsed).name(),
+    })
 }
 
 /// The parameter types that DROP FUNCTION names the function with, or None

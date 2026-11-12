@@ -280,3 +280,109 @@ fn a_role_that_is_not_a_superuser_cannot_change_functions() {
     let missing = pg.execute("DROP FUNCTION nosuch()").unwrap_err();
     assert_eq!(missing.sqlstate, "42883");
 }
+
+fn integers(statement: &mut turso_pg::Statement) -> Vec<i64> {
+    let rows = statement.run_collect_rows().unwrap();
+    statement.reset().unwrap();
+    rows.iter().map(|row| row[0].as_int().unwrap()).collect()
+}
+
+#[test]
+fn a_prepared_call_uses_the_function_as_it_is_when_the_statement_runs() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE FUNCTION amount() RETURNS integer LANGUAGE sql AS $$SELECT 1$$")
+        .unwrap();
+    let mut call = pg.prepare("SELECT amount()").unwrap();
+    assert_eq!(integers(&mut call), [1]);
+
+    pg.execute("CREATE OR REPLACE FUNCTION amount() RETURNS integer LANGUAGE sql AS $$SELECT 2$$")
+        .unwrap();
+    assert_eq!(integers(&mut call), [2]);
+
+    pg.execute("DROP FUNCTION amount()").unwrap();
+    let error = call.run_collect_rows().unwrap_err();
+    assert_eq!(error.to_string(), "no such function: amount");
+}
+
+#[test]
+fn a_prepared_call_uses_the_search_path_of_the_time_it_runs() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE SCHEMA one").unwrap();
+    pg.execute("CREATE SCHEMA two").unwrap();
+    pg.execute("CREATE FUNCTION one.amount() RETURNS integer LANGUAGE sql AS $$SELECT 1$$")
+        .unwrap();
+    pg.execute("CREATE FUNCTION two.amount() RETURNS integer LANGUAGE sql AS $$SELECT 2$$")
+        .unwrap();
+    pg.execute(
+        "CREATE FUNCTION public.next_amount() RETURNS integer LANGUAGE sql \
+         AS $$SELECT one.amount() + 1$$",
+    )
+    .unwrap();
+    pg.execute("SET search_path = one, public").unwrap();
+    let mut call = pg.prepare("SELECT amount() + next_amount()").unwrap();
+    assert_eq!(integers(&mut call), [3]);
+
+    pg.execute("SET search_path = two, public").unwrap();
+    assert_eq!(integers(&mut call), [4]);
+}
+
+#[test]
+fn the_parameters_of_a_function_are_not_parameters_of_the_statement() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute(
+        "CREATE FUNCTION add(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + $2$$",
+    )
+    .unwrap();
+
+    let mut without_parameters = pg.prepare("SELECT add(40, 2)").unwrap();
+    assert_eq!(without_parameters.parameters_count(), 0);
+    assert_eq!(integers(&mut without_parameters), [42]);
+
+    // $1 of the statement is the second argument, which is $2 of the body.
+    let mut with_parameter = pg.prepare("SELECT add(40, $1)").unwrap();
+    assert_eq!(with_parameter.parameters_count(), 1);
+    with_parameter
+        .bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(2))
+        .unwrap();
+    assert_eq!(integers(&mut with_parameter), [42]);
+}
+
+#[test]
+fn another_connection_calls_a_new_function() {
+    let db = TempDatabase::builder().build();
+    let writer = db.connect_postgres();
+    let reader = db.connect_postgres();
+    let error = reader.prepare("SELECT amount()").err().unwrap();
+    assert_eq!(error.to_string(), "no such function: amount");
+
+    writer
+        .execute("CREATE FUNCTION amount() RETURNS integer LANGUAGE sql AS $$SELECT 1$$")
+        .unwrap();
+    assert_eq!(
+        integers(&mut reader.prepare("SELECT amount()").unwrap()),
+        [1]
+    );
+}
+
+#[test]
+fn explain_shows_the_expression_of_a_call() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg.execute("CREATE TABLE t (a integer)").unwrap();
+    pg.execute(
+        "CREATE FUNCTION add_one(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1$$",
+    )
+    .unwrap();
+    let plan = pg
+        .prepare("EXPLAIN SELECT add_one(a) FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    // The plan is the plan of `SELECT a + 1 FROM t`: it scans the table and
+    // calls no function.
+    assert!(!plan.is_empty());
+    assert!(!format!("{plan:?}").contains("add_one"), "{plan:?}");
+}

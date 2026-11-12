@@ -4,6 +4,7 @@ mod catalog;
 mod classes;
 mod copy;
 mod error;
+mod function_calls;
 mod functions;
 mod options;
 mod pg_type;

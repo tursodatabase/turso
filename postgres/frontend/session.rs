@@ -475,6 +475,11 @@ fn prepare_statement_inner(
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    crate::function_calls::check_function_calls(
+        &pg_conn.conn,
+        &translator.called_functions(),
+        &parse_result,
+    )?;
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     let created_function = match translated.cmd.stmt() {

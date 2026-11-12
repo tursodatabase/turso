@@ -89,7 +89,7 @@ impl PostgreSQLTranslator {
         self.parameter_numbers.borrow().clone()
     }
 
-    fn record_called_function(&self, call: &pg_query::protobuf::FuncCall) {
+    fn record_called_function(&self, call: &pg_query::protobuf::FuncCall, in_from: bool) {
         let Ok(names) = extract_key_columns(&call.funcname) else {
             return;
         };
@@ -101,6 +101,7 @@ impl PostgreSQLTranslator {
         self.called_functions.borrow_mut().push(CalledFunction {
             schema: schema.cloned(),
             name: name.clone(),
+            in_from,
         });
     }
 
@@ -2738,7 +2739,7 @@ impl PostgreSQLTranslator {
             }
         };
 
-        self.record_called_function(func_call);
+        self.record_called_function(func_call, true);
         let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
         if func_call.func_variadic
@@ -4338,7 +4339,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        self.record_called_function(func_call);
+        self.record_called_function(func_call, false);
         let func_name = function_name(&func_call.funcname)?;
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
@@ -9339,6 +9340,18 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
             };
         }
     }
+    if let [schema, name] = extract_key_columns(names)?.as_slice() {
+        if !is_pg_catalog(schema) {
+            // A function that a user defined in a schema. The frontend
+            // checks that the schema and the function exist.
+            if schema.contains('.') || name.contains('.') {
+                return Err(ParseError::not_supported(
+                    "a function or schema name with a dot",
+                ));
+            }
+            return Ok(format!("{schema}.{name}"));
+        }
+    }
     let name = object_name(names, is_pg_catalog, "function")?;
     if name.contains('.') {
         return Err(no_such_function(&name));
@@ -13094,14 +13107,34 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_schema_qualified_functions() {
-        assert_not_supported("SELECT myschema.f(1)", "schema-qualified function");
-        assert_not_supported(
-            "SELECT * FROM myschema.generate_series(1, 3)",
-            "schema-qualified function",
-        );
-        assert_translates("SELECT pg_catalog.lower('A')");
+    fn schema_qualified_functions_keep_their_schema() {
+        let translated = |sql: &str| {
+            let parsed = crate::parse(sql).unwrap();
+            let translator = PostgreSQLTranslator::new();
+            let statement = translator.translate(&parsed).unwrap().to_string();
+            (statement, translator.called_functions())
+        };
+        let called = |schema: Option<&str>, name: &str, in_from: bool| CalledFunction {
+            schema: schema.map(str::to_string),
+            name: name.to_string(),
+            in_from,
+        };
+
+        // The frontend checks that the schema has the function.
+        let (statement, calls) = translated("SELECT myschema.f(1)");
+        assert_eq!(statement, "SELECT \"myschema.f\" (1) f");
+        assert_eq!(calls, [called(Some("myschema"), "f", false)]);
+        let (_, calls) = translated("SELECT * FROM myschema.generate_series(1, 3)");
+        assert_eq!(calls, [called(Some("myschema"), "generate_series", true)]);
+
+        // The functions of pg_catalog are the built-in functions.
+        let (statement, calls) = translated("SELECT pg_catalog.lower('A')");
+        assert_eq!(statement, "SELECT lower ('A') lower");
+        assert_eq!(calls, [called(Some("pg_catalog"), "lower", false)]);
         assert_translates("SELECT * FROM pg_catalog.generate_series(1, 3)");
+
+        assert_not_supported("SELECT \"my.schema\".f(1)", "name with a dot");
+        assert_not_supported("SELECT myschema.\"f.g\"(1)", "name with a dot");
     }
 
     #[test]

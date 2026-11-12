@@ -1,25 +1,20 @@
 # CREATE FUNCTION, CREATE PROCEDURE and the statements around them.
 #
-# tursopg stores SQL functions (see function-catalog.sqltest) but cannot call
-# them yet. When PostgreSQL rejects a statement, tursopg gives the same
-# error. Otherwise tursopg names the first feature it does not support. Each
-# test shows what PostgreSQL does, so a feature is supported once its
-# `expect @tursopg error` block is removed.
+# tursopg supports some SQL functions: see function-catalog.sqltest and
+# function-calls.sqltest. When PostgreSQL rejects a statement, tursopg gives
+# the same error. Otherwise tursopg names the first feature it does not
+# support. Each test shows what PostgreSQL does, so a feature is supported
+# once its `expect @tursopg error` block is removed.
 
 @database :memory:
 
-# A plain SQL function, which is the first kind of function tursopg will
-# call.
+# A plain SQL function, which is the kind of function that tursopg calls.
 test sql-function {
     CREATE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
 }
 expect {
     1
-}
-@sqlstate 42883
-expect @tursopg error {
-    no such function: one
 }
 
 test sql-function-with-parameter {
@@ -29,10 +24,6 @@ test sql-function-with-parameter {
 expect {
     42
 }
-@sqlstate 42883
-expect @tursopg error {
-    no such function: add_one
-}
 
 test sql-function-in-public-schema {
     CREATE FUNCTION public.one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
@@ -40,10 +31,6 @@ test sql-function-in-public-schema {
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a schema-qualified function name is not supported
 }
 
 test sql-function-in-other-schema {
@@ -53,38 +40,6 @@ test sql-function-in-other-schema {
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a schema-qualified function name is not supported
-}
-
-test sql-function-in-check-constraint {
-    CREATE FUNCTION is_positive(int) RETURNS boolean AS $$ SELECT $1 > 0 $$ LANGUAGE sql;
-    CREATE TABLE t (a int CHECK (is_positive(a)));
-    INSERT INTO t VALUES (1);
-    SELECT a FROM t;
-}
-expect {
-    1
-}
-@sqlstate 42883
-expect @tursopg error {
-    no such function: is_positive
-}
-
-test sql-function-in-column-default {
-    CREATE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
-    CREATE TABLE t (a int DEFAULT one(), b int);
-    INSERT INTO t (b) VALUES (2);
-    SELECT a, b FROM t;
-}
-expect {
-    1|2
-}
-@sqlstate 42883
-expect @tursopg error {
-    no such function: one
 }
 
 test sql-function-in-missing-schema {
@@ -101,10 +56,6 @@ test create-or-replace-function {
 }
 expect {
     1
-}
-@sqlstate 42883
-expect @tursopg error {
-    no such function: one
 }
 
 test create-procedure {

@@ -297,7 +297,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Incremental sort for SELECT DISTINCT | ❌ Not supported | |
 | Incremental sort for window functions | ❌ Not supported | |
 | Inlined WITH queries (Common Table Expressions) | ❌ Not supported | |
-| Inlining of SQL functions | ❌ Not supported | |
+| Inlining of SQL functions | ✅ Supported | The only way that tursopg runs a call of an SQL function. See "Custom Functions, Stored Procedures, & Triggers" |
 | Just-in-Time (JIT) compilation for expression evaluation and tuple deforming | ❌ Not supported | |
 | Load balancing for libpq / psql | ❌ Not supported | |
 | LZ4 compression for TOAST tables | ❌ Not supported | |
@@ -501,7 +501,7 @@ Upgrade is not supported.
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
 | ALTER FUNCTION / ALTER ROUTINE | ❌ Not supported | |
-| CREATE FUNCTION | 🟡 Partial | Stores a function of `LANGUAGE sql` whose body is one query in a dollar-quoted string, and whose parameters and result have base types that `pg_type` shows. The function cannot be called yet. `CREATE OR REPLACE FUNCTION` is supported. A function that PostgreSQL rejects gets PostgreSQL's error; any other unsupported function gets an error that names the first unsupported feature, such as the language, RETURNS SETOF or an option. See the notes below this table |
+| CREATE FUNCTION | 🟡 Partial | Stores a function of `LANGUAGE sql` whose body is one query in a dollar-quoted string, and whose parameters and result have base types that `pg_type` shows. A call is supported when PostgreSQL inlines the function. `CREATE OR REPLACE FUNCTION` is supported. A function that PostgreSQL rejects gets PostgreSQL's error; any other unsupported function gets an error that names the first unsupported feature, such as the language, RETURNS SETOF or an option. See the notes below this table |
 | DROP FUNCTION | 🟡 Partial | One function for each statement; CASCADE is not supported. Nothing checks whether another object uses the function. `DROP PROCEDURE` and `DROP ROUTINE` are not supported |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
@@ -542,9 +542,6 @@ Notes on `CREATE FUNCTION`:
 - tursopg does not know the type of the body's result, so it accepts a body
   whose result PostgreSQL rejects with `return type mismatch`, such as text
   for a function that returns integer.
-- tursopg cannot call a stored function, so the check of a body that calls
-  one fails with `no such function`. With `check_function_bodies = off`,
-  such a function can be created.
 - PostgreSQL stores a function before it checks the body, so a body can call
   the new function. tursopg checks the body before it stores the function,
   so the check does not find the new function.
@@ -595,6 +592,32 @@ Notes on `CREATE FUNCTION`:
   PostgreSQL. `pronamespace` is the oid of the schema in `pg_namespace`: the
   oid of `public` is PostgreSQL's 2200, the oid of any other schema is
   tursopg's own.
+
+Notes on calls of SQL functions:
+
+- tursopg runs a call as PostgreSQL does when it inlines the function: the
+  expression of the body takes the place of the call, with each argument
+  cast to the type of its parameter and the result cast to the return type.
+  The names in the body are bound when the statement that calls the function
+  is prepared, with the search path of that time, as in PostgreSQL.
+- A call is supported in SELECT, INSERT, UPDATE and DELETE. A call is
+  rejected in a FROM clause and in a statement that stores it: CREATE VIEW,
+  CREATE TABLE AS, a column default, a CHECK constraint and an index.
+- A call of a function that PostgreSQL does not inline is rejected: the body
+  is not a plain `SELECT` of one expression (it has FROM, WHERE, GROUP BY,
+  ORDER BY, LIMIT, a set operation, a subquery or an aggregate).
+- A call of a function whose body uses a parameter more than once is
+  rejected. PostgreSQL inlines such a function unless the argument is
+  volatile or expensive.
+- PostgreSQL chooses between functions of one name by the types of the
+  arguments. tursopg does not know these types, so it rejects a call of a
+  name that several functions of the searched schemas have.
+- tursopg does not check the types of the arguments. It casts each argument
+  to the type of its parameter, also where PostgreSQL finds no function for
+  the types of the arguments.
+- Functions that call each other in a circle, which `CREATE OR REPLACE` can
+  make, are rejected at the call. PostgreSQL fails with `stack depth limit
+  exceeded`.
 
 ## Procedural Languages
 

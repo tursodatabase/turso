@@ -1066,8 +1066,6 @@ expect {
     1
 }
 
-# tursopg cannot call a stored function yet, so the check of a body that
-# calls one fails.
 test body-that-calls-a-stored-function {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
     CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT one() + 1$$;
@@ -1075,10 +1073,6 @@ test body-that-calls-a-stored-function {
 }
 expect {
     2
-}
-@sqlstate 42883
-expect @tursopg error {
-    no such function: one
 }
 
 test body-that-calls-a-stored-function-when-check-function-bodies-is-off {
@@ -1091,7 +1085,7 @@ expect {
     2
 }
 
-# tursopg cannot call a function of a schema yet.
+# The body calls the function of another schema, not the new function.
 test function-that-calls-a-function-of-its-name-in-another-schema {
     CREATE SCHEMA app;
     CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
@@ -1101,11 +1095,9 @@ test function-that-calls-a-function-of-its-name-in-another-schema {
 expect {
     2
 }
-@sqlstate 0A000
-expect @tursopg error {
-    a schema-qualified function name is not supported
-}
 
+# The check of the body uses the function as it is before the statement.
+# tursopg rejects a call of the new function: see function-calls.sqltest.
 test replaced-function-that-calls-itself {
     CREATE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
     CREATE OR REPLACE FUNCTION forever(integer) RETURNS integer LANGUAGE sql AS $$SELECT forever($1)$$;
@@ -1113,10 +1105,6 @@ test replaced-function-that-calls-itself {
 }
 expect {
     SELECT forever($1)
-}
-@sqlstate 42883
-expect @tursopg error {
-    no such function: forever
 }
 
 # In PostgreSQL a table and a function of one schema can have the same name.
