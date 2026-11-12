@@ -19,6 +19,8 @@ pub enum PgType {
     Float8,
     Numeric,
     Text,
+    /// Text with a length limit that the column enforces; every length is the same type.
+    Varchar,
     Bytea,
     /// An object id, kept as an integer from 0 to 4294967295.
     Oid,
@@ -61,6 +63,9 @@ impl PgType {
         let spelled = one_spelling(name);
         if let Some(element) = spelled.strip_suffix("[]") {
             return PgType::array_of(PgType::from_name(element)).unwrap_or(PgType::Other(spelled));
+        }
+        if is_varchar(&spelled) {
+            return PgType::Varchar;
         }
         match spelled.as_str() {
             "int2" => PgType::Int2,
@@ -109,6 +114,8 @@ impl PgType {
             }
             ("numeric", [precision]) => PgType::from_name(&format!("numeric({precision},0)")),
             ("numeric", _) => PgType::from_name("numeric with a precision"),
+            ("varchar", [length]) => PgType::from_name(&format!("varchar({length})")),
+            ("varchar", _) => PgType::from_name("varchar"),
             _ => PgType::from_name(&lowercase),
         }
     }
@@ -126,7 +133,7 @@ impl PgType {
             PgType::Int4 | PgType::Oid | PgType::Regclass | PgType::Regnamespace => "INTEGER",
             PgType::Int8 => "BIGINT",
             PgType::Float8 | PgType::Numeric => "REAL",
-            PgType::Text | PgType::Char => "TEXT",
+            PgType::Text | PgType::Varchar | PgType::Char => "TEXT",
             PgType::Bytea => "BLOB",
             PgType::Bool => "boolean",
             PgType::Regproc | PgType::Array(_) | PgType::Unknown | PgType::Other(_) => return None,
@@ -162,7 +169,7 @@ impl PgType {
             | PgType::Regclass
             | PgType::Regnamespace
             | PgType::Regproc => TypeCategory::Number,
-            PgType::Text | PgType::Char => TypeCategory::String,
+            PgType::Text | PgType::Varchar | PgType::Char => TypeCategory::String,
             PgType::Array(_) => TypeCategory::Array,
             PgType::Bytea => TypeCategory::UserDefined,
             PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
@@ -211,6 +218,7 @@ impl fmt::Display for PgType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             PgType::Array(element) => return write!(f, "{element}[]"),
+            PgType::Varchar => "character varying",
             PgType::Bool => "boolean",
             PgType::Int2 => "smallint",
             PgType::Int4 => "integer",
@@ -428,7 +436,12 @@ pub fn check_unary_operand(operator: &str, operand: Option<&PgType>) -> Result<(
     match operand {
         None => Ok(()),
         Some(
-            ty @ (PgType::Text | PgType::Bool | PgType::Bytea | PgType::Oid | PgType::Regclass),
+            ty @ (PgType::Text
+            | PgType::Varchar
+            | PgType::Bool
+            | PgType::Bytea
+            | PgType::Oid
+            | PgType::Regclass),
         ) => Err(error(
             SQLSTATE_UNDEFINED_FUNCTION,
             format!("operator does not exist: {operator} {ty}"),
@@ -533,6 +546,14 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
         Bool, Bytea, Char, Float8, Int2, Int4, Int8, Numeric, Oid, Other, Regclass, Regnamespace,
         Regproc, Text,
     };
+
+    let (as_source, as_target) = (as_text(source), as_text(target));
+    if as_source == as_target {
+        return Allowed(Implicit, Nothing);
+    }
+    if as_source != *source || as_target != *target {
+        return cast_rule(&as_source, &as_target);
+    }
 
     match (source, target) {
         (Int2, Int4 | Int8) => Allowed(Implicit, Nothing),
@@ -653,6 +674,21 @@ fn operator_does_not_exist(
     )
 }
 
+fn as_text(ty: &PgType) -> PgType {
+    match ty {
+        PgType::Varchar => PgType::Text,
+        other => other.clone(),
+    }
+}
+
+fn is_varchar(spelled: &str) -> bool {
+    match spelled.strip_prefix("varchar") {
+        Some("") => true,
+        Some(modifier) => modifier.starts_with('(') && modifier.ends_with(')'),
+        None => false,
+    }
+}
+
 const ARITHMETIC_OPERAND_TYPES: &[PgType] = &[
     PgType::Int2,
     PgType::Int4,
@@ -686,7 +722,7 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
     let text = unquote(quoted);
     let trimmed = text.trim();
     let literal = match target {
-        PgType::Text | PgType::Regproc => {
+        PgType::Text | PgType::Varchar | PgType::Regproc => {
             return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string())))
         }
         PgType::Int2 => ast::Literal::Numeric(parse_int2(&text)?.to_string()),
@@ -1752,7 +1788,7 @@ mod tests {
 
     #[test]
     fn from_name_gives_one_value_for_every_name_of_a_type() {
-        let groups: [&[&str]; 10] = [
+        let groups: [&[&str]; 11] = [
             &[
                 "timestamptz",
                 "timestamp with time zone",
@@ -1763,6 +1799,7 @@ mod tests {
             &["time", "time without time zone"],
             &["int2", "smallint"],
             &["float4", "real"],
+            &["varchar", "character varying", "varchar(5)", "VARCHAR(50)"],
             &["bpchar", "character"],
             &["int4[]", "integer[]", "int[]"],
             &["float8", "double precision", "float"],
@@ -1778,6 +1815,7 @@ mod tests {
             PgType::from_name("timestamp with time zone"),
             PgType::Other("timestamptz".to_string())
         );
+        assert_eq!(PgType::from_name("character varying(5)"), PgType::Varchar);
         assert_eq!(
             PgType::from_name("numeric(10,2)"),
             PgType::Other("numeric(10,2)".to_string())
@@ -1880,6 +1918,15 @@ mod tests {
             PgType::from_column_type("numeric", 0, &[10, 2]),
             PgType::Numeric
         );
+    }
+
+    #[test]
+    fn a_varchar_column_is_the_same_type_at_every_length() {
+        let five = PgType::from_column_type("varchar", 0, &[5]);
+        assert_eq!(five, PgType::Varchar);
+        assert_eq!(five, PgType::from_column_type("varchar", 0, &[50]));
+        assert_eq!(five, PgType::from_column_type("varchar", 0, &[]));
+        assert_eq!(five, PgType::from_name("character varying(5)"));
     }
 
     #[test]
@@ -3723,6 +3770,212 @@ mod tests {
         assert_eq!(
             common_type(&[ty.clone(), PgType::Unknown, ty.clone()], "CASE").unwrap(),
             ty
+        );
+    }
+
+    fn varchar(_length: Option<u32>) -> PgType {
+        PgType::Varchar
+    }
+
+    #[test]
+    fn varchar_of_any_length_is_one_type_shown_without_its_length() {
+        for name in [
+            "varchar",
+            "varchar(5)",
+            "VARCHAR(50)",
+            "character varying(9)",
+        ] {
+            assert_eq!(PgType::from_name(name), PgType::Varchar, "{name}");
+        }
+        assert_ne!(PgType::Varchar, PgType::Text);
+        assert_eq!(PgType::Varchar.to_string(), "character varying");
+        assert_eq!(
+            PgType::from_name("varchar(5)[]"),
+            PgType::Array(Box::new(PgType::Varchar))
+        );
+        assert_eq!(PgType::Varchar.engine_type(), PgType::Text.engine_type());
+    }
+
+    #[test]
+    fn varchar_and_text_convert_to_each_other_without_changing_the_value() {
+        expect_expr(&varchar(Some(5)), &PgType::Text, Implicit, "nothing");
+        expect_expr(&PgType::Text, &varchar(Some(5)), Implicit, "nothing");
+        expect_expr(&varchar(None), &varchar(Some(5)), Implicit, "nothing");
+    }
+
+    #[test]
+    fn varchar_of_one_length_to_another_is_the_same_type() {
+        for context in [Implicit, Assignment, Explicit] {
+            let converted = convert(&varchar(Some(5)), &varchar(Some(50)), context).unwrap();
+            assert_eq!(
+                converted,
+                if context == Explicit {
+                    cast_to(number("5"), &varchar(None))
+                } else {
+                    number("5")
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn integers_convert_to_varchar_only_on_assignment() {
+        for source in [PgType::Int2, PgType::Int4, PgType::Int8, PgType::Oid] {
+            expect_expr(&source, &varchar(Some(5)), Assignment, "cast");
+        }
+    }
+
+    #[test]
+    fn varchar_has_the_casts_of_text_to_the_other_types() {
+        assert_eq!(
+            convert(&varchar(None), &PgType::Regclass, Implicit).unwrap(),
+            function_call("text_to_regclass", vec![number("5")])
+        );
+        for target in [PgType::Float8, PgType::Numeric, PgType::Bool] {
+            assert_error(
+                convert(&varchar(Some(5)), &target, Explicit),
+                "0A000",
+                &format!("a cast from character varying to {target} is not supported"),
+            );
+            assert_error(
+                convert(&varchar(Some(5)), &target, Assignment),
+                "42804",
+                &format!(
+                    "a value of type character varying cannot be used as {target} without a cast"
+                ),
+            );
+        }
+        for source in [PgType::Float8, PgType::Numeric, PgType::Bool, PgType::Bytea] {
+            assert_error(
+                convert(&source, &varchar(Some(5)), Assignment),
+                "0A000",
+                &format!("a cast from {source} to character varying is not supported"),
+            );
+        }
+    }
+
+    #[test]
+    fn varchar_string_literal_stays_a_string() {
+        assert_eq!(
+            convert_text("  it's ", &varchar(Some(5))).unwrap(),
+            string("  it's ")
+        );
+        assert_eq!(
+            coerce(
+                string("a"),
+                Some(&PgType::Unknown),
+                &varchar(None),
+                Explicit
+            )
+            .unwrap(),
+            cast_to(string("a"), &PgType::Text)
+        );
+    }
+
+    #[test]
+    fn varchar_assignment_gives_the_column_message_with_the_length() {
+        assert_assignment_error(
+            Some(&PgType::Bool),
+            Some(&varchar(Some(5))),
+            number("5"),
+            "0A000",
+            "a cast from boolean to character varying is not supported",
+        );
+        assert_assignment_error(
+            Some(&PgType::Bytea),
+            Some(&PgType::Int4),
+            number("5"),
+            "42804",
+            "column \"col\" is of type integer but expression is of type bytea",
+        );
+    }
+
+    #[test]
+    fn common_type_of_varchar_and_text_follows_the_first_type() {
+        assert_eq!(
+            common_type(&[varchar(None), PgType::Text], "CASE").unwrap(),
+            varchar(None)
+        );
+        assert_eq!(
+            common_type(&[PgType::Text, varchar(Some(5))], "CASE").unwrap(),
+            PgType::Text
+        );
+        assert_eq!(
+            common_type(&[varchar(Some(5)), varchar(Some(9))], "CASE").unwrap(),
+            varchar(Some(5))
+        );
+        assert_error(
+            common_type(&[varchar(None), PgType::Int4], "CASE").map(|_| null()),
+            "42804",
+            "CASE types character varying and integer cannot be matched",
+        );
+    }
+
+    #[test]
+    fn varchar_compares_and_matches_patterns_as_text() {
+        for other in [varchar(Some(5)), PgType::Text, PgType::Unknown] {
+            for (operator, kind) in [
+                ("=", OperatorKind::Comparison),
+                ("~~", OperatorKind::Pattern),
+            ] {
+                let items = vec![
+                    (number("1"), Some(varchar(Some(3)))),
+                    (string("x"), Some(other.clone())),
+                ];
+                assert_eq!(
+                    coerce_operands(operator, kind, items).unwrap(),
+                    vec![number("1"), string("x")],
+                    "{other}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn varchar_does_not_compare_with_numbers_or_have_arithmetic() {
+        let items = vec![
+            (number("1"), Some(varchar(None))),
+            (number("2"), Some(PgType::Int4)),
+        ];
+        assert_operand_error(
+            coerce_operands("=", OperatorKind::Comparison, items.clone()),
+            "42883",
+            "operator does not exist: character varying = integer",
+        );
+        assert_operand_error(
+            coerce_operands("+", OperatorKind::Arithmetic, items),
+            "42883",
+            "operator does not exist: character varying + integer",
+        );
+    }
+
+    #[test]
+    fn concat_converts_varchar_to_text() {
+        let items = vec![
+            (number("1"), Some(varchar(Some(3)))),
+            (number("2"), Some(varchar(None))),
+        ];
+        assert_eq!(
+            coerce_operands("||", OperatorKind::Concat, items).unwrap(),
+            vec![number("1"), number("2")]
+        );
+    }
+
+    #[test]
+    fn a_sign_in_front_of_varchar_does_not_exist() {
+        assert_error(
+            check_unary_operand("-", Some(&varchar(Some(3)))).map(|()| null()),
+            "42883",
+            "operator does not exist: - character varying",
+        );
+    }
+
+    #[test]
+    fn a_varchar_condition_is_rejected() {
+        assert_error(
+            coerce_to_boolean(number("1"), Some(&varchar(None)), "WHERE"),
+            "42804",
+            "argument of WHERE must be type boolean, not type character varying",
         );
     }
 

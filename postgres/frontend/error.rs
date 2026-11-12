@@ -401,6 +401,8 @@ fn raise_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_DATETIME_FORMAT
     } else if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg == "value too long for varchar" {
+        SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else {

@@ -653,11 +653,13 @@ fn binary_operator_type(operator: &str, left: &ExprType, right: &ExprType) -> Ex
             let (left, right) = (left.clone()?, right.clone()?);
             let is_one_of =
                 |found: &PgType, wanted: &PgType| found == wanted || *found == PgType::Unknown;
-            let is_text = |found: &PgType| matches!(found, PgType::Text | PgType::Unknown);
+            let is_text =
+                |found: &PgType| matches!(found, PgType::Text | PgType::Varchar | PgType::Unknown);
             let is_plain_value = |found: &PgType| {
                 matches!(
                     found,
                     PgType::Text
+                        | PgType::Varchar
                         | PgType::Unknown
                         | PgType::Int2
                         | PgType::Int4
@@ -1453,6 +1455,7 @@ mod tests {
     #[test]
     fn casts_with_modifiers_or_array_bounds_are_other_types() {
         assert_eq!(type_from_t("a::numeric(10,2)"), other("numeric(10,2)"));
+        assert_eq!(type_from_t("b::varchar(5)"), Some(PgType::Varchar));
         assert_eq!(
             type_from_t("a::int4[]"),
             Some(PgType::Array(Box::new(PgType::Int4)))
