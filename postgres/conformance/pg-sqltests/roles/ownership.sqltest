@@ -411,3 +411,24 @@ test owner-to-public-is-an-error {
 expect error {
     role "public" does not exist
 }
+
+# ALTER TABLE rewrites the table's definition in the schema, which needs no
+# privilege besides owning the table.
+test owner-alters-the-columns-of-its-own-table {
+    CREATE ROLE gw_alter_owner;
+    CREATE TABLE gw_altered (id INT);
+    CREATE INDEX gw_altered_id ON gw_altered (id);
+    CREATE VIEW gw_altered_ids AS SELECT id FROM gw_altered;
+    ALTER TABLE gw_altered OWNER TO gw_alter_owner;
+    ALTER VIEW gw_altered_ids OWNER TO gw_alter_owner;
+    SET ROLE gw_alter_owner;
+    ALTER TABLE gw_altered ADD COLUMN n INT;
+    ALTER TABLE gw_altered RENAME COLUMN n TO m;
+    ALTER TABLE gw_altered RENAME COLUMN id TO key;
+    ALTER TABLE gw_altered DROP COLUMN m;
+    INSERT INTO gw_altered VALUES (1);
+    SELECT key FROM gw_altered;
+}
+expect {
+    1
+}
