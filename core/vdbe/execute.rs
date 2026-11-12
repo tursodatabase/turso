@@ -10538,7 +10538,7 @@ pub fn op_function(
                 ),
             },
         },
-        crate::function::Func::Dialect(name) => {
+        crate::function::Func::Dialect(name) | crate::function::Func::DialectInPlace(name) => {
             let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
                 .iter()
                 .map(|r| r.get_value().clone())
@@ -16374,7 +16374,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -16383,12 +16383,12 @@ pub fn op_cast(
 
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
-        Affinity::Blob | Affinity::None => value.exec_cast("BLOB")?,
-        Affinity::Text => value.exec_cast("TEXT")?,
-        Affinity::Numeric => value.exec_cast("NUMERIC")?,
-        Affinity::Integer => program.connection.dialect().cast_to_integer(&value)?,
-        Affinity::Real => value.exec_cast("REAL")?,
-    };
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
+        Affinity::Text => value.exec_cast("TEXT"),
+        Affinity::Numeric => value.exec_cast("NUMERIC"),
+        Affinity::Integer => value.exec_cast("INTEGER"),
+        Affinity::Real => value.exec_cast("REAL"),
+    }?;
 
     state.registers[*reg].set_value(result);
     state.pc += 1;

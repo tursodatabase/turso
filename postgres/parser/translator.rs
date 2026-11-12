@@ -3405,11 +3405,11 @@ impl PostgreSQLTranslator {
                 }
                 let type_name = extract_type_name_from_typename(pg_type_name)?;
                 if type_name.eq_ignore_ascii_case("int2") {
-                    expr = Box::new(int_cast_operand(arg, *expr, IntegerType::Int2));
+                    return Ok(function_call("pg_cast_int2", vec![*expr]));
                 } else if type_name.eq_ignore_ascii_case("int4") {
-                    expr = Box::new(int_cast_operand(arg, *expr, IntegerType::Int4));
+                    return Ok(function_call("pg_cast_int4", vec![*expr]));
                 } else if type_name.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int_cast_operand(arg, *expr, IntegerType::Int8));
+                    return Ok(function_call("pg_cast_int8", vec![*expr]));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -4411,25 +4411,13 @@ impl PostgreSQLTranslator {
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
                 }
-                let mut operand = args.into_iter().next().unwrap();
+                let operand = args.into_iter().next().unwrap();
                 if func_name.eq_ignore_ascii_case("int2") {
-                    operand = Box::new(int_cast_operand(
-                        &func_call.args[0],
-                        *operand,
-                        IntegerType::Int2,
-                    ));
+                    return Ok(function_call("pg_cast_int2", vec![*operand]));
                 } else if func_name.eq_ignore_ascii_case("int4") {
-                    operand = Box::new(int_cast_operand(
-                        &func_call.args[0],
-                        *operand,
-                        IntegerType::Int4,
-                    ));
+                    return Ok(function_call("pg_cast_int4", vec![*operand]));
                 } else if func_name.eq_ignore_ascii_case("int8") {
-                    operand = Box::new(int_cast_operand(
-                        &func_call.args[0],
-                        *operand,
-                        IntegerType::Int8,
-                    ));
+                    return Ok(function_call("pg_cast_int8", vec![*operand]));
                 }
                 return Ok(ast::Expr::Cast {
                     expr: operand,
