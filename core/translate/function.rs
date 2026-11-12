@@ -173,9 +173,11 @@ fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<
         ast::Stmt::Select(select) => expand_in_select(select, expand),
         ast::Stmt::Insert {
             with,
+            or_conflict: _,
+            tbl_name: _,
+            columns: _,
             body,
             returning,
-            ..
         } => {
             expand_in_with(with.as_mut(), expand)?;
             if let ast::InsertBody::Select(select, upsert) = body {
@@ -184,26 +186,37 @@ fn expand_in_statement(stmt: &mut ast::Stmt, expand: &mut ExpandCall) -> Result<
             }
             expand_in_result_columns(returning, expand)
         }
-        ast::Stmt::Update(update) => {
-            expand_in_with(update.with.as_mut(), expand)?;
-            for set in &mut update.sets {
+        ast::Stmt::Update(ast::Update {
+            with,
+            or_conflict: _,
+            tbl_name: _,
+            indexed: _,
+            sets,
+            from,
+            where_clause,
+            returning,
+        }) => {
+            expand_in_with(with.as_mut(), expand)?;
+            for set in sets {
                 expand_in_expr(&mut set.expr, expand)?;
             }
-            if let Some(from) = &mut update.from {
+            if let Some(from) = from {
                 rewrite_from_clause_expressions(from, &mut |expr| {
                     expand_in_clause_expr(expr, expand)
                 })?;
             }
-            if let Some(where_clause) = &mut update.where_clause {
+            if let Some(where_clause) = where_clause {
                 expand_in_expr(where_clause, expand)?;
             }
-            expand_in_result_columns(&mut update.returning, expand)
+            expand_in_result_columns(returning, expand)
         }
         ast::Stmt::Delete {
             with,
+            tbl_name: _,
+            indexed: _,
             where_clause,
             returning,
-            ..
+            truncate: _,
         } => {
             expand_in_with(with.as_mut(), expand)?;
             if let Some(where_clause) = where_clause {
