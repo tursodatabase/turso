@@ -857,6 +857,38 @@ expect error {
     parameter "check_function_bodies" requires a Boolean value
 }
 
+# The value of a Boolean parameter cannot have spaces around it, but a cast
+# of text to boolean ignores them.
+test check-function-bodies-with-a-space-before-the-value {
+    SET check_function_bodies = ' off';
+}
+@sqlstate 22023
+expect error {
+    parameter "check_function_bodies" requires a Boolean value
+}
+
+test check-function-bodies-with-a-space-after-the-value {
+    SELECT set_config('check_function_bodies', 'off ', false);
+}
+@sqlstate 22023
+expect error {
+    parameter "check_function_bodies" requires a Boolean value
+}
+
+test check-function-bodies-with-the-start-of-a-boolean-word {
+    SET check_function_bodies = 'OF';
+    SHOW check_function_bodies;
+    SET check_function_bodies = 'T';
+    SHOW check_function_bodies;
+    SET check_function_bodies = 0;
+    SHOW check_function_bodies;
+}
+expect {
+    off
+    on
+    off
+}
+
 # PostgreSQL makes the catalog checks before it checks the body.
 test function-that-exists-with-a-body-that-does-not-compile {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;

@@ -432,7 +432,7 @@ pub(crate) fn checks_function_bodies(conn: &Connection) -> bool {
 /// `on` or `off` for `value`, a Boolean value of parameter `name` as
 /// PostgreSQL reads one.
 fn on_or_off(name: &str, value: &str) -> turso_core::Result<&'static str> {
-    match crate::functions::parse_pg_bool(value) {
+    match crate::functions::parse_pg_bool_word(value) {
         Some(true) => Ok("on"),
         Some(false) => Ok("off"),
         None => Err(crate::error::sqlstate_error(

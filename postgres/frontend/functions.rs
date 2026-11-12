@@ -1711,9 +1711,13 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 /// yes or no is enough. For on and off, the first two letters are necessary.
 /// None when the text is not a boolean literal.
 pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
-    let word = text
-        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
-        .to_ascii_lowercase();
+    parse_pg_bool_word(text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}'))
+}
+
+/// The value of a boolean literal that has no white space around it. This is
+/// how PostgreSQL reads the value of a Boolean configuration parameter.
+pub(crate) fn parse_pg_bool_word(word: &str) -> Option<bool> {
+    let word = word.to_ascii_lowercase();
     let starts = |full: &str, min_len: usize| word.len() >= min_len && full.starts_with(&word);
     if starts("true", 1) || starts("yes", 1) || starts("on", 2) || word == "1" {
         Some(true)
