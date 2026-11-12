@@ -1571,27 +1571,27 @@ fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
         let Some(table) = schema.get_btree_table(class.relnamespace, &class.relname) else {
             continue;
         };
-        let condition_text = |condition: &Option<ast::Expr>| {
-            condition.as_ref().map(|condition| {
-                crate::deparse::condition_text(condition, &table)
-                    .unwrap_or_else(|| render_expr(condition))
-            })
+        // A condition the printer cannot print as pg_get_expr does is shown
+        // as CREATE POLICY wrote it, which PostgreSQL also reads.
+        let condition_text = |condition: &Option<ast::Expr>, written: &Option<String>| {
+            let condition = condition.as_ref()?;
+            crate::deparse::condition_text(condition, &table).or_else(|| written.clone())
         };
-        for (oid, policy) in class.relpolicies.iter() {
+        for (details, policy) in class.relpolicies.iter() {
             let roles = if policy.roles.contains(&RoleId::PUBLIC) {
                 vec![RoleId::PUBLIC]
             } else {
                 policy.roles.clone()
             };
             policies.push(CatalogPolicy {
-                oid,
+                oid: details.oid,
                 table_oid: class.oid,
                 namespace: class.relnamespace,
                 table_name: &class.relname,
                 policy,
                 roles,
-                qual: condition_text(&policy.using_expr),
-                with_check: condition_text(&policy.check_expr),
+                qual: condition_text(&policy.using_expr, &details.using_sql),
+                with_check: condition_text(&policy.check_expr, &details.check_sql),
             });
         }
     }

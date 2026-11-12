@@ -1635,6 +1635,11 @@ pub struct CreatePolicy {
     pub using_expr: Option<Box<Expr>>,
     /// `WITH CHECK`: which new rows the policy lets the roles write
     pub check_expr: Option<Box<Expr>>,
+    /// `using_expr` as the statement wrote it, in the SQL of the frontend
+    /// that parsed it, for catalogs that show the condition in that SQL
+    pub using_sql: Option<String>,
+    /// `check_expr` as the statement wrote it, like `using_sql`
+    pub check_sql: Option<String>,
 }
 
 /// The command a policy applies to.

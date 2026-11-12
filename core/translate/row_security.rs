@@ -1211,6 +1211,8 @@ mod tests {
                 roles: vec![ast::Grantee::Public],
                 using_expr: None,
                 check_expr: None,
+                using_sql: None,
+                check_sql: None,
             })),
         ];
 

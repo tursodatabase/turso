@@ -920,15 +920,18 @@ pub(crate) fn translate_catalog_changes(
                     .iter()
                     .map(|role| resolve_policy_role(schema, connection, role))
                     .collect::<turso_core::Result<Vec<_>>>()?;
-                let (before_oid, after_oid) =
-                    class.relpolicies.stored_text_around_new_oid(RowPolicy {
+                let (before_oid, after_oid) = class.relpolicies.stored_text_around_new_oid(
+                    RowPolicy {
                         name: policy_name.to_string(),
                         permissive: policy.permissive,
                         command: policy.command,
                         roles,
                         using_expr: policy.using_expr.as_deref().cloned(),
                         check_expr: policy.check_expr.as_deref().cloned(),
-                    });
+                    },
+                    policy.using_sql.clone(),
+                    policy.check_sql.clone(),
+                );
                 // The catalog reads the conditions back from the stored form,
                 // so a condition that does not read back is refused here
                 // rather than leaving a database that cannot be opened.
