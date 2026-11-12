@@ -373,6 +373,18 @@ expect @tursopg error {
     function public\.nosuch does not exist
 }
 
+# tursopg has the built-in functions auth.uid, auth.email and auth.jwt. A
+# function of the user in schema auth is called as in each other schema.
+test call-of-a-function-in-schema-auth {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.seven() RETURNS integer LANGUAGE sql AS $$SELECT 7$$;
+    CREATE FUNCTION eight() RETURNS integer LANGUAGE sql AS $$SELECT auth.seven() + 1$$;
+    SELECT auth.seven(), eight();
+}
+expect {
+    7|8
+}
+
 # pg_catalog has only the built-in functions, also when the search path has
 # a function with the name.
 test call-of-a-user-function-as-a-function-of-pg-catalog {

@@ -9332,24 +9332,22 @@ fn no_such_function(name: &str) -> ParseError {
 /// The name of a function call, in the FROM clause or in an expression.
 fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
     if let [schema, name] = extract_key_columns(names)?.as_slice() {
-        if schema == "auth" {
-            let qualified_name = format!("{schema}.{name}");
-            return match name.as_str() {
-                "uid" | "email" | "jwt" => Ok(qualified_name),
-                _ => Err(no_such_function(&qualified_name)),
-            };
-        }
-    }
-    if let [schema, name] = extract_key_columns(names)?.as_slice() {
         if !is_pg_catalog(schema) {
-            // A function that a user defined in a schema. The frontend
-            // checks that the schema and the function exist.
+            // A function that a user defined in a schema, or one of the
+            // built-in functions auth.uid, auth.email and auth.jwt. The
+            // frontend checks that the schema and the function exist.
             if schema.contains('.') || name.contains('.') {
                 return Err(ParseError::not_supported(
                     "a function or schema name with a dot",
                 ));
             }
-            return Ok(format!("{schema}.{name}"));
+            let qualified_name = format!("{schema}.{name}");
+            // As for a name without a schema: a quoted name with an
+            // uppercase letter, such as auth."UID", names no function.
+            if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Err(no_such_function(&qualified_name));
+            }
+            return Ok(qualified_name);
         }
     }
     let name = object_name(names, is_pg_catalog, "function")?;
