@@ -5396,128 +5396,15 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        let mut start = None;
-        let mut increment = None;
-        let mut min_value = None;
-        let mut max_value = None;
-        let mut cycle = false;
-
-        let mut as_type = None;
-        for opt_node in &seq.options {
-            if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
-                if matches!(
-                    elem.defname.as_str(),
-                    "start" | "increment" | "minvalue" | "maxvalue"
-                ) && elem.arg.is_some()
-                    && extract_def_elem_int(elem).is_none()
-                {
-                    return Err(ParseError::not_supported(format!(
-                        "this {} value in CREATE SEQUENCE",
-                        elem.defname.to_uppercase()
-                    )));
-                }
-                match elem.defname.as_str() {
-                    "as" => {
-                        let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
-                            elem.arg.as_ref().and_then(|n| n.node.as_ref())
-                        else {
-                            return Err(ParseError::ParseError(
-                                "CREATE SEQUENCE AS: missing type".into(),
-                            ));
-                        };
-                        as_type = Some(extract_type_name_from_typename(tn)?);
-                    }
-                    "start" => {
-                        start = extract_def_elem_int(elem);
-                    }
-                    "increment" => {
-                        increment = extract_def_elem_int(elem);
-                    }
-                    "minvalue" => {
-                        min_value = extract_def_elem_int(elem);
-                    }
-                    "maxvalue" => {
-                        max_value = extract_def_elem_int(elem);
-                    }
-                    "cycle" => {
-                        // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
-                        cycle = extract_def_elem_bool(elem);
-                    }
-                    "cache" => match extract_def_elem_int(elem) {
-                        Some(1) => {}
-                        Some(cache) if cache < 1 => {
-                            return Err(ParseError::Sqlstate {
-                                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                                message: format!("CACHE ({cache}) must be greater than zero"),
-                            });
-                        }
-                        Some(cache) => {
-                            return Err(ParseError::not_supported(format!(
-                                "CACHE {cache} (Turso sequences do not cache values, \
-                                 so CACHE must be 1)"
-                            )));
-                        }
-                        None => {
-                            return Err(ParseError::not_supported(
-                                "this CACHE value in CREATE SEQUENCE",
-                            ));
-                        }
-                    },
-                    "owned_by"
-                        if matches!(
-                            elem.arg.as_ref().and_then(|n| n.node.as_ref()),
-                            Some(pg_query::protobuf::node::Node::List(l))
-                                if extract_key_columns(&l.items).is_ok_and(|n| n == ["none"])
-                        ) => {}
-                    other => {
-                        return Err(ParseError::not_supported(format!(
-                            "CREATE SEQUENCE option {}",
-                            other.to_uppercase().replace('_', " ")
-                        )))
-                    }
-                }
-            } else {
-                return Err(ParseError::ParseError(
-                    "CREATE SEQUENCE: unexpected option node".into(),
-                ));
-            }
-        }
-
-        // AS smallint/integer narrows the default bound in the sequence's
-        // direction; bigint is the default range.
-        if let Some(as_type) = as_type {
-            let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
-                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
-                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
-                "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
-                other => {
-                    return Err(ParseError::ParseError(format!(
-                        "CREATE SEQUENCE AS {other} is not supported"
-                    )))
-                }
-            };
-            for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
-                if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
-                    return Err(ParseError::ParseError(format!(
-                        "{option} ({value}) is out of range for sequence data type {type_name}"
-                    )));
-                }
-            }
-            if increment.unwrap_or(1) > 0 {
-                max_value.get_or_insert(type_max);
-            } else {
-                min_value.get_or_insert(type_min);
-            }
-        }
-
+        let options = sequence_options(&seq.options)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
+            start: options.start,
+            increment: options.increment,
+            min_value: options.min_value,
+            max_value: options.max_value,
+            cycle: options.cycle,
         })
     }
 
@@ -5874,6 +5761,139 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
         join.operator,
         ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
     )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequenceOptions {
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: bool,
+}
+
+fn sequence_options(options: &[pg_query::protobuf::Node]) -> Result<SequenceOptions, ParseError> {
+    let mut start = None;
+    let mut increment = None;
+    let mut min_value = None;
+    let mut max_value = None;
+    let mut cycle = false;
+
+    let mut as_type = None;
+    for opt_node in options {
+        if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
+            if matches!(
+                elem.defname.as_str(),
+                "start" | "increment" | "minvalue" | "maxvalue"
+            ) && elem.arg.is_some()
+                && extract_def_elem_int(elem).is_none()
+            {
+                return Err(ParseError::not_supported(format!(
+                    "this {} value in CREATE SEQUENCE",
+                    elem.defname.to_uppercase()
+                )));
+            }
+            match elem.defname.as_str() {
+                "as" => {
+                    let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
+                        elem.arg.as_ref().and_then(|n| n.node.as_ref())
+                    else {
+                        return Err(ParseError::ParseError(
+                            "CREATE SEQUENCE AS: missing type".into(),
+                        ));
+                    };
+                    as_type = Some(extract_type_name_from_typename(tn)?);
+                }
+                "start" => {
+                    start = extract_def_elem_int(elem);
+                }
+                "increment" => {
+                    increment = extract_def_elem_int(elem);
+                }
+                "minvalue" => {
+                    min_value = extract_def_elem_int(elem);
+                }
+                "maxvalue" => {
+                    max_value = extract_def_elem_int(elem);
+                }
+                "cycle" => {
+                    // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
+                    cycle = extract_def_elem_bool(elem);
+                }
+                "cache" => match extract_def_elem_int(elem) {
+                    Some(1) => {}
+                    Some(cache) if cache < 1 => {
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                            message: format!("CACHE ({cache}) must be greater than zero"),
+                        });
+                    }
+                    Some(cache) => {
+                        return Err(ParseError::not_supported(format!(
+                            "CACHE {cache} (Turso sequences do not cache values, \
+                             so CACHE must be 1)"
+                        )));
+                    }
+                    None => {
+                        return Err(ParseError::not_supported(
+                            "this CACHE value in CREATE SEQUENCE",
+                        ));
+                    }
+                },
+                "owned_by"
+                    if matches!(
+                        elem.arg.as_ref().and_then(|n| n.node.as_ref()),
+                        Some(pg_query::protobuf::node::Node::List(l))
+                            if extract_key_columns(&l.items).is_ok_and(|n| n == ["none"])
+                    ) => {}
+                other => {
+                    return Err(ParseError::not_supported(format!(
+                        "CREATE SEQUENCE option {}",
+                        other.to_uppercase().replace('_', " ")
+                    )))
+                }
+            }
+        } else {
+            return Err(ParseError::ParseError(
+                "CREATE SEQUENCE: unexpected option node".into(),
+            ));
+        }
+    }
+
+    // AS smallint/integer narrows the default bound in the sequence's
+    // direction; bigint is the default range.
+    if let Some(as_type) = as_type {
+        let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
+            "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
+            "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
+            "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "CREATE SEQUENCE AS {other} is not supported"
+                )))
+            }
+        };
+        for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
+            if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
+                return Err(ParseError::ParseError(format!(
+                    "{option} ({value}) is out of range for sequence data type {type_name}"
+                )));
+            }
+        }
+        if increment.unwrap_or(1) > 0 {
+            max_value.get_or_insert(type_max);
+        } else {
+            min_value.get_or_insert(type_min);
+        }
+    }
+
+    Ok(SequenceOptions {
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    })
 }
 
 /// The namespace of the sequences of the serial columns of table `tbl_name`:
