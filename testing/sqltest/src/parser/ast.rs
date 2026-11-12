@@ -343,6 +343,8 @@ pub enum SkipCondition {
     Sqlite,
     /// Skip when running against a real PostgreSQL server
     Postgres,
+    /// Skip when running against the tursopg server
+    Tursopg,
 }
 
 /// What we expect from executing the SQL

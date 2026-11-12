@@ -1,6 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
-use crate::error::sqlstate_error;
+use crate::error::{parse_error_to_core, sqlstate_error};
+use crate::oid_alias::{regclass_of_input, regclass_of_name, regnamespace_of_input};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
@@ -10,6 +11,7 @@ use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
+use turso_pg_parser::coerce::{parse_int4, parse_int8, parse_oid};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
@@ -17,6 +19,7 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
     SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
+use turso_pg_parser::ParseError;
 
 /// Registers one native scalar function per name. Each body is a Rust
 /// expression that can use `?`. The planner reads the SQL return type from the
@@ -89,6 +92,22 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",
         ))?,
+        "text_to_int4"(FunctionArity::Exact(1), true) => {
+            exec_text_to_integer(args[0].get_value(), parse_int4)?
+        },
+        "text_to_int8"(FunctionArity::Exact(1), true) => {
+            exec_text_to_integer(args[0].get_value(), parse_int8)?
+        },
+        "number_to_int2"(FunctionArity::Exact(1), true) => exec_number_to_int2(args[0].get_value())?,
+        "text_to_regclass"(FunctionArity::Exact(1), false) => {
+            exec_oid_alias_of(connection, args[0].get_value(), regclass_of_name)?
+        },
+        "unknown_to_regclass"(FunctionArity::Exact(1), false) => {
+            exec_oid_alias_of(connection, args[0].get_value(), regclass_of_input)?
+        },
+        "unknown_to_regnamespace"(FunctionArity::Exact(1), false) => {
+            exec_oid_alias_of(connection, args[0].get_value(), regnamespace_of_input)?
+        },
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -385,50 +404,13 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
     let value = args[i].get_value();
     match value {
         Value::Null => Ok(None),
-        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        Value::Text(text) => parse_oid(text.as_str())
+            .map(Some)
+            .map_err(parse_error_to_core),
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
     }
-}
-
-fn parse_oid(text: &str) -> Result<i64> {
-    let invalid =
-        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
-    let out_of_range =
-        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
-    let number = text.trim_matches(is_space);
-    let (negative, unsigned) = match number.as_bytes().first() {
-        Some(b'-') => (true, &number[1..]),
-        Some(b'+') => (false, &number[1..]),
-        _ => (false, number),
-    };
-    let (radix, digits) = if let Some(hex) = unsigned
-        .strip_prefix("0x")
-        .or_else(|| unsigned.strip_prefix("0X"))
-        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
-    {
-        (16, hex)
-    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
-        (8, &unsigned[1..])
-    } else {
-        (10, unsigned)
-    };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return Err(invalid());
-    }
-    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
-    let value = if negative {
-        magnitude.wrapping_neg()
-    } else {
-        magnitude
-    };
-    let oid = value as u32;
-    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
-        return Err(out_of_range());
-    }
-    Ok(i64::from(oid))
 }
 
 fn text_arg(args: &[Register], i: usize) -> String {
@@ -580,6 +562,49 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         ));
     }
     Ok(Some(value))
+}
+
+fn exec_text_to_integer(
+    value: &Value,
+    parse: fn(&str) -> std::result::Result<i64, ParseError>,
+) -> Result<Option<i64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => parse(text.as_str()).map(Some).map_err(parse_error_to_core),
+        other => parse(&other.to_string())
+            .map(Some)
+            .map_err(parse_error_to_core),
+    }
+}
+
+fn exec_number_to_int2(value: &Value) -> Result<Option<i64>> {
+    let rounded = match value {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Float(number)) => f64::from(*number).round(),
+        other => match other.as_int() {
+            Some(integer) => integer as f64,
+            None => f64::NAN,
+        },
+    };
+    if !(f64::from(i16::MIN)..=f64::from(i16::MAX)).contains(&rounded) {
+        return Err(sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "smallint out of range",
+        ));
+    }
+    Ok(Some(rounded as i64))
+}
+
+fn exec_oid_alias_of(
+    conn: &Connection,
+    value: &Value,
+    alias_of: fn(&Connection, &str) -> Result<i64>,
+) -> Result<Option<i64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => alias_of(conn, text.as_str()).map(Some),
+        other => alias_of(conn, &other.to_string()).map(Some),
+    }
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
@@ -969,10 +994,7 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
         .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
     match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
         Ok(regex) => Ok(Some(regex)),
-        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message))
-        }
-        Err(error) => Err(LimboError::ParseError(error.to_string())),
+        Err(error) => Err(parse_error_to_core(error)),
     }
 }
 
@@ -1730,6 +1752,9 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorReport;
+    use turso_parser::ast;
+    use turso_pg_parser::coerce::{coerce, CastContext, PgType};
 
     #[test]
     fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
@@ -1748,6 +1773,95 @@ mod tests {
         assert_eq!(
             role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
             "postgres"
+        );
+    }
+
+    const INTEGER_INPUTS: &[&str] = &[
+        "42",
+        " 42 ",
+        "+7",
+        "-7",
+        "0",
+        "007",
+        "0x1F",
+        "0o17",
+        "0b101",
+        "1_000",
+        "0x_1",
+        "\t42\n",
+        "abc",
+        "",
+        " ",
+        "1.5",
+        "1e3",
+        "0x",
+        "1__0",
+        "_1",
+        "1_",
+        "4 2",
+        "--1",
+        "- 1",
+        "2147483647",
+        "2147483648",
+        "-2147483648",
+        "-2147483649",
+        "0x80000000",
+        "99999999999999999999",
+        "99999999999x",
+        "2147483649x",
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "0x7FFFFFFFFFFFFFFF",
+        "0x8000000000000000",
+    ];
+
+    #[test]
+    fn text_read_as_an_integer_at_run_time_agrees_with_the_string_literal_read_at_translation() {
+        for (target, parse) in [
+            (
+                PgType::Int4,
+                parse_int4 as fn(&str) -> std::result::Result<i64, ParseError>,
+            ),
+            (PgType::Int8, parse_int8),
+        ] {
+            for input in INTEGER_INPUTS {
+                let quoted = format!("'{}'", input.replace('\'', "''"));
+                let literal = ast::Expr::Literal(ast::Literal::String(quoted));
+                let translated = coerce(
+                    literal,
+                    Some(&PgType::Unknown),
+                    &target,
+                    CastContext::Implicit,
+                );
+                let at_run_time = exec_text_to_integer(&Value::build_text(*input), parse);
+                match (translated, at_run_time) {
+                    (Ok(ast::Expr::Literal(ast::Literal::Numeric(text))), Ok(Some(value))) => {
+                        assert_eq!(text, value.to_string(), "{target} {input:?}");
+                    }
+                    (Err(ParseError::Sqlstate { sqlstate, message }), Err(error)) => {
+                        let report = ErrorReport::from(&error);
+                        assert_eq!(report.sqlstate, sqlstate, "{target} {input:?}");
+                        assert_eq!(report.message, message, "{target} {input:?}");
+                    }
+                    (translated, at_run_time) => {
+                        panic!("{target} {input:?}: {translated:?} but {at_run_time:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_read_as_an_integer_at_run_time_keeps_null_as_null() {
+        assert_eq!(
+            exec_text_to_integer(&Value::Null, parse_int4).unwrap(),
+            None
+        );
+        assert_eq!(
+            exec_text_to_integer(&Value::Null, parse_int8).unwrap(),
+            None
         );
     }
 }

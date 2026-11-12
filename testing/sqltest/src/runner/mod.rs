@@ -497,6 +497,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                 Some(SkipCondition::Mvcc) => options.mvcc,
                 Some(SkipCondition::Sqlite) => options.backend_is_sqlite,
                 Some(SkipCondition::Postgres) => options.backend_type == Backend::Postgres,
+                Some(SkipCondition::Tursopg) => options.backend_type == Backend::Tursopg,
             };
             if should_skip {
                 return TestResult {
@@ -1664,6 +1665,59 @@ expect {
                     matches!(
                         &result.outcome,
                         TestOutcome::Skipped { reason } if reason == "EXPLAIN shows the Turso query plan"
+                    ),
+                    "{:?}",
+                    result.outcome
+                ),
+                _ => assert!(
+                    matches!(result.outcome, TestOutcome::Passed),
+                    "{backend_type}: {:?}",
+                    result.outcome
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_if_tursopg_skips_only_on_the_tursopg_backend() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+@skip-if tursopg "a cast from text to int is not supported yet"
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#,
+        )
+        .unwrap();
+
+        for backend_type in Backend::ALL.iter().copied() {
+            let options = RunOptions {
+                file_path: PathBuf::from("skip.sqltest"),
+                db_config: file.databases[0].clone(),
+                setups: file.setups.clone(),
+                mvcc: false,
+                global_skip: file.global_skip.clone(),
+                global_requires: file.global_requires.clone(),
+                backend_capabilities: HashSet::new(),
+                backend_type,
+                backend_is_sqlite: false,
+                backend_reports_sqlstate: false,
+                snapshot_update_mode: SnapshotUpdateMode::No,
+                cross_check_binary: None,
+                verify_materialized_views: false,
+            };
+            let backend = Arc::new(OneRowBackend { backend_type });
+            let result = run_single(backend, file.tests[0].clone(), options).await;
+            match backend_type {
+                Backend::Tursopg => assert!(
+                    matches!(
+                        &result.outcome,
+                        TestOutcome::Skipped { reason } if reason == "a cast from text to int is not supported yet"
                     ),
                     "{:?}",
                     result.outcome

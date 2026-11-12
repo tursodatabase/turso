@@ -12,12 +12,13 @@ use crate::settings::{
     SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
-use turso_core::schema::Table;
+use turso_core::schema::{Column, Table};
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
 use turso_parser::ast::{self};
+use turso_pg_parser::coerce::PgType;
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
@@ -427,9 +428,14 @@ fn prepare_statement_inner(
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
     let conn_for_names = Arc::clone(&pg_conn.conn);
-    let translator = PostgreSQLTranslator::new().with_relation_name_check(move |schema, name| {
-        schema_has_relation(&conn_for_names, schema, name)
-    });
+    let conn_for_types = Arc::clone(&pg_conn.conn);
+    let translator = PostgreSQLTranslator::new()
+        .with_relation_name_check(move |schema, name| {
+            schema_has_relation(&conn_for_names, schema, name)
+        })
+        .with_column_types(Box::new(move |schema, name| {
+            relation_column_types(&conn_for_types, schema, name)
+        }));
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
@@ -1496,6 +1502,79 @@ fn schema_has_relation(conn: &Arc<Connection>, schema: &str, name: &str) -> bool
                 s.relation_kind(namespace.target.id, name).is_some()
             })
         })
+}
+
+fn relation_column_types(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    name: &str,
+) -> Option<Vec<(String, PgType)>> {
+    let found = relation_lookup_namespaces(conn, schema)
+        .iter()
+        .find_map(|namespace| {
+            conn.with_schema(namespace.database_id(), |s| {
+                let id = namespace.target.id;
+                match s.get_table(id, name) {
+                    Some(table) => Some(column_types(table.columns())),
+                    None => s.get_view(id, name).map(|view| column_types(&view.columns)),
+                }
+            })
+        });
+    match found {
+        Some(columns) => columns,
+        None => catalog_table_column_types(conn, schema, name),
+    }
+}
+
+fn catalog_table_column_types(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    name: &str,
+) -> Option<Vec<(String, PgType)>> {
+    if schema.is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog")) {
+        return None;
+    }
+    conn.with_schema(turso_core::MAIN_DB_ID, |s| {
+        match s.get_table(turso_core::NamespaceId::ROOT, name).as_deref() {
+            Some(table @ Table::Virtual(_)) => column_types(table.columns()),
+            _ => None,
+        }
+    })
+}
+
+fn column_types(columns: &[Column]) -> Option<Vec<(String, PgType)>> {
+    columns
+        .iter()
+        .filter(|column| !column.hidden())
+        .map(|column| {
+            let name = column.name.clone()?;
+            if column.ty_str.is_empty() {
+                return None;
+            }
+            let ty = PgType::from_column_type(
+                &column.ty_str,
+                column.array_dimensions(),
+                &column_type_parameters(column),
+            );
+            Some((name, ty))
+        })
+        .collect()
+}
+
+fn column_type_parameters(column: &Column) -> Vec<i64> {
+    let parameters: Vec<i64> = column
+        .ty_params
+        .iter()
+        .filter_map(|parameter| match parameter.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(number)) => number.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    if parameters.len() == column.ty_params.len() {
+        parameters
+    } else {
+        Vec::new()
+    }
 }
 
 /// `sql`, a CREATE TABLE statement, with each serial column whose sequence

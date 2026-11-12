@@ -69,7 +69,7 @@
     },
     "directive-skip-file-if": {
       "name": "meta.directive.skip-file-if.sqltest",
-      "begin": "(@skip-file-if)\\s+(mvcc|sqlite|postgres)\\s+(\")",
+      "begin": "(@skip-file-if)\\s+(mvcc|sqlite|postgres|tursopg)\\s+(\")",
       "beginCaptures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" },

@@ -248,6 +248,7 @@ The `@skip-if` decorator supports the following conditions:
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
 | `sqlite` | Skip when running with the sqlite CLI backend |
 | `postgres` | Skip when running against a real PostgreSQL server (`--backend postgres`). |
+| `tursopg` | Skip when running against the tursopg server (`--backend tursopg`) |
 
 #### Capabilities
 
@@ -589,6 +590,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
 skip_condition  = "mvcc"
                 | "sqlite"
                 | "postgres"
+                | "tursopg"
 
 capability      = "trigger" | "strict" | "materialized_views"
 

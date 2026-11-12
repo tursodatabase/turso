@@ -209,7 +209,7 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
          JOIN pg_class c ON a.attrelid = c.oid \
          JOIN pg_type t ON a.atttypid = t.oid \
          LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
-         WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND a.attisdropped = 0 \
+         WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND NOT a.attisdropped \
          ORDER BY a.attnum"
     );
     match conn.query(&sql) {
@@ -408,7 +408,7 @@ fn cmd_list_types(conn: &Connection, w: &mut dyn Write) {
 }
 
 fn cmd_list_roles(conn: &Connection, w: &mut dyn Write) {
-    let sql = "SELECT rolname, CASE WHEN rolsuper = 1 THEN 'Superuser' ELSE '' END \
+    let sql = "SELECT rolname, CASE WHEN rolsuper THEN 'Superuser' ELSE '' END \
                FROM pg_roles ORDER BY rolname";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {

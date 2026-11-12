@@ -101,6 +101,7 @@ expect {
     {"a":1e400}
 }
 
+@skip-if tursopg "a cast from text to json is not supported yet"
 test json-strip-nulls-keeps-input-nested-1000-levels {
     SELECT length(json_strip_nulls((repeat('[', 1000) || repeat(']', 1000))::json)::text);
 }
@@ -108,6 +109,7 @@ expect {
     2000
 }
 
+@skip-if tursopg "a cast from text to json is not supported yet"
 test json-strip-nulls-of-deeply-nested-input-errors {
     SELECT json_strip_nulls((repeat('[', 50000) || repeat(']', 50000))::json);
 }

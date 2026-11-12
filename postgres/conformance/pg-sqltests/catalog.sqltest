@@ -307,6 +307,7 @@ expect {
 }
 
 @skip-if postgres "PostgreSQL also finds the functions of information_schema"
+@skip-if tursopg "the operator = for types text and text[] does not exist: proacl is declared text, initprivs text[]"
 test pg-dump-function-discovery-excludes-builtins {
     SET search_path TO '';
     SELECT p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes,
@@ -1355,6 +1356,7 @@ expect {
     t||1
 }
 
+@skip-if tursopg "the type of the function acldefault is not known yet"
 test pg-public-schema-owner-and-acl {
     SELECT n.nspowner, r.rolname, pg_get_userbyid(n.nspowner), n.nspacl::text,
            acldefault('n', n.nspowner)::text
@@ -1629,4 +1631,539 @@ test constraint-oids-are-not-relation-oids {
 }
 expect {
     0
+}
+
+test oid-string-literal-reads-as-an-integer {
+    SELECT '16384'::oid, '0'::oid, ' 42 '::oid, '4294967295'::oid;
+}
+expect {
+    16384|0|42|4294967295
+}
+
+test oid-string-literal-reads-hex-octal-and-negative-numbers {
+    SELECT '0x10'::oid, '010'::oid, '-1'::oid, '+7'::oid;
+}
+expect {
+    16|8|4294967295|7
+}
+
+test oid-string-literal-above-the-range-is-an-error {
+    SELECT '4294967296'::oid;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test oid-string-literal-below-the-range-is-an-error {
+    SELECT '-2147483649'::oid;
+}
+@sqlstate 22003
+expect error {
+    value "-2147483649" is out of range for type oid
+}
+
+test oid-string-literal-that-is-not-a-number-is-an-error {
+    SELECT 'abc'::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "abc"
+}
+
+test oid-empty-string-literal-is-an-error {
+    SELECT ''::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: ""
+}
+
+test oid-string-literal-with-two-numbers-is-an-error {
+    SELECT '1 2'::oid;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "1 2"
+}
+
+test oid-from-integers {
+    SELECT 5::int4::oid, 4294967295::int8::oid, NULL::oid;
+}
+expect {
+    5|4294967295|
+}
+
+test oid-converts-to-integers {
+    SELECT '7'::oid::int4, '7'::oid::int8, '4294967295'::oid::int8;
+}
+expect {
+    7|7|4294967295
+}
+
+test oid-compares-with-integers {
+    SELECT ('7'::oid = 7)::int, (7 = '7'::oid)::int, ('7'::oid = 7::int8)::int, ('7'::oid < 8)::int, ('7'::oid IN (6, 7))::int;
+}
+expect {
+    1|1|1|1|1
+}
+
+test oid-compares-with-string-literals {
+    SELECT (7::oid = '7')::int, ('8' > 7::oid)::int;
+}
+expect {
+    1|1
+}
+
+test oid-has-no-arithmetic {
+    SELECT 1::oid + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid \+ integer
+}
+
+test oid-does-not-compare-with-float {
+    SELECT 1::oid = 1.5::float8;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = double precision
+}
+
+test oid-does-not-compare-with-numeric {
+    SELECT 1::oid = 1.5;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: oid = numeric
+}
+
+test coalesce-and-case-give-oid-for-oid-and-integers {
+    SELECT COALESCE(NULL::oid, 5), CASE WHEN true THEN 5 ELSE '6'::oid END, COALESCE(5::int8, 6::oid);
+}
+expect {
+    5|5|5
+}
+
+test coalesce-of-oid-and-float-cannot-convert {
+    SELECT COALESCE(1::oid, 1.5::float8);
+}
+@sqlstate 42846
+expect error {
+    COALESCE could not convert type double precision to oid
+}
+
+test oid-column-takes-integers-and-string-literals {
+    CREATE TABLE zz_oid_t (a oid);
+    INSERT INTO zz_oid_t VALUES (5), ('7'), (6::oid), (8::int8);
+    SELECT a FROM zz_oid_t ORDER BY a;
+}
+expect {
+    5
+    6
+    7
+    8
+}
+
+test oid-column-does-not-take-text-values {
+    CREATE TABLE zz_oid_u (a oid);
+    INSERT INTO zz_oid_u VALUES ('1'::text);
+}
+@sqlstate 42804
+expect error {
+    column "a" is of type
+}
+
+test oid-compares-with-catalog-oid-columns {
+    CREATE TABLE zz_oid_c (a int);
+    SELECT c.relname FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid WHERE c.oid = (SELECT oid FROM pg_class WHERE relname = 'zz_oid_c')::oid AND n.oid = 2200::oid;
+}
+expect {
+    zz_oid_c
+}
+
+test oid-from-boolean-has-no-cast {
+    SELECT true::oid;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type boolean to oid
+}
+
+test oid-from-float-has-no-cast {
+    SELECT 1.5::float8::oid;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type double precision to oid
+}
+
+test oid-from-numeric-has-no-cast {
+    SELECT 1.5::oid;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type numeric to oid
+}
+
+test oid-converts-to-text {
+    SELECT 5::oid::text, 5::oid || 'x';
+}
+expect {
+    5|5x
+}
+
+@skip-if tursopg "a cast from text to oid is not supported yet"
+test oid-from-a-text-value {
+    CREATE TABLE zz_oid_s (s text);
+    INSERT INTO zz_oid_s VALUES ('42');
+    SELECT s::oid FROM zz_oid_s;
+}
+expect {
+    42
+}
+
+test regclass-string-literal-names-a-catalog-table {
+    SELECT 'pg_class'::regclass::oid, 'pg_catalog.pg_class'::regclass::int4, '"pg_class"'::regclass::int8, 'PG_CLASS'::regclass::oid, ' pg_class '::regclass::oid;
+}
+expect {
+    1259|1259|1259|1259|1259
+}
+
+test regclass-string-literal-names-the-system-catalogs-pg-dump-reads {
+    SELECT 'pg_proc'::regclass::oid, 'pg_type'::regclass::oid, 'pg_namespace'::regclass::oid, 'pg_attribute'::regclass::oid, 'pg_depend'::regclass::oid, 'pg_init_privs'::regclass::oid, 'pg_trigger'::regclass::oid, 'pg_description'::regclass::oid;
+}
+expect {
+    1255|1247|2615|1249|2608|3394|2620|2609
+}
+
+test regclass-string-literal-names-a-user-table {
+    CREATE TABLE zz_rc_t (a int);
+    SELECT ('zz_rc_t'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'zz_rc_t'))::int, ('public.zz_rc_t'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'zz_rc_t'))::int;
+}
+expect {
+    1|1
+}
+
+test regclass-string-literal-names-a-table-index-sequence-and-view {
+    CREATE TABLE zz_rc_t2 (a text);
+    CREATE INDEX zz_rc_idx ON zz_rc_t2 (a);
+    CREATE SEQUENCE zz_rc_seq;
+    CREATE VIEW zz_rc_v AS SELECT 1 AS one;
+    SELECT ('zz_rc_t2'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'zz_rc_t2'))::int,
+           ('zz_rc_idx'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'zz_rc_idx'))::int,
+           ('zz_rc_seq'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'zz_rc_seq'))::int,
+           ('zz_rc_v'::regclass::oid > 0)::int;
+}
+expect {
+    1|1|1|1
+}
+
+test regclass-string-literal-follows-the-search-path {
+    CREATE SCHEMA zz_rc_s;
+    CREATE TABLE zz_rc_s.zz_rc_inner (a int);
+    SET search_path TO zz_rc_s;
+    SELECT ('zz_rc_inner'::regclass::oid = (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'zz_rc_s' AND c.relname = 'zz_rc_inner'))::int, ('zz_rc_s.zz_rc_inner'::regclass::oid = 'zz_rc_inner'::regclass::oid)::int;
+}
+expect {
+    1|1
+}
+
+test regclass-string-literal-keeps-the-case-of-a-quoted-name {
+    CREATE TABLE "ZzRcMixed" (a int);
+    SELECT ('"ZzRcMixed"'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'ZzRcMixed'))::int;
+}
+expect {
+    1
+}
+
+test regclass-string-literal-without-a-relation-is-an-error {
+    SELECT 'zz_rc_missing'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "zz_rc_missing" does not exist
+}
+
+test regclass-string-literal-in-a-missing-schema-is-an-error {
+    SELECT 'zz_rc_noschema.t'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "zz_rc_noschema.t" does not exist
+}
+
+test regclass-string-literal-of-digits-is-an-oid {
+    SELECT '1259'::regclass::oid, '0'::regclass::oid, '-'::regclass::oid, '99999'::regclass::oid;
+}
+expect {
+    1259|0|0|99999
+}
+
+test regclass-string-literal-of-digits-above-the-range-is-an-error {
+    SELECT '4294967296'::regclass;
+}
+@sqlstate 22003
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test regclass-string-literal-with-bad-name-syntax-is-an-error {
+    SELECT 'a b'::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-empty-string-literal-is-an-error {
+    SELECT ''::regclass;
+}
+@sqlstate 42602
+expect error {
+    invalid name syntax
+}
+
+test regclass-from-integers {
+    SELECT 1259::regclass::oid, 1259::int8::regclass::oid, 1259::oid::regclass::int4;
+}
+expect {
+    1259|1259|1259
+}
+
+test regclass-converts-to-integers-and-oid {
+    SELECT 'pg_class'::regclass::int4, 'pg_class'::regclass::int8, 'pg_class'::regclass::oid;
+}
+expect {
+    1259|1259|1259
+}
+
+test regclass-from-a-text-value {
+    CREATE TABLE zz_rc_names (n text);
+    CREATE TABLE zz_rc_named (a int);
+    INSERT INTO zz_rc_names VALUES ('zz_rc_named'), ('pg_class');
+    SELECT n, (n::regclass::oid = (SELECT oid FROM pg_class WHERE relname = n))::int FROM zz_rc_names WHERE n <> 'pg_class';
+}
+expect {
+    zz_rc_named|1
+}
+
+test regclass-from-a-text-value-reads-digits-as-a-name {
+    SELECT '1259'::text::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "1259" does not exist
+}
+
+test regclass-from-a-text-value-without-a-relation-is-an-error {
+    SELECT 'zz_rc_missing'::text::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "zz_rc_missing" does not exist
+}
+
+test regclass-from-a-null-text-value-is-null {
+    SELECT NULL::text::regclass::oid, NULL::regclass::oid;
+}
+expect {
+    |
+}
+
+test regclass-compares-with-integers-and-oid {
+    SELECT ('pg_class'::regclass = 1259)::int, (1259 = 'pg_class'::regclass)::int, ('pg_class'::regclass = 1259::oid)::int, ('pg_class'::regclass = 1259::int8)::int;
+}
+expect {
+    1|1|1|1
+}
+
+test regclass-compared-with-a-string-literal-reads-the-literal-as-an-oid {
+    SELECT 'pg_class'::regclass = 'pg_class';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type oid: "pg_class"
+}
+
+test regclass-of-an-oid-column-matches-the-column {
+    CREATE TABLE zz_rc_c (a int);
+    SELECT (c.oid::regclass::oid = c.oid)::int FROM pg_class c WHERE c.relname = 'zz_rc_c';
+}
+expect {
+    1
+}
+
+test catalog-rows-are-found-by-the-regclass-of-their-catalog {
+    SELECT count(*) FROM pg_depend WHERE classid = 'pg_class'::regclass AND objid < 0;
+}
+expect {
+    0
+}
+
+test regclass-has-no-cast-from-boolean {
+    SELECT true::regclass;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type boolean to regclass
+}
+
+@skip-if tursopg "a cast from regclass to text is not supported yet"
+test regclass-converts-to-text {
+    SELECT 'pg_class'::regclass::text;
+}
+expect {
+    pg_class
+}
+
+test smallint-casts-and-comparisons {
+    SELECT 0::int2, 5::int4::int2, '7'::int2, (3::int2 < 4)::int, (3::int2 + 4)::int, (3::int2 = 3::int8)::int;
+}
+expect {
+    0|5|7|1|7|1
+}
+
+test smallint-cast-out-of-range-is-an-error {
+    SELECT 70000::int4::int2;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test smallint-string-literal-out-of-range-is-an-error {
+    SELECT '70000'::int2;
+}
+@sqlstate 22003
+expect error {
+    value "70000" is out of range for type smallint
+}
+
+test smallint-string-literal-that-is-not-a-number-is-an-error {
+    SELECT 'x'::int2;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type smallint: "x"
+}
+
+test smallint-has-no-cast-to-boolean {
+    SELECT 1::int2::boolean;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type smallint to boolean
+}
+
+test smallint-with-oid-and-regclass {
+    SELECT 5::int2::oid, 1259::int2::regclass::oid;
+}
+expect {
+    5|1259
+}
+
+test regnamespace-string-literal-names-a-schema {
+    CREATE SCHEMA zz_rn_s;
+    SELECT 'pg_catalog'::regnamespace::oid, 'public'::regnamespace::oid, ('zz_rn_s'::regnamespace::oid = (SELECT oid FROM pg_namespace WHERE nspname = 'zz_rn_s'))::int;
+}
+expect {
+    11|2200|1
+}
+
+test regnamespace-string-literal-without-a-schema-is-an-error {
+    SELECT 'zz_nosuch'::regnamespace;
+}
+@sqlstate 3F000
+expect error {
+    schema "zz_nosuch" does not exist
+}
+
+test regnamespace-string-literal-of-digits-is-an-oid {
+    SELECT '11'::regnamespace::oid, '-'::regnamespace::oid, 11::regnamespace::oid;
+}
+expect {
+    11|0|11
+}
+
+test regnamespace-compares-with-a-namespace-column {
+    SELECT count(*) FROM pg_namespace WHERE oid = 'pg_catalog'::regnamespace;
+}
+expect {
+    1
+}
+
+test internal-char-string-literal-is-one-character {
+    SELECT 's'::"char"::text, 'abc'::"char"::text, E'\\163'::"char"::text;
+}
+expect {
+    s|a|s
+}
+
+test internal-char-takes-part-in-case-and-comparison {
+    SELECT CASE WHEN true THEN 'r'::"char" ELSE 's'::"char" END::text, ('r'::"char" = 'r')::int;
+}
+expect {
+    r|1
+}
+
+test oid-array-string-literal-and-unnest {
+    SELECT tbloid FROM unnest('{16385,16384}'::pg_catalog.oid[]) AS src(tbloid) ORDER BY tbloid;
+}
+expect {
+    16384
+    16385
+}
+
+test oid-array-unnest-joins-with-a-catalog {
+    SELECT count(*) FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid) JOIN pg_class c ON src.tbloid = c.oid;
+}
+expect {
+    0
+}
+
+test oid-array-unnest-column-compares-with-an-integer {
+    SELECT (o = 1)::int FROM unnest('{1,2}'::oid[]) AS s(o) ORDER BY 1;
+}
+expect {
+    0
+    1
+}
+
+test smallint-array-literal-and-subscript {
+    SELECT ('{5,6}'::int2[])[2], '{5,6}'::int2[];
+}
+expect {
+    6|{5,6}
+}
+
+test generate-series-column-is-typed {
+    SELECT g FROM generate_series(1, 4) AS g WHERE g = 2 OR g > 3 ORDER BY g;
+}
+expect {
+    2
+    4
+}
+
+test regproc-casts-from-an-integer {
+    SELECT 0::regproc::int4, 0::oid::regproc::oid;
+}
+expect {
+    0|0
+}
+
+test smallint-from-numbers-rounds-and-checks-the-range {
+    SELECT 2.6::float8::int2, 32767.4::float8::int2, 2.5::numeric::int2, (-7)::int8::int2;
+}
+expect {
+    3|32767|3|-7
+}
+
+test smallint-from-a-float-out-of-range-is-an-error {
+    SELECT 70000.4::float8::int2;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
 }

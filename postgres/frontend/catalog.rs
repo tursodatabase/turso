@@ -71,7 +71,7 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new().for_stored_sql();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
             Err(_) => turso_core::dialect::engine::parse(sql),
@@ -94,7 +94,7 @@ impl Dialect for PostgresDialect {
 
         let parse_result =
             turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new().for_stored_sql();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -117,7 +117,7 @@ impl Dialect for PostgresDialect {
 
         let parse_result =
             turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new().for_stored_sql();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -437,6 +437,37 @@ fn stored_relation_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> O
             .get_by_name(namespace, name)?
             .oid,
     )
+}
+
+/// The oid of the relation that `pg_class` lists as `name` in `namespace`, or the view of that name: tables are found by their declared name.
+pub(crate) fn relation_oid_by_name(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Option<i64> {
+    let table = user_tables_with_oids(schema)
+        .into_iter()
+        .find(|(table_namespace, _, table, _)| {
+            *table_namespace == namespace
+                && matches!(table.as_ref(), Table::BTree(btree) if btree.declared_name == name)
+        })
+        .map(|(_, _, _, oid)| oid);
+    table
+        .or_else(|| {
+            catalog_indexes(schema)
+                .into_iter()
+                .find(|index| index.namespace == namespace && index.name == name)
+                .map(|index| index.oid)
+        })
+        .or_else(|| {
+            sequence_catalog_entries(schema)
+                .into_iter()
+                .find(|(_, sequence_namespace, sequence)| {
+                    *sequence_namespace == namespace && sequence.name == name
+                })
+                .map(|(oid, _, _)| oid)
+        })
+        .or_else(|| stored_relation_oid(schema, namespace, name))
 }
 
 /// The `pg_class.relowner` oid of relation `name`: its stored owner.
@@ -779,6 +810,16 @@ impl SnapshotRows for PgDescriptionTable {
 /// The schemas that PostgreSQL always has, with their fixed OIDs.
 const BUILTIN_SCHEMAS: [(i64, &str); 2] = [(11, "pg_catalog"), (11394, "information_schema")];
 
+/// The oid of the schema `name` that pg_namespace lists, if there is one.
+pub(crate) fn namespace_oid_by_name(conn: &Connection, name: &str) -> Option<i64> {
+    if let Some((oid, _)) = BUILTIN_SCHEMAS.iter().find(|(_, schema)| *schema == name) {
+        return Some(*oid);
+    }
+    let schema = conn.current_schema();
+    let namespace = schema.namespace_named(name)?;
+    Some(namespace_oid(&schema, namespace))
+}
+
 /// Whether pg_namespace lists schema `name`: one of the schemas that
 /// PostgreSQL always has, or a namespace stored in the main database,
 /// which is what CREATE SCHEMA creates and what public is.
@@ -979,16 +1020,16 @@ impl SnapshotRows for PgRolesTable {
     const SCHEMA: &'static str = "CREATE TABLE pg_roles (
             oid INTEGER,
             rolname TEXT,
-            rolsuper INTEGER,
-            rolinherit INTEGER,
-            rolcreaterole INTEGER,
-            rolcreatedb INTEGER,
-            rolcanlogin INTEGER,
-            rolreplication INTEGER,
+            rolsuper BOOLEAN,
+            rolinherit BOOLEAN,
+            rolcreaterole BOOLEAN,
+            rolcreatedb BOOLEAN,
+            rolcanlogin BOOLEAN,
+            rolreplication BOOLEAN,
             rolconnlimit INTEGER,
             rolpassword TEXT,
             rolvaliduntil TEXT,
-            rolbypassrls INTEGER,
+            rolbypassrls BOOLEAN,
             rolconfig TEXT
         )";
     const TABLE_OID: Option<i64> = None;
@@ -1358,10 +1399,10 @@ impl SnapshotRows for PgTablesTable {
             tablename TEXT,
             tableowner TEXT,
             tablespace TEXT,
-            hasindexes INTEGER,
-            hasrules INTEGER,
-            hastriggers INTEGER,
-            rowsecurity INTEGER
+            hasindexes BOOLEAN,
+            hasrules BOOLEAN,
+            hastriggers BOOLEAN,
+            rowsecurity BOOLEAN
         )";
     const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 1000.0;
@@ -2409,7 +2450,7 @@ impl SnapshotRows for PgSequencesTable {
             min_value INTEGER,
             max_value INTEGER,
             increment_by INTEGER,
-            cycle INTEGER,
+            cycle BOOLEAN,
             cache_size INTEGER,
             last_value INTEGER
         )";
@@ -2599,7 +2640,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal BOOLEAN, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable BOOLEAN, tginitdeferred BOOLEAN, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_statistic_ext",
@@ -2609,12 +2650,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_inherits",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending BOOLEAN)".to_string() },
     );
     options = options.native_module(
         "pg_rewrite",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead BOOLEAN, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_foreign_table",
@@ -2636,7 +2677,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         EmptyPgCatalogTable {
             create_sql: "CREATE TABLE pg_collation (
                 oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
-                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
+                collprovider TEXT, collisdeterministic BOOLEAN, collencoding INTEGER,
                 collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
                 collversion TEXT, tableoid INTEGER HIDDEN
             )"
@@ -2662,7 +2703,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables BOOLEAN, pubinsert BOOLEAN, pubupdate BOOLEAN, pubdelete BOOLEAN, pubtruncate BOOLEAN, pubviaroot BOOLEAN, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_namespace",
@@ -2672,7 +2713,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_publication_rel",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs SMALLINT[], tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_depend",
@@ -4223,7 +4264,20 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
     use turso_core::ConnectOpts;
+    use turso_pg_parser::coerce::PgType;
     use turso_sqlite::SqliteDialect;
+
+    #[test]
+    fn cast_rules_and_pg_type_give_each_type_the_same_category() {
+        let different: Vec<_> = PG_BASE_TYPES
+            .iter()
+            .filter_map(|ty| {
+                let letter = PgType::from_name(ty.name).category_letter()?;
+                (letter != ty.typcategory).then_some((ty.name, letter, ty.typcategory))
+            })
+            .collect();
+        assert_eq!(different, Vec::new());
+    }
 
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
@@ -4251,6 +4305,28 @@ mod tests {
                 "{cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn stored_table_sql_that_a_new_statement_would_reject_still_loads() {
+        for sql in [
+            "CREATE TABLE made (ts timestamp, CHECK (ts > '2024-01-01'))",
+            "CREATE TABLE made (j jsonb DEFAULT '{}'::jsonb)",
+            "CREATE TABLE made (a int, b text, CHECK (a = b))",
+        ] {
+            let stored = encode_pg_schema_sql(sql);
+            PostgresDialect.parse_table_sql(&stored, 2).unwrap();
+            PostgresDialect.parse_table_sql_ast(&stored).unwrap();
+            PostgresDialect.table_sql_for_replay(&stored).unwrap();
+        }
+    }
+
+    #[test]
+    fn dialect_parse_keeps_loading_a_statement_with_a_rejected_conversion() {
+        let (cmd, _) = PostgresDialect
+            .parse("SELECT '{}'::jsonb, ts > '2024-01-01'")
+            .unwrap();
+        assert!(cmd.is_some());
     }
 
     #[test]

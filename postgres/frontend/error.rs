@@ -1,6 +1,7 @@
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
+use turso_pg_parser::ParseError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -49,6 +50,14 @@ impl From<LimboError> for Error {
             report: ErrorReport::from(&source),
             source,
         }))
+    }
+}
+
+/// The engine error for an error of the translator that has no schema-qualified name.
+pub(crate) fn parse_error_to_core(error: ParseError) -> LimboError {
+    match error {
+        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
+        other => LimboError::ParseError(other.to_string()),
     }
 }
 
@@ -392,6 +401,8 @@ fn raise_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_DATETIME_FORMAT
     } else if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg == "value too long for varchar" {
+        SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else {

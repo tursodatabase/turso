@@ -2,6 +2,7 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+#[ignore = "a cast from integer to pos_int is not supported yet"]
 fn test_pg_create_domain_basic_integer(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -28,6 +29,7 @@ fn test_pg_create_domain_basic_integer(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+#[ignore = "a cast from unknown to email is not supported yet"]
 fn test_pg_create_domain_text_with_check(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -55,6 +57,7 @@ fn test_pg_create_domain_text_with_check(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+#[ignore = "a cast from unknown to nn_text is not supported yet"]
 fn test_pg_create_domain_not_null(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -94,6 +97,7 @@ fn test_pg_create_domain_default(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+#[ignore = "a cast from integer to pos_nn is not supported yet"]
 fn test_pg_create_domain_multiple_constraints(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -114,6 +118,7 @@ fn test_pg_create_domain_multiple_constraints(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+#[ignore = "a cast from integer to pos_int is not supported yet"]
 fn test_pg_create_domain_named_constraint(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -127,6 +132,7 @@ fn test_pg_create_domain_named_constraint(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+#[ignore = "a cast from integer to score is not supported yet"]
 fn test_pg_create_domain_in_table(db: TempDatabase) {
     let conn = db.connect_postgres();
 

@@ -647,8 +647,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Postgres)
             }
+            Some(Token::Identifier(name)) if name == "tursopg" => {
+                self.advance();
+                Ok(ast::SkipCondition::Tursopg)
+            }
             Some(token) => Err(self.error(format!(
-                "expected skip condition (mvcc, sqlite, postgres), got {token}"
+                "expected skip condition (mvcc, sqlite, postgres, tursopg), got {token}"
             ))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
@@ -1374,6 +1378,30 @@ expect {
     }
 
     #[test]
+    fn test_parse_skip_if_tursopg() {
+        let input = r#"
+@database :memory:
+
+@skip-if tursopg "a cast from text to int is not supported yet"
+test explain-select {
+    EXPLAIN SELECT 1;
+}
+expect {
+    0|0|0|SCAN CONSTANT ROW
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.tests[0].modifiers.skip,
+            vec![ast::Skip {
+                reason: "a cast from text to int is not supported yet".to_string(),
+                condition: Some(ast::SkipCondition::Tursopg),
+            }]
+        );
+    }
+
+    #[test]
     fn test_parse_postgres_is_still_an_identifier() {
         let input = r#"
 @database :memory:
@@ -1636,6 +1664,30 @@ expect {
     }
 
     #[test]
+    fn test_parse_global_skip_if_tursopg() {
+        let input = r#"
+@database :memory:
+@skip-file-if tursopg "a cast from text to int is not supported yet"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            vec![ast::Skip {
+                reason: "a cast from text to int is not supported yet".to_string(),
+                condition: Some(ast::SkipCondition::Tursopg),
+            }]
+        );
+    }
+
+    #[test]
     fn test_parse_skip_if_unknown_condition() {
         let input = r#"
 @database :memory:
@@ -1652,7 +1704,7 @@ expect {
         let err = parse(input).unwrap_err();
         assert!(
             err.to_string()
-                .contains("expected skip condition (mvcc, sqlite, postgres), got mysql"),
+                .contains("expected skip condition (mvcc, sqlite, postgres, tursopg), got mysql"),
             "{err}"
         );
     }
