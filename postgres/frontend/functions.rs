@@ -365,6 +365,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
+        "jsonb_in"(FunctionArity::Exact(1), true) => crate::pg_type::jsonb::jsonb_in(args[0].get_value())?,
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
@@ -2171,9 +2172,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             }
             None
         }
+        // PostgreSQL's uuid input does not ignore spaces, so `input` is
+        // read, not `trimmed`.
         "uuid" => {
-            let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
-            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if crate::pg_type::uuid::parse_uuid(input).is_none() {
                 Some((
                     format!("invalid input syntax for type uuid: \"{input}\""),
                     "22P02".to_string(),
@@ -2186,17 +2188,22 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
         "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
         "time" | "time without time zone" => check_temporal_input(input, "time"),
-        "json" | "jsonb" => {
+        // Text is read as a cast to jsonb reads it, so the errors are
+        // PostgreSQL's: a lone surrogate or the NUL escape fails too.
+        "jsonb" => match crate::pg_type::jsonb::jsonb_in(&Value::build_text(input.to_string())) {
+            Ok(_) => None,
+            Err(LimboError::Dialect(error)) => Some((error.message, error.code.to_string())),
+            Err(error) => Some((
+                error.to_string(),
+                SQLSTATE_INVALID_TEXT_REPRESENTATION.to_string(),
+            )),
+        },
+        "json" => {
             if is_valid_json(trimmed) {
                 None
             } else {
-                let type_label = if base_type == "jsonb" {
-                    "jsonb"
-                } else {
-                    "json"
-                };
                 Some((
-                    format!("invalid input syntax for type {type_label}: \"{input}\""),
+                    format!("invalid input syntax for type json: \"{input}\""),
                     "22P02".to_string(),
                 ))
             }

@@ -106,50 +106,34 @@ expect {
 }
 
 # A-17: invalid uuid literal cast
-@compat-gap "type:uuid"
 test invalid-uuid-literal-cast {
     SELECT 'nope'::uuid;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    nope
-}
 
 # A-19: uuid uppercase input normalised
-@compat-gap "type:uuid"
 test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-}
 
 # A-20: uuid braces / no-hyphen input
-@compat-gap "type:uuid"
 test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
-}
 
 # A-21: uuid equality across case
-@compat-gap "operator:uuid = uuid"
 test uuid-equality-across-case {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
 }
 expect {
     t
-}
-expect @tursopg {
-    f
 }
 
 # A-22: numeric(10,2) rounding half away from zero
@@ -372,15 +356,11 @@ expect {
 }
 
 # A-48: invalid jsonb literal
-@compat-gap "type:jsonb"
 test invalid-jsonb-literal {
     SELECT 'not json'::jsonb;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    not json
-}
 
 # A-50: jsonb number precision
 test jsonb-number-precision {

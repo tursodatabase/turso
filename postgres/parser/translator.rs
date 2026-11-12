@@ -3588,8 +3588,19 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(ParseError::not_supported("a type modifier in a cast"));
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int8_cast_operand(arg, *expr));
+                match extract_type_name_from_typename(pg_type_name)?.as_str() {
+                    "int8" => expr = Box::new(int8_cast_operand(arg, *expr)),
+                    // The engine's cast to jsonb does not check text by
+                    // PostgreSQL's rules. An index expression and a
+                    // generation expression can use only core functions, so
+                    // there the text is not checked.
+                    "jsonb"
+                        if !self.translating_index.get()
+                            && self.generation_expression_table.borrow().is_none() =>
+                    {
+                        expr = Box::new(function_call("jsonb_in", vec![*expr]))
+                    }
+                    _ => {}
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -7909,9 +7920,10 @@ fn pg_type_name_to_ast_type(
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
+        "UUID" => "uuid",
         // For CAST expressions, map all text-like PG types to TEXT.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
-        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "INET" | "JSON" | "JSONB" | "XML"
+        | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => &pg_type,
     };
