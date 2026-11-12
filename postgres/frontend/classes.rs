@@ -66,6 +66,10 @@ use turso_core::{security::policy::RowPolicy, SessionRole};
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
+/// The table where earlier versions stored roles, before
+/// [`crate::roles::AUTHID_TABLE_NAME`].
+const OLD_ROLES_TABLE_NAME: &str = "__turso_internal_roles";
+
 pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name";
 
 /// PostgreSQL's `FirstNormalObjectId`: the first oid given to a user
@@ -1829,12 +1833,14 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
 /// that already has relations without the table is refused, and a read-only
 /// open can neither create nor need it: the database is empty. After this
 /// returns, every relation the database will ever hold has a class row from
-/// its CREATE.
+/// its CREATE. A database with the roles table of an earlier version is
+/// refused too, see [`refuse_roles_of_an_earlier_version`].
 pub(crate) fn ensure_classes_table(
     db: &Arc<turso_core::Database>,
     read_only: bool,
 ) -> crate::Result<()> {
     let conn = db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
+    refuse_roles_of_an_earlier_version(&conn)?;
     if let Some(table) = classes_table(&conn) {
         let has_every_column = has_acl_column(&table)
             && has_row_security_column(&table)
@@ -1881,6 +1887,22 @@ fn refuse_relations_without_catalog(conn: &Arc<Connection>) -> crate::Result<()>
          made it; this version does not open it"
             .to_string(),
     )
+    .into())
+}
+
+/// Refuses a database whose roles an earlier tursopg stored in
+/// `__turso_internal_roles`. Its relation catalog names those roles by id
+/// as owners, grantees and policy roles, and this version would give the
+/// same ids to the next roles it creates, which would then own the tables
+/// and hold the privileges of the old roles.
+fn refuse_roles_of_an_earlier_version(conn: &Arc<Connection>) -> crate::Result<()> {
+    if !table_exists(conn, OLD_ROLES_TABLE_NAME)? {
+        return Ok(());
+    }
+    Err(LimboError::ParseError(format!(
+        "the database has the roles table {OLD_ROLES_TABLE_NAME} of an earlier version of \
+         tursopg; this version does not open it"
+    ))
     .into())
 }
 

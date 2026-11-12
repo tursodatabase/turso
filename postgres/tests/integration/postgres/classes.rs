@@ -313,6 +313,54 @@ fn a_database_with_relations_but_no_catalog_is_refused() {
     }
 }
 
+/// The relation catalog of such a database names its roles by id, and new
+/// roles would get the same ids and with them the old roles' tables.
+#[test]
+fn a_database_with_the_roles_table_of_an_earlier_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old-roles.db");
+    let path = path.to_str().unwrap();
+    {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_pg::open_database_with_io(
+            io,
+            path,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        for sql in [
+            "CREATE TABLE __turso_internal_roles (id INTEGER PRIMARY KEY, \
+             name TEXT NOT NULL, superuser INTEGER NOT NULL)",
+            "INSERT INTO __turso_internal_roles VALUES (1, 'alice', 0)",
+        ] {
+            conn.prepare_engine_schema_statement(sql)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap();
+        }
+    }
+
+    for read_only in [false, true] {
+        let mut flags = turso_core::OpenFlags::default();
+        if read_only {
+            flags |= turso_core::OpenFlags::ReadOnly;
+        }
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let error =
+            turso_pg::open_database_with_io(io, path, flags, turso_core::DatabaseOpts::new())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("roles table __turso_internal_roles of an earlier version"),
+            "read_only={read_only}: {error}"
+        );
+    }
+}
+
 #[test]
 fn a_rolled_back_create_leaves_no_class_row_behind() {
     let db = TempDatabase::builder().build();
