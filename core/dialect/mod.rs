@@ -65,8 +65,10 @@ pub enum CatalogChange {
         name: String,
         owner: NewOwner,
     },
-    /// `GRANT privileges ON relation TO grantees`.
+    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
+    /// relation FROM grantees` when `revoke` is set.
     Grant {
+        revoke: bool,
         namespace: NamespaceId,
         name: String,
         privileges: Vec<Privilege>,
@@ -365,8 +367,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// dialect without schema state of its own, except that such a dialect
     /// has no roles, ownership, privileges or row-level security and refuses
     /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
-    /// `GRANT`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`
-    /// and `DROP POLICY`.
+    /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
+    /// `CREATE POLICY` and `DROP POLICY`.
     fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -393,8 +395,11 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
                 }
-                CatalogChange::Grant { .. } => {
-                    return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                CatalogChange::Grant { revoke, .. } => {
+                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
+                    return Err(LimboError::ParseError(format!(
+                        "{statement} is not supported"
+                    )));
                 }
                 CatalogChange::SetRowSecurity { .. }
                 | CatalogChange::CreatePolicy { .. }

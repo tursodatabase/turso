@@ -528,7 +528,7 @@ pub(crate) fn role_has_privilege(
     let Some(acl) = &class.relacl else {
         return class.relowner == role;
     };
-    let wanted = Privileges::granted_on(class.relkind, &[privilege]);
+    let wanted = Privileges::named_on(class.relkind, &[privilege]);
     !wanted.is_empty() && acl.grants(role_oid(role), wanted)
 }
 
@@ -792,27 +792,30 @@ pub(crate) fn translate_catalog_changes(
                 }
             }
             CatalogChange::Grant {
+                revoke,
                 namespace,
                 name,
                 privileges,
                 grantees,
             } => {
+                let statement = if *revoke { "REVOKE" } else { "GRANT" };
                 let grantees = grantees
                     .iter()
                     .map(|grantee| resolve_grantee(schema, connection, grantee))
                     .collect::<turso_core::Result<Vec<_>>>()?;
                 // A relation without a class row has no list to store the
                 // privileges in. Every role reads the pg_catalog views
-                // already, so a GRANT on one changes nothing. Only a
-                // superuser uses the engine's own tables, so a GRANT on one
-                // would claim access it does not give, and is refused.
+                // already, so a GRANT or REVOKE on one changes nothing. Only
+                // a superuser uses the engine's own tables, so a GRANT or
+                // REVOKE on one would claim a change it does not make, and is
+                // refused.
                 let Some(class) =
                     class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
                 else {
                     if schema.get_btree_table(*namespace, name).is_some() {
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
-                            format!("GRANT on internal table {name} is not supported"),
+                            format!("{statement} on internal table {name} is not supported"),
                         ));
                     }
                     continue;
@@ -832,10 +835,10 @@ pub(crate) fn translate_catalog_changes(
                     .relacl
                     .clone()
                     .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
-                // Only the owner may grant, and a superuser grants as the
-                // owner. As in PostgreSQL, anyone else is refused when the
-                // list gives it nothing on the relation, and grants nothing
-                // otherwise, for want of a grant option.
+                // Only the owner may grant or revoke, and a superuser does
+                // so as the owner. As in PostgreSQL, anyone else is refused
+                // when the list gives it nothing on the relation, and changes
+                // nothing otherwise, for want of a grant option.
                 let may_grant = connection.current_role_is_superuser()
                     || class.relowner == connection.current_role();
                 if !may_grant {
@@ -846,15 +849,21 @@ pub(crate) fn translate_catalog_changes(
                         PermissionDenied::privilege(Action::Read, relation_object(class)),
                     )));
                 }
-                // As in PostgreSQL, a GRANT that gives nothing on the
-                // relation, such as INSERT on a sequence, leaves its list
-                // as it is, even when it has none yet.
-                let granted = Privileges::granted_on(class.relkind, privileges);
-                if granted.is_empty() {
+                // As in PostgreSQL, a statement that names no privilege of
+                // the relation, such as INSERT on a sequence, leaves its list
+                // as it is, even when it has none yet. Otherwise a relation
+                // without a list gets the owner's default one first, so a
+                // REVOKE that takes nothing away still stores it.
+                let named = Privileges::named_on(class.relkind, privileges);
+                if named.is_empty() {
                     continue;
                 }
                 for grantee in &grantees {
-                    acl.grant(*grantee, granted, owner);
+                    if *revoke {
+                        acl.revoke(*grantee, named, owner);
+                    } else {
+                        acl.grant(*grantee, named, owner);
+                    }
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;

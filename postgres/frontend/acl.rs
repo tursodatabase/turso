@@ -83,14 +83,14 @@ impl Privileges {
         }
     }
 
-    /// The privileges that `GRANT privileges` gives on a relation of `kind`.
-    /// As in PostgreSQL, `ALL` is every privilege of the kind, and a
-    /// privilege the kind does not have, such as INSERT on a sequence, is
-    /// left out.
-    pub(crate) fn granted_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
+    /// The privileges that `GRANT privileges` gives, or `REVOKE privileges`
+    /// takes away, on a relation of `kind`. As in PostgreSQL, `ALL` is every
+    /// privilege of the kind, and a privilege the kind does not have, such
+    /// as INSERT on a sequence, is left out.
+    pub(crate) fn named_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
         let all = Self::all_on(kind);
-        let granted = privileges.iter().fold(Self::empty(), |granted, privilege| {
-            granted
+        let named = privileges.iter().fold(Self::empty(), |named, privilege| {
+            named
                 | match privilege {
                     ast::Privilege::Select => Self::SELECT,
                     ast::Privilege::Insert => Self::INSERT,
@@ -104,7 +104,7 @@ impl Privileges {
                     ast::Privilege::All => all,
                 }
         });
-        granted & all
+        named & all
     }
 
     /// Reads the letters of an `aclitem`, such as `arwdDxtm`. A `*` after a
@@ -394,9 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn grant_gives_the_privileges_that_the_kind_of_relation_has() {
+    fn a_statement_names_the_privileges_that_the_kind_of_relation_has() {
         let letters = |kind, privileges: &[ast::Privilege]| {
-            Privileges::granted_on(kind, privileges).to_string()
+            Privileges::named_on(kind, privileges).to_string()
         };
         assert_eq!(
             letters(RelationKind::Table, &[ast::Privilege::All]),

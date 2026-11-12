@@ -85,8 +85,8 @@ pub fn check_statement_privileges(
                 Object::Schema(MAIN_SCHEMA_NAME.to_string()),
             )
         }
-        // The dialect decides who may grant on each relation, from the
-        // privileges it stores.
+        // The dialect decides who may grant or revoke on each relation, from
+        // the privileges it stores.
         ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
@@ -529,8 +529,8 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT`: the dialect stores the privileges with each relation, through
-/// its relation hooks, as it stores ownership.
+/// `GRANT` and `REVOKE`: the dialect changes the privileges it stores with
+/// each relation, through its relation hooks, as it stores ownership.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
@@ -565,6 +565,7 @@ pub fn translate_grant(
             continue;
         }
         changes.push(crate::CatalogChange::Grant {
+            revoke: grant.revoke,
             namespace: namespace.id,
             name: normalized_name,
             privileges: grant.privileges.clone(),
