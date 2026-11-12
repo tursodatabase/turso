@@ -5,6 +5,7 @@ mod classes;
 mod copy;
 mod error;
 mod functions;
+mod oid_alias;
 mod options;
 mod session;
 mod settings;

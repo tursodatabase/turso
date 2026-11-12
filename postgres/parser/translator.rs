@@ -8915,7 +8915,13 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 }
 
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
-const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range", "number_to_int2"];
+const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
+    "int8_out_of_range",
+    "number_to_int2",
+    "text_to_regclass",
+    "unknown_to_regclass",
+    "unknown_to_regnamespace",
+];
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
     match names {

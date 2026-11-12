@@ -2644,6 +2644,9 @@ mod tests {
             ("a::oid", PgType::Oid),
             ("a::pg_catalog.oid", PgType::Oid),
             ("'1'::OID", PgType::Oid),
+            ("a::regclass", PgType::Regclass),
+            ("a::oid::regclass", PgType::Regclass),
+            ("a::regclass::oid", PgType::Oid),
         ] {
             assert_eq!(type_from_t(expr), Some(expected), "{expr}");
         }
@@ -2652,6 +2655,7 @@ mod tests {
     #[test]
     fn comparisons_of_oid_are_boolean() {
         assert_eq!(type_from_t("a::oid = 5"), Some(PgType::Bool));
+        assert_eq!(type_from_t("a = 'x'::regclass"), Some(PgType::Bool));
     }
 
     #[test]
@@ -2688,6 +2692,11 @@ mod tests {
 
     #[test]
     fn casts_to_regnamespace_regproc_smallint_and_char_have_those_types() {
+        assert_eq!(
+            type_from_t("'pg_catalog'::regnamespace"),
+            Some(PgType::Regnamespace)
+        );
+        assert_eq!(type_from_t("a::pg_catalog.regproc"), Some(PgType::Regproc));
         assert_eq!(type_from_t("0::pg_catalog.int2"), Some(PgType::Int2));
     }
 

@@ -1,6 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::{parse_error_to_core, sqlstate_error};
+use crate::oid_alias::{regclass_of_input, regclass_of_name, regnamespace_of_input};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
@@ -91,6 +92,15 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "bigint out of range",
         ))?,
         "number_to_int2"(FunctionArity::Exact(1), true) => exec_number_to_int2(args[0].get_value())?,
+        "text_to_regclass"(FunctionArity::Exact(1), false) => {
+            exec_oid_alias_of(connection, args[0].get_value(), regclass_of_name)?
+        },
+        "unknown_to_regclass"(FunctionArity::Exact(1), false) => {
+            exec_oid_alias_of(connection, args[0].get_value(), regclass_of_input)?
+        },
+        "unknown_to_regnamespace"(FunctionArity::Exact(1), false) => {
+            exec_oid_alias_of(connection, args[0].get_value(), regnamespace_of_input)?
+        },
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -563,6 +573,18 @@ fn exec_number_to_int2(value: &Value) -> Result<Option<i64>> {
         ));
     }
     Ok(Some(rounded as i64))
+}
+
+fn exec_oid_alias_of(
+    conn: &Connection,
+    value: &Value,
+    alias_of: fn(&Connection, &str) -> Result<i64>,
+) -> Result<Option<i64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => alias_of(conn, text.as_str()).map(Some),
+        other => alias_of(conn, &other.to_string()).map(Some),
+    }
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {

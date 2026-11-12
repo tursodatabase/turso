@@ -439,6 +439,37 @@ fn stored_relation_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> O
     )
 }
 
+/// The oid of the relation that `pg_class` lists as `name` in `namespace`, or the view of that name: tables are found by their declared name.
+pub(crate) fn relation_oid_by_name(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Option<i64> {
+    let table = user_tables_with_oids(schema)
+        .into_iter()
+        .find(|(table_namespace, _, table, _)| {
+            *table_namespace == namespace
+                && matches!(table.as_ref(), Table::BTree(btree) if btree.declared_name == name)
+        })
+        .map(|(_, _, _, oid)| oid);
+    table
+        .or_else(|| {
+            catalog_indexes(schema)
+                .into_iter()
+                .find(|index| index.namespace == namespace && index.name == name)
+                .map(|index| index.oid)
+        })
+        .or_else(|| {
+            sequence_catalog_entries(schema)
+                .into_iter()
+                .find(|(_, sequence_namespace, sequence)| {
+                    *sequence_namespace == namespace && sequence.name == name
+                })
+                .map(|(oid, _, _)| oid)
+        })
+        .or_else(|| stored_relation_oid(schema, namespace, name))
+}
+
 /// The `pg_class.relowner` oid of relation `name`: its stored owner.
 fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i64 {
     match crate::classes::relation_owner(schema, namespace, name) {
@@ -778,6 +809,16 @@ impl SnapshotRows for PgDescriptionTable {
 
 /// The schemas that PostgreSQL always has, with their fixed OIDs.
 const BUILTIN_SCHEMAS: [(i64, &str); 2] = [(11, "pg_catalog"), (11394, "information_schema")];
+
+/// The oid of the schema `name` that pg_namespace lists, if there is one.
+pub(crate) fn namespace_oid_by_name(conn: &Connection, name: &str) -> Option<i64> {
+    if let Some((oid, _)) = BUILTIN_SCHEMAS.iter().find(|(_, schema)| *schema == name) {
+        return Some(*oid);
+    }
+    let schema = conn.current_schema();
+    let namespace = schema.namespace_named(name)?;
+    Some(namespace_oid(&schema, namespace))
+}
 
 /// Whether pg_namespace lists schema `name`: one of the schemas that
 /// PostgreSQL always has, or a namespace stored in the main database,

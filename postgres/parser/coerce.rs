@@ -22,6 +22,12 @@ pub enum PgType {
     Bytea,
     /// An object id, kept as an integer from 0 to 4294967295.
     Oid,
+    /// An oid that names a relation.
+    Regclass,
+    /// An oid that names a schema.
+    Regnamespace,
+    /// A reference to a function: the value passes as it is, whether it is an oid or a name.
+    Regproc,
     /// A string literal, NULL or parameter: its type comes from where it is used.
     Unknown,
     /// A type that has a name but no supported casts yet (date, uuid, an enum, ...). Lowercase name.
@@ -59,6 +65,9 @@ impl PgType {
             "bool" => PgType::Bool,
             "bytea" => PgType::Bytea,
             "oid" => PgType::Oid,
+            "regclass" => PgType::Regclass,
+            "regnamespace" => PgType::Regnamespace,
+            "regproc" => PgType::Regproc,
             _ => PgType::Other(spelled),
         }
     }
@@ -90,13 +99,13 @@ impl PgType {
     pub fn engine_type(&self) -> Option<ast::Type> {
         let name = match self {
             PgType::Int2 => "smallint",
-            PgType::Int4 | PgType::Oid => "INTEGER",
+            PgType::Int4 | PgType::Oid | PgType::Regclass | PgType::Regnamespace => "INTEGER",
             PgType::Int8 => "BIGINT",
             PgType::Float8 | PgType::Numeric => "REAL",
             PgType::Text => "TEXT",
             PgType::Bytea => "BLOB",
             PgType::Bool => "boolean",
-            PgType::Unknown | PgType::Other(_) => return None,
+            PgType::Regproc | PgType::Unknown | PgType::Other(_) => return None,
         };
         Some(ast::Type {
             name: name.to_string(),
@@ -124,7 +133,10 @@ impl PgType {
             | PgType::Int8
             | PgType::Float8
             | PgType::Numeric
-            | PgType::Oid => TypeCategory::Number,
+            | PgType::Oid
+            | PgType::Regclass
+            | PgType::Regnamespace
+            | PgType::Regproc => TypeCategory::Number,
             PgType::Text => TypeCategory::String,
             PgType::Bytea => TypeCategory::UserDefined,
             PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
@@ -132,7 +144,10 @@ impl PgType {
     }
 
     fn is_oid_alias(&self) -> bool {
-        matches!(self, PgType::Oid)
+        matches!(
+            self,
+            PgType::Oid | PgType::Regclass | PgType::Regnamespace | PgType::Regproc
+        )
     }
 
     fn is_preferred(&self) -> bool {
@@ -140,6 +155,14 @@ impl PgType {
             self,
             PgType::Bool | PgType::Float8 | PgType::Oid | PgType::Text
         )
+    }
+
+    fn unknown_reader(&self) -> Option<&'static str> {
+        match self {
+            PgType::Regclass => Some(UNKNOWN_TO_REGCLASS),
+            PgType::Regnamespace => Some(UNKNOWN_TO_REGNAMESPACE),
+            _ => None,
+        }
     }
 }
 
@@ -152,6 +175,9 @@ enum TypeCategory {
     Other,
 }
 
+const UNKNOWN_TO_REGCLASS: &str = "unknown_to_regclass";
+const UNKNOWN_TO_REGNAMESPACE: &str = "unknown_to_regnamespace";
+const TEXT_TO_REGCLASS: &str = "text_to_regclass";
 const NUMBER_TO_INT2: &str = "number_to_int2";
 
 impl fmt::Display for PgType {
@@ -166,6 +192,9 @@ impl fmt::Display for PgType {
             PgType::Text => "text",
             PgType::Bytea => "bytea",
             PgType::Oid => "oid",
+            PgType::Regclass => "regclass",
+            PgType::Regnamespace => "regnamespace",
+            PgType::Regproc => "regproc",
             PgType::Unknown => "unknown",
             PgType::Other(name) => name,
         };
@@ -306,7 +335,12 @@ fn coerce_from_unknown(
         _ if context == CastContext::Explicit && matches!(target, PgType::Other(_)) => {
             return Err(cast_not_supported(&PgType::Unknown, target))
         }
-        other => other,
+        other => match target.unknown_reader() {
+            Some(reader) if other != ast::Expr::Literal(ast::Literal::Null) => {
+                function_call(reader, vec![other])
+            }
+            _ => other,
+        },
     };
     Ok(wrap_if_explicit(converted, target, context))
 }
@@ -364,7 +398,9 @@ pub fn coerce_to_boolean(
 pub fn check_unary_operand(operator: &str, operand: Option<&PgType>) -> Result<(), ParseError> {
     match operand {
         None => Ok(()),
-        Some(ty @ (PgType::Text | PgType::Bool | PgType::Bytea | PgType::Oid)) => Err(error(
+        Some(
+            ty @ (PgType::Text | PgType::Bool | PgType::Bytea | PgType::Oid | PgType::Regclass),
+        ) => Err(error(
             SQLSTATE_UNDEFINED_FUNCTION,
             format!("operator does not exist: {operator} {ty}"),
         )),
@@ -464,7 +500,10 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
     use CastContext::{Assignment, Explicit, Implicit};
     use CastMethod::{EngineCast, Function, Nothing, RoundThenCast};
     use CastRule::{Allowed, NoCast, Unsupported};
-    use PgType::{Bool, Bytea, Float8, Int2, Int4, Int8, Numeric, Oid, Other, Text};
+    use PgType::{
+        Bool, Bytea, Float8, Int2, Int4, Int8, Numeric, Oid, Other, Regclass, Regnamespace,
+        Regproc, Text,
+    };
 
     match (source, target) {
         (Int2, Int4 | Int8) => Allowed(Implicit, Nothing),
@@ -498,6 +537,9 @@ fn cast_rule(source: &PgType, target: &PgType) -> CastRule {
         (alias, Int4 | Int8) if alias.is_oid_alias() => Allowed(Assignment, Nothing),
         (Oid, alias) | (alias, Oid) if alias.is_oid_alias() => Allowed(Implicit, Nothing),
         (Oid, Text) => Allowed(Assignment, EngineCast),
+        (Regclass | Regnamespace | Regproc, Text) => Unsupported(Assignment),
+        (Text, Regclass) => Allowed(Implicit, Function(TEXT_TO_REGCLASS)),
+        (Text, Regproc) => Allowed(Explicit, Nothing),
         (alias, Bool | Float8 | Numeric | Bytea) | (Bool | Float8 | Numeric | Bytea, alias)
             if alias.is_oid_alias() =>
         {
@@ -610,7 +652,9 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
     let text = unquote(quoted);
     let trimmed = text.trim();
     let literal = match target {
-        PgType::Text => return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string()))),
+        PgType::Text | PgType::Regproc => {
+            return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string())))
+        }
         PgType::Int2 => ast::Literal::Numeric(parse_int2(&text)?.to_string()),
         PgType::Int4 => ast::Literal::Numeric(parse_int4(&text)?.to_string()),
         PgType::Int8 => ast::Literal::Numeric(parse_int8(&text)?.to_string()),
@@ -619,6 +663,13 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
         PgType::Bool => return parse_bool(&text, trimmed).map(bool_literal),
         PgType::Bytea => parse_bytea(&text, trimmed)?,
         PgType::Oid => ast::Literal::Numeric(parse_oid(&text)?.to_string()),
+        PgType::Regclass | PgType::Regnamespace => {
+            let reader = target.unknown_reader().expect("an oid alias has a reader");
+            return Ok(function_call(
+                reader,
+                vec![ast::Expr::Literal(ast::Literal::String(quoted.to_string()))],
+            ));
+        }
         PgType::Unknown | PgType::Other(_) => {
             return Ok(ast::Expr::Literal(ast::Literal::String(quoted.to_string())))
         }
@@ -2730,7 +2781,9 @@ mod tests {
     fn oid_and_regclass_are_found_by_name_and_shown_by_name() {
         assert_eq!(PgType::from_name("oid"), PgType::Oid);
         assert_eq!(PgType::from_name("OID"), PgType::Oid);
+        assert_eq!(PgType::from_name("regclass"), PgType::Regclass);
         assert_eq!(PgType::Oid.to_string(), "oid");
+        assert_eq!(PgType::Regclass.to_string(), "regclass");
         assert_eq!(
             PgType::from_name("regtype"),
             PgType::Other("regtype".to_string())
@@ -2741,12 +2794,13 @@ mod tests {
     fn oid_and_regclass_are_stored_as_integers() {
         let integer = PgType::Int4.engine_type();
         assert_eq!(PgType::Oid.engine_type(), integer);
+        assert_eq!(PgType::Regclass.engine_type(), integer);
     }
 
     #[test]
     fn integers_convert_to_oid_and_regclass_without_changing_the_value() {
         for source in [PgType::Int4, PgType::Int8] {
-            for target in [PgType::Oid] {
+            for target in [PgType::Oid, PgType::Regclass] {
                 expect_expr(&source, &target, Implicit, "nothing");
             }
         }
@@ -2754,7 +2808,7 @@ mod tests {
 
     #[test]
     fn oid_and_regclass_convert_to_integers_only_on_assignment() {
-        for source in [PgType::Oid] {
+        for source in [PgType::Oid, PgType::Regclass] {
             for target in [PgType::Int4, PgType::Int8] {
                 expect_expr(&source, &target, Assignment, "nothing");
             }
@@ -2762,8 +2816,46 @@ mod tests {
     }
 
     #[test]
+    fn oid_and_regclass_convert_to_each_other_implicitly() {
+        expect_expr(&PgType::Oid, &PgType::Regclass, Implicit, "nothing");
+        expect_expr(&PgType::Regclass, &PgType::Oid, Implicit, "nothing");
+    }
+
+    #[test]
     fn oid_converts_to_text_only_on_assignment() {
         expect_expr(&PgType::Oid, &PgType::Text, Assignment, "cast");
+    }
+
+    #[test]
+    fn regclass_to_text_is_not_supported() {
+        assert_error(
+            convert(&PgType::Regclass, &PgType::Text, Implicit),
+            "42804",
+            "a value of type regclass cannot be used as text without a cast",
+        );
+        for context in [Assignment, Explicit] {
+            assert_error(
+                convert(&PgType::Regclass, &PgType::Text, context),
+                "0A000",
+                "a cast from regclass to text is not supported",
+            );
+        }
+    }
+
+    #[test]
+    fn text_converts_to_regclass_by_name_even_implicitly() {
+        for context in [Implicit, Assignment, Explicit] {
+            let converted = convert(&PgType::Text, &PgType::Regclass, context).unwrap();
+            let call = function_call("text_to_regclass", vec![number("5")]);
+            assert_eq!(
+                converted,
+                if context == Explicit {
+                    cast_to(call, &PgType::Regclass)
+                } else {
+                    call
+                }
+            );
+        }
     }
 
     #[test]
@@ -2783,7 +2875,7 @@ mod tests {
     #[test]
     fn oid_and_regclass_have_no_cast_to_or_from_boolean_float_numeric_or_bytea() {
         for other in [PgType::Bool, PgType::Float8, PgType::Numeric, PgType::Bytea] {
-            for special in [PgType::Oid] {
+            for special in [PgType::Oid, PgType::Regclass] {
                 for (source, target) in [
                     (special.clone(), other.clone()),
                     (other.clone(), special.clone()),
@@ -2867,8 +2959,53 @@ mod tests {
     }
 
     #[test]
+    fn unknown_values_read_as_regclass_through_one_function() {
+        let read = |expr: ast::Expr| function_call("unknown_to_regclass", vec![expr]);
+        for context in [Implicit, Assignment] {
+            assert_eq!(
+                coerce(
+                    string("pg_class"),
+                    Some(&PgType::Unknown),
+                    &PgType::Regclass,
+                    context
+                )
+                .unwrap(),
+                read(string("pg_class"))
+            );
+            assert_eq!(
+                coerce(
+                    variable(),
+                    Some(&PgType::Unknown),
+                    &PgType::Regclass,
+                    context
+                )
+                .unwrap(),
+                read(variable())
+            );
+            assert_eq!(
+                coerce(null(), Some(&PgType::Unknown), &PgType::Regclass, context).unwrap(),
+                null()
+            );
+        }
+        assert_eq!(
+            coerce(
+                string("5"),
+                Some(&PgType::Unknown),
+                &PgType::Regclass,
+                Explicit
+            )
+            .unwrap(),
+            cast_to(read(string("5")), &PgType::Regclass)
+        );
+        assert_eq!(
+            coerce(null(), Some(&PgType::Unknown), &PgType::Regclass, Explicit).unwrap(),
+            cast_to(null(), &PgType::Regclass)
+        );
+    }
+
+    #[test]
     fn a_sign_in_front_of_an_oid_or_regclass_does_not_exist() {
-        for ty in [PgType::Oid] {
+        for ty in [PgType::Oid, PgType::Regclass] {
             assert_error(
                 check_unary_operand("-", Some(&ty)).map(|()| null()),
                 "42883",
@@ -2892,6 +3029,22 @@ mod tests {
                 "{types:?}"
             );
         }
+    }
+
+    #[test]
+    fn common_type_of_oid_and_regclass_is_the_first_of_them() {
+        assert_eq!(
+            common_type(&[PgType::Oid, PgType::Regclass], "CASE").unwrap(),
+            PgType::Oid
+        );
+        assert_eq!(
+            common_type(&[PgType::Regclass, PgType::Oid], "CASE").unwrap(),
+            PgType::Regclass
+        );
+        assert_eq!(
+            common_type(&[PgType::Int4, PgType::Regclass], "CASE").unwrap(),
+            PgType::Regclass
+        );
     }
 
     #[test]
@@ -2919,6 +3072,11 @@ mod tests {
             common_type(&[PgType::Oid, PgType::Text], "CASE").map(|_| null()),
             "42804",
             "CASE types oid and text cannot be matched",
+        );
+        assert_error(
+            common_type(&[PgType::Regclass, PgType::Bool], "UNION").map(|_| null()),
+            "42804",
+            "UNION types regclass and boolean cannot be matched",
         );
     }
 
@@ -3003,7 +3161,7 @@ mod tests {
 
     #[test]
     fn comparison_of_oid_with_integers_and_regclass_converts_to_oid() {
-        for other in [PgType::Int4, PgType::Int8, PgType::Oid] {
+        for other in [PgType::Int4, PgType::Int8, PgType::Regclass, PgType::Oid] {
             let items = vec![
                 (number("1"), Some(PgType::Oid)),
                 (number("2"), Some(other.clone())),
@@ -3015,6 +3173,27 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    #[test]
+    fn comparison_of_regclass_reads_a_string_literal_as_an_oid() {
+        let items = vec![
+            (number("1"), Some(PgType::Regclass)),
+            (string("pg_class"), Some(PgType::Unknown)),
+        ];
+        assert_operand_error(
+            coerce_operands("=", OperatorKind::Comparison, items),
+            "22P02",
+            "invalid input syntax for type oid: \"pg_class\"",
+        );
+        let items = vec![
+            (number("1"), Some(PgType::Regclass)),
+            (number("2"), Some(PgType::Regclass)),
+        ];
+        assert_eq!(
+            coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+            vec![number("1"), number("2")]
+        );
     }
 
     #[test]
@@ -3094,16 +3273,20 @@ mod tests {
                 &format!("a value of type {source} cannot be used as smallint without a cast"),
             );
         }
-        for target in [PgType::Oid] {
+        for target in [PgType::Oid, PgType::Regclass] {
             expect_expr(&PgType::Int2, &target, Implicit, "nothing");
         }
+        assert_eq!(
+            convert(&PgType::Int2, &PgType::Regproc, Implicit).unwrap(),
+            number("5")
+        );
     }
 
     #[test]
     fn smallint_has_no_cast_to_or_from_boolean_bytea_or_an_oid_type() {
-        for other in [PgType::Bool, PgType::Bytea, PgType::Oid] {
+        for other in [PgType::Bool, PgType::Bytea, PgType::Oid, PgType::Regclass] {
             for (source, target) in [(PgType::Int2, other.clone()), (other.clone(), PgType::Int2)] {
-                if matches!(other, PgType::Oid) && source == PgType::Int2 {
+                if matches!(other, PgType::Oid | PgType::Regclass) && source == PgType::Int2 {
                     continue;
                 }
                 assert_error(
@@ -3153,6 +3336,109 @@ mod tests {
         assert_eq!(
             common_type(&[PgType::Int4, PgType::Int2], "CASE").unwrap(),
             PgType::Int4
+        );
+    }
+
+    fn expect_expr_without_cast(source: &PgType, target: &PgType, weakest: CastContext) {
+        assert_eq!(
+            convert(source, target, weakest).unwrap(),
+            number("5"),
+            "{source} to {target}"
+        );
+        let explicit = convert(source, target, Explicit).unwrap();
+        let wrapped = target.engine_type().is_some();
+        assert_eq!(
+            explicit,
+            if wrapped {
+                cast_to(number("5"), target)
+            } else {
+                number("5")
+            },
+            "{source} to {target} explicit"
+        );
+    }
+
+    #[test]
+    fn regnamespace_and_regproc_are_oid_aliases() {
+        assert_eq!(PgType::from_name("regnamespace"), PgType::Regnamespace);
+        assert_eq!(PgType::from_name("regproc"), PgType::Regproc);
+        assert_eq!(PgType::Regnamespace.to_string(), "regnamespace");
+        assert_eq!(PgType::Regproc.to_string(), "regproc");
+        assert_eq!(
+            PgType::Regnamespace.engine_type(),
+            PgType::Int4.engine_type()
+        );
+        assert_eq!(PgType::Regproc.engine_type(), None);
+        for alias in [PgType::Regnamespace, PgType::Regproc] {
+            expect_expr_without_cast(&PgType::Int4, &alias, Implicit);
+            expect_expr_without_cast(&alias, &PgType::Int8, Assignment);
+            expect_expr_without_cast(&PgType::Oid, &alias, Implicit);
+            expect_expr_without_cast(&alias, &PgType::Oid, Implicit);
+        }
+    }
+
+    #[test]
+    fn two_oid_aliases_other_than_oid_have_no_cast_between_them() {
+        assert_error(
+            convert(&PgType::Regclass, &PgType::Regproc, Explicit),
+            "42846",
+            "cannot cast type regclass to regproc",
+        );
+        assert_error(
+            convert(&PgType::Regnamespace, &PgType::Regclass, Implicit),
+            "42804",
+            "a value of type regnamespace cannot be used as regclass without a cast",
+        );
+    }
+
+    #[test]
+    fn unknown_values_read_as_regnamespace_through_one_function() {
+        let read = |expr: ast::Expr| function_call("unknown_to_regnamespace", vec![expr]);
+        assert_eq!(
+            coerce(
+                string("pg_catalog"),
+                Some(&PgType::Unknown),
+                &PgType::Regnamespace,
+                Implicit
+            )
+            .unwrap(),
+            read(string("pg_catalog"))
+        );
+        assert_eq!(
+            coerce(
+                variable(),
+                Some(&PgType::Unknown),
+                &PgType::Regnamespace,
+                Assignment
+            )
+            .unwrap(),
+            read(variable())
+        );
+    }
+
+    #[test]
+    fn text_converts_to_regproc_only_with_an_explicit_cast() {
+        assert_eq!(
+            convert(&PgType::Text, &PgType::Regproc, Explicit).unwrap(),
+            number("5")
+        );
+        assert_error(
+            convert(&PgType::Text, &PgType::Regproc, Assignment),
+            "42804",
+            "a value of type text cannot be used as regproc without a cast",
+        );
+        assert_error(
+            convert(&PgType::Regproc, &PgType::Text, Assignment),
+            "0A000",
+            "a cast from regproc to text is not supported",
+        );
+    }
+
+    #[test]
+    fn a_string_literal_stays_a_string_for_regproc() {
+        assert_eq!(
+            convert_text("bthandler", &PgType::Regproc).unwrap(),
+            string("bthandler")
         );
     }
 
