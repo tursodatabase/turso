@@ -1,3 +1,4 @@
+use crate::table_function::one_argument_best_index;
 use std::sync::Arc;
 use turso_core::{
     array_values_from_any,
@@ -5,9 +6,7 @@ use turso_core::{
     types::IOResultOr,
     Connection, IOResult, LimboError, Result, Value,
 };
-use turso_ext::{
-    ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
-};
+use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode};
 
 #[derive(Debug)]
 pub(crate) struct Unnest;
@@ -44,21 +43,7 @@ impl VirtualTable for Unnest {
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
-        let input = constraints
-            .iter()
-            .position(|c| c.column_index == 1 && c.op == ConstraintOp::Eq && c.usable)
-            .ok_or(ResultCode::ConstraintViolation)?;
-        Ok(IndexInfo {
-            constraint_usages: (0..constraints.len())
-                .map(|i| ConstraintUsage {
-                    argv_index: (i == input).then_some(1),
-                    omit: i == input,
-                })
-                .collect(),
-            estimated_cost: 1.0,
-            estimated_rows: 10,
-            ..Default::default()
-        })
+        one_argument_best_index(constraints, 1, 10)
     }
 }
 

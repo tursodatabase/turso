@@ -6,15 +6,14 @@ use std::sync::Arc;
 use turso_core::{
     namespace::{mangle_name, NamespaceRef},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::SEQ_BACKING_TABLE_PREFIX,
+    sequence_backing_table_name,
     types::IOResultOr,
     Connection, IOResult, LimboError, Result, Statement, Value, MAIN_DB_ID,
 };
-use turso_ext::{
-    ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
-};
+use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode};
 
 use crate::catalog::sequence_catalog_entries;
+use crate::table_function::one_argument_best_index;
 
 const SEQUENCE_OID_COLUMN: usize = 3;
 
@@ -58,23 +57,7 @@ impl VirtualTable for PgGetSequenceData {
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
-        let input = constraints.iter().position(|c| {
-            c.column_index == SEQUENCE_OID_COLUMN as u32 && c.op == ConstraintOp::Eq && c.usable
-        });
-        let Some(input) = input else {
-            return Err(ResultCode::ConstraintViolation);
-        };
-        Ok(IndexInfo {
-            constraint_usages: (0..constraints.len())
-                .map(|i| ConstraintUsage {
-                    argv_index: (i == input).then_some(1),
-                    omit: i == input,
-                })
-                .collect(),
-            estimated_cost: 1.0,
-            estimated_rows: 1,
-            ..Default::default()
-        })
+        one_argument_best_index(constraints, SEQUENCE_OID_COLUMN as u32, 1)
     }
 }
 
@@ -179,10 +162,7 @@ impl SequenceDataCursor {
         if !self.conn.may_read_sequence(namespace_ref, &sequence.name) {
             return None;
         }
-        let backing_table = format!(
-            "{SEQ_BACKING_TABLE_PREFIX}{}",
-            mangle_name(namespace, &sequence.name)
-        );
+        let backing_table = sequence_backing_table_name(&mangle_name(namespace, &sequence.name));
         // Every nextval adds a row keyed by its value, so the current one is
         // the highest value of an ascending sequence and the lowest of a
         // descending one.
