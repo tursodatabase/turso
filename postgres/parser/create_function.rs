@@ -5,11 +5,12 @@
 //! tursopg does not support, so that each feature can be enabled on its own.
 
 use crate::cmdtag::CommandTag;
-use crate::names::{extract_key_columns, is_default_schema, object_name};
+use crate::names::{is_default_schema, object_name};
 use crate::sqlstate::{
     SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_OBJECT,
 };
+use crate::type_names::{built_in_type, schema_and_name, type_name_text, BuiltInType};
 use crate::{FunctionTypeUse, ParseError};
 use pg_query::protobuf::{
     node::Node, CreateFunctionStmt, DefElem, FunctionParameter, FunctionParameterMode, TypeName,
@@ -516,30 +517,17 @@ fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
     if type_name.pct_type {
         return Ok(TypeClass::ColumnType);
     }
-    let names = extract_key_columns(&type_name.names)?;
-    let (schema, name) = match names.as_slice() {
-        [name] => (None, name),
-        [schema, name] => (Some(schema), name),
-        _ => return Err(ParseError::not_supported("a cross-database reference")),
-    };
-    let is_built_in_schema = schema.is_none_or(|schema| schema == "pg_catalog");
-    let class = if !is_built_in_schema {
-        None
-    } else if POLYMORPHIC_TYPES.contains(&name.as_str()) {
-        Some(TypeClass::Polymorphic(name.clone()))
-    } else if name == "any" {
+    let (schema, name) = schema_and_name(type_name)?;
+    let class = built_in_type(schema, name).map(|kind| match kind {
+        BuiltInType::Base => TypeClass::Base,
+        BuiltInType::Polymorphic => TypeClass::Polymorphic(name.to_string()),
         // "any" is a keyword, so PostgreSQL quotes it.
-        Some(TypeClass::Pseudo("\"any\"".to_string()))
-    } else if PSEUDO_TYPES.contains(&name.as_str()) {
-        Some(TypeClass::Pseudo(name.clone()))
-    } else if BASE_TYPES.contains(&name.as_str()) {
-        Some(TypeClass::Base)
-    } else {
-        None
-    };
+        BuiltInType::Pseudo if name == "any" => TypeClass::Pseudo("\"any\"".to_string()),
+        BuiltInType::Pseudo => TypeClass::Pseudo(name.to_string()),
+    });
     let not_built_in = TypeClass::NotBuiltIn {
-        schema: schema.cloned(),
-        name: name.clone(),
+        schema: schema.map(str::to_string),
+        name: name.to_string(),
     };
     if type_name.array_bounds.is_empty() {
         return Ok(class.unwrap_or(not_built_in));
@@ -554,140 +542,3 @@ fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
         _ => not_built_in,
     })
 }
-
-/// The type name as PostgreSQL writes it in an error about a type that does
-/// not exist, such as `public.nosuch[]`.
-fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
-    let mut text = extract_key_columns(&type_name.names)?.join(".");
-    for _ in &type_name.array_bounds {
-        text.push_str("[]");
-    }
-    Ok(text)
-}
-
-// FIXME: the three lists that follow are written by hand, and they must
-// follow the PostgreSQL version of pg_query. They are also one of three
-// places that say what a type name is. The FIXME in
-// postgres/frontend/pg_type.rs gives the plan for one type lookup.
-
-/// The types that stand for the types of a function's arguments.
-const POLYMORPHIC_TYPES: &[&str] = &[
-    "anyelement",
-    "anyarray",
-    "anynonarray",
-    "anyenum",
-    "anyrange",
-    "anymultirange",
-    "anycompatible",
-    "anycompatiblearray",
-    "anycompatiblenonarray",
-    "anycompatiblerange",
-    "anycompatiblemultirange",
-];
-
-/// The pseudo-types that are not polymorphic.
-const PSEUDO_TYPES: &[&str] = &[
-    "any",
-    "cstring",
-    "internal",
-    "language_handler",
-    "fdw_handler",
-    "table_am_handler",
-    "index_am_handler",
-    "tsm_handler",
-    "record",
-    "trigger",
-    "event_trigger",
-    "pg_ddl_command",
-    "void",
-    "unknown",
-];
-
-/// The built-in base, range and multirange types, by the names pg_query
-/// gives them: `int` is `int4` and `double precision` is `float8`, for
-/// example.
-const BASE_TYPES: &[&str] = &[
-    "bool",
-    "int2",
-    "int4",
-    "int8",
-    "float4",
-    "float8",
-    "numeric",
-    "money",
-    "text",
-    "varchar",
-    "bpchar",
-    "char",
-    "name",
-    "bytea",
-    "uuid",
-    "date",
-    "time",
-    "timetz",
-    "timestamp",
-    "timestamptz",
-    "interval",
-    "json",
-    "jsonb",
-    "xml",
-    "inet",
-    "cidr",
-    "macaddr",
-    "macaddr8",
-    "bit",
-    "varbit",
-    "oid",
-    "regclass",
-    "regtype",
-    "regproc",
-    "regprocedure",
-    "regnamespace",
-    "regrole",
-    "point",
-    "line",
-    "lseg",
-    "box",
-    "path",
-    "polygon",
-    "circle",
-    "tsvector",
-    "tsquery",
-    "gtsvector",
-    "jsonpath",
-    "refcursor",
-    "aclitem",
-    "int2vector",
-    "oidvector",
-    "tid",
-    "xid",
-    "xid8",
-    "cid",
-    "pg_lsn",
-    "pg_snapshot",
-    "txid_snapshot",
-    "regoper",
-    "regoperator",
-    "regconfig",
-    "regdictionary",
-    "regcollation",
-    "regdatabase",
-    "pg_node_tree",
-    "pg_ndistinct",
-    "pg_dependencies",
-    "pg_mcv_list",
-    "pg_brin_bloom_summary",
-    "pg_brin_minmax_multi_summary",
-    "int4range",
-    "int8range",
-    "numrange",
-    "daterange",
-    "tsrange",
-    "tstzrange",
-    "int4multirange",
-    "int8multirange",
-    "nummultirange",
-    "datemultirange",
-    "tsmultirange",
-    "tstzmultirange",
-];

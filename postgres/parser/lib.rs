@@ -9,6 +9,7 @@ use thiserror::Error;
 
 pub mod sqlstate;
 pub mod translator;
+mod type_names;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
