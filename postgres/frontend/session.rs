@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
@@ -2364,10 +2365,14 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
             tables.push(name.to_string());
         }
     }
+    let owned_sequences: HashSet<String> = tables
+        .iter()
+        .flat_map(|table| crate::classes::sequences_owned_by_table(&current, namespace, table))
+        .collect();
     let mut sequences: Vec<String> = current
         .sequences_by_name(namespace)
         .keys()
-        .filter(|name| is_user_object(name))
+        .filter(|name| is_user_object(name) && !owned_sequences.contains(*name))
         .cloned()
         .collect();
     views.sort();

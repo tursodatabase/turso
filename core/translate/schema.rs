@@ -2493,11 +2493,27 @@ pub fn translate_drop_table(
 
     // Dropping a table also drops its indexes, the automatic ones among
     // them, so the dialect hears about all of them.
+    let owned_sequences = if table.btree().is_some() {
+        resolver.catalog.dialect.sequences_owned_by_table(
+            resolver.schema(),
+            namespace.id,
+            &normalize_ident(name),
+        )
+    } else {
+        Vec::new()
+    };
     if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![CatalogChange::Drop {
+        let mut changes: Vec<_> = owned_sequences
+            .iter()
+            .map(|sequence| CatalogChange::Drop {
+                namespace: namespace.id,
+                name: sequence.clone(),
+            })
+            .collect();
+        changes.push(CatalogChange::Drop {
             namespace: namespace.id,
             name: normalize_ident(name),
-        }];
+        });
         changes.extend(indices.iter().map(|index| CatalogChange::Drop {
             namespace: namespace.id,
             name: index.name.clone(),
@@ -2918,6 +2934,12 @@ pub fn translate_drop_table(
             resolver,
             NamespaceRef::root_of(database_id),
             &seq_name,
+        )?;
+    }
+
+    for sequence in &owned_sequences {
+        crate::translate::sequence::emit_drop_sequence_cleanup(
+            program, resolver, namespace, sequence,
         )?;
     }
 

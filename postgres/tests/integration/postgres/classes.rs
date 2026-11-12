@@ -495,7 +495,7 @@ fn capture_data_changes_is_refused_under_the_postgres_dialect() {
 }
 
 #[test]
-fn dropping_a_table_releases_the_sequences_it_owned() {
+fn dropping_a_table_drops_the_sequences_it_owned() {
     let db = TempDatabase::builder().build();
     let pg = db.connect_postgres();
     pg.execute("CREATE ROLE alice").unwrap();
@@ -505,10 +505,12 @@ fn dropping_a_table_releases_the_sequences_it_owned() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("cannot change owner of sequence"), "{error}");
-    // Turso keeps the sequence of a dropped table, unlike PostgreSQL, so it
-    // becomes a sequence of its own.
     pg.execute("DROP TABLE d").unwrap();
-    pg.execute("ALTER SEQUENCE d_x_seq OWNER TO alice").unwrap();
+    let error = pg
+        .execute("ALTER SEQUENCE d_x_seq OWNER TO alice")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
 }
 
 /// The stored access control list of `relname`, as `pg_class.relacl` shows
