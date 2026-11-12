@@ -24,7 +24,8 @@
 //! Oids start at 16384, PostgreSQL's `FirstNormalObjectId`, and are never
 //! reused inside one database, even after the relation is dropped: the
 //! highest oid ever used is kept in `sqlite_sequence` under the catalog's
-//! own name, like an AUTOINCREMENT table's watermark.
+//! own name, like an AUTOINCREMENT table's watermark. Row-level security
+//! policies take their oids from the same counter.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -53,7 +54,7 @@ use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
-use crate::policies;
+use crate::policies::{self, TablePolicies};
 use crate::roles::{
     schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
 };
@@ -152,7 +153,7 @@ pub(crate) struct RelationClass {
     /// Whether the table has row-level security.
     pub(crate) relrowsecurity: bool,
     /// The table's row-level security policies.
-    pub(crate) relpolicies: Vec<RowPolicy>,
+    pub(crate) relpolicies: TablePolicies,
 }
 
 /// The class rows of a database, loaded as the engine's opaque dialect
@@ -244,7 +245,7 @@ impl ClassCatalog {
                     relownedby: 0,
                     relacl: None,
                     relrowsecurity: false,
-                    relpolicies: Vec::new(),
+                    relpolicies: TablePolicies::default(),
                 });
             }
             CatalogChange::Drop { namespace, name } => {
@@ -416,7 +417,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 _ => return Err(corrupt_row(row)),
             };
             let relpolicies = match relpolicies {
-                Value::Null => Vec::new(),
+                Value::Null => TablePolicies::default(),
                 Value::Text(text) => {
                     policies::parse(text.as_str()).ok_or_else(|| corrupt_row(row))?
                 }
@@ -586,9 +587,9 @@ fn read_back_acl(value: &Value) -> turso_core::Result<Option<Acl>> {
     }
 }
 
-fn read_back_policies(value: &Value) -> turso_core::Result<Vec<RowPolicy>> {
+fn read_back_policies(value: &Value) -> turso_core::Result<TablePolicies> {
     match value {
-        Value::Null => Ok(Vec::new()),
+        Value::Null => Ok(TablePolicies::default()),
         Value::Text(text) => policies::parse(text.as_str()).ok_or_else(|| {
             LimboError::InternalError(format!(
                 "the relation change read back invalid policies {text:?}"
@@ -618,9 +619,12 @@ pub(crate) fn translate_catalog_changes(
     connection: &Arc<Connection>,
     changes: &[CatalogChange],
 ) -> turso_core::Result<()> {
-    let allocates_oids = changes
-        .iter()
-        .any(|change| matches!(change, CatalogChange::Create { .. }));
+    let allocates_oids = changes.iter().any(|change| {
+        matches!(
+            change,
+            CatalogChange::Create { .. } | CatalogChange::CreatePolicy { .. }
+        )
+    });
     let changes_owner_or_privileges = changes.iter().any(|change| {
         matches!(
             change,
@@ -900,11 +904,7 @@ pub(crate) fn translate_catalog_changes(
             } => {
                 let class = table_class(schema, *namespace, name)?;
                 let policy_name = policy.policy_name.as_str();
-                if class
-                    .relpolicies
-                    .iter()
-                    .any(|existing| existing.name == policy_name)
-                {
+                if class.relpolicies.contains(policy_name) {
                     return Err(sqlstate_error(
                         SQLSTATE_DUPLICATE_OBJECT,
                         format!("policy \"{policy_name}\" for table \"{name}\" already exists"),
@@ -915,20 +915,20 @@ pub(crate) fn translate_catalog_changes(
                     .iter()
                     .map(|role| resolve_policy_role(schema, connection, role))
                     .collect::<turso_core::Result<Vec<_>>>()?;
-                let mut relpolicies = class.relpolicies.clone();
-                relpolicies.push(RowPolicy {
-                    name: policy_name.to_string(),
-                    permissive: policy.permissive,
-                    command: policy.command,
-                    roles,
-                    using_expr: policy.using_expr.as_deref().cloned(),
-                    check_expr: policy.check_expr.as_deref().cloned(),
-                });
-                let stored = policies::stored_text(&relpolicies);
+                let (before_oid, after_oid) =
+                    class.relpolicies.stored_text_around_new_oid(RowPolicy {
+                        name: policy_name.to_string(),
+                        permissive: policy.permissive,
+                        command: policy.command,
+                        roles,
+                        using_expr: policy.using_expr.as_deref().cloned(),
+                        check_expr: policy.check_expr.as_deref().cloned(),
+                    });
                 // The catalog reads the conditions back from the stored form,
                 // so a condition that does not read back is refused here
                 // rather than leaving a database that cannot be opened.
-                if policies::parse(&stored).is_none() {
+                let some_oid = FIRST_NORMAL_OBJECT_ID;
+                if policies::parse(&format!("{before_oid}{some_oid}{after_oid}")).is_none() {
                     return Err(LimboError::ParseError(format!(
                         "the conditions of policy \"{policy_name}\" cannot be stored"
                     )));
@@ -938,7 +938,10 @@ pub(crate) fn translate_catalog_changes(
                     &cursors,
                     *namespace,
                     name,
-                    Some(stored),
+                    StoredPolicies::WithNewOid {
+                        before_oid,
+                        after_oid,
+                    },
                     change,
                 );
             }
@@ -949,11 +952,7 @@ pub(crate) fn translate_catalog_changes(
                 if_exists,
             } => {
                 let class = table_class(schema, *namespace, name)?;
-                if !class
-                    .relpolicies
-                    .iter()
-                    .any(|existing| existing.name == *policy_name)
-                {
+                if !class.relpolicies.contains(policy_name) {
                     if *if_exists {
                         continue;
                     }
@@ -962,13 +961,12 @@ pub(crate) fn translate_catalog_changes(
                         format!("policy \"{policy_name}\" for table \"{name}\" does not exist"),
                     ));
                 }
-                let relpolicies: Vec<RowPolicy> = class
-                    .relpolicies
-                    .iter()
-                    .filter(|existing| existing.name != *policy_name)
-                    .cloned()
-                    .collect();
-                let stored = (!relpolicies.is_empty()).then(|| policies::stored_text(&relpolicies));
+                let relpolicies = class.relpolicies.without(policy_name);
+                let stored = if relpolicies.is_empty() {
+                    StoredPolicies::None
+                } else {
+                    StoredPolicies::Text(relpolicies.stored_text())
+                };
                 emit_class_row_set_policies(program, &cursors, *namespace, name, stored, change);
             }
             CatalogChange::CreateRole { .. } => {
@@ -1173,37 +1171,7 @@ fn emit_class_row_insert(
     if !is_user_relation_name(kind, name) {
         return;
     }
-    let seq_cursor_id = cursors
-        .seq_cursor_id
-        .expect("the caller opened the cursors with allocates_oids");
-
-    // oid = max(largest oid in the table + 1, highest oid ever used + 1,
-    // FIRST_NORMAL_OBJECT_ID), so an oid is never reused even after the
-    // relation with the largest oid is dropped.
-    let watermark_reg = emit_read_oid_watermark(program, seq_cursor_id);
-    let oid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cursors.table_cursor_id,
-        rowid_reg: oid_reg,
-        prev_largest_reg: 0,
-    });
-    let floor_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        value: FIRST_NORMAL_OBJECT_ID - 1,
-        dest: floor_reg,
-    });
-    program.emit_insn(Insn::MemMax {
-        dest_reg: watermark_reg,
-        src_reg: floor_reg,
-    });
-    program.emit_insn(Insn::AddImm {
-        register: watermark_reg,
-        value: 1,
-    });
-    program.emit_insn(Insn::MemMax {
-        dest_reg: oid_reg,
-        src_reg: watermark_reg,
-    });
+    let oid_reg = emit_allocate_oid(program, cursors);
 
     emit_class_name_index_insert(program, cursors, namespace, name, oid_reg);
 
@@ -1265,17 +1233,6 @@ fn emit_class_row_insert(
         table_name: CLASSES_TABLE_NAME.to_string(),
     });
 
-    emit_sqlite_sequence_row_write(
-        program,
-        cursors
-            .seq_table
-            .clone()
-            .expect("the caller opened the cursors with allocates_oids"),
-        MAIN_DB_ID,
-        CLASSES_TABLE_NAME,
-        oid_reg,
-    );
-
     program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
         change: Box::new(CatalogChange::Create {
@@ -1286,6 +1243,54 @@ fn emit_class_row_insert(
         }),
         value_regs: vec![oid_reg, first_column_reg + 4],
     });
+}
+
+/// Puts the next oid in the returned register and records it as the
+/// highest oid ever used.
+fn emit_allocate_oid(program: &mut ProgramBuilder, cursors: &ClassTableCursors) -> usize {
+    let seq_cursor_id = cursors
+        .seq_cursor_id
+        .expect("the caller opened the cursors with allocates_oids");
+
+    // oid = max(largest oid in the table + 1, highest oid ever used + 1,
+    // FIRST_NORMAL_OBJECT_ID), so an oid is never reused even after the
+    // relation or policy with the largest oid is dropped.
+    let watermark_reg = emit_read_oid_watermark(program, seq_cursor_id);
+    let oid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cursors.table_cursor_id,
+        rowid_reg: oid_reg,
+        prev_largest_reg: 0,
+    });
+    let floor_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: FIRST_NORMAL_OBJECT_ID - 1,
+        dest: floor_reg,
+    });
+    program.emit_insn(Insn::MemMax {
+        dest_reg: watermark_reg,
+        src_reg: floor_reg,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: watermark_reg,
+        value: 1,
+    });
+    program.emit_insn(Insn::MemMax {
+        dest_reg: oid_reg,
+        src_reg: watermark_reg,
+    });
+
+    emit_sqlite_sequence_row_write(
+        program,
+        cursors
+            .seq_table
+            .clone()
+            .expect("the caller opened the cursors with allocates_oids"),
+        MAIN_DB_ID,
+        CLASSES_TABLE_NAME,
+        oid_reg,
+    );
+    oid_reg
 }
 
 /// Makes the table with oid `table_oid` the owner of relation `name` of
@@ -1483,27 +1488,65 @@ fn emit_class_row_set_row_security(
     });
 }
 
+/// What a statement stores in `relpolicies`.
+enum StoredPolicies {
+    /// NULL, for no policies.
+    None,
+    Text(String),
+    /// The stored form of policies, one of which is new and gets the next
+    /// oid, which goes between the two parts.
+    WithNewOid {
+        before_oid: String,
+        after_oid: String,
+    },
+}
+
 /// Sets `relpolicies` of the class row of table `name` of `namespace` to
-/// `stored`, NULL for no policies, as `change` says.
+/// `stored`, as `change` says.
 fn emit_class_row_set_policies(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
     namespace: NamespaceId,
     name: &str,
-    stored: Option<String>,
+    stored: StoredPolicies,
     change: &CatalogChange,
 ) {
     let policies_reg = program.alloc_register();
     match stored {
-        Some(stored) => program.emit_insn(Insn::String8 {
-            value: stored,
-            dest: policies_reg,
-        }),
-        None => program.emit_insn(Insn::Null {
-            dest: policies_reg,
-            dest_end: None,
-        }),
-    };
+        StoredPolicies::None => {
+            program.emit_insn(Insn::Null {
+                dest: policies_reg,
+                dest_end: None,
+            });
+        }
+        StoredPolicies::Text(text) => {
+            program.emit_insn(Insn::String8 {
+                value: text,
+                dest: policies_reg,
+            });
+        }
+        StoredPolicies::WithNewOid {
+            before_oid,
+            after_oid,
+        } => {
+            let oid_reg = emit_allocate_oid(program, cursors);
+            program.emit_insn(Insn::String8 {
+                value: before_oid,
+                dest: policies_reg,
+            });
+            program.emit_insn(Insn::Concat {
+                lhs: policies_reg,
+                rhs: oid_reg,
+                dest: policies_reg,
+            });
+            let after_oid_reg = program.emit_string8_new_reg(after_oid);
+            program.emit_insn(Insn::Concat {
+                lhs: policies_reg,
+                rhs: after_oid_reg,
+                dest: policies_reg,
+            });
+        }
+    }
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
