@@ -305,6 +305,7 @@ fn keyword_requires_quoting(ident: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn returns_rows_is_true_only_for_statements_that_send_rows() {
@@ -460,6 +461,52 @@ mod tests {
         for sql in queries {
             let result = parse(sql);
             assert!(result.is_ok(), "Failed to parse: {sql}");
+        }
+    }
+
+    #[test]
+    fn expression_casts_are_built_only_in_coerce_rs() {
+        let pattern = ["Expr::Cast", " {"].concat();
+        let pattern_matched_not_built = [("frontend/statement.rs", 1)];
+        let never_compiled = ["parser/parser.rs"];
+        let postgres_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for directory in ["parser", "frontend"] {
+            collect_rust_files(&postgres_dir.join(directory), &mut files);
+        }
+        let mut wrong = Vec::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(&postgres_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == "parser/coerce.rs" || never_compiled.contains(&relative.as_str()) {
+                continue;
+            }
+            let found = std::fs::read_to_string(&file)
+                .unwrap()
+                .matches(&pattern)
+                .count();
+            let expected = pattern_matched_not_built
+                .iter()
+                .find(|(name, _)| *name == relative)
+                .map_or(0, |(_, count)| *count);
+            if found != expected {
+                wrong.push(format!("{relative}: found {found}, expected {expected}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{pattern} outside coerce.rs: {wrong:?}");
+    }
+
+    fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
         }
     }
 }
