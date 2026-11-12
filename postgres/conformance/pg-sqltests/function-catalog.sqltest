@@ -1244,6 +1244,21 @@ expect @tursopg error {
     a function with the name of the built-in function "to_hex" is not supported
 }
 
+# array_overlaps is another name of the built-in function array_overlap of
+# tursopg. PostgreSQL has no function with this name. tursopg would call its
+# built-in function.
+test function-with-another-name-of-a-built-in-function-of-tursopg {
+    CREATE FUNCTION array_overlaps(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT 42$$;
+    SELECT array_overlaps(1, 2);
+}
+expect {
+    42
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name of the built-in function "array_overlaps" is not supported
+}
+
 # generate_series is a function of PostgreSQL that returns a set. tursopg has
 # it as a table function, which pg_proc of tursopg does not show.
 test function-with-the-name-of-a-built-in-set-returning-function {

@@ -764,14 +764,30 @@ pub(crate) fn search_path_namespaces(connection: &Connection) -> Vec<NamespaceId
 /// functions that tursopg does not have, and the functions that the
 /// translator replaces with another expression, such as `int4(x)`.
 pub(crate) fn is_built_in_function(connection: &Connection, name: &str) -> bool {
-    turso_core::Func::builtin_function_list()
-        .iter()
-        .any(|function| function.name.eq_ignore_ascii_case(name))
+    is_engine_function(name)
         || connection
             .get_syms_functions()
             .iter()
             .any(|(function_name, ..)| function_name.eq_ignore_ascii_case(name))
         || is_postgres_built_in_function(name)
+}
+
+/// Whether the engine has a function `name`, for some number of arguments.
+fn is_engine_function(name: &str) -> bool {
+    // The list has one name for each function and each number of arguments.
+    let is_listed = turso_core::Func::builtin_function_list()
+        .iter()
+        .any(|function| function.name.eq_ignore_ascii_case(name));
+    // The lookup of a call also finds the other names of a function, such
+    // as `array_overlaps` for `array_overlap`. An error means that the
+    // engine has the function, but not for this number of arguments.
+    let is_found_by_a_call = (0..=2).any(|argument_count| {
+        !matches!(
+            turso_core::Func::resolve_function(name, argument_count),
+            Ok(None)
+        )
+    });
+    is_listed || is_found_by_a_call
 }
 
 /// Whether tursopg has a built-in table or table function `name`: a table
