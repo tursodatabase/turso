@@ -123,6 +123,33 @@ fn test_copy_from_with_columns(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_copy_from_writes_always_identity_values(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (id bigint GENERATED ALWAYS AS IDENTITY, v text)")
+        .unwrap();
+
+    let named = write_temp_file("10\ta\n");
+    conn.execute(format!("COPY t (id, v) FROM '{}'", named.path().display()))
+        .unwrap();
+    let positional = write_temp_file("11\tb\n");
+    conn.execute(format!("COPY t FROM '{}'", positional.path().display()))
+        .unwrap();
+    conn.execute("INSERT INTO t (v) VALUES ('c')").unwrap();
+    assert!(conn
+        .execute("INSERT INTO t (id, v) VALUES (12, 'd')")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot insert a non-DEFAULT value into column \"id\""));
+
+    let rows = query_all(&conn, "SELECT id, v FROM t ORDER BY v");
+    assert_eq!(rows.len(), 3);
+    assert_int(&rows[0][0], 10);
+    assert_int(&rows[1][0], 11);
+    assert_int(&rows[2][0], 1);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_copy_from_file_not_found(db: TempDatabase) {
     let conn = db.connect_postgres();
 
