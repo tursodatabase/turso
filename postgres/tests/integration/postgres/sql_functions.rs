@@ -452,12 +452,12 @@ fn a_parameter_in_many_nested_in_lists_of_rows_is_used_more_than_once() {
     ))
     .unwrap();
 
-    let error = pg.execute("SELECT nested(true)").unwrap_err();
+    let error = pg.execute("SELECT nested(random() < 2)").unwrap_err();
     assert_eq!(error.sqlstate, "0A000");
     assert_eq!(
         error.to_string(),
-        "a call of function \"nested\", whose body uses a parameter more than once, is not \
-         supported"
+        "a call of function \"nested\" with a volatile argument or a subquery that the body uses \
+         more than once is not supported"
     );
 }
 

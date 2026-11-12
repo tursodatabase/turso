@@ -177,11 +177,14 @@ impl<'a> Expansion<'a> {
 
         let use_counts = parameter_use_counts(&inlined.result, args.len())?;
         // PostgreSQL does not inline a function that would compute a
-        // volatile or an expensive argument more than once. tursopg cannot
-        // tell such an argument yet.
-        if use_counts.iter().any(|use_count| *use_count > 1) {
+        // volatile argument or a subquery more than once.
+        let has_volatile_copies = args.iter().zip(&use_counts).any(|(argument, use_count)| {
+            *use_count > 1 && has_subquery_or_volatile_call(self.built_in_functions, argument)
+        });
+        if has_volatile_copies {
             return Err(not_supported(format!(
-                "a call of function \"{name}\", whose body uses a parameter more than once,"
+                "a call of function \"{name}\" with a volatile argument or a subquery that the \
+                 body uses more than once"
             )));
         }
         // The expression has no place for the argument of a parameter that
@@ -211,13 +214,20 @@ impl<'a> Expansion<'a> {
             return Err(stack_depth_limit_exceeded());
         }
         // PostgreSQL computes an argument that is a constant before it
-        // inlines the function. Thus an argument that fails is an error
-        // also when the body does not compute its parameter. tursopg
-        // computes the argument where the expression has it.
+        // inlines the function. It also computes an argument before the
+        // call when it does not inline the function, which it does for an
+        // expensive argument that the body uses more than once. tursopg
+        // does not know the cost that PostgreSQL gives to an argument,
+        // because the cost depends on the types. Thus an argument that
+        // fails can be an error in PostgreSQL also when the body does not
+        // compute its parameter. tursopg computes the argument where the
+        // expression has it.
         let has_argument_that_can_be_skipped =
             args.iter().zip(&use_counts).any(|(argument, use_count)| {
+                let can_be_computed_before_the_call =
+                    *use_count > 1 || is_constant(self.built_in_functions, argument);
                 *use_count > 0
-                    && is_constant(self.built_in_functions, argument)
+                    && can_be_computed_before_the_call
                     && !cannot_fail(argument)
                     && !always_computes(&expression, argument)
             });
@@ -679,9 +689,9 @@ fn always_computes(expression: &ast::Expr, argument: &ast::Expr) -> bool {
         ast::Expr::Binary(left, _, right) => {
             always_computes(left, argument) || always_computes(right, argument)
         }
-        ast::Expr::Like { lhs, .. } | ast::Expr::InList { lhs, .. } => {
-            always_computes(lhs, argument)
-        }
+        ast::Expr::Between { lhs, .. }
+        | ast::Expr::Like { lhs, .. }
+        | ast::Expr::InList { lhs, .. } => always_computes(lhs, argument),
         ast::Expr::Case {
             base: Some(base), ..
         } => always_computes(base, argument),

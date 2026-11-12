@@ -615,11 +615,28 @@ Notes on calls of SQL functions:
   is not a plain `SELECT` of one expression (it has FROM, WHERE, GROUP BY,
   ORDER BY, LIMIT, a set operation, a subquery or an aggregate).
 - A call of a function whose body uses a parameter more than once is
-  rejected. PostgreSQL inlines such a function unless the argument is
-  volatile or expensive. The uses are counted as PostgreSQL has them: its
-  parser writes `a BETWEEN b AND c` as `a >= b AND a <= c`, which uses `a`
-  twice, and it compares a row on the left side of `IN` with each item of
-  the list on its own, which uses the row one time for each item.
+  rejected when the argument is volatile or has a subquery, because
+  PostgreSQL does not inline the function then. The uses are counted as
+  PostgreSQL has them: its parser writes `a BETWEEN b AND c` as
+  `a >= b AND a <= c`, which uses `a` twice, and it compares a row on the
+  left side of `IN` with each item of the list on its own, which uses the
+  row one time for each item.
+- PostgreSQL also does not inline such a function when the argument is
+  expensive: it costs more than 10 operators. It then computes the argument
+  one time before the call. tursopg does not know this cost, because it
+  depends on the types, so it inlines the function. The result is the same
+  when the expression of the call always computes the argument. When it
+  does not, an argument that fails is an error in PostgreSQL only. Thus the
+  rule for a constant argument that can fail (see below) also applies to
+  each argument of a parameter that the body uses more than once.
+  PostgreSQL inlines such a call when the argument is not expensive.
+- tursopg does not have the STABLE class of PostgreSQL. A function is
+  volatile when `pg_proc.provolatile` of tursopg shows `v`, which includes
+  functions that PostgreSQL calls STABLE or IMMUTABLE, such as `now()` and
+  `make_date`. `CURRENT_DATE`, `CURRENT_TIME` and `CURRENT_TIMESTAMP` are
+  volatile too, because tursopg computes them again at each use. A call with
+  such an argument is rejected when the body uses the parameter more than
+  once, where PostgreSQL inlines the function.
 - For a parameter that the body does not use, the argument of a call must
   be a constant or a parameter of the statement (`$1`), also with a sign or
   a cast. Other arguments are rejected. PostgreSQL reads such an argument

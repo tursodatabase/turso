@@ -204,6 +204,15 @@ expect {
     hello world
 }
 
+test body-with-several-parameters {
+    CREATE FUNCTION between_two(integer, integer, integer) RETURNS integer LANGUAGE sql
+    AS $$SELECT CASE WHEN $1 < $2 THEN $2 WHEN $1 > $3 THEN $3 ELSE $1 END$$;
+    SELECT between_two(5, 1, 3), between_two(0, 1, 3), between_two(2, 1, 3);
+}
+expect {
+    3|1|2
+}
+
 test body-that-does-not-use-a-parameter {
     CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
     SELECT first_of(1, 2);
@@ -775,32 +784,212 @@ expect @tursopg error {
 
 # Arguments that the body uses more than once
 
-# PostgreSQL inlines the function unless the argument is volatile or
-# expensive. tursopg cannot tell such an argument yet.
-test parameter-that-the-body-uses-twice {
+# PostgreSQL inlines a function when the body uses a volatile or expensive
+# argument one time at most.
+test volatile-argument-that-the-body-uses-once {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION add_one(bigint) RETURNS bigint LANGUAGE sql AS $$SELECT $1 + 1$$;
+    SELECT add_one(nextval('ids'));
+    SELECT nextval('ids');
+}
+expect {
+    2
+    2
+}
+
+test cheap-argument-that-the-body-uses-twice {
     CREATE FUNCTION square(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * $1$$;
-    SELECT square(3);
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (3);
+    SELECT square(a), square(a + 1), square(square(a)) FROM t;
+}
+expect {
+    9|16|81
+}
+
+# PostgreSQL does not inline a function that would compute an expensive
+# argument more than once: one that costs more than 10 operators. It computes
+# the argument one time before the call. tursopg does not know this cost,
+# because it depends on the types. It inlines the function, which gives the
+# same result when the expression of the call always computes the argument.
+test argument-with-eleven-operators-that-the-body-uses-twice {
+    CREATE FUNCTION square(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * $1$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (0);
+    SELECT square(a + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1) FROM t;
+}
+expect {
+    121
+}
+
+test argument-with-nested-calls-that-the-body-uses-twice {
+    CREATE FUNCTION double(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * 2$$;
+    CREATE FUNCTION square(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * $1$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1);
+    SELECT square(double(double(double(double(a))))) FROM t;
+}
+expect {
+    256
+}
+
+# PostgreSQL computes the argument one time: it does not inline the function.
+test volatile-argument-that-the-body-uses-twice {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION square(bigint) RETURNS bigint LANGUAGE sql AS $$SELECT $1 * $1$$;
+    SELECT square(nextval('ids'));
+    SELECT nextval('ids');
+}
+expect {
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "square" with a volatile argument or a subquery that the body uses more than once is not supported
+}
+
+# pg_is_in_recovery is volatile in PostgreSQL and in tursopg.
+test argument-with-a-volatile-catalog-function-that-the-body-uses-twice {
+    CREATE FUNCTION same(boolean) RETURNS boolean LANGUAGE sql AS $$SELECT $1 = $1$$;
+    SELECT same(pg_is_in_recovery());
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "same" with a volatile argument or a subquery that the body uses more than once is not supported
+}
+
+# PostgreSQL computes now() and CURRENT_DATE one time in a statement, so it
+# inlines the function. tursopg computes them again at each use, so two
+# copies of the argument can be different.
+test argument-with-the-current-time-that-the-body-uses-twice {
+    CREATE FUNCTION same(timestamptz) RETURNS boolean LANGUAGE sql AS $$SELECT $1 = $1$$;
+    SELECT same(now());
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "same" with a volatile argument or a subquery that the body uses more than once is not supported
+}
+
+test argument-with-the-current-date-that-the-body-uses-twice {
+    CREATE FUNCTION same(date) RETURNS boolean LANGUAGE sql AS $$SELECT $1 = $1$$;
+    SELECT same(CURRENT_DATE);
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "same" with a volatile argument or a subquery that the body uses more than once is not supported
+}
+
+# An aggregate is not volatile: PostgreSQL computes it one time for the
+# group.
+test aggregate-argument-that-the-body-uses-twice {
+    CREATE FUNCTION square(bigint) RETURNS bigint LANGUAGE sql AS $$SELECT $1 * $1$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2), (3), (3);
+    SELECT square(sum(a)), square(count(*)), square(count(DISTINCT a)),
+           square(sum(a) FILTER (WHERE a > 1))
+    FROM t;
+}
+expect {
+    81|16|9|64
+}
+
+test window-function-argument-that-the-body-uses-twice {
+    CREATE FUNCTION square(bigint) RETURNS bigint LANGUAGE sql AS $$SELECT $1 * $1$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (10), (20), (30);
+    SELECT a, square(row_number() OVER (ORDER BY a)) FROM t ORDER BY a;
+}
+expect {
+    10|1
+    20|4
+    30|9
+}
+
+test row-comparison-argument-that-the-body-uses-twice {
+    CREATE FUNCTION as_number(boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 AND $1 THEN 1 ELSE 0 END$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a, as_number((a, 1) = (3, 1)) FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|0
+    3|1
+}
+
+# pg_proc of tursopg does not show each name that the engine has for a
+# function, such as char_length and btrim.
+test argument-with-string-functions-that-the-body-uses-twice {
+    CREATE FUNCTION square(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * $1$$;
+    CREATE TABLE t (a text);
+    INSERT INTO t VALUES (' abc ');
+    SELECT square(char_length(btrim(a))), square(strpos(a, 'c')), square(position('c' in a)),
+           square(char_length(reverse(a)))
+    FROM t;
+}
+expect {
+    9|16|16|25
+}
+
+test subquery-argument-that-the-body-uses-twice {
+    CREATE FUNCTION square(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * $1$$;
+    SELECT square((SELECT 3));
 }
 expect {
     9
 }
 @sqlstate 0A000
 expect @tursopg error {
-    a call of function "square", whose body uses a parameter more than once, is not supported
+    a call of function "square" with a volatile argument or a subquery that the body uses more than once is not supported
 }
 
 # The parser of PostgreSQL writes `a BETWEEN b AND c` as
 # `a >= b AND a <= c`, so the body uses the left side twice.
 test parameter-on-the-left-side-of-between {
     CREATE FUNCTION inside(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 BETWEEN 1 AND 10 THEN 1 ELSE 0 END$$;
-    SELECT inside(5);
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (5), (20);
+    SELECT a, inside(a) FROM t ORDER BY a;
+}
+expect {
+    5|1
+    20|0
+}
+
+test volatile-argument-on-the-left-side-of-between {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION inside(bigint) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 BETWEEN 1 AND 10 THEN 1 ELSE 0 END$$;
+    SELECT inside(nextval('ids'));
+    SELECT nextval('ids');
 }
 expect {
     1
+    2
 }
 @sqlstate 0A000
 expect @tursopg error {
-    a call of function "inside", whose body uses a parameter more than once, is not supported
+    a call of function "inside" with a volatile argument or a subquery that the body uses more than once is not supported
+}
+
+test volatile-argument-in-a-limit-of-between {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION below(bigint) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN 1 BETWEEN 1 AND $1 THEN 1 ELSE 0 END$$;
+    SELECT below(nextval('ids'));
+    SELECT nextval('ids');
+}
+expect {
+    1
+    2
 }
 
 test parameter-in-a-limit-of-between {
@@ -832,14 +1021,39 @@ expect {
 # body uses the row one time for each item.
 test parameter-in-a-row-on-the-left-side-of-in {
     CREATE FUNCTION small(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN ($1, 1) IN ((1, 1), (2, 1)) THEN 1 ELSE 0 END$$;
-    SELECT small(2);
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (2), (3);
+    SELECT a, small(a) FROM t ORDER BY a;
+}
+expect {
+    2|1
+    3|0
+}
+
+test volatile-argument-in-a-row-on-the-left-side-of-in {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION small(bigint) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN ($1, 1) IN ((1, 1), (2, 1)) THEN 1 ELSE 0 END$$;
+    SELECT small(nextval('ids'));
+    SELECT nextval('ids');
 }
 expect {
     1
+    2
 }
 @sqlstate 0A000
 expect @tursopg error {
-    a call of function "small", whose body uses a parameter more than once, is not supported
+    a call of function "small" with a volatile argument or a subquery that the body uses more than once is not supported
+}
+
+test volatile-argument-on-the-left-side-of-in {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION small(bigint) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 IN (1, 2) THEN 1 ELSE 0 END$$;
+    SELECT small(nextval('ids'));
+    SELECT nextval('ids');
+}
+expect {
+    1
+    2
 }
 
 test parameter-in-a-row-on-the-left-side-of-in-with-one-item {
@@ -851,6 +1065,160 @@ test parameter-in-a-row-on-the-left-side-of-in-with-one-item {
 expect {
     2|1
     3|0
+}
+
+# Arguments that the expression of a call can skip
+#
+# When PostgreSQL does not inline a function, it computes each argument one
+# time before the call, also when the body does not compute the parameter. An
+# argument that fails is then an error. tursopg cannot be sure that
+# PostgreSQL inlines a function whose body uses a parameter more than once.
+# Thus it rejects an argument that can fail (one with an operator, a function
+# or a cast) for such a parameter, when the expression of the call does not
+# always compute the argument. PostgreSQL inlines these calls, but the last
+# one.
+
+test argument-in-the-branches-of-a-case-only {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN $1 * $1 ELSE 0 END$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, choose(a + 1, a > 1) FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|9
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "choose" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+# A column and a literal cannot fail.
+test column-and-constant-in-the-branches-of-a-case-only {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN $1 * $1 ELSE 0 END$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, choose(a, a > 1), choose(3, a > 1) FROM t ORDER BY a;
+}
+expect {
+    1|0|0
+    2|4|9
+}
+
+# In each body, the engine always computes the first use of the parameter.
+test argument-that-the-expression-always-computes {
+    CREATE FUNCTION in_a_condition(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 > 2 THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION in_a_case_operand(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE $1 WHEN 3 THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_and(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 > 2 AND $1 < 9 THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_between(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 BETWEEN 3 AND 9 THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_in(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 IN (3, 4) THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_like(text) RETURNS text LANGUAGE sql AS $$SELECT CASE WHEN $1 LIKE '3%' THEN $1 ELSE '' END$$;
+    CREATE FUNCTION in_the_first_argument(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN coalesce($1, 0) > 2 THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_right_of_an_operator(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN 2 < $1 THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION with_a_sign_and_a_null_test(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN (- $1) IS NULL THEN 0 ELSE $1 END$$;
+    CREATE FUNCTION in_the_first_column_of_a_row(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN ($1, 1) = (3, 1) THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION in_another_function(integer) RETURNS integer LANGUAGE sql AS $$SELECT in_a_condition($1) + in_a_condition($1)$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, in_a_condition(a + 1), in_a_case_operand(a + 1), on_the_left_of_and(a + 1),
+           on_the_left_of_between(a + 1), on_the_left_of_in(a + 1), on_the_left_of_like((a + 1)::text),
+           in_the_first_argument(a + 1), on_the_right_of_an_operator(a + 1),
+           with_a_sign_and_a_null_test(a + 1), in_the_first_column_of_a_row(a + 1),
+           in_another_function(a + 1)
+    FROM t ORDER BY a;
+}
+expect {
+    1|0|0|0|0|0||0|0|2|0|0
+    2|3|3|1|1|3|3|3|3|3|3|6
+}
+
+# The body always computes the parameter, so a constant argument that can
+# fail is not rejected.
+test constant-argument-that-the-body-uses-twice {
+    CREATE FUNCTION square(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 * $1$$;
+    SELECT square(1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1);
+}
+expect {
+    144
+}
+
+test argument-on-the-right-of-and-only {
+    CREATE FUNCTION large_if(boolean, integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 AND $2 > 1 THEN $2 ELSE 0 END$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, large_if(a > 0, a + 1) FROM t ORDER BY a;
+}
+expect {
+    1|2
+    2|3
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "large_if" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+test argument-after-the-first-argument-of-a-function-only {
+    CREATE FUNCTION first_or_double(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT coalesce($1, $2 + $2)$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, first_or_double(NULL, a + 1) FROM t ORDER BY a;
+}
+expect {
+    1|4
+    2|6
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_or_double" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+test argument-in-the-items-of-a-list-only {
+    CREATE FUNCTION is_listed(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 IN ($2, $2 + 1) THEN 1 ELSE 0 END$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, is_listed(3, a + 1) FROM t ORDER BY a;
+}
+expect {
+    1|1
+    2|1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "is_listed" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+# The body of the inner function does not always compute its parameter.
+test argument-that-another-function-can-skip {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN $1 ELSE 0 END$$;
+    CREATE FUNCTION choose_twice(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT choose($1, $2) + choose($1, $2)$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a, choose_twice(a + 1, a > 1) FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|6
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "choose_twice" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+# This argument costs 12 operators in PostgreSQL, so PostgreSQL does not
+# inline the function, and it computes the argument before the call.
+test expensive-argument-that-fails-for-a-parameter-that-the-body-does-not-compute {
+    CREATE FUNCTION never_reads(boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN false THEN CASE WHEN $1 AND $1 THEN 1 ELSE 0 END ELSE 2 END$$;
+    CREATE TABLE t (a integer, b integer);
+    INSERT INTO t VALUES (1, 1), (2, 3);
+    SELECT a, never_reads((a / (a - a) + 1 + 1 + 1) BETWEEN b AND b) FROM t ORDER BY a;
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "never_reads" with an argument that can fail, for a parameter that the body does not always compute, is not supported
 }
 
 # Functions that PostgreSQL does not inline
