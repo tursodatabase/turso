@@ -207,6 +207,16 @@ expect error {
     permission denied to create role
 }
 
+@skip-if postgres "PostgreSQL supports ALTER ROLE ... RENAME"
+test alter-role-rename-is-not-supported {
+    CREATE ROLE rn_role;
+    ALTER ROLE rn_role RENAME TO rn_role_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER ROLE ... RENAME is not supported
+}
+
 test pg-tables-does-not-list-the-roles-table {
     CREATE ROLE pt_role;
     SELECT count(*) FROM pg_tables WHERE tablename LIKE '%roles%';

@@ -521,3 +521,14 @@ test rename-of-column-a-policy-reads-in-a-subquery-is-rejected {
 expect error {
     cannot change column "owner" of table "rp_docs_42" because policy "own" uses it
 }
+
+@skip-if postgres "PostgreSQL supports ALTER POLICY ... RENAME"
+test alter-policy-rename-is-not-supported {
+    CREATE TABLE rn_policy_docs (id INT PRIMARY KEY);
+    CREATE POLICY everything ON rn_policy_docs USING (true);
+    ALTER POLICY everything ON rn_policy_docs RENAME TO all_rows;
+}
+@sqlstate 0A000
+expect error {
+    ALTER POLICY ... RENAME is not supported
+}
