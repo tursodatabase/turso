@@ -234,15 +234,23 @@ impl Dialect for PostgresDialect {
         false
     }
 
-    fn schema_state_query(&self, schema: &Schema) -> Option<String> {
+    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
         crate::classes::schema_state_query(schema)
+            .into_iter()
+            .collect()
     }
 
     fn build_schema_state(
         &self,
         schema: &Schema,
-        rows: &[Vec<Value>],
+        results: &[Vec<Vec<Value>>],
     ) -> turso_core::Result<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        let [rows] = results else {
+            return Err(turso_core::LimboError::InternalError(format!(
+                "expected the rows of one schema state query, got {}",
+                results.len()
+            )));
+        };
         crate::classes::build_schema_state(schema, rows)
     }
 

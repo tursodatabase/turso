@@ -336,24 +336,25 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// SQL that reads the dialect's own schema state, such as the PostgreSQL
-    /// frontend's relation catalog table, or None when this database keeps
-    /// none. The statement runs with engine semantics after the schema rows
-    /// load, and its rows go to [`Dialect::build_schema_state`].
-    fn schema_state_query(&self, schema: &Schema) -> Option<String> {
+    /// SQL statements that read the dialect's own schema state, such as the
+    /// PostgreSQL frontend's relation catalog table, or none when this
+    /// database keeps none. The statements run with engine semantics after
+    /// the schema rows load, and their rows go to
+    /// [`Dialect::build_schema_state`].
+    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
         let _ = schema;
-        None
+        Vec::new()
     }
 
-    /// Builds [`Schema::dialect_schema`] from the rows that
-    /// [`Dialect::schema_state_query`] returned. `schema` is the schema the
-    /// state is built for, already holding every other object.
+    /// Builds [`Schema::dialect_schema`] from the rows of each statement of
+    /// [`Dialect::schema_state_queries`], in the same order. `schema` is the
+    /// schema the state is built for, already holding every other object.
     fn build_schema_state(
         &self,
         schema: &Schema,
-        rows: &[Vec<Value>],
+        results: &[Vec<Vec<Value>>],
     ) -> Result<Arc<dyn Any + Send + Sync>> {
-        let _ = (schema, rows);
+        let _ = (schema, results);
         Err(LimboError::InternalError(
             "the dialect queried schema state it cannot build".to_string(),
         ))

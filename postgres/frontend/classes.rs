@@ -424,7 +424,8 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
     schema.dialect_schema.as_ref()?.downcast_ref()
 }
 
-/// [`turso_core::Dialect::schema_state_query`] for the PostgreSQL frontend.
+/// The query of the relation catalog for
+/// [`turso_core::Dialect::schema_state_queries`].
 /// A catalog made before it had `relacl`, `relrowsecurity` or `relpolicies`
 /// and opened read-only, which cannot add them, reads as having no grants,
 /// no row-level security and no policies.

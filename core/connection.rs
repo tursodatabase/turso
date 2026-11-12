@@ -42,6 +42,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 
 use crate::security::roles::SessionRole;
 use std::fmt::Display;
@@ -274,10 +275,14 @@ enum ReparsePhase {
         rows: Vec<Vec<Value>>,
     },
     /// Loading the dialect's own schema state, such as the PostgreSQL
-    /// frontend's relation catalog.
+    /// frontend's relation catalog: `stmt` reads one query into `rows`, the
+    /// rows of the queries before it are in `results`, and `queries` are
+    /// still to be read.
     LoadDialectSchema {
         stmt: Box<Statement>,
         rows: Vec<Vec<Value>>,
+        results: Vec<Vec<Vec<Value>>>,
+        queries: VecDeque<String>,
     },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
@@ -1739,7 +1744,12 @@ impl Connection {
                     inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
                     inner.phase = self.load_dialect_schema_phase(&inner.fresh, true)?;
                 }
-                ReparsePhase::LoadDialectSchema { stmt, rows } => {
+                ReparsePhase::LoadDialectSchema {
+                    stmt,
+                    rows,
+                    results,
+                    queries,
+                } => {
                     crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
                         turso_assert!(
                             !matches!(self.get_tx_state(), TransactionState::None),
@@ -1748,8 +1758,16 @@ impl Connection {
                         rows.push(row.get_values().cloned().collect());
                         Ok(())
                     }));
-                    inner.fresh.dialect_schema =
-                        Some(self.db.dialect().build_schema_state(&inner.fresh, rows)?);
+                    results.push(std::mem::take(rows));
+                    if let Some(sql) = queries.pop_front() {
+                        *stmt = Box::new(self.prepare_engine_metadata_read(&sql)?);
+                        continue;
+                    }
+                    inner.fresh.dialect_schema = Some(
+                        self.db
+                            .dialect()
+                            .build_schema_state(&inner.fresh, results)?,
+                    );
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1807,7 +1825,8 @@ impl Connection {
         fresh: &Schema,
         schema_installed: bool,
     ) -> Result<ReparsePhase> {
-        let Some(sql) = self.db.dialect().schema_state_query(fresh) else {
+        let mut queries = VecDeque::from(self.db.dialect().schema_state_queries(fresh));
+        let Some(sql) = queries.pop_front() else {
             return Ok(ReparsePhase::RefreshStats {
                 stats: Default::default(),
             });
@@ -1819,6 +1838,8 @@ impl Connection {
         Ok(ReparsePhase::LoadDialectSchema {
             stmt: Box::new(stmt),
             rows: Vec::new(),
+            results: Vec::new(),
+            queries,
         })
     }
 
@@ -1842,14 +1863,16 @@ impl Connection {
     /// open itself loaded the schema before the table existed.
     pub fn reload_dialect_schema(self: &Arc<Connection>) -> Result<()> {
         let dialect = self.db.dialect();
-        let Some(sql) = dialect.schema_state_query(&self.current_schema()) else {
+        let queries = dialect.schema_state_queries(&self.current_schema());
+        if queries.is_empty() {
             return Ok(());
-        };
-        let rows = self
-            .prepare_engine_metadata_read(&sql)?
-            .run_collect_rows()?;
+        }
+        let results = queries
+            .iter()
+            .map(|sql| self.prepare_engine_metadata_read(sql)?.run_collect_rows())
+            .collect::<Result<Vec<_>>>()?;
         let state = self.with_schema(crate::MAIN_DB_ID, |schema| {
-            dialect.build_schema_state(schema, &rows)
+            dialect.build_schema_state(schema, &results)
         })?;
         self.db.with_schema_mut(|schema| {
             schema.dialect_schema = Some(state.clone());
