@@ -2351,46 +2351,79 @@ impl SnapshotRows for PgAttrdefTable {
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
-        let mut rows = Vec::new();
-
-        let tables = user_tables_sorted(&schema);
-        let tbl_oid_map = table_oid_map(&schema);
-
-        // OID counter for pg_attrdef rows — start after constraint OIDs
-        // Use a high base to avoid collisions
-        let mut attrdef_oid: i64 = 50000;
-
-        for (namespace, table_name, table) in &tables {
-            let btree = match table.as_ref() {
-                Table::BTree(bt) => bt,
-                _ => continue,
-            };
-            let table_oid = tbl_oid_map
-                .get(&(*namespace, (*table_name).to_string()))
-                .copied()
-                .unwrap_or(0);
-
-            for (col_idx, col) in btree.columns().iter().enumerate() {
-                let adbin = match (&col.default, col.generated_type()) {
-                    (Some(default_expr), _) => render_expr(default_expr),
-                    (None, GeneratedType::Stored { expr, .. }) => {
-                        let named = generated_expr_with_names(expr, btree.columns())
-                            .expect("stored generated column expression resolves its columns");
-                        render_expr(&named)
-                    }
-                    (None, _) => continue,
-                };
-                rows.push(vec![
-                    Value::from_i64(attrdef_oid),        // oid
-                    Value::from_i64(table_oid),          // adrelid
-                    Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
-                    Value::build_text(adbin),            // adbin
-                ]);
-                attrdef_oid += 1;
-            }
-        }
-        rows
+        catalog_column_defaults(conn, &schema)
+            .into_iter()
+            .map(|default| {
+                vec![
+                    Value::from_i64(default.oid),           // oid
+                    Value::from_i64(default.table_oid),     // adrelid
+                    Value::from_i64(default.column_number), // adnum
+                    Value::build_text(default.text),        // adbin
+                ]
+            })
+            .collect()
     }
+}
+
+/// A column's default or stored generated expression, as pg_attrdef lists
+/// it.
+struct CatalogColumnDefault {
+    oid: i64,
+    table_oid: i64,
+    /// The 1-based number of the column.
+    column_number: i64,
+    /// The expression as pg_get_expr prints it.
+    text: String,
+    /// The oids of the sequences whose nextval, currval or setval the
+    /// expression calls.
+    sequence_oids: Vec<i64>,
+}
+
+fn catalog_column_defaults(conn: &Connection, schema: &Schema) -> Vec<CatalogColumnDefault> {
+    let tbl_oid_map = table_oid_map(schema);
+    let indexes = catalog_indexes(schema);
+    let mut defaults = Vec::new();
+    // A high base keeps pg_attrdef oids apart from other catalog oids.
+    let mut oid: i64 = 50000;
+    for (namespace, table_name, table) in user_tables_sorted(schema) {
+        let Table::BTree(btree) = table.as_ref() else {
+            continue;
+        };
+        let table_oid = tbl_oid_map
+            .get(&(namespace, table_name.to_string()))
+            .copied()
+            .unwrap_or(0);
+        for (position, column) in btree.columns().iter().enumerate() {
+            let (text, sequence_oids) = match (&column.default, column.generated_type()) {
+                (Some(default), _) => {
+                    let (default, sequences) =
+                        with_sequence_names_as_written(conn, schema, &indexes, default);
+                    let sequence_oids = sequences
+                        .into_iter()
+                        .map(|(namespace, name)| {
+                            stored_relation_oid(schema, namespace, &name).unwrap_or(0)
+                        })
+                        .collect();
+                    (render_expr(&default), sequence_oids)
+                }
+                (None, GeneratedType::Stored { expr, .. }) => {
+                    let named = generated_expr_with_names(expr, btree.columns())
+                        .expect("stored generated column expression resolves its columns");
+                    (render_expr(&named), Vec::new())
+                }
+                (None, _) => continue,
+            };
+            defaults.push(CatalogColumnDefault {
+                oid,
+                table_oid,
+                column_number: position as i64 + 1,
+                text,
+                sequence_oids,
+            });
+            oid += 1;
+        }
+    }
+    defaults
 }
 
 #[derive(Debug)]
@@ -3064,12 +3097,6 @@ struct IndexRow<'a> {
     column_numbers: Option<&'a str>,
 }
 
-struct ColumnDefaultRow {
-    oid: i64,
-    table_oid: i64,
-    column_number: i64,
-}
-
 #[derive(Debug)]
 struct PgDependTable;
 
@@ -3183,18 +3210,22 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
-        let default_rows = PgAttrdefTable::load_rows(conn);
-        let defaults = default_rows
-            .iter()
-            .map(Vec::as_slice)
-            .map(ColumnDefaultRow::from_row);
-        // Default expressions automatically depend on the column that owns them.
-        for default in defaults {
+        // Default expressions automatically depend on the column that owns
+        // them, and normally on the sequences they use. pg_dump creates a
+        // sequence before a table whose default uses it by these rows.
+        for default in catalog_column_defaults(conn, &conn.current_schema()) {
             rows.push(dependency_row(
                 ObjectAddress::whole::<PgAttrdefTable>(default.oid),
                 ObjectAddress::column(default.table_oid, default.column_number),
                 DependencyKind::Auto,
             ));
+            for sequence_oid in default.sequence_oids {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgAttrdefTable>(default.oid),
+                    ObjectAddress::whole::<PgClassTable>(sequence_oid),
+                    DependencyKind::Normal,
+                ));
+            }
         }
         rows
     }
@@ -3342,27 +3373,6 @@ impl<'a> IndexRow<'a> {
                 .expect("catalog index uniqueness is an integer")
                 == CATALOG_BOOLEAN_TRUE,
             column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
-        }
-    }
-}
-
-impl ColumnDefaultRow {
-    // Zero-based positions in PgAttrdefTable's SQL column order.
-    const OID_COLUMN: usize = 0;
-    const TABLE_OID_COLUMN: usize = 1;
-    const COLUMN_NUMBER_COLUMN: usize = 2;
-
-    fn from_row(row: &[Value]) -> Self {
-        Self {
-            oid: row[Self::OID_COLUMN]
-                .as_int()
-                .expect("catalog OIDs are integers"),
-            table_oid: row[Self::TABLE_OID_COLUMN]
-                .as_int()
-                .expect("catalog OIDs are integers"),
-            column_number: row[Self::COLUMN_NUMBER_COLUMN]
-                .as_int()
-                .expect("catalog column numbers are integers"),
         }
     }
 }
@@ -3979,33 +3989,14 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
             let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
                 parent.declared_name.as_str()
             });
-            let visible = conn
-                .search_order()
-                .into_iter()
-                .find(|namespace| {
-                    schema
-                        .get_table(namespace.target.id, &fk.parent_table)
-                        .is_some()
-                        || schema
-                            .get_view(namespace.target.id, &fk.parent_table)
-                            .is_some()
-                        || schema
-                            .get_sequence(namespace.target.id, &fk.parent_table)
-                            .is_some()
-                        || indexes.iter().any(|index| {
-                            index.namespace == namespace.target.id && index.name == fk.parent_table
-                        })
-                })
-                .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
-            let parent_name = if visible {
-                quote_identifier(parent_name)
-            } else {
-                format!(
-                    "{}.{}",
-                    quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
-                    quote_identifier(parent_name),
-                )
-            };
+            let parent_name = relation_name_for_search_path(
+                conn,
+                &schema,
+                &indexes,
+                fk.parent_namespace,
+                &fk.parent_table,
+                parent_name,
+            );
             let mut def =
                 format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
             let on_update = ref_act_to_char(&fk.on_update);
@@ -4024,6 +4015,99 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
             Some(format!("NOT NULL {}", quote_identifier(column_name)))
         }
     }
+}
+
+/// `name` as PostgreSQL prints a relation name: quoted where needed, and
+/// qualified by its schema unless the search path finds this relation by
+/// its bare name. `lookup_name` is the name the schema stores it under.
+fn relation_name_for_search_path(
+    conn: &Connection,
+    schema: &Schema,
+    indexes: &[CatalogIndex],
+    namespace: NamespaceId,
+    lookup_name: &str,
+    name: &str,
+) -> String {
+    let visible = conn
+        .search_order()
+        .into_iter()
+        .find(|qualifier| {
+            let id = qualifier.target.id;
+            schema.get_table(id, lookup_name).is_some()
+                || schema.get_view(id, lookup_name).is_some()
+                || schema.get_sequence(id, lookup_name).is_some()
+                || indexes
+                    .iter()
+                    .any(|index| index.namespace == id && index.name == lookup_name)
+        })
+        .is_some_and(|qualifier| qualifier.target.id == namespace);
+    if visible {
+        quote_identifier(name)
+    } else {
+        format!(
+            "{}.{}",
+            quote_identifier(schema_name_of(schema, namespace)),
+            quote_identifier(name),
+        )
+    }
+}
+
+/// `expr` with each sequence argument of nextval, currval and setval named
+/// the way users name the sequence, and the namespace and name of each
+/// sequence renamed. A serial column's default refers to its sequence by
+/// the name the schema stores it under, such as `__turso_ns1_t_id_seq`,
+/// which PostgreSQL does not accept.
+fn with_sequence_names_as_written(
+    conn: &Connection,
+    schema: &Schema,
+    indexes: &[CatalogIndex],
+    expr: &ast::Expr,
+) -> (ast::Expr, Vec<(NamespaceId, String)>) {
+    let mut expr = expr.clone();
+    let mut sequences = Vec::new();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        let ast::Expr::FunctionCall { name, args, .. } = expr else {
+            return Ok(WalkControl::Continue);
+        };
+        if !["nextval", "currval", "setval"]
+            .iter()
+            .any(|function| name.as_str().eq_ignore_ascii_case(function))
+        {
+            return Ok(WalkControl::Continue);
+        }
+        let Some(ast::Expr::Literal(ast::Literal::String(literal))) =
+            args.first_mut().map(|arg| arg.as_mut())
+        else {
+            return Ok(WalkControl::Continue);
+        };
+        let stored_name = sql_string_value(literal);
+        let (namespace, sequence_name) = schema.demangle_name(&stored_name);
+        if namespace.is_root() || schema.get_sequence(namespace, sequence_name).is_none() {
+            return Ok(WalkControl::Continue);
+        }
+        let written = relation_name_for_search_path(
+            conn,
+            schema,
+            indexes,
+            namespace,
+            sequence_name,
+            sequence_name,
+        );
+        *literal = format!("'{}'", written.replace('\'', "''"));
+        sequences.push((namespace, sequence_name.to_string()));
+        Ok(WalkControl::Continue)
+    })
+    .expect("renaming sequence arguments does not fail");
+    (expr, sequences)
+}
+
+/// The value of SQL string literal text such as `'it''s'`.
+fn sql_string_value(literal: &str) -> String {
+    literal
+        .strip_prefix('\'')
+        .and_then(|literal| literal.strip_suffix('\''))
+        .unwrap_or(literal)
+        .replace("''", "'")
 }
 
 /// A constraint of a user table, with the oid that pg_constraint lists it

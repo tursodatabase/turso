@@ -993,6 +993,39 @@ expect {
     3
 }
 
+# pg_dump writes these defaults into CREATE TABLE, so the sequence names
+# must be ones PostgreSQL accepts.
+test pg-attrdef-of-serial-names-its-sequence {
+    CREATE TABLE serial_public (id serial);
+    CREATE SCHEMA serial_schema;
+    CREATE TABLE serial_schema.t (id bigserial);
+    SELECT c.relname, replace(pg_get_expr(a.adbin, a.adrelid), '::regclass', '')
+    FROM pg_attrdef a JOIN pg_class c ON c.oid = a.adrelid
+    WHERE c.relname IN ('serial_public', 't') ORDER BY 1;
+    SET search_path = serial_schema, public;
+    SELECT c.relname, replace(pg_get_expr(a.adbin, a.adrelid), '::regclass', '')
+    FROM pg_attrdef a JOIN pg_class c ON c.oid = a.adrelid
+    WHERE c.relname = 't';
+}
+expect {
+    serial_public|nextval('serial_public_id_seq')
+    t|nextval('serial_schema.t_id_seq')
+    t|nextval('t_id_seq')
+}
+
+# pg_dump creates a sequence before the tables whose defaults use it by
+# this dependency. 2604 is pg_attrdef and 1259 is pg_class.
+test pg-depend-of-serial-default-on-its-sequence {
+    CREATE TABLE serial_depend (id serial);
+    SELECT d.deptype FROM pg_depend d
+    JOIN pg_attrdef a ON d.classid = 2604 AND d.objid = a.oid
+    JOIN pg_class s ON d.refclassid = 1259 AND d.refobjid = s.oid
+    WHERE s.relname = 'serial_depend_id_seq';
+}
+expect {
+    n
+}
+
 test pg-attribute-created-table-columns {
     CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT);
     SELECT a.attname, t.typname FROM pg_attribute a
