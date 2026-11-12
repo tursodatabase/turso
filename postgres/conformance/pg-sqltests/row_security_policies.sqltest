@@ -1065,6 +1065,26 @@ expect {
     12
 }
 
+# A subquery of a WITH CHECK condition that reads no column of the row is
+# computed once per statement too, not once per row the statement writes, so
+# an INSERT of five rows takes one value from the sequence.
+test scalar-subquery-of-with-check-is-computed-once-for-an-insert-of-several-rows {
+    CREATE ROLE rw_alice_30;
+    CREATE SEQUENCE rw_seq_30;
+    CREATE TABLE rw_docs_30 (id INT PRIMARY KEY);
+    ALTER TABLE rw_docs_30 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY counted ON rw_docs_30 FOR INSERT WITH CHECK ((SELECT nextval('rw_seq_30')) > 0);
+    GRANT INSERT ON rw_docs_30 TO rw_alice_30;
+    GRANT USAGE ON SEQUENCE rw_seq_30 TO rw_alice_30;
+    SET ROLE rw_alice_30;
+    INSERT INTO rw_docs_30 VALUES (1), (2), (3), (4), (5);
+    RESET ROLE;
+    SELECT nextval('rw_seq_30');
+}
+expect {
+    2
+}
+
 # INSERT ... ON CONFLICT DO UPDATE checks the row that conflicts against the
 # USING conditions of the UPDATE and SELECT policies, and fails instead of
 # skipping it, and checks the row the update writes like an UPDATE does.
