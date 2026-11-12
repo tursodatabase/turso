@@ -640,6 +640,103 @@ expect @tursopg error {
     stack depth limit exceeded
 }
 
+# Bodies that CREATE FUNCTION did not check
+
+test call-of-a-function-that-is-created-after-the-function-that-calls-it {
+    SET check_function_bodies = off;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT one() + 1$$;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT two();
+}
+expect {
+    2
+}
+
+test call-of-a-function-whose-body-uses-a-parameter-that-it-does-not-have {
+    SET check_function_bodies = off;
+    CREATE FUNCTION second(integer) RETURNS integer LANGUAGE sql AS $$SELECT $2$$;
+    SELECT second(1);
+}
+@sqlstate 42P02
+expect error {
+    there is no parameter \$2
+}
+
+test call-of-a-function-whose-body-returns-two-columns {
+    SET check_function_bodies = off;
+    CREATE FUNCTION pair() RETURNS integer LANGUAGE sql AS $$SELECT 1, 2$$;
+    SELECT pair();
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
+}
+
+test call-of-a-function-whose-body-reads-two-columns-of-a-table {
+    SET check_function_bodies = off;
+    CREATE FUNCTION pair() RETURNS integer LANGUAGE sql AS $$SELECT a, b FROM t$$;
+    CREATE TABLE t (a integer, b integer);
+    SELECT pair();
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
+}
+
+test call-of-a-function-whose-body-calls-a-user-function-as-a-function-of-pg-catalog {
+    SET check_function_bodies = off;
+    CREATE FUNCTION add_one(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1$$;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT pg_catalog.add_one(1)$$;
+    SELECT two();
+}
+@sqlstate 42883
+expect error {
+    function pg_catalog.add_one\(integer\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    function pg_catalog.add_one does not exist
+}
+
+test call-of-a-function-whose-body-calls-a-function-of-a-schema-that-does-not-exist {
+    SET check_function_bodies = off;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT nosuch.add_one(1)$$;
+    SELECT two();
+}
+@sqlstate 3F000
+expect error {
+    schema "nosuch" does not exist
+}
+
+test call-of-a-function-whose-body-calls-a-function-that-does-not-exist {
+    SET check_function_bodies = off;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT nosuch(1)$$;
+    SELECT two();
+}
+@sqlstate 42883
+expect error {
+    function nosuch\(integer\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: nosuch
+}
+
+# PostgreSQL runs the function until the stack is full.
+test call-of-a-function-whose-body-calls-the-function {
+    SET check_function_bodies = off;
+    CREATE FUNCTION forever() RETURNS integer LANGUAGE sql AS $$SELECT forever()$$;
+    SELECT forever();
+}
+@sqlstate 54001
+expect error {
+    stack depth limit exceeded
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "forever", which calls itself, is not supported
+}
+
 # Functions with the same name
 
 # PostgreSQL chooses the function by the types of the arguments, which

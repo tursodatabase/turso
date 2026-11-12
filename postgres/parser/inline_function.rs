@@ -5,6 +5,10 @@
 //! (`inline_function` in `clauses.c`). tursopg runs every call this way, so
 //! it can only call the functions that PostgreSQL inlines.
 
+use crate::create_function::{
+    display_signature_type_name, return_type_mismatch_message, CalledFunction,
+};
+use crate::sqlstate::SQLSTATE_INVALID_FUNCTION_DEFINITION;
 use crate::translator::PostgreSQLTranslator;
 use crate::ParseError;
 use pg_query::protobuf::{node::Node, ParamRef, SelectStmt, SetOperation, TypeCast, TypeName};
@@ -18,6 +22,8 @@ pub struct InlinedFunction {
     /// For each parameter, `$n` cast to the parameter's type. An argument
     /// takes the place of the `ast::Expr::Variable` in it.
     pub parameters: Vec<ast::Expr>,
+    /// The functions that the body calls.
+    pub called_functions: Vec<CalledFunction>,
 }
 
 /// The expressions of a function with the parameters `parameter_types`, the
@@ -30,11 +36,20 @@ pub fn inlined_function(
     body: &str,
 ) -> Result<Option<InlinedFunction>, ParseError> {
     let parsed = crate::parse(body)?;
+    // CREATE FUNCTION refuses such a body when it checks the body, which it
+    // does not do when check_function_bodies is off.
+    if returns_several_columns(&parsed) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
+            message: return_type_mismatch_message(&display_signature_type_name(return_type)),
+        });
+    }
     let Some(expression) = inlinable_expression(&parsed) else {
         return Ok(None);
     };
     let translator = PostgreSQLTranslator::new();
     let result = translator.translate_expr(&type_cast(expression.clone(), return_type))?;
+    let called_functions = translator.called_functions();
     let parameters = parameter_types
         .iter()
         .zip(1..)
@@ -51,7 +66,32 @@ pub fn inlined_function(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(InlinedFunction { result, parameters }))
+    Ok(Some(InlinedFunction {
+        result,
+        parameters,
+        called_functions,
+    }))
+}
+
+/// Whether the query of the body returns more than one column. A `*` counts
+/// as one column, because the tables are not known here.
+fn returns_several_columns(parsed: &pg_query::ParseResult) -> bool {
+    let [statement] = parsed.protobuf.stmts.as_slice() else {
+        return false;
+    };
+    let Some(Node::SelectStmt(select)) = statement
+        .stmt
+        .as_ref()
+        .and_then(|statement| statement.node.as_ref())
+    else {
+        return false;
+    };
+    // The first query of a set operation has the columns.
+    let mut select = select.as_ref();
+    while let Some(first) = &select.larg {
+        select = first;
+    }
+    select.target_list.len() > 1
 }
 
 /// The expression of a body that is a plain `SELECT` of one expression:
@@ -146,10 +186,29 @@ mod tests {
             "SELECT 1 UNION SELECT 2",
             "VALUES (1)",
             "WITH one AS (SELECT 1) SELECT 1",
-            "SELECT 1, 2",
             "SELECT 1 FOR UPDATE",
         ] {
             assert!(inlined(body).is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_body_that_returns_several_columns_is_refused() {
+        for body in [
+            "SELECT 1, 2",
+            "SELECT a, b FROM t",
+            "SELECT 1, 2 UNION SELECT 3, 4",
+        ] {
+            let Err(ParseError::Sqlstate { sqlstate, message }) =
+                inlined_function(&["int4".to_string()], "int4", body)
+            else {
+                panic!("{body} is not refused");
+            };
+            assert_eq!(sqlstate, "42P13", "{body}");
+            assert_eq!(
+                message, "return type mismatch in function declared to return integer",
+                "{body}"
+            );
         }
     }
 }

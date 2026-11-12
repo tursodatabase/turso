@@ -615,9 +615,10 @@ Notes on calls of SQL functions:
 - tursopg does not check the types of the arguments. It casts each argument
   to the type of its parameter, also where PostgreSQL finds no function for
   the types of the arguments.
-- Functions that call each other in a circle, which `CREATE OR REPLACE` can
-  make, are rejected at the call. PostgreSQL fails with `stack depth limit
-  exceeded`.
+- A function that calls itself, and functions that call each other in a
+  circle, are rejected at the call. `CREATE OR REPLACE` and
+  `check_function_bodies = off` can make such functions. PostgreSQL fails
+  with `stack depth limit exceeded` when the calls do not stop.
 - A call fails with `stack depth limit exceeded` when the expression that
   takes its place has more than 100 levels, or when the call goes through
   more than 100 function bodies. PostgreSQL limits the size of the stack

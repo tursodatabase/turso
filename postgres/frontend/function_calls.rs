@@ -19,7 +19,7 @@ use turso_parser::ast;
 use turso_parser::parser::MAX_EXPR_DEPTH;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::{inlined_function, InlinedFunction};
 
@@ -69,57 +69,7 @@ pub(crate) fn check_function_calls(
 ) -> turso_core::Result<()> {
     let schema = connection.current_schema();
     let functions = function_catalog(&schema);
-    let is_user_function = |called: &turso_pg_parser::CalledFunction| {
-        functions.is_some_and(|functions| {
-            functions_named(
-                connection,
-                functions,
-                called.schema.as_deref(),
-                &called.name,
-            )
-            .next()
-            .is_some()
-        })
-    };
-    for called in called_functions {
-        let Some(schema_name) = &called.schema else {
-            continue;
-        };
-        // PostgreSQL names the types of the arguments, which tursopg does
-        // not know.
-        let no_such_function = || {
-            sqlstate_error(
-                SQLSTATE_UNDEFINED_FUNCTION,
-                format!("function {schema_name}.{} does not exist", called.name),
-            )
-        };
-        if schema_name == "pg_catalog" {
-            // The translator removes `pg_catalog.` from the name, so the
-            // expansion would find a function of the search path.
-            let without_schema = turso_pg_parser::CalledFunction {
-                schema: None,
-                ..called.clone()
-            };
-            if is_user_function(&without_schema) && !is_built_in_function(connection, &called.name)
-            {
-                return Err(no_such_function());
-            }
-            continue;
-        }
-        // The translator knows the auth functions.
-        if schema_name == "auth" {
-            continue;
-        }
-        if schema_namespace(connection, schema_name).is_none() {
-            return Err(sqlstate_error(
-                SQLSTATE_INVALID_SCHEMA_NAME,
-                format!("schema \"{schema_name}\" does not exist"),
-            ));
-        }
-        if !is_user_function(called) {
-            return Err(no_such_function());
-        }
-    }
+    check_schemas_of_calls(connection, functions, called_functions)?;
     if functions.is_none_or(|functions| functions.iter().next().is_none()) {
         return Ok(());
     }
@@ -131,14 +81,14 @@ pub(crate) fn check_function_calls(
     };
     if let Some(called) = called_functions
         .iter()
-        .find(|called| called.in_from && is_user_function(called))
+        .find(|called| called.in_from && is_user_function(connection, functions, called))
     {
         return Err(unsupported_call(called, "FROM"));
     }
     if let Some(statement) = turso_pg_parser::statement_without_function_expansion(parsed) {
         if let Some(called) = called_functions
             .iter()
-            .find(|called| is_user_function(called))
+            .find(|called| is_user_function(connection, functions, called))
         {
             return Err(unsupported_call(called, statement));
         }
@@ -193,7 +143,7 @@ impl Expansion<'_> {
             &function.return_type,
             &function.body,
         )
-        .map_err(|error| LimboError::ParseError(error.to_string()))?
+        .map_err(body_error)?
         .filter(|inlined| !self.has_subquery_or_aggregate(&inlined.result))
         .ok_or_else(|| {
             not_supported(format!(
@@ -201,6 +151,13 @@ impl Expansion<'_> {
                  expression,"
             ))
         })?;
+        // CREATE FUNCTION makes this check when it checks the body, which
+        // it does not do when check_function_bodies is off.
+        check_schemas_of_calls(
+            self.connection,
+            Some(self.functions),
+            &inlined.called_functions,
+        )?;
 
         let (mut expression, use_counts) = with_arguments(inlined, args)?;
         // PostgreSQL does not inline a function that would compute a
@@ -403,14 +360,14 @@ fn with_arguments(
             };
             let position = parameter.index.get() as usize - 1;
             // CREATE FUNCTION refuses a body that uses a parameter that the
-            // function does not have.
+            // function does not have, unless check_function_bodies is off.
             let (Some(argument), Some(cast)) =
                 (arguments.get(position), inlined.parameters.get(position))
             else {
-                return Err(LimboError::Corrupt(format!(
-                    "a stored function uses parameter ${}, which it does not have",
-                    parameter.index
-                )));
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_PARAMETER,
+                    format!("there is no parameter ${}", parameter.index),
+                ));
             };
             use_counts[position] += 1;
             *expression = cast_argument(cast.clone(), argument);
@@ -435,6 +392,84 @@ fn cast_argument(mut cast: ast::Expr, argument: &ast::Expr) -> ast::Expr {
         },
     );
     cast
+}
+
+/// The engine error for an error in the body of a stored function.
+fn body_error(error: turso_pg_parser::ParseError) -> LimboError {
+    match error {
+        turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
+            sqlstate_error(sqlstate, message)
+        }
+        other => LimboError::ParseError(other.to_string()),
+    }
+}
+
+/// Fails with PostgreSQL's errors when one of `called_functions` names a
+/// schema that does not exist, or a schema that does not have the function.
+fn check_schemas_of_calls(
+    connection: &Connection,
+    functions: Option<&FunctionCatalog>,
+    called_functions: &[turso_pg_parser::CalledFunction],
+) -> turso_core::Result<()> {
+    for called in called_functions {
+        let Some(schema_name) = &called.schema else {
+            continue;
+        };
+        // PostgreSQL names the types of the arguments, which tursopg does
+        // not know.
+        let no_such_function = || {
+            sqlstate_error(
+                SQLSTATE_UNDEFINED_FUNCTION,
+                format!("function {schema_name}.{} does not exist", called.name),
+            )
+        };
+        if schema_name == "pg_catalog" {
+            // The translator removes `pg_catalog.` from the name, so the
+            // expansion would find a function of the search path.
+            let without_schema = turso_pg_parser::CalledFunction {
+                schema: None,
+                ..called.clone()
+            };
+            if is_user_function(connection, functions, &without_schema)
+                && !is_built_in_function(connection, &called.name)
+            {
+                return Err(no_such_function());
+            }
+            continue;
+        }
+        // The translator knows the auth functions.
+        if schema_name == "auth" {
+            continue;
+        }
+        if schema_namespace(connection, schema_name).is_none() {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_SCHEMA_NAME,
+                format!("schema \"{schema_name}\" does not exist"),
+            ));
+        }
+        if !is_user_function(connection, functions, called) {
+            return Err(no_such_function());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `called` names a function that a user defined.
+fn is_user_function(
+    connection: &Connection,
+    functions: Option<&FunctionCatalog>,
+    called: &turso_pg_parser::CalledFunction,
+) -> bool {
+    functions.is_some_and(|functions| {
+        functions_named(
+            connection,
+            functions,
+            called.schema.as_deref(),
+            &called.name,
+        )
+        .next()
+        .is_some()
+    })
 }
 
 /// The functions of users that a call names `name`: the functions of schema
