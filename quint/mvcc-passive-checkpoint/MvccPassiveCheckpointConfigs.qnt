@@ -28,7 +28,45 @@ module main {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// The main configuration with two keys, a longer run and the trace replay
+// constants, for the traces of `make traces`. The Makefile does not model check
+// it, because TLC needs hours for two keys.
+// Expect no error: every rule of the design is on, as in the code today.
+// Invariants: TypeOK ReadsCorrect RecoveryCorrect BackfillBelowReaders BackfillFloorBelowReaders
+module mbt {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1", "k2"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 8,
+    MaxCheckpoints = 3,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "code",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = true,
+    LogAppendOneAtATime = true,
+    WriterBeginTicks = true,
+    WritersPinMarks = true
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -56,7 +94,11 @@ module abortsKeepMaterialized {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -84,7 +126,11 @@ module abortsNoDependency {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -112,7 +158,11 @@ module aborts {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -140,7 +190,11 @@ module dirtyClearFullScanEarly {
     GuardFullScanUntilStampCovered = false,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -168,7 +222,11 @@ module dirtyKeys {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -196,7 +254,11 @@ module dirtyMarkAfterCommit {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -224,7 +286,11 @@ module dirtyNoGenerationCas {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = false,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -251,7 +317,11 @@ module floorBackfill {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -278,7 +348,11 @@ module floorPinned {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -306,7 +380,11 @@ module floorRegistered {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -334,7 +412,11 @@ module gcSampleNoRecheck {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = true,
-    GuardGcRechecksIdleLwm = false
+    GuardGcRechecksIdleLwm = false,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -362,7 +444,11 @@ module gcSample {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = true,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -389,7 +475,11 @@ module noBackfillStop {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -416,7 +506,11 @@ module noGcWait {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -443,7 +537,11 @@ module noSnapshotClamp {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -471,7 +569,11 @@ module rule3UnderLoadOneLook {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }
 
@@ -499,6 +601,10 @@ module rule3UnderLoad {
     GuardFullScanUntilStampCovered = true,
     GuardFullScanGenerationCas = true,
     GcSamplesFirst = false,
-    GuardGcRechecksIdleLwm = true
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
   ).* from "./MvccPassiveCheckpoint"
 }

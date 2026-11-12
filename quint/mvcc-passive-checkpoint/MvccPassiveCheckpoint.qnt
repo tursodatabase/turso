@@ -100,6 +100,19 @@ module MvccPassiveCheckpoint {
   const GcSamplesFirst: bool          // sample lwm and floor, then apply
   const GuardGcRechecksIdleLwm: bool  // gc_chain_now recomputes lwm = MAX
 
+  // Trace replay only. Each one makes the spec take only the steps that the
+  // engine can take. false in every configuration that is model checked.
+  const BackfillToLimit: bool      // the backfill copies every frame up to
+                                   // the limit, not any frame up to it
+  const LogAppendOneAtATime: bool  // a writer appends its log record only when
+                                   // no other writer appended and did not
+                                   // finish (pager_commit_lock)
+  const WriterBeginTicks: bool     // a writer takes a begin timestamp from
+                                   // the clock before its commit timestamp
+  const WritersPinMarks: bool      // a writer holds a WAL read mark from its
+                                   // prepare to its finish, and the backfill
+                                   // stops at it
+
   pure val Inf = 1000   // "no end timestamp", "no reader"
   pure val None = -1    // "no visible version"
 
@@ -112,7 +125,10 @@ module MvccPassiveCheckpoint {
               last event, 0 when no frame shows it yet. */
   type Version = { b: int, e: int, value: int, mat: int }
   type Write = { ts: int, k: str, v: int }
-  type Inflight = { ts: int, k: str, v: int, logged: bool, marked: bool, omat: int }
+  // mark: the WAL mark of the writer's read transaction, 0 without
+  // WritersPinMarks.
+  type Inflight = { ts: int, k: str, v: int, logged: bool, marked: bool, omat: int,
+                    mark: int }
   type WalFrame = { w: str -> int, meta: int }
   type Cand = { k: str, s: int }
   type CkState = { pc: str, snap: int, old: int, todo: Set[str], wset: str -> int,
@@ -262,7 +278,7 @@ module MvccPassiveCheckpoint {
   // speculatively, which this model shows as plain visibility, because every
   // prepared commit finishes.
   action WritePrepare(k: str, isDelete: bool): bool = {
-    val ts = clock + 1
+    val ts = if (WriterBeginTicks) clock + 2 else clock + 1
     val old = Oracle(k, ts)
     val v = if (isDelete) 0 else ts
     // A version with begin None and end None is rolled-back garbage.
@@ -274,14 +290,15 @@ module MvccPassiveCheckpoint {
       else Set()
     val added = if (isDelete) Set() else Set({ b: ts, e: Inf, value: ts, mat: 0 })
     all {
-      clock < MaxTs,
+      ts <= MaxTs,
       not(inflight.exists(i => i.k == k)),
       not(isDelete and old == 0),
       clock' = ts,
       chain' = chain.set(k, chain.get(k).exclude(cur).union(ended).union(added)),
       inflight' = inflight.union(Set({ ts: ts, k: k, v: v, logged: false,
                                        marked: not(DirtyKeys and GuardMarkBeforeCommitEnd),
-                                       omat: omat })),
+                                       omat: omat,
+                                       mark: if (WritersPinMarks) wal.length() else 0 })),
       writes' = writes.union(Set({ ts: ts, k: k, v: v })),
       lastCommitted' = lastCommitted, llog' = llog, wal' = wal, nBackfill' = nBackfill,
       db' = db, dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor,
@@ -308,6 +325,7 @@ module MvccPassiveCheckpoint {
   action WriteLogAppend(i: Inflight): bool = all {
     not(i.logged),
     i.marked,
+    not(LogAppendOneAtATime and inflight.exists(j => j.logged)),
     llog' = llog.union(Set({ ts: i.ts, k: i.k, v: i.v })),
     logged' = logged.union(Set({ ts: i.ts, k: i.k, v: i.v })),
     inflight' = inflight.exclude(Set(i)).union(Set({ ...i, logged: true })),
@@ -581,6 +599,7 @@ module MvccPassiveCheckpoint {
   // a frame that a pinned reader does not see. Busy is the case upTo = nBackfill.
   action CheckpointBackfill: bool = {
     val marks = Pinned.map(r => rd.get(r).mark)
+                  .union(if (WritersPinMarks) inflight.map(i => i.mark) else Set())
     val limit = if (GuardBackfillStopsAtReaders) Min(marks.union(Set(wal.length())))
                 else wal.length()
     all {
@@ -588,7 +607,7 @@ module MvccPassiveCheckpoint {
       // \E to \in nBackfill..limit is false when the range is empty. "to" is
       // a built-in name in Quint, so the pick is named upTo.
       nBackfill <= limit,
-      nondet upTo = nBackfill.to(limit).oneOf()
+      nondet upTo = (if (BackfillToLimit) Set(limit) else nBackfill.to(limit)).oneOf()
       all {
         db' = Keys.mapBy(k =>
                 if (FramesWith(k, nBackfill + 1, upTo) == Set()) db.get(k)

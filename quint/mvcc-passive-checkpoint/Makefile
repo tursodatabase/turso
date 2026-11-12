@@ -39,6 +39,9 @@ CONFIGS = awk '/^\/\/ Expect /{ e = ""; if (match($$0, /Expect [A-Za-z]+ to fail
 
 # The module name of the main configuration in each configs file.
 MAIN = main
+# The module for `make traces`, if a configs file has it. It is not model
+# checked.
+MBT = mbt
 
 all: check variants
 
@@ -58,6 +61,7 @@ check variants:
 	  $(CONFIGS) $${spec}Configs.qnt | while IFS='|' read -r mod expect invs; do \
 	    if [ "$(KIND)" = main ] && [ "$$mod" != "$$main" ]; then continue; fi; \
 	    if [ "$(KIND)" = variants ] && [ "$$mod" = "$$main" ]; then continue; fi; \
+	    if [ "$$mod" = "$(MBT)" ]; then continue; fi; \
 	    if [ -n "$(ONLY)" ] && ! echo " $(ONLY) " | grep -q " $$mod "; then continue; fi; \
 	    name=$$spec-$$mod; start=$$(date +%s); \
 	    out=$$($(QUINT) verify $${spec}Configs.qnt --main $$mod --init Init --step Next \
@@ -95,12 +99,14 @@ simulate:
 	  else echo "FAIL $$spec-$$main"; echo "$$out" | tail -40; exit 1; fi; \
 	done
 
-# Random traces of each main configuration in the Informal Trace Format, for
-# trace replay. Each state records the action it took (mbt::actionTaken) and
-# the values the action picked (mbt::nondetPicks).
+# Random traces in the Informal Trace Format, for trace replay. Each state
+# records the action it took (mbt::actionTaken) and the values the action
+# picked (mbt::nondetPicks). A spec uses its mbt module if it has one, else
+# its main module.
 traces:
 	@set -e; mkdir -p traces; for spec in $(SPECS); do \
 	  main=$(MAIN); \
+	  if grep -q '^module $(MBT) ' $${spec}Configs.qnt; then main=$(MBT); fi; \
 	  $(QUINT) run $${spec}Configs.qnt --main $$main --init Init --step Next \
 	    --mbt --out-itf "traces/$${spec}_{seq}.itf.json" --n-traces $(TRACES) \
 	    --max-samples $(TRACES) --max-steps $(STEPS) --n-threads $(WORKERS) \
