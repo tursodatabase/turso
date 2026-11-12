@@ -532,6 +532,8 @@ Notes on `CREATE FUNCTION`:
   cannot be created in `pg_catalog`.
 - `DROP SCHEMA` fails for a schema that has functions; `CASCADE` drops
   them.
+- pg_dump fails on a database that has a function: it reads each function
+  with a `PREPARE` statement, which tursopg does not support.
 - `pg_proc` shows a function with its `proname` and `prosrc` as in
   PostgreSQL. `pronamespace` is the oid of the schema in `pg_namespace`: the
   oid of `public` is PostgreSQL's 2200, the oid of any other schema is
