@@ -13,6 +13,7 @@ use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
     SettingScope,
 };
+use crate::sql_functions;
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
@@ -107,7 +108,9 @@ pub fn open_database_with_io(
     // any relation, and every relation gets its row from its CREATE. A
     // database with relations but no catalog is from an earlier tursopg and
     // is refused.
-    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
+    let read_only = flags.contains(turso_core::OpenFlags::ReadOnly);
+    crate::classes::ensure_classes_table(&db, read_only)?;
+    crate::sql_functions::ensure_functions_table(&db, read_only)?;
     Ok(db)
 }
 
@@ -664,6 +667,11 @@ enum DeferredCommand {
     Ast(ast::Stmt),
     Postgres(String),
     Sqlite(String),
+    /// Engine SQL that writes a table of the frontend's schema state.
+    SchemaStateWrite(String),
+    /// Reads the functions table into the connection's function catalog,
+    /// after statements that wrote the table.
+    ReloadFunctions,
 }
 
 struct DeferredStatement {
@@ -694,6 +702,9 @@ struct PrerequisiteState {
 struct CommandSequence {
     statements: Vec<DeferredStatement>,
     index: usize,
+    /// The rows that the current statement has returned, kept only for a
+    /// statement whose rows the sequence uses.
+    rows: Vec<Vec<Value>>,
 }
 
 struct CopyState {
@@ -829,9 +840,8 @@ impl DeferredExecution {
         }
         let result = match self.phase {
             Inspect => self.work.as_mut().unwrap().inspect_nonblock(active),
-            Savepoint | Execute | Release | Rollback | RollbackRelease => {
-                active.run_ignore_rows_nonblock()
-            }
+            Execute => self.work.as_mut().unwrap().execute_nonblock(active),
+            Savepoint | Release | Rollback | RollbackRelease => active.run_ignore_rows_nonblock(),
             Start | Done => unreachable!(),
         }
         .map_err(crate::Error::into_core_error)?;
@@ -901,11 +911,11 @@ impl DeferredExecution {
                 Execute
             }
             Execute => {
-                let done = self
-                    .work
-                    .as_mut()
-                    .unwrap()
-                    .finish_statement(&mut self.active, inner)?;
+                let done = self.work.as_mut().unwrap().finish_statement(
+                    &self.pg_conn.conn,
+                    &mut self.active,
+                    inner,
+                )?;
                 if !done {
                     return Ok(());
                 }
@@ -1106,6 +1116,7 @@ impl DeferredOperation {
                     commands: CommandSequence {
                         statements,
                         index: 0,
+                        rows: Vec::new(),
                     },
                     target_index,
                     target_exists: false,
@@ -1133,6 +1144,18 @@ impl DeferredOperation {
                             return Err(LimboError::ReadOnly);
                         }
                         drop_schema_commands(conn, stmt)?
+                    }
+                    FrontendStmt::CreateFunction(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        function_catalog_statements(sql_functions::create_commands(conn, stmt)?)
+                    }
+                    FrontendStmt::DropFunction(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        function_catalog_statements(sql_functions::drop_commands(conn, stmt)?)
                     }
                     FrontendStmt::CopyFrom(stmt) => {
                         *active = Some(crate::Statement::new(prepare_copy_columns(
@@ -1173,6 +1196,7 @@ impl DeferredOperation {
                 Ok(Some(DeferredWork::Commands(CommandSequence {
                     statements,
                     index: 0,
+                    rows: Vec::new(),
                 })))
             }
         }
@@ -1202,6 +1226,13 @@ impl DeferredWork {
         }
     }
 
+    fn execute_nonblock(&mut self, active: &mut crate::Statement) -> crate::Result<IOResult<()>> {
+        match self {
+            Self::Commands(commands) => commands.execute_nonblock(active),
+            Self::Prerequisites(_) | Self::Copy(_) => active.run_ignore_rows_nonblock(),
+        }
+    }
+
     fn prepare_active(
         &self,
         pg_conn: &Arc<PgConnectionInner>,
@@ -1227,6 +1258,7 @@ impl DeferredWork {
 
     fn finish_statement(
         &mut self,
+        conn: &Connection,
         active: &mut Option<crate::Statement>,
         inner: &mut Statement,
     ) -> Result<bool> {
@@ -1241,6 +1273,7 @@ impl DeferredWork {
             }
             Self::Commands(commands) => {
                 *active = None;
+                commands.finish_statement(conn)?;
                 Ok(commands.advance())
             }
             Self::Copy(state) => state.finish_statement(active),
@@ -1295,7 +1328,34 @@ impl CommandSequence {
                 prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
             }
             DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(sql)?),
+            DeferredCommand::SchemaStateWrite(_) => {
+                crate::Statement::new(conn.prepare_dialect_schema_write(sql)?)
+            }
+            DeferredCommand::ReloadFunctions => {
+                crate::Statement::new(conn.prepare_dialect_schema_read(sql)?)
+            }
         })
+    }
+
+    fn execute_nonblock(&mut self, active: &mut crate::Statement) -> crate::Result<IOResult<()>> {
+        if !matches!(self.current().command, DeferredCommand::ReloadFunctions) {
+            return active.run_ignore_rows_nonblock();
+        }
+        let rows = &mut self.rows;
+        active.run_with_row_callback_nonblock(|row| {
+            rows.push(row.get_values().cloned().collect());
+            Ok(())
+        })
+    }
+
+    /// What a statement of the sequence does once it has run, besides what
+    /// it wrote.
+    fn finish_statement(&mut self, conn: &Connection) -> Result<()> {
+        let rows = std::mem::take(&mut self.rows);
+        match self.current().command {
+            DeferredCommand::ReloadFunctions => sql_functions::replace_catalog(conn, &rows),
+            _ => Ok(()),
+        }
     }
 
     fn advance(&mut self) -> bool {
@@ -1307,8 +1367,10 @@ impl CommandSequence {
         match &self.current().command {
             DeferredCommand::Translated(_, sql)
             | DeferredCommand::Sqlite(sql)
-            | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
+            | DeferredCommand::Postgres(sql)
+            | DeferredCommand::SchemaStateWrite(sql) => Cow::Borrowed(sql),
             DeferredCommand::Ast(stmt) => stmt.to_string().into(),
+            DeferredCommand::ReloadFunctions => sql_functions::select_sql().into(),
         }
     }
 
@@ -1754,6 +1816,8 @@ fn try_prepare_special(
         | FrontendStmt::DiscardAll
         | FrontendStmt::CreateSchema(_)
         | FrontendStmt::DropSchema(_)
+        | FrontendStmt::CreateFunction(_)
+        | FrontendStmt::DropFunction(_)
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
         | FrontendStmt::CommentOn(_)
@@ -1847,6 +1911,24 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         FrontendStmt::DropSchema(stmt) => {
             PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
         }
+        FrontendStmt::CreateFunction(stmt) => PermissionDenied::privilege(
+            Action::Create,
+            Object::Schema(sql_functions::creation_schema_name(
+                conn,
+                stmt.schema.as_deref(),
+            )?),
+        ),
+        FrontendStmt::DropFunction(stmt) => {
+            let name = stmt
+                .functions
+                .first()
+                .map(|function| function.name.as_str())
+                .unwrap_or_default();
+            return Err(sqlstate_error(
+                SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                format!("must be owner of function {name}"),
+            ));
+        }
         FrontendStmt::CopyFrom(stmt) => {
             PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
         }
@@ -1865,6 +1947,22 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         }
     };
     Err(LimboError::PermissionDenied(Box::new(denial)))
+}
+
+/// The statements that run the steps of a change to the function catalog.
+fn function_catalog_statements(
+    commands: Vec<sql_functions::CatalogCommand>,
+) -> Vec<DeferredStatement> {
+    commands
+        .into_iter()
+        .map(|command| DeferredStatement {
+            command: match command {
+                sql_functions::CatalogCommand::Write(sql) => DeferredCommand::SchemaStateWrite(sql),
+                sql_functions::CatalogCommand::Reload => DeferredCommand::ReloadFunctions,
+            },
+            context: CommandContext::Default,
+        })
+        .collect()
 }
 
 /// The engine GRANT that stores a GRANT. The engine checks the
@@ -2261,7 +2359,9 @@ fn drop_schema_commands(
     }
 
     let objects = schema_objects(conn, &name);
-    if !stmt.cascade && !objects.is_empty() {
+    let namespace = conn.qualifier(&name).expect("the schema exists").target.id;
+    let has_functions = sql_functions::schema_has_functions(conn, namespace);
+    if !stmt.cascade && (!objects.is_empty() || has_functions) {
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
             format!("cannot drop schema \"{name}\" because other objects depend on it"),
@@ -2275,6 +2375,9 @@ fn drop_schema_commands(
             context: CommandContext::DropSchema,
         })
         .collect();
+    commands.extend(function_catalog_statements(
+        sql_functions::drop_schema_commands(conn, namespace),
+    ));
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name),

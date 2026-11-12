@@ -207,6 +207,15 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
     }
 
+    fn expand_function_call(
+        &self,
+        scope: &turso_core::FunctionScope<'_>,
+        name: &str,
+        args: &[Box<ast::Expr>],
+    ) -> Result<Option<ast::Expr>> {
+        crate::sql_functions::expand_call(scope, name, args)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
@@ -1199,8 +1208,92 @@ impl SnapshotRows for PgProcTable {
             ]);
             oid += 1;
         }
+        rows.extend(sql_function_rows(conn));
         rows
     }
+}
+
+/// PostgreSQL's oid of the `sql` language in `pg_language`.
+const SQL_LANGUAGE_OID: i64 = 14;
+
+/// The `pg_proc` rows of the functions that users defined with CREATE
+/// FUNCTION.
+fn sql_function_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    let schema = conn.current_schema();
+    let Some(state) = crate::schema_state::schema_state(&schema) else {
+        return Vec::new();
+    };
+    state
+        .functions
+        .iter()
+        .filter_map(|function| {
+            // A function whose stored statement cannot be read cannot be
+            // called either, and is left out.
+            let definition = function.definition().ok()?;
+            let argument_types = definition
+                .parameters
+                .iter()
+                .map(|parameter| sqlite_type_to_pg_oid(&parameter.type_name).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let has_argument_names = definition
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.is_some());
+            let argument_names = if has_argument_names {
+                let names = definition
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        format!(
+                            "\"{}\"",
+                            parameter
+                                .name
+                                .as_deref()
+                                .unwrap_or_default()
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Value::build_text(format!("{{{names}}}"))
+            } else {
+                Value::Null
+            };
+            Some(vec![
+                Value::from_i64(function.oid),                                   // oid
+                Value::build_text(function.name.clone()),                        // proname
+                Value::from_i64(namespace_oid(&schema, function.namespace)),     // pronamespace
+                Value::from_i64(role_oid(function.owner)),                       // proowner
+                Value::from_i64(SQL_LANGUAGE_OID),                               // prolang
+                Value::from_f64(definition.hints.cost),                          // procost
+                Value::from_f64(0.0),                                            // prorows
+                Value::from_i64(0),                                              // provariadic
+                Value::build_text("f"),                                          // prokind
+                Value::from_i64(0),                                              // prosecdef
+                Value::from_i64(definition.hints.leakproof.into()),              // proleakproof
+                Value::from_i64(definition.hints.strict.into()),                 // proisstrict
+                Value::from_i64(0),                                              // proretset
+                Value::build_text(definition.volatility.letter()),               // provolatile
+                Value::build_text(definition.hints.parallel.to_string()),        // proparallel
+                Value::from_i64(function.argument_count as i64),                 // pronargs
+                Value::from_i64(0),                                              // pronargdefaults
+                Value::from_i64(sqlite_type_to_pg_oid(&definition.return_type)), // prorettype
+                Value::build_text(argument_types),                               // proargtypes
+                Value::Null,                                                     // proallargtypes
+                Value::Null,                                                     // proargmodes
+                argument_names,                                                  // proargnames
+                Value::Null,                                                     // proargdefaults
+                Value::Null,                                                     // protrftypes
+                Value::build_text(definition.source.clone()),                    // prosrc
+                Value::Null,                                                     // probin
+                Value::Null,                                                     // prosqlbody
+                Value::Null,                                                     // proconfig
+                Value::Null,                                                     // proacl
+            ])
+        })
+        .collect()
 }
 
 /// Virtual table implementation for pg_catalog.pg_database

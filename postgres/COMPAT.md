@@ -500,7 +500,8 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error. A function that PostgreSQL rejects gets PostgreSQL's error; otherwise the error names the first unsupported feature, such as the language, RETURNS SETOF or an option |
+| CREATE FUNCTION | 🟡 Partial | Only `LANGUAGE sql` functions that return one value and whose body, given with `AS`, is one `SELECT` of one expression without `FROM`: the function is expanded where it is called, so it cannot return a set, modify data or call itself. A subquery in the body needs a function without parameters. Not supported: `SECURITY DEFINER`, `STRICT` with parameters, `SET`, `SUPPORT`, `TRANSFORM`, `WINDOW`, parameter defaults, `OUT` and `VARIADIC` parameters, polymorphic and array types, and two functions of a schema with the same name and number of arguments. Only a superuser creates, replaces and drops functions; every role may call one. See MANUAL.md |
+| DROP FUNCTION | 🟡 Partial | The argument list selects a function by the number of arguments, not their types. `CASCADE` and `RESTRICT` are accepted, but no dependencies are recorded: a view that calls a dropped function fails when it is read |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
 | Event triggers | ❌ Not supported | |
@@ -520,7 +521,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION in a language other than `sql` and DO are rejected with an error |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |

@@ -203,6 +203,89 @@ Only the owner of the table or a superuser may drop its policies.
 DROP POLICY own_docs ON docs;
 ```
 
+### `CREATE FUNCTION` — define a function in SQL
+
+```sql
+CREATE [ OR REPLACE ] FUNCTION name ( [ [ argname ] argtype [, ...] ] )
+    RETURNS rettype
+    LANGUAGE sql
+    [ IMMUTABLE | STABLE | VOLATILE ]
+    AS 'SELECT expression'
+```
+
+Defines a function whose value is one SQL expression. The body is one
+`SELECT` of one expression, without `FROM` or any other clause. The body
+reads a parameter by its name or as `$1`, `$2`, and so on.
+
+```sql
+CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE sql IMMUTABLE
+    AS 'SELECT x + 1';
+
+CREATE FUNCTION current_tenant() RETURNS int LANGUAGE sql STABLE
+    AS $$ SELECT nullif(current_setting('app.tenant', true), '')::int $$;
+
+SELECT * FROM notes WHERE tenant = current_tenant();
+```
+
+tursopg does not run the function when it is called. It puts the body's
+expression, cast to the return type, where the call is, with each argument,
+cast to its parameter's type, in place of the parameter. PostgreSQL does
+the same with such functions. The planner sees the expression, so
+`tenant = current_tenant()` can use an index on `tenant`.
+
+Because of this, some things that PostgreSQL accepts are errors with
+SQLSTATE `0A000`:
+
+- A language other than `sql`, and a body written with `RETURN` or
+  `BEGIN ATOMIC`.
+- A body that is not one `SELECT` of one expression: one with `FROM`,
+  several statements, or `INSERT`, `UPDATE` or `DELETE`. A body can read a
+  table in a subquery, `SELECT (SELECT max(id) FROM t)`, if the function has
+  no parameters.
+- An aggregate or window function in the body outside a subquery.
+- A function that calls itself.
+- `RETURNS SETOF`, `RETURNS TABLE`, `RETURNS void`, and `OUT`, `INOUT`,
+  `VARIADIC` and polymorphic (`anyelement`) parameters, and defaults for
+  parameters.
+- Parameters and results of array types or written with `%TYPE`.
+- `SECURITY DEFINER`, `SET`, `SUPPORT`, `TRANSFORM`, `WINDOW`, and `STRICT`
+  on a function with parameters.
+- Two functions of one schema with the same name and the same number of
+  parameters. Functions with different numbers of parameters can share a
+  name.
+- A call whose argument can give a different value each time it is
+  computed, such as `random()`, for a parameter that the body reads more
+  than once. PostgreSQL computes the argument once.
+
+The body is checked when the function is created: a function, table or
+column that it names has to exist. The value that the body selects is cast
+to the return type, also where PostgreSQL would report that the types do
+not match.
+
+A function is created in the schema that its name gives, or else in the
+first schema of the search path. A call without a schema finds a built-in
+function of that name first, then looks in the schemas of the search path.
+`CREATE OR REPLACE` keeps the function's oid and cannot change its return
+type. Only a superuser creates, replaces or drops a function. Every role may
+call a function, and the body runs with the privileges of the caller.
+
+Functions are listed in `pg_proc`. Creating a function can be rolled back.
+
+### `DROP FUNCTION` — remove a function
+
+```sql
+DROP FUNCTION [ IF EXISTS ] name [ ( [ argtype [, ...] ] ) ] [, ...]
+```
+
+Removes functions made with `CREATE FUNCTION`. With an argument list, the
+function with that number of parameters is removed; the types are not
+compared. Without one, the name has to belong to one function.
+
+tursopg does not record which views, defaults and constraints call a
+function. `DROP FUNCTION` succeeds when something still calls the function,
+and that view or statement then fails with `no such function`. `DROP SCHEMA`
+needs `CASCADE` for a schema that has functions.
+
 ### `CREATE ROLE` — create a role
 
 **Synopsis:**
