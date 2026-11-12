@@ -501,9 +501,14 @@ expect error {
     OVER specified, but add_one is not a window function nor an aggregate function
 }
 
+# Constant arguments that can fail
+#
 # PostgreSQL computes a constant argument before it inlines the function, so
 # an argument that fails is an error also when the body does not compute it.
-# tursopg computes the argument where the body uses it.
+# tursopg computes the argument where the body uses it. Thus it rejects a
+# constant argument that can fail (one with an operator, a function or a
+# cast) when the body does not always compute it.
+
 test constant-argument-that-fails-and-that-the-body-does-not-compute {
     CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
     SELECT choose(1 / 0, true);
@@ -512,8 +517,155 @@ test constant-argument-that-fails-and-that-the-body-does-not-compute {
 expect error {
     division by zero
 }
-expect @tursopg {
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "choose" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+test constant-argument-that-fails-and-that-the-body-computes {
+    CREATE FUNCTION add_one(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1$$;
+    SELECT add_one(1 / 0);
+}
+@sqlstate 22012
+expect error {
+    division by zero
+}
+
+# PostgreSQL returns a result for an argument that does not fail. tursopg
+# cannot tell if an operator, a function or a cast fails.
+test constant-argument-with-a-cast-that-the-body-does-not-always-compute {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    SELECT choose('5'::integer, false);
+}
+expect {
+    5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "choose" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+test constant-argument-without-an-operator-that-the-body-does-not-always-compute {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    SELECT choose(5, false), choose(-5, false), choose((5), false), coalesce(choose(NULL, false), -1);
+}
+expect {
+    5|-5|5|-1
+}
+
+# An argument with a column is computed where the body uses it, in
+# PostgreSQL and in tursopg.
+test argument-with-a-column-that-fails-and-that-the-body-does-not-compute {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    CREATE TABLE t (a integer);
+    INSERT INTO t VALUES (1);
+    SELECT choose(a / (a - a), true) FROM t;
+}
+expect {
     0
+}
+
+# PostgreSQL does not compute a volatile function, the current date or a
+# subquery when it plans the statement, so such an argument is not a
+# constant: PostgreSQL also computes it where the body uses it.
+test volatile-argument-that-the-body-does-not-compute {
+    CREATE SEQUENCE ids;
+    CREATE FUNCTION choose(bigint, boolean) RETURNS bigint LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    SELECT choose(nextval('ids') + 1, true);
+    SELECT nextval('ids');
+}
+expect {
+    0
+    1
+}
+
+test argument-with-the-current-date-that-the-body-does-not-compute {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    SELECT choose(1 / (CURRENT_DATE - CURRENT_DATE), true);
+}
+expect {
+    0
+}
+
+test subquery-argument-that-the-body-does-not-always-compute {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    SELECT choose((SELECT 5), false);
+}
+expect {
+    5
+}
+
+# In each body, the engine always computes the parameter.
+test constant-argument-that-the-body-always-computes {
+    CREATE FUNCTION in_a_condition(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 > 2 THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION in_a_case_operand(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE $1 WHEN 3 THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_and(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 > 2 AND $2 THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_in(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 IN (3, 4) THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION on_the_left_of_like(text) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 LIKE '3%' THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION in_the_first_argument(integer) RETURNS integer LANGUAGE sql AS $$SELECT coalesce($1, 0)$$;
+    CREATE FUNCTION on_the_right_of_an_operator(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN 2 < $1 THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION with_a_sign_and_a_null_test(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN (- $1) IS NULL THEN 0 ELSE 1 END$$;
+    CREATE FUNCTION with_a_not_null_test(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 IS NOT NULL THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION in_the_first_column_of_a_row(integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN ($1, 1) = (3, 1) THEN 1 ELSE 0 END$$;
+    CREATE FUNCTION in_another_function(integer) RETURNS integer LANGUAGE sql AS $$SELECT in_a_condition($1) + 10$$;
+    SELECT in_a_condition(1 + 2), in_a_case_operand(1 + 2), on_the_left_of_and(1 + 2, true),
+           on_the_left_of_in(1 + 2), on_the_left_of_like('3' || 'x'), in_the_first_argument(1 + 2),
+           on_the_right_of_an_operator(1 + 2), with_a_sign_and_a_null_test(1 + 2),
+           with_a_not_null_test(1 + 2), in_the_first_column_of_a_row(1 + 2),
+           in_another_function(1 + 2);
+}
+expect {
+    1|1|1|1|1|3|1|1|1|1|11
+}
+
+test constant-argument-on-the-right-of-and-only {
+    CREATE FUNCTION large_if(boolean, integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 AND $2 > 1 THEN 1 ELSE 0 END$$;
+    SELECT large_if(true, 1 + 1);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "large_if" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+test constant-argument-after-the-first-argument-of-a-function-only {
+    CREATE FUNCTION first_or(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT coalesce($1, $2)$$;
+    SELECT first_or(NULL, 1 + 1);
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "first_or" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+test constant-argument-in-an-item-of-a-list-only {
+    CREATE FUNCTION is_listed(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $1 IN ($2, 5) THEN 1 ELSE 0 END$$;
+    SELECT is_listed(2, 1 + 1);
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "is_listed" with an argument that can fail, for a parameter that the body does not always compute, is not supported
+}
+
+# The body of the inner function does not always compute its parameter.
+test constant-argument-that-another-function-can-skip {
+    CREATE FUNCTION choose(integer, boolean) RETURNS integer LANGUAGE sql AS $$SELECT CASE WHEN $2 THEN 0 ELSE $1 END$$;
+    CREATE FUNCTION choose_first(integer) RETURNS integer LANGUAGE sql AS $$SELECT choose($1, false)$$;
+    SELECT choose_first(1 + 1);
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a call of function "choose" with an argument that can fail, for a parameter that the body does not always compute, is not supported
 }
 
 # Arguments that the body does not use

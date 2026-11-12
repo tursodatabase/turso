@@ -15,7 +15,8 @@
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::{
-    expr_is_deeper_than, walk_expr, walk_expr_mut, Connection, Func, LimboError, WalkControl,
+    expr_is_deeper_than, walk_expr, walk_expr_mut, Connection, Deterministic, Func, LimboError,
+    WalkControl,
 };
 use turso_parser::ast;
 use turso_parser::parser::MAX_EXPR_DEPTH;
@@ -209,6 +210,23 @@ impl<'a> Expansion<'a> {
         if expr_is_deeper_than(&expression, MAX_EXPR_DEPTH) {
             return Err(stack_depth_limit_exceeded());
         }
+        // PostgreSQL computes an argument that is a constant before it
+        // inlines the function. Thus an argument that fails is an error
+        // also when the body does not compute its parameter. tursopg
+        // computes the argument where the expression has it.
+        let has_argument_that_can_be_skipped =
+            args.iter().zip(&use_counts).any(|(argument, use_count)| {
+                *use_count > 0
+                    && is_constant(self.built_in_functions, argument)
+                    && !cannot_fail(argument)
+                    && !always_computes(&expression, argument)
+            });
+        if has_argument_that_can_be_skipped {
+            return Err(not_supported(format!(
+                "a call of function \"{name}\" with an argument that can fail, for a parameter \
+                 that the body does not always compute,"
+            )));
+        }
         Ok(Some(expression))
     }
 
@@ -319,6 +337,7 @@ struct BuiltInFunctions<'a> {
 struct BuiltInFunction {
     /// An aggregate or a window function.
     is_aggregate: bool,
+    is_deterministic: bool,
 }
 
 impl BuiltInFunctions<'_> {
@@ -332,13 +351,17 @@ impl BuiltInFunctions<'_> {
         if let Ok(Some(function)) = self.dialect.resolve_function(name, argument_count) {
             return Some(BuiltInFunction {
                 is_aggregate: matches!(function, Func::Agg(_) | Func::Window(_)),
+                is_deterministic: function.is_deterministic(),
             });
         }
         self.connection
             .get_syms_functions()
             .into_iter()
             .find(|(function_name, ..)| function_name.eq_ignore_ascii_case(name))
-            .map(|(_, is_aggregate, ..)| BuiltInFunction { is_aggregate })
+            .map(|(_, is_aggregate, _, is_deterministic)| BuiltInFunction {
+                is_aggregate,
+                is_deterministic,
+            })
     }
 
     /// Whether `expression` is a call of an aggregate or a window function.
@@ -364,6 +387,20 @@ impl BuiltInFunctions<'_> {
             }
             _ => false,
         }
+    }
+}
+
+impl BuiltInFunctions<'_> {
+    /// Whether two calls of the function that a call of `name` with
+    /// `argument_count` arguments runs can give different results for the
+    /// same arguments in one statement. The engine's flag for a function
+    /// that is not deterministic says this, as `pg_proc.provolatile` shows.
+    /// An aggregate or a window function is not volatile: PostgreSQL
+    /// computes it one time where a query uses it. A function that tursopg
+    /// does not have is volatile.
+    fn is_volatile(&self, name: &str, argument_count: usize) -> bool {
+        self.get(name, argument_count)
+            .is_none_or(|function| !function.is_aggregate && !function.is_deterministic)
     }
 }
 
@@ -513,6 +550,151 @@ fn is_constant_or_variable(argument: &ast::Expr) -> bool {
         }
         ast::Expr::Unary(_, operand) => is_constant_or_variable(operand),
         ast::Expr::Cast { expr, .. } => is_constant_or_variable(expr),
+        _ => false,
+    }
+}
+
+/// Whether PostgreSQL computes `argument` when it plans the statement:
+/// `argument` has no column, no variable of the statement, no subquery, and
+/// no function or literal that gives a new result at each use.
+fn is_constant(built_in_functions: BuiltInFunctions, argument: &ast::Expr) -> bool {
+    !has_column_or_variable(argument)
+        && !has_subquery_or_volatile_call(built_in_functions, argument)
+}
+
+/// Whether `expression` has a column or a variable of the statement. A
+/// variable of the statement can be a parameter of a function, when
+/// `CREATE FUNCTION` checks the body.
+fn has_column_or_variable(expression: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expression, &mut |part| {
+        found |= is_column(part) || matches!(part, ast::Expr::Variable(_));
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+fn is_column(expression: &ast::Expr) -> bool {
+    matches!(
+        expression,
+        ast::Expr::Id(_)
+            | ast::Expr::Name(_)
+            | ast::Expr::Qualified(..)
+            | ast::Expr::DoublyQualified(..)
+            | ast::Expr::Column { .. }
+            | ast::Expr::RowId { .. }
+    )
+}
+
+/// Whether `argument` has a subquery, or a function or a literal that can
+/// give a different result at each use.
+///
+/// PostgreSQL has three classes of functions: IMMUTABLE, STABLE (one result
+/// in a statement, such as `now()` and `CURRENT_DATE`) and VOLATILE. tursopg
+/// only knows if a function is deterministic. A function that is not
+/// deterministic is volatile here, also when PostgreSQL calls it STABLE,
+/// because tursopg computes it again at each call.
+fn has_subquery_or_volatile_call(
+    built_in_functions: BuiltInFunctions,
+    argument: &ast::Expr,
+) -> bool {
+    let mut found = false;
+    let _ = walk_expr(argument, &mut |expression| {
+        found |= match expression {
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => true,
+            ast::Expr::Literal(literal) => is_computed_at_each_use(literal),
+            ast::Expr::FunctionCall { name, args, .. } => {
+                built_in_functions.is_volatile(name.as_str(), args.len())
+            }
+            ast::Expr::FunctionCallStar { name, .. } => {
+                built_in_functions.is_volatile(name.as_str(), 0)
+            }
+            _ => false,
+        };
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// Whether tursopg computes `literal` again at each use, so that two copies
+/// of it can be different.
+fn is_computed_at_each_use(literal: &ast::Literal) -> bool {
+    match literal {
+        ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp => {
+            true
+        }
+        ast::Literal::Numeric(_)
+        | ast::Literal::String(_)
+        | ast::Literal::Blob(_)
+        | ast::Literal::Keyword(_)
+        | ast::Literal::Null
+        | ast::Literal::True
+        | ast::Literal::False => false,
+    }
+}
+
+/// Whether `argument` cannot fail when it is computed: it is a column, a
+/// literal or a variable of the statement, also with a sign or parentheses.
+/// An operator, a function and a cast can fail.
+fn cannot_fail(argument: &ast::Expr) -> bool {
+    match argument {
+        ast::Expr::Literal(_) | ast::Expr::Variable(_) => true,
+        // The translator writes `true` and `false` as a cast of 1 and 0.
+        ast::Expr::Cast {
+            expr,
+            type_name: Some(type_name),
+        } if type_name.name == "boolean" => {
+            matches!(expr.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(digit)) if digit == "0" || digit == "1")
+        }
+        ast::Expr::Parenthesized(parts) => parts.iter().all(|part| cannot_fail(part)),
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, operand) => {
+            matches!(
+                operand.as_ref(),
+                ast::Expr::Literal(ast::Literal::Numeric(_))
+            )
+        }
+        column => is_column(column),
+    }
+}
+
+/// Whether the engine computes `argument` each time it computes
+/// `expression`, which has copies of `argument`. The engine does not always
+/// compute a branch of `CASE`, the right side of `AND` or `OR`, an item of a
+/// list, or an argument of a function after the first one.
+fn always_computes(expression: &ast::Expr, argument: &ast::Expr) -> bool {
+    if expression == argument {
+        return true;
+    }
+    match expression {
+        ast::Expr::Parenthesized(parts) => parts
+            .first()
+            .is_some_and(|part| always_computes(part, argument)),
+        ast::Expr::Unary(_, part)
+        | ast::Expr::IsNull(part)
+        | ast::Expr::NotNull(part)
+        | ast::Expr::Cast { expr: part, .. } => always_computes(part, argument),
+        ast::Expr::Binary(left, ast::Operator::And | ast::Operator::Or, _) => {
+            always_computes(left, argument)
+        }
+        ast::Expr::Binary(left, _, right) => {
+            always_computes(left, argument) || always_computes(right, argument)
+        }
+        ast::Expr::Like { lhs, .. } | ast::Expr::InList { lhs, .. } => {
+            always_computes(lhs, argument)
+        }
+        ast::Expr::Case {
+            base: Some(base), ..
+        } => always_computes(base, argument),
+        ast::Expr::Case {
+            base: None,
+            when_then_pairs,
+            ..
+        } => when_then_pairs
+            .first()
+            .is_some_and(|(condition, _)| always_computes(condition, argument)),
+        ast::Expr::FunctionCall { args, .. } => args
+            .first()
+            .is_some_and(|first| always_computes(first, argument)),
         _ => false,
     }
 }

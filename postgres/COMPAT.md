@@ -631,8 +631,18 @@ Notes on calls of SQL functions:
 - PostgreSQL computes a constant argument before it inlines the function.
   Thus an argument that fails, such as `1 / 0`, is an error also when the
   body does not compute it, such as in a `CASE` branch that does not run.
-  tursopg computes the argument where the body uses it, so the call returns
-  a result.
+  tursopg computes the argument where the body uses it. Thus it rejects a
+  call with a constant argument that can fail (it has an operator, a
+  function or a cast), when the expression of the call does not always
+  compute the argument: each use of the parameter is in a branch of `CASE`,
+  on the right side of `AND` or `OR`, in an item of a list, or in an
+  argument of a function after the first one. PostgreSQL returns a result
+  for such a call when the argument does not fail. An argument with a
+  column, a subquery, or a function that tursopg does not flag as
+  deterministic is not a constant. An argument with a parameter of the
+  statement (`$1`) is not a constant for this rule either. PostgreSQL
+  computes such an argument before the call when it plans the statement for
+  the values of the parameters.
 - PostgreSQL chooses between functions of one name by the types of the
   arguments. tursopg does not know these types, so it rejects a call of a
   name that several functions of the searched schemas have.
