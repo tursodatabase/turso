@@ -5,6 +5,7 @@
 
 mod itf;
 mod rows;
+mod schema;
 
 use std::sync::Arc;
 
@@ -29,6 +30,8 @@ use itf::Step;
 enum Expect {
     /// Every check holds at every step.
     Conforms,
+    /// The engine fails a check at this step, with this kind of failure.
+    Violation { step: usize, kind: Failure },
 }
 
 /// The kinds of differences between the engine and the trace.
@@ -54,6 +57,8 @@ enum Failure {
     RecoveryError,
     /// A crash now makes recovery panic.
     RecoveryPanic,
+    /// The schema cookie in the global header is below the shared schema.
+    CookieBehind,
 }
 
 /// Why a replay stopped before the end of the trace.
@@ -117,6 +122,18 @@ fn replay(name: &str, trace: &str, expect: Expect, driver: &mut dyn Driver) -> R
             "{name}: the engine differs from the spec at step {index} ({}): {kind:?}: {detail}",
             steps[index].action
         ),
+        (Expect::Violation { step, kind }, None) => panic!(
+            "{name}: expected {kind:?} at step {step}, but every step conforms. \
+             If a fix made this pass, change the test to Expect::Conforms."
+        ),
+        (Expect::Violation { step, kind }, Some((index, Stop::Failed { kind: got, detail }))) => {
+            assert_eq!(
+                (index, got),
+                (step, kind),
+                "{name}: expected {kind:?} at step {step}, got {got:?} at step {index}: {detail}"
+            );
+            Replay::Done
+        }
     }
 }
 
