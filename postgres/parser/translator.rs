@@ -3,7 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
-use crate::coerce::{bool_literal, coerce, engine_cast, CastContext, PgType};
+use crate::coerce::{bool_literal, coerce, engine_cast, engine_cast_as, CastContext, PgType};
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
@@ -60,6 +60,7 @@ pub struct PostgreSQLTranslator {
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
     scopes: RefCell<Scopes>,
+    for_stored_sql: bool,
 }
 
 struct ScopeGuard<'a>(&'a RefCell<Scopes>);
@@ -89,6 +90,14 @@ impl PostgreSQLTranslator {
     pub fn with_column_types(self, lookup: ColumnLookup) -> Self {
         Self {
             scopes: RefCell::new(Scopes::new(Some(lookup))),
+            ..self
+        }
+    }
+
+    /// A translator for SQL text that the database stored, which keeps loading when a conversion is rejected.
+    pub fn for_stored_sql(self) -> Self {
+        Self {
+            for_stored_sql: true,
             ..self
         }
     }
@@ -749,21 +758,7 @@ impl PostgreSQLTranslator {
         let col_type = if mapping.type_name.is_empty() {
             None
         } else {
-            let size = match mapping.type_params.as_slice() {
-                [p, s] => Some(ast::TypeSize::TypeSize(
-                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
-                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
-                )),
-                [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
-                    ast::Literal::Numeric(n.to_string()),
-                )))),
-                _ => None,
-            };
-            Some(ast::Type {
-                name: mapping.type_name.clone(),
-                size,
-                array_dimensions: mapping.array_dimensions,
-            })
+            Some(mapping.to_ast_type())
         };
 
         // Build constraints list
@@ -1260,21 +1255,7 @@ impl PostgreSQLTranslator {
         }
         let typmods = extract_integer_typmods(col_def)?;
         let mapping = map_column_type(&pg_type, &typmods)?;
-        let size = match mapping.type_params.as_slice() {
-            [p, s] => Some(ast::TypeSize::TypeSize(
-                Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
-                Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
-            )),
-            [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
-                ast::Literal::Numeric(n.to_string()),
-            )))),
-            _ => None,
-        };
-        let col_type = Some(ast::Type {
-            name: mapping.type_name,
-            size,
-            array_dimensions: mapping.array_dimensions,
-        });
+        let col_type = Some(mapping.to_ast_type());
 
         let mut constraints = Vec::new();
         for constraint_node in &col_def.constraints {
@@ -5194,11 +5175,20 @@ impl PostgreSQLTranslator {
         target: &PgType,
         context: CastContext,
     ) -> Result<ast::Expr, ParseError> {
-        self.known_type(source)
-            .and_then(|source| coerce(expr, source.as_ref(), target, context))
+        let stored = self.for_stored_sql.then(|| expr.clone());
+        let result = self
+            .known_type(source)
+            .and_then(|source| coerce(expr, source.as_ref(), target, context));
+        match (result, stored) {
+            (Err(_), Some(expr)) => Ok(stored_cast(expr, target, context)),
+            (result, _) => result,
+        }
     }
 
     fn known_type(&self, typed: ExprType) -> Result<Option<PgType>, ParseError> {
+        if self.for_stored_sql {
+            return Ok(typed.ok());
+        }
         require_type(typed)
     }
 
@@ -6120,6 +6110,24 @@ pub struct PgTypeMapping {
 }
 
 impl PgTypeMapping {
+    fn to_ast_type(&self) -> ast::Type {
+        let size = match self.type_params.as_slice() {
+            [p, s] => Some(ast::TypeSize::TypeSize(
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
+            )),
+            [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
+                ast::Literal::Numeric(n.to_string()),
+            )))),
+            _ => None,
+        };
+        ast::Type {
+            name: self.type_name.clone(),
+            size,
+            array_dimensions: self.array_dimensions,
+        }
+    }
+
     pub fn scalar(name: impl Into<String>) -> Self {
         Self {
             type_name: name.into(),
@@ -6142,6 +6150,16 @@ impl PgTypeMapping {
             array_dimensions: dims,
             type_params: vec![],
         }
+    }
+}
+
+fn stored_cast(expr: ast::Expr, target: &PgType, context: CastContext) -> ast::Expr {
+    if context != CastContext::Explicit {
+        return expr;
+    }
+    match map_pg_type(&target.to_string(), &[]) {
+        Some(mapping) => engine_cast_as(expr, mapping.to_ast_type()),
+        None => expr,
     }
 }
 
@@ -12793,6 +12811,21 @@ mod tests {
             }
             other => panic!("{sql}: expected an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stored_sql_keeps_loading_a_default_cast_of_a_string_to_jsonb() {
+        let sql = "CREATE TABLE made (j jsonb DEFAULT '{}'::jsonb)";
+        assert_rejected(
+            &PostgreSQLTranslator::new(),
+            sql,
+            "0A000",
+            "a cast from unknown to jsonb is not supported",
+        );
+        let translated = translate_with(&PostgreSQLTranslator::new().for_stored_sql(), sql)
+            .unwrap()
+            .to_string();
+        assert!(translated.contains("CAST ('{}' AS jsonb)"), "{translated}");
     }
 
     #[test]

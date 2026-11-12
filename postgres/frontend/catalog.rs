@@ -71,7 +71,7 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new().for_stored_sql();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
             Err(_) => turso_core::dialect::engine::parse(sql),
@@ -94,7 +94,7 @@ impl Dialect for PostgresDialect {
 
         let parse_result =
             turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new().for_stored_sql();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -117,7 +117,7 @@ impl Dialect for PostgresDialect {
 
         let parse_result =
             turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new().for_stored_sql();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -4251,6 +4251,28 @@ mod tests {
                 "{cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn stored_table_sql_that_a_new_statement_would_reject_still_loads() {
+        for sql in [
+            "CREATE TABLE made (ts timestamp, CHECK (ts > '2024-01-01'))",
+            "CREATE TABLE made (j jsonb DEFAULT '{}'::jsonb)",
+            "CREATE TABLE made (a int, b text, CHECK (a = b))",
+        ] {
+            let stored = encode_pg_schema_sql(sql);
+            PostgresDialect.parse_table_sql(&stored, 2).unwrap();
+            PostgresDialect.parse_table_sql_ast(&stored).unwrap();
+            PostgresDialect.table_sql_for_replay(&stored).unwrap();
+        }
+    }
+
+    #[test]
+    fn dialect_parse_keeps_loading_a_statement_with_a_rejected_conversion() {
+        let (cmd, _) = PostgresDialect
+            .parse("SELECT '{}'::jsonb, ts > '2024-01-01'")
+            .unwrap();
+        assert!(cmd.is_some());
     }
 
     #[test]
