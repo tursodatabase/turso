@@ -115,7 +115,7 @@ PRAGMA table_info(table-name);
 |--------|------|-------------|
 | cid | INTEGER | Column index (0-based) |
 | name | TEXT | Column name |
-| type | TEXT | Declared type name |
+| type | TEXT | Declared type name. As in SQLite, a standard type name (ANY, BLOB, INT, INTEGER, REAL, TEXT) is reported in upper case however it was written; any other type name keeps its spelling |
 | notnull | INTEGER | 1 if NOT NULL constraint exists |
 | dflt_value | TEXT | Default value expression, or NULL |
 | pk | INTEGER | 1 if column is part of the PRIMARY KEY |

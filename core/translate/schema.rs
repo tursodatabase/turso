@@ -525,7 +525,7 @@ fn resolve_column_type(
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     if let Some(ref col_type) = col.col_type {
-        resolve_type_name(&column_declared_type(&col_type.name), resolver)
+        resolve_type_name(&column_declared_type(col_type), resolver)
     } else {
         // No type specified — in STRICT tables this would be caught elsewhere,
         // but treat as ANY for CHECK validation purposes.
@@ -823,7 +823,7 @@ pub(crate) fn check_column_type(
         }
         return Ok(());
     };
-    let type_name = &column_declared_type(&col_type.name);
+    let type_name = &column_declared_type(col_type);
     let is_builtin = is_builtin_strict_type(&col_type.name);
 
     if col_type.is_array() {
