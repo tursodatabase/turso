@@ -190,6 +190,28 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
+/// Re-entrant state for [`Connection::maybe_reparse_schema_nonblock`].
+///
+/// Every state but `Start` holds a read transaction, which
+/// [`Connection::end_maybe_reparse_schema`] ends when an error stops the
+/// check before it finishes.
+#[derive(Default)]
+pub(crate) enum MaybeReparseSchemaState {
+    #[default]
+    Start,
+    /// Reading the schema cookie. Outside MVCC, a read transaction is open.
+    ReadCookie {
+        pager: Arc<Pager>,
+        had_main_mv_tx: bool,
+    },
+    /// The schema changed on disk and is being read again.
+    Reparse {
+        pager: Arc<Pager>,
+        had_main_mv_tx: bool,
+        reparse: ReparseSchemaState,
+    },
+}
+
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
 /// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
 /// `Start` is the fresh state (cookie not yet read / schema build not yet
@@ -1275,93 +1297,149 @@ impl Connection {
     /// This function must be called outside of any transaction because internally it will start transaction session by itself.
     /// In multi-process mode, this is the only way to discover schema changes made by other processes.
     pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.load().clone();
-        let mv_store = self.mv_store();
-
-        // maybe_reparse_schema must be called outside any explicit transaction
-        // because it starts its own read transaction to load a fresh view of
-        // sqlite_schema from disk.
-        if self.get_tx_state() != TransactionState::None {
-            return Ok(());
+        let io = self.pager.load().io.clone();
+        let mut state = MaybeReparseSchemaState::default();
+        let result = io.block(|| self.maybe_reparse_schema_nonblock(&mut state));
+        if result.is_err() {
+            self.end_maybe_reparse_schema(&mut state);
         }
-        let had_main_mv_tx = self.get_mv_tx().is_some();
+        result
+    }
 
-        if self.db.shared_wal_coordination()?.is_some() {
-            // Cross-process schema changes can leave page 1 and sqlite_schema
-            // pages cached from an earlier WAL snapshot. Drop the cache before
-            // probing the cookie so reparsing observes the current committed view.
-            pager.clear_page_cache(false);
-            pager.set_schema_cookie(None);
-        }
+    /// Non-blocking [`Self::maybe_reparse_schema`]. Call again with the same
+    /// `state` after every `IOResult::IO` until it returns `IOResult::Done`.
+    /// When it fails, the caller ends the read transaction that `state` holds
+    /// with [`Self::end_maybe_reparse_schema`].
+    pub(crate) fn maybe_reparse_schema_nonblock(
+        self: &Arc<Connection>,
+        state: &mut MaybeReparseSchemaState,
+    ) -> crate::types::IOResultOr<()> {
+        use crate::types::IOResult;
+        loop {
+            match state {
+                MaybeReparseSchemaState::Start => {
+                    // maybe_reparse_schema must be called outside any explicit transaction
+                    // because it starts its own read transaction to load a fresh view of
+                    // sqlite_schema from disk.
+                    if self.get_tx_state() != TransactionState::None {
+                        return Ok(IOResult::Done(()));
+                    }
+                    let pager = self.pager.load().clone();
+                    let had_main_mv_tx = self.get_mv_tx().is_some();
 
-        let on_disk_schema_version = if mv_store.as_ref().is_some() {
-            self.read_current_schema_cookie().or_else(|err| match err {
-                LimboError::Page1NotAlloc => Ok(0),
-                other => Err(other),
-            })?
-        } else {
-            // first, quickly read schema_version from the root page in order to check if schema changed
-            pager.begin_read_tx()?;
-            let on_disk_schema_version = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie));
-
-            let on_disk_schema_version = match on_disk_schema_version {
-                Ok(db_schema_version) => db_schema_version.get(),
-                Err(LimboError::Page1NotAlloc) => {
-                    // this means this is a fresh db, so return a schema version of 0
-                    0
+                    if self.db.shared_wal_coordination()?.is_some() {
+                        // Cross-process schema changes can leave page 1 and sqlite_schema
+                        // pages cached from an earlier WAL snapshot. Drop the cache before
+                        // probing the cookie so reparsing observes the current committed view.
+                        pager.clear_page_cache(false);
+                        pager.set_schema_cookie(None);
+                    }
+                    // first, quickly read schema_version from the root page in order to check if schema changed
+                    if self.mv_store().is_none() {
+                        pager.begin_read_tx()?;
+                    }
+                    *state = MaybeReparseSchemaState::ReadCookie {
+                        pager,
+                        had_main_mv_tx,
+                    };
                 }
-                Err(err) => {
+                MaybeReparseSchemaState::ReadCookie { .. } => {
+                    let cookie = self.read_current_schema_cookie_nonblock();
+                    if let Ok(IOResult::IO(io)) = cookie {
+                        return Ok(IOResult::IO(io));
+                    }
+                    let MaybeReparseSchemaState::ReadCookie {
+                        pager,
+                        had_main_mv_tx,
+                    } = std::mem::take(state)
+                    else {
+                        unreachable!("state is ReadCookie");
+                    };
+                    if self.mv_store().is_none() {
+                        pager.end_read_tx();
+                    }
+                    let on_disk_schema_version = match cookie {
+                        Ok(IOResult::Done(cookie)) => cookie,
+                        Ok(IOResult::IO(_)) => unreachable!("IO is returned above"),
+                        // this means this is a fresh db, so return a schema version of 0
+                        Err(err) if matches!(*err, LimboError::Page1NotAlloc) => 0,
+                        Err(err) => return Err(err),
+                    };
+
+                    let db_schema_version = self.db.schema.lock().schema_version;
+                    tracing::debug!(
+                        "path: {}, db_schema_version={} vs on_disk_schema_version={}",
+                        self.db.path,
+                        db_schema_version,
+                        on_disk_schema_version
+                    );
+                    // if schema_versions matches - exit early
+                    if db_schema_version == on_disk_schema_version {
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    // start read transaction manually, because we will read schema cookie once again and
+                    // we must be sure that it will consistent with schema content
+                    //
+                    // from now on we must be very careful with errors propagation
+                    // in order to not accidentally keep read transaction opened
+                    pager.begin_read_tx()?;
+                    self.set_tx_state(TransactionState::Read);
+                    *state = MaybeReparseSchemaState::Reparse {
+                        pager,
+                        had_main_mv_tx,
+                        reparse: ReparseSchemaState::default(),
+                    };
+                }
+                MaybeReparseSchemaState::Reparse { reparse, .. } => {
+                    let reparse_result = match self.reparse_schema_nonblock(reparse) {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(())) => Ok(()),
+                        Err(err) => Err(err),
+                    };
+                    self.end_maybe_reparse_schema(state);
+                    reparse_result?;
+
+                    let schema = self.schema.read().clone();
+                    self.db.update_schema_if_newer(schema);
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    /// Ends the read transaction that `state` holds and returns it to `Start`.
+    pub(crate) fn end_maybe_reparse_schema(
+        self: &Arc<Connection>,
+        state: &mut MaybeReparseSchemaState,
+    ) {
+        match std::mem::take(state) {
+            MaybeReparseSchemaState::Start => {}
+            MaybeReparseSchemaState::ReadCookie { pager, .. } => {
+                if self.mv_store().is_none() {
                     pager.end_read_tx();
-                    return Err(err);
                 }
-            };
-            pager.end_read_tx();
-            on_disk_schema_version
-        };
-
-        let db_schema_version = self.db.schema.lock().schema_version;
-        tracing::debug!(
-            "path: {}, db_schema_version={} vs on_disk_schema_version={}",
-            self.db.path,
-            db_schema_version,
-            on_disk_schema_version
-        );
-        // if schema_versions matches - exit early
-        if db_schema_version == on_disk_schema_version {
-            return Ok(());
+            }
+            MaybeReparseSchemaState::Reparse {
+                pager,
+                had_main_mv_tx,
+                ..
+            } => {
+                let previous = self.transaction_state.swap(TransactionState::None);
+                turso_assert!(
+                    matches!(previous, TransactionState::None | TransactionState::Read),
+                    "unexpected end transaction state"
+                );
+                // close opened transaction if it was kept open
+                // (in most cases, it will be automatically closed if stmt was executed properly)
+                if previous == TransactionState::Read {
+                    pager.end_read_tx();
+                }
+                if !had_main_mv_tx {
+                    self.clear_internal_main_mvcc_tx(&pager);
+                }
+            }
         }
-
-        // start read transaction manually, because we will read schema cookie once again and
-        // we must be sure that it will consistent with schema content
-        //
-        // from now on we must be very careful with errors propagation
-        // in order to not accidentally keep read transaction opened
-        pager.begin_read_tx()?;
-        self.set_tx_state(TransactionState::Read);
-
-        let reparse_result = self.reparse_schema();
-
-        let previous = self.transaction_state.swap(TransactionState::None);
-        turso_assert!(
-            matches!(previous, TransactionState::None | TransactionState::Read),
-            "unexpected end transaction state"
-        );
-        // close opened transaction if it was kept open
-        // (in most cases, it will be automatically closed if stmt was executed properly)
-        if previous == TransactionState::Read {
-            pager.end_read_tx();
-        }
-        if !had_main_mv_tx {
-            self.clear_internal_main_mvcc_tx(&pager);
-        }
-
-        reparse_result?;
-
-        let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema);
-        Ok(())
     }
 
     /// Parse schema from scratch even if the schema cookie did not change.
