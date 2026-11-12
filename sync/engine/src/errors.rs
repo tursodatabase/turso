@@ -1,5 +1,7 @@
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum Error {
+    #[error("encrypted sync data authentication failed")]
+    AuthenticationFailed,
     #[error("database error: {0}")]
     TursoError(#[from] turso_core::LimboError),
     #[error("database tape error: {0}")]
