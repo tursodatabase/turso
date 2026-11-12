@@ -7,7 +7,7 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
-use crate::pg_type::type_exists;
+use crate::pg_type::lookup_type;
 use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
@@ -1792,7 +1792,7 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
                     return missing_schema;
                 }
             }
-            if type_exists(conn, schema.as_deref(), name) {
+            if lookup_type(conn, schema.as_deref(), name).is_some() {
                 sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
             } else {
                 sqlstate_error(

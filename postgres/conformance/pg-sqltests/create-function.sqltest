@@ -997,6 +997,25 @@ expect error {
     type t_a does not exist
 }
 
+# A sequence has no row type either.
+test sequence-as-parameter-type {
+    CREATE SEQUENCE s;
+    CREATE FUNCTION f(s) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type s does not exist
+}
+
+# The built-in types are in pg_catalog, not in public.
+test built-in-type-in-public-schema {
+    CREATE FUNCTION f(public.uuid) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type public\.uuid does not exist
+}
+
 test table-row-parameter-in-other-schema {
     CREATE SCHEMA app;
     CREATE TABLE app.emp (name text);
