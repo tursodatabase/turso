@@ -67,9 +67,9 @@ fn step_until_done(stmt: &mut Statement) {
 }
 
 #[derive(Default)]
-struct SyncCountingIo {
+pub(super) struct SyncCountingIo {
     inner: MemoryIO,
-    syncs: Arc<AtomicUsize>,
+    pub(super) syncs: Arc<AtomicUsize>,
 }
 
 impl Clock for SyncCountingIo {

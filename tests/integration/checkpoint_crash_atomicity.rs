@@ -182,6 +182,9 @@ fn crash_now_and_recover(
     if let Some(wal) = files.get(&format!("{db_path_sim}-wal")) {
         std::fs::write(dir.path().join("recovered.db-wal"), wal)?;
     }
+    if let Some(log) = files.get(&format!("{db_path_sim}-log")) {
+        std::fs::write(dir.path().join("recovered.db-log"), log)?;
+    }
     let recovered_db = Database::open_file(
         Arc::new(turso_core::PlatformIO::new()?),
         db_path.to_str().unwrap(),
@@ -224,6 +227,45 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
         vec!["1".to_string(), "2".to_string()],
         "a synchronous=FULL commit was acknowledged but did not survive a \
          power loss immediately after COMMIT returned"
+    );
+    Ok(())
+}
+
+/// Closing the last connection to an MVCC database does not fsync the WAL,
+/// because the MVCC checkpoint has already synced or truncated everything it
+/// wrote there. A power loss right after the close must keep every
+/// `synchronous=FULL` commit.
+#[test]
+fn mvcc_full_commits_survive_power_loss_after_last_connection_closes() -> anyhow::Result<()> {
+    let db_path_sim = "mvcc-power-loss-after-close.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("INSERT INTO t VALUES (2)")?;
+    conn.close()?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{db_path_sim}-wal")),
+        "the MVCC checkpoint left unsynced WAL writes"
+    );
+    let (_dir, recovered) = crash_now_and_recover(&io, db_path_sim)?;
+    let rows = query_rows(&recovered, "SELECT x FROM t ORDER BY x")?;
+    assert_eq!(
+        rows,
+        vec!["1".to_string(), "2".to_string()],
+        "a synchronous=FULL commit was lost by a power loss after close"
     );
     Ok(())
 }
