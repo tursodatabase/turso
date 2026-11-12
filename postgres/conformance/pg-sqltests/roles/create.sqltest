@@ -221,7 +221,7 @@ test grant-of-a-role-to-a-role-is-not-supported {
 }
 @sqlstate 0A000
 expect error {
-    GRANT ROLE is not supported
+    GRANT of role membership is not supported
 }
 
 # PostgreSQL cuts identifiers to 63 bytes.

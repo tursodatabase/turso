@@ -1837,8 +1837,8 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
-        // Who may grant on each table is decided from its stored privileges
-        // when the engine's GRANT runs.
+        // Who may grant or revoke on each table is decided from its stored
+        // privileges when the engine's GRANT or REVOKE runs.
         FrontendStmt::Grant(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
@@ -1867,8 +1867,8 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
     Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
-/// The engine GRANT that stores a GRANT. The engine checks the
-/// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
+/// The engine statement that stores a GRANT or REVOKE. The engine checks
+/// the tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
 /// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
 /// there are none.
@@ -1880,6 +1880,21 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
             for schema in schemas {
                 check_schema_exists(conn, schema)?;
                 let schema = schema.to_lowercase();
+                // The catalog views are not listed among the schema's
+                // objects. A GRANT on them changes nothing, since every role
+                // reads them, but a REVOKE would leave every role reading
+                // them.
+                if stmt.revoke
+                    && !stmt.on_sequences
+                    && matches!(schema.as_str(), "pg_catalog" | "information_schema")
+                {
+                    return Err(sqlstate_error(
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        format!(
+                            "REVOKE on the system catalogs of schema {schema} is not supported"
+                        ),
+                    ));
+                }
                 relations.extend(
                     schema_objects(conn, &schema)
                         .into_iter()
@@ -1901,7 +1916,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
         }
     };
     if relations.is_empty() {
-        // With nothing to grant on, the roles are still checked, as in
+        // With no relation to change, the roles are still checked, as in
         // PostgreSQL; otherwise the dialect checks them.
         let roles = connection_roles(conn);
         for grantee in &stmt.roles {
@@ -1918,6 +1933,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
     }
     Ok(vec![DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            revoke: stmt.revoke,
             privileges: stmt.privileges.clone(),
             on_sequences: stmt.on_sequences,
             relations,

@@ -532,18 +532,6 @@ expect error {
     GRANT of column privileges is not supported
 }
 
-@skip-if postgres "PostgreSQL supports REVOKE"
-test revoke-is-not-supported {
-    CREATE ROLE gx_revoked;
-    CREATE TABLE gx_revoked_from (id INT);
-    GRANT SELECT ON gx_revoked_from TO gx_revoked;
-    REVOKE SELECT ON gx_revoked_from FROM gx_revoked;
-}
-@sqlstate 0A000
-expect error {
-    REVOKE is not supported
-}
-
 @skip-if postgres "PostgreSQL supports WITH GRANT OPTION"
 test grant-with-grant-option-is-not-supported {
     CREATE ROLE gx_grant_option;

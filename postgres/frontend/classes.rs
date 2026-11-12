@@ -506,10 +506,13 @@ pub(crate) fn relation_owner(
 }
 
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
-/// the owner has every privilege, and another role has the ones the list
-/// gives it, by oid or through PUBLIC. A table without a class row is one of
-/// the engine's own, such as `__turso_internal_authid` or `sqlite_sequence`,
-/// and only a superuser uses it, because nothing says who else may.
+/// a role has the privileges the relation's list gives it, by oid or through
+/// PUBLIC. A relation without a list has the default one, which gives the
+/// owner every privilege and no one else any. As in PostgreSQL, an owner
+/// that revoked a privilege from itself no longer has it. A table without a
+/// class row is one of the engine's own, such as `__turso_internal_authid` or
+/// `sqlite_sequence`, and only a superuser uses it, because nothing says who
+/// else may.
 pub(crate) fn role_has_privilege(
     schema: &Schema,
     namespace: NamespaceId,
@@ -522,15 +525,11 @@ pub(crate) fn role_has_privilege(
     else {
         return false;
     };
-    if class.relowner == role {
-        return true;
-    }
-    let wanted = Privileges::granted_on(class.relkind, &[privilege]);
-    !wanted.is_empty()
-        && class
-            .relacl
-            .as_ref()
-            .is_some_and(|acl| acl.grants(role_oid(role), wanted))
+    let Some(acl) = &class.relacl else {
+        return class.relowner == role;
+    };
+    let wanted = Privileges::named_on(class.relkind, &[privilege]);
+    !wanted.is_empty() && acl.grants(role_oid(role), wanted)
 }
 
 /// The access control list of relation `name` of `namespace`, or None when
@@ -793,27 +792,40 @@ pub(crate) fn translate_catalog_changes(
                 }
             }
             CatalogChange::Grant {
+                revoke,
                 namespace,
                 name,
                 privileges,
                 grantees,
             } => {
+                let statement = if *revoke { "REVOKE" } else { "GRANT" };
                 let grantees = grantees
                     .iter()
                     .map(|grantee| resolve_grantee(schema, connection, grantee))
                     .collect::<turso_core::Result<Vec<_>>>()?;
                 // A relation without a class row has no list to store the
-                // privileges in. Every role reads the pg_catalog views
-                // already, so a GRANT on one changes nothing. Only a
-                // superuser uses the engine's own tables, so a GRANT on one
-                // would claim access it does not give, and is refused.
+                // privileges in. Only a superuser uses the engine's own
+                // tables, so a GRANT or REVOKE on one would claim a change it
+                // does not make, and is refused. Every role reads the catalog
+                // views, such as pg_class, so a GRANT on one changes nothing,
+                // but a REVOKE would leave every role reading it, and is
+                // refused too.
                 let Some(class) =
                     class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
                 else {
                     if schema.get_btree_table(*namespace, name).is_some() {
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
-                            format!("GRANT on internal table {name} is not supported"),
+                            format!("{statement} on internal table {name} is not supported"),
+                        ));
+                    }
+                    if *revoke {
+                        return Err(sqlstate_error(
+                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            format!(
+                                "REVOKE on system catalog {} is not supported",
+                                catalog_view_name(name)
+                            ),
                         ));
                     }
                     continue;
@@ -833,10 +845,10 @@ pub(crate) fn translate_catalog_changes(
                     .relacl
                     .clone()
                     .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
-                // Only the owner may grant, and a superuser grants as the
-                // owner. As in PostgreSQL, anyone else is refused when the
-                // list gives it nothing on the relation, and grants nothing
-                // otherwise, for want of a grant option.
+                // Only the owner may grant or revoke, and a superuser does
+                // so as the owner. As in PostgreSQL, anyone else is refused
+                // when the list gives it nothing on the relation, and changes
+                // nothing otherwise, for want of a grant option.
                 let may_grant = connection.current_role_is_superuser()
                     || class.relowner == connection.current_role();
                 if !may_grant {
@@ -847,15 +859,21 @@ pub(crate) fn translate_catalog_changes(
                         PermissionDenied::privilege(Action::Read, relation_object(class)),
                     )));
                 }
-                // As in PostgreSQL, a GRANT that gives nothing on the
-                // relation, such as INSERT on a sequence, leaves its list
-                // as it is, even when it has none yet.
-                let granted = Privileges::granted_on(class.relkind, privileges);
-                if granted.is_empty() {
+                // As in PostgreSQL, a statement that names no privilege of
+                // the relation, such as INSERT on a sequence, leaves its list
+                // as it is, even when it has none yet. Otherwise a relation
+                // without a list gets the owner's default one first, so a
+                // REVOKE that takes nothing away still stores it.
+                let named = Privileges::named_on(class.relkind, privileges);
+                if named.is_empty() {
                     continue;
                 }
                 for grantee in &grantees {
-                    acl.grant(*grantee, granted, owner);
+                    if *revoke {
+                        acl.revoke(*grantee, named, owner);
+                    } else {
+                        acl.grant(*grantee, named, owner);
+                    }
                 }
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;
@@ -965,6 +983,15 @@ pub(crate) fn translate_catalog_changes(
         }
     }
     Ok(())
+}
+
+/// The name a catalog view has in PostgreSQL: the engine names
+/// `information_schema.schemata` `pg_information_schema_schemata`.
+fn catalog_view_name(name: &str) -> String {
+    match name.strip_prefix("pg_information_schema_") {
+        Some(view) => format!("information_schema.{view}"),
+        None => name.to_string(),
+    }
 }
 
 /// The class row of table `name` of `namespace`, which row-level security

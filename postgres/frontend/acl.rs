@@ -83,14 +83,14 @@ impl Privileges {
         }
     }
 
-    /// The privileges that `GRANT privileges` gives on a relation of `kind`.
-    /// As in PostgreSQL, `ALL` is every privilege of the kind, and a
-    /// privilege the kind does not have, such as INSERT on a sequence, is
-    /// left out.
-    pub(crate) fn granted_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
+    /// The privileges that `GRANT privileges` gives, or `REVOKE privileges`
+    /// takes away, on a relation of `kind`. As in PostgreSQL, `ALL` is every
+    /// privilege of the kind, and a privilege the kind does not have, such
+    /// as INSERT on a sequence, is left out.
+    pub(crate) fn named_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
         let all = Self::all_on(kind);
-        let granted = privileges.iter().fold(Self::empty(), |granted, privilege| {
-            granted
+        let named = privileges.iter().fold(Self::empty(), |named, privilege| {
+            named
                 | match privilege {
                     ast::Privilege::Select => Self::SELECT,
                     ast::Privilege::Insert => Self::INSERT,
@@ -104,7 +104,7 @@ impl Privileges {
                     ast::Privilege::All => all,
                 }
         });
-        granted & all
+        named & all
     }
 
     /// Reads the letters of an `aclitem`, such as `arwdDxtm`. A `*` after a
@@ -245,6 +245,25 @@ impl Acl {
         }
     }
 
+    /// Takes `revoked` away from the entry that `grantor` gave `grantee`,
+    /// and drops the entry once it has no privileges left, as PostgreSQL's
+    /// `merge_acl_with_grant` does for REVOKE. What other grantors gave
+    /// `grantee` stays.
+    pub(crate) fn revoke(&mut self, grantee: i64, revoked: Privileges, grantor: i64) {
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.grantee == grantee && item.grantor == grantor)
+        else {
+            return;
+        };
+        let item = &mut self.items[index];
+        item.privileges.remove(revoked);
+        if item.privileges.is_empty() {
+            self.items.remove(index);
+        }
+    }
+
     /// Whether the list gives `role`, by oid or through `PUBLIC`, every
     /// privilege of `wanted`.
     pub(crate) fn grants(&self, role: i64, wanted: Privileges) -> bool {
@@ -333,9 +352,51 @@ mod tests {
     }
 
     #[test]
-    fn grant_gives_the_privileges_that_the_kind_of_relation_has() {
+    fn a_revoke_takes_privileges_out_of_the_entry() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT | Privileges::INSERT, OWNER);
+        acl.revoke(READER, Privileges::INSERT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+        acl.revoke(READER, Privileges::UPDATE, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+    }
+
+    #[test]
+    fn a_revoke_of_every_privilege_drops_the_entry() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(PUBLIC_OID, Privileges::SELECT, OWNER);
+        acl.revoke(READER, Privileges::SELECT | Privileges::INSERT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,=r/10}");
+        acl.revoke(PUBLIC_OID, Privileges::RELATION, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10}");
+        acl.revoke(OWNER, Privileges::RELATION, OWNER);
+        assert_eq!(acl.stored_text(), "{}");
+    }
+
+    #[test]
+    fn a_revoke_changes_only_what_the_grantor_gave() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(READER, Privileges::SELECT, STRANGER);
+        acl.revoke(READER, Privileges::SELECT, STRANGER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+        acl.revoke(STRANGER, Privileges::SELECT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=arwdDxtm/10,16385=r/10}");
+    }
+
+    #[test]
+    fn the_owner_may_revoke_from_itself() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.revoke(OWNER, Privileges::SELECT, OWNER);
+        assert_eq!(acl.stored_text(), "{10=awdDxtm/10}");
+        assert!(!acl.grants(OWNER, Privileges::SELECT));
+    }
+
+    #[test]
+    fn a_statement_names_the_privileges_that_the_kind_of_relation_has() {
         let letters = |kind, privileges: &[ast::Privilege]| {
-            Privileges::granted_on(kind, privileges).to_string()
+            Privileges::named_on(kind, privileges).to_string()
         };
         assert_eq!(
             letters(RelationKind::Table, &[ast::Privilege::All]),

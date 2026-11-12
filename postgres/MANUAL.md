@@ -293,7 +293,8 @@ where role_specification is:
 `GRANT` gives roles privileges on tables and sequences. `GRANT SELECT`
 lets roles read tables. A role that is not a superuser reads
 a table, view or materialized view only when it owns it or `SELECT` on it
-was granted to it or to `PUBLIC`; otherwise reading it, directly or through
+was granted to it or to `PUBLIC`, and an owner that revoked `SELECT` from
+itself with `REVOKE` no longer reads it; otherwise reading it, directly or through
 a join, subquery or CTE, fails with `permission denied for table` (SQLSTATE
 42501). As in PostgreSQL, a view's tables are read as the view's owner, so
 `SELECT` on a view is enough when its owner may read its tables. The
@@ -307,8 +308,8 @@ The privileges are stored in the database file, in the table's access
 control list, which `pg_class.relacl` shows in PostgreSQL's form: after
 `GRANT SELECT ON accounts TO reader` by the owner `postgres`, it reads
 `{postgres=arwdDxtm/postgres,reader=r/postgres}`. The list is `NULL` until
-the first `GRANT`, when the owner has every privilege and nobody else has
-any, as in PostgreSQL. `pg_class` does not list views yet, so a view's list
+the first `GRANT` or `REVOKE`, when the owner has every privilege and nobody
+else has any, as in PostgreSQL. `pg_class` does not list views yet, so a view's list
 is stored but not shown.
 
 **Parameters:**
@@ -374,10 +375,10 @@ does not apply to `TRUNCATE`, which removes every row. A constraint error
 shows the values of the row or key (`Failing row contains ...`, `Key ...
 already exists`) only to a role with `SELECT` on the table; PostgreSQL also
 shows the values that the statement itself gave. Column
-privileges, `WITH GRANT OPTION`, `GRANTED BY`, `GRANT` on other kinds of
-objects, and `REVOKE` fail as not supported, so that a script never believes
-it changed what a role may do when it did not. `GRANT role_name TO
-role_name` is not supported either.
+privileges, `WITH GRANT OPTION`, `GRANTED BY`, and `GRANT` on other kinds of
+objects fail as not supported (SQLSTATE 0A000), so that a script never
+believes it changed what a role may do when it did not. `GRANT role_name TO
+role_name` is not supported either. `REVOKE` takes privileges away again.
 
 **Examples:**
 
@@ -386,6 +387,75 @@ CREATE ROLE reader;
 CREATE TABLE accounts (id int);
 GRANT SELECT ON accounts TO reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+```
+
+### `REVOKE` — take privileges on tables away from roles
+
+**Synopsis:**
+
+```sql
+REVOKE { { SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN }
+        [, ...] | ALL [ PRIVILEGES ] }
+    ON { [ TABLE ] table_name [, ...] | ALL TABLES IN SCHEMA schema_name [, ...] }
+    FROM role_specification [, ...]
+    [ CASCADE | RESTRICT ]
+
+REVOKE { { USAGE | SELECT | UPDATE } [, ...] | ALL [ PRIVILEGES ] }
+    ON { SEQUENCE sequence_name [, ...] | ALL SEQUENCES IN SCHEMA schema_name [, ...] }
+    FROM role_specification [, ...]
+    [ CASCADE | RESTRICT ]
+
+where role_specification is:
+    role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
+```
+
+**Description:**
+
+`REVOKE` takes privileges that `GRANT` gave away from roles. It names the
+same tables, sequences, schemas and roles as `GRANT`, with the same errors,
+and changes the same access control list, which `pg_class.relacl` shows. As
+in PostgreSQL:
+
+- Privileges that a role was never given are left alone, without an error.
+- An entry left without privileges is dropped from the list, so revoking
+  every privilege from the owner leaves the list empty, `{}`.
+- A relation whose list is `NULL` first gets the default list, in which
+  the owner has every privilege, so the list is no longer `NULL` even when
+  nothing was taken away. A statement that names no privilege of the
+  relation, such as `REVOKE INSERT ON s` on a sequence `s`, leaves the list
+  as it is.
+- Revoking from `PUBLIC` takes away only what was granted to `PUBLIC`; a
+  role keeps what was granted to it by name, and the other way round.
+- The owner may revoke privileges from itself, and then is refused what
+  they allowed, such as reading the table, until it grants them again.
+- `CASCADE` and `RESTRICT` revoke the same, because no privilege depends on
+  another when `WITH GRANT OPTION` is not supported.
+
+Statements prepared before the `REVOKE` are checked against the new list
+when they run. A transaction that is already open on another connection
+keeps the old list until it ends, as it does after `GRANT`; PostgreSQL
+applies the change to its next statement.
+
+**Notes:**
+
+As with `GRANT`, the table's owner may revoke, and a superuser revokes as
+the owner, so only the entries that the owner gave change. Any other role
+gets `permission denied for table` (SQLSTATE 42501), unless the list gives
+it a privilege on the table, when the statement succeeds and changes
+nothing, as in PostgreSQL, which warns. `REVOKE GRANT OPTION FOR`, `GRANTED
+BY`, column privileges, `REVOKE` on other kinds of objects, and `REVOKE
+role_name FROM role_name` fail as not supported (SQLSTATE 0A000). So does
+`REVOKE` on a catalog view such as `pg_catalog.pg_roles` or
+`information_schema.schemata`, and `ON ALL TABLES IN SCHEMA` `pg_catalog` or
+`information_schema`: every role reads the catalog views, and they have no
+list that a `REVOKE` could change.
+
+**Examples:**
+
+```sql
+REVOKE INSERT, UPDATE ON accounts FROM reader;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
+REVOKE USAGE ON SEQUENCE accounts_id_seq FROM reader;
 ```
 
 ### `SET ROLE` — set the current role
@@ -422,8 +492,8 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT` on
-tables (see `GRANT`). A role that is not a superuser may read and write the
+Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT` and
+`REVOKE` on tables (see `GRANT` and `REVOKE`). A role that is not a superuser may read and write the
 tables it owns or was granted privileges on, and it may alter and drop the
 relations it owns, except that renaming a relation or creating an index on
 it also needs CREATE on the schema, which only a superuser has; it may call
