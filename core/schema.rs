@@ -1,7 +1,7 @@
 mod record;
-pub use record::{
-    schema_record_with_root_page, SchemaRecord, SchemaRowType, SCHEMA_RECORD_COLUMN_COUNT,
-};
+mod store;
+pub use record::{SchemaRecord, SchemaRowType};
+pub use store::{SchemaStore, SqliteSchemaStore};
 
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;

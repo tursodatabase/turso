@@ -20,7 +20,7 @@ pub(crate) use engine::EngineDialect;
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
-    schema::{BTreeTable, RelationKind, Schema},
+    schema::{BTreeTable, RelationKind, Schema, SchemaStore, SqliteSchemaStore},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
@@ -334,6 +334,12 @@ pub trait Dialect: Send + Sync + 'static {
     /// for tables, views and indexes.
     fn relation_names_unique_across_kinds(&self) -> bool {
         false
+    }
+
+    /// How the database stores its schema. Every dialect stores it in
+    /// `sqlite_schema` for now.
+    fn schema_store(&self) -> &dyn SchemaStore {
+        &SqliteSchemaStore
     }
 
     /// SQL statements that read the dialect's own schema state, such as the
