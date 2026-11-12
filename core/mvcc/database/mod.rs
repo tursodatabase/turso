@@ -6920,7 +6920,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
     fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction<A>) -> Result<(), TryReserveError> {
-        self.txs.insert(tx_id, Arc::new(tx));
+        self.txs.try_insert(tx_id, Arc::new(tx))?;
         Ok(())
     }
 

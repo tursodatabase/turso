@@ -5,6 +5,7 @@
 //! holds only a few entries, so a linear search is enough. A bit mask tells which
 //! shards hold entries, so a walk over all entries skips the empty shards.
 
+use crate::alloc::{TryReserveError, TursoVecExt, ALLOC_ERR_MSG};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::RwLock;
 use crossbeam_utils::CachePadded;
@@ -13,7 +14,7 @@ use super::TxID;
 
 const SHARDS: usize = 64;
 
-type Shard<V> = RwLock<Vec<(TxID, V)>>;
+type Shard<V> = RwLock<crate::alloc::Vec<(TxID, V)>>;
 
 pub struct TxMap<V> {
     shards: Box<[CachePadded<Shard<V>>]>,
@@ -68,7 +69,11 @@ impl<V: Clone> TxMap<V> {
     pub fn new() -> Self {
         Self {
             shards: (0..SHARDS)
-                .map(|_| CachePadded::new(RwLock::new(Vec::with_capacity(4))))
+                .map(|_| {
+                    CachePadded::new(RwLock::new(<crate::alloc::Vec<(TxID, V)> as TursoVecExt<
+                        (TxID, V),
+                    >>::with_capacity(4)))
+                })
                 .collect(),
             occupied: AtomicU64::new(0),
             len: AtomicUsize::new(0),
@@ -85,32 +90,28 @@ impl<V: Clone> TxMap<V> {
 
     /// Inserts `value` for `key`. An existing value for `key` is replaced.
     pub fn insert(&self, key: TxID, value: V) -> TxEntry<V> {
+        self.try_insert(key, value).expect(ALLOC_ERR_MSG)
+    }
+
+    /// Like [`Self::insert`], but returns an error when the shard cannot grow.
+    pub fn try_insert(&self, key: TxID, value: V) -> Result<TxEntry<V>, TryReserveError> {
         let index = Self::shard_index(key);
         let mut shard = self.shards[index].write();
         match shard.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => slot.1 = value.clone(),
             None => {
-                shard.push((key, value.clone()));
+                shard.try_push((key, value.clone()))?;
                 if shard.len() == 1 {
                     self.occupied.fetch_or(1 << index, Ordering::Release);
                 }
                 self.len.fetch_add(1, Ordering::Relaxed);
             }
         }
-        TxEntry { key, value }
+        Ok(TxEntry { key, value })
     }
 
     pub fn contains_key(&self, key: &TxID) -> bool {
         self.shard(*key).read().iter().any(|(k, _)| k == key)
-    }
-
-    #[cfg(test)]
-    pub fn try_insert(
-        &self,
-        key: TxID,
-        value: V,
-    ) -> Result<TxEntry<V>, crate::alloc::TryReserveError> {
-        Ok(self.insert(key, value))
     }
 
     pub fn remove(&self, key: &TxID) -> Option<TxEntry<V>> {
