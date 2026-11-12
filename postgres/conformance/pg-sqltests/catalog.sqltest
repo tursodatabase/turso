@@ -1937,3 +1937,18 @@ expect {
     rd_a_table_with_a_name_long_e_a_column_with_a_name_long_eno_seq
     rd_another_table_with_a_long__a_column_with_a_name_long_eno_seq
 }
+
+# pg_dump writes column types with format_type(atttypid, atttypmod).
+test pg-attribute-type-modifiers {
+    CREATE TABLE tm_items (a varchar(20), b numeric(10,2), c numeric(5), d decimal(8,3), e int);
+    SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'tm_items') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    a|24|character varying(20)
+    b|655366|numeric(10,2)
+    c|327684|numeric(5,0)
+    d|524295|numeric(8,3)
+    e|-1|integer
+}

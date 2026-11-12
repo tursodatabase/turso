@@ -410,6 +410,33 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// PostgreSQL's `atttypmod` of a column of type `type_oid`: the length of a
+/// `varchar(n)` and the precision and scale of a `numeric(p, s)`, encoded as
+/// PostgreSQL encodes them, or -1 for a column without a modifier.
+fn type_modifier(type_oid: i64, column: &turso_core::schema::Column) -> i64 {
+    const VARHDRSZ: i64 = 4;
+    if column.is_array() {
+        return -1;
+    }
+    let params: Option<Vec<i64>> = column
+        .ty_params
+        .iter()
+        .map(|param| match param.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(number)) => number.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    match (type_oid, params.as_deref()) {
+        (VARCHAR_OID, Some([length])) => length + VARHDRSZ,
+        (NUMERIC_OID, Some([precision, scale])) => ((precision << 16) | scale) + VARHDRSZ,
+        (NUMERIC_OID, Some([precision])) => (precision << 16) + VARHDRSZ,
+        _ => -1,
+    }
+}
+
+const VARCHAR_OID: i64 = 1043;
+const NUMERIC_OID: i64 = 1700;
+
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
 fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
@@ -923,18 +950,18 @@ impl SnapshotRows for PgAttributeTable {
                 let generated = if col.is_stored_generated() { "s" } else { "" };
 
                 rows.push(vec![
-                    Value::from_i64(table_oid),   // attrelid
-                    Value::Text(col_name.into()), // attname
-                    Value::from_i64(type_oid),    // atttypid
-                    Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(-1),          // attlen
-                    Value::from_i64(attnum),      // attnum
-                    Value::from_i64(0),           // attndims
-                    Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(-1),          // atttypmod
-                    Value::from_i64(1),           // attbyval
-                    Value::build_text(storage),   // attstorage
-                    Value::Text("i".into()),      // attalign (int)
+                    Value::from_i64(table_oid),                    // attrelid
+                    Value::Text(col_name.into()),                  // attname
+                    Value::from_i64(type_oid),                     // atttypid
+                    Value::from_i64(-1),                           // attstattarget
+                    Value::from_i64(-1),                           // attlen
+                    Value::from_i64(attnum),                       // attnum
+                    Value::from_i64(0),                            // attndims
+                    Value::from_i64(-1),                           // attcacheoff
+                    Value::from_i64(type_modifier(type_oid, col)), // atttypmod
+                    Value::from_i64(1),                            // attbyval
+                    Value::build_text(storage),                    // attstorage
+                    Value::Text("i".into()),                       // attalign (int)
                     Value::Text("".into()),
                     Value::from_i64(notnull),      // attnotnull
                     Value::from_i64(has_def),      // atthasdef
