@@ -807,8 +807,10 @@ fn is_built_in_table(schema: &Schema, connection: &Connection, name: &str) -> bo
 /// new PostgreSQL version, write the result of this query to the file:
 ///
 /// ```sql
-/// SELECT DISTINCT proname FROM pg_proc
-/// WHERE pronamespace = 'pg_catalog'::regnamespace ORDER BY proname COLLATE "C";
+/// SELECT proname FROM (
+///     SELECT DISTINCT proname::text AS proname FROM pg_proc
+///     WHERE pronamespace = 'pg_catalog'::regnamespace
+/// ) AS names ORDER BY proname COLLATE "C";
 /// ```
 fn is_postgres_built_in_function(name: &str) -> bool {
     static NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
