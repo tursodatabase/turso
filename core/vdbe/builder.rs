@@ -1157,9 +1157,11 @@ impl ProgramBuilder {
     }
 
     /// End the current constant span. The last instruction that was emitted is the last
-    /// instruction in the span.
+    /// instruction in the span. Does nothing if the span was invalidated.
     pub fn constant_span_end(&mut self, span_idx: usize) {
-        let span = &mut self.constant_spans[span_idx];
+        let Some(span) = self.constant_spans.get_mut(span_idx) else {
+            return;
+        };
         if span.1 == usize::MAX {
             span.1 = self.insns.len().saturating_sub(1);
         }
@@ -1205,6 +1207,19 @@ impl ProgramBuilder {
     pub fn constant_span_is_open(&self) -> bool {
         self.constant_spans
             .last()
+            .is_some_and(|(_, end)| *end == usize::MAX)
+    }
+
+    /// The index of the constant span that is currently open, if any.
+    pub fn open_constant_span(&self) -> Option<usize> {
+        self.constant_span_is_open()
+            .then(|| self.constant_spans.len() - 1)
+    }
+
+    /// Whether the constant span at `span_idx` is still open.
+    pub fn constant_span_is_open_at(&self, span_idx: usize) -> bool {
+        self.constant_spans
+            .get(span_idx)
             .is_some_and(|(_, end)| *end == usize::MAX)
     }
 

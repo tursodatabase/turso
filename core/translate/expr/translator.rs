@@ -822,6 +822,35 @@ fn translate_cast_expr(
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
+    let constant_span = program.open_constant_span();
+    let result = translate_cast_of_value(
+        program,
+        type_name.as_ref(),
+        cast_type_name,
+        target_register,
+        resolver,
+    );
+    // A CAST of a constant counts as constant, but the ENCODE or DECODE of a
+    // custom type may hold an expression that is not, like RAISE, which ends
+    // the span in the middle of the CAST. The instructions before that point
+    // jump past the ENCODE, so they cannot run apart from the rest of the
+    // CAST, where the constants of a statement run.
+    if let Some(span) = constant_span {
+        if !program.constant_span_is_open_at(span) {
+            program.constant_spans_invalidate_after(span);
+        }
+    }
+    result
+}
+
+/// Emits the CAST to `type_name` of the value in `target_register`.
+fn translate_cast_of_value(
+    program: &mut ProgramBuilder,
+    type_name: Option<&ast::Type>,
+    cast_type_name: Option<String>,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
         if tn.array_dimensions > 0 {
             resolver.schema().check_array_element_type(cast_type_name)?;

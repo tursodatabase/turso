@@ -2241,3 +2241,20 @@ test virtual-custom-type-column-through-a-hash-join {
 expect {
     3
 }
+
+# The ENCODE of uuid has a RAISE, which is not a constant, so the CAST of a
+# constant is not computed with the statement's constants.
+test cast-constant-to-type-whose-encode-is-not-constant {
+    CREATE TABLE cast_rows (a INTEGER);
+    INSERT INTO cast_rows VALUES (1), (2);
+    SELECT 5, CAST(NULL AS uuid), 6;
+    SELECT a, CAST(NULL AS uuid), 7 FROM cast_rows ORDER BY a;
+    SELECT a, CAST('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' AS uuid), 8 FROM cast_rows ORDER BY a;
+}
+expect {
+    5||6
+    1||7
+    2||7
+    1|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|8
+    2|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|8
+}
