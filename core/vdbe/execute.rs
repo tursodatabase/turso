@@ -145,8 +145,9 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        array_values_from_blob, compute_array_length, exec_array_set_element, exec_array_slice,
+        make_array_from_registers, parse_text_array, serialize_array_from_blob,
+        values_to_record_blob, MAX_ARRAY_ELEMENTS,
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
@@ -2691,7 +2692,6 @@ pub fn op_array_encode(
         return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
-    const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
             "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"
@@ -3178,38 +3178,12 @@ pub fn op_array_set_element(
         insn
     );
 
-    let arr_val = state.registers[*array_reg].get_value();
-    if matches!(arr_val, Value::Null) {
-        state.registers[*dest].set_null();
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
-    }
-
-    let idx = match state.registers[*index_reg].get_value() {
-        Value::Numeric(Numeric::Integer(i)) if *i >= 1 => (*i - 1) as usize,
-        _ => {
-            // Invalid index (non-positive, non-integer): preserve original array (PG: 1-based)
-            state.registers[*dest].set_value(arr_val.clone());
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
-    };
-
-    let new_val = state.registers[*value_reg].get_value().clone();
-
-    let Value::Blob(blob) = arr_val else {
-        return Err(
-            LimboError::InternalError("ArraySetElement: expected blob array".into()).into(),
-        );
-    };
-    let mut elements = array_values_from_blob(blob)?;
-    if idx >= elements.len() {
-        // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest].set_blob(blob.clone())?;
-    } else {
-        elements[idx] = new_val;
-        state.registers[*dest].set_value(values_to_record_blob(&elements)?);
-    }
+    let result = exec_array_set_element(
+        state.registers[*array_reg].get_value(),
+        state.registers[*index_reg].get_value(),
+        state.registers[*value_reg].get_value(),
+    )?;
+    state.registers[*dest].set_value(result);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
