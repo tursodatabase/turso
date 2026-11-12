@@ -336,7 +336,7 @@ INTEGER. Unknown type names pass through as custom types.
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
-| array_to_json | 🟡 Partial | Elements are written by their type, as in PostgreSQL: booleans as `true`/`false`, json and jsonb as JSON, bytea as `"\\x..."`, timestamps in ISO format, floats like float8 output. A json or jsonb value cast in the query, as in `ARRAY['{"a":1}'::json]`, comes out as a JSON string, because such a cast gives text; json and jsonb columns work. json and jsonb elements lose their whitespace and numeric elements their trailing zeros, as these types do elsewhere |
+| array_to_json | ✅ Supported | |
 | json_strip_nulls | 🟡 Partial | Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json; `jsonb_strip_nulls` is not supported |
 | json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list; WITH ORDINALITY and ROWS FROM are not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
