@@ -14,6 +14,26 @@ expect error {
     permission denied for schema public
 }
 
+test role-without-privileges-cannot-create-view {
+    CREATE ROLE sc_view_creator;
+    SET ROLE sc_view_creator;
+    CREATE VIEW sc_created_view AS SELECT 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test role-without-privileges-cannot-create-sequence {
+    CREATE ROLE sc_sequence_creator;
+    SET ROLE sc_sequence_creator;
+    CREATE SEQUENCE sc_created_sequence;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
 test owner-may-not-rename-without-create-on-the-schema {
     CREATE ROLE ro_renamer2;
     CREATE TABLE ro_owned_rename (x int);
