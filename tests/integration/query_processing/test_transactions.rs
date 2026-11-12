@@ -2640,13 +2640,22 @@ fn test_noop_ddl_does_not_need_write_lock(tmp_db: TempDatabase) {
 
     conn1.execute("CREATE TABLE t(x)").unwrap();
     conn1.execute("CREATE INDEX i ON t(x)").unwrap();
+    conn1.execute("CREATE VIEW v AS SELECT 1").unwrap();
+    conn1
+        .execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END")
+        .unwrap();
     conn1.execute("BEGIN IMMEDIATE").unwrap();
 
     for sql in [
         "CREATE TABLE IF NOT EXISTS t(x)",
         "CREATE INDEX IF NOT EXISTS i ON t(x)",
+        "CREATE VIEW IF NOT EXISTS v AS SELECT 1",
+        "CREATE VIEW IF NOT EXISTS t AS SELECT 1",
+        "CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON t BEGIN SELECT 1; END",
         "DROP TABLE IF EXISTS nosuch",
         "DROP INDEX IF EXISTS nosuch",
+        "DROP VIEW IF EXISTS nosuch",
+        "DROP TRIGGER IF EXISTS nosuch",
     ] {
         conn2
             .execute(sql)

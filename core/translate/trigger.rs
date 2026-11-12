@@ -170,8 +170,6 @@ pub fn translate_create_trigger(
     }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-    program.begin_write_operation()?;
 
     // Temp-backed triggers follow SQLite's looser name-resolution rules and may
     // access objects across schemas. Ordinary triggers stay schema-local.
@@ -195,6 +193,7 @@ pub fn translate_create_trigger(
             .is_some()
     }) {
         if if_not_exists {
+            program.begin_noop_ddl(database_id, schema_cookie)?;
             return Ok(());
         }
         bail_parse_error!(
@@ -202,6 +201,8 @@ pub fn translate_create_trigger(
             crate::util::identifier_token_for_error(&trigger_name.name)
         );
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     if time
         .as_ref()
@@ -562,8 +563,6 @@ pub fn translate_drop_trigger(
     let namespace = resolver.resolve_existing_trigger(trigger_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-    program.begin_write_operation()?;
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
     // Check if trigger exists
@@ -572,10 +571,13 @@ pub fn translate_drop_trigger(
             .is_none()
     }) {
         if if_exists {
+            program.begin_noop_ddl(database_id, schema_cookie)?;
             return Ok(());
         }
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
