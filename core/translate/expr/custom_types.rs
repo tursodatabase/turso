@@ -382,7 +382,9 @@ pub(crate) fn translate_untyped_operand_as(
     emit_untyped_operand_store(program, resolved, reg, resolver)?;
     emit_decode(program, resolved, reg, resolver)?;
     if let Some(span) = constant_span {
-        program.constant_span_end(span);
+        if !program.constant_span_was_invalidated(span) {
+            program.constant_span_end(span);
+        }
     }
     Ok(reg)
 }

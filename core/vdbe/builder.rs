@@ -1208,6 +1208,26 @@ impl ProgramBuilder {
             .is_some_and(|(_, end)| *end == usize::MAX)
     }
 
+    /// The index of the constant span that is currently open, if any.
+    pub fn open_constant_span(&self) -> Option<usize> {
+        self.constant_span_is_open()
+            .then(|| self.constant_spans.len() - 1)
+    }
+
+    /// Whether the constant span at `span_idx` was invalidated, as a CAST
+    /// to a custom type does with the span it is in when the CAST cannot be
+    /// computed apart from the rest of the statement.
+    pub fn constant_span_was_invalidated(&self, span_idx: usize) -> bool {
+        span_idx >= self.constant_spans.len()
+    }
+
+    /// Whether the constant span at `span_idx` is still open.
+    pub fn constant_span_is_open_at(&self, span_idx: usize) -> bool {
+        self.constant_spans
+            .get(span_idx)
+            .is_some_and(|(_, end)| *end == usize::MAX)
+    }
+
     /// Get the index of the next constant span.
     /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
     /// all constant spans after the given index.
