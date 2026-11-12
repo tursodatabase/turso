@@ -515,6 +515,21 @@ expect {
     1|1|1|1
 }
 
+# PostgreSQL gives each argument the type of its parameter before it inlines
+# the function. tursopg does not give the argument to the engine, so it does
+# not find a constant that is not valid for the type.
+test constant-that-is-not-valid-for-a-parameter-that-the-body-does-not-use {
+    CREATE FUNCTION first_of(integer, date) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;
+    SELECT first_of(1, 'notadate');
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type date: "notadate"
+}
+expect @tursopg {
+    1
+}
+
 # The aggregate makes the statement return one row for the table.
 test aggregate-for-a-parameter-that-the-body-does-not-use {
     CREATE FUNCTION first_of(integer, integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$;

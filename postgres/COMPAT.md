@@ -618,7 +618,9 @@ Notes on calls of SQL functions:
   a cast. Other arguments are rejected. PostgreSQL reads such an argument
   before it inlines the function: an aggregate makes the statement group
   its rows, and a column that does not exist is an error. tursopg gives the
-  engine only the arguments that the body uses.
+  engine only the arguments that the body uses. Thus it also does not find
+  a constant that is not valid for the type of such a parameter, such as
+  `'notadate'` for a `date`.
 - PostgreSQL computes a constant argument before it inlines the function.
   Thus an argument that fails, such as `1 / 0`, is an error also when the
   body does not compute it, such as in a `CASE` branch that does not run.
