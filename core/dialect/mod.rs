@@ -1097,6 +1097,14 @@ mod tests {
                     Expr::Parenthesized(vec![argument.clone()]),
                 )])));
             }
+            if name.as_str() == "selected" {
+                let [argument] = args.as_slice() else {
+                    return Err(LimboError::ParseError(
+                        "selected takes one argument".to_string(),
+                    ));
+                };
+                return Ok(Some(subquery_of(subquery_of(argument.as_ref().clone()))));
+            }
             if name.as_str() == "first_of" {
                 let [first, _] = args.as_slice() else {
                     return Err(LimboError::ParseError(
@@ -1132,6 +1140,20 @@ mod tests {
                 operand(),
             ))])))
         }
+    }
+
+    /// The expression `(SELECT expr)`.
+    fn subquery_of(expr: Expr) -> Expr {
+        let Cmd::Stmt(Stmt::Select(mut select)) =
+            Parser::new(b"SELECT 0").next_cmd().unwrap().unwrap()
+        else {
+            unreachable!("the statement is a SELECT");
+        };
+        let turso_parser::ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+            unreachable!("the statement has no VALUES");
+        };
+        columns[0] = turso_parser::ast::ResultColumn::Expr(Box::new(expr), None);
+        Expr::Subquery(Box::new(select))
     }
 
     #[test]
@@ -1311,6 +1333,18 @@ mod tests {
                 let rows = run(unused_argument(49)).unwrap();
                 assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
                 let error = run(unused_argument(50)).unwrap_err();
+                assert!(error.to_string().contains(too_large), "{error}");
+
+                // The expressions of a subquery are one level below the
+                // subquery, as the parser counts them. `selected(x)` is
+                // `(SELECT (SELECT x))`: 49 calls make 99 levels, and 50
+                // calls make 101 levels.
+                let in_subqueries = |calls: usize| {
+                    format!("SELECT {}1{}", "selected(".repeat(calls), ")".repeat(calls))
+                };
+                let rows = run(in_subqueries(49)).unwrap();
+                assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+                let error = run(in_subqueries(50)).unwrap_err();
                 assert!(error.to_string().contains(too_large), "{error}");
                 conn.close().unwrap();
             })

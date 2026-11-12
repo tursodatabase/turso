@@ -22,6 +22,7 @@ use crate::translate::schema::{
 use crate::translate::trigger_exec::{
     rewrite_from_clause_expressions, rewrite_select_expressions, rewrite_window_expressions,
 };
+use crate::util::walk_select_expressions;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{Connection, LimboError, Result, MAIN_DB_ID};
@@ -390,12 +391,18 @@ fn expand_call_or_subquery(expr: &mut ast::Expr, expand: &mut ExpandCall) -> Res
     Ok(WalkControl::Continue)
 }
 
-/// Whether `expr` has more than `limit` levels. A subquery is one level:
-/// its expressions are expressions of their own clauses.
+/// Whether `expr` has more than `limit` levels. The expressions of a
+/// subquery are one level below the subquery, as the parser counts them.
 fn is_deeper_than(expr: &ast::Expr, limit: usize) -> bool {
-    let mut pending = vec![(expr, 1)];
-    while let Some((expr, depth)) = pending.pop() {
-        if depth > limit {
+    has_level_above(expr, 1, limit)
+}
+
+/// Whether `expr`, which is at level `level`, has a part at a level above
+/// `limit`.
+fn has_level_above(expr: &ast::Expr, level: usize, limit: usize) -> bool {
+    let mut pending = vec![(expr, level)];
+    while let Some((expr, level)) = pending.pop() {
+        if level > limit {
             return true;
         }
         let mut is_expr = true;
@@ -403,9 +410,27 @@ fn is_deeper_than(expr: &ast::Expr, limit: usize) -> bool {
             if std::mem::take(&mut is_expr) {
                 return Ok(WalkControl::Continue);
             }
-            pending.push((part, depth + 1));
+            pending.push((part, level + 1));
             Ok(WalkControl::SkipChildren)
         });
+        let subquery = match expr {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => Some(select),
+            ast::Expr::InSelect { rhs, .. } => Some(rhs),
+            _ => None,
+        };
+        let Some(subquery) = subquery else {
+            continue;
+        };
+        // The walk gives each expression of the clauses of the subquery,
+        // and this function then looks at its parts.
+        let mut is_too_deep = false;
+        let _ = walk_select_expressions(subquery, &mut |part: &ast::Expr| {
+            is_too_deep = is_too_deep || has_level_above(part, level + 1, limit);
+            Ok(WalkControl::SkipChildren)
+        });
+        if is_too_deep {
+            return true;
+        }
     }
     false
 }
