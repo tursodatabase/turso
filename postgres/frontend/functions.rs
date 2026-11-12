@@ -1,6 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
+use crate::json_object;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
@@ -68,6 +69,14 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
+        },
+        "json_object"(FunctionArity::OneOf(&[1, 2]), true) => {
+            json_object::object_fields("json_object", args)?
+                .map(|fields| Json(json_object::json_text(&fields)))
+        },
+        "jsonb_object"(FunctionArity::OneOf(&[1, 2]), true) => {
+            json_object::object_fields("jsonb_object", args)?
+                .map(|fields| Jsonb(json_object::jsonb_text(fields)))
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| exec_pg_format_type(type_oid, int_arg(args, 1, -1))),
@@ -216,6 +225,28 @@ pub(crate) struct Uuid(pub(crate) String);
 
 impl ScalarReturn for Uuid {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("uuid"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `json` value in its text form.
+struct Json(String);
+
+impl ScalarReturn for Json {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("json"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `jsonb` value in its text form, such as `{"a": 1}`.
+struct Jsonb(String);
+
+impl ScalarReturn for Jsonb {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("jsonb"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -1203,7 +1234,7 @@ fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
 
 /// The error of PostgreSQL for a call with arguments of types that no
 /// function of this name accepts.
-fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
+pub(crate) fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
         format!("function {name}({}) does not exist", arg_types.join(", ")),
@@ -1211,7 +1242,7 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
 }
 
 /// The PostgreSQL type that a value of the engine has, for error messages.
-fn pg_type_name(value: &Value) -> &'static str {
+pub(crate) fn pg_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "unknown",
         Value::Numeric(Numeric::Integer(_)) => "integer",

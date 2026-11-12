@@ -1,0 +1,143 @@
+# json_object(text[]) and json_object(keys text[], values text[]), and the
+# jsonb_object variants: an object built from one array of alternating keys
+# and values, a two-column array of pairs, or an array of keys and an array of
+# values. A NULL array element is a JSON null value. Two-dimensional array
+# literals are written with a space between braces, because the test format
+# reads two braces as a macro.
+
+@database :memory:
+
+test json-object-from-keys-and-values {
+    SELECT json_object('{a,b}', '{1,2}');
+    SELECT json_object(ARRAY['a', 'b'], ARRAY['x', NULL]);
+}
+expect {
+    {"a" : "1", "b" : "2"}
+    {"a" : "x", "b" : null}
+}
+
+test json-object-from-one-array {
+    SELECT json_object('{a,1,b,2}');
+    SELECT json_object('{ {a,1},{b,2} }');
+    SELECT json_object(ARRAY['a', NULL]);
+}
+expect {
+    {"a" : "1", "b" : "2"}
+    {"a" : "1", "b" : "2"}
+    {"a" : null}
+}
+
+test jsonb-object-from-arrays {
+    SELECT jsonb_object('{a,b}', '{1,2}');
+    SELECT jsonb_object('{a,1,b,2}');
+    SELECT jsonb_object('{ {a,1},{b,2} }');
+}
+expect {
+    {"a": "1", "b": "2"}
+    {"a": "1", "b": "2"}
+    {"a": "1", "b": "2"}
+}
+
+test json-object-keeps-key-order-and-repeated-keys {
+    SELECT json_object('{b,1,a,2,b,3}');
+}
+expect {
+    {"b" : "1", "a" : "2", "b" : "3"}
+}
+
+test jsonb-object-sorts-keys-and-keeps-last-value {
+    SELECT jsonb_object('{b,1,a,2,b,3}');
+    SELECT jsonb_object('{bb,1,a,2,ab,3}');
+}
+expect {
+    {"a": "2", "b": "3"}
+    {"a": "2", "ab": "3", "bb": "1"}
+}
+
+test json-object-reads-quoted-elements {
+    SELECT json_object('{a, "NULL", " b c ", "x\"y"}');
+    SELECT json_object(ARRAY[E'tab\tx'], ARRAY[E'line\nbreak']);
+}
+expect {
+    {"a" : "NULL", " b c " : "x\"y"}
+    {"tab\tx" : "line\nbreak"}
+}
+
+test json-object-of-empty-arrays {
+    SELECT json_object('{}');
+    SELECT json_object('{}', '{}');
+    SELECT jsonb_object('{}');
+}
+expect {
+    {}
+    {}
+    {}
+}
+
+test json-object-of-null-is-null {
+    SELECT json_object(NULL);
+}
+expect {
+}
+
+test jsonb-object-of-null-values-array-is-null {
+    SELECT jsonb_object('{a}', NULL);
+}
+expect {
+}
+
+test json-object-odd-number-of-elements {
+    SELECT json_object('{a,b,c}');
+}
+@sqlstate 2202E
+expect error {
+    array must have even number of elements
+}
+
+test json-object-three-columns {
+    SELECT jsonb_object('{ {a,1,2},{b,2,3} }');
+}
+@sqlstate 2202E
+expect error {
+    array must have two columns
+}
+
+test json-object-keys-and-values-of-different-lengths {
+    SELECT json_object('{a,b}', '{1}');
+}
+@sqlstate 2202E
+expect error {
+    mismatched array dimensions
+}
+
+test json-object-two-dimensional-keys {
+    SELECT json_object('{ {a},{b} }', '{ {1},{2} }');
+}
+@sqlstate 2202E
+expect error {
+    wrong number of array subscripts
+}
+
+test json-object-null-key {
+    SELECT json_object('{NULL,a}');
+}
+@sqlstate 22004
+expect error {
+    null value not allowed for object key
+}
+
+test jsonb-object-null-key {
+    SELECT jsonb_object(ARRAY['a', NULL], ARRAY['1', '2']);
+}
+@sqlstate 22004
+expect error {
+    null value not allowed for object key
+}
+
+test json-object-malformed-array {
+    SELECT json_object('a,b');
+}
+@sqlstate 22P02
+expect error {
+    malformed array literal: "a,b"
+}
