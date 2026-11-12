@@ -69,6 +69,11 @@ pub(crate) enum StatementOrigin {
     /// internal tables at open: engine SQL semantics like
     /// [`StatementOrigin::EngineMetadataRead`], run as a top-level statement.
     EngineSchemaWrite,
+    /// A write of a table that holds the dialect's own schema state, which a
+    /// frontend makes for a statement of its user: engine SQL semantics like
+    /// [`StatementOrigin::EngineSchemaWrite`], and the statement also
+    /// increments the schema cookie.
+    DialectSchemaWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +97,18 @@ impl StatementOrigin {
     pub(crate) const fn is_top_level(self) -> bool {
         matches!(
             self,
-            Self::Root | Self::EngineMetadataRead | Self::EngineSchemaWrite
+            Self::Root
+                | Self::EngineMetadataRead
+                | Self::EngineSchemaWrite
+                | Self::DialectSchemaWrite
         )
+    }
+
+    /// Whether the statement is SQLite text of the engine or a frontend,
+    /// whatever the database's dialect, that may name the engine's reserved
+    /// objects.
+    pub(crate) const fn is_engine_write(self) -> bool {
+        matches!(self, Self::EngineSchemaWrite | Self::DialectSchemaWrite)
     }
 }
 

@@ -127,6 +127,7 @@ pub fn translate(
         crate::statement::StatementOrigin::InternalHelper
             | crate::statement::StatementOrigin::EngineMetadataRead
             | crate::statement::StatementOrigin::EngineSchemaWrite
+            | crate::statement::StatementOrigin::DialectSchemaWrite
     );
     let search_path = if is_engine_statement {
         None
@@ -194,6 +195,12 @@ pub fn translate(
         }
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
+    if matches!(
+        origin,
+        crate::statement::StatementOrigin::DialectSchemaWrite
+    ) {
+        schema::emit_schema_cookie(&resolver, &mut program);
+    }
 
     program.epilogue(schema);
 

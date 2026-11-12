@@ -1376,6 +1376,49 @@ mod tests {
     }
 
     #[test]
+    fn dialect_schema_write_increments_the_schema_cookie() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-state.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let schema_version = || {
+            conn.prepare("PRAGMA schema_version")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        let write = |sql: &str| {
+            conn.prepare_dialect_schema_write(sql)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap()
+        };
+
+        conn.execute("CREATE TABLE state (name TEXT)").unwrap();
+        let before = schema_version();
+        write("INSERT INTO state VALUES ('a')");
+        let after_insert = schema_version();
+        assert_ne!(before, after_insert);
+        write("DELETE FROM state WHERE name = 'a'");
+        let after_delete = schema_version();
+        assert_ne!(after_insert, after_delete);
+
+        // A write that is rolled back leaves the cookie as it was.
+        conn.execute("BEGIN").unwrap();
+        write("INSERT INTO state VALUES ('b')");
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(schema_version(), after_delete);
+        let rows = conn
+            .prepare("SELECT count(*) FROM state")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+        conn.close().unwrap();
+    }
+
+    #[test]
     fn dialect_function_alias_preserves_outer_join() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(

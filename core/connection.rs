@@ -1162,7 +1162,7 @@ impl Connection {
                 crate::stack::trace_stack!("parse");
                 // An engine schema statement is the engine's own SQLite text,
                 // whatever the database's dialect parses.
-                if matches!(origin, StatementOrigin::EngineSchemaWrite) {
+                if origin.is_engine_write() {
                     crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
                 } else {
                     self.parse_sql(sql)?
@@ -1848,6 +1848,32 @@ impl Connection {
     pub fn prepare_engine_schema_statement(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
         self.start_nested();
         let statement = self.prepare_with_origin(sql, StatementOrigin::EngineSchemaWrite);
+        self.end_nested();
+        statement
+    }
+
+    /// Prepares a read of a table that holds the dialect's own schema state,
+    /// with engine SQL semantics. A frontend reads its state back with it
+    /// after a [`Connection::prepare_dialect_schema_write`], to change
+    /// [`Schema::dialect_schema`] to match.
+    pub fn prepare_dialect_schema_read(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        self.prepare_engine_metadata_read(sql)
+    }
+
+    /// Prepares a write of a table that holds the dialect's own schema state,
+    /// such as the function catalog of the PostgreSQL frontend, which a
+    /// frontend makes for a statement of its user. `sql` is SQLite text like
+    /// that of [`Connection::prepare_engine_schema_statement`]. The statement
+    /// also increments the schema cookie, so once the transaction commits,
+    /// every other connection loads the schema state again.
+    ///
+    /// The caller changes [`Schema::dialect_schema`] of this connection's
+    /// schema to match once the statement has run. A rollback, of the
+    /// transaction or to a savepoint, puts it back with the rest of the
+    /// schema.
+    pub fn prepare_dialect_schema_write(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        self.start_nested();
+        let statement = self.prepare_with_origin(sql, StatementOrigin::DialectSchemaWrite);
         self.end_nested();
         statement
     }
