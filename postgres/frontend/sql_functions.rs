@@ -354,13 +354,17 @@ pub(crate) fn translate_create_function(
     let name = create.name.name.as_str();
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
     check_types_are_supported(create)?;
+    // Every built-in name is in lowercase, and PostgreSQL matches the name
+    // of a function exactly. Thus a quoted name with an uppercase letter,
+    // such as "Abs", is not the name of a built-in function or table.
+    let can_be_a_built_in_name = !name.bytes().any(|byte| byte.is_ascii_uppercase());
     // PostgreSQL looks in pg_catalog first and chooses between functions of
     // one name by the types of the arguments. tursopg does not know these
     // types. With a user-defined function of the same name, it could not
     // tell which function a call names. For a built-in function that only
     // PostgreSQL has, tursopg would call the function of the user where
     // PostgreSQL calls the built-in function.
-    if is_built_in_function(connection, name) {
+    if can_be_a_built_in_name && is_built_in_function(connection, name) {
         return Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!(
@@ -370,7 +374,7 @@ pub(crate) fn translate_create_function(
     }
     // A call in FROM finds a built-in table function, such as json_tree, by
     // its name alone, in every schema.
-    if is_built_in_table(schema, connection, name) {
+    if can_be_a_built_in_name && is_built_in_table(schema, connection, name) {
         return Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!(
