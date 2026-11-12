@@ -119,6 +119,55 @@ expect error {
     CURRENT_USER cannot be used as a role name here
 }
 
+@skip-if postgres "PostgreSQL supports CREATE USER"
+test create-user-is-not-supported {
+    CREATE USER un_user;
+}
+@sqlstate 0A000
+expect error {
+    CREATE USER is not supported
+}
+
+@skip-if postgres "PostgreSQL supports role options"
+test create-role-options-are-not-supported {
+    CREATE ROLE un_login WITH LOGIN;
+}
+@sqlstate 0A000
+expect error {
+    CREATE ROLE options are not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER ROLE"
+test alter-role-is-not-supported {
+    CREATE ROLE un_altered;
+    ALTER ROLE un_altered WITH LOGIN;
+}
+@sqlstate 0A000
+expect error {
+    ALTER ROLE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports DROP ROLE"
+test drop-role-is-not-supported {
+    CREATE ROLE un_dropped;
+    DROP ROLE un_dropped;
+}
+@sqlstate 0A000
+expect error {
+    DROP ROLE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports role membership"
+test grant-of-a-role-to-a-role-is-not-supported {
+    CREATE ROLE un_group;
+    CREATE ROLE un_member;
+    GRANT un_group TO un_member;
+}
+@sqlstate 0A000
+expect error {
+    GRANT ROLE is not supported
+}
+
 # PostgreSQL cuts identifiers to 63 bytes.
 test create-role-cuts-a-long-name-to-63-bytes {
     CREATE ROLE cn_a_name_that_is_much_longer_than_the_sixty_three_bytes_postgresql_keeps;

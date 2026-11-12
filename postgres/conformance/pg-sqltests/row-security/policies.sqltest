@@ -352,6 +352,17 @@ expect error {
     DROP POLICY ... CASCADE is not supported
 }
 
+@skip-if postgres "PostgreSQL supports ALTER POLICY"
+test alter-policy-is-not-supported {
+    CREATE TABLE un_policy_docs (id INT PRIMARY KEY);
+    CREATE POLICY everything ON un_policy_docs USING (true);
+    ALTER POLICY everything ON un_policy_docs USING (false);
+}
+@sqlstate 0A000
+expect error {
+    ALTER POLICY is not supported
+}
+
 test policy-on-a-view-is-rejected {
     CREATE TABLE rp_docs_21 (id INT PRIMARY KEY);
     CREATE VIEW rp_view_21 AS SELECT id FROM rp_docs_21;

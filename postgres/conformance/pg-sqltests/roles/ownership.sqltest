@@ -448,6 +448,26 @@ expect error {
     role "public" does not exist
 }
 
+@skip-if postgres "PostgreSQL supports REASSIGN OWNED"
+test reassign-owned-is-not-supported {
+    CREATE ROLE un_reassigned;
+    REASSIGN OWNED BY un_reassigned TO postgres;
+}
+@sqlstate 0A000
+expect error {
+    REASSIGN OWNED is not supported
+}
+
+@skip-if postgres "PostgreSQL supports DROP OWNED"
+test drop-owned-is-not-supported {
+    CREATE ROLE un_owner_dropped;
+    DROP OWNED BY un_owner_dropped;
+}
+@sqlstate 0A000
+expect error {
+    DROP OWNED is not supported
+}
+
 # ALTER TABLE rewrites the table's definition in the schema, which needs no
 # privilege besides owning the table.
 test owner-alters-the-columns-of-its-own-table {
