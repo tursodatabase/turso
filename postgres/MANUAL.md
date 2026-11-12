@@ -388,6 +388,79 @@ GRANT SELECT ON accounts TO reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
 ```
 
+### `ALTER DEFAULT PRIVILEGES` — give privileges to relations created later
+
+**Synopsis:**
+
+```sql
+ALTER DEFAULT PRIVILEGES
+    [ FOR { ROLE | USER } target_role [, ...] ]
+    [ IN SCHEMA schema_name [, ...] ]
+    abbreviated_grant
+
+where abbreviated_grant is one of:
+
+GRANT { { SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN }
+        [, ...] | ALL [ PRIVILEGES ] }
+    ON TABLES
+    TO role_specification [, ...]
+
+GRANT { { USAGE | SELECT | UPDATE } [, ...] | ALL [ PRIVILEGES ] }
+    ON SEQUENCES
+    TO role_specification [, ...]
+```
+
+**Description:**
+
+`ALTER DEFAULT PRIVILEGES` gives privileges to the relations that a role
+creates later, so that they do not each need a `GRANT`. Relations that exist
+already keep their privileges. `ON TABLES` covers tables, views and
+materialized views, and `ON SEQUENCES` covers sequences, including those of
+`serial` columns.
+
+When a role creates a relation, the relation gets the privileges that the
+role's defaults for every schema give, or, without those, the privileges
+every relation has before a `GRANT`, plus what the role's defaults for the
+relation's schema add. `pg_class.relacl` shows the result: after
+`ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO reader` by `postgres`, a
+table that `postgres` creates has
+`{postgres=arwdDxtm/postgres,reader=r/postgres}`. As in PostgreSQL, the list
+is ordered with `PUBLIC` first and then the roles in the order they were
+created.
+
+The defaults are stored in the database file, and `pg_default_acl` shows
+them with PostgreSQL's conventions: `defaclnamespace` is 0 for defaults that
+apply in every schema, whose list also holds the role's own privileges, and
+the list of defaults for one schema holds only what was granted. Defaults
+that would give a relation nothing beyond what it has anyway are not stored.
+
+**Parameters:**
+
+- `target_role`: The role whose relations get the privileges, by default the
+  current role. A role may change its own defaults, and a superuser those of
+  any role; anyone else gets `permission denied to change default privileges`
+  (SQLSTATE 42501).
+- `schema_name`: The name of an existing schema. The privileges apply only to
+  relations created in it. Without `IN SCHEMA`, they apply in every schema.
+- `role_specification`: As for `GRANT`.
+
+**Notes:**
+
+The statement fails if a role or schema does not exist, with the same errors
+as PostgreSQL. `USAGE` on tables and privileges that sequences do not have,
+such as `INSERT` on sequences, fail with `invalid privilege type` (SQLSTATE
+0LP01), as in PostgreSQL. `REVOKE`, `WITH GRANT OPTION`, and defaults for
+functions, routines, types, schemas and large objects fail as not supported
+(SQLSTATE 0A000).
+
+**Examples:**
+
+```sql
+CREATE ROLE reader;
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA reports GRANT USAGE ON SEQUENCES TO reader;
+```
+
 ### `SET ROLE` — set the current role
 
 **Synopsis:**
