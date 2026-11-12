@@ -1217,15 +1217,50 @@ expect {
     descending_seq|bigint|-5|-2|-1|-99|1|f
 }
 
+# As in PostgreSQL 18, every NOT NULL column has a NOT NULL constraint,
+# primary key columns included. pg_dump 18 reads them.
+test pg-constraint-lists-not-null-constraints {
+    CREATE TABLE nn_items (id int PRIMARY KEY, label text NOT NULL, note text);
+    SELECT conname, contype, conkey, connoinherit, conislocal, convalidated
+    FROM pg_constraint
+    WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'nn_items') AND contype = 'n'
+    ORDER BY conname;
+}
+expect {
+    nn_items_id_not_null|n|{1}|f|t|t
+    nn_items_label_not_null|n|{2}|f|t|t
+}
+
+test pg-constraint-shortens-long-not-null-names {
+    CREATE TABLE nn_a_table_with_a_name_long_enough_to_be_shortened (
+        a_column_with_a_name_long_enough_to_be_shortened_too int NOT NULL);
+    SELECT conname FROM pg_constraint WHERE contype = 'n' AND conrelid = (
+        SELECT oid FROM pg_class
+        WHERE relname = 'nn_a_table_with_a_name_long_enough_to_be_shortened');
+}
+expect {
+    nn_a_table_with_a_name_long_a_column_with_a_name_long__not_null
+}
+
+test pg-get-constraintdef-of-a-not-null-constraint {
+    CREATE TABLE nn_def ("Mixed Name" int NOT NULL);
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'nn_def_Mixed Name_not_null';
+}
+expect {
+    NOT NULL "Mixed Name"
+}
+
 test pg-constraint-conkey-is-an-array {
     CREATE TABLE ck_pair (a int, b int, c int, PRIMARY KEY (b, c));
     SELECT conname, conkey FROM pg_constraint
-    WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ck_pair') AND contype = 'p';
+    WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ck_pair') ORDER BY conname;
     SELECT a.attname FROM pg_attribute a, pg_constraint c
     WHERE c.conname = 'ck_pair_pkey' AND a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
     ORDER BY a.attname;
 }
 expect {
+    ck_pair_b_not_null|{2}
+    ck_pair_c_not_null|{3}
     ck_pair_pkey|{2,3}
     b
     c

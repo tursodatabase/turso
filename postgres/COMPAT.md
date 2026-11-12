@@ -80,6 +80,10 @@ Basics not enumerated by the official feature matrix.
 
 ## Backend
 
+As in PostgreSQL 18, every NOT NULL
+column has a NOT NULL constraint (`contype = 'n'`) in `pg_constraint`, and
+`conkey` and `confkey` are arrays such as `{1,2}`.
+
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,

@@ -19,6 +19,7 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::translator::make_object_name;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -1993,6 +1994,8 @@ enum ConstraintKind {
     ForeignKey,
     #[strum(serialize = "c")]
     Check,
+    #[strum(serialize = "n")]
+    NotNull,
 }
 
 const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, conenforced BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conperiod BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
@@ -2003,7 +2006,7 @@ struct PgConstraintTable;
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
     /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
-    /// unique constraints, foreign keys and checks.
+    /// unique constraints, foreign keys, checks and NOT NULL constraints.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
@@ -2299,6 +2302,46 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
                     Value::build_text(render_expr(&chk.expr)), // conbin
+                ]);
+                constraint_oid += 1;
+            }
+
+            // As in PostgreSQL 18, each NOT NULL column has a constraint of
+            // its own, primary key columns included.
+            for (position, column) in btree.columns().iter().enumerate() {
+                if !column.notnull() {
+                    continue;
+                }
+                let column_name = column.name.as_deref().expect("table columns have names");
+                let contype: &'static str = ConstraintKind::NotNull.into();
+                rows.push(vec![
+                    Value::from_i64(constraint_oid), // oid
+                    Value::build_text(make_object_name(table_name, column_name, "not_null")), // conname
+                    Value::from_i64(2200),      // connamespace
+                    Value::build_text(contype), // contype
+                    Value::from_i64(0),         // condeferrable
+                    Value::from_i64(0),         // condeferred
+                    Value::from_i64(1),         // conenforced
+                    Value::from_i64(1),         // convalidated
+                    Value::from_i64(table_oid), // conrelid
+                    Value::from_i64(0),         // contypid
+                    Value::from_i64(0),         // conindid
+                    Value::from_i64(0),         // conparentid
+                    Value::from_i64(0),         // confrelid
+                    Value::Null,                // confupdtype
+                    Value::Null,                // confdeltype
+                    Value::Null,                // confmatchtype
+                    Value::from_i64(1),         // conislocal
+                    Value::from_i64(0),         // coninhcount
+                    Value::from_i64(0),         // connoinherit
+                    Value::from_i64(0),         // conperiod
+                    Value::build_text(format!("{{{}}}", position + 1)), // conkey
+                    Value::Null,                // confkey
+                    Value::Null,                // conpfeqop
+                    Value::Null,                // conppeqop
+                    Value::Null,                // conffeqop
+                    Value::Null,                // conexclop
+                    Value::Null,                // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -4014,6 +4057,15 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
                 return Some(format!("CHECK ({})", render_expr(&chk.expr)));
+            }
+            constraint_oid += 1;
+        }
+
+        // NOT NULL constraints, one per column
+        for column in btree.columns().iter().filter(|column| column.notnull()) {
+            if constraint_oid == target_oid {
+                let column_name = column.name.as_deref().expect("table columns have names");
+                return Some(format!("NOT NULL {}", quote_identifier(column_name)));
             }
             constraint_oid += 1;
         }
