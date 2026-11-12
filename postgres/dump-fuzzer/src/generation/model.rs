@@ -51,6 +51,19 @@ pub enum Constraint {
     Default(i32),
 }
 
+/// A sequence as CREATE SEQUENCE declares it. Bounds and start are only
+/// written when given; otherwise PostgreSQL's defaults for the direction
+/// of `increment` apply.
+#[derive(Clone, Debug)]
+pub struct Sequence {
+    pub name: Identifier,
+    pub increment: i64,
+    /// MINVALUE and MAXVALUE.
+    pub bounds: Option<(i64, i64)>,
+    pub start: Option<i64>,
+    pub cycle: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     Null,
@@ -168,6 +181,13 @@ pub enum Statement {
         schema: Identifier,
         command: Command,
     },
+    CreateSequence(Sequence),
+    NextVal(Identifier),
+    SetVal {
+        sequence: Identifier,
+        value: i64,
+        is_called: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +295,35 @@ impl Display for Statement {
             Self::DefaultPrivilege { schema, command } => write!(
                 f,
                 "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT {command} ON TABLES TO PUBLIC"
+            ),
+            Self::CreateSequence(sequence) => {
+                write!(
+                    f,
+                    "CREATE SEQUENCE {} INCREMENT {}",
+                    sequence.name, sequence.increment
+                )?;
+                if let Some((min, max)) = sequence.bounds {
+                    write!(f, " MINVALUE {min} MAXVALUE {max}")?;
+                }
+                if let Some(start) = sequence.start {
+                    write!(f, " START {start}")?;
+                }
+                if sequence.cycle {
+                    f.write_str(" CYCLE")?;
+                }
+                Ok(())
+            }
+            Self::NextVal(sequence) => {
+                write!(f, "SELECT nextval({})", Value::Text(sequence.to_string()))
+            }
+            Self::SetVal {
+                sequence,
+                value,
+                is_called,
+            } => write!(
+                f,
+                "SELECT setval({}, {value}, {is_called})",
+                Value::Text(sequence.to_string())
             ),
         }
     }

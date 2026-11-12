@@ -23,6 +23,7 @@ pub enum Feature {
     Grants,
     Revokes,
     DefaultPrivileges,
+    Sequences,
 }
 
 #[derive(Clone, Debug)]

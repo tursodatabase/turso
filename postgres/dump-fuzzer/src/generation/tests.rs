@@ -235,8 +235,20 @@ fn workload_orders_steps_and_keeps_access_control_out_of_tables_profile(tc: Test
     let sql = tc.draw(workload(profile, disabled));
     let mut last_phase = 0;
     let mut created = false;
+    let mut sequences = false;
     for statement in pg_query::parse(&sql).unwrap().protobuf.stmts {
-        let phase = match statement.stmt.unwrap().node.unwrap() {
+        let node = statement.stmt.unwrap().node.unwrap();
+        // Sequences and the calls that use them come after every table.
+        match &node {
+            N::CreateSeqStmt(_) => {
+                assert_eq!(profile, Profile::Compatible);
+                sequences = true;
+                continue;
+            }
+            N::SelectStmt(_) if sequences => continue,
+            _ => assert!(!sequences, "table statements must come before sequences"),
+        }
+        let phase = match node {
             N::VariableSetStmt(_) => continue,
             N::CreateStmt(_) => {
                 created = true;
@@ -879,9 +891,22 @@ fn workload_uses_declared_tables_and_distinct_relation_names(tc: TestCase) {
     let case = tc.draw(cases(profile, vec![]));
     let mut relations = std::collections::BTreeSet::new();
     let mut tables = std::collections::BTreeSet::new();
+    let mut sequences = std::collections::BTreeSet::new();
     for statement in case.0 {
         let table = match statement {
             Statement::StandardConformingStrings | Statement::DefaultPrivilege { .. } => continue,
+            Statement::CreateSequence(sequence) => {
+                assert!(relations.insert(sequence.name.as_str().to_owned()));
+                assert!(sequences.insert(sequence.name.as_str().to_owned()));
+                continue;
+            }
+            Statement::NextVal(sequence) | Statement::SetVal { sequence, .. } => {
+                assert!(
+                    sequences.contains(sequence.as_str()),
+                    "sequence must be declared before use"
+                );
+                continue;
+            }
             Statement::CreateTable(table) => {
                 assert!(relations.insert(table.name.as_str().to_owned()));
                 assert!(tables.insert(table.name.as_str().to_owned()));
@@ -957,4 +982,46 @@ fn seeded_campaign_exercises_schema_and_index_variants() {
     assert_eq!(key_counts, (1..=3).collect());
     assert_eq!(directions, [false, true].into_iter().collect());
     assert_eq!(uniqueness, [false, true].into_iter().collect());
+}
+
+#[hegel::test(test_cases = 2000)]
+fn sequence_workloads_stay_within_the_bounds(tc: TestCase) {
+    use model::*;
+    let index = tc.draw(gs::integers::<usize>().max_value(1));
+    let statements = tc.draw(sequences::sequence_statements(index));
+    let Statement::CreateSequence(sequence) = &statements[0] else {
+        panic!("the first statement creates the sequence")
+    };
+    let (min, max) = sequence.bounds.unwrap_or(if sequence.increment > 0 {
+        (1, i64::MAX)
+    } else {
+        (i64::MIN, -1)
+    });
+    assert!(min < max);
+    let first = if sequence.increment > 0 { min } else { max };
+    let mut next = sequence.start.unwrap_or(first);
+    assert!((min..=max).contains(&next));
+    for statement in &statements[1..] {
+        match statement {
+            Statement::NextVal(name) => {
+                assert_eq!(name, &sequence.name);
+                assert!((min..=max).contains(&next), "nextval must not run out");
+                next += sequence.increment;
+            }
+            Statement::SetVal {
+                sequence: name,
+                value,
+                ..
+            } => {
+                assert_eq!(name, &sequence.name);
+                assert!((min..=max).contains(value));
+            }
+            other => panic!("unexpected statement {other:?}"),
+        }
+    }
+    let sql = Workload(statements.clone()).to_string();
+    assert_eq!(
+        pg_query::parse(&sql).unwrap().protobuf.stmts.len(),
+        statements.len()
+    );
 }

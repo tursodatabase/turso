@@ -112,6 +112,7 @@ make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast --en
 | `grants` | Table GRANT and REVOKE |
 | `revokes` | REVOKE only; GRANT remains |
 | `default-privileges` | ALTER DEFAULT PRIVILEGES |
+| `sequences` | CREATE SEQUENCE and the nextval and setval calls that use them |
 
 Policies can be generated without RLS. Default privileges can be generated
 without table grants. Disabling a parent removes dependent statements so, for
@@ -342,6 +343,7 @@ statements. The reference server is PostgreSQL 18, the version in
 | Indexes | 0–3 B-tree indexes per table; 1–3 distinct columns in varying order; ASC/DESC keys; optional UNIQUE when a primary-key column is included |
 | Grants | GRANT/REVOKE SELECT, INSERT, UPDATE, DELETE, ALL ON TABLE to/from PUBLIC |
 | Default privileges | ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT on tables to PUBLIC |
+| Sequences | 0–2 sequences per workload after the tables, with an increment of ±1 to ±3, optional MINVALUE/MAXVALUE, START and CYCLE; up to three `SELECT nextval(...)` calls and an optional `SELECT setval(...)`, which stay within the bounds |
 | Policies | CREATE POLICY for ALL/SELECT/INSERT/UPDATE/DELETE; PERMISSIVE/RESTRICTIVE; USING and WITH CHECK; ALTER/DROP POLICY |
 | RLS | ENABLE, FORCE, DISABLE ROW LEVEL SECURITY |
 | Roles/membership | Not generated: roles are cluster-wide and pg_dump does not serialize role definitions; needs an isolated cluster plus pg_dumpall coverage |
@@ -360,14 +362,16 @@ postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer --profile tabl
 Each workload has zero to four tables and zero to twelve initial rows per table.
 Data generation uses INSERT VALUES only. A table without a primary key can
 receive one additional duplicate row by repeating a generated VALUES row.
-No SELECT, UPDATE, DELETE, or INSERT SELECT statements are generated.
+No SELECT, UPDATE, DELETE, or INSERT SELECT statements are generated, apart
+from the SELECT nextval and setval calls on generated sequences.
 Unique indexes include a primary-key column, so data generation cannot violate
 their uniqueness. Integers span their Rust type
 domains; strings include Unicode and control characters. NUL is removed because
 PostgreSQL text cannot contain it. Materialized text and row counts are bounded
 to keep database creation and shrinking practical.
 
-Partial/expression indexes, checks, serial/generated columns, enums,
+Partial/expression indexes, checks, serial/generated columns, sequence data
+types other than bigint, enums,
 and views are not currently generated. Other SQL types,
 foreign keys, custom schemas, transactional migrations, and concurrent writers
 are not yet generated. PUBLIC policies exercise catalog serialization but do
