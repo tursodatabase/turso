@@ -486,6 +486,17 @@ pub trait Dialect: Send + Sync + 'static {
     /// None for every other function. The calls in the arguments of `call`
     /// are expanded already, and the result must not have a call that the
     /// dialect expands.
+    ///
+    /// The engine asks for the calls of SELECT, INSERT, UPDATE, DELETE and
+    /// CREATE TABLE AS. It does not ask for a call that a statement stores
+    /// in the schema, such as the query of a view, the body of a trigger or
+    /// a column default: such a call fails as a call of a function that
+    /// does not exist. A dialect that wants a clearer error must refuse
+    /// these statements.
+    ///
+    /// The engine walks an expression with recursion, so the result must not
+    /// have more levels than the parser permits
+    /// ([`turso_parser::parser::MAX_EXPR_DEPTH`]).
     fn expand_function_call(
         &self,
         schema: &Schema,
@@ -1167,6 +1178,31 @@ mod tests {
             statement.run_collect_rows().unwrap(),
             vec![vec![Value::from_i64(10)]]
         );
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn a_statement_that_stores_a_call_keeps_the_call() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-stored-call.db", Arc::new(ExpandingDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+        conn.execute("CREATE TABLE log (a INTEGER)").unwrap();
+
+        conn.execute("CREATE VIEW doubled AS SELECT twice(a) FROM t")
+            .unwrap();
+        let error = conn.prepare("SELECT * FROM doubled").err().unwrap();
+        assert!(error.to_string().contains("no such function: twice"));
+
+        conn.execute(
+            "CREATE TRIGGER log_doubled AFTER INSERT ON t \
+             BEGIN INSERT INTO log VALUES (twice(new.a)); END",
+        )
+        .unwrap();
+        let error = conn.execute("INSERT INTO t VALUES (1)").err().unwrap();
+        assert!(error.to_string().contains("no such function: twice"));
         conn.close().unwrap();
     }
 

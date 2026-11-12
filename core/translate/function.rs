@@ -145,6 +145,9 @@ pub fn emit_dialect_schema_row_delete(
 /// query or change data: SELECT, INSERT, UPDATE, DELETE and CREATE TABLE AS.
 /// The rest of translation only sees the expression. Returns whether it
 /// replaced a call.
+///
+/// A statement that stores an expression in the schema, such as CREATE VIEW,
+/// CREATE TRIGGER or a column default, keeps the call.
 pub(crate) fn expand_function_calls(
     stmt: &mut ast::Stmt,
     resolver: &Resolver,
