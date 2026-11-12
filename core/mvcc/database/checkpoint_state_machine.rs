@@ -1313,9 +1313,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows_from_store(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
+        let store = mvstore.row_store();
         let guard = epoch::pin();
         let mut cursor = std::mem::take(&mut self.collect_table_cursor);
-        let result = walk_table_keys(&mvstore.rows, &guard, &mut cursor, bounds, |key, chain| {
+        let result = walk_table_keys(&store.rows, &guard, &mut cursor, bounds, |key, chain| {
             tracing::trace!("collecting {key:?}");
             let row_versions = chain.read();
             self.collect_table_row_versions(key, &row_versions)?;
@@ -1329,8 +1330,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows_from_dirty_keys(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
+        let store = mvstore.row_store();
         let guard = epoch::pin();
-        let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
+        let mut rows = LockstepCursor::new(&store.rows, &guard);
         let mut cursor = std::mem::take(&mut self.collect_table_cursor);
         let result = walk_table_keys(
             &mvstore.checkpoint_dirty_table_keys,
@@ -1603,8 +1605,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             };
         let mut processed = 0;
         let mvstore = self.mvstore.clone();
+        let store = mvstore.row_store();
         let guard = epoch::pin();
-        let mut outer_range = mvstore.index_rows.range(outer_bounds);
+        let mut outer_range = store.index_rows.range(outer_bounds);
         while let Some(pinned) = outer_range.inner.next(&guard) {
             let outer = CollectEntry::new(pinned, &guard);
             let index_id = *outer.key();
@@ -1651,6 +1654,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_index_rows_from_dirty_keys(&mut self) -> Result<bool> {
         let mut processed = 0;
         let mvstore = self.mvstore.clone();
+        let store = mvstore.row_store();
         let guard = epoch::pin();
         let mut current_index: Option<(
             MVTableId,
@@ -1674,7 +1678,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .as_ref()
                     .is_none_or(|(id, _, _)| *id != index_id)
                 {
-                    current_index = mvstore.index_rows.get(&index_id).map(|index| {
+                    current_index = store.index_rows.get(&index_id).map(|index| {
                         let keys = LockstepCursor::new(index.value(), &guard);
                         (index_id, index, keys)
                     });
@@ -1764,7 +1768,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if self.mvstore.checkpoint_full_scan_generation().is_some() {
             return;
         }
-        for entry in self.mvstore.rows.iter() {
+        let store = self.mvstore.row_store();
+        for entry in store.rows.iter() {
             let key = entry.key();
             if self.destroyed_tables.contains(&key.table_id) {
                 continue;
@@ -1788,7 +1793,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if self.mvstore.checkpoint_full_scan_generation().is_some() {
             return;
         }
-        for index in self.mvstore.index_rows.iter() {
+        let store = self.mvstore.row_store();
+        for index in store.index_rows.iter() {
             let index_id = *index.key();
             if self.destroyed_indexes.contains(&index_id) {
                 continue;
@@ -2030,11 +2036,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
                 row_id: RowKey::Int(sqlite_schema_rowid),
             };
-            let sqlite_schema_row = self
-                .mvstore
-                .rows
-                .get(&key)
-                .expect("sqlite_schema row not found");
+            let store = self.mvstore.row_store();
+            let sqlite_schema_row = store.rows.get(&key).expect("sqlite_schema row not found");
             let mut row_versions = sqlite_schema_row.value().write();
             // Patch payload in place (same version id), don't append: a duplicate
             // (id, begin, end) would leave a phantom current version after a later
@@ -2284,7 +2287,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     true,
                 )
             };
-            if let Some(entry) = self.mvstore.rows.get(row_id) {
+            let store = self.mvstore.row_store();
+            if let Some(entry) = store.rows.get(row_id) {
                 let mut versions = entry.value().write();
                 if stamp {
                     self.mvstore.stamp_chain_materialized(
@@ -2360,8 +2364,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         &self.unwritten_index_rows[current - self.index_write_set.len()];
                     (*index_id, sortable_key, true)
                 };
-                let outer_entry = self
-                    .mvstore
+                let store = self.mvstore.row_store();
+                let outer_entry = store
                     .index_rows
                     .get(&index_id)
                     .expect("index_id from write set must exist in index_rows");
@@ -3766,7 +3770,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
         let snapshot_ts = self.snapshot_ts;
         let start = Bound::Included(RowID::new(self.table_id, RowKey::Int(i64::MIN)));
         let end = next_table_start(self.table_id).map_or(Bound::Unbounded, Bound::Excluded);
-        for entry in self.mvstore.rows.range((start, end)) {
+        let store = self.mvstore.row_store();
+        for entry in store.rows.range((start, end)) {
             let key = entry.key();
             let rowid = key.row_id.to_int_or_panic();
             let versions = entry.value().read();
@@ -4152,7 +4157,8 @@ mod tests {
             index_row_version("blue_river_906", 75, 2, None, Some(10), true);
 
         insert_dirty_index_version(&mvstore, index_id, garbage_key, garbage_version);
-        let entry = mvstore
+        let row_store = mvstore.row_store();
+        let entry = row_store
             .index_rows
             .get(&index_id)
             .expect("index entry should exist after first insert");
@@ -4312,6 +4318,7 @@ mod tests {
         let stamp = version_stamp(&version);
         versions.push(version);
         mvstore
+            .row_store()
             .rows
             .insert(key.clone(), Arc::new(RwLock::new(versions)));
         mvstore.mark_checkpoint_dirty_key(&key, stamp).unwrap();
@@ -4340,7 +4347,10 @@ mod tests {
                 crate::alloc::DynAllocator,
             >>::new_in(crate::alloc::DynAllocator::default());
         versions.push(version);
-        mvstore.rows.insert(key, Arc::new(RwLock::new(versions)));
+        mvstore
+            .row_store()
+            .rows
+            .insert(key, Arc::new(RwLock::new(versions)));
     }
 
     fn insert_dirty_index_version(
@@ -4353,7 +4363,7 @@ mod tests {
     ) {
         let stamp = version_stamp(&version);
         let (key, _, _) = mvstore
-            .insert_index_version(index_id, key, version)
+            .insert_index_version(&mvstore.row_store(), index_id, key, version)
             .unwrap();
         mvstore
             .mark_checkpoint_dirty_key(&RowID::new(index_id, RowKey::Record(key)), stamp)
@@ -4550,6 +4560,7 @@ mod tests {
                 >>::new_in(crate::alloc::DynAllocator::default());
             versions.push(version.clone());
             mvstore
+                .row_store()
                 .rows
                 .insert(row_id.clone(), Arc::new(RwLock::new(versions)));
             checkpoint.write_set.push((row_id, version, None));
@@ -4575,11 +4586,13 @@ mod tests {
         // Write-set GC clears version chains but leaves empty SkipMap slots;
         // Truncate Finalize `_and_slots` unlinks them.
         let slots = mvstore
+            .row_store()
             .rows
             .iter()
             .filter(|entry| entry.key().table_id == table_id)
             .count();
         let versions: usize = mvstore
+            .row_store()
             .rows
             .iter()
             .filter(|entry| entry.key().table_id == table_id)
@@ -4592,6 +4605,7 @@ mod tests {
         );
         mvstore.drop_unused_row_versions_and_slots();
         let remaining = mvstore
+            .row_store()
             .rows
             .iter()
             .filter(|entry| entry.key().table_id == table_id)
@@ -4645,7 +4659,8 @@ mod tests {
         while checkpoint.gc_checkpointed_index_versions().is_some() {}
         // Write-set GC clears version chains but leaves empty SkipMap slots;
         // Truncate Finalize `_and_slots` unlinks them.
-        let inner = mvstore
+        let row_store = mvstore.row_store();
+        let inner = row_store
             .index_rows
             .get(&index_id)
             .expect("index map must exist");
@@ -4665,6 +4680,7 @@ mod tests {
         );
         mvstore.drop_unused_row_versions_and_slots();
         let remaining = mvstore
+            .row_store()
             .index_rows
             .get(&index_id)
             .map_or(0, |entry| entry.value().len());
@@ -4770,7 +4786,7 @@ mod tests {
         let index_id = MVTableId::from(-7);
         let (clean_key, clean_version) = index_row_version("k", 1, 1, Some(1), None, false);
         mvstore
-            .insert_index_version(index_id, clean_key, clean_version)
+            .insert_index_version(&mvstore.row_store(), index_id, clean_key, clean_version)
             .unwrap();
         let (dirty_key, dirty_version) = index_row_version("k", 2, 1, Some(5), None, false);
         insert_dirty_index_version(&mvstore, index_id, dirty_key, dirty_version);
@@ -4926,7 +4942,8 @@ mod tests {
             1,
             "only the index key with a newer version stays: {remaining:?}"
         );
-        let index = mvstore.index_rows.get(&index_id).unwrap();
+        let row_store = mvstore.row_store();
+        let index = row_store.index_rows.get(&index_id).unwrap();
         let RowKey::Record(remaining_key) = &remaining[0].row_id else {
             panic!("index dirty keys carry Record keys");
         };
@@ -4976,7 +4993,10 @@ mod tests {
         mvstore
             .mark_checkpoint_dirty_key(&RowID::new(table_id, RowKey::Int(60)), 5)
             .unwrap();
-        mvstore.rows.remove(&RowID::new(table_id, RowKey::Int(60)));
+        mvstore
+            .row_store()
+            .rows
+            .remove(&RowID::new(table_id, RowKey::Int(60)));
 
         while checkpoint.collect_table_rows().unwrap().is_some() {}
 

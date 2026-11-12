@@ -4728,7 +4728,7 @@ mod tests {
             // Use read_from_table_or_index to read the index row
             // This verifies that index rows were properly serialized and deserialized from the logical log
             let index_row_opt = mvcc_store
-                .read_from_table_or_index(tx, &index_rowid, Some(index_id))
+                .read_from_table_or_index(&mvcc_store.row_store(), tx, &index_rowid, Some(index_id))
                 .unwrap_or_else(|e| {
                     panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}",
                            data_value, row_id, e, index_id, index.root_page)
