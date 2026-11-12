@@ -48,6 +48,12 @@ enum Failure {
     Backfill,
     /// The logical log is empty where the spec has records, or the other way.
     LogicalLog,
+    /// A crash now recovers other rows than the spec.
+    RecoveryRows,
+    /// A crash now makes the database fail to open or to read.
+    RecoveryError,
+    /// A crash now makes recovery panic.
+    RecoveryPanic,
 }
 
 /// Why a replay stopped before the end of the trace.
@@ -270,4 +276,72 @@ impl Checkpointer {
         }
         panic!("checkpoint did not reach the state in {STEP_LIMIT} steps");
     }
+}
+
+/// What a process crash at this moment recovers.
+#[derive(Debug)]
+enum Recovery<T> {
+    Read(T),
+    Error(String),
+    Panic(String),
+}
+
+/// Copies the database file, the WAL and the logical log to a new folder,
+/// as a process crash leaves them, then opens the copy and reads it with
+/// `read`. The running database does not change.
+fn crash_probe<T>(
+    db_path: &str,
+    read: impl FnOnce(&Arc<Connection>) -> crate::Result<T>,
+) -> Recovery<T> {
+    let source = std::path::Path::new(db_path);
+    let name = source.file_name().unwrap().to_str().unwrap();
+    let folder = tempfile::TempDir::new().unwrap();
+    for entry in std::fs::read_dir(source.parent().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        let file = entry.file_name().into_string().unwrap();
+        if file.starts_with(name) && !file.ends_with("-tshm") {
+            std::fs::copy(entry.path(), folder.path().join(&file)).unwrap();
+        }
+    }
+    let copy = folder.path().join(name);
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> crate::Result<_> {
+        let io = Arc::new(crate::io::PlatformIO::new()?);
+        let db = crate::Database::open_file_with_flags(
+            io,
+            copy.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+            None,
+            Arc::new(crate::EngineDialect),
+        )?;
+        let copy = MvccTestDbNoConn {
+            db: Some(db),
+            path: None,
+            opts: crate::DatabaseOpts::new(),
+            enc_opts: None,
+            _temp_dir: None,
+        };
+        read(&copy.connect())
+    }));
+    match opened {
+        Ok(Ok(value)) => Recovery::Read(value),
+        Ok(Err(err)) => Recovery::Error(err.to_string()),
+        Err(payload) => Recovery::Panic(
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+fn query_rows(conn: &Arc<Connection>, sql: &str) -> crate::Result<Vec<Vec<crate::Value>>> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect());
+        Ok(())
+    })?;
+    Ok(rows)
 }

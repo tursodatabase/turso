@@ -80,7 +80,11 @@ impl Driver for RowDriver {
             "Gc" => self.gc(step)?,
             other => return refuse(format!("no engine operation for {other}")),
         }
-        self.check(step)
+        self.check(step)?;
+        if step.action.starts_with("Write") || step.action.starts_with("Checkpoint") {
+            self.check_recovery(step)?;
+        }
+        Ok(())
     }
 }
 
@@ -477,6 +481,37 @@ impl RowDriver {
             return fail(
                 Failure::LogicalLog,
                 format!("spec log empty: {spec_log_empty}, engine log empty: {log_empty}"),
+            );
+        }
+        Ok(())
+    }
+
+    /// RecoveryCorrect: a crash now recovers the latest logged value of
+    /// every key.
+    fn check_recovery(&self, step: &Step) -> StepOutcome {
+        let logged = step.var("logged");
+        let mut want: BTreeMap<i64, i64> = BTreeMap::new();
+        for write in logged.items() {
+            want.entry(spec_key(write.field("k"))).or_insert(0);
+        }
+        let want: BTreeMap<i64, i64> = want
+            .into_keys()
+            .map(|key| (key, latest_in(logged, key, i64::MAX)))
+            .filter(|(_, value)| *value != 0)
+            .collect();
+        let path = self.db.path.as_ref().unwrap();
+        let got = match crash_probe(path, |conn| query_rows(conn, "SELECT k, v FROM t")) {
+            Recovery::Read(rows) => rows
+                .iter()
+                .map(|row| (row[0].as_int().unwrap(), row[1].as_int().unwrap()))
+                .collect::<BTreeMap<_, _>>(),
+            Recovery::Error(err) => return fail(Failure::RecoveryError, err),
+            Recovery::Panic(msg) => return fail(Failure::RecoveryPanic, msg),
+        };
+        if got != want {
+            return fail(
+                Failure::RecoveryRows,
+                format!("recovered {got:?}, spec logged {want:?}"),
             );
         }
         Ok(())
