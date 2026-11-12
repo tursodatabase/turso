@@ -5516,6 +5516,49 @@ fn test_checkpoint_empties_mv_store_after_interrupted_checkpoint() {
     assert_eq!(rows[0][1].as_int().unwrap(), 10);
 }
 
+/// A blocking checkpoint clears the whole MV store in Finalize, so it must not do the
+/// stamp and GC work on single rows first.
+#[test]
+fn test_blocking_checkpoint_skips_row_gc_states() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let mvcc_store = db.get_mvcc_store();
+
+    let checkpoint_conn = db.connect();
+    let pager = checkpoint_conn.pager.load().clone();
+    let mut checkpoint = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        checkpoint_conn.clone(),
+        true,
+        checkpoint_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    loop {
+        assert!(
+            !matches!(
+                checkpoint.state_for_test(),
+                CheckpointState::GcTableRows { .. } | CheckpointState::GcIndexRows { .. }
+            ),
+            "blocking checkpoint entered a row GC state"
+        );
+        match checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+    assert!(mvcc_store.rows.is_empty());
+}
+
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;

@@ -3493,7 +3493,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let lwm = self.mvstore.sample_gc_lwm();
                 // Reclaim retired root-page bindings no transaction can still see (end <= lwm).
                 self.mvstore.gc_rootpage_entries(lwm);
-                self.state = CheckpointState::GcTableRows { next_index: 0, lwm };
+                self.state = if self.mvstore.uses_passive_checkpoint() {
+                    CheckpointState::GcTableRows { next_index: 0, lwm }
+                } else {
+                    // Finalize clears the whole store, so no row needs a stamp or the chain rules.
+                    CheckpointState::PruneDirtyKeys
+                };
                 Ok(TransitionResult::Continue)
             }
 
