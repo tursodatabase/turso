@@ -1,6 +1,7 @@
 use crate::functions::validate_pg_input;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::cell::Cell;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -20,7 +21,9 @@ use turso_core::{
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+use turso_parser::ast::fmt::{BlankContext, ToTokens, TokenStream, WriteTokenStream};
 use turso_parser::ast::{self, RefAct, SortOrder};
+use turso_parser::token::TokenType;
 use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
@@ -4339,7 +4342,100 @@ fn render_expr(expr: &ast::Expr) -> String {
         Ok(WalkControl::Continue)
     })
     .expect("rewriting role functions does not fail");
-    expr.to_string()
+    let mut sql = String::new();
+    let no_space_before_next_token = Cell::new(false);
+    let mut output = SpaceSkippingWriter {
+        sql: &mut sql,
+        skip_space: &no_space_before_next_token,
+    };
+    let mut writer = SchemaFunctionCallWriter {
+        tokens: WriteTokenStream::new(&mut output),
+        no_space_before_next_token: &no_space_before_next_token,
+        name_before_call: None,
+    };
+    expr.to_tokens(&mut writer, &BlankContext)
+        .and_then(|()| writer.finish())
+        .expect("writing to a string does not fail");
+    sql
+}
+
+/// Writes the tokens of an expression as the engine's printer does, except
+/// for the call of a function of a schema. Its name is the schema and the
+/// function in one name, which the engine prints as one quoted identifier:
+/// `"auth.uid" ()`. PostgreSQL prints `auth.uid()`.
+struct SchemaFunctionCallWriter<'a, W: std::fmt::Write> {
+    tokens: WriteTokenStream<'a, W>,
+    no_space_before_next_token: &'a Cell<bool>,
+    /// An identifier with a schema that is written only when the next token
+    /// shows whether it names a function, followed by `(`, or a column.
+    name_before_call: Option<String>,
+}
+
+impl<W: std::fmt::Write> TokenStream for SchemaFunctionCallWriter<'_, W> {
+    type Error = std::fmt::Error;
+
+    fn append(&mut self, ty: TokenType, value: Option<&str>) -> std::fmt::Result {
+        if let Some(name) = self.name_before_call.take() {
+            match ty {
+                TokenType::TK_LP => {
+                    let (schema, function) =
+                        turso_pg_parser::translator::split_function_name(&name);
+                    let schema = schema.expect("only names with a schema are held");
+                    self.tokens
+                        .append(TokenType::TK_ID, Some(&quote_identifier(schema)))?;
+                    self.tokens.append(TokenType::TK_DOT, None)?;
+                    self.tokens
+                        .append(TokenType::TK_ID, Some(&quote_identifier(function)))?;
+                    self.no_space_before_next_token.set(true);
+                }
+                _ => self.write_identifier(&name)?,
+            }
+        }
+        if let (TokenType::TK_ID, Some(identifier)) = (ty, value) {
+            let name = ast::Name::from_string(identifier);
+            if turso_pg_parser::translator::split_function_name(name.as_str())
+                .0
+                .is_some()
+            {
+                self.name_before_call = Some(name.as_str().to_string());
+                return Ok(());
+            }
+        }
+        self.tokens.append(ty, value)
+    }
+}
+
+impl<W: std::fmt::Write> SchemaFunctionCallWriter<'_, W> {
+    /// Writes the identifier that the expression may end with.
+    fn finish(&mut self) -> std::fmt::Result {
+        match self.name_before_call.take() {
+            Some(name) => self.write_identifier(&name),
+            None => Ok(()),
+        }
+    }
+
+    fn write_identifier(&mut self, name: &str) -> std::fmt::Result {
+        self.tokens.append(
+            TokenType::TK_ID,
+            Some(&ast::Name::exact(name.to_string()).as_ident()),
+        )
+    }
+}
+
+/// Writes `sql`, but skips the space that comes right after `skip_space`
+/// is set.
+struct SpaceSkippingWriter<'a> {
+    sql: &'a mut String,
+    skip_space: &'a Cell<bool>,
+}
+
+impl std::fmt::Write for SpaceSkippingWriter<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if !(self.skip_space.replace(false) && text == " ") {
+            self.sql.push_str(text);
+        }
+        Ok(())
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
