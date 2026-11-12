@@ -194,10 +194,14 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        // random() is a native function (see functions.rs) because it returns
-        // a double, not SQLite's integer. Skipping the builtin lets that one
-        // be found.
-        if name.eq_ignore_ascii_case("random") {
+        // random(), json_object() and jsonb_object() are native functions
+        // (see functions.rs): random() returns a double, not SQLite's integer,
+        // and the other two read arrays of keys and values instead of a list
+        // of arguments. Skipping the builtin lets those be found.
+        if ["random", "json_object", "jsonb_object"]
+            .iter()
+            .any(|native| name.eq_ignore_ascii_case(native))
+        {
             return Ok(None);
         }
         turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
