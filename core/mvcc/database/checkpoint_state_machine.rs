@@ -1021,6 +1021,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     #[cfg(test)]
+    pub(crate) fn snapshot_ts_for_test(&self) -> u64 {
+        self.snapshot_ts
+    }
+
+    #[cfg(test)]
     pub(crate) fn last_collected_table_key_for_test(&self) -> Option<&RowID> {
         self.collect_table_cursor.last_visited.as_ref()
     }
