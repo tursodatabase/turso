@@ -539,6 +539,7 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
     use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
 
     #[test]
@@ -546,7 +547,9 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =
             Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE scan_target(first, second)")
             .unwrap();
 

@@ -43,6 +43,7 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::borrow::Cow;
 
+use crate::security::roles::SessionRole;
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -2030,7 +2031,7 @@ impl Connection {
                 None,
                 dialect,
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
             return Ok((io, conn));
         }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
@@ -2060,7 +2061,7 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -5467,6 +5468,7 @@ impl SymbolTable {
 mod tests {
     use super::*;
     use crate::attach::AttachDatabaseState;
+    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::EngineDialect;
     use crate::IOResult;
@@ -5483,7 +5485,8 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap()
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
@@ -5556,8 +5559,12 @@ mod tests {
             Database::open_file(io, ":memory:sync-synced", Arc::new(EngineDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
-        let draft = draft_db.connect(ConnectOpts::new()).unwrap();
-        let synced = synced_db.connect(ConnectOpts::new()).unwrap();
+        let draft = draft_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let synced = synced_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         for conn in [&draft, &synced] {
             assert_eq!(conn.get_database_canonical_path(), "");
@@ -5584,13 +5591,17 @@ mod tests {
 
         let first_db =
             Database::open_file(io.clone(), ":memory:reopen", Arc::new(EngineDialect)).unwrap();
-        let first = first_db.connect(ConnectOpts::new()).unwrap();
+        let first = first_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
         let second_db = Database::open_file(io, ":memory:reopen", Arc::new(EngineDialect)).unwrap();
-        let second = second_db.connect(ConnectOpts::new()).unwrap();
+        let second = second_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
 
@@ -5687,7 +5698,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap()))
             .unwrap();
@@ -5970,7 +5983,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.with_schema_mut(|schema| {
             schema.dialect_schema = Some(Arc::new(()));
         })

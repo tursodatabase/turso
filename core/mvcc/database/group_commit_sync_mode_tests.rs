@@ -1,4 +1,5 @@
 use crate::io::{File, FileId, FileSyncType};
+use crate::security::roles::SessionRole;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::{
     Buffer, Clock, Completion, ConnectOpts, Database, EngineDialect, MemoryIO, MonotonicInstant,
@@ -25,7 +26,9 @@ fn prepare_group_commit(
 ) -> (Arc<Database>, Arc<SyncCountingIo>, [Statement; 2]) {
     let io = Arc::new(SyncCountingIo::default());
     let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
-    let leader = db.connect(ConnectOpts::new()).unwrap();
+    let leader = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     leader.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     leader
         .execute("CREATE TABLE t(pk INTEGER PRIMARY KEY)")
@@ -33,7 +36,9 @@ fn prepare_group_commit(
     leader
         .execute("PRAGMA mvcc_checkpoint_threshold = -1")
         .unwrap();
-    let waiter = db.connect(ConnectOpts::new()).unwrap();
+    let waiter = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     leader.set_sync_mode(leader_sync);
     waiter.set_sync_mode(SyncMode::Full);
     for (conn, pk) in [(&leader, 1), (&waiter, 2)] {

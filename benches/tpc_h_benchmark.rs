@@ -9,7 +9,7 @@ use codspeed_criterion_compat::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode,
 };
 
-use turso_core::{ConnectOpts, Database, PlatformIO};
+use turso_core::{ConnectOpts, Database, PlatformIO, SessionRole};
 
 const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
@@ -39,7 +39,9 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, TPC_H_PATH, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
+    let limbo_conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     let queries = [
         tpc_query!(1),

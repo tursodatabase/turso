@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::common::TempDatabase;
-use turso_core::{Connection, Value};
+use turso_core::{Connection, SessionRole, Value};
 
 /// The class rows as `(oid, relname, relnamespace, relkind, relowner)`,
 /// ordered by oid.
@@ -286,7 +286,9 @@ fn a_database_with_relations_but_no_catalog_is_refused() {
     let path = path.to_str().unwrap();
     {
         let db = open_without_catalog(path);
-        let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.create_namespace("app").unwrap();
         conn.prepare("CREATE TABLE app.t (x int)")
             .unwrap()
@@ -493,7 +495,9 @@ fn write_catalog_without_relpolicies(path: &str) {
 /// table `app.t`, written by hand.
 fn write_old_catalog(path: &str, last_column: &str) {
     let db = open_without_catalog(path);
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.create_namespace("app").unwrap();
     let app = conn.qualifier("app").unwrap().target.id.as_u32();
     let (relacl_column, relacl_value) = match last_column {
@@ -546,7 +550,9 @@ fn a_catalog_made_before_relacl_gets_the_column_when_opened() {
     )
     .unwrap();
     let pg = turso_pg::Connection::connect(&db).unwrap();
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     assert_eq!(stored_relacl(&conn, "t"), None);
     assert_eq!(relacl(&pg, "t"), None);
 

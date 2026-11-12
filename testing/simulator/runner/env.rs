@@ -30,6 +30,7 @@ use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
+use turso_core::SessionRole;
 
 /// Pre-create attached DB files with MVCC journal mode so that journal modes
 /// are compatible when ATTACH happens later during simulation.
@@ -45,7 +46,7 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
-            .connect(ConnectOpts::new())
+            .connect(ConnectOpts::new(SessionRole::Superuser))
             .expect("Failed to connect to aux DB for MVCC setup");
         aux_conn
             .execute("PRAGMA journal_mode = 'mvcc'")
@@ -1723,7 +1724,7 @@ impl SimulatorEnv {
         // Re-enable MVCC mode if the profile says to use MVCC
         if self.profile.mvcc {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(SessionRole::Superuser))
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1958,7 +1959,7 @@ impl SimulatorEnv {
         // Switch to MVCC mode if the profile says to use MVCC
         if profile.mvcc {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(SessionRole::Superuser))
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -2011,7 +2012,7 @@ impl SimulatorEnv {
                     .db
                     .as_ref()
                     .expect("db to be Some")
-                    .connect(ConnectOpts::new())
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
                     .expect("Failed to connect to Limbo database");
                 if self.opts.cache_size != DEFAULT_CACHE_SIZE {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
