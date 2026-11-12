@@ -477,9 +477,10 @@ fn prepare_statement_inner(
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
-    if let ast::Stmt::CreateFunction(function) = translated.cmd.stmt() {
-        validate_function_body(pg_conn, function)?;
-    }
+    let created_function = match translated.cmd.stmt() {
+        ast::Stmt::CreateFunction(function) => Some(function.clone()),
+        _ => None,
+    };
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
@@ -497,6 +498,12 @@ fn prepare_statement_inner(
         // Preparing CREATE TYPE refuses a taken type name, which PostgreSQL
         // reports before bad enum labels.
         check_enum_labels(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?;
+        // Preparing CREATE FUNCTION refuses a schema that does not exist, a
+        // function that exists and another return type, which PostgreSQL
+        // reports before it checks the body.
+        if let Some(function) = &created_function {
+            validate_function_body(pg_conn, function)?;
+        }
         return Ok(crate::Statement::new(stmt)
             .with_result_kind(result_kind)
             .with_tx_tracking(conn, tx, role)

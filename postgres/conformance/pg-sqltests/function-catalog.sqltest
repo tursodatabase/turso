@@ -791,6 +791,33 @@ expect error {
 expect @tursopg {
 }
 
+# PostgreSQL makes the catalog checks before it checks the body.
+test function-that-exists-with-a-body-that-does-not-compile {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42723
+expect error {
+    function "one" already exists with same argument types
+}
+
+test function-in-a-schema-that-does-not-exist-with-a-body-that-does-not-compile {
+    CREATE FUNCTION nosuch.one() RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 3F000
+expect error {
+    schema "nosuch" does not exist
+}
+
+test replace-with-another-return-type-and-a-body-that-does-not-compile {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE OR REPLACE FUNCTION one() RETURNS text LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P13
+expect error {
+    cannot change return type of existing function
+}
+
 # Features that tursopg does not support
 
 # PostgreSQL creates a function that calls itself. tursopg rejects it, also
