@@ -20,9 +20,10 @@ use crate::security::roles::RoleId;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
+use crate::translate::row_security::translate_change;
 use crate::translate::schema::emit_schema_cookie;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, CatalogChange, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
@@ -590,18 +591,10 @@ pub fn translate_create_role(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
-    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
-        program,
-        resolver.schema(),
-        connection,
-        &[crate::CatalogChange::CreateRole {
-            name: role_name.to_string(),
-        }],
-    )?;
-    emit_schema_cookie(resolver, program);
-    Ok(())
+    let change = CatalogChange::CreateRole {
+        name: role_name.to_string(),
+    };
+    translate_change(change, resolver, program, connection)
 }
 
 #[cfg(test)]

@@ -755,7 +755,7 @@ fn row_security_table(
 
 /// Records `change` through the dialect, in a write transaction that bumps
 /// the schema cookie so that other connections load it.
-fn translate_change(
+pub(crate) fn translate_change(
     change: CatalogChange,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
