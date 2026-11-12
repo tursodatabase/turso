@@ -815,9 +815,15 @@ struct SpillState {
 }
 
 /// Unused byte ranges of a spill file, as sorted, non-adjacent (offset, length).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FreeExtents {
     extents: Vec<(u64, u64)>,
+}
+
+impl Default for FreeExtents {
+    fn default() -> Self {
+        Self { extents: vec![] }
+    }
 }
 
 impl FreeExtents {
@@ -6527,7 +6533,8 @@ mod hashtests {
         let mut expected: Vec<(i64, i64)> = buffered
             .iter()
             .map(|key| (*key, key + PROBE_ROWID_BASE))
-            .collect();
+            .try_collect()
+            .unwrap();
         expected.sort_unstable();
         let mut matches = run.matches.clone();
         matches.sort_unstable();
@@ -6556,7 +6563,8 @@ mod hashtests {
                 let partition_idx = ht.partition_for_keys(&[Value::from_i64(*key)]).unwrap();
                 !ht.is_partition_loaded(partition_idx)
             })
-            .collect();
+            .try_collect()
+            .unwrap();
         expected_unmatched.sort_unstable();
         let buffered = buffer_probe_rows(&mut ht, (0..KEYS).filter(|key| key % 2 == 0));
 
@@ -6568,7 +6576,8 @@ mod hashtests {
         let mut expected_matches: Vec<(i64, i64)> = buffered
             .iter()
             .map(|key| (*key, key + PROBE_ROWID_BASE))
-            .collect();
+            .try_collect()
+            .unwrap();
         expected_matches.sort_unstable();
         assert_eq!(matches, expected_matches);
         let mut unmatched = run.unmatched;
@@ -6621,7 +6630,8 @@ mod hashtests {
         matches.sort_unstable();
         let expected: Vec<(i64, i64)> = (0..HOT_ROWS)
             .map(|rowid| (rowid, HOT_KEY + PROBE_ROWID_BASE))
-            .collect();
+            .try_collect()
+            .unwrap();
         assert_eq!(matches, expected);
     }
 
@@ -6639,7 +6649,8 @@ mod hashtests {
                 let partition_idx = ht.partition_for_keys(&[Value::from_i64(*key)]).unwrap();
                 !ht.is_partition_loaded(partition_idx)
             })
-            .collect();
+            .try_collect()
+            .unwrap();
         let mut offset_after_first_pass = 0;
         let mut free_after_first_pass = FreeExtents::default();
 
@@ -6660,7 +6671,8 @@ mod hashtests {
             let mut expected_matches: Vec<(i64, i64)> = buffered
                 .iter()
                 .map(|key| (*key, key + PROBE_ROWID_BASE))
-                .collect();
+                .try_collect()
+                .unwrap();
             expected_matches.sort_unstable();
             assert_eq!(matches, expected_matches, "pass {pass}");
             assert_eq!(run.probe_rows, buffered.len(), "pass {pass}");
@@ -6671,7 +6683,8 @@ mod hashtests {
                     .iter()
                     .copied()
                     .filter(|key| key % PASSES != pass)
-                    .collect();
+                    .try_collect()
+                    .unwrap();
                 assert_eq!(unmatched, expected_unmatched, "pass {pass}");
             }
 
@@ -6715,7 +6728,8 @@ mod hashtests {
             .flat_map(|partition| partition.chunks.iter())
             .filter(|chunk| chunk.size_bytes > 0)
             .map(|chunk| (chunk.file_offset, chunk.size_bytes as u64))
-            .collect()
+            .try_collect()
+            .unwrap()
     }
 
     /// Free space of the build temp file, and what can still be read, never
@@ -6763,7 +6777,8 @@ mod hashtests {
         let mut expected: Vec<(i64, i64)> = buffered
             .iter()
             .map(|key| (*key, key + PROBE_ROWID_BASE))
-            .collect();
+            .try_collect()
+            .unwrap();
         expected.sort_unstable();
         assert_eq!(matches, expected, "every probe row matches its build row");
         let offset_after = ht.spill_state.as_ref().unwrap().next_spill_offset;
@@ -6796,7 +6811,8 @@ mod hashtests {
         matches.sort_unstable();
         let mut expected: Vec<(i64, i64)> = (0..HOT_ROWS)
             .map(|rowid| (rowid, HOT_KEY + PROBE_ROWID_BASE))
-            .collect();
+            .try_collect()
+            .unwrap();
         expected.extend(
             buffered
                 .iter()
@@ -6854,8 +6870,13 @@ mod hashtests {
         let mut ht = make_partitioned_ht(16 * 1024, false, (0..2_000).map(|k| (k, k)));
         let entries: Vec<HashEntry> = (0..ENTRIES as i64)
             .map(|rowid| HashEntry::new(rowid as u64, vec![Value::from_i64(rowid)], rowid))
-            .collect();
-        let sizes: Vec<u64> = entries.iter().map(|e| chunk_entry_size(e) as u64).collect();
+            .try_collect()
+            .unwrap();
+        let sizes: Vec<u64> = entries
+            .iter()
+            .map(|e| chunk_entry_size(e) as u64)
+            .try_collect()
+            .unwrap();
 
         // Leave a gap in the file for the free extents: 5 entries and a spare byte,
         // then exactly the next 7 entries.
@@ -6903,7 +6924,8 @@ mod hashtests {
         let layout: Vec<(usize, usize)> = chunks
             .iter()
             .map(|c| (c.num_entries, c.size_bytes))
-            .collect();
+            .try_collect()
+            .unwrap();
         assert_eq!(
             layout,
             vec![
@@ -6948,6 +6970,6 @@ mod hashtests {
                 rowids.push(entry.rowid);
             }
         }
-        assert_eq!(rowids, (0..ENTRIES as i64).collect::<Vec<_>>());
+        assert_eq!(rowids, (0..ENTRIES as i64).try_collect::<Vec<_>>().unwrap());
     }
 }
