@@ -68,6 +68,8 @@ fn row_security_statements_reject_a_materialized_view() {
             roles: vec![ast::Grantee::Public],
             using_expr: None,
             check_expr: None,
+            using_sql: None,
+            check_sql: None,
         })),
     ];
 
