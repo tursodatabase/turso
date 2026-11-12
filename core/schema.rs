@@ -1208,6 +1208,9 @@ pub struct Sequence {
     pub cycle: bool,
 }
 
+/// Sequences grouped by namespace, each by normalized name.
+pub type SequencesByNamespace = std::vec::Vec<(NamespaceId, HashMap<String, Arc<Sequence>>)>;
+
 impl Sequence {
     pub fn new(
         name: String,
@@ -2067,14 +2070,21 @@ impl Schema {
         &self.namespace(namespace).sequences
     }
 
-    /// Replaces the sequences of the namespace with `sequences`, by
-    /// normalized name.
-    pub fn set_sequences(
-        &mut self,
-        namespace: NamespaceId,
-        sequences: HashMap<String, Arc<Sequence>>,
-    ) {
-        self.namespace_mut(namespace).sequences = sequences;
+    /// The sequences of every namespace that has any, by namespace and normalized name.
+    pub fn sequences_by_namespace(&self) -> SequencesByNamespace {
+        self.namespaces
+            .iter()
+            .filter(|(_, objects)| !objects.sequences.is_empty())
+            .map(|(namespace, objects)| (*namespace, objects.sequences.clone()))
+            .collect()
+    }
+
+    /// Replaces the sequences of each namespace in `sequences`.
+    pub fn set_sequences_by_namespace(&mut self, sequences: SequencesByNamespace) {
+        for (namespace, sequences) in sequences {
+            self.add_namespace_of_object(namespace);
+            self.namespace_mut(namespace).sequences = sequences;
+        }
     }
 
     pub fn add_sequence(&mut self, namespace: NamespaceId, sequence: Sequence) {
