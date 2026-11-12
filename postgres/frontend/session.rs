@@ -495,10 +495,25 @@ fn prepare_statement_inner(
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
     if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
-        let stmt = pg_conn
+        let stmt = match pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
-            .map_err(schema_error)?;
+            .map_err(schema_error)
+        {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                // PostgreSQL creates a function that tursopg refuses as not
+                // supported, and it checks the body. An error of the body
+                // thus comes before the refusal.
+                if let Some(function) = created_function
+                    .as_ref()
+                    .filter(|_| is_feature_not_supported(&error))
+                {
+                    validate_function_body(pg_conn, function)?;
+                }
+                return Err(error);
+            }
+        };
         // Preparing CREATE TYPE refuses a taken type name, which PostgreSQL
         // reports before bad enum labels.
         check_enum_labels(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?;
@@ -582,6 +597,10 @@ fn validate_function_body(
         ));
     }
     Ok(())
+}
+
+fn is_feature_not_supported(error: &LimboError) -> bool {
+    matches!(error, LimboError::Dialect(error) if error.code == SQLSTATE_FEATURE_NOT_SUPPORTED)
 }
 
 /// The numbers of the parameters that the query `sql` uses.

@@ -884,6 +884,34 @@ expect error {
     cannot change return type of existing function
 }
 
+# PostgreSQL has the type point, so it creates the function and checks the
+# body. tursopg refuses the type, but an error of the body comes first, as
+# in PostgreSQL.
+test function-with-a-type-that-is-not-supported-and-a-body-that-does-not-compile {
+    CREATE FUNCTION far(point) RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such table: nosuch
+}
+
+test function-with-a-type-that-is-not-supported-when-check-function-bodies-is-off {
+    SET check_function_bodies = off;
+    CREATE FUNCTION far(point) RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'far';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of type point is not supported
+}
+
 # Features that tursopg does not support
 
 # PostgreSQL stores a function before it checks the body, so the check finds
