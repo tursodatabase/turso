@@ -1352,6 +1352,18 @@ fn is_domain(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if type_def.is_domain)
 }
 
+/// The type's name with each domain replaced by its base type: `boolean[]`
+/// for an array of a domain over boolean.
+pub(crate) fn name_without_domains(ty: ExprType, schema: &Schema) -> String {
+    match ty {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => ExprType::array(without_domain(*element, schema), dimensions).to_string(),
+        scalar => without_domain(scalar, schema).to_string(),
+    }
+}
+
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it reads as. Other types are
 /// returned unchanged.

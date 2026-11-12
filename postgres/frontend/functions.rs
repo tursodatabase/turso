@@ -44,6 +44,19 @@ macro_rules! scalar_functions {
 }
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
+    let options = register_scalar_functions(options);
+    options.extension_function(
+        pg_scalar_function(
+            "array_to_json",
+            FunctionArity::OneOf(&[1, 2]),
+            true,
+            |_, args| exec_array_to_json(args),
+        )
+        .receiving_argument_types(),
+    )
+}
+
+fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
@@ -190,6 +203,18 @@ struct Timestamptz(String);
 
 impl ScalarReturn for Timestamptz {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `json` value in its text form. Returning one gives the function the type
+/// `json`, as in PostgreSQL, instead of text.
+struct Json(String);
+
+impl ScalarReturn for Json {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("json"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -658,6 +683,181 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     let mut stripped = String::with_capacity(json.len());
     copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
     Ok(Some(stripped))
+}
+
+/// `array_to_json(array [, pretty])`: the array as a JSON array, with line
+/// feeds between its elements when `pretty` is true. After the arguments come
+/// their type names, such as `boolean[]`, because an element's stored value
+/// doesn't tell its type: a boolean is stored as 1, and a bytea like a nested
+/// array, as a blob.
+fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
+    let (args, types) = args.split_at(args.len() / 2);
+    let array = args[0].get_value();
+    let pretty = match args.get(1).map(Register::get_value) {
+        None => false,
+        Some(Value::Null) => return Ok(None),
+        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
+    };
+    if matches!(array, Value::Null) {
+        return Ok(None);
+    }
+    let array_type = types[0].get_value().to_string();
+    let element_type = array_type.trim_end_matches("[]");
+    let dimensions = (array_type.len() - element_type.len()) / 2;
+    let element = JsonElement::of_type(element_type);
+    let mut json = String::new();
+    write_json_array(
+        array,
+        &JsonArrayLayout {
+            element,
+            dimensions,
+            separator: if pretty { ",\n " } else { "," },
+        },
+        &mut json,
+    )?;
+    Ok(Some(Json(json)))
+}
+
+struct JsonArrayLayout {
+    element: JsonElement,
+    /// The number of array levels, or 0 when the argument's type doesn't say.
+    dimensions: usize,
+    separator: &'static str,
+}
+
+/// How an array element is written as JSON, which depends on its type.
+#[derive(Clone, Copy)]
+enum JsonElement {
+    /// `true` or `false`.
+    Boolean,
+    /// A JSON number, or a JSON string for Infinity and -Infinity.
+    Number,
+    /// The value as it is, since it is already JSON.
+    Json,
+    /// `"\\x0102"`: the bytes in hex, as a string.
+    Bytea,
+    /// A JSON string with a `T` between the date and the time.
+    Timestamp,
+    /// Like Timestamp, followed by the UTC offset `+00:00`.
+    Timestamptz,
+    /// The value's text, as a JSON string.
+    Text,
+    /// The argument's type doesn't say: numbers are written as numbers, text as
+    /// strings and a blob as a nested array.
+    Unknown,
+}
+
+impl JsonElement {
+    fn of_type(name: &str) -> Self {
+        match name {
+            "boolean" => Self::Boolean,
+            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
+            "json" | "jsonb" => Self::Json,
+            // A cast to bytea is a cast to blob, so a blob is a bytea.
+            "bytea" | "blob" => Self::Bytea,
+            "timestamp" => Self::Timestamp,
+            "timestamptz" => Self::Timestamptz,
+            "anyarray" | "any" | "unknown" | "null" => Self::Unknown,
+            _ => Self::Text,
+        }
+    }
+}
+
+fn write_json_array(array: &Value, layout: &JsonArrayLayout, json: &mut String) -> Result<()> {
+    write_json_array_level(array, layout, layout.separator, 1, json)
+}
+
+fn write_json_array_level(
+    array: &Value,
+    layout: &JsonArrayLayout,
+    separator: &str,
+    level: usize,
+    json: &mut String,
+) -> Result<()> {
+    let elements = turso_core::array_values_from_any(array)
+        .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
+    json.push('[');
+    for (i, element) in elements.iter().enumerate() {
+        if i > 0 {
+            json.push_str(separator);
+        }
+        let inner_level = level < layout.dimensions
+            || (matches!(element, Value::Blob(_)) && !matches!(layout.element, JsonElement::Bytea));
+        match element {
+            Value::Null => json.push_str("null"),
+            // Only the outermost level gets line feeds, as in PostgreSQL.
+            _ if inner_level => write_json_array_level(element, layout, ",", level + 1, json)?,
+            _ => write_json_element(element, layout.element, json),
+        }
+    }
+    json.push(']');
+    Ok(())
+}
+
+fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
+    match (kind, element) {
+        (JsonElement::Boolean, Value::Numeric(Numeric::Integer(0))) => json.push_str("false"),
+        (JsonElement::Boolean, Value::Numeric(_)) => json.push_str("true"),
+        (JsonElement::Json, Value::Text(text)) => json.push_str(text.as_str()),
+        (JsonElement::Timestamp, Value::Text(text)) => {
+            write_json_string(&text.as_str().replacen(' ', "T", 1), json)
+        }
+        (JsonElement::Timestamptz, Value::Text(text)) => write_json_string(
+            &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
+            json,
+        ),
+        (JsonElement::Text, Value::Numeric(number)) => {
+            write_json_string(&Value::Numeric(*number).to_string(), json)
+        }
+        (_, Value::Numeric(Numeric::Integer(number))) => json.push_str(&number.to_string()),
+        (_, Value::Numeric(Numeric::Float(number))) => {
+            let text = float8_text(f64::from(*number));
+            if number.is_finite() {
+                json.push_str(&text);
+            } else {
+                // JSON has no infinity, so PostgreSQL writes it as a string.
+                write_json_string(&text, json);
+            }
+        }
+        (_, Value::Text(text)) => write_json_string(text.as_str(), json),
+        (_, Value::Blob(bytes)) => {
+            write_json_string(&format!("\\x{}", hex::encode(bytes.as_slice())), json)
+        }
+        (_, Value::Null) => json.push_str("null"),
+    }
+}
+
+fn write_json_string(text: &str, json: &mut String) {
+    json.push_str(&serde_json::to_string(text).expect("a string serializes"));
+}
+
+/// A float8 in PostgreSQL's text form: the shortest digits that read back as
+/// the same number, in scientific notation when the exponent is below -4 or
+/// 15 or more, as in `1e+20` and `1e-05`.
+fn float8_text(value: f64) -> String {
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("scientific notation has an exponent");
+    let exponent: i32 = exponent.parse().expect("the exponent is a number");
+    if (-4..15).contains(&exponent) {
+        format!("{value}")
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
 }
 
 /// The nesting limit of the walk below, the same as core's jsonb parser. Past
@@ -1750,5 +1950,44 @@ mod tests {
             role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
             "postgres"
         );
+    }
+
+    #[test]
+    fn array_to_json_writes_infinite_floats_as_strings() {
+        let record = turso_core::types::ImmutableRecord::from_values(
+            &[
+                Value::from_f64(f64::INFINITY),
+                Value::from_f64(f64::NEG_INFINITY),
+                Value::from_f64(1.5),
+            ],
+            3,
+        )
+        .unwrap();
+        let layout = JsonArrayLayout {
+            element: JsonElement::Number,
+            dimensions: 1,
+            separator: ",",
+        };
+        let mut json = String::new();
+        write_json_array(&Value::Blob(record.as_blob().clone()), &layout, &mut json).unwrap();
+        assert_eq!(json, r#"["Infinity","-Infinity",1.5]"#);
+    }
+
+    #[test]
+    fn float8_text_is_postgres_float8_output() {
+        for (value, text) in [
+            (1.0, "1"),
+            (-0.0, "-0"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e-4, "0.0001"),
+            (1.5e-5, "1.5e-05"),
+            (123456789012345.0, "123456789012345"),
+            (1e15, "1e+15"),
+            (1e20, "1e+20"),
+            (-1.25e300, "-1.25e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+        ] {
+            assert_eq!(float8_text(value), text, "{value:e}");
+        }
     }
 }
