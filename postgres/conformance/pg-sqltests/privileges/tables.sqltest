@@ -206,6 +206,42 @@ expect error {
     permission denied for table gs_closed_count
 }
 
+test copy-to-needs-select {
+    CREATE ROLE ta_copier;
+    CREATE TABLE ta_copied (id INT);
+    INSERT INTO ta_copied VALUES (1);
+    SET ROLE ta_copier;
+    COPY ta_copied TO STDOUT;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ta_copied
+}
+
+test copy-to-with-select {
+    CREATE ROLE ta_copy_reader;
+    CREATE TABLE ta_copy_read (id INT);
+    INSERT INTO ta_copy_read VALUES (1), (2);
+    GRANT SELECT ON ta_copy_read TO ta_copy_reader;
+    SET ROLE ta_copy_reader;
+    COPY ta_copy_read TO STDOUT;
+}
+expect unordered {
+    1
+    2
+}
+
+test explain-needs-select {
+    CREATE ROLE ta_explainer;
+    CREATE TABLE ta_explained (id INT);
+    SET ROLE ta_explainer;
+    EXPLAIN SELECT id FROM ta_explained;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ta_explained
+}
+
 # What the write privileges let a role do. As in PostgreSQL, a write that
 # reads the table's columns, in WHERE, SET, RETURNING or ON CONFLICT, also
 # needs SELECT.
@@ -591,6 +627,110 @@ test delete-with-a-subquery-that-reads-the-table-needs-select {
 @sqlstate 42501
 expect error {
     permission denied for table gw_delete_correlated_docs
+}
+
+test grant-update-to-public-lets-every-role-update {
+    CREATE ROLE ta_public_updater;
+    CREATE TABLE ta_public_updated (id INT);
+    INSERT INTO ta_public_updated VALUES (1);
+    GRANT UPDATE ON ta_public_updated TO PUBLIC;
+    SET ROLE ta_public_updater;
+    UPDATE ta_public_updated SET id = 2;
+    RESET ROLE;
+    SELECT id FROM ta_public_updated;
+}
+expect {
+    2
+}
+
+test grant-delete-to-public-lets-every-role-delete {
+    CREATE ROLE ta_public_deleter;
+    CREATE TABLE ta_public_deleted (id INT);
+    INSERT INTO ta_public_deleted VALUES (1);
+    GRANT DELETE ON ta_public_deleted TO PUBLIC;
+    SET ROLE ta_public_deleter;
+    DELETE FROM ta_public_deleted;
+    RESET ROLE;
+    SELECT count(*) FROM ta_public_deleted;
+}
+expect {
+    0
+}
+
+test grant-truncate-to-public-lets-every-role-truncate {
+    CREATE ROLE ta_public_truncater;
+    CREATE TABLE ta_public_truncated (id INT);
+    INSERT INTO ta_public_truncated VALUES (1);
+    GRANT TRUNCATE ON ta_public_truncated TO PUBLIC;
+    SET ROLE ta_public_truncater;
+    TRUNCATE ta_public_truncated;
+    RESET ROLE;
+    SELECT count(*) FROM ta_public_truncated;
+}
+expect {
+    0
+}
+
+# A table that a write reads in FROM or in a SELECT needs SELECT, like
+# any table a query reads.
+test update-from-another-table-needs-select-on-it {
+    CREATE ROLE ta_from_updater;
+    CREATE TABLE ta_from_updated (id INT, n INT);
+    CREATE TABLE ta_from_source (id INT);
+    GRANT SELECT, UPDATE ON ta_from_updated TO ta_from_updater;
+    SET ROLE ta_from_updater;
+    UPDATE ta_from_updated SET n = 1 FROM ta_from_source WHERE ta_from_source.id = ta_from_updated.id;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ta_from_source
+}
+
+test update-from-another-table-with-select-on-it {
+    CREATE ROLE ta_from_reader;
+    CREATE TABLE ta_from_read_updated (id INT, n INT);
+    CREATE TABLE ta_from_read_source (id INT);
+    INSERT INTO ta_from_read_updated VALUES (1, 0), (2, 0);
+    INSERT INTO ta_from_read_source VALUES (2);
+    GRANT SELECT, UPDATE ON ta_from_read_updated TO ta_from_reader;
+    GRANT SELECT ON ta_from_read_source TO ta_from_reader;
+    SET ROLE ta_from_reader;
+    UPDATE ta_from_read_updated SET n = 1 FROM ta_from_read_source WHERE ta_from_read_source.id = ta_from_read_updated.id;
+    SELECT id, n FROM ta_from_read_updated ORDER BY id;
+}
+expect {
+    1|0
+    2|1
+}
+
+test insert-select-from-another-table-needs-select-on-it {
+    CREATE ROLE ta_select_inserter;
+    CREATE TABLE ta_select_inserted (id INT);
+    CREATE TABLE ta_select_source (id INT);
+    GRANT INSERT ON ta_select_inserted TO ta_select_inserter;
+    SET ROLE ta_select_inserter;
+    INSERT INTO ta_select_inserted SELECT id FROM ta_select_source;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ta_select_source
+}
+
+test insert-select-from-another-table-with-select-on-it {
+    CREATE ROLE ta_select_reader;
+    CREATE TABLE ta_select_read_inserted (id INT);
+    CREATE TABLE ta_select_read_source (id INT);
+    INSERT INTO ta_select_read_source VALUES (1), (2);
+    GRANT INSERT ON ta_select_read_inserted TO ta_select_reader;
+    GRANT SELECT ON ta_select_read_source TO ta_select_reader;
+    SET ROLE ta_select_reader;
+    INSERT INTO ta_select_read_inserted SELECT id FROM ta_select_read_source;
+    RESET ROLE;
+    SELECT id FROM ta_select_read_inserted ORDER BY id;
+}
+expect {
+    1
+    2
 }
 
 test insert-with-a-subquery-in-returning-that-does-not-read-the-table-needs-no-select {
