@@ -378,10 +378,10 @@ pub(crate) fn qualify_sequence_argument(
     resolver: &Resolver,
 ) -> Option<Box<[Box<ast::Expr>]>> {
     let seq_name_raw = extract_string_literal(args.first()?).ok()?;
-    if seq_name_raw.contains('.') {
+    let (None, bare_name) = crate::util::split_sequence_name(&seq_name_raw) else {
         return None;
-    }
-    let name = normalize_ident(&seq_name_raw);
+    };
+    let name = normalize_ident(&bare_name);
     let (namespace, name) = match resolver.sequence_of_mangled_name(&name) {
         Some(sequence) => sequence,
         None => (resolver.find_existing_sequence(&name)?, name),

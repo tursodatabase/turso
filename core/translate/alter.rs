@@ -850,19 +850,13 @@ pub fn translate_alter_table(
         );
     }
     match alter_table {
-        ast::AlterTableBody::EnableRowSecurity => {
+        ast::AlterTableBody::EnableRowSecurity
+        | ast::AlterTableBody::DisableRowSecurity
+        | ast::AlterTableBody::ForceRowSecurity
+        | ast::AlterTableBody::NoForceRowSecurity => {
             return row_security::translate_set_row_security(
                 &qualified_name,
-                true,
-                resolver,
-                program,
-                connection,
-            );
-        }
-        ast::AlterTableBody::DisableRowSecurity => {
-            return row_security::translate_set_row_security(
-                &qualified_name,
-                false,
+                &alter_table,
                 resolver,
                 program,
                 connection,
@@ -935,7 +929,9 @@ pub fn translate_alter_table(
     match alter_table {
         ast::AlterTableBody::OwnerTo { .. }
         | ast::AlterTableBody::EnableRowSecurity
-        | ast::AlterTableBody::DisableRowSecurity => {
+        | ast::AlterTableBody::DisableRowSecurity
+        | ast::AlterTableBody::ForceRowSecurity
+        | ast::AlterTableBody::NoForceRowSecurity => {
             unreachable!(
                 "OWNER TO and row-level security are translated before the table is resolved"
             )
@@ -2691,7 +2687,9 @@ fn reject_alter_of_view(
         // These are translated before this check runs.
         ast::AlterTableBody::OwnerTo { .. }
         | ast::AlterTableBody::EnableRowSecurity
-        | ast::AlterTableBody::DisableRowSecurity => Ok(()),
+        | ast::AlterTableBody::DisableRowSecurity
+        | ast::AlterTableBody::ForceRowSecurity
+        | ast::AlterTableBody::NoForceRowSecurity => Ok(()),
     }
 }
 

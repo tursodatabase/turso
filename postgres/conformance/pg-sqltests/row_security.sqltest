@@ -1,5 +1,7 @@
-# ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY through the PostgreSQL
-# frontend. pg_class.relrowsecurity shows which tables have it.
+# ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY and FORCE/NO FORCE ROW
+# LEVEL SECURITY through the PostgreSQL frontend. pg_class.relrowsecurity
+# shows which tables have row-level security, and relforcerowsecurity which
+# apply it to their owner too.
 
 @database :memory:
 
@@ -137,4 +139,173 @@ test enable-on-a-view-is-rejected {
 }
 expect error {
     "rls_view" is not a table
+}
+
+test new-table-does-not-force-row-security {
+    CREATE TABLE rls_force_new (id INT);
+    SELECT relforcerowsecurity FROM pg_class WHERE relname = 'rls_force_new';
+}
+expect {
+    f
+}
+
+test force-row-security-shows-in-pg-class {
+    CREATE TABLE rls_force (id INT);
+    ALTER TABLE rls_force FORCE ROW LEVEL SECURITY;
+    SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'rls_force';
+}
+expect {
+    f|t
+}
+
+test no-force-row-security-hides-it-from-pg-class {
+    CREATE TABLE rls_no_force (id INT);
+    ALTER TABLE rls_no_force ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_no_force FORCE ROW LEVEL SECURITY;
+    ALTER TABLE rls_no_force NO FORCE ROW LEVEL SECURITY;
+    SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'rls_no_force';
+}
+expect {
+    t|f
+}
+
+test disable-row-security-keeps-force {
+    CREATE TABLE rls_disable_forced (id INT);
+    ALTER TABLE rls_disable_forced ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_disable_forced FORCE ROW LEVEL SECURITY;
+    ALTER TABLE rls_disable_forced DISABLE ROW LEVEL SECURITY;
+    SELECT relrowsecurity, relforcerowsecurity FROM pg_class
+        WHERE relname = 'rls_disable_forced';
+}
+expect {
+    f|t
+}
+
+test renamed-table-keeps-force-row-security {
+    CREATE TABLE rls_force_before (id INT);
+    ALTER TABLE rls_force_before FORCE ROW LEVEL SECURITY;
+    ALTER TABLE rls_force_before RENAME TO rls_force_after;
+    SELECT relforcerowsecurity FROM pg_class WHERE relname = 'rls_force_after';
+}
+expect {
+    t
+}
+
+test rolled-back-force-leaves-row-security-unforced {
+    CREATE TABLE rls_force_rollback (id INT);
+    BEGIN;
+    ALTER TABLE rls_force_rollback FORCE ROW LEVEL SECURITY;
+    ROLLBACK;
+    SELECT relforcerowsecurity FROM pg_class WHERE relname = 'rls_force_rollback';
+}
+expect {
+    f
+}
+
+# Without policies, row-level security hides every row from the roles it
+# applies to. FORCE makes it apply to the table's owner too.
+
+test owner-reads-every-row-without-force {
+    CREATE ROLE rls_owner_unforced;
+    CREATE TABLE rls_unforced_rows (id INT);
+    INSERT INTO rls_unforced_rows VALUES (1), (2);
+    ALTER TABLE rls_unforced_rows ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_unforced_rows OWNER TO rls_owner_unforced;
+    SET ROLE rls_owner_unforced;
+    SELECT count(*) FROM rls_unforced_rows;
+}
+expect {
+    2
+}
+
+test force-hides-rows-from-the-owner {
+    CREATE ROLE rls_owner_forced;
+    CREATE TABLE rls_forced_rows (id INT);
+    INSERT INTO rls_forced_rows VALUES (1), (2);
+    ALTER TABLE rls_forced_rows ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_forced_rows FORCE ROW LEVEL SECURITY;
+    ALTER TABLE rls_forced_rows OWNER TO rls_owner_forced;
+    SET ROLE rls_owner_forced;
+    SELECT count(*) FROM rls_forced_rows;
+}
+expect {
+    0
+}
+
+test force-refuses-inserts-by-the-owner {
+    CREATE ROLE rls_owner_insert;
+    CREATE TABLE rls_forced_insert (id INT);
+    ALTER TABLE rls_forced_insert ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_forced_insert FORCE ROW LEVEL SECURITY;
+    ALTER TABLE rls_forced_insert OWNER TO rls_owner_insert;
+    SET ROLE rls_owner_insert;
+    INSERT INTO rls_forced_insert VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy for table "rls_forced_insert"
+}
+
+test force-without-enable-leaves-the-owner-every-row {
+    CREATE ROLE rls_owner_force_only;
+    CREATE TABLE rls_force_only_rows (id INT);
+    INSERT INTO rls_force_only_rows VALUES (1), (2);
+    ALTER TABLE rls_force_only_rows FORCE ROW LEVEL SECURITY;
+    ALTER TABLE rls_force_only_rows OWNER TO rls_owner_force_only;
+    SET ROLE rls_owner_force_only;
+    SELECT count(*) FROM rls_force_only_rows;
+}
+expect {
+    2
+}
+
+test force-does-not-limit-a-superuser {
+    CREATE TABLE rls_forced_superuser (id INT);
+    INSERT INTO rls_forced_superuser VALUES (1), (2);
+    ALTER TABLE rls_forced_superuser ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_forced_superuser FORCE ROW LEVEL SECURITY;
+    SELECT count(*) FROM rls_forced_superuser;
+}
+expect {
+    2
+}
+
+test owner-forces-row-security-of-its-table {
+    CREATE ROLE rls_owner_forcing;
+    CREATE TABLE rls_forced_by_owner (id INT);
+    ALTER TABLE rls_forced_by_owner OWNER TO rls_owner_forcing;
+    SET ROLE rls_owner_forcing;
+    ALTER TABLE rls_forced_by_owner FORCE ROW LEVEL SECURITY;
+    RESET ROLE;
+    SELECT relforcerowsecurity FROM pg_class WHERE relname = 'rls_forced_by_owner';
+}
+expect {
+    t
+}
+
+test force-row-security-by-a-role-that-is-not-the-owner-fails {
+    CREATE ROLE rls_not_owner;
+    CREATE TABLE rls_force_not_theirs (id INT);
+    SET ROLE rls_not_owner;
+    ALTER TABLE rls_force_not_theirs FORCE ROW LEVEL SECURITY;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table rls_force_not_theirs
+}
+
+test force-applies-the-policies-to-the-owner {
+    CREATE ROLE rls_owner_with_policy;
+    CREATE TABLE rls_forced_policy (id INT);
+    INSERT INTO rls_forced_policy VALUES (1), (2), (3);
+    ALTER TABLE rls_forced_policy ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_forced_policy FORCE ROW LEVEL SECURITY;
+    CREATE POLICY small_ids ON rls_forced_policy USING (id < 3);
+    ALTER TABLE rls_forced_policy OWNER TO rls_owner_with_policy;
+    SET ROLE rls_owner_with_policy;
+    SELECT id FROM rls_forced_policy ORDER BY id;
+}
+expect {
+    1
+    2
 }

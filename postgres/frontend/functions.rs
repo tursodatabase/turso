@@ -46,6 +46,12 @@ macro_rules! scalar_functions {
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
+        "regclass"(FunctionArity::Exact(1), false) => {
+            crate::regclass::regclass_oid(connection, args[0].get_value())?
+        },
+        "regnamespace"(FunctionArity::Exact(1), false) => {
+            crate::regclass::regnamespace_oid(connection, args[0].get_value())?
+        },
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
@@ -73,8 +79,8 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
-        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
-            .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
+        "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2, 3]), false) => oid_arg(args, 0)?
+            .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid, int_arg(args, 1, 0))),
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
         "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
@@ -606,10 +612,10 @@ fn exec_pg_is_visible(_oid: i64) -> Boolean {
     Boolean(true)
 }
 
-/// PostgreSQL version advertised by version(). The major version matches the
-/// server_version startup parameter pgwire's DefaultServerParameterProvider
-/// sends, so the two claims agree.
-const SERVER_VERSION: &str = "16.6";
+/// The PostgreSQL version that tursopg claims to be, in version() and in the
+/// server_version startup parameter. Clients such as pg_dump choose their
+/// catalog queries by it.
+pub const SERVER_VERSION: &str = "18.0";
 
 /// Clients sometimes gate connection setup on this string: knex and TypeORM regex
 /// parse it as `^PostgreSQL ([\d.]+)`, so it must lead with a numeric version.
@@ -985,7 +991,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
 }
 
 /// The name of a type as `format_type` prints it.
-fn format_type(type_oid: i64, typemod: i64) -> String {
+pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),

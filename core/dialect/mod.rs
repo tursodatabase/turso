@@ -64,8 +64,10 @@ pub enum RelationChange {
         name: String,
         owner: NewOwner,
     },
-    /// `GRANT privileges ON relation TO grantees`.
+    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
+    /// relation FROM grantees` when `is_grant` is false.
     Grant {
+        is_grant: bool,
         namespace: NamespaceId,
         name: String,
         privileges: Vec<Privilege>,
@@ -77,6 +79,13 @@ pub enum RelationChange {
         namespace: NamespaceId,
         name: String,
         enabled: bool,
+    },
+    /// `ALTER TABLE ... FORCE ROW LEVEL SECURITY`, or `NO FORCE` when
+    /// `forced` is false.
+    SetForceRowSecurity {
+        namespace: NamespaceId,
+        name: String,
+        forced: bool,
     },
     /// `CREATE POLICY` on table `name`. Its expressions refer to the
     /// table's columns by their unqualified names.
@@ -394,10 +403,14 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
                 }
-                RelationChange::Grant { .. } => {
-                    return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                RelationChange::Grant { is_grant, .. } => {
+                    let command = if *is_grant { "GRANT" } else { "REVOKE" };
+                    return Err(LimboError::ParseError(format!(
+                        "{command} is not supported"
+                    )));
                 }
                 RelationChange::SetRowSecurity { .. }
+                | RelationChange::SetForceRowSecurity { .. }
                 | RelationChange::CreatePolicy { .. }
                 | RelationChange::DropPolicy { .. } => {
                     return Err(LimboError::ParseError(
@@ -463,6 +476,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// Whether table `name` of `namespace` has row-level security enabled.
     /// A dialect without row-level security never has it enabled.
     fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        let _ = (schema, namespace, name);
+        false
+    }
+
+    /// Whether the row-level security of table `name` of `namespace`
+    /// applies to the table's owner too, as `FORCE ROW LEVEL SECURITY` sets.
+    fn table_rls_forced(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
         let _ = (schema, namespace, name);
         false
     }

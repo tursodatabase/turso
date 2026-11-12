@@ -81,3 +81,40 @@ expect error {
 expect @tursopg error {
     this CACHE value in CREATE SEQUENCE is not supported
 }
+
+# The sequence argument of nextval, currval and setval is a name, which may be
+# qualified with a schema and double-quoted.
+test sequence-functions-take-quoted-names {
+    CREATE SEQUENCE "sequence 0" INCREMENT 2 MINVALUE 5 MAXVALUE 500 START 7 CYCLE;
+    SELECT nextval('"sequence 0"'), currval('"sequence 0"');
+    SELECT setval('"sequence 0"', 9, false), nextval('"sequence 0"');
+}
+expect {
+    7|7
+    9|9
+}
+
+test sequence-functions-take-names-with-dots-and-quotes {
+    CREATE SEQUENCE "seq.with ""quotes""";
+    SELECT nextval('"seq.with ""quotes"""'), nextval('public."seq.with ""quotes"""');
+}
+expect {
+    1|2
+}
+
+test sequence-functions-take-schema-qualified-quoted-names {
+    CREATE SCHEMA "Seq Schema";
+    CREATE SEQUENCE "Seq Schema".items_seq START 3;
+    SELECT nextval('"Seq Schema".items_seq'), currval('"Seq Schema"."items_seq"');
+}
+expect {
+    3|3
+}
+
+test sequence-functions-fold-unquoted-names {
+    CREATE SEQUENCE folded_seq;
+    SELECT nextval('FOLDED_SEQ');
+}
+expect {
+    1
+}

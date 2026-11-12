@@ -23,6 +23,7 @@ pub enum Feature {
     Grants,
     Revokes,
     DefaultPrivileges,
+    Sequences,
 }
 
 #[derive(Clone, Debug)]
@@ -31,15 +32,7 @@ pub(super) struct Config {
     pub disabled: Vec<Feature>,
 }
 
-const DISABLED_BY_DEFAULT: [Feature; 7] = [
-    Feature::Defaults,
-    Feature::MixedCaseIdentifiers,
-    Feature::DescendingIndexes,
-    Feature::Rls,
-    Feature::Policies,
-    Feature::Grants,
-    Feature::DefaultPrivileges,
-];
+const DISABLED_BY_DEFAULT: [Feature; 2] = [Feature::Policies, Feature::DefaultPrivileges];
 
 pub fn disabled_features(enable: &[Feature], disable: &[Feature]) -> Result<Vec<Feature>> {
     let mut enabled = enable.to_vec();

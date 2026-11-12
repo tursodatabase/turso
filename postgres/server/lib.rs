@@ -15,7 +15,10 @@ use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::ParseResult;
 
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::{
+    finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
+    DefaultServerParameterProvider, StartupHandler,
+};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{
     send_execution_response, send_query_response, send_ready_for_query, ExtendedQueryHandler,
@@ -28,7 +31,7 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireServerHandlers, Type,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
@@ -38,7 +41,7 @@ use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -160,7 +163,34 @@ impl PgWireServerHandlers for TursoPgFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(TursoPgStartupHandler)
+    }
+}
+
+/// Accepts every client without authentication, as pgwire's `NoopHandler`
+/// does, but reports tursopg's own server version.
+struct TursoPgStartupHandler;
+
+#[async_trait]
+impl StartupHandler for TursoPgStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let PgWireFrontendMessage::Startup(ref startup) = message {
+            protocol_negotiation(client, startup).await?;
+            save_startup_parameters_to_metadata(client, startup);
+            let mut parameters = DefaultServerParameterProvider::default();
+            parameters.server_version = turso_pg::SERVER_VERSION.to_string();
+            finish_authentication(client, &parameters).await?;
+        }
+        Ok(())
     }
 }
 

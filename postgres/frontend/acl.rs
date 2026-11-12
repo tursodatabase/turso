@@ -245,6 +245,18 @@ impl Acl {
         }
     }
 
+    /// Takes `revoked` out of the entry that `grantor` gave `grantee`, and
+    /// removes the entry when it has no privileges left, as PostgreSQL's
+    /// `merge_acl_with_grant` does.
+    pub(crate) fn revoke(&mut self, grantee: i64, revoked: Privileges, grantor: i64) {
+        for item in &mut self.items {
+            if item.grantee == grantee && item.grantor == grantor {
+                item.privileges -= revoked;
+            }
+        }
+        self.items.retain(|item| !item.privileges.is_empty());
+    }
+
     /// Whether the list gives `role`, by oid or through `PUBLIC`, every
     /// privilege of `wanted`.
     pub(crate) fn grants(&self, role: i64, wanted: Privileges) -> bool {

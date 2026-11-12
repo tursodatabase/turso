@@ -953,6 +953,24 @@ expect {
     idx_items_price|CREATE UNIQUE INDEX idx_items_price ON items USING btree (price)
 }
 
+test pg-get-indexdef-of-one-column {
+    CREATE TABLE idx_cols (a int, b text, c int);
+    CREATE INDEX idx_cols_b_c ON idx_cols (b, c DESC);
+    SELECT substr(pg_get_indexdef(oid, 0, true), 1, 25),
+           pg_get_indexdef(oid, 1, true), pg_get_indexdef(oid, 2, true)
+    FROM pg_class WHERE relname = 'idx_cols_b_c';
+}
+expect {
+    CREATE INDEX idx_cols_b_c|b|c
+}
+
+test pg-database-has-datlocale {
+    SELECT count(datlocale) FROM pg_database WHERE datname = current_database();
+}
+expect {
+    0
+}
+
 test pg-attrdef-default-columns {
     CREATE TABLE defaults_test (id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed',
                                score INTEGER DEFAULT 0);
@@ -962,6 +980,38 @@ test pg-attrdef-default-columns {
 expect {
     2
     3
+}
+
+test pg-get-expr-constant-defaults {
+    CREATE TABLE constant_defaults (
+        int_positive INTEGER DEFAULT 5,
+        int_negative INTEGER DEFAULT -2048,
+        int_min INTEGER DEFAULT -2147483648,
+        bigint_small BIGINT DEFAULT -5,
+        bigint_positive BIGINT DEFAULT 5000000000,
+        bigint_negative BIGINT DEFAULT -5000000000,
+        numeric_integer NUMERIC DEFAULT 99999999999999999999,
+        numeric_positive NUMERIC DEFAULT 1.50,
+        numeric_negative NUMERIC DEFAULT -1.5,
+        flag_true BOOLEAN DEFAULT true,
+        flag_false BOOLEAN DEFAULT false);
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 'constant_defaults' ORDER BY d.adnum;
+}
+expect {
+    int_positive|5
+    int_negative|'-2048'::integer
+    int_min|'-2147483648'::integer
+    bigint_small|'-5'::integer
+    bigint_positive|'5000000000'::bigint
+    bigint_negative|'-5000000000'::bigint
+    numeric_integer|'99999999999999999999'::numeric
+    numeric_positive|1.50
+    numeric_negative|'-1.5'::numeric
+    flag_true|true
+    flag_false|false
 }
 
 test pg-attribute-created-table-columns {
@@ -1208,6 +1258,137 @@ test pg-sequence-metadata-matches-pg-class {
 expect {
     ascending_seq|bigint|7|3|100|1|1|t
     descending_seq|bigint|-5|-2|-1|-99|1|f
+}
+
+# pg_dump of PostgreSQL 18 reads each sequence's value with
+# pg_get_sequence_data. The tests pass the oid from pg_class, as pg_dump
+# does.
+test pg-get-sequence-data-of-an-unused-sequence {
+    CREATE SEQUENCE sd_unused START 5;
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_unused';
+}
+expect {
+    5|f
+}
+
+test pg-get-sequence-data-after-nextval {
+    CREATE SEQUENCE sd_used START 5 INCREMENT 3;
+    SELECT nextval('sd_used');
+    SELECT nextval('sd_used');
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_used';
+}
+expect {
+    5
+    8
+    8|t
+}
+
+test pg-get-sequence-data-of-a-descending-sequence {
+    CREATE SEQUENCE sd_descending INCREMENT -2;
+    SELECT nextval('sd_descending');
+    SELECT nextval('sd_descending');
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_descending';
+}
+expect {
+    -1
+    -3
+    -3|t
+}
+
+test pg-get-sequence-data-after-setval {
+    CREATE SEQUENCE sd_set;
+    SELECT setval('sd_set', 42, false);
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_set';
+}
+expect {
+    42
+    42|f
+}
+
+test pg-get-sequence-data-of-a-table-is-null {
+    CREATE TABLE sd_table (id int);
+    SELECT coalesce(d.last_value::text, 'null'), coalesce(d.is_called::text, 'null')
+    FROM pg_class c, pg_get_sequence_data(c.oid) d WHERE c.relname = 'sd_table';
+}
+expect {
+    null|null
+}
+
+test pg-get-sequence-data-without-privileges-is-null {
+    CREATE ROLE sd_stranger;
+    CREATE SEQUENCE sd_private;
+    SET ROLE sd_stranger;
+    SELECT coalesce(d.last_value::text, 'null'), coalesce(d.is_called::text, 'null')
+    FROM pg_class c, pg_get_sequence_data(c.oid) d WHERE c.relname = 'sd_private';
+}
+expect {
+    null|null
+}
+
+test pg-get-sequence-data-in-the-pg-dump-query {
+    CREATE SEQUENCE sd_dumped START 10;
+    SELECT nextval('sd_dumped');
+    SELECT c.relname, s.seqstart, d.last_value, d.is_called
+    FROM pg_catalog.pg_sequence s, pg_get_sequence_data(s.seqrelid) d,
+         pg_catalog.pg_class c
+    WHERE c.oid = s.seqrelid AND c.relname = 'sd_dumped';
+}
+expect {
+    10
+    sd_dumped|10|10|t
+}
+
+# As in PostgreSQL 18, every NOT NULL column has a NOT NULL constraint,
+# primary key columns included. pg_dump 18 reads them.
+test pg-constraint-lists-not-null-constraints {
+    CREATE TABLE nn_items (id int PRIMARY KEY, label text NOT NULL, note text);
+    SELECT conname, contype, conkey, connoinherit, conislocal, convalidated
+    FROM pg_constraint
+    WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'nn_items') AND contype = 'n'
+    ORDER BY conname;
+}
+expect {
+    nn_items_id_not_null|n|{1}|f|t|t
+    nn_items_label_not_null|n|{2}|f|t|t
+}
+
+test pg-constraint-shortens-long-not-null-names {
+    CREATE TABLE nn_a_table_with_a_name_long_enough_to_be_shortened (
+        a_column_with_a_name_long_enough_to_be_shortened_too int NOT NULL);
+    SELECT conname FROM pg_constraint WHERE contype = 'n' AND conrelid = (
+        SELECT oid FROM pg_class
+        WHERE relname = 'nn_a_table_with_a_name_long_enough_to_be_shortened');
+}
+expect {
+    nn_a_table_with_a_name_long_a_column_with_a_name_long__not_null
+}
+
+test pg-get-constraintdef-of-a-not-null-constraint {
+    CREATE TABLE nn_def ("Mixed Name" int NOT NULL);
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'nn_def_Mixed Name_not_null';
+}
+expect {
+    NOT NULL "Mixed Name"
+}
+
+test pg-constraint-conkey-is-an-array {
+    CREATE TABLE ck_pair (a int, b int, c int, PRIMARY KEY (b, c));
+    SELECT conname, conkey FROM pg_constraint
+    WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ck_pair') ORDER BY conname;
+    SELECT a.attname FROM pg_attribute a, pg_constraint c
+    WHERE c.conname = 'ck_pair_pkey' AND a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+    ORDER BY a.attname;
+}
+expect {
+    ck_pair_b_not_null|{2}
+    ck_pair_c_not_null|{3}
+    ck_pair_pkey|{2,3}
+    b
+    c
 }
 
 test pg-sequence-reflects-drop {
@@ -1629,4 +1810,178 @@ test constraint-oids-are-not-relation-oids {
 }
 expect {
     0
+}
+
+# regclass and regnamespace turn a name into an oid. The tests compare oids
+# rather than print a regclass, which PostgreSQL shows as a name.
+test regclass-of-system-catalogs {
+    SELECT 'pg_class'::regclass::oid, 'pg_catalog.pg_proc'::regclass::oid,
+           'pg_extension'::regclass::oid, 'PG_CONSTRAINT'::regclass::oid;
+}
+expect {
+    1259|1255|3079|2606
+}
+
+test regclass-of-user-relations {
+    CREATE SCHEMA rc_schema;
+    CREATE TABLE rc_items (id serial);
+    CREATE TABLE "RC Mixed" (id int);
+    CREATE TABLE rc_schema.inner_items (id int);
+    CREATE SEQUENCE rc_seq;
+    SELECT relname FROM pg_class
+    WHERE oid IN ('rc_items'::regclass, 'public.rc_items'::regclass, '"RC Mixed"'::regclass,
+                  'rc_schema.inner_items'::regclass, 'rc_seq'::regclass)
+    ORDER BY relname;
+}
+expect {
+    RC Mixed
+    inner_items
+    rc_items
+    rc_seq
+}
+
+test regclass-keeps-an-oid {
+    CREATE TABLE rc_by_oid (id int);
+    SELECT relname FROM pg_class WHERE oid = (SELECT oid FROM pg_class WHERE relname = 'rc_by_oid')::regclass;
+}
+expect {
+    rc_by_oid
+}
+
+test regclass-of-a-missing-relation-fails {
+    SELECT 'rc_missing'::regclass;
+}
+@sqlstate 42P01
+expect error {
+    relation "rc_missing" does not exist
+}
+
+test regnamespace-of-schemas {
+    CREATE SCHEMA rn_schema;
+    SELECT 'pg_catalog'::regnamespace::oid, 'public'::regnamespace::oid;
+    SELECT nspname FROM pg_namespace WHERE oid = 'rn_schema'::regnamespace;
+}
+expect {
+    11|2200
+    rn_schema
+}
+
+test regnamespace-of-a-missing-schema-fails {
+    SELECT 'rn_missing'::regnamespace;
+}
+@sqlstate 3F000
+expect error {
+    schema "rn_missing" does not exist
+}
+
+# pg_dump finds the table that owns a serial column's sequence this way.
+test regclass-in-the-pg-dump-sequence-owner-query {
+    CREATE TABLE rc_owner (id serial, v int);
+    SELECT c.relname, t.relname, d.refobjsubid FROM pg_class c
+    LEFT JOIN pg_depend d ON (c.relkind = 'S' AND d.classid = 'pg_class'::regclass
+        AND d.objid = c.oid AND d.objsubid = 0 AND d.refclassid = 'pg_class'::regclass
+        AND d.deptype IN ('a', 'i'))
+    LEFT JOIN pg_class t ON t.oid = d.refobjid
+    WHERE c.relname = 'rc_owner_id_seq';
+}
+expect {
+    rc_owner_id_seq|rc_owner|1
+}
+
+# A nextval default names its sequence as a regclass, qualified when the
+# search path does not find it. pg_dump empties the search path.
+test pg-get-expr-of-serial-defaults {
+    CREATE SCHEMA rd_app;
+    CREATE TABLE rd_items (id serial);
+    CREATE TABLE "rd quoted" (id serial);
+    CREATE TABLE rd_app.inner_items (id serial);
+    SELECT c.relname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname IN ('rd_items', 'rd quoted', 'inner_items') ORDER BY c.relname;
+    SELECT set_config('search_path', '', false);
+    SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_catalog.pg_attrdef d
+    JOIN pg_catalog.pg_class c ON c.oid = d.adrelid WHERE c.relname = 'rd_items';
+}
+expect {
+    inner_items|nextval('rd_app.inner_items_id_seq'::regclass)
+    rd quoted|nextval('"rd quoted_id_seq"'::regclass)
+    rd_items|nextval('rd_items_id_seq'::regclass)
+
+    nextval('public.rd_items_id_seq'::regclass)
+}
+
+test pg-get-expr-of-a-nextval-default {
+    CREATE SEQUENCE rd_shared;
+    CREATE TABLE rd_uses_shared (a int DEFAULT nextval('rd_shared'));
+    SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_class c ON c.oid = d.adrelid WHERE c.relname = 'rd_uses_shared';
+    SELECT count(*) FROM pg_depend d JOIN pg_attrdef a ON d.objid = a.oid
+    WHERE d.classid = 'pg_attrdef'::regclass AND d.refclassid = 'pg_class'::regclass
+      AND d.refobjid = 'rd_shared'::regclass AND d.deptype = 'n';
+}
+expect {
+    nextval('rd_shared'::regclass)
+    1
+}
+
+test serial-sequence-names-are-shortened-like-postgresql {
+    CREATE SEQUENCE rd_a_table_with_a_name_long_e_a_column_with_a_name_long_eno_seq;
+    CREATE TABLE rd_a_table_with_a_name_long_enough_to_shorten (
+        a_column_with_a_name_long_enough_to_shorten serial);
+    CREATE TABLE rd_another_table_with_a_long_enough_name (
+        a_column_with_a_name_long_enough_to_shorten serial);
+    SELECT relname FROM pg_class WHERE relkind = 'S' AND relname LIKE 'rd_a%' ORDER BY relname;
+}
+expect {
+    rd_a_table_with_a_name_long_e_a_column_with_a_name_long_en_seq1
+    rd_a_table_with_a_name_long_e_a_column_with_a_name_long_eno_seq
+    rd_another_table_with_a_long__a_column_with_a_name_long_eno_seq
+}
+
+# pg_dump writes column types with format_type(atttypid, atttypmod).
+test pg-attribute-type-modifiers {
+    CREATE TABLE tm_items (a varchar(20), b numeric(10,2), c numeric(5), d decimal(8,3), e int);
+    SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'tm_items') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    a|24|character varying(20)
+    b|655366|numeric(10,2)
+    c|327684|numeric(5,0)
+    d|524295|numeric(8,3)
+    e|-1|integer
+}
+
+# PostgreSQL reads a string default as a value of the column's type, and
+# pg_get_expr shows it as a constant of that type.
+test pg-get-expr-of-string-defaults {
+    CREATE TABLE sd_defaults (
+        a text DEFAULT 'hello', b varchar(20) DEFAULT 'x', d int DEFAULT '5',
+        f boolean DEFAULT 'true', g date DEFAULT '2020-01-01',
+        i uuid DEFAULT '00000000-0000-0000-0000-000000000000', j json DEFAULT '{}',
+        k bytea DEFAULT '\x00', l text DEFAULT 5, m bigint DEFAULT '7',
+        o text DEFAULT 'it''s', p text DEFAULT '', q int DEFAULT '-3',
+        r numeric(10,2) DEFAULT '2.5', s jsonb DEFAULT '[]');
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+    JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    WHERE d.adrelid = (SELECT oid FROM pg_class WHERE relname = 'sd_defaults')
+    ORDER BY d.adnum;
+}
+expect {
+    a|'hello'::text
+    b|'x'::character varying
+    d|5
+    f|true
+    g|'2020-01-01'::date
+    i|'00000000-0000-0000-0000-000000000000'::uuid
+    j|'{}'::json
+    k|'\x00'::bytea
+    l|5
+    m|'7'::bigint
+    o|'it''s'::text
+    p|''::text
+    q|'-3'::integer
+    r|2.5
+    s|'[]'::jsonb
 }

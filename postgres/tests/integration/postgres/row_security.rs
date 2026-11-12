@@ -157,22 +157,6 @@ fn role_that_does_not_own_the_table_cannot_enable_row_security() {
 }
 
 #[test]
-fn force_row_security_is_not_supported() {
-    let db = TempDatabase::builder().build();
-    let conn = db.connect_postgres();
-    conn.execute("CREATE TABLE t (x int)").unwrap();
-
-    let error = conn
-        .execute("ALTER TABLE t FORCE ROW LEVEL SECURITY")
-        .unwrap_err();
-
-    assert_eq!(
-        error.to_string(),
-        "ALTER TABLE ... FORCE ROW LEVEL SECURITY is not supported"
-    );
-}
-
-#[test]
 fn role_sees_no_rows_of_a_table_with_row_security() {
     let db = TempDatabase::builder().build();
     let conn = connect_with_documents(&db);

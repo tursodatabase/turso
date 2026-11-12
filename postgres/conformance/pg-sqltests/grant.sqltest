@@ -1,4 +1,4 @@
-# GRANT on tables through the PostgreSQL frontend.
+# GRANT and REVOKE on tables through the PostgreSQL frontend.
 # PostgreSQL roles belong to the whole server, not to one database, so every
 # test uses its own role names.
 #
@@ -1456,4 +1456,187 @@ test grant-on-an-engine-table-is-not-supported {
 @sqlstate 0A000
 expect error {
     GRANT on internal table __turso_internal_roles is not supported
+}
+
+# REVOKE takes privileges out of the entry the owner granted. An entry left
+# with no privileges is removed from the list.
+
+test revoke-select-removes-the-entry {
+    CREATE ROLE rv_reader;
+    CREATE TABLE rv_docs (id INT);
+    GRANT SELECT ON rv_docs TO rv_reader;
+    REVOKE SELECT ON rv_docs FROM rv_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-some-privileges-keeps-the-others {
+    CREATE ROLE rv_writer;
+    CREATE TABLE rv_written (id INT);
+    GRANT SELECT, INSERT, UPDATE ON rv_written TO rv_writer;
+    REVOKE INSERT, UPDATE ON TABLE rv_written FROM rv_writer;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_written';
+}
+expect {
+    {postgres=arwdDxtm/postgres,rv_writer=r/postgres}
+}
+
+test revoke-all-from-public {
+    CREATE TABLE rv_public (id INT);
+    GRANT ALL ON rv_public TO PUBLIC;
+    REVOKE ALL PRIVILEGES ON rv_public FROM PUBLIC;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_public';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-before-any-grant-stores-the-default-list {
+    CREATE TABLE rv_untouched (id INT);
+    REVOKE SELECT ON rv_untouched FROM PUBLIC;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_untouched';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-from-the-owner {
+    CREATE TABLE rv_owner_some (id INT);
+    CREATE TABLE rv_owner_all (id INT);
+    REVOKE INSERT, DELETE ON rv_owner_some FROM postgres;
+    REVOKE ALL ON rv_owner_all FROM CURRENT_USER;
+    SELECT relname, relacl FROM pg_class
+        WHERE relname IN ('rv_owner_some', 'rv_owner_all') ORDER BY relname;
+}
+expect {
+    rv_owner_all|{}
+    rv_owner_some|{postgres=rwDxtm/postgres}
+}
+
+test revoke-on-all-tables-in-schema {
+    CREATE ROLE rv_all_tables;
+    CREATE SCHEMA rv_schema;
+    CREATE TABLE rv_schema.a (id INT);
+    CREATE TABLE rv_schema.b (id INT);
+    GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA rv_schema TO rv_all_tables;
+    REVOKE INSERT ON ALL TABLES IN SCHEMA rv_schema FROM rv_all_tables;
+    SELECT c.relname, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rv_schema' ORDER BY c.relname;
+}
+expect {
+    a|{postgres=arwdDxtm/postgres,rv_all_tables=r/postgres}
+    b|{postgres=arwdDxtm/postgres,rv_all_tables=r/postgres}
+}
+
+test revoke-on-sequence {
+    CREATE ROLE rv_seq_user;
+    CREATE SEQUENCE rv_seq;
+    GRANT ALL ON SEQUENCE rv_seq TO rv_seq_user;
+    REVOKE USAGE ON SEQUENCE rv_seq FROM rv_seq_user;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_seq';
+}
+expect {
+    {postgres=rwU/postgres,rv_seq_user=rw/postgres}
+}
+
+test revoke-cascade-and-restrict {
+    CREATE ROLE rv_cascade;
+    CREATE TABLE rv_cascade_docs (id INT);
+    GRANT SELECT, INSERT ON rv_cascade_docs TO rv_cascade;
+    REVOKE SELECT ON rv_cascade_docs FROM rv_cascade CASCADE;
+    REVOKE INSERT ON rv_cascade_docs FROM rv_cascade RESTRICT;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_cascade_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-select-stops-a-role-reading {
+    CREATE ROLE rv_former_reader;
+    CREATE TABLE rv_closed (id INT);
+    GRANT SELECT ON rv_closed TO rv_former_reader;
+    REVOKE SELECT ON rv_closed FROM rv_former_reader;
+    SET ROLE rv_former_reader;
+    SELECT id FROM rv_closed;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_closed
+}
+
+test revoke-from-public-keeps-a-direct-grant {
+    CREATE ROLE rv_direct;
+    CREATE TABLE rv_both (id INT);
+    INSERT INTO rv_both VALUES (1);
+    GRANT SELECT ON rv_both TO PUBLIC, rv_direct;
+    REVOKE SELECT ON rv_both FROM PUBLIC;
+    SET ROLE rv_direct;
+    SELECT id FROM rv_both;
+}
+expect {
+    1
+}
+
+test revoke-from-missing-role-fails {
+    CREATE TABLE rv_missing_role (id INT);
+    REVOKE SELECT ON rv_missing_role FROM rv_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "rv_no_such_role" does not exist
+}
+
+test revoke-on-missing-table-fails {
+    REVOKE SELECT ON rv_no_such_table FROM PUBLIC;
+}
+@sqlstate 42P01
+expect error {
+    relation "rv_no_such_table" does not exist
+}
+
+test revoke-by-a-role-without-privileges-fails {
+    CREATE ROLE rv_stranger;
+    CREATE TABLE rv_not_theirs (id INT);
+    SET ROLE rv_stranger;
+    REVOKE SELECT ON rv_not_theirs FROM PUBLIC;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_not_theirs
+}
+
+# PostgreSQL warns that no privileges could be revoked and changes nothing.
+test revoke-by-a-role-without-grant-option-changes-nothing {
+    CREATE ROLE rv_no_option;
+    CREATE TABLE rv_readable (id INT);
+    GRANT SELECT ON rv_readable TO PUBLIC;
+    SET ROLE rv_no_option;
+    REVOKE SELECT ON rv_readable FROM PUBLIC;
+    SET ROLE postgres;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_readable';
+}
+expect {
+    {postgres=arwdDxtm/postgres,=r/postgres}
+}
+
+@skip-if postgres "PostgreSQL supports grant options"
+test revoke-grant-option-for-is-not-supported {
+    CREATE ROLE rv_option;
+    CREATE TABLE rv_option_docs (id INT);
+    REVOKE GRANT OPTION FOR SELECT ON rv_option_docs FROM rv_option;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE GRANT OPTION FOR is not supported
+}
+
+test revoke-insert-on-sequence-stores-nothing {
+    CREATE SEQUENCE rv_seq_insert;
+    REVOKE INSERT ON rv_seq_insert FROM PUBLIC;
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'rv_seq_insert';
+}
+expect {
+    null
 }

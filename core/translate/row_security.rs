@@ -356,7 +356,8 @@ fn policy(
 /// Whether row-level security limits the rows of table `table_name` of
 /// `namespace` in `schema` that `role` may access for `command`, and the
 /// policies that then decide. As in PostgreSQL's `check_enable_rls`,
-/// row-level security does not limit superusers or the table's owner.
+/// row-level security does not limit superusers, nor the table's owner
+/// unless the table forces it.
 fn policy_for(
     dialect: &dyn Dialect,
     roles: &RoleCatalog,
@@ -369,7 +370,8 @@ fn policy_for(
     let table_name = normalize_ident(table_name);
     if roles.is_superuser(role)
         || !dialect.table_rls_enabled(schema, namespace, &table_name)
-        || dialect.relation_owner(schema, namespace, &table_name) == Some(role)
+        || (dialect.relation_owner(schema, namespace, &table_name) == Some(role)
+            && !dialect.table_rls_forced(schema, namespace, &table_name))
     {
         return Policy::Allow;
     }
@@ -566,29 +568,45 @@ fn no_rows() -> ast::Expr {
     ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))
 }
 
-/// ALTER TABLE ... ENABLE ROW LEVEL SECURITY, or DISABLE when `enabled` is
-/// false. The dialect records it with the table, so it follows the table
-/// when the table is renamed and goes away when the table is dropped.
+/// ALTER TABLE ... ENABLE, DISABLE, FORCE or NO FORCE ROW LEVEL SECURITY,
+/// as `body` says. The dialect records it with the table, so it follows the
+/// table when the table is renamed and goes away when the table is dropped.
 /// [`crate::translate::roles::check_statement_privileges`] lets the table's
 /// owner and superusers run it.
 pub(crate) fn translate_set_row_security(
     qualified_name: &ast::QualifiedName,
-    enabled: bool,
+    body: &ast::AlterTableBody,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let (namespace, table) = row_security_table(qualified_name, resolver)?;
-    translate_change(
-        RelationChange::SetRowSecurity {
-            namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            enabled,
+    let namespace = namespace.id;
+    let name = normalize_ident(&table.declared_name);
+    let change = match body {
+        ast::AlterTableBody::EnableRowSecurity => RelationChange::SetRowSecurity {
+            namespace,
+            name,
+            enabled: true,
         },
-        resolver,
-        program,
-        connection,
-    )
+        ast::AlterTableBody::DisableRowSecurity => RelationChange::SetRowSecurity {
+            namespace,
+            name,
+            enabled: false,
+        },
+        ast::AlterTableBody::ForceRowSecurity => RelationChange::SetForceRowSecurity {
+            namespace,
+            name,
+            forced: true,
+        },
+        ast::AlterTableBody::NoForceRowSecurity => RelationChange::SetForceRowSecurity {
+            namespace,
+            name,
+            forced: false,
+        },
+        _ => unreachable!("the caller passes a row-level security change"),
+    };
+    translate_change(change, resolver, program, connection)
 }
 
 /// CREATE POLICY. The dialect stores the policy with the table, so it

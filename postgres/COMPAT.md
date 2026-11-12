@@ -80,6 +80,12 @@ Basics not enumerated by the official feature matrix.
 
 ## Backend
 
+tursopg reports itself as PostgreSQL 18.0, in `version()` and in the
+`server_version` startup parameter, so clients such as pg_dump and psql send
+the catalog queries of PostgreSQL 18. As in PostgreSQL 18, every NOT NULL
+column has a NOT NULL constraint (`contype = 'n'`) in `pg_constraint`, and
+`conkey` and `confkey` are arrays such as `{1,2}`.
+
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
@@ -102,7 +108,12 @@ exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,
-`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
+`pg_get_constraintdef`, `pg_get_indexdef` (also the `(oid, column, pretty)`
+form, which gives one key column), `regclass` and `regnamespace` casts and functions (turn a relation or schema
+name into its oid; the result is an integer, so it prints as the oid rather
+than the name), `pg_get_sequence_data` (a sequence's
+stored value, NULL for a relation that is not a sequence or a role with
+neither SELECT nor USAGE on it), `pg_get_expr` (returns TursoPG's
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
@@ -422,7 +433,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT ... ON ALL TABLES IN SCHEMA` and `GRANT ... ON ALL SEQUENCES IN SCHEMA` store the privileges in each relation's `pg_class.relacl`; functions and REVOKE are not supported |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT ... ON ALL TABLES IN SCHEMA` and `GRANT ... ON ALL SEQUENCES IN SCHEMA` store the privileges in each relation's `pg_class.relacl`, and `REVOKE` with the same forms takes them away; functions are not supported |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -436,8 +447,8 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read and write the tables they own or were granted `SELECT`, `INSERT`, `UPDATE` and `DELETE` on, with SELECT also needed when a write reads the table's columns, and call `nextval` with `USAGE` or `UPDATE` and `setval` with `UPDATE` on the sequence, but not change the schema they do not own; `GRANT` of privileges on whole tables and sequences, `ALL` included, is stored in `pg_class.relacl`; `TRUNCATE` needs the `TRUNCATE` privilege, and the `REFERENCES`, `TRIGGER` and `MAINTAIN` privileges let a role do nothing yet; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
-| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; `CREATE POLICY` and `DROP POLICY` work, with permissive and restrictive `USING` policies limiting what roles read; `UPDATE` and `DELETE` change only the rows the policies of the command allow, with the `SELECT` policies too when the statement reads columns, and new rows of `INSERT` and `UPDATE` must pass `WITH CHECK`, and the `SELECT` policies with `RETURNING`, or the statement fails with 42501; `TRUNCATE` is not subject to policies, as in PostgreSQL; `INSERT ... ON CONFLICT DO UPDATE` checks the conflicting row against the `UPDATE` and `SELECT` policies and fails if it does not pass; a new row is checked after its `NOT NULL` constraints instead of before; `pg_policy` does not show policies; policies cannot use subqueries with `FROM`, and the columns they use cannot be renamed or dropped; `FORCE ROW LEVEL SECURITY` is not supported; views apply it as the view's owner, except that a superuser reading a view sees every row |
+| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read and write the tables they own or were granted `SELECT`, `INSERT`, `UPDATE` and `DELETE` on, with SELECT also needed when a write reads the table's columns, and call `nextval` with `USAGE` or `UPDATE` and `setval` with `UPDATE` on the sequence, but not change the schema they do not own; `GRANT` and `REVOKE` of privileges on whole tables and sequences, `ALL` included, change `pg_class.relacl`; `TRUNCATE` needs the `TRUNCATE` privilege, and the `REFERENCES`, `TRIGGER` and `MAINTAIN` privileges let a role do nothing yet; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; `CREATE POLICY` and `DROP POLICY` work, with permissive and restrictive `USING` policies limiting what roles read; `UPDATE` and `DELETE` change only the rows the policies of the command allow, with the `SELECT` policies too when the statement reads columns, and new rows of `INSERT` and `UPDATE` must pass `WITH CHECK`, and the `SELECT` policies with `RETURNING`, or the statement fails with 42501; `TRUNCATE` is not subject to policies, as in PostgreSQL; `INSERT ... ON CONFLICT DO UPDATE` checks the conflicting row against the `UPDATE` and `SELECT` policies and fails if it does not pass; a new row is checked after its `NOT NULL` constraints instead of before; `pg_policy` does not show policies; policies cannot use subqueries with `FROM`, and the columns they use cannot be renamed or dropped; `FORCE/NO FORCE ROW LEVEL SECURITY` works, applies the policies to the table's owner too and is shown in `pg_class.relforcerowsecurity`; views apply it as the view's owner, except that a superuser reading a view sees every row |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |

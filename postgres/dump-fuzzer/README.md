@@ -71,10 +71,9 @@ make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
 ## Feature configuration
 
 The hard-coded compatible configuration is in `src/generation/config.rs`. It disables
-`defaults`, `mixed-case-identifiers`, `descending-indexes`, `rls`, `policies`,
-`grants`, and `default-privileges` by default,
-including the dependent operations described below. Tables, data, and indexes
-remain enabled.
+`policies` and `default-privileges` by default, including the dependent
+operations described below. Tables, column defaults, data, indexes, grants,
+revokes, and row-level security remain enabled.
 
 Use `fuzz --enable-features` to opt features back in, and `--disable-features`
 for additional exclusions. Both accept comma-separated names and can be
@@ -84,9 +83,10 @@ Enabling a child also enables its required parent: `force-rls` enables `rls`,
 `alter-policy`/`drop-policy` enable `policies`, and `revokes` enables `grants`. Index subfeatures (`composite-indexes`,
 `unique-indexes`, `descending-indexes`) enable `indexes`.
 Explicitly disabling a required parent is an error.
-When opting into RLS with FORCE enabled, the reference dump role needs
-BYPASSRLS; otherwise PostgreSQL itself rejects the dump. Use
-`--disable-features force-rls` to exercise RLS without FORCE.
+With FORCE ROW LEVEL SECURITY, the reference dump role needs BYPASSRLS;
+otherwise PostgreSQL itself rejects the dump. The `postgres` superuser that
+the Docker helper uses has it. Use `--disable-features force-rls` to
+exercise RLS without FORCE.
 
 ```sh
 # Current compatible defaults: no exclusion list needed.
@@ -112,6 +112,7 @@ make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast --en
 | `grants` | Table GRANT and REVOKE |
 | `revokes` | REVOKE only; GRANT remains |
 | `default-privileges` | ALTER DEFAULT PRIVILEGES |
+| `sequences` | CREATE SEQUENCE and the nextval and setval calls that use them |
 
 Policies can be generated without RLS. Default privileges can be generated
 without table grants. Disabling a parent removes dependent statements so, for
@@ -125,40 +126,29 @@ metadata records how the original SQL was generated; it does not filter replay.
 
 ### Frontend observations
 
-Feature-isolated campaigns against PostgreSQL 18.4 and the current `tursopg`,
-with seed 42 and up to 30 cases each, found:
+Feature-isolated campaigns against PostgreSQL 18 and `tursopg` found:
 
 | Feature | Observed result |
 | --- | --- |
 | Basic tables/data | 30 cases passed |
 | Single-column indexes | 30 cases passed |
-| RLS | Turso rejects ALTER TABLE ENABLE ROW SECURITY |
+| RLS without FORCE | 100 cases passed |
+| FORCE ROW LEVEL SECURITY | 200 cases passed |
 | Policies | Turso rejects CREATE POLICY |
-| Grants | Turso rejects GRANT |
+| Grants and revokes | 200 cases passed |
 | Default privileges | Turso rejects ALTER DEFAULT PRIVILEGES |
-| Column defaults | Both engines accept the SQL; negative defaults produce different dump ASTs |
+| Column defaults | 200 cases passed |
+| Mixed-case identifiers | 200 cases passed |
+| DESC index keys | 200 cases passed |
 
-The expanded schema campaign on October 28 also found that a quoted table name
-`"Table 1"` is dumped as `"table 1"` by Turso. Replaying the same SQL with the
-lowercase name passed. The compatible profile excludes `mixed-case-identifiers`
-by default; enable it explicitly to retest this discrepancy. This changes only
-generation, not comparison or replay.
-
-The same expanded campaign found DESC index keys dumped without DESC by Turso.
-Replaying that case with ASC keys passed, including composite and unique indexes.
-The compatible profile excludes `descending-indexes` by default; use
-`--enable-features descending-indexes` to reproduce the discrepancy.
-Composite and unique indexes remain enabled. With these compatible defaults,
-100 cases at seed 42 generated 251 tables spanning all widths from 1–8 columns,
-326 indexes (199 composite and 45 unique), and 1,300 VALUES rows. Both engines
-loaded and dumped all 1,300 rows successfully.
+Column defaults, mixed-case identifiers, DESC index keys, grants, revokes,
+and row-level security failed in earlier campaigns and now pass, so the
+compatible profile enables them.
 
 Child operations were not reached independently after their parent failed.
 These observations are campaign results, not an exhaustive compatibility claim.
-Defaults are a separate comparison limitation, not unsupported SQL: PostgreSQL
-emits a string cast for a negative integer default where Turso emits a literal.
-The hard-coded compatible defaults exclude that known structural difference and
-the unsupported access-control generators. Run the remaining surface with:
+The hard-coded compatible defaults exclude the unsupported access-control
+generators. Run the remaining surface with:
 
 ```sh
 make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 1000 --seed 42 --fail-fast'
@@ -353,6 +343,7 @@ statements. The reference server is PostgreSQL 18, the version in
 | Indexes | 0–3 B-tree indexes per table; 1–3 distinct columns in varying order; ASC/DESC keys; optional UNIQUE when a primary-key column is included |
 | Grants | GRANT/REVOKE SELECT, INSERT, UPDATE, DELETE, ALL ON TABLE to/from PUBLIC |
 | Default privileges | ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT on tables to PUBLIC |
+| Sequences | 0–2 sequences per workload after the tables, with an increment of ±1 to ±3, optional MINVALUE/MAXVALUE, START and CYCLE; up to three `SELECT nextval(...)` calls and an optional `SELECT setval(...)`, which stay within the bounds |
 | Policies | CREATE POLICY for ALL/SELECT/INSERT/UPDATE/DELETE; PERMISSIVE/RESTRICTIVE; USING and WITH CHECK; ALTER/DROP POLICY |
 | RLS | ENABLE, FORCE, DISABLE ROW LEVEL SECURITY |
 | Roles/membership | Not generated: roles are cluster-wide and pg_dump does not serialize role definitions; needs an isolated cluster plus pg_dumpall coverage |
@@ -371,23 +362,25 @@ postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer --profile tabl
 Each workload has zero to four tables and zero to twelve initial rows per table.
 Data generation uses INSERT VALUES only. A table without a primary key can
 receive one additional duplicate row by repeating a generated VALUES row.
-No SELECT, UPDATE, DELETE, or INSERT SELECT statements are generated.
+No SELECT, UPDATE, DELETE, or INSERT SELECT statements are generated, apart
+from the SELECT nextval and setval calls on generated sequences.
 Unique indexes include a primary-key column, so data generation cannot violate
 their uniqueness. Integers span their Rust type
 domains; strings include Unicode and control characters. NUL is removed because
 PostgreSQL text cannot contain it. Materialized text and row counts are bounded
 to keep database creation and shrinking practical.
 
-Partial/expression indexes, checks, serial/generated columns, enums,
+Partial/expression indexes, checks, serial/generated columns, sequence data
+types other than bigint, enums,
 and views are not currently generated. Other SQL types,
 foreign keys, custom schemas, transactional migrations, and concurrent writers
 are not yet generated. PUBLIC policies exercise catalog serialization but do
 not validate role-specific authorization or policy enforcement.
 
-AST differences may still be semantically equivalent. For example, the first
-table-profile campaign found PostgreSQL emitting `DEFAULT '-1'::integer` where
-Turso emits `DEFAULT -1`. Both remain distinct ASTs for inspection; the fuzzer
-does not erase casts to make the campaign pass.
+AST differences may still be semantically equivalent. For example, an earlier
+campaign found PostgreSQL emitting `DEFAULT '-1'::integer` where Turso emitted
+`DEFAULT -1`. The fuzzer reports such differences rather than erasing casts to
+make the campaign pass.
 
 ## Failures and replay
 

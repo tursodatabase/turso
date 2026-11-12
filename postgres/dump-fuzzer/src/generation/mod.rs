@@ -3,6 +3,7 @@ mod config;
 mod data;
 pub mod model;
 mod schema;
+mod sequences;
 
 pub use config::{disabled_features, Feature, Profile};
 use hegel::{
@@ -29,6 +30,12 @@ pub fn cases(tc: TestCase, profile: Profile, disabled: Vec<Feature>) -> Workload
         let generated = schema::table(index, config.clone())
             .flat_map(|table| table_statements(table, config.clone()));
         statements.extend(tc.draw(generated));
+    }
+    if config.profile == Profile::Compatible && config.enabled(Feature::Sequences) {
+        let count = tc.draw(gs::integers::<usize>().max_value(2));
+        for index in 0..count {
+            statements.extend(tc.draw(sequences::sequence_statements(index)));
+        }
     }
     Workload(statements)
 }

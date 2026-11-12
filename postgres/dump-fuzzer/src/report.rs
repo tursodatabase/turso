@@ -127,6 +127,9 @@ pub(crate) fn render(
         "grant",
         "revoke",
         "default_privileges",
+        "create_sequence",
+        "nextval",
+        "setval",
         "set",
         "other",
     ]

@@ -256,6 +256,8 @@ impl Generated {
                     continue;
                 }
                 N::VariableSetStmt(_) => "set",
+                N::CreateSeqStmt(_) => "create_sequence",
+                N::SelectStmt(select) => select_function(&select).unwrap_or("select"),
                 _ => "other",
             };
             result.feature(feature);
@@ -452,4 +454,23 @@ fn schema_features() -> Vec<String> {
         }
     }
     names
+}
+
+/// The sequence function that a generated `SELECT nextval(...)` or
+/// `SELECT setval(...)` calls, as a feature name.
+fn select_function(select: &pg_query::protobuf::SelectStmt) -> Option<&'static str> {
+    let Some(N::ResTarget(target)) = select.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(call)) = target.val.as_ref()?.node.as_ref() else {
+        return None;
+    };
+    let Some(N::String(name)) = call.funcname.last()?.node.as_ref() else {
+        return None;
+    };
+    match name.sval.as_str() {
+        "nextval" => Some("nextval"),
+        "setval" => Some("setval"),
+        _ => None,
+    }
 }
