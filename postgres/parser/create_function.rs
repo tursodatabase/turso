@@ -774,6 +774,10 @@ pub fn display_signature_type_name(name: &str) -> String {
         "timestamp" => "timestamp without time zone",
         "timestamptz" => "timestamp with time zone",
         "varbit" => "bit varying",
+        // PostgreSQL shows a name with an uppercase letter in quotes.
+        other if other.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+            return format!("\"{other}\"{}", &name[element.len()..]);
+        }
         other => other,
     };
     format!("{display}{}", &name[element.len()..])

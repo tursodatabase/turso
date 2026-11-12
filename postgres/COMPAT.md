@@ -541,7 +541,20 @@ Notes on `CREATE FUNCTION`:
   database system requires the function. tursopg finds its built-in
   functions by their name and their number of parameters, not by the types
   of the parameters. For a built-in function that only PostgreSQL has, the
-  error is that the function does not exist.
+  error is that the function does not exist. Without a parameter list, the
+  error has the parameter types only for a function without parameters, and
+  tursopg gives this error also where PostgreSQL says that the name is not
+  unique, such as for `abs`.
+- PostgreSQL looks in `pg_catalog` before the schemas of the search path.
+  Thus `DROP FUNCTION lower(text)` names the built-in function, and
+  `DROP FUNCTION lower(integer)` names a function of the user. tursopg
+  cannot tell the two, so it rejects `DROP FUNCTION` without a schema when a
+  built-in function and a function of the user have the name and the number
+  of parameters. `DROP FUNCTION public.lower(text)` drops the function of
+  the user.
+- `DROP FUNCTION` finds a parameter type by its exact name, as PostgreSQL
+  does. tursopg stores the name of a custom type in lowercase: for a type
+  that was created as `"Mood"`, it finds `mood` and does not find `"Mood"`.
 - `pg_proc` shows a function with its `proname` and `prosrc` as in
   PostgreSQL. `pronamespace` is the oid of the schema in `pg_namespace`: the
   oid of `public` is PostgreSQL's 2200, the oid of any other schema is

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use turso_core::namespace::{mangle_name, NamespaceId};
-use turso_core::schema::Schema;
+use turso_core::schema::{RelationKind, Schema};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_dialect_schema_row_delete, emit_dialect_schema_row_insert,
@@ -41,8 +41,7 @@ use crate::classes::{
     open_class_table_for_writing, read_back_integer, FIRST_NORMAL_OBJECT_ID,
 };
 use crate::error::sqlstate_error;
-use crate::pg_type::type_exists;
-use crate::session::check_schema_exists;
+use crate::session::{check_schema_exists, relation_lookup_namespaces};
 
 /// The `type` of the `sqlite_schema` row that stores a function. The
 /// version is part of the type, so that a later format gets a type of its
@@ -201,7 +200,8 @@ impl FunctionCatalog {
                 assert!(replaced.is_some(), "a replaced function exists");
             }
             FunctionChange::Drop { oid } => {
-                self.by_oid.remove(oid);
+                let dropped = self.by_oid.remove(oid);
+                assert!(dropped.is_some(), "a dropped function exists");
             }
         }
         Ok(())
@@ -414,15 +414,11 @@ pub(crate) fn translate_drop_function(
     drop: &ast::DropFunction,
 ) -> turso_core::Result<()> {
     let functions = function_catalog(schema).ok_or_else(no_catalog)?;
-    let Some(function) = find_function_to_drop(connection, functions, drop)? else {
-        if let Some(built_in) = built_in_function_signature(drop) {
-            return Err(sqlstate_error(
-                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-                format!(
-                    "cannot drop function {built_in} because it is required by the database system"
-                ),
-            ));
-        }
+    let found = find_function_to_drop(connection, functions, drop)?;
+    if let Some(built_in) = built_in_function_signature(connection, drop) {
+        check_built_in_function_is_not_dropped(drop, &built_in, found.is_some())?;
+    }
+    let Some(function) = found else {
         if drop.if_exists {
             return Ok(());
         }
@@ -460,22 +456,90 @@ pub(crate) fn translate_drop_function(
     Ok(())
 }
 
-/// The signature of the built-in function of tursopg that `drop` names, as
-/// PostgreSQL shows it. tursopg does not know the parameter types of its
-/// built-in functions, so the function is one with the name and the number
-/// of parameters of the statement.
-fn built_in_function_signature(drop: &ast::DropFunction) -> Option<String> {
+/// Fails for a statement that names the built-in function `built_in`.
+/// PostgreSQL looks in pg_catalog before the schemas of the search path, and
+/// it does not drop a function of pg_catalog. `has_user_function` says if a
+/// schema of the search path also has a function that the statement names.
+fn check_built_in_function_is_not_dropped(
+    drop: &ast::DropFunction,
+    built_in: &str,
+    has_user_function: bool,
+) -> turso_core::Result<()> {
     let name = drop.name.name.as_str();
-    let parameter_types = drop.parameter_types.as_ref()?;
-    // The engine finds its functions without regard to case, and each of
-    // them has a name in lowercase.
-    let is_built_in = drop.name.namespace.is_none()
-        && !name.bytes().any(|byte| byte.is_ascii_uppercase())
-        && matches!(
-            turso_core::Func::resolve_function(name, parameter_types.len()),
-            Ok(Some(_))
-        );
-    is_built_in.then(|| display_signature(name, parameter_types))
+    Err(match (&drop.parameter_types, has_user_function) {
+        (_, false) => sqlstate_error(
+            SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            format!(
+                "cannot drop function {built_in} because it is required by the database system"
+            ),
+        ),
+        // PostgreSQL finds the built-in function when it has these parameter
+        // types, and the function of the user when it does not. tursopg
+        // does not know the parameter types of its built-in functions.
+        (Some(_), true) => sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "DROP FUNCTION without a schema for \"{name}\", a name that a built-in function \
+                 also has, is not supported"
+            ),
+        ),
+        (None, true) => function_name_is_not_unique(name),
+    })
+}
+
+/// The built-in function of tursopg that `drop` names, as PostgreSQL shows
+/// it. tursopg does not know the parameter types of its built-in functions.
+/// With a parameter list, the function is one with the name and the number
+/// of parameters of the statement. Without one, it is one with the name.
+fn built_in_function_signature(
+    connection: &Connection,
+    drop: &ast::DropFunction,
+) -> Option<String> {
+    let name = drop.name.name.as_str();
+    // tursopg finds its built-in functions without regard to case, and each
+    // of them has a name in lowercase.
+    if drop.name.namespace.is_some() || name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return None;
+    }
+    let argument_counts = built_in_function_argument_counts(connection, name);
+    match &drop.parameter_types {
+        Some(parameter_types) => {
+            let is_built_in = matches!(
+                turso_core::Func::resolve_function(name, parameter_types.len()),
+                Ok(Some(_))
+            ) || argument_counts
+                .iter()
+                .any(|count| *count < 0 || *count as usize == parameter_types.len());
+            is_built_in.then(|| display_signature(name, parameter_types))
+        }
+        // PostgreSQL shows the parameter types, which tursopg only knows
+        // for a function without parameters.
+        None => match argument_counts.as_slice() {
+            [] => None,
+            [0] => Some(format!("{name}()")),
+            _ => Some(name.to_string()),
+        },
+    }
+}
+
+/// The numbers of arguments that tursopg has a built-in function `name`
+/// for: a function of the engine, or a function that the frontend or an
+/// extension registered. A negative number is a function for each number of
+/// arguments.
+fn built_in_function_argument_counts(connection: &Connection, name: &str) -> Vec<i32> {
+    let of_the_engine = turso_core::Func::builtin_function_list()
+        .into_iter()
+        .filter(|function| function.name.eq_ignore_ascii_case(name))
+        .map(|function| function.narg);
+    let registered = connection
+        .get_syms_functions()
+        .into_iter()
+        .filter(|(function_name, ..)| function_name.eq_ignore_ascii_case(name))
+        .map(|(_, _, argument_count, _)| argument_count);
+    let mut argument_counts: Vec<i32> = of_the_engine.chain(registered).collect();
+    argument_counts.sort_unstable();
+    argument_counts.dedup();
+    argument_counts
 }
 
 /// The function that `drop` names. A statement with parameter types names
@@ -499,18 +563,25 @@ fn find_function_to_drop<'a>(
     };
     let Some(parameter_types) = &drop.parameter_types else {
         // The name must be the name of one function in all of the schemas
-        // that the statement looks in.
-        let mut named = namespaces
+        // that the statement looks in. A function of an earlier schema
+        // hides the functions with its parameter types of the later ones.
+        let mut visible: Vec<&SqlFunction> = Vec::new();
+        for function in namespaces
             .into_iter()
-            .flat_map(|namespace| functions.named(namespace, name));
-        let function = named.next();
-        if named.next().is_some() {
-            return Err(sqlstate_error(
-                SQLSTATE_AMBIGUOUS_FUNCTION,
-                format!("function name \"{name}\" is not unique"),
-            ));
+            .flat_map(|namespace| functions.named(namespace, name))
+        {
+            let is_hidden = visible
+                .iter()
+                .any(|earlier| earlier.parameter_types == function.parameter_types);
+            if !is_hidden {
+                visible.push(function);
+            }
         }
-        return Ok(function);
+        return match visible.as_slice() {
+            [] => Ok(None),
+            [function] => Ok(Some(function)),
+            _ => Err(function_name_is_not_unique(name)),
+        };
     };
     for parameter_type in parameter_types {
         if let Err(error) = check_type_exists(connection, parameter_type) {
@@ -538,8 +609,11 @@ fn check_type_exists(connection: &Arc<Connection>, type_name: &str) -> turso_cor
     if let Some(schema_name) = schema_name {
         check_schema_exists(connection, schema_name)?;
     }
-    if (schema_name.is_none() && (is_base_type_name(name) || is_pseudo_type_name(name)))
-        || type_exists(connection, schema_name, name)
+    if (schema_name.is_none()
+        && (is_base_type_name(name)
+            || is_pseudo_type_name(name)
+            || is_catalog_table(connection, name)))
+        || has_type_with_exact_name(connection, schema_name, name)
     {
         return Ok(());
     }
@@ -547,6 +621,47 @@ fn check_type_exists(connection: &Arc<Connection>, type_name: &str) -> turso_cor
         SQLSTATE_UNDEFINED_OBJECT,
         format!("type \"{type_name}\" does not exist"),
     ))
+}
+
+/// Whether tursopg has a catalog table `name`, such as `pg_class`.
+/// PostgreSQL has a row type for each of its catalog tables.
+fn is_catalog_table(connection: &Connection, name: &str) -> bool {
+    name.starts_with("pg_") && connection.get_syms_vtab_mods().contains(name)
+}
+
+/// Whether the schema `schema_name`, or a schema of the search path, has a
+/// type that is not built in with exactly the name `name`. PostgreSQL finds
+/// a type by its exact name: `"Mood"` is not `mood`. tursopg stores the name
+/// of a custom type in lowercase, and it knows the name of a table as its
+/// statement has it.
+fn has_type_with_exact_name(
+    connection: &Arc<Connection>,
+    schema_name: Option<&str>,
+    name: &str,
+) -> bool {
+    let is_lowercase = !name.bytes().any(|byte| byte.is_ascii_uppercase());
+    relation_lookup_namespaces(connection, schema_name)
+        .iter()
+        .any(|namespace| {
+            connection.with_schema(namespace.database_id(), |schema| {
+                let is_custom_type = is_lowercase && schema.get_type_def_unchecked(name).is_some();
+                let is_row_type = match schema.relation_kind(namespace.target.id, name) {
+                    None | Some(RelationKind::Index) => false,
+                    Some(RelationKind::Table) => schema
+                        .get_btree_table(namespace.target.id, name)
+                        .is_none_or(|table| table.declared_name == name),
+                    Some(_) => true,
+                };
+                is_custom_type || is_row_type
+            })
+        })
+}
+
+fn function_name_is_not_unique(name: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_AMBIGUOUS_FUNCTION,
+        format!("function name \"{name}\" is not unique"),
+    )
 }
 
 /// The namespace of the schema that `name` puts a function in: the schema

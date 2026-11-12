@@ -278,6 +278,20 @@ expect error {
     function name "show" is not unique
 }
 
+# A function of an earlier schema of the search path hides the functions of
+# the later schemas that have its parameter types.
+test drop-function-with-a-name-that-a-function-of-a-later-schema-also-has {
+    CREATE SCHEMA app;
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'public'$$;
+    CREATE FUNCTION app.show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'app'$$;
+    SET search_path = app, public;
+    DROP FUNCTION show;
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'show';
+}
+expect {
+    public
+}
+
 test drop-function-that-does-not-exist {
     CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
     DROP FUNCTION show(text, bigint);
@@ -375,6 +389,99 @@ expect error {
     cannot drop function lower\(text\) because it is required by the database system
 }
 
+# PostgreSQL shows the parameter types of the function. tursopg knows them
+# only for a function without parameters.
+test drop-built-in-function-without-a-parameter-list {
+    DROP FUNCTION pg_backend_pid;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop function pg_backend_pid\(\) because it is required by the database system
+}
+
+test drop-built-in-function-without-a-parameter-list-if-exists {
+    DROP FUNCTION IF EXISTS pg_backend_pid;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop function pg_backend_pid\(\) because it is required by the database system
+}
+
+# PostgreSQL has several functions abs, so the name is not unique. tursopg
+# does not know the parameter types of its built-in functions.
+test drop-built-in-function-with-parameters-without-a-parameter-list {
+    DROP FUNCTION abs;
+}
+@sqlstate 42725
+expect error {
+    function name "abs" is not unique
+}
+@sqlstate 2BP01
+expect @tursopg error {
+    cannot drop function abs because it is required by the database system
+}
+
+# PostgreSQL matches the name of a function exactly, and the built-in
+# functions have a name in lowercase.
+test drop-function-with-the-name-of-a-built-in-function-in-another-case {
+    DROP FUNCTION "Abs";
+}
+@sqlstate 42883
+expect error {
+    could not find a function named "Abs"
+}
+
+# PostgreSQL looks in pg_catalog before the schemas of the search path. It
+# finds the built-in function lower(text), which it does not drop. tursopg
+# does not know the parameter types of its built-in functions, so it cannot
+# tell if the statement names the built-in function or the function of the
+# user. It refuses the statement.
+test drop-function-with-the-signature-of-a-built-in-function {
+    CREATE FUNCTION lower(text) RETURNS text LANGUAGE sql AS $$SELECT 'x'$$;
+    DROP FUNCTION lower(text);
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop function lower\(text\) because it is required by the database system
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP FUNCTION without a schema for "lower", a name that a built-in function also has, is not supported
+}
+
+# PostgreSQL has no built-in function lower(integer), so it drops the
+# function of the user.
+test drop-function-with-the-name-of-a-built-in-function-and-other-parameter-types {
+    CREATE FUNCTION lower(integer) RETURNS text LANGUAGE sql AS $$SELECT 'x'$$;
+    DROP FUNCTION lower(integer);
+    SELECT count(*) FROM pg_proc WHERE proname = 'lower' AND oid >= 16384;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP FUNCTION without a schema for "lower", a name that a built-in function also has, is not supported
+}
+
+test drop-function-with-the-name-of-a-built-in-function-with-its-schema {
+    CREATE FUNCTION lower(text) RETURNS text LANGUAGE sql AS $$SELECT 'x'$$;
+    DROP FUNCTION public.lower(text);
+    SELECT count(*) FROM pg_proc WHERE proname = 'lower' AND oid >= 16384;
+}
+expect {
+    0
+}
+
+test drop-function-with-the-name-of-a-built-in-function-without-a-parameter-list {
+    CREATE FUNCTION lower(integer) RETURNS text LANGUAGE sql AS $$SELECT 'x'$$;
+    DROP FUNCTION lower;
+}
+@sqlstate 42725
+expect error {
+    function name "lower" is not unique
+}
+
 test drop-function-with-a-parameter-type-that-does-not-exist {
     CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
     DROP FUNCTION one(nosuch);
@@ -382,6 +489,68 @@ test drop-function-with-a-parameter-type-that-does-not-exist {
 @sqlstate 42704
 expect error {
     type "nosuch" does not exist
+}
+
+# PostgreSQL finds a type by its exact name.
+test drop-function-with-a-parameter-type-in-another-case {
+    CREATE TYPE mood AS ENUM ('a');
+    DROP FUNCTION one("Mood");
+}
+@sqlstate 42704
+expect error {
+    type "Mood" does not exist
+}
+
+test drop-function-with-the-row-type-of-a-table-in-another-case {
+    CREATE TABLE item (a integer);
+    DROP FUNCTION one("Item");
+}
+@sqlstate 42704
+expect error {
+    type "Item" does not exist
+}
+
+test drop-function-with-the-row-type-of-a-table-with-an-uppercase-letter {
+    CREATE TABLE "Item" (a integer);
+    DROP FUNCTION one(item);
+}
+@sqlstate 42704
+expect error {
+    type "item" does not exist
+}
+
+test drop-function-with-the-row-type-of-a-table-with-an-uppercase-letter-in-quotes {
+    CREATE TABLE "Item" (a integer);
+    DROP FUNCTION one("Item");
+}
+@sqlstate 42883
+expect error {
+    function one\("Item"\) does not exist
+}
+
+# tursopg stores the name of a custom type in lowercase, so it does not find
+# the type by its quoted name, and it finds the type by the name in
+# lowercase.
+test drop-function-with-a-parameter-type-that-has-an-uppercase-letter {
+    CREATE TYPE "Mood" AS ENUM ('a');
+    DROP FUNCTION one("Mood");
+}
+@sqlstate 42883
+expect error {
+    function one\("Mood"\) does not exist
+}
+@sqlstate 42704
+expect @tursopg error {
+    type "Mood" does not exist
+}
+
+# Each catalog table has a row type.
+test drop-function-with-the-row-type-of-a-catalog-table {
+    DROP FUNCTION one(pg_class);
+}
+@sqlstate 42883
+expect error {
+    function one\(pg_class\) does not exist
 }
 
 # A parameter type without a schema is a type of the search path.
