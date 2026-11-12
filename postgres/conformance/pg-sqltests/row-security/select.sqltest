@@ -944,3 +944,18 @@ expect {
     1
     3
 }
+
+test copy-to-shows-only-the-rows-the-policies-allow {
+    CREATE ROLE se_copy_alice;
+    CREATE TABLE se_copy_docs (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO se_copy_docs VALUES (1, 'se_copy_alice'), (2, 'someone else'), (3, 'se_copy_alice');
+    ALTER TABLE se_copy_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON se_copy_docs USING (owner = current_user);
+    GRANT SELECT ON se_copy_docs TO se_copy_alice;
+    SET ROLE se_copy_alice;
+    COPY se_copy_docs TO STDOUT;
+}
+expect unordered {
+    1|se_copy_alice
+    3|se_copy_alice
+}
