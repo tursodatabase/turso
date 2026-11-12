@@ -254,8 +254,8 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        if let [turso_core::CatalogChange::CreateRole { name, .. }] = changes {
-            return crate::roles::translate_create_role(program, schema, name);
+        if let [turso_core::CatalogChange::CreateRole { name, options }] = changes {
+            return crate::roles::translate_create_role(program, schema, name, options);
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
@@ -275,6 +275,10 @@ impl Dialect for PostgresDialect {
 
     fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
         schema_roles(schema).is_superuser(role)
+    }
+
+    fn role_bypass_rls(&self, schema: &Schema, role: RoleId) -> bool {
+        schema_roles(schema).bypass_rls(role)
     }
 
     fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
@@ -992,6 +996,7 @@ pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> 
         id: RoleId::SUPERUSER,
         name: BOOTSTRAP_SUPERUSER_NAME.to_string(),
         superuser: true,
+        bypassrls: true,
     };
     std::iter::once(superuser).chain(roles.iter().cloned())
 }
@@ -1049,19 +1054,19 @@ fn role_row(role: &Role) -> Vec<Value> {
     let superuser = Value::from_i64(role.superuser as i64);
     let can_login = role.id == RoleId::SUPERUSER;
     vec![
-        Value::from_i64(role_oid(role.id)),   // oid
-        Value::build_text(role.name.clone()), // rolname
-        superuser.clone(),                    // rolsuper
-        Value::from_i64(1),                   // rolinherit
-        superuser.clone(),                    // rolcreaterole
-        superuser.clone(),                    // rolcreatedb
-        Value::from_i64(can_login as i64),    // rolcanlogin
-        superuser.clone(),                    // rolreplication
-        Value::from_i64(-1),                  // rolconnlimit (-1 = no limit)
-        Value::Null,                          // rolpassword (never exposed)
-        Value::Null,                          // rolvaliduntil
-        superuser,                            // rolbypassrls
-        Value::Null,                          // rolconfig
+        Value::from_i64(role_oid(role.id)),     // oid
+        Value::build_text(role.name.clone()),   // rolname
+        superuser.clone(),                      // rolsuper
+        Value::from_i64(1),                     // rolinherit
+        superuser.clone(),                      // rolcreaterole
+        superuser.clone(),                      // rolcreatedb
+        Value::from_i64(can_login as i64),      // rolcanlogin
+        superuser,                              // rolreplication
+        Value::from_i64(-1),                    // rolconnlimit (-1 = no limit)
+        Value::Null,                            // rolpassword (never exposed)
+        Value::Null,                            // rolvaliduntil
+        Value::from_i64(role.bypassrls as i64), // rolbypassrls
+        Value::Null,                            // rolconfig
     ]
 }
 

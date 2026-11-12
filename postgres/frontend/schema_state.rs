@@ -78,8 +78,8 @@ pub(crate) fn apply_catalog_change(
     })?;
     let state_mut = Arc::make_mut(&mut state);
     let result = match change {
-        CatalogChange::CreateRole { name, .. } => {
-            Arc::make_mut(&mut state_mut.roles).apply_create_role(name, values)
+        CatalogChange::CreateRole { name, options } => {
+            Arc::make_mut(&mut state_mut.roles).apply_create_role(name, options, values)
         }
         _ => Arc::make_mut(&mut state_mut.classes).apply(change, values),
     };

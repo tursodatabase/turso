@@ -1,5 +1,5 @@
 # Which roles row-level security does not apply to, through the PostgreSQL
-# frontend: superusers and the owner of the table. A view reads its tables as
+# frontend: superusers, roles with BYPASSRLS and the owner of the table. A view reads its tables as
 # the view's owner, so a view shows its readers the rows its owner sees.
 # PostgreSQL roles belong to the whole server, so every test uses its own
 # role and table names.
@@ -250,4 +250,98 @@ test owner-writes-every-row-of-its-table-with-row-security {
 }
 expect {
     1|x
+}
+
+test bypassrls-role-reads-every-row {
+    CREATE ROLE rb_role_70 BYPASSRLS;
+    CREATE TABLE rb_docs_70 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_70 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_70 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY only_alice ON rb_docs_70 USING (owner = 'alice');
+    GRANT SELECT ON rb_docs_70 TO rb_role_70;
+    SET ROLE rb_role_70;
+    SELECT id FROM rb_docs_70 ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+test nobypassrls-role-reads-only-the-rows-of-the-policies {
+    CREATE ROLE rb_role_71 NOBYPASSRLS;
+    CREATE TABLE rb_docs_71 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_71 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_71 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY only_alice ON rb_docs_71 USING (owner = 'alice');
+    GRANT SELECT ON rb_docs_71 TO rb_role_71;
+    SET ROLE rb_role_71;
+    SELECT id FROM rb_docs_71 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test bypassrls-role-inserts-updates-and-deletes-rows-without-policies {
+    CREATE ROLE rb_role_72 BYPASSRLS;
+    CREATE TABLE rb_docs_72 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_72 VALUES (1, 'alice'), (2, 'bob');
+    ALTER TABLE rb_docs_72 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON rb_docs_72 TO rb_role_72;
+    SET ROLE rb_role_72;
+    INSERT INTO rb_docs_72 VALUES (3, 'carol');
+    UPDATE rb_docs_72 SET owner = 'x' WHERE id = 1;
+    DELETE FROM rb_docs_72 WHERE id = 2;
+    SELECT id, owner FROM rb_docs_72 ORDER BY id;
+}
+expect {
+    1|x
+    3|carol
+}
+
+test bypassrls-role-still-needs-privileges {
+    CREATE ROLE rb_role_73 BYPASSRLS;
+    CREATE TABLE rb_docs_73 (id INT PRIMARY KEY);
+    ALTER TABLE rb_docs_73 ENABLE ROW LEVEL SECURITY;
+    SET ROLE rb_role_73;
+    SELECT id FROM rb_docs_73;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rb_docs_73
+}
+
+test view-owned-by-bypassrls-role-shows-every-row {
+    CREATE ROLE rb_view_owner_74 BYPASSRLS;
+    CREATE ROLE rb_role_74;
+    CREATE TABLE rb_docs_74 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_74 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_74 ENABLE ROW LEVEL SECURITY;
+    CREATE VIEW rb_view_74 AS SELECT id FROM rb_docs_74;
+    ALTER VIEW rb_view_74 OWNER TO rb_view_owner_74;
+    GRANT SELECT ON rb_docs_74 TO rb_view_owner_74;
+    GRANT SELECT ON rb_view_74 TO rb_role_74;
+    SET ROLE rb_role_74;
+    SELECT count(*) FROM rb_view_74;
+}
+expect {
+    3
+}
+
+test bypassrls-role-reads-through-a-view-with-the-policies-of-its-owner {
+    CREATE ROLE rb_view_owner_75;
+    CREATE ROLE rb_role_75 BYPASSRLS;
+    CREATE TABLE rb_docs_75 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_75 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_75 ENABLE ROW LEVEL SECURITY;
+    CREATE VIEW rb_view_75 AS SELECT id FROM rb_docs_75;
+    ALTER VIEW rb_view_75 OWNER TO rb_view_owner_75;
+    GRANT SELECT ON rb_docs_75 TO rb_view_owner_75;
+    GRANT SELECT ON rb_view_75 TO rb_role_75;
+    SET ROLE rb_role_75;
+    SELECT count(*) FROM rb_view_75;
+}
+expect {
+    0
 }

@@ -33,6 +33,31 @@ expect {
     1
 }
 
+test create-role-with-bypassrls-bypasses-row-level-security {
+    CREATE ROLE cr_bypassrls BYPASSRLS;
+    SELECT count(*) FROM pg_roles
+    WHERE rolname = 'cr_bypassrls' AND rolbypassrls AND NOT rolsuper;
+}
+expect {
+    1
+}
+
+test create-role-with-nobypassrls-does-not-bypass-row-level-security {
+    CREATE ROLE cr_nobypassrls WITH NOBYPASSRLS;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'cr_nobypassrls' AND NOT rolbypassrls;
+}
+expect {
+    1
+}
+
+test create-role-with-bypassrls-twice-fails {
+    CREATE ROLE cr_bypassrls_twice NOBYPASSRLS BYPASSRLS;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
 test create-role-named-postgres-fails {
     CREATE ROLE postgres;
 }
@@ -140,7 +165,7 @@ test create-role-options-are-not-supported {
 }
 @sqlstate 0A000
 expect error {
-    CREATE ROLE options are not supported
+    CREATE ROLE option LOGIN is not supported
 }
 
 @skip-if postgres "PostgreSQL supports ALTER ROLE"

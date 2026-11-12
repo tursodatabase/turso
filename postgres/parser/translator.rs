@@ -6421,11 +6421,29 @@ fn translate_create_role(
             )))
         }
     }
-    if !stmt.options.is_empty() {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-            message: "CREATE ROLE options are not supported".to_string(),
-        });
+    let mut options = ast::RoleOptions::default();
+    let mut seen = std::collections::HashSet::new();
+    for option in &stmt.options {
+        let Some(pg_query::protobuf::node::Node::DefElem(elem)) = option.node.as_ref() else {
+            return Err(ParseError::ParseError(
+                "CREATE ROLE: invalid role option".to_string(),
+            ));
+        };
+        if !seen.insert(elem.defname.as_str()) {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_SYNTAX_ERROR,
+                message: "conflicting or redundant options".to_string(),
+            });
+        }
+        match elem.defname.as_str() {
+            "bypassrls" => options.bypassrls = extract_def_elem_bool(elem),
+            _ => {
+                return Err(ParseError::not_supported(format!(
+                    "CREATE ROLE option {}",
+                    role_option_keyword(elem)
+                )))
+            }
+        }
     }
     if stmt.role.starts_with("pg_") {
         return Err(ParseError::Sqlstate {
@@ -6441,8 +6459,35 @@ fn translate_create_role(
     }
     Ok(ast::Stmt::CreateRole {
         role_name: stmt.role.clone(),
-        options: ast::RoleOptions::default(),
+        options,
     })
+}
+
+/// The keyword that a CREATE ROLE option is written with, such as `NOLOGIN`
+/// for the option PostgreSQL's parser names `canlogin` with value false.
+fn role_option_keyword(elem: &pg_query::protobuf::DefElem) -> String {
+    let keyword = match elem.defname.as_str() {
+        "superuser" => "SUPERUSER",
+        "createrole" => "CREATEROLE",
+        "isreplication" => "REPLICATION",
+        "createdb" => "CREATEDB",
+        "canlogin" => "LOGIN",
+        "inherit" => "INHERIT",
+        "bypassrls" => "BYPASSRLS",
+        "password" => return "PASSWORD".to_string(),
+        "connectionlimit" => return "CONNECTION LIMIT".to_string(),
+        "validUntil" => return "VALID UNTIL".to_string(),
+        "sysid" => return "SYSID".to_string(),
+        "rolemembers" => return "ROLE".to_string(),
+        "adminmembers" => return "ADMIN".to_string(),
+        "addroleto" => return "IN ROLE".to_string(),
+        other => return other.to_uppercase(),
+    };
+    if extract_def_elem_bool(elem) {
+        keyword.to_string()
+    } else {
+        format!("NO{keyword}")
+    }
 }
 
 /// The functions that the role keywords `CURRENT_USER`, `CURRENT_ROLE`,
@@ -12134,6 +12179,49 @@ mod tests {
                 panic!("{sql}: expected SELECT");
             };
             assert!(select.with.is_some(), "{sql}: WITH clause was dropped");
+        }
+    }
+
+    #[test]
+    fn create_role_refuses_options_other_than_bypassrls() {
+        for (sql, keyword) in [
+            ("CREATE ROLE r LOGIN", "LOGIN"),
+            ("CREATE ROLE r NOLOGIN", "NOLOGIN"),
+            ("CREATE ROLE r NOINHERIT", "NOINHERIT"),
+            ("CREATE ROLE r SUPERUSER", "SUPERUSER"),
+            ("CREATE ROLE r CREATEDB", "CREATEDB"),
+            ("CREATE ROLE r CREATEROLE", "CREATEROLE"),
+            ("CREATE ROLE r REPLICATION", "REPLICATION"),
+            ("CREATE ROLE r PASSWORD 'x'", "PASSWORD"),
+            ("CREATE ROLE r CONNECTION LIMIT 1", "CONNECTION LIMIT"),
+            ("CREATE ROLE r VALID UNTIL '2030-01-01'", "VALID UNTIL"),
+            ("CREATE ROLE r IN ROLE other", "IN ROLE"),
+            ("CREATE ROLE r BYPASSRLS LOGIN", "LOGIN"),
+        ] {
+            assert_not_supported(sql, &format!("CREATE ROLE option {keyword} "));
+        }
+    }
+
+    #[test]
+    fn create_role_reads_bypassrls() {
+        for (sql, bypassrls) in [
+            ("CREATE ROLE r", false),
+            ("CREATE ROLE r BYPASSRLS", true),
+            ("CREATE ROLE r WITH BYPASSRLS", true),
+            ("CREATE ROLE r NOBYPASSRLS", false),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .unwrap();
+            assert!(
+                matches!(
+                    &translated.cmd,
+                    ast::Cmd::Stmt(ast::Stmt::CreateRole { options, .. }) if options.bypassrls == bypassrls
+                ),
+                "{sql}: {:?}",
+                translated.cmd
+            );
         }
     }
 
