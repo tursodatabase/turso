@@ -2261,10 +2261,17 @@ fn drop_schema_commands(
     }
 
     let objects = schema_objects(conn, &name);
-    if !stmt.cascade && !objects.is_empty() {
+    let has_functions = crate::sql_functions::schema_has_functions(conn, &name);
+    if !stmt.cascade && (!objects.is_empty() || has_functions) {
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
             format!("cannot drop schema \"{name}\" because other objects depend on it"),
+        ));
+    }
+    if has_functions {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "DROP SCHEMA ... CASCADE of a schema with functions is not supported",
         ));
     }
 

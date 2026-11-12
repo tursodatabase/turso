@@ -326,3 +326,33 @@ expect {
 expect @tursopg error {
     a function result of type point is not supported
 }
+
+# DROP SCHEMA
+
+test drop-schema-with-a-function {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP SCHEMA app;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop schema app because other objects depend on it
+}
+@sqlstate 2BP01
+expect @tursopg error {
+    cannot drop schema "app" because other objects depend on it
+}
+
+test drop-schema-cascade-with-a-function {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    DROP SCHEMA app CASCADE;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP SCHEMA \.\.\. CASCADE of a schema with functions is not supported
+}
