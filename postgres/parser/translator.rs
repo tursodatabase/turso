@@ -4,8 +4,8 @@
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
 use crate::coerce::{
-    bool_literal, check_unary_operand, coerce, coerce_operands, engine_cast, engine_cast_as,
-    CastContext, OperatorKind, PgType,
+    bool_literal, check_unary_operand, coerce, coerce_operands, coerce_to_boolean, engine_cast,
+    engine_cast_as, CastContext, OperatorKind, PgType,
 };
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
@@ -509,7 +509,7 @@ impl PostgreSQLTranslator {
                         }
                         ConstrType::ConstrCheck => {
                             if let Some(ref raw_expr) = constraint.raw_expr {
-                                let expr = self.translate_expr(raw_expr)?;
+                                let expr = self.translate_condition(raw_expr, "CHECK")?;
                                 table_constraints.push(ast::NamedTableConstraint {
                                     name: Some(pg_check_constraint_name(
                                         &tbl_name_str,
@@ -735,7 +735,7 @@ impl PostgreSQLTranslator {
                                 check_names,
                             )),
                             constraint: ast::ColumnConstraint::Check {
-                                expr: Box::new(self.translate_expr(raw_expr)?),
+                                expr: Box::new(self.translate_condition(raw_expr, "CHECK")?),
                                 source: None,
                             },
                         });
@@ -1406,7 +1406,7 @@ impl PostgreSQLTranslator {
         }
 
         let where_clause = if let Some(ref wc) = idx.where_clause {
-            Some(Box::new(self.translate_expr(wc)?))
+            Some(Box::new(self.translate_condition(wc, "WHERE")?))
         } else {
             None
         };
@@ -1993,7 +1993,7 @@ impl PostgreSQLTranslator {
 
         // Translate WHERE clause
         let where_clause = if let Some(where_node) = &update.where_clause {
-            Some(Box::new(self.translate_expr(where_node)?))
+            Some(Box::new(self.translate_condition(where_node, "WHERE")?))
         } else {
             None
         };
@@ -2048,7 +2048,7 @@ impl PostgreSQLTranslator {
 
         // Translate WHERE clause
         let where_clause = if let Some(where_node) = &delete.where_clause {
-            Some(Box::new(self.translate_expr(where_node)?))
+            Some(Box::new(self.translate_condition(where_node, "WHERE")?))
         } else {
             None
         };
@@ -2143,7 +2143,7 @@ impl PostgreSQLTranslator {
         let result_columns = self.translate_target_list(target_list)?;
 
         let where_clause = if let Some(where_clause) = &select.where_clause {
-            Some(self.translate_expr(where_clause)?)
+            Some(self.translate_condition(where_clause, "WHERE")?)
         } else {
             None
         };
@@ -2351,7 +2351,7 @@ impl PostgreSQLTranslator {
         let result_columns = self.translate_target_list(target_list)?;
 
         let where_clause = if let Some(where_clause) = &select.where_clause {
-            Some(self.translate_expr(where_clause)?)
+            Some(self.translate_condition(where_clause, "WHERE")?)
         } else {
             None
         };
@@ -3039,7 +3039,7 @@ impl PostgreSQLTranslator {
         // Translate join constraint (ON / USING)
         let constraint = if let Some(quals) = &join_expr.quals {
             Some(ast::JoinConstraint::On(Box::new(
-                self.translate_expr(quals)?,
+                self.translate_condition(quals, "JOIN/ON")?,
             )))
         } else if !join_expr.using_clause.is_empty() {
             let names = extract_key_columns(&join_expr.using_clause)?
@@ -3282,7 +3282,20 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("BooleanTest missing arg".into()))?;
-                let expr = self.translate_operand(arg)?;
+                let construct = match BoolTestType::try_from(bt.booltesttype) {
+                    Ok(BoolTestType::IsTrue) => "IS TRUE",
+                    Ok(BoolTestType::IsNotTrue) => "IS NOT TRUE",
+                    Ok(BoolTestType::IsFalse) => "IS FALSE",
+                    Ok(BoolTestType::IsNotFalse) => "IS NOT FALSE",
+                    Ok(BoolTestType::IsUnknown) => "IS UNKNOWN",
+                    Ok(BoolTestType::IsNotUnknown) => "IS NOT UNKNOWN",
+                    _ => {
+                        return Err(ParseError::ParseError(
+                            "BooleanTest: unsupported test type".into(),
+                        ))
+                    }
+                };
+                let expr = self.translate_condition_operand(arg, construct)?;
                 // Map IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE / IS UNKNOWN / IS NOT UNKNOWN
                 match BoolTestType::try_from(bt.booltesttype) {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
@@ -4178,7 +4191,7 @@ impl PostgreSQLTranslator {
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
-            Some(Box::new(self.translate_expr(filter)?))
+            Some(Box::new(self.translate_condition(filter, "FILTER")?))
         } else {
             None
         };
@@ -4557,7 +4570,7 @@ impl PostgreSQLTranslator {
             .collect::<Result<Vec<_>, ParseError>>()?;
 
         let having = if let Some(having_node) = having_clause {
-            Some(Box::new(self.translate_expr(having_node)?))
+            Some(Box::new(self.translate_condition(having_node, "HAVING")?))
         } else {
             None
         };
@@ -4971,7 +4984,7 @@ impl PostgreSQLTranslator {
                     "ON CONFLICT DO UPDATE",
                 )?;
                 let where_clause = if let Some(wc) = &clause.where_clause {
-                    Some(Box::new(self.translate_expr(wc)?))
+                    Some(Box::new(self.translate_condition(wc, "WHERE")?))
                 } else {
                     None
                 };
@@ -5015,7 +5028,7 @@ impl PostgreSQLTranslator {
                     .collect::<Result<_, _>>()?;
 
                 let where_clause = if let Some(wc) = &infer.where_clause {
-                    Some(Box::new(self.translate_expr(wc)?))
+                    Some(Box::new(self.translate_condition(wc, "WHERE")?))
                 } else {
                     None
                 };
@@ -5174,7 +5187,8 @@ impl PostgreSQLTranslator {
                         "NOT expression must have exactly 1 argument".to_string(),
                     ));
                 }
-                let operand = Box::new(self.translate_operand(&bool_expr.args[0])?);
+                let operand =
+                    Box::new(self.translate_condition_operand(&bool_expr.args[0], "NOT")?);
                 Ok(ast::Expr::Unary(ast::UnaryOperator::Not, operand))
             }
             BoolExprType::AndExpr => {
@@ -5184,9 +5198,9 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // Combine all arguments into a binary tree with AND
-                let mut result = self.translate_operand(&bool_expr.args[0])?;
+                let mut result = self.translate_condition_operand(&bool_expr.args[0], "AND")?;
                 for arg in &bool_expr.args[1..] {
-                    let right = self.translate_operand(arg)?;
+                    let right = self.translate_condition_operand(arg, "AND")?;
                     result =
                         ast::Expr::Binary(Box::new(result), ast::Operator::And, Box::new(right));
                 }
@@ -5199,9 +5213,9 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // Combine all arguments into a binary tree with OR
-                let mut result = self.translate_operand(&bool_expr.args[0])?;
+                let mut result = self.translate_condition_operand(&bool_expr.args[0], "OR")?;
                 for arg in &bool_expr.args[1..] {
-                    let right = self.translate_operand(arg)?;
+                    let right = self.translate_condition_operand(arg, "OR")?;
                     result =
                         ast::Expr::Binary(Box::new(result), ast::Operator::Or, Box::new(right));
                 }
@@ -5232,6 +5246,24 @@ impl PostgreSQLTranslator {
             | ast::Expr::InTable { .. } => ast::Expr::Parenthesized(vec![Box::new(expr)]),
             _ => expr,
         })
+    }
+
+    fn translate_condition(
+        &self,
+        node: &pg_query::protobuf::Node,
+        construct: &str,
+    ) -> Result<ast::Expr, ParseError> {
+        let expr = self.translate_expr(node)?;
+        self.coerce_condition(expr, node, construct)
+    }
+
+    fn translate_condition_operand(
+        &self,
+        node: &pg_query::protobuf::Node,
+        construct: &str,
+    ) -> Result<ast::Expr, ParseError> {
+        let expr = self.translate_operand(node)?;
+        self.coerce_condition(expr, node, construct)
     }
 
     fn typed_operand(
@@ -5292,6 +5324,22 @@ impl PostgreSQLTranslator {
         });
         match (result, stored) {
             (Err(_), Some(exprs)) => Ok(exprs),
+            (result, _) => result,
+        }
+    }
+
+    fn coerce_condition(
+        &self,
+        expr: ast::Expr,
+        node: &pg_query::protobuf::Node,
+        construct: &str,
+    ) -> Result<ast::Expr, ParseError> {
+        let stored = self.for_stored_sql.then(|| expr.clone());
+        let result = self
+            .known_type(self.type_of(node))
+            .and_then(|source| coerce_to_boolean(expr, source.as_ref(), construct));
+        match (result, stored) {
+            (Err(_), Some(expr)) => Ok(expr),
             (result, _) => result,
         }
     }
@@ -5560,7 +5608,7 @@ impl PostgreSQLTranslator {
                 ConstrType::ConstrNull => {}
                 ConstrType::ConstrCheck => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
-                        let check_expr = self.translate_expr(raw_expr)?;
+                        let check_expr = self.translate_condition(raw_expr, "CHECK")?;
                         let name = if constraint.conname.is_empty() {
                             None
                         } else {
@@ -13168,6 +13216,81 @@ mod tests {
                 .to_string();
             assert_eq!(stored, translated, "{sql}");
         }
+    }
+
+    #[test]
+    fn conditions_must_be_boolean() {
+        let cases = [
+            ("SELECT 1 FROM t WHERE a", "WHERE", "integer"),
+            ("SELECT 1 FROM t GROUP BY a HAVING a", "HAVING", "integer"),
+            ("SELECT 1 FROM t JOIN t AS u ON t.a", "JOIN/ON", "integer"),
+            (
+                "SELECT count(*) FILTER (WHERE a) FROM t",
+                "FILTER",
+                "integer",
+            ),
+            ("SELECT a AND d FROM t", "AND", "integer"),
+            ("SELECT d AND a FROM t", "AND", "integer"),
+            ("SELECT a OR d FROM t", "OR", "integer"),
+            ("SELECT NOT a FROM t", "NOT", "integer"),
+            ("SELECT a IS TRUE FROM t", "IS TRUE", "integer"),
+            ("SELECT a IS NOT TRUE FROM t", "IS NOT TRUE", "integer"),
+            ("SELECT a IS FALSE FROM t", "IS FALSE", "integer"),
+            ("SELECT a IS NOT FALSE FROM t", "IS NOT FALSE", "integer"),
+            ("SELECT a IS UNKNOWN FROM t", "IS UNKNOWN", "integer"),
+            (
+                "SELECT a IS NOT UNKNOWN FROM t",
+                "IS NOT UNKNOWN",
+                "integer",
+            ),
+            ("UPDATE t SET a = 1 WHERE b", "WHERE", "text"),
+            ("DELETE FROM t WHERE f", "WHERE", "double precision"),
+            ("CREATE INDEX i ON t (a) WHERE b", "WHERE", "text"),
+            ("CREATE TABLE n (x int CHECK (x))", "CHECK", "integer"),
+            ("CREATE TABLE n (x int, CHECK (x + 1))", "CHECK", "integer"),
+            (
+                "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2 WHERE a",
+                "WHERE",
+                "integer",
+            ),
+            (
+                "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) WHERE a DO NOTHING",
+                "WHERE",
+                "integer",
+            ),
+        ];
+        let translator = operand_translator();
+        for (sql, construct, ty) in cases {
+            assert_rejected(
+                &translator,
+                sql,
+                "42804",
+                &format!("argument of {construct} must be type boolean, not type {ty}"),
+            );
+            assert_stored_sql_accepts(sql);
+        }
+    }
+
+    #[test]
+    fn conditions_that_are_boolean_or_unknown_are_accepted() {
+        let translator = operand_translator();
+        for sql in [
+            "SELECT 1 FROM t WHERE d",
+            "SELECT 1 FROM t WHERE 'true'",
+            "SELECT 1 FROM t WHERE NULL",
+            "SELECT 1 FROM t WHERE a = 1 AND d",
+            "SELECT 1 FROM t WHERE d IS TRUE",
+            "CREATE TABLE n (x int CHECK (x > 0))",
+            "CREATE INDEX i ON t (a) WHERE d",
+        ] {
+            assert_cast_accepted(&translator, sql);
+        }
+        assert_rejected(
+            &translator,
+            "SELECT 1 FROM t WHERE 'maybe'",
+            "22P02",
+            "invalid input syntax for type boolean: \"maybe\"",
+        );
     }
 
     #[test]
