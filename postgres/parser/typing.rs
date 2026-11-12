@@ -345,6 +345,7 @@ pub fn type_of(node: &Node, scopes: &Scopes) -> ExprType {
             if is_one_subscript(&indirection.indirection) {
                 match &operand {
                     Some(Ok(PgType::Text)) => return Ok(PgType::Char),
+                    Some(Ok(PgType::Array(element))) => return Ok((**element).clone()),
                     _ => {}
                 }
             }
@@ -971,10 +972,16 @@ fn add_from_item(item: &Node, base: &Scopes, relations: &mut Vec<Relation>) {
                 }
             }
         },
-        Some(NodeKind::RangeFunction(function)) => relations.push(aliased_relation(
-            function.alias.as_ref(),
-            Columns::Hidden(format!("a column of {}", function_in_from(function))),
-        )),
+        Some(NodeKind::RangeFunction(function)) => {
+            let visible = base.with_frame(Frame {
+                ctes: Vec::new(),
+                relations: relations.clone(),
+            });
+            let columns = function_columns(function, &visible).unwrap_or_else(|| {
+                Columns::Hidden(format!("a column of {}", function_in_from(function)))
+            });
+            relations.push(aliased_relation(function.alias.as_ref(), columns));
+        }
         _ => relations.push(aliased_relation(
             None,
             Columns::Hidden("a column of this kind of FROM item".to_string()),
@@ -986,6 +993,70 @@ fn columns_of(what: &str, alias: Option<&Alias>) -> String {
     match alias {
         Some(alias) => format!("a column of {what} {}", alias.aliasname),
         None => format!("a column of {what}"),
+    }
+}
+
+fn function_columns(function: &RangeFunction, scopes: &Scopes) -> Option<Columns> {
+    if function.ordinality {
+        return None;
+    }
+    if !function.coldeflist.is_empty() {
+        return Some(Columns::Known(
+            function
+                .coldeflist
+                .iter()
+                .filter_map(|element| match &element.node {
+                    Some(NodeKind::ColumnDef(definition)) => Some(Column {
+                        name: definition.colname.clone(),
+                        ty: definition
+                            .type_name
+                            .as_ref()
+                            .and_then(|type_name| declared_type(type_name, false))
+                            .ok_or_else(|| cause("a column with no declared type")),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        ));
+    }
+    let [item] = function.functions.as_slice() else {
+        return None;
+    };
+    let Some(NodeKind::List(list)) = &item.node else {
+        return None;
+    };
+    let Some(NodeKind::FuncCall(call)) = list.items.first()?.node.as_ref() else {
+        return None;
+    };
+    let names = extract_key_columns(&call.funcname).ok()?;
+    let name = match names.as_slice() {
+        [name] => name.to_lowercase(),
+        [schema, name] if schema == "pg_catalog" => name.to_lowercase(),
+        _ => return None,
+    };
+    let arguments = types_of(&call.args, scopes)
+        .into_iter()
+        .collect::<Result<Vec<PgType>, Untyped>>()
+        .ok()?;
+    let ty = match (name.as_str(), arguments.as_slice()) {
+        ("unnest", [PgType::Array(element)]) => (**element).clone(),
+        ("generate_series", [_, _] | [_, _, _]) => series_type(&arguments)?,
+        _ => return None,
+    };
+    let column_name = match &function.alias {
+        Some(alias) => alias.aliasname.clone(),
+        None => name,
+    };
+    Some(Columns::Known(vec![Column {
+        name: column_name,
+        ty: Ok(ty),
+    }]))
+}
+
+fn series_type(arguments: &[PgType]) -> Option<PgType> {
+    match common_type(arguments, "generate_series").ok()? {
+        ty @ (PgType::Int4 | PgType::Int8 | PgType::Numeric) => Some(ty),
+        _ => None,
     }
 }
 
@@ -1373,6 +1444,10 @@ mod tests {
     #[test]
     fn casts_with_modifiers_or_array_bounds_are_other_types() {
         assert_eq!(type_from_t("a::numeric(10,2)"), other("numeric(10,2)"));
+        assert_eq!(
+            type_from_t("a::int4[]"),
+            Some(PgType::Array(Box::new(PgType::Int4)))
+        );
         assert_eq!(type_from_t("a::integer[][]"), other("int4[][]"));
         assert_eq!(type_from_t("a::date[]"), other("date[]"));
     }
@@ -2121,7 +2196,7 @@ mod tests {
     fn create_table_scope_has_the_new_columns_without_a_lookup() {
         let NodeEnum::CreateStmt(create) = statement(
             "CREATE TABLE made (i serial, j bigserial, k smallserial, l serial4, m serial8, \
-             n smallint, o numeric(8,2), p text, q boolean, s double precision, \
+             n smallint, o numeric(8,2), p text, q boolean, r int[], s double precision, \
              CHECK (i > 0))",
         ) else {
             panic!("not a create table");
@@ -2138,6 +2213,7 @@ mod tests {
             ("o", other("numeric(8,2)")),
             ("p", Some(PgType::Text)),
             ("q", Some(PgType::Bool)),
+            ("r", Some(PgType::Array(Box::new(PgType::Int4)))),
             ("s", Some(PgType::Float8)),
         ];
         for (column, ty) in expected {
@@ -2708,6 +2784,90 @@ mod tests {
     fn a_slice_or_several_subscripts_of_a_name_are_not_typed() {
         assert_eq!(type_from_t("b[0:1]"), None);
         assert_eq!(type_from_t("b[0][1]"), None);
+    }
+
+    fn array_of(element: PgType) -> PgType {
+        PgType::Array(Box::new(element))
+    }
+
+    #[test]
+    fn unnest_of_an_array_has_one_column_of_the_element_type() {
+        assert_eq!(
+            types("SELECT unnest FROM unnest('{1,2}'::pg_catalog.oid[])"),
+            vec![Some(PgType::Oid)]
+        );
+        assert_eq!(
+            types("SELECT src.tbloid FROM unnest('{1}'::oid[]) AS src(tbloid)"),
+            vec![Some(PgType::Oid)]
+        );
+        assert_eq!(
+            types("SELECT s FROM unnest('{a}'::text[]) AS s"),
+            vec![Some(PgType::Text)]
+        );
+    }
+
+    #[test]
+    fn unnest_of_anything_else_has_unknown_columns() {
+        for sql in [
+            "SELECT unnest FROM unnest(ARRAY[1, 2])",
+            "SELECT unnest FROM unnest('{1}'::oid[], '{2}'::oid[])",
+            "SELECT unnest FROM unnest('{1}'::oid[]) WITH ORDINALITY",
+            "SELECT unnest FROM unnest(a) ",
+        ] {
+            assert_eq!(types(sql), vec![None], "{sql}");
+        }
+    }
+
+    #[test]
+    fn unnest_can_read_a_column_of_a_relation_on_its_left() {
+        assert_eq!(
+            types("SELECT unnest FROM u, unnest(x::text[])"),
+            vec![Some(PgType::Text)]
+        );
+    }
+
+    #[test]
+    fn generate_series_of_integers_has_one_integer_column() {
+        for (sql, expected) in [
+            ("SELECT g FROM generate_series(1, 3) AS g", PgType::Int4),
+            (
+                "SELECT generate_series FROM generate_series(1, 3)",
+                PgType::Int4,
+            ),
+            (
+                "SELECT g.n FROM generate_series(1, 3) AS g(n)",
+                PgType::Int4,
+            ),
+            ("SELECT g FROM generate_series(1, 3, 2) AS g", PgType::Int4),
+            (
+                "SELECT g FROM generate_series(1, 3::int8) AS g",
+                PgType::Int8,
+            ),
+            (
+                "SELECT g FROM generate_series(1, 3.5) AS g",
+                PgType::Numeric,
+            ),
+            ("SELECT g FROM t, generate_series(a, 3) AS g", PgType::Int4),
+        ] {
+            assert_eq!(types(sql), vec![Some(expected)], "{sql}");
+        }
+    }
+
+    #[test]
+    fn generate_series_of_other_types_has_unknown_columns() {
+        for sql in [
+            "SELECT g FROM generate_series(1.5::float8, 3) AS g",
+            "SELECT g FROM generate_series('2024-01-01'::date, '2024-01-03'::date, '1 day'::interval) AS g",
+            "SELECT g FROM generate_series(1) AS g",
+        ] {
+            assert_eq!(types(sql), vec![None], "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_subscript_of_an_array_has_the_element_type() {
+        assert_eq!(type_from_t("('{1,2}'::int2[])[1]"), Some(PgType::Int2));
+        assert_eq!(type_from_t("('{1,2}'::oid[])[1] = 1"), Some(PgType::Bool));
     }
 
     #[test]

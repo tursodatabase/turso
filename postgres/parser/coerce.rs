@@ -30,6 +30,8 @@ pub enum PgType {
     Regproc,
     /// The one-byte internal type that PostgreSQL writes as "char".
     Char,
+    /// An array with one dimension, of a type that has an engine type.
+    Array(Box<PgType>),
     /// A string literal, NULL or parameter: its type comes from where it is used.
     Unknown,
     /// A type that has a name but no supported casts yet (date, uuid, an enum, ...). Lowercase name.
@@ -57,6 +59,9 @@ impl PgType {
     /// Finds the type with this name, ignoring case; every name of a type gives the same value.
     pub fn from_name(name: &str) -> PgType {
         let spelled = one_spelling(name);
+        if let Some(element) = spelled.strip_suffix("[]") {
+            return PgType::array_of(PgType::from_name(element)).unwrap_or(PgType::Other(spelled));
+        }
         match spelled.as_str() {
             "int2" => PgType::Int2,
             "int4" => PgType::Int4,
@@ -72,6 +77,16 @@ impl PgType {
             "regproc" => PgType::Regproc,
             "char" => PgType::Char,
             _ => PgType::Other(spelled),
+        }
+    }
+
+    /// The type of an array with one dimension of `element`, if the engine can hold such arrays.
+    pub fn array_of(element: PgType) -> Option<PgType> {
+        match element {
+            PgType::Array(_) => None,
+            _ => element
+                .engine_type()
+                .map(|_| PgType::Array(Box::new(element))),
         }
     }
 
@@ -100,6 +115,12 @@ impl PgType {
 
     /// The type the engine uses to store values of this type, if there is one.
     pub fn engine_type(&self) -> Option<ast::Type> {
+        if let PgType::Array(element) = self {
+            return element.engine_type().map(|element| ast::Type {
+                array_dimensions: 1,
+                ..element
+            });
+        }
         let name = match self {
             PgType::Int2 => "smallint",
             PgType::Int4 | PgType::Oid | PgType::Regclass | PgType::Regnamespace => "INTEGER",
@@ -108,7 +129,7 @@ impl PgType {
             PgType::Text | PgType::Char => "TEXT",
             PgType::Bytea => "BLOB",
             PgType::Bool => "boolean",
-            PgType::Regproc | PgType::Unknown | PgType::Other(_) => return None,
+            PgType::Regproc | PgType::Array(_) | PgType::Unknown | PgType::Other(_) => return None,
         };
         Some(ast::Type {
             name: name.to_string(),
@@ -124,6 +145,7 @@ impl PgType {
             TypeCategory::Number => Some("N"),
             TypeCategory::String => Some("S"),
             TypeCategory::UserDefined => Some("U"),
+            TypeCategory::Array => Some("A"),
             TypeCategory::Other => None,
         }
     }
@@ -141,6 +163,7 @@ impl PgType {
             | PgType::Regnamespace
             | PgType::Regproc => TypeCategory::Number,
             PgType::Text | PgType::Char => TypeCategory::String,
+            PgType::Array(_) => TypeCategory::Array,
             PgType::Bytea => TypeCategory::UserDefined,
             PgType::Unknown | PgType::Other(_) => TypeCategory::Other,
         }
@@ -175,6 +198,7 @@ enum TypeCategory {
     Number,
     String,
     UserDefined,
+    Array,
     Other,
 }
 
@@ -186,6 +210,7 @@ const NUMBER_TO_INT2: &str = "number_to_int2";
 impl fmt::Display for PgType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            PgType::Array(element) => return write!(f, "{element}[]"),
             PgType::Bool => "boolean",
             PgType::Int2 => "smallint",
             PgType::Int4 => "integer",
@@ -593,7 +618,11 @@ fn operand_target(
     let target = match kind {
         OperatorKind::Arithmetic => operand_type_among(&known, ARITHMETIC_OPERAND_TYPES),
         OperatorKind::Comparison => match different {
-            None if COMPARISON_OPERAND_TYPES.contains(first) => Some((*first).clone()),
+            None if COMPARISON_OPERAND_TYPES.contains(first)
+                || matches!(first, PgType::Array(_)) =>
+            {
+                Some((*first).clone())
+            }
             _ => operand_type_among(&known, COMPARISON_OPERAND_TYPES),
         },
         OperatorKind::Concat if known.iter().all(|t| **t == PgType::Bytea) => Some(PgType::Bytea),
@@ -669,6 +698,12 @@ fn convert_literal(quoted: &str, target: &PgType) -> Result<ast::Expr, ParseErro
         PgType::Bytea => parse_bytea(&text, trimmed)?,
         PgType::Oid => ast::Literal::Numeric(parse_oid(&text)?.to_string()),
         PgType::Char => parse_char(&text)?,
+        PgType::Array(_) => {
+            return Ok(engine_cast(
+                ast::Expr::Literal(ast::Literal::String(quoted.to_string())),
+                target,
+            ))
+        }
         PgType::Regclass | PgType::Regnamespace => {
             let reader = target.unknown_reader().expect("an oid alias has a reader");
             return Ok(function_call(
@@ -1849,6 +1884,10 @@ mod tests {
 
     #[test]
     fn array_columns_are_arrays_of_one_dimension_or_other_types() {
+        assert_eq!(
+            PgType::from_column_type("INTEGER", 1, &[]),
+            PgType::Array(Box::new(PgType::Int4))
+        );
         assert_eq!(
             PgType::from_column_type("Text", 2, &[]),
             PgType::Other("text[][]".to_string())
@@ -3574,6 +3613,116 @@ mod tests {
         assert_eq!(
             convert_text("bthandler", &PgType::Regproc).unwrap(),
             string("bthandler")
+        );
+    }
+
+    fn array_of(element: PgType) -> PgType {
+        PgType::Array(Box::new(element))
+    }
+
+    #[test]
+    fn an_array_name_of_a_supported_element_is_an_array() {
+        for (name, element) in [
+            ("oid[]", PgType::Oid),
+            ("pg_catalog.oid[]", PgType::Oid),
+            ("int2[]", PgType::Int2),
+            ("smallint[]", PgType::Int2),
+            ("text[]", PgType::Text),
+            ("INTEGER[]", PgType::Int4),
+        ] {
+            let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+            assert_eq!(PgType::from_name(name), array_of(element), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_array_name_of_another_element_or_more_dimensions_is_another_type() {
+        for name in ["date[]", "int4[][]", "regproc[]", "unknown[]"] {
+            assert_eq!(
+                PgType::from_name(name),
+                PgType::Other(name.to_string()),
+                "{name}"
+            );
+        }
+        assert_eq!(PgType::array_of(array_of(PgType::Int4)), None);
+        assert_eq!(PgType::array_of(date()), None);
+        assert_eq!(PgType::array_of(PgType::Unknown), None);
+        assert_eq!(PgType::array_of(PgType::Oid), Some(array_of(PgType::Oid)));
+    }
+
+    #[test]
+    fn an_array_shows_its_element_and_is_stored_as_an_array_of_its_engine_type() {
+        assert_eq!(array_of(PgType::Oid).to_string(), "oid[]");
+        assert_eq!(array_of(PgType::Int4).to_string(), "integer[]");
+        let engine = array_of(PgType::Int2).engine_type().unwrap();
+        assert_eq!(engine.name, "smallint");
+        assert_eq!(engine.array_dimensions, 1);
+    }
+
+    #[test]
+    fn a_string_literal_read_as_an_array_is_cast_by_the_engine_in_every_context() {
+        let target = array_of(PgType::Oid);
+        for context in [Implicit, Assignment, Explicit] {
+            assert_eq!(
+                coerce(string("{1,2}"), Some(&PgType::Unknown), &target, context).unwrap(),
+                cast_to(string("{1,2}"), &target),
+                "{context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parameter_or_null_read_as_an_array_is_cast_only_when_explicit() {
+        let target = array_of(PgType::Text);
+        assert_eq!(
+            coerce(variable(), Some(&PgType::Unknown), &target, Assignment).unwrap(),
+            variable()
+        );
+        assert_eq!(
+            coerce(null(), Some(&PgType::Unknown), &target, Explicit).unwrap(),
+            cast_to(null(), &target)
+        );
+    }
+
+    #[test]
+    fn an_array_has_no_supported_cast_to_another_type() {
+        let source = array_of(PgType::Text);
+        for target in [PgType::Text, array_of(PgType::Int4), PgType::Int4] {
+            assert_error(
+                convert(&source, &target, Explicit),
+                "0A000",
+                &format!("a cast from text[] to {target} is not supported"),
+            );
+        }
+    }
+
+    #[test]
+    fn arrays_of_the_same_type_compare_and_arrays_of_different_types_do_not() {
+        let items = vec![
+            (number("1"), Some(array_of(PgType::Int4))),
+            (string("{1}"), Some(PgType::Unknown)),
+        ];
+        assert_eq!(
+            coerce_operands("=", OperatorKind::Comparison, items).unwrap(),
+            vec![number("1"), cast_to(string("{1}"), &array_of(PgType::Int4))]
+        );
+        let items = vec![
+            (number("1"), Some(array_of(PgType::Int4))),
+            (number("2"), Some(array_of(PgType::Int8))),
+        ];
+        assert_operand_error(
+            coerce_operands("=", OperatorKind::Comparison, items),
+            "42883",
+            "operator does not exist: integer[] = bigint[]",
+        );
+    }
+
+    #[test]
+    fn common_type_of_equal_arrays_is_that_array() {
+        let ty = array_of(PgType::Oid);
+        assert_eq!(
+            common_type(&[ty.clone(), PgType::Unknown, ty.clone()], "CASE").unwrap(),
+            ty
         );
     }
 
