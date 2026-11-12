@@ -438,8 +438,8 @@ fn translate_statement(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
-        ast::Stmt::CreateRole { role_name } => {
-            roles::translate_create_role(&role_name, resolver, program, connection)?
+        ast::Stmt::CreateRole { role_name, options } => {
+            roles::translate_create_role(role_name, options, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {

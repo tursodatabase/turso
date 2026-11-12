@@ -94,7 +94,10 @@ pub enum CatalogChange {
         if_exists: bool,
     },
     /// `CREATE ROLE name`: a role that is not a superuser and cannot log in.
-    CreateRole { name: String },
+    CreateRole {
+        name: String,
+        options: ast::RoleOptions,
+    },
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
@@ -446,6 +449,12 @@ pub trait Dialect: Send + Sync + 'static {
     fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
         let _ = schema;
         role == RoleId::SUPERUSER
+    }
+
+    /// Whether row-level security does not limit `role`. As in PostgreSQL,
+    /// it does not limit a superuser.
+    fn role_bypass_rls(&self, schema: &Schema, role: RoleId) -> bool {
+        self.role_is_superuser(schema, role)
     }
 
     /// Whether a session whose current role is `member` may switch to `role`

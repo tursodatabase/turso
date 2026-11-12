@@ -210,7 +210,7 @@ pub fn check_statement_privileges(
         ast::Stmt::DropSchema { name } => {
             PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string()))
         }
-        ast::Stmt::CreateRole { role_name } => {
+        ast::Stmt::CreateRole { role_name, .. } => {
             PermissionDenied::privilege(Action::Create, Object::Role(role_name.clone()))
         }
         ast::Stmt::Pragma {
@@ -586,13 +586,15 @@ pub fn translate_grant(
 /// `CREATE ROLE`: the dialect stores the role, through the same hook as its
 /// other catalog changes.
 pub fn translate_create_role(
-    role_name: &str,
+    role_name: String,
+    options: ast::RoleOptions,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let change = CatalogChange::CreateRole {
-        name: role_name.to_string(),
+        name: role_name,
+        options,
     };
     translate_change(change, resolver, program, connection)
 }
@@ -629,6 +631,7 @@ mod tests {
     fn create_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {
         let create_role = ast::Cmd::Stmt(ast::Stmt::CreateRole {
             role_name: name.to_string(),
+            options: ast::RoleOptions::default(),
         });
         conn.prepare_translated_cmd(create_role, &format!("CREATE ROLE {name}"))?
             .run_ignore_rows()

@@ -691,10 +691,14 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::CreateRole { role_name } => {
+            Self::CreateRole { role_name, options } => {
                 s.append(TK_CREATE, None)?;
                 s.append(TK_ID, Some("ROLE"))?;
-                s.append(TK_ID, Some(role_name))
+                s.append(TK_ID, Some(role_name))?;
+                if options.bypassrls {
+                    s.append(TK_ID, Some("BYPASSRLS"))?;
+                }
+                Ok(())
             }
             Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {

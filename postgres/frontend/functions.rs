@@ -1940,6 +1940,7 @@ mod tests {
             Value::from_i64(1),
             Value::build_text("alice"),
             Value::from_i64(0),
+            Value::from_i64(0),
         ]])
         .unwrap();
         let without_alice = RoleCatalog::new(&[]).unwrap();

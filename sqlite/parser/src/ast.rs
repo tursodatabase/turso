@@ -206,6 +206,8 @@ pub enum Stmt {
     CreateRole {
         /// role name
         role_name: String,
+        /// role options
+        options: RoleOptions,
     },
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
@@ -1549,6 +1551,14 @@ pub enum RoleSpec {
     CurrentRole,
     /// `SESSION_USER`: the role the session logged in as.
     SessionUser,
+}
+
+/// The options of `CREATE ROLE`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RoleOptions {
+    /// `BYPASSRLS`: row-level security does not limit the role
+    pub bypassrls: bool,
 }
 
 /// `GRANT privileges ON relations TO grantees`. The relations are named one

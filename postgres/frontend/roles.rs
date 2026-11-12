@@ -1,8 +1,8 @@
 //! Roles, PostgreSQL's `pg_authid` rows, in the `__turso_internal_authid`
 //! table of the main database.
 //!
-//! The table has the `pg_authid` columns that tursopg uses: `rolname` and
-//! `rolsuper`. Its `id` column is the engine's [`RoleId`] of the role, which
+//! The table has the `pg_authid` columns that tursopg uses: `rolname`,
+//! `rolsuper` and `rolbypassrls`. Its `id` column is the engine's [`RoleId`] of the role, which
 //! other catalog rows store, such as `relowner` of the relation catalog.
 //! [`crate::catalog::role_oid`] gives the role's PostgreSQL oid.
 //!
@@ -27,6 +27,7 @@ use turso_core::{
     to_u32, CatalogChange, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn, LimboError,
     Numeric, ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_CONSTRAINT_UNIQUE,
 };
+use turso_parser::ast::RoleOptions;
 use turso_pg_parser::sqlstate::SQLSTATE_DUPLICATE_OBJECT;
 
 use crate::error::sqlstate_error;
@@ -41,14 +42,15 @@ const AUTHID_NAME_INDEX_NAME: &str = "__turso_internal_authid_rolname";
 pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
     id INTEGER PRIMARY KEY, \
     rolname TEXT NOT NULL, \
-    rolsuper INTEGER NOT NULL)";
+    rolsuper INTEGER NOT NULL, \
+    rolbypassrls INTEGER NOT NULL)";
 
 /// Keeps role names unique in the stored table, whatever writes it.
 pub(crate) const CREATE_AUTHID_NAME_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_authid_rolname ON __turso_internal_authid (rolname)";
 
 /// The number of columns of [`AUTHID_TABLE_NAME`].
-const AUTHID_COLUMN_COUNT: usize = 3;
+const AUTHID_COLUMN_COUNT: usize = 4;
 
 /// The query that reads the roles for the frontend's schema state, or None
 /// when the database has no roles table, as in a read-only open of an empty
@@ -56,7 +58,7 @@ const AUTHID_COLUMN_COUNT: usize = 3;
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME)?;
     Some(format!(
-        "SELECT id, rolname, rolsuper FROM {AUTHID_TABLE_NAME}"
+        "SELECT id, rolname, rolsuper, rolbypassrls FROM {AUTHID_TABLE_NAME}"
     ))
 }
 
@@ -86,6 +88,8 @@ pub(crate) struct Role {
     pub(crate) name: String,
     /// A superuser passes every privilege check.
     pub(crate) superuser: bool,
+    /// Row-level security does not limit a role with `bypassrls`.
+    pub(crate) bypassrls: bool,
 }
 
 /// The roles stored in the roles table of a database, in memory. The
@@ -98,7 +102,7 @@ pub(crate) struct RoleCatalog {
 
 impl RoleCatalog {
     /// Returns a catalog of the rows read from the roles table. Each row is
-    /// `(id, rolname, rolsuper)`.
+    /// `(id, rolname, rolsuper, rolbypassrls)`.
     pub(crate) fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
@@ -135,6 +139,12 @@ impl RoleCatalog {
         id == RoleId::SUPERUSER || self.get(id).is_some_and(|role| role.superuser)
     }
 
+    /// Whether row-level security does not limit role `id`: a superuser or a
+    /// role with `bypassrls`, as in PostgreSQL.
+    pub(crate) fn bypass_rls(&self, id: RoleId) -> bool {
+        self.is_superuser(id) || self.get(id).is_some_and(|role| role.bypassrls)
+    }
+
     /// Whether a session whose current role is `member` may switch to `role`
     /// with `SET ROLE`. Role membership does not exist yet, so only a
     /// superuser may switch to another role. No session may switch to
@@ -148,6 +158,7 @@ impl RoleCatalog {
     pub(crate) fn apply_create_role(
         &mut self,
         name: &str,
+        options: &RoleOptions,
         values: &[Value],
     ) -> turso_core::Result<()> {
         let [Value::Numeric(Numeric::Integer(id))] = values else {
@@ -159,6 +170,7 @@ impl RoleCatalog {
             id: RoleId::from_stored(*id),
             name: name.to_string(),
             superuser: false,
+            bypassrls: options.bypassrls,
         });
         Ok(())
     }
@@ -178,18 +190,20 @@ impl RoleCatalog {
 }
 
 fn role_from_row(row: &[Value]) -> turso_core::Result<Role> {
-    let [id, name, superuser] = row else {
+    let [id, name, superuser, bypassrls] = row else {
         return Err(corrupt_row(row));
     };
-    match (id, name, superuser) {
+    match (id, name, superuser, bypassrls) {
         (
             Value::Numeric(Numeric::Integer(id)),
             Value::Text(name),
             Value::Numeric(Numeric::Integer(superuser @ (0 | 1))),
+            Value::Numeric(Numeric::Integer(bypassrls @ (0 | 1))),
         ) if *id > 0 => Ok(Role {
             id: RoleId::from_stored(*id),
             name: name.as_str().to_string(),
             superuser: *superuser == 1,
+            bypassrls: *bypassrls == 1,
         }),
         _ => Err(corrupt_row(row)),
     }
@@ -200,12 +214,13 @@ fn corrupt_row(row: &[Value]) -> LimboError {
 }
 
 /// `CREATE ROLE name`: inserts a role that is not a superuser and cannot log
-/// in, and tells the engine to add it to the in-memory catalog. Fails with
-/// PostgreSQL's 42710 when a role of that name exists.
+/// in, with `options`, and tells the engine to add it to the in-memory
+/// catalog. Fails with PostgreSQL's 42710 when a role of that name exists.
 pub(crate) fn translate_create_role(
     program: &mut ProgramBuilder,
     schema: &Schema,
     name: &str,
+    options: &RoleOptions,
 ) -> turso_core::Result<()> {
     if schema_roles(schema).get_by_name(name).is_some() {
         return Err(sqlstate_error(
@@ -257,6 +272,10 @@ pub(crate) fn translate_create_role(
         value: 0,
         dest: first_column_reg + 2,
     });
+    program.emit_insn(Insn::Integer {
+        value: options.bypassrls as i64,
+        dest: first_column_reg + 3,
+    });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
@@ -278,6 +297,7 @@ pub(crate) fn translate_create_role(
         db: MAIN_DB_ID,
         change: Box::new(CatalogChange::CreateRole {
             name: name.to_string(),
+            options: options.clone(),
         }),
         value_regs: vec![id_reg],
     });
@@ -377,6 +397,24 @@ mod tests {
     }
 
     #[test]
+    fn superusers_and_bypassrls_roles_bypass_rls() {
+        let catalog = RoleCatalog::new(&[
+            role_row(1, "alice", 0),
+            role_row(2, "admin", 1),
+            bypassrls_role_row(3, "reader"),
+        ])
+        .unwrap();
+        let id = |name| catalog.get_by_name(name).unwrap().id;
+
+        assert!(catalog.bypass_rls(RoleId::SUPERUSER));
+        assert!(catalog.bypass_rls(id("admin")));
+        assert!(catalog.bypass_rls(id("reader")));
+        assert!(!catalog.is_superuser(id("reader")));
+        assert!(!catalog.bypass_rls(id("alice")));
+        assert!(!catalog.bypass_rls(RoleId::PUBLIC));
+    }
+
+    #[test]
     fn only_a_superuser_may_set_another_role_and_no_one_may_set_public() {
         let catalog = RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "bob", 0)]).unwrap();
         let alice = catalog.get_by_name("alice").unwrap().id;
@@ -394,6 +432,16 @@ mod tests {
             Value::from_i64(id),
             Value::build_text(name.to_string()),
             Value::from_i64(superuser),
+            Value::from_i64(0),
+        ]
+    }
+
+    fn bypassrls_role_row(id: i64, name: &str) -> Vec<Value> {
+        vec![
+            Value::from_i64(id),
+            Value::build_text(name.to_string()),
+            Value::from_i64(0),
+            Value::from_i64(1),
         ]
     }
 }
