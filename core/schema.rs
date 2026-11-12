@@ -114,6 +114,7 @@ impl Trigger {
     }
 }
 
+use crate::dialect::identity_table_sql_marker;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -6099,6 +6100,12 @@ impl BTreeTable {
         if self.primary_key_is_not_rowid_alias {
             sql.push_str(crate::dialect::PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER);
         }
+        sql.push_str(&identity_table_sql_marker(
+            self.columns
+                .iter()
+                .enumerate()
+                .filter_map(|(position, column)| Some((position, column.identity?))),
+        ));
         sql.push_str(&format!("CREATE TABLE {} (", quote_ident(name)));
         let needs_pk_inline = self.primary_key_is_inline
             && self.primary_key_columns.len() == 1
@@ -7422,6 +7429,7 @@ pub fn create_table(
                 let mut default = None;
                 let mut generated: Option<Box<Expr>> = None;
                 let mut generated_stored = false;
+                let mut identity_col = None;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut explicit_notnull = false;
@@ -7528,6 +7536,9 @@ pub fn create_table(
                             foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
                         }
+                        ast::ColumnConstraint::Identity(kind) => {
+                            identity_col = Some(*kind);
+                        }
                     }
                 }
 
@@ -7606,6 +7617,7 @@ pub fn create_table(
                         }
                     )
                 });
+                col.identity = identity_col;
                 col.ty_params = ty_params;
                 if let Some(t) = col_type.as_ref() {
                     col.apply_written_type(t);
@@ -8029,6 +8041,7 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     generated_always: bool,
+    pub identity: Option<ast::IdentityKind>,
     info: ColumnInfo,
     /// The declared collation, or for a column of a subquery, view or CTE the
     /// collation of its expression. None means BINARY. Kept apart from
@@ -8193,6 +8206,7 @@ impl Column {
             default,
             generated_type,
             generated_always: false,
+            identity: None,
             info,
             collation: col,
             type_ordering: None,
@@ -8311,6 +8325,10 @@ impl Column {
                 }
             )
         });
+        col.identity = value.constraints.iter().find_map(|c| match c.constraint {
+            ast::ColumnConstraint::Identity(kind) => Some(kind),
+            _ => None,
+        });
         col.ty_params = ty_params;
         if let Some(t) = value.col_type.as_ref() {
             col.apply_written_type(t);
@@ -8350,6 +8368,26 @@ impl Column {
     pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> Result<()> {
         if !matches!(self.generated_type, GeneratedType::NotGenerated) {
             bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
+        }
+        Ok(())
+    }
+
+    /// Returns an error if this is a `GENERATED ALWAYS AS IDENTITY` column.
+    pub fn ensure_insert_value_allowed(&self) -> Result<()> {
+        if self.identity == Some(ast::IdentityKind::Always) {
+            bail_parse_error!(
+                "cannot insert a non-DEFAULT value into column \"{}\"",
+                self.name.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns an error if an UPDATE sets this identity column to anything but DEFAULT.
+    pub fn ensure_update_value_allowed(&self, value: &ast::Expr, col_name: &str) -> Result<()> {
+        if self.identity == Some(ast::IdentityKind::Always) && !matches!(value, ast::Expr::Default)
+        {
+            bail_parse_error!("column \"{}\" can only be updated to DEFAULT", col_name);
         }
         Ok(())
     }

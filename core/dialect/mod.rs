@@ -27,7 +27,7 @@ use crate::{
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{
-    self, Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt,
+    self, Cmd, CreateTableBody, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec, Stmt,
 };
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -128,6 +128,10 @@ pub struct ScalarFuncContext<'a> {
 /// without it was written before a dialect could say so, and keeps the
 /// SQLite rule.
 pub const PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER: &str = "/* turso_pk_column */ ";
+
+/// Start of the comment in stored table SQL that lists the positions and kinds
+/// of its identity columns, as in `/* turso_identity 0:always 2:default */ `.
+pub const IDENTITY_TABLE_SQL_MARKER: &str = "/* turso_identity";
 
 /// SQL dialect layered on top of the engine.
 ///
@@ -626,6 +630,56 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+}
+
+/// The comment that marks the columns at the given positions as identity
+/// columns of the given kinds in stored table SQL, or nothing when there are none.
+pub fn identity_table_sql_marker(
+    columns: impl IntoIterator<Item = (usize, IdentityKind)>,
+) -> String {
+    let columns: Vec<String> = columns
+        .into_iter()
+        .map(|(position, kind)| {
+            let kind = match kind {
+                IdentityKind::Always => "always",
+                IdentityKind::ByDefault => "default",
+            };
+            format!("{position}:{kind}")
+        })
+        .collect();
+    if columns.is_empty() {
+        return String::new();
+    }
+    format!("{IDENTITY_TABLE_SQL_MARKER} {} */ ", columns.join(" "))
+}
+
+/// Splits the identity comment off the start of `sql`, returning the column
+/// positions and kinds it lists and the rest of the text.
+pub fn split_identity_table_sql_marker(
+    sql: &str,
+) -> crate::Result<(Vec<(usize, IdentityKind)>, &str)> {
+    let Some(marked) = sql.strip_prefix(IDENTITY_TABLE_SQL_MARKER) else {
+        return Ok((Vec::new(), sql));
+    };
+    let corrupt =
+        || crate::LimboError::Corrupt(format!("malformed identity marker in table SQL: {sql}"));
+    let (list, rest) = marked.split_once(" */ ").ok_or_else(corrupt)?;
+    let columns = list
+        .split_whitespace()
+        .map(|entry| {
+            let (position, kind) = entry.split_once(':').ok_or_else(corrupt)?;
+            let kind = match kind {
+                "always" => IdentityKind::Always,
+                "default" => IdentityKind::ByDefault,
+                _ => return Err(corrupt()),
+            };
+            Ok((position.parse::<usize>().map_err(|_| corrupt())?, kind))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(corrupt());
+    }
+    Ok((columns, rest))
 }
 
 #[cfg(test)]
@@ -1619,5 +1673,41 @@ mod tests {
                 .unwrap(),
             vec![vec![Value::from_i64(42)]]
         );
+    }
+
+    #[test]
+    fn identity_marker_keeps_each_columns_position_and_kind() {
+        let marker =
+            identity_table_sql_marker([(0, IdentityKind::Always), (2, IdentityKind::ByDefault)]);
+        assert_eq!(marker, "/* turso_identity 0:always 2:default */ ");
+
+        let sql = format!("{marker}CREATE TABLE t (a, b, c)");
+        let (columns, rest) = split_identity_table_sql_marker(&sql).unwrap();
+        assert_eq!(
+            columns,
+            [(0, IdentityKind::Always), (2, IdentityKind::ByDefault)]
+        );
+        assert_eq!(rest, "CREATE TABLE t (a, b, c)");
+    }
+
+    #[test]
+    fn identity_marker_is_absent_without_identity_columns() {
+        assert_eq!(identity_table_sql_marker([]), "");
+        let (columns, rest) = split_identity_table_sql_marker("CREATE TABLE t (a)").unwrap();
+        assert!(columns.is_empty());
+        assert_eq!(rest, "CREATE TABLE t (a)");
+    }
+
+    #[test]
+    fn malformed_identity_marker_is_corruption() {
+        for sql in [
+            "/* turso_identity */ CREATE TABLE t (a)",
+            "/* turso_identity 0 */ CREATE TABLE t (a)",
+            "/* turso_identity 0:sometimes */ CREATE TABLE t (a)",
+            "/* turso_identity x:always */ CREATE TABLE t (a)",
+            "/* turso_identity 0:always CREATE TABLE t (a)",
+        ] {
+            assert!(split_identity_table_sql_marker(sql).is_err(), "{sql}");
+        }
     }
 }

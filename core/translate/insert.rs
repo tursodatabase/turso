@@ -257,6 +257,7 @@ pub fn translate_insert(
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
+    overriding_system_value: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
@@ -345,6 +346,9 @@ pub fn translate_insert(
         );
     };
 
+    if !overriding_system_value && !connection.writes_stored_values() {
+        ensure_no_always_identity_values(&table, &columns, &body)?;
+    }
     let BoundInsertResult {
         mut values,
         mut upsert_actions,
@@ -2156,6 +2160,56 @@ pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     found_subquery
 }
 
+/// Returns an error if the INSERT writes a value other than DEFAULT to a
+/// `GENERATED ALWAYS AS IDENTITY` column.
+fn ensure_no_always_identity_values(
+    table: &Table,
+    columns: &[ast::Name],
+    body: &InsertBody,
+) -> Result<()> {
+    let InsertBody::Select(select, _) = body else {
+        return Ok(());
+    };
+    let selects = std::iter::once(&select.body.select).chain(
+        select
+            .body
+            .compounds
+            .iter()
+            .map(|compound| &compound.select),
+    );
+    for one_select in selects {
+        match one_select {
+            OneSelect::Values(rows) => {
+                for row in rows {
+                    for (position, value) in row.iter().enumerate() {
+                        if !matches!(value.as_ref(), Expr::Default) {
+                            ensure_value_allowed_at(table, columns, position)?;
+                        }
+                    }
+                }
+            }
+            OneSelect::Select { .. } => {
+                let value_count = if columns.is_empty() {
+                    table.columns().len()
+                } else {
+                    columns.len()
+                };
+                for position in 0..value_count {
+                    ensure_value_allowed_at(table, columns, position)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_value_allowed_at(table: &Table, columns: &[ast::Name], position: usize) -> Result<()> {
+    match insert_target_column(table, columns, position) {
+        Some(column) => column.ensure_insert_value_allowed(),
+        None => Ok(()),
+    }
+}
+
 /// Resolve `Expr::Default` in a VALUES row by replacing it with the column's
 /// default expression from the schema.
 fn resolve_defaults_in_row(
@@ -2169,21 +2223,26 @@ fn resolve_defaults_in_row(
         if !matches!(expr.as_ref(), Expr::Default) {
             continue;
         }
-        let col = if columns.is_empty() {
-            // No column list — position maps to non-hidden columns in order
-            table.columns().iter().filter(|c| !c.hidden()).nth(i)
-        } else {
-            // Column list — map by name
-            columns.get(i).and_then(|name| {
-                let name = crate::util::normalize_ident(name.as_str());
-                table.get_column_by_name(&name).map(|(_, col)| col)
-            })
-        };
-        *expr = match col {
+        *expr = match insert_target_column(table, columns, i) {
             Some(col) => column_default_expr(col, is_strict, resolver),
             None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
         };
     }
+}
+
+/// The column that the value at `position` of an INSERT row is written to.
+fn insert_target_column<'a>(
+    table: &'a Table,
+    columns: &[ast::Name],
+    position: usize,
+) -> Option<&'a Column> {
+    if columns.is_empty() {
+        return table.columns().iter().filter(|c| !c.hidden()).nth(position);
+    }
+    columns.get(position).and_then(|name| {
+        let name = crate::util::normalize_ident(name.as_str());
+        table.get_column_by_name(&name).map(|(_, col)| col)
+    })
 }
 
 /// The value a column takes when a statement writes DEFAULT to it.

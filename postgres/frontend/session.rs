@@ -1328,7 +1328,7 @@ impl CopyState {
         conn: &Arc<Connection>,
         sql: &str,
     ) -> Result<Option<crate::Statement>> {
-        let mut stmt = crate::Statement::new(conn.prepare_sqlite(sql)?);
+        let mut stmt = crate::Statement::new(prepare_copy_insert(conn, sql)?);
         if self.rows.is_empty() {
             return Ok(None);
         }
@@ -2431,6 +2431,29 @@ fn prepare_copy_rows(
 
     let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
     Ok((insert_sql, rows))
+}
+
+fn prepare_copy_insert(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let cmd = parser
+        .next_cmd()
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let Some(ast::Cmd::Stmt(mut stmt)) = cmd else {
+        return Err(LimboError::InternalError(
+            "COPY FROM builds no INSERT".into(),
+        ));
+    };
+    let ast::Stmt::Insert {
+        overriding_system_value,
+        ..
+    } = &mut stmt
+    else {
+        return Err(LimboError::InternalError(
+            "COPY FROM builds no INSERT".into(),
+        ));
+    };
+    *overriding_system_value = true;
+    conn.prepare_ast_stmt(stmt)
 }
 
 fn bind_copy_row(stmt: &mut crate::Statement, row: &[Option<String>]) -> Result<()> {

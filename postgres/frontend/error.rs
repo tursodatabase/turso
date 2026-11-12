@@ -306,8 +306,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if msg.starts_with("cannot INSERT into generated column ")
         || msg.starts_with("cannot UPDATE generated column ")
+        || is_identity_write_error(msg)
     {
         SQLSTATE_GENERATED_ALWAYS
+    } else if is_invalid_identity_or_sequence_parameter(msg) {
+        SQLSTATE_INVALID_PARAMETER_VALUE
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
@@ -390,6 +393,20 @@ fn is_duplicate_object_error(msg: &str) -> bool {
     msg.ends_with(" already exists")
         && KINDS.iter().any(|kind| msg.starts_with(kind))
         && !msg.contains(" has no column named ")
+}
+
+fn is_identity_write_error(msg: &str) -> bool {
+    msg.starts_with("cannot insert a non-DEFAULT value into column \"")
+        || (msg.starts_with("column \"") && msg.ends_with("\" can only be updated to DEFAULT"))
+}
+
+fn is_invalid_identity_or_sequence_parameter(msg: &str) -> bool {
+    msg.starts_with("identity column type must be ")
+        || msg == "INCREMENT must not be zero"
+        || (msg.starts_with("MINVALUE (") && msg.contains(") must be less than MAXVALUE ("))
+        || (msg.starts_with("START value (") && msg.contains(") cannot be "))
+        || ((msg.starts_with("MINVALUE (") || msg.starts_with("MAXVALUE ("))
+            && msg.contains(") is out of range for sequence data type "))
 }
 
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {

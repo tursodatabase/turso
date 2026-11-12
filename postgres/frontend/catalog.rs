@@ -6,7 +6,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
-    dialect::{POSTGRES_TABLE_SQL_PREFIX, PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER},
+    dialect::{
+        identity_table_sql_marker, split_identity_table_sql_marker, POSTGRES_TABLE_SQL_PREFIX,
+        PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER,
+    },
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
@@ -87,8 +90,14 @@ impl Dialect for PostgresDialect {
         // carry no frontend marker and are plain SQLite SQL.
         let primary_key_is_not_rowid_alias = has_primary_key_column_marker(sql);
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let table = BTreeTable::from_stored_sql(
-                strip_primary_key_column_marker(sql),
+            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
+                canonical_table_sql_ast(sql)?
+            else {
+                unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
+            };
+            let table = BTreeTable::from_create_table_ast(
+                &tbl_name,
+                &body,
                 root_page,
                 true,
                 primary_key_is_not_rowid_alias,
@@ -128,7 +137,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::parse_table_sql_ast(sql);
+            return canonical_table_sql_ast(sql);
         };
 
         let parse_result =
@@ -209,10 +218,18 @@ impl Dialect for PostgresDialect {
             Some(previous_sql) => has_primary_key_column_marker(previous_sql),
             None => self.primary_key_is_not_rowid_alias(tbl_name.name.as_str()),
         };
-        if marked {
-            return Ok(format!("{PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER}{sql}"));
-        }
-        Ok(sql)
+        let primary_key_marker = if marked {
+            PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER
+        } else {
+            ""
+        };
+        let identity_marker = identity_table_sql_marker(
+            table_columns(body)
+                .iter()
+                .enumerate()
+                .filter_map(|(position, column)| Some((position, identity_kind(column)?))),
+        );
+        Ok(format!("{primary_key_marker}{identity_marker}{sql}"))
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -409,6 +426,48 @@ fn has_primary_key_column_marker(sql: &str) -> bool {
 fn strip_primary_key_column_marker(sql: &str) -> &str {
     sql.strip_prefix(PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER)
         .unwrap_or(sql)
+}
+
+/// The `CREATE TABLE` of stored table SQL that is SQLite text, with its
+/// identity columns marked as the SQL says.
+fn canonical_table_sql_ast(sql: &str) -> Result<ast::Stmt> {
+    let (identity_columns, sql) =
+        split_identity_table_sql_marker(strip_primary_key_column_marker(sql))?;
+    let mut stmt = turso_core::dialect::engine::parse_table_sql_ast(sql)?;
+    let ast::Stmt::CreateTable { body, .. } = &mut stmt else {
+        unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+    };
+    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return Err(LimboError::Corrupt(format!(
+            "stored table SQL has no column definitions: {sql}"
+        )));
+    };
+    for (position, kind) in identity_columns {
+        let column = columns.get_mut(position).ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "identity column {position} is not in table SQL: {sql}"
+            ))
+        })?;
+        column.constraints.push(ast::NamedColumnConstraint {
+            name: None,
+            constraint: ast::ColumnConstraint::Identity(kind),
+        });
+    }
+    Ok(stmt)
+}
+
+fn table_columns(body: &ast::CreateTableBody) -> &[ast::ColumnDefinition] {
+    match body {
+        ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns,
+        ast::CreateTableBody::AsSelect(_) => &[],
+    }
+}
+
+fn identity_kind(column: &ast::ColumnDefinition) -> Option<ast::IdentityKind> {
+    column.constraints.iter().find_map(|c| match c.constraint {
+        ast::ColumnConstraint::Identity(kind) => Some(kind),
+        _ => None,
+    })
 }
 
 /// Returns the user tables of every namespace as (namespace, name, table)
@@ -3220,6 +3279,7 @@ impl SnapshotRows for PgDependTable {
                 DependencyKind::Auto,
             ));
         }
+
         rows
     }
 }
@@ -3759,7 +3819,10 @@ impl PgGetTableDefCursor {
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
-        let mut postgres_ddl = strip_primary_key_column_marker(sqlite_ddl).to_string();
+        let sqlite_ddl = strip_primary_key_column_marker(sqlite_ddl);
+        let sqlite_ddl =
+            split_identity_table_sql_marker(sqlite_ddl).map_or(sqlite_ddl, |(_, sql)| sql);
+        let mut postgres_ddl = sqlite_ddl.to_string();
 
         // Basic SQLite to PostgreSQL type conversions
         // Handle INTEGER PRIMARY KEY specially for SERIAL

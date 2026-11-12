@@ -52,6 +52,7 @@ pub struct SerialSequence {
     /// text implies. A table whose sequence is named otherwise has to be
     /// stored as text that names the sequence.
     pub has_default_name: bool,
+    pub options: SequenceOptions,
 }
 
 /// Whether a schema, by name, has a relation of a name.
@@ -564,11 +565,11 @@ impl PostgreSQLTranslator {
                     exact_name(&namespace),
                     exact_name(&sequence.name),
                 ),
-                start: None,
-                increment: None,
-                min_value: None,
-                max_value: None,
-                cycle: false,
+                start: sequence.options.start,
+                increment: sequence.options.increment,
+                min_value: sequence.options.min_value,
+                max_value: sequence.options.max_value,
+                cycle: sequence.options.cycle,
             })
             .collect();
         // PostgreSQL links a serial column's sequence to the column once the
@@ -681,6 +682,10 @@ impl PostgreSQLTranslator {
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
         let mut stored_generated_constraint: Option<ast::NamedColumnConstraint> = None;
+        let mut identity = None;
+        let mut has_identity = false;
+        let mut explicit_default = false;
+        let mut explicit_null = false;
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
@@ -708,6 +713,7 @@ impl PostgreSQLTranslator {
                     let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
                         ParseError::ParseError("DEFAULT missing expression".into())
                     })?;
+                    explicit_default = true;
                     default_expr = Some(self.translate_expr(raw_expr)?);
                 }
                 ConstrType::ConstrCheck => {
@@ -737,9 +743,34 @@ impl PostgreSQLTranslator {
                     stored_generated_constraint =
                         Some(self.translate_generated_constraint(constraint, tbl_name)?);
                 }
-                ConstrType::ConstrNull
-                | ConstrType::ConstrAttrNotDeferrable
-                | ConstrType::ConstrAttrImmediate => {}
+                ConstrType::ConstrIdentity => {
+                    if has_identity {
+                        return Err(ParseError::ParseError(format!(
+                            "multiple identity specifications for column \"{name}\" of table \"{}\"",
+                            tbl_name.name.as_str()
+                        )));
+                    }
+                    if !matches!(
+                        pg_type.as_str(),
+                        "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint"
+                    ) {
+                        return Err(ParseError::ParseError(
+                            "identity column type must be smallint, integer, or bigint".into(),
+                        ));
+                    }
+                    has_identity = true;
+                    let options = sequence_options(&constraint.options, Some(&pg_type))?;
+                    default_expr =
+                        Some(self.serial_default(tbl_name, &name, options, serial_sequences));
+                    is_not_null = true;
+                    identity = Some(if constraint.generated_when == "a" {
+                        ast::IdentityKind::Always
+                    } else {
+                        ast::IdentityKind::ByDefault
+                    });
+                }
+                ConstrType::ConstrNull => explicit_null = true,
+                ConstrType::ConstrAttrNotDeferrable | ConstrType::ConstrAttrImmediate => {}
                 other => {
                     return Err(ParseError::not_supported(format!(
                         "column constraint {}",
@@ -747,6 +778,19 @@ impl PostgreSQLTranslator {
                     )))
                 }
             }
+        }
+
+        if has_identity && explicit_default {
+            return Err(ParseError::ParseError(format!(
+                "both default and identity specified for column \"{name}\" of table \"{}\"",
+                tbl_name.name.as_str()
+            )));
+        }
+        if has_identity && explicit_null {
+            return Err(ParseError::ParseError(format!(
+                "conflicting NULL/NOT NULL declarations for column \"{name}\" of table \"{}\"",
+                tbl_name.name.as_str()
+            )));
         }
 
         // Build the type with size parameters (e.g. varchar(4), numeric(10,2))
@@ -775,35 +819,12 @@ impl PostgreSQLTranslator {
 
         // For serial columns, add DEFAULT nextval('namespace.tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let (seq_name, has_default_name) = self.serial_sequence_name(tbl_name, &name);
-            // The stored text of a table of a schema names the table by its
-            // mangled name, and the sequence's mangled name is that name with
-            // the same suffix, so the default names the sequence that way.
-            let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
-                seq_name.clone()
-            } else {
-                format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
-            };
-            serial_sequences.push(SerialSequence {
-                column: name.clone(),
-                schema: serial_sequence_namespace(tbl_name),
-                name: seq_name,
-                has_default_name,
-            });
-            default_expr = Some(ast::Expr::FunctionCall {
-                name: exact_name("nextval"),
-                distinctness: None,
-                args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{}'",
-                    sequence.replace('\'', "''")
-                ))))],
-                order_by: vec![],
-                within_group: vec![],
-                filter_over: ast::FunctionTail {
-                    filter_clause: None,
-                    over_clause: None,
-                },
-            });
+            default_expr = Some(self.serial_default(
+                tbl_name,
+                &name,
+                SequenceOptions::default(),
+                serial_sequences,
+            ));
         }
 
         // PRIMARY KEY (only on column level if there's no table-level PK)
@@ -865,6 +886,13 @@ impl PostgreSQLTranslator {
             constraints.push(gen);
         }
 
+        if let Some(kind) = identity {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Identity(kind),
+            });
+        }
+
         Ok(ast::ColumnDefinition {
             col_name: exact_name(name),
             col_type,
@@ -895,6 +923,47 @@ impl PostgreSQLTranslator {
             .find(|name| !is_taken(&schema, name))
             .expect("the numbers never run out");
         (free_name, false)
+    }
+
+    /// Record the sequence of a serial or identity column and return the
+    /// `nextval` default that draws from it.
+    fn serial_default(
+        &self,
+        tbl_name: &ast::QualifiedName,
+        column: &str,
+        options: SequenceOptions,
+        serial_sequences: &mut Vec<SerialSequence>,
+    ) -> ast::Expr {
+        let (seq_name, has_default_name) = self.serial_sequence_name(tbl_name, column);
+        // The stored text of a table of a schema names the table by its
+        // mangled name, and the sequence's mangled name is that name with
+        // the same suffix, so the default names the sequence that way.
+        let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
+            seq_name.clone()
+        } else {
+            format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
+        };
+        serial_sequences.push(SerialSequence {
+            column: column.to_string(),
+            schema: serial_sequence_namespace(tbl_name),
+            name: seq_name,
+            has_default_name,
+            options,
+        });
+        ast::Expr::FunctionCall {
+            name: exact_name("nextval"),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                sequence.replace('\'', "''")
+            ))))],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }
     }
 
     /// Translate `GENERATED ALWAYS AS (expr) STORED` of a column of table `tbl_name`.
@@ -1928,6 +1997,7 @@ impl PostgreSQLTranslator {
                 ));
             }
             return Ok(ast::Stmt::Insert {
+                overriding_system_value: false,
                 with: self.translate_with_clause(&insert.with_clause)?,
                 or_conflict: None,
                 tbl_name,
@@ -2003,6 +2073,7 @@ impl PostgreSQLTranslator {
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
+            overriding_system_value: false,
             with,
             or_conflict: None,
             tbl_name,
@@ -5396,7 +5467,7 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        let options = sequence_options(&seq.options)?;
+        let options = sequence_options(&seq.options, None)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
@@ -5772,14 +5843,19 @@ pub struct SequenceOptions {
     pub cycle: bool,
 }
 
-fn sequence_options(options: &[pg_query::protobuf::Node]) -> Result<SequenceOptions, ParseError> {
+/// The options of a sequence of the type `data_type`, or of the type an `AS`
+/// option names.
+fn sequence_options(
+    options: &[pg_query::protobuf::Node],
+    data_type: Option<&str>,
+) -> Result<SequenceOptions, ParseError> {
     let mut start = None;
     let mut increment = None;
     let mut min_value = None;
     let mut max_value = None;
     let mut cycle = false;
 
-    let mut as_type = None;
+    let mut as_type = data_type.map(str::to_string);
     for opt_node in options {
         if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
             if matches!(
@@ -9082,7 +9158,9 @@ fn reject_constraint_attributes(
     if !constraint.including.is_empty() {
         return Err(ParseError::not_supported("INCLUDE on a constraint"));
     }
-    if !constraint.options.is_empty() || !constraint.indexspace.is_empty() {
+    if (!constraint.options.is_empty() && contype != ConstrType::ConstrIdentity)
+        || !constraint.indexspace.is_empty()
+    {
         return Err(ParseError::not_supported(
             "WITH (storage parameters) / USING INDEX TABLESPACE on a constraint",
         ));
@@ -12473,14 +12551,8 @@ mod tests {
 
     #[test]
     fn fail_closed_create_table_column_constraint_kinds() {
-        assert_not_supported(
-            "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY)",
-            "AS IDENTITY",
-        );
-        assert_not_supported(
-            "CREATE TABLE t (id int GENERATED BY DEFAULT AS IDENTITY)",
-            "AS IDENTITY",
-        );
+        assert_translates("CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY)");
+        assert_translates("CREATE TABLE t (id int GENERATED BY DEFAULT AS IDENTITY)");
         assert_translates("CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)");
         assert_translates("CREATE TABLE t (a int NULL)");
     }
@@ -12496,6 +12568,33 @@ mod tests {
         assert!(
             output.contains("AS (a * 2) STORED"),
             "STORED generated column must keep its expression: {output}"
+        );
+    }
+
+    #[test]
+    fn test_identity_columns_emit_sequence_and_default() {
+        let sql = "CREATE TABLE orders (id int GENERATED ALWAYS AS IDENTITY, name text)";
+        let parsed = crate::parse(sql).unwrap();
+        let result = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect("translation must succeed");
+        let output = format!(
+            "{} {}",
+            result
+                .prereqs
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            result.cmd
+        );
+        assert!(
+            output.contains("nextval"),
+            "IDENTITY column must emit a nextval() DEFAULT: {output}"
+        );
+        assert!(
+            output.contains("orders_id_seq"),
+            "IDENTITY column must create a sequence named orders_id_seq: {output}"
         );
     }
 
