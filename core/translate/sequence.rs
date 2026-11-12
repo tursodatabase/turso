@@ -1287,7 +1287,7 @@ pub(crate) fn bind_sequence_names_in_select(
 ) -> Result<()> {
     rewrite_select_expressions(select, &mut |expr: &mut ast::Expr| {
         bind_sequence_call(expr, resolver);
-        Ok(())
+        Ok(WalkControl::Continue)
     })
 }
 

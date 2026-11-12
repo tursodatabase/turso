@@ -318,7 +318,8 @@ fn trigger_cmd_to_stmt_for_subprogram(
             let mut from_clone = from.clone();
             if let Some(ref mut from_clause) = from_clone {
                 rewrite_from_clause_expressions(from_clause, &mut |e: &mut ast::Expr| {
-                    rewrite_trigger_expr_single_for_subprogram(e, subprogram_ctx)
+                    rewrite_trigger_expr_single_for_subprogram(e, subprogram_ctx)?;
+                    Ok(WalkControl::Continue)
                 })?;
             }
 
@@ -383,7 +384,8 @@ fn rewrite_expressions_in_select_for_subprogram(
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
     rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-        rewrite_trigger_expr_single_for_subprogram(e, ctx)
+        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
+        Ok(WalkControl::Continue)
     })
 }
 
@@ -1129,18 +1131,21 @@ fn rewrite_expressions_in_select_for_when_clause(
     column_types: &[Option<Box<ast::Type>>],
 ) -> Result<()> {
     rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-        rewrite_trigger_expr_single_for_when_clause(e, ctx, column_types, true)
+        rewrite_trigger_expr_single_for_when_clause(e, ctx, column_types, true)?;
+        Ok(WalkControl::Continue)
     })
 }
 
 /// Rewrite all expressions in a SELECT tree, including CTEs, compounds, ORDER BY,
-/// LIMIT/OFFSET, FROM/JOIN subqueries, and window clauses.
+/// LIMIT/OFFSET, FROM/JOIN subqueries, and window clauses. `rewrite_expr`
+/// sees each expression before its parts, and decides if the walk continues
+/// into the parts.
 pub(crate) fn rewrite_select_expressions<F>(
     select: &mut ast::Select,
     rewrite_expr: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     // Rewrite WITH clause (CTEs)
     if let Some(with_clause) = &mut select.with {
@@ -1177,7 +1182,7 @@ fn rewrite_one_select_expressions<F>(
     rewrite_expr: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     match one_select {
         ast::OneSelect::Select {
@@ -1227,12 +1232,12 @@ where
     Ok(())
 }
 
-fn rewrite_from_clause_expressions<F>(
+pub(crate) fn rewrite_from_clause_expressions<F>(
     from_clause: &mut ast::FromClause,
     rewrite_expr: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     rewrite_select_table_expressions(&mut from_clause.select, rewrite_expr)?;
 
@@ -1251,7 +1256,7 @@ fn rewrite_select_table_expressions<F>(
     rewrite_expr: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     match select_table {
         ast::SelectTable::Table(..) => {}
@@ -1270,9 +1275,12 @@ where
     Ok(())
 }
 
-fn rewrite_window_expressions<F>(window: &mut ast::Window, rewrite_expr: &mut F) -> Result<()>
+pub(crate) fn rewrite_window_expressions<F>(
+    window: &mut ast::Window,
+    rewrite_expr: &mut F,
+) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     for expr in &mut window.partition_by {
         rewrite_expression_tree(expr, rewrite_expr)?;
@@ -1297,7 +1305,7 @@ fn rewrite_frame_bound_expressions<F>(
     rewrite_expr: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
     match frame_bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
@@ -1312,16 +1320,9 @@ where
 
 fn rewrite_expression_tree<F>(expr: &mut ast::Expr, rewrite_expr: &mut F) -> Result<()>
 where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> Result<expr::WalkControl> {
-            rewrite_expr(e)?;
-            Ok(WalkControl::Continue)
-        },
-    )?;
-
+    walk_expr_mut(expr, rewrite_expr)?;
     Ok(())
 }
 
