@@ -208,7 +208,7 @@ pub fn check_statement_privileges(
         }
         ast::Stmt::CreateFunction(create) => create_in_schema_denial(&create.name),
         // The dialect decides who may drop a function, from the owner it
-        // stores.
+        // stores, after it has looked for the function.
         ast::Stmt::DropFunction(_) => return Ok(()),
         ast::Stmt::CreateSchema { .. } => database_denial(Action::Create),
         ast::Stmt::DropSchema { name } => {

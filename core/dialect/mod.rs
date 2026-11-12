@@ -454,6 +454,11 @@ pub trait Dialect: Send + Sync + 'static {
     }
 
     /// Emits the writes that remove the function of `DROP FUNCTION`.
+    ///
+    /// The engine does not check who may drop a function, so the dialect
+    /// must: only the dialect knows if the function exists and who owns it.
+    /// PostgreSQL lets every role run `DROP FUNCTION IF EXISTS` for a
+    /// function that does not exist.
     fn translate_drop_function(
         &self,
         program: &mut ProgramBuilder,

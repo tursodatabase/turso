@@ -88,6 +88,10 @@ pub fn open_schema_table_for_dialect_rows(
 
 /// Inserts the `sqlite_schema` row `(row_type, name, name, 0, sql)` through
 /// the cursor that [`open_schema_table_for_dialect_rows`] opened.
+///
+/// The parser of the dialect must accept `sql`. The engine skips the row
+/// when it loads the schema, but a statement that renames a table or a
+/// column parses the SQL of each row.
 pub fn emit_dialect_schema_row_insert(
     program: &mut ProgramBuilder,
     schema_cursor_id: usize,
