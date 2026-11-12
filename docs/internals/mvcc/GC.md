@@ -80,6 +80,11 @@ No reader needs the store then. The checkpoint skips `GcTableRows` and
 every version and every slot with `clear_row_versions`. This includes the
 versions of an earlier checkpoint that stopped after its pager commit.
 
+Because the store is empty after each checkpoint, each key in it changed since
+the last checkpoint. Such a store does not record dirty keys
+(`records_checkpoint_dirty_keys`): a commit marks none, the checkpoint reads
+every key of the store, and it skips `PruneDirtyKeys`.
+
 ## Materialization stamps
 
 Stamps are **not** applied when a row is handed to the pager. They run in

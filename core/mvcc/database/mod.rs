@@ -7911,6 +7911,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<(usize, usize), TryReserveError> {
         let write_set = tx.write_set.lock();
         let total = write_set.entries.len();
+        if !self.records_checkpoint_dirty_keys() {
+            return Ok((total, total));
+        }
         let end = total.min(from.saturating_add(limit));
         for (key, _) in &write_set.entries[from..end] {
             self.mark_checkpoint_dirty_key(key, stamp)?;
@@ -7950,6 +7953,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub(crate) fn uses_passive_checkpoint(&self) -> bool {
+        self.experimental_mvcc_passive_checkpoint
+    }
+
+    /// True when the store records which keys changed since the last checkpoint.
+    ///
+    /// A blocking checkpoint clears the whole store, so each key in the store changed since
+    /// the last checkpoint. Such a store does not record the keys.
+    pub(crate) fn records_checkpoint_dirty_keys(&self) -> bool {
         self.experimental_mvcc_passive_checkpoint
     }
 

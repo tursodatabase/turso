@@ -1271,7 +1271,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         let mut processed = 0;
         loop {
-            let full_scan = self.full_scan_generation.is_some();
+            let full_scan = self.scans_whole_store();
             let must_yield = match (full_scan, self.collect_table_phase) {
                 (true, CollectTablePhase::DirtyStamps) => {
                     self.record_dirty_stamps(DirtyMap::Table, &mut processed)?
@@ -1284,7 +1284,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             let next_phase = match self.collect_table_phase {
                 CollectTablePhase::Schema => Some(CollectTablePhase::User),
-                CollectTablePhase::User if full_scan => Some(CollectTablePhase::DirtyStamps),
+                CollectTablePhase::User if self.full_scan_generation.is_some() => {
+                    Some(CollectTablePhase::DirtyStamps)
+                }
                 CollectTablePhase::User | CollectTablePhase::DirtyStamps => None,
             };
             match next_phase {
@@ -1296,7 +1298,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
         #[cfg(debug_assertions)]
-        if self.full_scan_generation.is_none() {
+        if !self.scans_whole_store() {
             self.debug_assert_checkpointable_table_keys_are_dirty();
         }
         self.write_set.sort_by_key(|(row_id, _, _)| {
@@ -1308,6 +1310,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         });
         Ok(None)
+    }
+
+    /// The checkpoint reads every key of the store when the store does not record dirty
+    /// keys, or when the store lost a dirty key.
+    fn scans_whole_store(&self) -> bool {
+        !self.mvstore.records_checkpoint_dirty_keys() || self.full_scan_generation.is_some()
     }
 
     fn collect_table_rows_from_store(&mut self, processed: &mut usize) -> Result<bool> {
@@ -1567,7 +1575,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     ///    * The row is a delete AND it exists in the database file already.
     fn collect_index_rows(&mut self) -> Result<Option<IOCompletions>> {
         loop {
-            let full_scan = self.full_scan_generation.is_some();
+            let full_scan = self.scans_whole_store();
             let must_yield = match (full_scan, self.collect_index_phase) {
                 (true, CollectIndexPhase::Rows) => self.collect_index_rows_from_store()?,
                 (true, CollectIndexPhase::DirtyStamps) => {
@@ -1579,14 +1587,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if must_yield {
                 return Ok(Some(IOCompletions(Completion::new_yield())));
             }
-            if full_scan && self.collect_index_phase == CollectIndexPhase::Rows {
+            if self.full_scan_generation.is_some()
+                && self.collect_index_phase == CollectIndexPhase::Rows
+            {
                 self.collect_index_phase = CollectIndexPhase::DirtyStamps;
                 continue;
             }
             break;
         }
         #[cfg(debug_assertions)]
-        if self.full_scan_generation.is_none() {
+        if !self.scans_whole_store() {
             self.debug_assert_checkpointable_index_keys_are_dirty();
         }
         Ok(None)
@@ -2525,7 +2535,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Sample the snapshot only after the stop-the-world lock: no concurrent
                 // commits can land between snapshot_ts and collection on this path.
                 self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
-                self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing with other checkpoints so already-durable
                 // index deletes are not replayed, and keep schema-derived index metadata
@@ -3496,8 +3505,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.state = if self.mvstore.uses_passive_checkpoint() {
                     CheckpointState::GcTableRows { next_index: 0, lwm }
                 } else {
-                    // Finalize clears the whole store, so no row needs a stamp or the chain rules.
-                    CheckpointState::PruneDirtyKeys
+                    // Finalize clears the whole store, so no row needs a stamp or the chain
+                    // rules. The store has no dirty keys to remove.
+                    CheckpointState::Finalize
                 };
                 Ok(TransitionResult::Continue)
             }
@@ -4200,7 +4210,18 @@ mod tests {
 
     fn checkpoint_for_collect_tests(
     ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
-        let db = MvccTestDbNoConn::new();
+        checkpoint_of(MvccTestDbNoConn::new())
+    }
+
+    /// A checkpoint of a store that records dirty keys.
+    fn checkpoint_for_dirty_key_tests(
+    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
+        checkpoint_of(MvccTestDbNoConn::new_passive())
+    }
+
+    fn checkpoint_of(
+        db: MvccTestDbNoConn,
+    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
         let pager = conn.pager.load().clone();
@@ -4685,7 +4706,7 @@ mod tests {
 
     #[test]
     fn collect_table_rows_visits_only_dirty_keys() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
         for rowid in 1..=10 {
@@ -4704,7 +4725,7 @@ mod tests {
 
     #[test]
     fn collect_table_rows_full_scan_visits_every_row() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         checkpoint.full_scan_generation = NonZeroU64::new(1);
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
@@ -4728,7 +4749,7 @@ mod tests {
 
     #[test]
     fn collect_table_rows_tolerates_dirty_key_without_chain() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
         mvstore
@@ -4745,7 +4766,7 @@ mod tests {
 
     #[test]
     fn prune_dirty_keys_keeps_key_marked_again_after_collect() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
         let key = RowID::new(table_id, RowKey::Int(7));
@@ -4765,7 +4786,7 @@ mod tests {
 
     #[test]
     fn collect_index_rows_visits_only_dirty_keys() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let index_id = MVTableId::from(-7);
         let (clean_key, clean_version) = index_row_version("k", 1, 1, Some(1), None, false);
@@ -4831,7 +4852,7 @@ mod tests {
     #[test]
     fn collect_table_rows_finishes_while_rows_are_appended() {
         for full_scan in [false, true] {
-            let mut checkpoint = checkpoint_for_collect_tests();
+            let mut checkpoint = checkpoint_for_dirty_key_tests();
             checkpoint.snapshot_ts = 10;
             checkpoint.full_scan_generation = full_scan.then(|| NonZeroU64::new(1).unwrap());
             let mvstore = checkpoint.mvstore.clone();
@@ -4860,7 +4881,7 @@ mod tests {
     #[test]
     fn collect_index_rows_finishes_while_index_rows_are_appended() {
         for full_scan in [false, true] {
-            let mut checkpoint = checkpoint_for_collect_tests();
+            let mut checkpoint = checkpoint_for_dirty_key_tests();
             checkpoint.snapshot_ts = 10;
             checkpoint.full_scan_generation = full_scan.then(|| NonZeroU64::new(1).unwrap());
             let mvstore = checkpoint.mvstore.clone();
@@ -4890,7 +4911,7 @@ mod tests {
 
     #[test]
     fn prune_dirty_keys_keeps_keys_with_versions_past_the_snapshot() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
         insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
@@ -4939,7 +4960,7 @@ mod tests {
 
     #[test]
     fn prune_dirty_keys_preempts_on_large_map() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
@@ -4961,7 +4982,7 @@ mod tests {
 
     #[test]
     fn dirty_walk_finds_near_and_far_keys_and_skips_missing_chains() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         let mvstore = checkpoint.mvstore.clone();
         let table_id = MVTableId::from(-2);
         for rowid in 1..=200 {
@@ -4990,7 +5011,7 @@ mod tests {
 
     #[test]
     fn full_scan_prunes_dirty_keys_it_covered() {
-        let mut checkpoint = checkpoint_for_collect_tests();
+        let mut checkpoint = checkpoint_for_dirty_key_tests();
         checkpoint.full_scan_generation = NonZeroU64::new(1);
         checkpoint.snapshot_ts = 10;
         let mvstore = checkpoint.mvstore.clone();
