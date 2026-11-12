@@ -246,6 +246,13 @@ impl PostgreSQLTranslator {
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
+            NodeRef::GrantRoleStmt(grant) => {
+                return Err(ParseError::not_supported(if grant.is_grant {
+                    "GRANT of role membership"
+                } else {
+                    "REVOKE of role membership"
+                }))
+            }
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -13706,6 +13713,27 @@ mod tests {
         ] {
             let error = try_extract_grant(&crate::parse(sql).unwrap()).unwrap_err();
             assert_eq!(error.to_string(), message, "{sql}");
+        }
+    }
+
+    #[test]
+    fn grant_and_revoke_of_role_membership_are_not_supported() {
+        for (sql, message) in [
+            ("GRANT admins TO alice", "GRANT of role membership"),
+            ("REVOKE admins FROM alice", "REVOKE of role membership"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            assert_eq!(try_extract_grant(&parsed).unwrap(), None, "{sql}");
+            match PostgreSQLTranslator::new().translate(&parsed) {
+                Err(ParseError::Sqlstate {
+                    sqlstate,
+                    message: got,
+                }) => {
+                    assert_eq!(sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
+                    assert_eq!(got, format!("{message} is not supported"), "{sql}");
+                }
+                other => panic!("{sql}: {other:?}"),
+            }
         }
     }
 }
