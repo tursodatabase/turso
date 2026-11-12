@@ -289,6 +289,10 @@ impl Dialect for PostgresDialect {
         crate::classes::table_rls_enabled(schema, namespace, name)
     }
 
+    fn table_rls_forced(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        crate::classes::table_rls_forced(schema, namespace, name)
+    }
+
     fn row_security_policies<'a>(
         &self,
         schema: &'a Schema,
@@ -588,6 +592,8 @@ impl SnapshotRows for PgClassTable {
             let relchecks = btree.check_constraints.len() as i64;
             let relrowsecurity =
                 i64::from(crate::classes::table_rls_enabled(&schema, *namespace, name));
+            let relforcerowsecurity =
+                i64::from(crate::classes::table_rls_forced(&schema, *namespace, name));
 
             rows.push(vec![
                 Value::from_i64(table_oid),                                     // oid
@@ -613,7 +619,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),              // relhastriggers
                 Value::from_i64(0),              // relhassubclass
                 Value::from_i64(relrowsecurity), // relrowsecurity
-                Value::from_i64(0),              // relforcerowsecurity
+                Value::from_i64(relforcerowsecurity), // relforcerowsecurity
                 Value::from_i64(1),              // relispopulated
                 Value::Text("d".into()),         // relreplident
                 Value::from_i64(0),              // relispartition

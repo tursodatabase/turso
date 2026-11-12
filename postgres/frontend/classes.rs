@@ -76,6 +76,8 @@ pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 /// else has any. `relrowsecurity` is 1 when the table has row-level
 /// security, 0 otherwise. `relpolicies` holds the table's row-level security
 /// policies in the form [`policies`] describes, NULL when it has none.
+/// `relforcerowsecurity` is 1 when the table's row-level security applies to
+/// its owner too.
 const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     oid INTEGER PRIMARY KEY, \
     relname TEXT NOT NULL, \
@@ -85,13 +87,16 @@ const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     relownedby INTEGER NOT NULL, \
     relacl TEXT, \
     relrowsecurity INTEGER NOT NULL DEFAULT 0, \
-    relpolicies TEXT)";
+    relpolicies TEXT, \
+    relforcerowsecurity INTEGER NOT NULL DEFAULT 0)";
 
 const ACL_COLUMN_NAME: &str = "relacl";
 
 const ROW_SECURITY_COLUMN_NAME: &str = "relrowsecurity";
 
 const POLICIES_COLUMN_NAME: &str = "relpolicies";
+
+const FORCE_ROW_SECURITY_COLUMN_NAME: &str = "relforcerowsecurity";
 
 /// Adds `relacl` to a catalog made before it had the column.
 const ADD_ACL_COLUMN_SQL: &str = "ALTER TABLE __turso_internal_classes ADD COLUMN relacl TEXT";
@@ -104,7 +109,11 @@ const ADD_ROW_SECURITY_COLUMN_SQL: &str =
 const ADD_POLICIES_COLUMN_SQL: &str =
     "ALTER TABLE __turso_internal_classes ADD COLUMN relpolicies TEXT";
 
-const CLASS_COLUMN_COUNT: usize = 9;
+/// Adds `relforcerowsecurity` to a catalog made before it had the column.
+const ADD_FORCE_ROW_SECURITY_COLUMN_SQL: &str = "ALTER TABLE __turso_internal_classes \
+     ADD COLUMN relforcerowsecurity INTEGER NOT NULL DEFAULT 0";
+
+const CLASS_COLUMN_COUNT: usize = 10;
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
      ON __turso_internal_classes (relnamespace, relname)";
@@ -152,6 +161,8 @@ pub(crate) struct RelationClass {
     pub(crate) relrowsecurity: bool,
     /// The table's row-level security policies.
     pub(crate) relpolicies: Vec<RowPolicy>,
+    /// Whether the table's row-level security applies to its owner too.
+    pub(crate) relforcerowsecurity: bool,
 }
 
 /// The class rows of a database, loaded as the engine's opaque dialect
@@ -165,7 +176,7 @@ pub(crate) struct ClassCatalog {
 impl ClassCatalog {
     /// Returns a catalog of the rows read from the classes table. Each row is
     /// `(oid, relname, relnamespace, relkind, relowner, relownedby, relacl,
-    /// relrowsecurity, relpolicies)`.
+    /// relrowsecurity, relpolicies, relforcerowsecurity)`.
     fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
@@ -224,6 +235,7 @@ impl ClassCatalog {
                     relacl: None,
                     relrowsecurity: false,
                     relpolicies: Vec::new(),
+                    relforcerowsecurity: false,
                 });
             }
             RelationChange::Drop { namespace, name } => {
@@ -306,6 +318,18 @@ impl ClassCatalog {
                         .relrowsecurity = *enabled;
                 }
             }
+            RelationChange::SetForceRowSecurity {
+                namespace,
+                name,
+                forced,
+            } => {
+                if let Some(oid) = self.oids_by_name.get(&(*namespace, name.to_string())) {
+                    self.by_oid
+                        .get_mut(oid)
+                        .expect("both maps hold the row")
+                        .relforcerowsecurity = *forced;
+                }
+            }
             RelationChange::CreatePolicy {
                 namespace, name, ..
             }
@@ -352,7 +376,7 @@ impl ClassCatalog {
 }
 
 fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
-    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies] =
+    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies, relforcerowsecurity] =
         row
     else {
         return Err(corrupt_row(row));
@@ -365,6 +389,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
         relowner,
         relownedby,
         relrowsecurity,
+        relforcerowsecurity,
     ) {
         (
             Value::Numeric(Numeric::Integer(oid)),
@@ -374,6 +399,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
             Value::Numeric(Numeric::Integer(relowner)),
             Value::Numeric(Numeric::Integer(relownedby)),
             Value::Numeric(Numeric::Integer(relrowsecurity @ (0 | 1))),
+            Value::Numeric(Numeric::Integer(relforcerowsecurity @ (0 | 1))),
         ) if *oid >= FIRST_NORMAL_OBJECT_ID
             && u32::try_from(*relnamespace).is_ok()
             && *relowner >= 0
@@ -406,6 +432,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 relacl,
                 relrowsecurity: *relrowsecurity == 1,
                 relpolicies,
+                relforcerowsecurity: *relforcerowsecurity == 1,
             })
         }
         _ => Err(corrupt_row(row)),
@@ -424,9 +451,9 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
 }
 
 /// [`turso_core::Dialect::schema_state_query`] for the PostgreSQL frontend.
-/// A catalog made before it had `relacl`, `relrowsecurity` or `relpolicies`
-/// and opened read-only, which cannot add them, reads as having no grants,
-/// no row-level security and no policies.
+/// A catalog made before it had `relacl`, `relrowsecurity`, `relpolicies` or
+/// `relforcerowsecurity` and opened read-only, which cannot add them, reads
+/// as having no grants, no row-level security and no policies.
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     let relacl = if has_acl_column(&table) {
@@ -444,9 +471,14 @@ pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     } else {
         "NULL AS relpolicies"
     };
+    let relforcerowsecurity = if has_force_row_security_column(&table) {
+        "relforcerowsecurity"
+    } else {
+        "0 AS relforcerowsecurity"
+    };
     Some(format!(
         "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, {relacl}, \
-         {relrowsecurity}, {relpolicies} FROM {CLASSES_TABLE_NAME}"
+         {relrowsecurity}, {relpolicies}, {relforcerowsecurity} FROM {CLASSES_TABLE_NAME}"
     ))
 }
 
@@ -460,6 +492,10 @@ fn has_row_security_column(table: &BTreeTable) -> bool {
 
 fn has_policies_column(table: &BTreeTable) -> bool {
     table.get_column(POLICIES_COLUMN_NAME).is_some()
+}
+
+fn has_force_row_security_column(table: &BTreeTable) -> bool {
+    table.get_column(FORCE_ROW_SECURITY_COLUMN_NAME).is_some()
 }
 
 /// [`turso_core::Dialect::build_schema_state`] for the PostgreSQL frontend:
@@ -560,6 +596,15 @@ pub(crate) fn table_rls_enabled(schema: &Schema, namespace: NamespaceId, name: &
         .is_some_and(|class| class.relrowsecurity)
 }
 
+/// [`turso_core::Dialect::table_rls_forced`] for the PostgreSQL frontend:
+/// whether the row-level security of table `name` of `namespace` applies to
+/// its owner too, as `pg_class.relforcerowsecurity` shows it.
+pub(crate) fn table_rls_forced(schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+    class_catalog(schema)
+        .and_then(|catalog| catalog.get_by_name(namespace, name))
+        .is_some_and(|class| class.relforcerowsecurity)
+}
+
 /// [`turso_core::Dialect::row_security_policies`] for the PostgreSQL
 /// frontend.
 pub(crate) fn row_security_policies<'a>(
@@ -623,8 +668,9 @@ fn read_back_policies(value: &Value) -> turso_core::Result<Vec<RowPolicy>> {
 /// control list and `REVOKE` takes from it when the owner or a superuser
 /// runs them; anyone else changes nothing, as in PostgreSQL, which only
 /// warns. `ALTER TABLE ... ENABLE ROW
-/// LEVEL SECURITY` sets `relrowsecurity` of the table's row, which a catalog
-/// table does not have (42501).
+/// LEVEL SECURITY` sets `relrowsecurity` of the table's row, and `FORCE ROW
+/// LEVEL SECURITY` its `relforcerowsecurity`, which a catalog table does not
+/// have (42501).
 pub(crate) fn translate_relation_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -642,6 +688,7 @@ pub(crate) fn translate_relation_changes(
                 ..
             } | RelationChange::Grant { .. }
                 | RelationChange::SetRowSecurity { .. }
+                | RelationChange::SetForceRowSecurity { .. }
                 | RelationChange::CreatePolicy { .. }
                 | RelationChange::DropPolicy { .. }
         )
@@ -893,6 +940,23 @@ pub(crate) fn translate_relation_changes(
                 }
                 emit_class_row_set_row_security(program, &cursors, *namespace, name, change);
             }
+            RelationChange::SetForceRowSecurity {
+                namespace,
+                name,
+                forced,
+            } => {
+                let Some(class) =
+                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+                else {
+                    return Err(LimboError::ParseError(format!(
+                        "permission denied: \"{name}\" is a system catalog"
+                    )));
+                };
+                if class.relforcerowsecurity == *forced {
+                    continue;
+                }
+                emit_class_row_set_row_security(program, &cursors, *namespace, name, change);
+            }
             RelationChange::CreatePolicy {
                 namespace,
                 name,
@@ -1078,6 +1142,8 @@ struct ClassTableCursors {
     has_row_security_column: bool,
     /// The same for `relpolicies`.
     has_policies_column: bool,
+    /// The same for `relforcerowsecurity`.
+    has_force_row_security_column: bool,
     /// Only opened when the statement inserts a row, which allocates an oid.
     seq_cursor_id: Option<usize>,
     seq_table: Option<Arc<BTreeTable>>,
@@ -1138,6 +1204,7 @@ fn open_class_table_for_writing(
         has_acl_column: has_acl_column(&table),
         has_row_security_column: has_row_security_column(&table),
         has_policies_column: has_policies_column(&table),
+        has_force_row_security_column: has_force_row_security_column(&table),
         seq_cursor_id,
         seq_table,
     }))
@@ -1232,6 +1299,10 @@ fn emit_class_row_insert(
         dest: first_column_reg + 8,
         dest_end: None,
     });
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: first_column_reg + 9,
+    });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
@@ -1294,6 +1365,7 @@ fn emit_class_row_set_owned_by(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relforcerowsecurity_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1347,6 +1419,7 @@ fn emit_class_row_rename(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relforcerowsecurity_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1389,6 +1462,7 @@ fn emit_class_row_set_owner(
             ClassRecordColumn::Register(acl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relforcerowsecurity_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1425,6 +1499,7 @@ fn emit_class_row_set_acl(
             ClassRecordColumn::Register(acl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relforcerowsecurity_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1435,8 +1510,8 @@ fn emit_class_row_set_acl(
     });
 }
 
-/// Sets `relrowsecurity` of the class row of table `name` of `namespace` as
-/// `change` says.
+/// Sets `relrowsecurity` or `relforcerowsecurity` of the class row of table
+/// `name` of `namespace` as `change` says.
 fn emit_class_row_set_row_security(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -1444,10 +1519,18 @@ fn emit_class_row_set_row_security(
     name: &str,
     change: &RelationChange,
 ) {
-    let RelationChange::SetRowSecurity { enabled, .. } = change else {
-        unreachable!("the caller passes a row-level security change");
-    };
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
+        let (relrowsecurity, relforcerowsecurity) = match change {
+            RelationChange::SetRowSecurity { enabled, .. } => (
+                ClassRecordColumn::LiteralInt(i64::from(*enabled)),
+                ClassRecordColumn::Register(row.relforcerowsecurity_reg),
+            ),
+            RelationChange::SetForceRowSecurity { forced, .. } => (
+                ClassRecordColumn::Register(row.relrowsecurity_reg),
+                ClassRecordColumn::LiteralInt(i64::from(*forced)),
+            ),
+            _ => unreachable!("the caller passes a row-level security change"),
+        };
         let record_reg = emit_class_record(
             program,
             ClassRecordColumn::Literal(name.to_string()),
@@ -1456,8 +1539,9 @@ fn emit_class_row_set_row_security(
             ClassRecordColumn::Register(row.relowner_reg),
             ClassRecordColumn::Register(row.relownedby_reg),
             ClassRecordColumn::Register(row.relacl_reg),
-            ClassRecordColumn::LiteralInt(i64::from(*enabled)),
+            relrowsecurity,
             ClassRecordColumn::Register(row.relpolicies_reg),
+            relforcerowsecurity,
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1500,6 +1584,7 @@ fn emit_class_row_set_policies(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(policies_reg),
+            ClassRecordColumn::Register(row.relforcerowsecurity_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1534,6 +1619,7 @@ struct FoundClassRow {
     relacl_reg: usize,
     relrowsecurity_reg: usize,
     relpolicies_reg: usize,
+    relforcerowsecurity_reg: usize,
 }
 
 /// Scans the classes table for the row of relation `name` of `namespace` and
@@ -1589,6 +1675,7 @@ fn emit_find_class_row(
         relacl_reg: program.alloc_register(),
         relrowsecurity_reg: program.alloc_register(),
         relpolicies_reg: program.alloc_register(),
+        relforcerowsecurity_reg: program.alloc_register(),
     };
     program.emit_insn(Insn::RowId {
         cursor_id: cursors.table_cursor_id,
@@ -1621,6 +1708,14 @@ fn emit_find_class_row(
             dest_end: None,
         });
     }
+    if cursors.has_force_row_security_column {
+        program.emit_column_or_rowid(cursors.table_cursor_id, 9, row.relforcerowsecurity_reg);
+    } else {
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: row.relforcerowsecurity_reg,
+        });
+    }
     found(program, &row);
     program.emit_insn(Insn::Goto { target_pc: done });
 
@@ -1643,8 +1738,8 @@ enum ClassRecordColumn {
 }
 
 /// Builds a class record `(NULL, relname, relnamespace, relkind, relowner,
-/// relownedby, relacl, relrowsecurity, relpolicies)` and returns its
-/// register.
+/// relownedby, relacl, relrowsecurity, relpolicies, relforcerowsecurity)`
+/// and returns its register.
 #[allow(clippy::too_many_arguments)]
 fn emit_class_record(
     program: &mut ProgramBuilder,
@@ -1656,6 +1751,7 @@ fn emit_class_record(
     relacl: ClassRecordColumn,
     relrowsecurity: ClassRecordColumn,
     relpolicies: ClassRecordColumn,
+    relforcerowsecurity: ClassRecordColumn,
 ) -> usize {
     let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
     program.emit_insn(Insn::Null {
@@ -1671,6 +1767,7 @@ fn emit_class_record(
         relacl,
         relrowsecurity,
         relpolicies,
+        relforcerowsecurity,
     ]
     .into_iter()
     .enumerate()
@@ -1831,8 +1928,8 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
 
 /// Creates the classes table, its name index, the `sqlite_sequence` table
 /// and the oid watermark row in one write transaction, unless the table
-/// exists. A table made before it had `relacl`, `relrowsecurity` or
-/// `relpolicies` gets the missing columns. A database
+/// exists. A table made before it had `relacl`, `relrowsecurity`,
+/// `relpolicies` or `relforcerowsecurity` gets the missing columns. A database
 /// that already has relations without the table is refused, and a read-only
 /// open can neither create nor need it: the database is empty. After this
 /// returns, every relation the database will ever hold has a class row from
@@ -1845,7 +1942,8 @@ pub(crate) fn ensure_classes_table(
     if let Some(table) = classes_table(&conn) {
         let has_every_column = has_acl_column(&table)
             && has_row_security_column(&table)
-            && has_policies_column(&table);
+            && has_policies_column(&table)
+            && has_force_row_security_column(&table);
         if has_every_column || read_only {
             return Ok(());
         }
@@ -1924,6 +2022,9 @@ fn add_missing_columns(conn: &Arc<Connection>) -> crate::Result<()> {
     }
     if !has_policies_column(&table) {
         run_internal(conn, ADD_POLICIES_COLUMN_SQL)?;
+    }
+    if !has_force_row_security_column(&table) {
+        run_internal(conn, ADD_FORCE_ROW_SECURITY_COLUMN_SQL)?;
     }
     Ok(())
 }

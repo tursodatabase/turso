@@ -9,6 +9,8 @@
 ```sql
 ALTER TABLE name ENABLE ROW LEVEL SECURITY
 ALTER TABLE name DISABLE ROW LEVEL SECURITY
+ALTER TABLE name FORCE ROW LEVEL SECURITY
+ALTER TABLE name NO FORCE ROW LEVEL SECURITY
 ```
 
 **Description:**
@@ -25,6 +27,13 @@ joins, subqueries, common table expressions, views and `COPY ... TO STDOUT`.
 In a `LEFT JOIN`, the columns of a row the role may not see read as NULL.
 The policies also limit which rows the role may insert, update and delete.
 Superusers and the table's owner see and write every row.
+
+`FORCE ROW LEVEL SECURITY` makes row-level security apply to the table's
+owner too, so the owner sees no rows either and cannot insert any, as in
+PostgreSQL. `NO FORCE ROW LEVEL SECURITY` undoes it. The
+`relforcerowsecurity` column of `pg_class` shows which tables force it.
+Forcing has no effect while row-level security is disabled, and superusers
+see every row either way.
 
 **Parameters:**
 
@@ -51,11 +60,9 @@ for a table that does not, does nothing. Renaming a table keeps its row-level
 security, and a new table created with the name of a dropped table starts
 without it.
 
-Only the owner of a table or a superuser may enable or disable its row-level
-security.
-
-`FORCE ROW LEVEL SECURITY` and `NO FORCE ROW LEVEL SECURITY` are not
-supported.
+Only the owner of a table or a superuser may enable, disable, force or stop
+forcing its row-level security. Disabling row-level security keeps the
+table forced, as in PostgreSQL.
 
 **Examples:**
 

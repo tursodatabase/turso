@@ -80,6 +80,13 @@ pub enum RelationChange {
         name: String,
         enabled: bool,
     },
+    /// `ALTER TABLE ... FORCE ROW LEVEL SECURITY`, or `NO FORCE` when
+    /// `forced` is false.
+    SetForceRowSecurity {
+        namespace: NamespaceId,
+        name: String,
+        forced: bool,
+    },
     /// `CREATE POLICY` on table `name`. Its expressions refer to the
     /// table's columns by their unqualified names.
     CreatePolicy {
@@ -403,6 +410,7 @@ pub trait Dialect: Send + Sync + 'static {
                     )));
                 }
                 RelationChange::SetRowSecurity { .. }
+                | RelationChange::SetForceRowSecurity { .. }
                 | RelationChange::CreatePolicy { .. }
                 | RelationChange::DropPolicy { .. } => {
                     return Err(LimboError::ParseError(
@@ -468,6 +476,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// Whether table `name` of `namespace` has row-level security enabled.
     /// A dialect without row-level security never has it enabled.
     fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        let _ = (schema, namespace, name);
+        false
+    }
+
+    /// Whether the row-level security of table `name` of `namespace`
+    /// applies to the table's owner too, as `FORCE ROW LEVEL SECURITY` sets.
+    fn table_rls_forced(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
         let _ = (schema, namespace, name);
         false
     }

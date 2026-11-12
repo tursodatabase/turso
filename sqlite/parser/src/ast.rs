@@ -1525,6 +1525,10 @@ pub enum AlterTableBody {
     EnableRowSecurity,
     /// `DISABLE ROW LEVEL SECURITY`
     DisableRowSecurity,
+    /// `FORCE ROW LEVEL SECURITY`
+    ForceRowSecurity,
+    /// `NO FORCE ROW LEVEL SECURITY`
+    NoForceRowSecurity,
 }
 
 /// What kind of relation a schema object is. `ALTER ... OWNER TO` names

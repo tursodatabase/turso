@@ -1757,6 +1757,11 @@ impl ToTokens for AlterTableBody {
             }
             Self::EnableRowSecurity => row_security_to_tokens(s, "ENABLE"),
             Self::DisableRowSecurity => row_security_to_tokens(s, "DISABLE"),
+            Self::ForceRowSecurity => row_security_to_tokens(s, "FORCE"),
+            Self::NoForceRowSecurity => {
+                s.append(TK_NO, None)?;
+                row_security_to_tokens(s, "FORCE")
+            }
         }
     }
 }
@@ -1886,9 +1891,9 @@ impl ToTokens for CreatePolicy {
 /// `ENABLE ROW LEVEL SECURITY` or `DISABLE ROW LEVEL SECURITY`.
 fn row_security_to_tokens<S: TokenStream + ?Sized>(
     s: &mut S,
-    enable_or_disable: &str,
+    action: &str,
 ) -> Result<(), S::Error> {
-    for word in [enable_or_disable, "ROW", "LEVEL", "SECURITY"] {
+    for word in [action, "ROW", "LEVEL", "SECURITY"] {
         s.append(TK_ID, Some(word))?;
     }
     Ok(())

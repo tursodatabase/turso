@@ -1218,12 +1218,8 @@ impl PostgreSQLTranslator {
             }
             AlterTableType::AtEnableRowSecurity => ast::AlterTableBody::EnableRowSecurity,
             AlterTableType::AtDisableRowSecurity => ast::AlterTableBody::DisableRowSecurity,
-            AlterTableType::AtForceRowSecurity => {
-                return Err(not_supported("ALTER TABLE ... FORCE ROW LEVEL SECURITY"));
-            }
-            AlterTableType::AtNoForceRowSecurity => {
-                return Err(not_supported("ALTER TABLE ... NO FORCE ROW LEVEL SECURITY"));
-            }
+            AlterTableType::AtForceRowSecurity => ast::AlterTableBody::ForceRowSecurity,
+            AlterTableType::AtNoForceRowSecurity => ast::AlterTableBody::NoForceRowSecurity,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "ALTER TABLE {} is not supported",

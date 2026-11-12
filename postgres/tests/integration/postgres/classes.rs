@@ -487,10 +487,18 @@ fn write_catalog_without_relpolicies(path: &str) {
     write_old_catalog(path, "relrowsecurity");
 }
 
+/// Writes a database at `path` with the catalog as tursopg made it before
+/// FORCE ROW LEVEL SECURITY: `relpolicies` but no `relforcerowsecurity`.
+/// The table `app.t` has row-level security.
+fn write_catalog_without_relforcerowsecurity(path: &str) {
+    write_old_catalog(path, "relpolicies");
+}
+
 /// Writes a database at `path` with a catalog that has the columns of the
 /// first catalog and the later ones up to `last_column`: none for "",
-/// `relacl`, or `relacl` and `relrowsecurity`. It has a class row for the
-/// table `app.t`, written by hand.
+/// `relacl`, `relacl` and `relrowsecurity`, or those and `relpolicies`, when
+/// `app.t` has row-level security. It has a class row for the table `app.t`,
+/// written by hand.
 fn write_old_catalog(path: &str, last_column: &str) {
     let db = open_without_catalog(path);
     let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
@@ -502,6 +510,10 @@ fn write_old_catalog(path: &str, last_column: &str) {
         "relrowsecurity" => (
             ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0",
             ", NULL, 0",
+        ),
+        "relpolicies" => (
+            ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0, relpolicies TEXT",
+            ", NULL, 1, NULL",
         ),
         _ => unreachable!("unknown catalog column {last_column}"),
     };
@@ -726,6 +738,67 @@ fn a_catalog_made_before_relpolicies_opens_read_only_without_the_column() {
     assert!(!relrowsecurity(&pg, "t"));
     let error = pg
         .execute("CREATE POLICY one ON app.t USING (x = 1)")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("readonly"), "{error}");
+}
+
+/// Whether the row-level security of `relname` applies to its owner too, as
+/// `pg_class.relforcerowsecurity` shows it.
+fn relforcerowsecurity(conn: &turso_pg::Connection, relname: &str) -> bool {
+    let rows = conn
+        .query(format!(
+            "SELECT relforcerowsecurity FROM pg_class WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    rows[0][0].as_int() == Some(1)
+}
+
+#[test]
+fn a_catalog_made_before_relforcerowsecurity_gets_the_column_when_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relforcerowsecurity.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relforcerowsecurity(path);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    assert!(relrowsecurity(&pg, "t"));
+    assert!(!relforcerowsecurity(&pg, "t"));
+
+    pg.execute("ALTER TABLE app.t FORCE ROW LEVEL SECURITY")
+        .unwrap();
+    assert!(relforcerowsecurity(&pg, "t"));
+    pg.close().unwrap();
+    drop(pg);
+    drop(db);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    assert!(relrowsecurity(&pg, "t"));
+    assert!(relforcerowsecurity(&pg, "t"));
+}
+
+#[test]
+fn a_catalog_made_before_relforcerowsecurity_opens_read_only_without_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relforcerowsecurity-read-only.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relforcerowsecurity(path);
+
+    let db = open_pg_database(
+        path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+
+    assert!(relrowsecurity(&pg, "t"));
+    assert!(!relforcerowsecurity(&pg, "t"));
+    let error = pg
+        .execute("ALTER TABLE app.t FORCE ROW LEVEL SECURITY")
         .unwrap_err()
         .to_string();
     assert!(error.contains("readonly"), "{error}");
