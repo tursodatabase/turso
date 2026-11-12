@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use turso_core::{
     ConnectAsyncState, ConnectOpts, Connection, Database, IOResult, LimboError, OpenDbAsyncState,
-    OpenOptions, Statement, Value, IO,
+    OpenOptions, ReparseSchemaState, Statement, IO,
 };
 
 /// Opens a PostgreSQL database and initializes its catalog before returning it.
@@ -73,10 +73,7 @@ pub fn open_database_async(
                 let conn = state.conn.as_ref().unwrap();
                 if state.statement.is_none() {
                     let Some(sql) = state.queries.pop_front() else {
-                        state.queries =
-                            crate::schema_state::schema_state_queries(&conn.current_schema())
-                                .into();
-                        state.phase = OpenPhase::Reading;
+                        state.phase = OpenPhase::Reloading;
                         continue;
                     };
                     state.statement = Some(conn.prepare_engine_schema_statement(&sql)?);
@@ -92,35 +89,14 @@ pub fn open_database_async(
                 };
                 state.statement = None;
             }
-            OpenPhase::Reading => {
+            OpenPhase::Reloading => {
                 let conn = state.conn.as_ref().unwrap();
-                if state.statement.is_none() {
-                    let Some(sql) = state.queries.pop_front() else {
-                        let catalog = crate::schema_state::build_schema_state(
-                            &conn.current_schema(),
-                            &state.results,
-                        )?;
-                        conn.with_schema_mut(|schema| schema.dialect_schema = Some(catalog))?;
-                        state.statement = Some(conn.prepare_engine_schema_statement("COMMIT")?);
-                        state.phase = OpenPhase::Committing;
-                        continue;
-                    };
-                    state.statement = Some(conn.prepare_engine_schema_statement(&sql)?);
-                }
-                let rows = &mut state.rows;
-                match state
-                    .statement
-                    .as_mut()
-                    .unwrap()
-                    .run_with_row_callback_nonblock(|row| {
-                        rows.push(row.get_values().cloned().collect());
-                        Ok(())
-                    })? {
-                    IOResult::Done(value) => value,
+                match conn.reparse_schema_nonblock(&mut state.reparse)? {
+                    IOResult::Done(()) => {}
                     IOResult::IO(completions) => return Ok(IOResult::IO(completions)),
-                };
-                state.statement = None;
-                state.results.push(std::mem::take(&mut state.rows));
+                }
+                state.statement = Some(conn.prepare_engine_schema_statement("COMMIT")?);
+                state.phase = OpenPhase::Committing;
             }
             OpenPhase::Committing => {
                 match state
@@ -151,8 +127,7 @@ pub struct OpenDatabaseState {
     conn: Option<Arc<Connection>>,
     statement: Option<Statement>,
     queries: VecDeque<String>,
-    rows: Vec<Vec<Value>>,
-    results: Vec<Vec<Vec<Value>>>,
+    reparse: ReparseSchemaState,
 }
 
 #[derive(Default)]
@@ -162,7 +137,7 @@ enum OpenPhase {
     Connecting,
     Beginning,
     Initializing,
-    Reading,
+    Reloading,
     Committing,
     Done,
 }

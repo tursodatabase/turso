@@ -1476,9 +1476,10 @@ impl Connection {
         })
     }
 
-    /// Non-blocking schema reparse. Reads the current schema cookie, then drives
-    /// the schema rebuild via the shared [`ReparseSchemaState`].
-    pub(crate) fn reparse_schema_nonblock(
+    /// Rebuilds this connection's schema, including dialect metadata, without
+    /// blocking. Preserve `state` across I/O yields and resume on this connection.
+    /// An active schema transaction publishes the rebuilt schema when it commits.
+    pub fn reparse_schema_nonblock(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
     ) -> crate::types::IOResultOr<()> {

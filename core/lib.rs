@@ -125,7 +125,9 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, ReparseSchemaState, Row, StepResult, SymbolTable,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 pub use database::is_memory_like;
