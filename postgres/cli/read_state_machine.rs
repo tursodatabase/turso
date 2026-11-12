@@ -1,6 +1,13 @@
-use std::ops::ControlFlow;
-
 use itertools::Itertools;
+
+/// Whether the input read so far is a complete statement. The input comes
+/// in pieces, such as lines, and a quoted string or a comment can start in
+/// one piece and end in a later one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadState {
+    statement: StatementState,
+    quote: Quote,
+}
 
 /// State machine for determining if a SQL statement is complete.
 /// Based on SQLite's `sqlite3_complete()` from src/complete.c
@@ -9,7 +16,7 @@ use itertools::Itertools;
 /// in their body but should only be considered complete when the
 /// `;END;` pattern is seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReadState {
+enum StatementState {
     /// No non-whitespace seen yet (initial state)
     #[default]
     Invalid,
@@ -29,6 +36,27 @@ pub enum ReadState {
     End,
 }
 
+/// The quoted string or comment that the input read so far ends inside.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Quote {
+    #[default]
+    None,
+    /// A string or identifier that the character `end` closes.
+    Delimited {
+        end: char,
+    },
+    /// A dollar-quoted string that `tag`, such as `$$` or `$body$`, closes.
+    /// `matched` is how many characters of the tag the input ends with.
+    Dollar {
+        tag: Vec<char>,
+        matched: usize,
+    },
+    LineComment,
+    BlockComment {
+        after_star: bool,
+    },
+}
+
 /// Token types recognized by the state machine
 #[expect(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,128 +71,102 @@ enum Token {
     TkEnd,
 }
 
-struct Tokenizer<'a> {
-    chars: std::iter::Peekable<std::str::Chars<'a>>,
-}
-
-impl<'a> Tokenizer<'a> {
-    fn new(chars: std::iter::Peekable<std::str::Chars<'a>>) -> Self {
-        Self { chars }
-    }
-
-    /// Read an identifier/keyword and classify it
-    fn read_keyword(&mut self, first: char) -> Token {
-        let word: String = std::iter::once(first)
-            .chain(
-                self.chars
-                    .peeking_take_while(|c| c.is_ascii_alphanumeric() || *c == '_'),
-            )
-            .collect();
-
-        match word.to_ascii_uppercase().as_str() {
-            "EXPLAIN" => Token::TkExplain,
-            "CREATE" => Token::TkCreate,
-            "TEMP" | "TEMPORARY" => Token::TkTemp,
-            "TRIGGER" => Token::TkTrigger,
-            "END" => Token::TkEnd,
-            _ => Token::TkOther,
-        }
-    }
-}
-
-impl<'a> Iterator for Tokenizer<'a> {
-    type Item = Token;
-
-    fn next(&mut self) -> Option<Token> {
-        loop {
-            let c = self.chars.next()?;
-
-            let token = match c {
-                '\'' | '"' | '`' | '[' => {
-                    let end_char = if c == '[' { ']' } else { c };
-                    // Consumes all tokens between the delimeters
-                    self.chars
-                        .by_ref()
-                        .take_while_inclusive(|&ch| ch != end_char)
-                        .for_each(drop);
-                    continue;
-                }
-                '$' => {
-                    // Try to read a dollar-quote tag: $<optional_ident>$
-                    let mut tag = String::from('$');
-                    let is_dollar_quote = loop {
-                        match self.chars.peek() {
-                            Some(&'$') => {
-                                tag.push(self.chars.next().unwrap());
-                                break true;
-                            }
-                            Some(&ch)
-                                if ch == '_'
-                                    || ch.is_ascii_alphabetic()
-                                    || (tag.len() > 1 && ch.is_ascii_digit()) =>
-                            {
-                                tag.push(self.chars.next().unwrap());
-                            }
-                            _ => break false, // bare $ or $1 etc.
-                        }
-                    };
-                    if is_dollar_quote {
-                        // Consume everything until the matching closing tag
-                        let tag_bytes = tag.as_bytes();
-                        let tag_len = tag_bytes.len();
-                        let mut buf = Vec::new();
-                        for ch in self.chars.by_ref() {
-                            buf.push(ch as u8);
-                            if buf.len() >= tag_len && buf[buf.len() - tag_len..] == *tag_bytes {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    // Not a dollar-quote (e.g. $1 positional param) — treat as other
-                    Token::TkOther
-                }
-                // Handle Comments
-                '-' if self.chars.peek() == Some(&'-') => {
-                    self.chars.next(); // Consume second `-`
-                                       // Consume until you find a new line
-                    self.chars.by_ref().find(|&ch| ch == '\n');
-                    continue;
-                }
-                '/' if self.chars.peek() == Some(&'*') => {
-                    // Consumes until you find a `*/`
-                    let _ = self.chars.by_ref().try_fold(false, |saw_star, c| {
-                        if saw_star && c == '/' {
-                            ControlFlow::Break(())
-                        } else {
-                            ControlFlow::Continue(c == '*')
-                        }
-                    });
-                    continue;
-                }
-                ';' => Token::TkSemi,
-                c if c.is_ascii_whitespace() => Token::TkWhitespace,
-                c if c.is_ascii_alphabetic() || c == '_' => self.read_keyword(c),
-                _ => Token::TkOther,
-            };
-
-            break Some(token);
-        }
-    }
-}
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
 impl ReadState {
     /// Returns true if the state machine is in a "complete" state,
     /// meaning the accumulated SQL forms a complete statement.
     pub fn is_complete(&self) -> bool {
-        matches!(self, ReadState::Start)
+        // A line comment that the input ends inside cannot hide a semicolon
+        // that is still to come.
+        matches!(self.quote, Quote::None | Quote::LineComment)
+            && self.statement == StatementState::Start
     }
 
+    /// Reads the next piece of the input.
+    pub fn process(&mut self, sql: &str) {
+        let mut chars = sql.chars().peekable();
+        while self.skip_quote(&mut chars) {
+            let Some(c) = chars.next() else {
+                return;
+            };
+            let token = match c {
+                '\'' | '"' | '`' => {
+                    self.quote = Quote::Delimited { end: c };
+                    continue;
+                }
+                '[' => {
+                    self.quote = Quote::Delimited { end: ']' };
+                    continue;
+                }
+                '$' => match read_dollar_tag(&mut chars) {
+                    Some(tag) => {
+                        self.quote = Quote::Dollar { tag, matched: 0 };
+                        continue;
+                    }
+                    // Not a dollar-quote (e.g. $1 positional param) — treat as other
+                    None => Token::TkOther,
+                },
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    self.quote = Quote::LineComment;
+                    continue;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    self.quote = Quote::BlockComment { after_star: false };
+                    continue;
+                }
+                ';' => Token::TkSemi,
+                c if c.is_ascii_whitespace() => Token::TkWhitespace,
+                c if c.is_ascii_alphabetic() || c == '_' => read_keyword(c, &mut chars),
+                _ => Token::TkOther,
+            };
+            self.statement = self.statement.transition(token);
+        }
+    }
+
+    /// Reads to the end of the quoted string or comment that the input is
+    /// inside, if any. Returns false when the input ends first.
+    fn skip_quote(&mut self, chars: &mut Chars<'_>) -> bool {
+        while self.quote != Quote::None {
+            let Some(c) = chars.next() else {
+                return false;
+            };
+            let closed = match &mut self.quote {
+                Quote::None => unreachable!("the loop runs only inside a quote"),
+                Quote::Delimited { end } => c == *end,
+                Quote::LineComment => c == '\n',
+                Quote::BlockComment { after_star } => {
+                    let closed = *after_star && c == '/';
+                    *after_star = c == '*';
+                    closed
+                }
+                Quote::Dollar { tag, matched } => {
+                    // Only the first and the last character of a tag are
+                    // `$`, so a mismatch can start a new match only at a `$`.
+                    if c == tag[*matched] {
+                        *matched += 1;
+                    } else {
+                        *matched = usize::from(c == '$');
+                    }
+                    *matched == tag.len()
+                }
+            };
+            if closed {
+                self.quote = Quote::None;
+            }
+        }
+        true
+    }
+}
+
+impl StatementState {
     // Copied form SQLite
     /// Process a single character and return the new state.
     /// This should be called for each character in the input.
-    fn transition(&self, token: Token) -> ReadState {
-        use ReadState::*;
+    fn transition(self, token: Token) -> StatementState {
+        use StatementState::*;
         use Token::*;
 
         match (self, token) {
@@ -230,13 +232,44 @@ impl ReadState {
             (End, _) => Trigger, // false alarm
         }
     }
+}
 
-    /// Process a SQL string and update the state.
-    /// Returns the new state after processing all input.
-    pub fn process(&mut self, sql: &str) {
-        let chars = sql.chars().peekable();
+/// Read an identifier/keyword and classify it
+fn read_keyword(first: char, chars: &mut Chars<'_>) -> Token {
+    let word: String = std::iter::once(first)
+        .chain(chars.peeking_take_while(|c| c.is_ascii_alphanumeric() || *c == '_'))
+        .collect();
 
-        *self = Tokenizer::new(chars).fold(*self, |state, token| state.transition(token));
+    match word.to_ascii_uppercase().as_str() {
+        "EXPLAIN" => Token::TkExplain,
+        "CREATE" => Token::TkCreate,
+        "TEMP" | "TEMPORARY" => Token::TkTemp,
+        "TRIGGER" => Token::TkTrigger,
+        "END" => Token::TkEnd,
+        _ => Token::TkOther,
+    }
+}
+
+/// Reads the rest of a dollar-quote tag after its first `$`, such as `$` or
+/// `body$`, and returns the whole tag. Returns None when the `$` does not
+/// start a tag, as in the parameter `$1`.
+fn read_dollar_tag(chars: &mut Chars<'_>) -> Option<Vec<char>> {
+    let mut tag = vec!['$'];
+    loop {
+        match chars.peek() {
+            Some(&'$') => {
+                tag.push(chars.next().unwrap());
+                return Some(tag);
+            }
+            Some(&ch)
+                if ch == '_'
+                    || ch.is_ascii_alphabetic()
+                    || (tag.len() > 1 && ch.is_ascii_digit()) =>
+            {
+                tag.push(chars.next().unwrap());
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -429,6 +462,45 @@ mod tests {
         // Positional params are not dollar-quotes
         assert!(is_complete("SELECT $1;"));
         assert!(!is_complete("SELECT $1"));
+    }
+
+    /// Whether the input is complete after each of `pieces`, read one
+    /// after the other.
+    fn is_complete_after_each(pieces: &[&str]) -> Vec<bool> {
+        let mut state = ReadState::default();
+        pieces
+            .iter()
+            .map(|piece| {
+                state.process(piece);
+                state.is_complete()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_quote_over_several_pieces() {
+        assert_eq!(
+            is_complete_after_each(&["SELECT 'a\n", "b;\n", "c';\n"]),
+            [false, false, true]
+        );
+        assert_eq!(
+            is_complete_after_each(&["SELECT $body$a\n", "b;\n", "$body;$\n", "$body$;\n"]),
+            [false, false, false, true]
+        );
+        assert_eq!(
+            is_complete_after_each(&["SELECT 1 /* a\n", "b; */\n", ";\n"]),
+            [false, false, true]
+        );
+        assert_eq!(
+            is_complete_after_each(&["SELECT 1 -- a;\n", ";\n"]),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn test_dollar_tag_after_a_partial_match() {
+        assert!(is_complete("SELECT $a$x$$a$;"));
+        assert!(!is_complete("SELECT $ab$x$a$;"));
     }
 }
 

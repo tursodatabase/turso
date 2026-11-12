@@ -930,11 +930,12 @@ impl Repl {
                     }
 
                     self.interrupt_count.store(0, Ordering::Release);
-                    self.read_state.process(&line);
+                    let prev_len = self.input_buf.len();
                     self.input_buf.push_str(&line);
                     if !self.input_buf.ends_with(char::is_whitespace) {
                         self.input_buf.push('\n');
                     }
+                    self.read_state.process(&self.input_buf[prev_len..]);
                     self.consume(false);
                 }
                 Err(ReadlineError::Interrupted) => {
