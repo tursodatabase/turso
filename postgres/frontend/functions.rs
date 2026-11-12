@@ -1622,109 +1622,279 @@ fn validate_json_braces(s: &str) -> bool {
 
 /// Format a number using PG's to_char numeric format patterns.
 fn pg_to_char_numeric(num: f64, format: &str) -> String {
+    if format.is_empty() {
+        return String::new();
+    }
+
+    enum FormatToken {
+        Digit { fraction: bool, slot: usize },
+        Literal(String),
+        Decimal,
+        Group,
+        Exponent,
+        Sign,
+        Minus,
+        Pr,
+    }
+
     let is_negative = num < 0.0;
     let abs_num = num.abs();
 
-    // Parse format string for flags
-    let upper_fmt = format.to_uppercase();
-    let fm = upper_fmt.contains("FM"); // fill mode (suppress padding)
-    let has_pr = upper_fmt.contains("PR"); // angle brackets for negative
-    let has_s = upper_fmt.contains('S'); // sign
-    let has_mi = upper_fmt.starts_with("MI") || upper_fmt.ends_with("MI");
+    let chars: Vec<char> = format.chars().collect();
+    let mut tokens = Vec::new();
+    let mut fm = false;
+    let mut scientific = false;
+    let mut in_fraction = false;
+    let mut integer_zero = Vec::new();
+    let mut fraction_zero = Vec::new();
+    let mut index = 0;
 
-    // Count digit positions
-    let mut integer_digits = 0;
-    let mut decimal_digits = 0;
-    let mut leading_zeros = 0;
-    let mut seen_dot = false;
-
-    for ch in upper_fmt.chars() {
-        match ch {
-            '9' => {
-                if seen_dot {
-                    decimal_digits += 1;
+    while index < chars.len() {
+        if chars[index] == '"' {
+            index += 1;
+            let mut literal = String::new();
+            while index < chars.len() {
+                if chars[index] == '"' {
+                    if chars.get(index + 1) == Some(&'"') {
+                        literal.push('"');
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
                 } else {
-                    integer_digits += 1;
+                    literal.push(chars[index]);
+                    index += 1;
                 }
             }
-            '0' => {
-                if seen_dot {
-                    decimal_digits += 1;
+            tokens.push(FormatToken::Literal(literal));
+            continue;
+        }
+
+        if matches_at(&chars, index, "FM") {
+            fm = true;
+            index += 2;
+            continue;
+        }
+        if matches_at(&chars, index, "EEEE") {
+            scientific = true;
+            tokens.push(FormatToken::Exponent);
+            index += 4;
+            continue;
+        }
+        if matches_at(&chars, index, "MI") {
+            tokens.push(FormatToken::Minus);
+            index += 2;
+            continue;
+        }
+        if matches_at(&chars, index, "PR") {
+            tokens.push(FormatToken::Pr);
+            index += 2;
+            continue;
+        }
+
+        match chars[index].to_ascii_uppercase() {
+            '9' | '0' => {
+                let zero = chars[index] == '0';
+                let slot = if in_fraction {
+                    let slot = fraction_zero.len();
+                    fraction_zero.push(zero);
+                    slot
                 } else {
-                    integer_digits += 1;
-                    leading_zeros += 1;
-                }
+                    let slot = integer_zero.len();
+                    integer_zero.push(zero);
+                    slot
+                };
+                tokens.push(FormatToken::Digit {
+                    fraction: in_fraction,
+                    slot,
+                });
+                index += 1;
             }
-            'D' | '.' => seen_dot = true,
-            _ => {}
+            'D' | '.' => {
+                in_fraction = true;
+                tokens.push(FormatToken::Decimal);
+                index += 1;
+            }
+            'G' | ',' => {
+                tokens.push(FormatToken::Group);
+                index += 1;
+            }
+            'S' => {
+                tokens.push(FormatToken::Sign);
+                index += 1;
+            }
+            _ => index += 1,
         }
     }
 
-    if integer_digits == 0 && decimal_digits == 0 {
-        return format!("{num}");
-    }
-
-    // Format the number
-    let formatted = if decimal_digits > 0 {
-        let prec = decimal_digits;
-        format!("{abs_num:.prec$}")
-    } else {
-        let int_val = abs_num as i64;
-        format!("{int_val}")
-    };
-
-    // Split into integer and decimal parts
-    let parts: Vec<&str> = formatted.split('.').collect();
-    let int_part = parts[0];
-    let dec_part = if parts.len() > 1 { parts[1] } else { "" };
-
-    // Pad integer part
-    let padded_int = if !fm {
-        let width = integer_digits.max(int_part.len());
-        if leading_zeros > 0 {
-            format!("{int_part:0>width$}")
+    let decimal_digits = fraction_zero.len();
+    let (int_part, dec_part, exponent_part) = if scientific {
+        let mut exponent = if abs_num == 0.0 {
+            0
         } else {
-            format!("{int_part:>width$}")
-        }
-    } else {
-        int_part.to_string()
-    };
-
-    // Build result
-    let mut result = if decimal_digits > 0 {
-        format!("{padded_int}.{dec_part}")
-    } else {
-        padded_int
-    };
-
-    // Add sign
-    if has_pr {
-        result = if is_negative {
-            format!("<{result}>")
-        } else {
-            format!(" {result} ")
+            abs_num.log10().floor() as i32
         };
-    } else if has_s {
-        let sign_pos = upper_fmt.find('S').unwrap_or(0);
-        let sign = if is_negative { "-" } else { "+" };
-        if sign_pos == 0 {
-            result = format!("{sign}{result}");
+        let mut mantissa = if abs_num == 0.0 {
+            0.0
         } else {
-            result = format!("{result}{sign}");
+            abs_num / 10_f64.powi(exponent)
+        };
+        let precision = decimal_digits;
+        let mut mantissa_text = format!("{mantissa:.precision$}");
+        if mantissa_text.split('.').next().unwrap_or_default().len() > 1 {
+            exponent += 1;
+            mantissa = 1.0;
+            mantissa_text = format!("{mantissa:.precision$}");
         }
-    } else if has_mi {
-        if is_negative {
-            result = format!("{result}-");
-        } else {
-            result = format!("{result} ");
-        }
-    } else if is_negative {
-        result = format!("-{result}");
+        let (int_part, dec_part) = mantissa_text
+            .split_once('.')
+            .map_or((mantissa_text.as_str(), ""), |parts| parts);
+        (
+            int_part.to_string(),
+            dec_part.to_string(),
+            format!(
+                "e{}{:02}",
+                if exponent >= 0 { '+' } else { '-' },
+                exponent.abs()
+            ),
+        )
     } else {
-        result = format!(" {result}");
+        let rounded = format!("{abs_num:.decimal_digits$}");
+        let (int_part, dec_part) = rounded
+            .split_once('.')
+            .map_or((rounded.as_str(), ""), |parts| parts);
+        (int_part.to_string(), dec_part.to_string(), String::new())
+    };
+
+    let int_chars: Vec<char> = int_part.chars().collect();
+    let dec_chars: Vec<char> = dec_part.chars().collect();
+    let integer_values: Vec<char> = integer_zero
+        .iter()
+        .enumerate()
+        .map(|(slot, zero)| {
+            let first_digit_slot = integer_zero.len().saturating_sub(int_chars.len());
+            let source = if slot < first_digit_slot {
+                None
+            } else {
+                let source = if int_chars.len() > integer_zero.len() {
+                    int_chars.len() - integer_zero.len() + slot
+                } else {
+                    slot - first_digit_slot
+                };
+                int_chars.get(source).copied()
+            };
+            source.unwrap_or(if *zero { '0' } else { ' ' })
+        })
+        .collect();
+    let fraction_values: Vec<char> = fraction_zero
+        .iter()
+        .enumerate()
+        .map(|(slot, _)| dec_chars.get(slot).copied().unwrap_or('0'))
+        .collect();
+
+    let has_sign = tokens.iter().any(|token| {
+        matches!(
+            token,
+            FormatToken::Sign | FormatToken::Minus | FormatToken::Pr
+        )
+    });
+    let has_pr = tokens.iter().any(|token| matches!(token, FormatToken::Pr));
+    let mut result = String::new();
+    let mut integer_slot = 0;
+    let mut fraction_slot = 0;
+    let mut started_digit = false;
+    let mut seen_digit = false;
+    let mut pending_sign = false;
+    let sign = if is_negative { '-' } else { '+' };
+
+    for token in tokens {
+        match token {
+            FormatToken::Digit { fraction, slot } => {
+                if !started_digit {
+                    started_digit = true;
+                    if !has_sign {
+                        if is_negative {
+                            result.push('-');
+                        } else if !fm {
+                            result.push(' ');
+                        }
+                    }
+                }
+                let digit = if fraction {
+                    fraction_values[fraction_slot]
+                } else {
+                    integer_values[integer_slot]
+                };
+                if fraction {
+                    fraction_slot = slot + 1;
+                } else {
+                    integer_slot = slot + 1;
+                }
+                if pending_sign && digit != ' ' {
+                    result.push(sign);
+                    pending_sign = false;
+                }
+                if !(fm && digit == ' ' && !seen_digit) {
+                    result.push(digit);
+                }
+                seen_digit |= digit != ' ';
+            }
+            FormatToken::Literal(literal) => result.push_str(&literal),
+            FormatToken::Decimal => result.push('.'),
+            FormatToken::Group => {
+                let left = integer_values[..integer_slot]
+                    .iter()
+                    .any(|digit| *digit != ' ');
+                let right = integer_values[integer_slot..]
+                    .iter()
+                    .any(|digit| *digit != ' ');
+                if left && right {
+                    result.push(',');
+                } else if !fm {
+                    result.push(' ');
+                }
+            }
+            FormatToken::Exponent => result.push_str(&exponent_part),
+            FormatToken::Sign => {
+                if started_digit {
+                    result.push(sign);
+                } else {
+                    pending_sign = true;
+                }
+            }
+            FormatToken::Minus => {
+                if is_negative {
+                    result.push('-');
+                } else if !fm {
+                    result.push(' ');
+                }
+            }
+            FormatToken::Pr => {}
+        }
+    }
+
+    if has_pr {
+        if is_negative {
+            result = format!("<{result}>");
+        } else if !fm {
+            result = format!(" {result} ");
+        }
+    }
+
+    if fm {
+        result = result.trim().to_string();
     }
 
     result
+}
+
+fn matches_at(chars: &[char], index: usize, word: &str) -> bool {
+    word.chars().enumerate().all(|(offset, expected)| {
+        chars
+            .get(index + offset)
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected))
+    })
 }
 
 #[cfg(test)]
@@ -1749,5 +1919,16 @@ mod tests {
             role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
             "postgres"
         );
+    }
+
+    #[test]
+    fn to_char_numeric_matches_postgres_format_tokens() {
+        assert_eq!(pg_to_char_numeric(7.0, "FM999"), "7");
+        assert_eq!(pg_to_char_numeric(12.5, "9.999EEEE"), " 1.250e+01");
+        assert_eq!(pg_to_char_numeric(1234.5, "9,999.99"), " 1,234.50");
+        assert_eq!(pg_to_char_numeric(-3.0, "S999"), "  -3");
+        assert_eq!(pg_to_char_numeric(6.78, "9"), " 7");
+        assert_eq!(pg_to_char_numeric(8.0, "\"n=\"999"), "n=   8");
+        assert_eq!(pg_to_char_numeric(100.0, ""), "");
     }
 }

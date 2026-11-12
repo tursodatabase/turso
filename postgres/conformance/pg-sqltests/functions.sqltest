@@ -126,6 +126,19 @@ expect {
     E'a\\\\b'
 }
 
+test to-char-numeric-format-patterns {
+    SELECT to_char(7, 'FM999'),
+           to_char(12.5, '9.999EEEE'),
+           to_char(1234.5, '9,999.99'),
+           to_char(-3, 'S999'),
+           to_char(6.78, '9'),
+           to_char(8, '"n="999'),
+           to_char(100, '');
+}
+expect raw {
+7| 1.250e+01| 1,234.50|  -3| 7|n=   8|
+}
+
 test current-schema-default {
     SELECT current_schema();
 }
