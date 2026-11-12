@@ -506,10 +506,13 @@ pub(crate) fn relation_owner(
 }
 
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
-/// the owner has every privilege, and another role has the ones the list
-/// gives it, by oid or through PUBLIC. A table without a class row is one of
-/// the engine's own, such as `__turso_internal_authid` or `sqlite_sequence`,
-/// and only a superuser uses it, because nothing says who else may.
+/// a role has the privileges the relation's list gives it, by oid or through
+/// PUBLIC. A relation without a list has the default one, which gives the
+/// owner every privilege and no one else any. As in PostgreSQL, an owner
+/// that revoked a privilege from itself no longer has it. A table without a
+/// class row is one of the engine's own, such as `__turso_internal_authid` or
+/// `sqlite_sequence`, and only a superuser uses it, because nothing says who
+/// else may.
 pub(crate) fn role_has_privilege(
     schema: &Schema,
     namespace: NamespaceId,
@@ -522,15 +525,11 @@ pub(crate) fn role_has_privilege(
     else {
         return false;
     };
-    if class.relowner == role {
-        return true;
-    }
+    let Some(acl) = &class.relacl else {
+        return class.relowner == role;
+    };
     let wanted = Privileges::granted_on(class.relkind, &[privilege]);
-    !wanted.is_empty()
-        && class
-            .relacl
-            .as_ref()
-            .is_some_and(|acl| acl.grants(role_oid(role), wanted))
+    !wanted.is_empty() && acl.grants(role_oid(role), wanted)
 }
 
 /// The access control list of relation `name` of `namespace`, or None when
