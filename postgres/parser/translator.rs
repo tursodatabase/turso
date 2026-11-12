@@ -3396,8 +3396,13 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(ParseError::not_supported("a type modifier in a cast"));
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int8_cast_operand(arg, *expr));
+                match extract_type_name_from_typename(pg_type_name)?.as_str() {
+                    "int8" => expr = Box::new(int8_cast_operand(arg, *expr)),
+                    // The engine's casts do not check text by PostgreSQL's
+                    // rules for these types.
+                    "uuid" => expr = Box::new(function_call("uuid_in", vec![*expr])),
+                    "jsonb" => expr = Box::new(function_call("jsonb_in", vec![*expr])),
+                    _ => {}
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -6895,7 +6900,8 @@ fn pg_type_name_to_ast_type(
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        "UUID" => "uuid",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "INTERVAL" | "INET" | "JSON"
         | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
             "TEXT"
         }
