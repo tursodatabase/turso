@@ -1476,9 +1476,10 @@ impl Connection {
         })
     }
 
-    /// Non-blocking schema reparse. Reads the current schema cookie, then drives
-    /// the schema rebuild via the shared [`ReparseSchemaState`].
-    pub(crate) fn reparse_schema_nonblock(
+    /// Rebuilds this connection's schema, including dialect metadata, without
+    /// blocking. Preserve `state` across I/O yields and resume on this connection.
+    /// An active schema transaction publishes the rebuilt schema when it commits.
+    pub fn reparse_schema_nonblock(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
     ) -> crate::types::IOResultOr<()> {
@@ -1811,33 +1812,6 @@ impl Connection {
         sql: &str,
     ) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
-    }
-
-    /// Reads the dialect's own schema state into the database's schema and
-    /// this connection's. A frontend that creates its schema table when it
-    /// opens a database calls this after the creation commits, because the
-    /// open itself loaded the schema before the table existed.
-    pub fn reload_dialect_schema(self: &Arc<Connection>) -> Result<()> {
-        let dialect = self.db.dialect();
-        let queries = dialect.schema_state_queries(&self.current_schema());
-        if queries.is_empty() {
-            return Ok(());
-        }
-        let results = queries
-            .iter()
-            .map(|sql| self.prepare_engine_metadata_read(sql)?.run_collect_rows())
-            .collect::<Result<Vec<_>>>()?;
-        let state = self.with_schema(crate::MAIN_DB_ID, |schema| {
-            dialect.build_schema_state(schema, &results)
-        })?;
-        self.db.with_schema_mut(|schema| {
-            schema.dialect_schema = Some(state.clone());
-            Ok(())
-        })?;
-        self.with_schema_mut(|schema| {
-            schema.dialect_schema = Some(state);
-        })?;
-        Ok(())
     }
 
     /// Prepares a schema statement of the engine's own: SQLite text whatever

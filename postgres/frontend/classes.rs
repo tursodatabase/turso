@@ -18,12 +18,8 @@
 //! the rest of the frontend's schema state, see [`crate::schema_state`],
 //! whenever it loads the schema.
 //!
-//! The frontend creates the table when it opens a database, before it holds
-//! any relation, together with the roles table of [`crate::roles`]. A database that already has relations but no catalog was
-//! written by an earlier tursopg; the frontend refuses such files instead of
-//! migrating them: tursopg has made no compatibility promises yet, and a
-//! refusal is better than inventing oids and owners for relations it did not
-//! see created.
+//! The PostgreSQL opening functions create these tables before
+//! returning the database. Every relation receives its catalog row when created.
 //!
 //! Oids start at 16384, PostgreSQL's `FirstNormalObjectId`, and are never
 //! reused inside one database, even after the relation is dropped: the
@@ -62,7 +58,7 @@ use crate::roles::{
     schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
 };
 use crate::schema_state::schema_state;
-use turso_core::{security::policy::RowPolicy, SessionRole};
+use turso_core::security::policy::RowPolicy;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -1848,129 +1844,52 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
     watermark_reg
 }
 
-/// Creates the classes table, its name index, the `sqlite_sequence` table,
-/// the oid watermark row and the roles table in one write transaction,
-/// unless the classes table exists. A classes table made before it had
-/// `relacl`, `relrowsecurity` or `relpolicies` gets the missing columns, and
-/// a database made before the roles table gets an empty one. A database
-/// that already has relations without the table is refused, and a read-only
-/// open can neither create nor need it: the database is empty. After this
-/// returns, every relation the database will ever hold has a class row from
-/// its CREATE.
-pub(crate) fn ensure_classes_table(
-    db: &Arc<turso_core::Database>,
+pub(crate) fn initialize_schema(
+    schema: &Schema,
     read_only: bool,
-) -> crate::Result<()> {
-    let conn = db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
-    if let Some(table) = classes_table(&conn) {
-        let has_every_column = has_acl_column(&table)
-            && has_row_security_column(&table)
-            && has_policies_column(&table);
-        if (has_every_column && table_exists(&conn, AUTHID_TABLE_NAME)?) || read_only {
-            return Ok(());
-        }
-        return in_write_transaction(&conn, add_missing_parts);
+) -> turso_core::Result<Vec<String>> {
+    let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME);
+    if table.is_none() && !schema.user_relations().is_empty() {
+        return Err(LimboError::ParseError(
+            "the database has relations but no relation catalog, as an earlier version of tursopg \
+             made it; this version does not open it"
+                .to_string(),
+        ));
     }
-    refuse_relations_without_catalog(&conn)?;
     if read_only {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    in_write_transaction(&conn, create_classes_table)?;
-    // The open loaded the schema before the table existed, so the in-memory
-    // catalog is still unloaded.
-    conn.reload_dialect_schema().map_err(Into::into)
-}
-
-/// Runs `change` in a write transaction of its own. Two processes can race
-/// to open the same file; BEGIN IMMEDIATE serializes them, and `change`
-/// finds what the winner did.
-fn in_write_transaction(
-    conn: &Arc<Connection>,
-    change: fn(&Arc<Connection>) -> crate::Result<()>,
-) -> crate::Result<()> {
-    run_internal(conn, "BEGIN IMMEDIATE")?;
-    match change(conn) {
-        Ok(()) => run_internal(conn, "COMMIT"),
-        Err(error) => {
-            let _ = run_internal(conn, "ROLLBACK");
-            Err(error)
+    let mut statements = Vec::new();
+    if let Some(table) = table {
+        if !has_acl_column(&table) {
+            statements.push(ADD_ACL_COLUMN_SQL.to_string());
         }
-    }
-}
-
-/// Refuses a database that has relations but no catalog to describe them.
-fn refuse_relations_without_catalog(conn: &Arc<Connection>) -> crate::Result<()> {
-    if conn.current_schema().user_relations().is_empty() {
-        return Ok(());
-    }
-    Err(LimboError::ParseError(
-        "the database has relations but no relation catalog, as an earlier version of tursopg \
-         made it; this version does not open it"
-            .to_string(),
-    )
-    .into())
-}
-
-fn create_classes_table(conn: &Arc<Connection>) -> crate::Result<()> {
-    if table_exists(conn, CLASSES_TABLE_NAME)? {
-        return Ok(());
-    }
-    run_internal(conn, CREATE_CLASSES_TABLE_SQL)?;
-    run_internal(conn, CREATE_CLASSES_NAME_INDEX_SQL)?;
-    if !table_exists(conn, "sqlite_sequence")? {
-        run_internal(conn, "CREATE TABLE sqlite_sequence(name,seq)")?;
-    }
-    run_internal(
-        conn,
-        &format!(
+        if !has_row_security_column(&table) {
+            statements.push(ADD_ROW_SECURITY_COLUMN_SQL.to_string());
+        }
+        if !has_policies_column(&table) {
+            statements.push(ADD_POLICIES_COLUMN_SQL.to_string());
+        }
+    } else {
+        statements.push(CREATE_CLASSES_TABLE_SQL.to_string());
+        statements.push(CREATE_CLASSES_NAME_INDEX_SQL.to_string());
+        if schema
+            .get_btree_table(NamespaceId::ROOT, "sqlite_sequence")
+            .is_none()
+        {
+            statements.push("CREATE TABLE sqlite_sequence(name,seq)".to_string());
+        }
+        statements.push(format!(
             "INSERT INTO sqlite_sequence (name, seq) VALUES ('{CLASSES_TABLE_NAME}', {})",
             FIRST_NORMAL_OBJECT_ID - 1
-        ),
-    )?;
-    create_authid_table(conn)
-}
-
-fn create_authid_table(conn: &Arc<Connection>) -> crate::Result<()> {
-    if table_exists(conn, AUTHID_TABLE_NAME)? {
-        return Ok(());
+        ));
     }
-    run_internal(conn, CREATE_AUTHID_TABLE_SQL)?;
-    run_internal(conn, CREATE_AUTHID_NAME_INDEX_SQL)
-}
-
-/// Adds the columns and the roles table that a catalog made by an earlier
-/// version lacks. They are checked again inside the write transaction,
-/// because another process may have added them first.
-fn add_missing_parts(conn: &Arc<Connection>) -> crate::Result<()> {
-    let Some(table) = classes_table(conn) else {
-        return Ok(());
-    };
-    if !has_acl_column(&table) {
-        run_internal(conn, ADD_ACL_COLUMN_SQL)?;
+    if schema
+        .get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME)
+        .is_none()
+    {
+        statements.push(CREATE_AUTHID_TABLE_SQL.to_string());
+        statements.push(CREATE_AUTHID_NAME_INDEX_SQL.to_string());
     }
-    if !has_row_security_column(&table) {
-        run_internal(conn, ADD_ROW_SECURITY_COLUMN_SQL)?;
-    }
-    if !has_policies_column(&table) {
-        run_internal(conn, ADD_POLICIES_COLUMN_SQL)?;
-    }
-    create_authid_table(conn)
-}
-
-fn classes_table(conn: &Arc<Connection>) -> Option<Arc<BTreeTable>> {
-    conn.current_schema()
-        .get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)
-}
-
-fn table_exists(conn: &Arc<Connection>, name: &str) -> crate::Result<bool> {
-    Ok(conn
-        .current_schema()
-        .get_btree_table(NamespaceId::ROOT, name)
-        .is_some())
-}
-
-fn run_internal(conn: &Arc<Connection>, sql: &str) -> crate::Result<()> {
-    conn.prepare_engine_schema_statement(sql)?
-        .run_ignore_rows()
-        .map_err(Into::into)
+    Ok(statements)
 }
