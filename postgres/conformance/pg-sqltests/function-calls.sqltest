@@ -617,6 +617,29 @@ expect @tursopg error {
     a call of function "ping", which calls itself, is not supported
 }
 
+# tursopg walks an expression with recursion, so it limits the levels of the
+# expression that a call becomes. PostgreSQL limits the size of the stack
+# (max_stack_depth), which these calls do not get to.
+test call-that-becomes-an-expression-below-the-depth-limit {
+    CREATE FUNCTION add_twenty(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1$$;
+    SELECT add_twenty(add_twenty(1));
+}
+expect {
+    41
+}
+
+test call-that-becomes-an-expression-above-the-depth-limit {
+    CREATE FUNCTION add_twenty(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1$$;
+    SELECT add_twenty(add_twenty(add_twenty(1)));
+}
+expect {
+    61
+}
+@sqlstate 54001
+expect @tursopg error {
+    stack depth limit exceeded
+}
+
 # Functions with the same name
 
 # PostgreSQL chooses the function by the types of the arguments, which

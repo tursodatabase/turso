@@ -618,6 +618,10 @@ Notes on calls of SQL functions:
 - Functions that call each other in a circle, which `CREATE OR REPLACE` can
   make, are rejected at the call. PostgreSQL fails with `stack depth limit
   exceeded`.
+- A call fails with `stack depth limit exceeded` when the expression that
+  takes its place has more than 100 levels, or when the call goes through
+  more than 100 function bodies. PostgreSQL limits the size of the stack
+  (`max_stack_depth`), which permits more.
 
 ## Procedural Languages
 

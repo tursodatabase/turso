@@ -386,3 +386,32 @@ fn explain_shows_the_expression_of_a_call() {
     assert!(!plan.is_empty());
     assert!(!format!("{plan:?}").contains("add_one"), "{plan:?}");
 }
+
+/// The expansion of a body in a body uses the stack, so tursopg limits how
+/// many bodies a call can go through.
+#[test]
+fn a_call_through_too_many_function_bodies_fails() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    // CREATE FUNCTION expands the calls of the body when it checks the body.
+    pg.execute("SET check_function_bodies = off").unwrap();
+    pg.execute("CREATE FUNCTION link0() RETURNS integer LANGUAGE sql AS $$SELECT 1$$")
+        .unwrap();
+    for link in 1..=1000 {
+        pg.execute(format!(
+            "CREATE FUNCTION link{link}() RETURNS integer LANGUAGE sql AS $$SELECT link{}()$$",
+            link - 1
+        ))
+        .unwrap();
+    }
+
+    let rows = pg
+        .prepare("SELECT link10()")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].as_int(), Some(1));
+    let error = pg.execute("SELECT link1000()").unwrap_err();
+    assert_eq!(error.sqlstate, "54001");
+    assert_eq!(error.to_string(), "stack depth limit exceeded");
+}

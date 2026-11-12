@@ -16,9 +16,10 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::{walk_expr, walk_expr_mut, Connection, Func, LimboError, WalkControl, MAIN_DB_ID};
 use turso_parser::ast;
+use turso_parser::parser::MAX_EXPR_DEPTH;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_STATEMENT_TOO_COMPLEX,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::{inlined_function, InlinedFunction};
 
@@ -183,6 +184,10 @@ impl Expansion<'_> {
                 "a call of function \"{name}\", which calls itself,"
             )));
         }
+        // The expansion of a body in a body uses the stack.
+        if self.active.len() == MAX_EXPR_DEPTH {
+            return Err(stack_depth_limit_exceeded());
+        }
         let inlined = inlined_function(
             &function.parameter_types,
             &function.return_type,
@@ -210,6 +215,11 @@ impl Expansion<'_> {
         let expanded = self.expand_calls_in(&mut expression);
         self.active.pop();
         expanded?;
+        // The engine walks an expression with recursion. Its parser does
+        // not make an expression with more levels than this.
+        if height(&expression) > MAX_EXPR_DEPTH {
+            return Err(stack_depth_limit_exceeded());
+        }
         Ok(Some(expression))
     }
 
@@ -454,6 +464,27 @@ pub(crate) fn schema_namespace(connection: &Connection, schema_name: &str) -> Op
         .qualifier(&schema_name.to_lowercase())
         .filter(|qualifier| qualifier.database_id() == MAIN_DB_ID && !qualifier.is_database())
         .map(|qualifier| qualifier.target.id)
+}
+
+/// The number of levels of `expression`: 1 for an expression that has no
+/// expression in it.
+fn height(expression: &ast::Expr) -> usize {
+    let mut is_the_expression = true;
+    let mut tallest_part = 0;
+    let _ = walk_expr(expression, &mut |part: &ast::Expr| {
+        if std::mem::take(&mut is_the_expression) {
+            return Ok(WalkControl::Continue);
+        }
+        tallest_part = tallest_part.max(height(part));
+        Ok(WalkControl::SkipChildren)
+    });
+    1 + tallest_part
+}
+
+/// PostgreSQL's error for a statement that needs more stack than
+/// `max_stack_depth` permits.
+fn stack_depth_limit_exceeded() -> LimboError {
+    sqlstate_error(SQLSTATE_STATEMENT_TOO_COMPLEX, "stack depth limit exceeded")
 }
 
 fn not_supported(what: String) -> LimboError {
