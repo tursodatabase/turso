@@ -6,12 +6,12 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{POSTGRES_TABLE_SQL_PREFIX, PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER},
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
-        AUTOINCREMENT_SEQ_PREFIX,
+        AUTOINCREMENT_SEQ_PREFIX, TURSO_INTERNAL_PREFIX,
     },
     security::roles::RoleId,
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
@@ -85,8 +85,14 @@ impl Dialect for PostgresDialect {
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
+        let primary_key_is_not_rowid_alias = has_primary_key_column_marker(sql);
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
+            let table = BTreeTable::from_stored_sql(
+                strip_primary_key_column_marker(sql),
+                root_page,
+                true,
+                primary_key_is_not_rowid_alias,
+            )?;
             if !table.has_rowid {
                 return Err(LimboError::ParseError(format!(
                     "PostgreSQL does not support WITHOUT ROWID table '{}'",
@@ -104,7 +110,13 @@ impl Dialect for PostgresDialect {
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
+                BTreeTable::from_create_table_ast(
+                    &tbl_name,
+                    &body,
+                    root_page,
+                    true,
+                    primary_key_is_not_rowid_alias,
+                )
             }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
@@ -135,7 +147,9 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::table_sql_for_replay(sql);
+            return turso_core::dialect::engine::table_sql_for_replay(
+                strip_primary_key_column_marker(sql),
+            );
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -175,16 +189,30 @@ impl Dialect for PostgresDialect {
     ) -> Result<String> {
         let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
             .unwrap_or_else(|_| input.to_string());
-        Ok(encode_pg_schema_sql(&sql))
+        let primary_key_is_not_rowid_alias =
+            self.primary_key_is_not_rowid_alias(tbl_name.name.as_str());
+        Ok(encode_pg_schema_sql(&sql, primary_key_is_not_rowid_alias))
     }
 
-    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
-        let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+    fn format_rewritten_table_sql(
+        &self,
+        stmt: &turso_parser::ast::Stmt,
+        previous_sql: Option<&str>,
+    ) -> Result<String> {
+        let ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
             return Err(LimboError::InternalError(
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        turso_core::dialect::engine::format_table_sql(tbl_name, body)
+        let sql = turso_core::dialect::engine::format_table_sql(tbl_name, body)?;
+        let marked = match previous_sql {
+            Some(previous_sql) => has_primary_key_column_marker(previous_sql),
+            None => self.primary_key_is_not_rowid_alias(tbl_name.name.as_str()),
+        };
+        if marked {
+            return Ok(format!("{PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER}{sql}"));
+        }
+        Ok(sql)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -334,6 +362,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn primary_key_is_not_rowid_alias(&self, table_name: &str) -> bool {
+        !table_name.starts_with(TURSO_INTERNAL_PREFIX)
+    }
+
     fn constraint_errors_show_values(&self) -> bool {
         true
     }
@@ -355,12 +387,28 @@ impl Dialect for PostgresDialect {
     }
 }
 
-pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
+pub fn encode_pg_schema_sql(sql: &str, primary_key_is_not_rowid_alias: bool) -> String {
+    let marker = if primary_key_is_not_rowid_alias {
+        PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER
+    } else {
+        ""
+    };
+    format!("{POSTGRES_TABLE_SQL_PREFIX}{marker}{sql}")
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
     sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
+        .map(strip_primary_key_column_marker)
+}
+
+fn has_primary_key_column_marker(sql: &str) -> bool {
+    let sql = sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX).unwrap_or(sql);
+    sql.starts_with(PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER)
+}
+
+fn strip_primary_key_column_marker(sql: &str) -> &str {
+    sql.strip_prefix(PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER)
+        .unwrap_or(sql)
 }
 
 /// Returns the user tables of every namespace as (namespace, name, table)
@@ -3711,7 +3759,7 @@ impl PgGetTableDefCursor {
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
-        let mut postgres_ddl = sqlite_ddl.to_string();
+        let mut postgres_ddl = strip_primary_key_column_marker(sqlite_ddl).to_string();
 
         // Basic SQLite to PostgreSQL type conversions
         // Handle INTEGER PRIMARY KEY specially for SERIAL

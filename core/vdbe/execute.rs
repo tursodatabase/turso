@@ -10755,12 +10755,10 @@ pub fn op_function(
                                             options,
                                         },
                                     };
-                                    Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
-                                    )
+                                    Some(program.connection.dialect().format_rewritten_table_sql(
+                                        &new_stmt,
+                                        Some(sql.as_str()),
+                                    )?)
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
                                     if !any_change {
@@ -10776,12 +10774,10 @@ pub fn op_function(
                                             options,
                                         },
                                     };
-                                    Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
-                                    )
+                                    Some(program.connection.dialect().format_rewritten_table_sql(
+                                        &new_stmt,
+                                        Some(sql.as_str()),
+                                    )?)
                                 }
                             }
                             ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
@@ -11178,10 +11174,10 @@ pub fn op_function(
                                     if_not_exists,
                                 };
                                 Some(
-                                    program
-                                        .connection
-                                        .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                    program.connection.dialect().format_rewritten_table_sql(
+                                        &new_stmt,
+                                        Some(sql.as_str()),
+                                    )?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements

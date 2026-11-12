@@ -4019,6 +4019,7 @@ impl Schema {
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
                 primary_key_constraint_name: None,
+                primary_key_is_not_rowid_alias: false,
                 unique_sets: vec![],
                 has_virtual_columns: false,
                 logical_to_physical_map,
@@ -5015,6 +5016,7 @@ impl TryClone for BTreeTable {
             check_constraints: self.check_constraints.try_clone()?,
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
             primary_key_constraint_name: self.primary_key_constraint_name.clone(),
+            primary_key_is_not_rowid_alias: self.primary_key_is_not_rowid_alias,
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
@@ -5666,6 +5668,7 @@ pub struct BTreeTable {
     /// Stored here because rowid-alias PKs have their UniqueSet removed.
     pub rowid_alias_conflict_clause: Option<ResolveType>,
     pub primary_key_constraint_name: Option<String>,
+    pub primary_key_is_not_rowid_alias: bool,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
@@ -5744,6 +5747,7 @@ impl BTreeTable {
             check_constraints,
             rowid_alias_conflict_clause,
             primary_key_constraint_name,
+            primary_key_is_not_rowid_alias: false,
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
@@ -5965,6 +5969,7 @@ impl BTreeTable {
             column.set_primary_key(true);
             column.set_rowid_alias(
                 self.has_rowid
+                    && !self.primary_key_is_not_rowid_alias
                     && self.primary_key_columns.len() == 1
                     && definition
                         .col_type
@@ -6026,7 +6031,7 @@ impl BTreeTable {
     /// Builds a table from the SQLite text of its `CREATE TABLE`, as a
     /// database that does not support namespaces holds it.
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
-        Self::from_stored_sql(sql, root_page, false)
+        Self::from_stored_sql(sql, root_page, false, false)
     }
 
     /// Builds a table from the SQLite text of its `CREATE TABLE`.
@@ -6036,11 +6041,18 @@ impl BTreeTable {
         sql: &str,
         root_page: i64,
         supports_namespaces: bool,
+        primary_key_is_not_rowid_alias: bool,
     ) -> Result<BTreeTable> {
         let cmd = crate::dialect::engine::parse_statement(sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
+                Self::from_create_table_ast(
+                    &tbl_name,
+                    &body,
+                    root_page,
+                    supports_namespaces,
+                    primary_key_is_not_rowid_alias,
+                )
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
@@ -6060,8 +6072,15 @@ impl BTreeTable {
         body: &CreateTableBody,
         root_page: i64,
         supports_namespaces: bool,
+        primary_key_is_not_rowid_alias: bool,
     ) -> Result<BTreeTable> {
-        create_table(tbl_name.name.as_str(), body, root_page, supports_namespaces)
+        create_table(
+            tbl_name.name.as_str(),
+            body,
+            root_page,
+            supports_namespaces,
+            primary_key_is_not_rowid_alias,
+        )
     }
 
     /// Reconstruct the SQL for the table.
@@ -6076,7 +6095,11 @@ impl BTreeTable {
     /// The `CREATE TABLE` text of the table under `name`: the mangled name
     /// when the text is written into a schema row of a namespace.
     pub fn to_sql_as(&self, name: &str) -> String {
-        let mut sql = format!("CREATE TABLE {} (", quote_ident(name));
+        let mut sql = String::new();
+        if self.primary_key_is_not_rowid_alias {
+            sql.push_str(crate::dialect::PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER);
+        }
+        sql.push_str(&format!("CREATE TABLE {} (", quote_ident(name)));
         let needs_pk_inline = self.primary_key_is_inline
             && self.primary_key_columns.len() == 1
             && self
@@ -7146,6 +7169,7 @@ pub fn create_table(
     body: &CreateTableBody,
     root_page: i64,
     supports_namespaces: bool,
+    primary_key_is_not_rowid_alias: bool,
 ) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
@@ -7388,7 +7412,8 @@ pub fn create_table(
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(written_type) => {
-                        typename_exactly_integer = is_rowid_alias_type(written_type);
+                        typename_exactly_integer =
+                            !primary_key_is_not_rowid_alias && is_rowid_alias_type(written_type);
                         type_from_name(&ty_str).0
                     }
                     None => Type::Null,
@@ -7710,6 +7735,7 @@ pub fn create_table(
         check_constraints,
         rowid_alias_conflict_clause,
         primary_key_constraint_name,
+        primary_key_is_not_rowid_alias,
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
@@ -8625,6 +8651,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
         primary_key_constraint_name: None,
+        primary_key_is_not_rowid_alias: false,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
         logical_to_physical_map,
@@ -9629,7 +9656,7 @@ mod tests {
             else {
                 panic!("expected CREATE TABLE: {sql}");
             };
-            let table = create_table("t", &body, 0, false)?;
+            let table = create_table("t", &body, 0, false, false)?;
             let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
                 panic!("expected column definitions: {sql}");
             };
@@ -9711,6 +9738,20 @@ mod tests {
             !column.is_rowid_alias(),
             "column 'a´ has type different than INTEGER so can't be a rowid alias"
         );
+        Ok(())
+    }
+
+    #[test]
+    pub fn integer_primary_key_is_an_ordinary_column_when_the_dialect_says_so() -> Result<()> {
+        let sql = "CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT)";
+        let table = BTreeTable::from_stored_sql(sql, 0, false, true)?;
+        assert!(table.get_rowid_alias_column().is_none());
+        assert!(table.primary_key_is_not_rowid_alias);
+        assert!(table
+            .to_sql()
+            .starts_with("/* turso_pk_column */ CREATE TABLE"));
+        let table = BTreeTable::from_stored_sql(&table.to_sql(), 0, false, true)?;
+        assert!(table.get_rowid_alias_column().is_none());
         Ok(())
     }
 
@@ -10165,6 +10206,7 @@ mod tests {
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
             primary_key_constraint_name: None,
+            primary_key_is_not_rowid_alias: false,
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),

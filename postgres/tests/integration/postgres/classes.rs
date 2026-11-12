@@ -47,7 +47,7 @@ fn postgres_async_open_initializes_the_postgres_catalog() {
     pg.execute("CREATE TABLE b (value text)").unwrap();
     assert_catalog_columns(&pg, "public");
     let rows = class_rows(pg.inner());
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| row.0 >= 16384));
     assert_ne!(rows[0].0, rows[1].0);
 }
@@ -61,7 +61,7 @@ fn postgres_async_open_initializes_catalog_across_io_yields() {
         .unwrap();
     pg.execute("CREATE TABLE b (value text)").unwrap();
     assert_catalog_columns(&pg, "public");
-    assert_eq!(class_rows(pg.inner()).len(), 2);
+    assert_eq!(class_rows(pg.inner()).len(), 3);
 }
 
 #[cfg(feature = "io_memory_yield")]
@@ -194,9 +194,10 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
     pg.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
         .unwrap();
     let rows = class_rows(&conn);
-    // The table and the automatic index of its UNIQUE constraint; the rowid
-    // alias primary key has no backing index.
-    assert_eq!(rows.len(), 2, "{rows:?}");
+    // The table and the automatic indexes of its PRIMARY KEY and UNIQUE
+    // constraints; an integer primary key is an ordinary column, so it has
+    // an index of its own.
+    assert_eq!(rows.len(), 3, "{rows:?}");
     let (t_oid, _, t_namespace, t_kind, t_owner) = class_row(&conn, "t").unwrap();
     assert_eq!(t_oid, 16384);
     assert_eq!(t_namespace, 1, "public is namespace 1");
@@ -209,7 +210,7 @@ fn a_new_database_has_the_classes_table_and_ddl_maintains_it() {
     pg.execute("CREATE INDEX t_name ON t (name)").unwrap();
     assert_eq!(
         class_row(&conn, "t_name").unwrap(),
-        (16386, "t_name".to_string(), 1, "i".to_string(), 0)
+        (16387, "t_name".to_string(), 1, "i".to_string(), 0)
     );
 
     pg.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();

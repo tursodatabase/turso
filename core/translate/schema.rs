@@ -765,7 +765,13 @@ fn validate(
             }
         }
 
-        let mut table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+        let mut table = create_table(
+            table_name,
+            body,
+            0,
+            resolver.dialect.supports_namespaces(),
+            resolver.dialect.primary_key_is_not_rowid_alias(table_name),
+        )?;
         // Rules for new tables only: VACUUM creates the tables the database
         // already has as nested statements, and those may break these rules.
         if !is_nested {
@@ -1064,6 +1070,10 @@ fn emit_ctas_insert(
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
+        resolver
+            .catalog
+            .dialect
+            .primary_key_is_not_rowid_alias(table_name),
     )?);
     // SQLite applies the derived CTAS affinity in MakeRecord. This keeps each
     // stored value consistent with the declared type of the CTAS column.
@@ -1387,15 +1397,15 @@ pub fn translate_create_table(
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else if bound_sequence_names {
-        resolver
-            .catalog
-            .dialect
-            .format_rewritten_table_sql(&ast::Stmt::CreateTable {
+        resolver.catalog.dialect.format_rewritten_table_sql(
+            &ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
                 tbl_name: tbl_name_in_sql,
                 body: body.clone(),
-            })?
+            },
+            None,
+        )?
     } else {
         resolver
             .catalog
@@ -1958,6 +1968,10 @@ fn collect_autoindexes(
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
+        resolver
+            .catalog
+            .dialect
+            .primary_key_is_not_rowid_alias(tbl_name),
     )?;
 
     let mut regs: Vec<usize> = Vec::new();

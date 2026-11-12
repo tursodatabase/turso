@@ -1244,7 +1244,7 @@ expect {
 }
 
 expect @tursopg {
-    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX __turso_internal_pk_index_items ON public.items USING btree (id)
+    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX sqlite_autoindex___turso_ns1_items_1 ON public.items USING btree (id)
     1
     1
 }
@@ -1276,8 +1276,8 @@ expect {
 }
 
 expect @tursopg {
-    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
-    __turso_internal_pk_index_quoted table|CREATE UNIQUE INDEX "__turso_internal_pk_index_quoted table" ON public."quoted table" USING btree ("key column")
+    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "sqlite_autoindex___turso_ns1_quoted table_1" ON public."quoted table" USING btree ("key column")
+    sqlite_autoindex___turso_ns1_quoted table_1|CREATE UNIQUE INDEX "sqlite_autoindex___turso_ns1_quoted table_1" ON public."quoted table" USING btree ("key column")
 }
 
 test pg-primary-key-after-identical-unique {
@@ -1316,9 +1316,9 @@ expect {
     t_pkey3|t_pkey3
 }
 expect @tursopg {
-    t_pkey|__turso_internal_pk_index_t|CREATE UNIQUE INDEX __turso_internal_pk_index_t ON public.t USING btree (id)
+    t_pkey|sqlite_autoindex___turso_ns1_t_1|CREATE UNIQUE INDEX sqlite_autoindex___turso_ns1_t_1 ON public.t USING btree (id)
     1
-    t_pkey|__turso_internal_pk_index_t
+    t_pkey|sqlite_autoindex___turso_ns1_t_1
 }
 
 test pg-attribute-not-null-dump {

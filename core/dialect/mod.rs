@@ -123,6 +123,12 @@ pub struct ScalarFuncContext<'a> {
     pub collation: CollationSeq,
 }
 
+/// Comment at the start of stored table SQL that says its single-column
+/// `INTEGER PRIMARY KEY` is an ordinary column, not the rowid. Stored SQL
+/// without it was written before a dialect could say so, and keeps the
+/// SQLite rule.
+pub const PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER: &str = "/* turso_pk_column */ ";
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -216,7 +222,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// longer describes the rewritten table. Dialects that need syntax beyond
     /// a marker around canonical SQL can override this to render their native
     /// table definition from the rewritten AST.
-    fn format_rewritten_table_sql(&self, stmt: &Stmt) -> Result<String> {
+    ///
+    /// `previous_sql` is the stored text of the table being rewritten, or
+    /// `None` for a table that is being created.
+    fn format_rewritten_table_sql(
+        &self,
+        stmt: &Stmt,
+        _previous_sql: Option<&str>,
+    ) -> Result<String> {
         let Stmt::CreateTable { tbl_name, body, .. } = stmt else {
             return Err(LimboError::InternalError(
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
@@ -551,6 +564,16 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// PostgreSQL raises SQLSTATE 21000. SQLite uses the first row.
     fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
+        false
+    }
+
+    /// Whether a single-column `INTEGER PRIMARY KEY` of the new table
+    /// `table_name` is an ordinary column and not an alias of the rowid.
+    ///
+    /// PostgreSQL keeps the column default, rejects NULL, and counts a
+    /// sequence apart from the stored keys, except in the engine's own
+    /// tables, which need the rowid. SQLite makes the column the rowid.
+    fn primary_key_is_not_rowid_alias(&self, _table_name: &str) -> bool {
         false
     }
 
