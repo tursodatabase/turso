@@ -57,7 +57,7 @@ use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
 use crate::policies;
-use turso_core::security::policy::RowPolicy;
+use turso_core::{security::policy::RowPolicy, SessionRole};
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -1834,7 +1834,7 @@ pub(crate) fn ensure_classes_table(
     db: &Arc<turso_core::Database>,
     read_only: bool,
 ) -> crate::Result<()> {
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    let conn = db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
     if let Some(table) = classes_table(&conn) {
         let has_every_column = has_acl_column(&table)
             && has_row_security_column(&table)

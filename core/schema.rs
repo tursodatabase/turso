@@ -9158,6 +9158,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
 
     fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
         Arc::new(BTreeTable::from_sql(sql, root_page).unwrap())
@@ -9189,7 +9190,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let syms = conn.syms.read();
         conn.with_schema(MAIN_DB_ID, |schema| {
             assert!(schema.type_registry.values().all(|t| t.is_builtin));

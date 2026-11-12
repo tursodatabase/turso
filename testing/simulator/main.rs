@@ -24,6 +24,7 @@ use crate::model::interactions::{
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
+use turso_core::SessionRole;
 
 mod common;
 mod generation;
@@ -609,7 +610,7 @@ fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
             .db
             .as_ref()
             .expect("simulation database exists")
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         let mut statement = connection.prepare("PRAGMA integrity_check")?;
         statement.run_with_row_callback(|row| {
             result.push(row.get::<String>(0)?);
@@ -637,6 +638,7 @@ fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
 #[cfg(test)]
 mod integrity_tests {
     use super::*;
+    use turso_core::SessionRole;
     use turso_sqlite::SqliteDialect;
 
     #[test]
@@ -654,7 +656,7 @@ mod integrity_tests {
             .db
             .as_ref()
             .unwrap()
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO checked VALUES (42)")?;
         env.io.persist_files()?;
@@ -680,7 +682,7 @@ mod integrity_tests {
             .db
             .as_ref()
             .unwrap()
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO checked VALUES (42)")?;
         connection.execute("CREATE SEQUENCE checked_seq START 10")?;
@@ -696,7 +698,7 @@ mod integrity_tests {
             path.to_str().unwrap(),
             Arc::new(SqliteDialect),
         )?
-        .connect(turso_core::ConnectOpts::new())?;
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         let rows = reopened
             .prepare("SELECT id FROM checked")?
             .run_collect_rows()?;

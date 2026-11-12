@@ -35,6 +35,15 @@ pub const CREATE_ROLES_NAME_INDEX_SQL: &str =
 
 pub const SELECT_ROLES_SQL: &str = "SELECT id, name, superuser FROM __turso_internal_roles";
 
+/// The role a new connection runs as. The program that opens the connection
+/// chooses it; SQL cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRole {
+    Superuser,
+    /// A role stored in the roles table, by its case-sensitive name.
+    Named(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RoleId(i64);
 

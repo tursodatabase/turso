@@ -4537,6 +4537,7 @@ pub(crate) fn decode_serial_type_into_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -4568,7 +4569,9 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);

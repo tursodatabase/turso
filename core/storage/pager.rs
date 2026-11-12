@@ -6570,6 +6570,7 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
+    use crate::security::roles::SessionRole;
     use crate::sync::Arc;
 
     use crate::sync::RwLock;
@@ -6591,7 +6592,9 @@ mod tests {
         let io = Arc::new(MemoryIO::new());
         let db =
             crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
@@ -6918,7 +6921,9 @@ mod tests {
     fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = crate::Database::open_file(io, path, Arc::new(crate::EngineDialect)).unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         (db, conn)
     }
 
@@ -7391,6 +7396,7 @@ mod ptrmap_tests {
 mod checkpoint_phase_tests {
     use super::*;
     use crate::io::{PlatformIO, IO};
+    use crate::security::roles::SessionRole;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
@@ -7450,7 +7456,9 @@ mod checkpoint_phase_tests {
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();

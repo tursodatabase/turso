@@ -1,5 +1,47 @@
 use crate::common::TempDatabase;
+use turso_core::{ConnectOpts, SessionRole};
 use turso_pg::{ErrorReport, PgConnection};
+
+#[test]
+fn session_runs_as_the_role_it_was_opened_as() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    superuser.execute("CREATE ROLE alice").unwrap();
+    superuser.execute("CREATE TABLE t (x INT)").unwrap();
+
+    let alice = PgConnection::connect_with(
+        &db.db,
+        ConnectOpts::new(SessionRole::Named("alice".to_string())),
+    )
+    .unwrap();
+
+    assert_eq!(current_user(&alice), "alice");
+    assert_eq!(session_user(&alice), "alice");
+    assert!(!alice.inner().current_role_is_superuser());
+    let Err(error) = alice.query("SELECT x FROM t") else {
+        panic!("a role without privileges read table t");
+    };
+    assert_eq!(error.to_string(), "permission denied for table t");
+    alice.execute("RESET ROLE").unwrap();
+    assert_eq!(current_user(&alice), "alice");
+    assert_eq!(current_user(&superuser), "postgres");
+}
+
+#[test]
+fn connecting_as_a_role_that_does_not_exist_fails() {
+    let db = TempDatabase::builder().build();
+
+    for name in ["alice", "public"] {
+        let Err(error) = db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Named(name.to_string())))
+        else {
+            panic!("connecting as {name}, which does not exist, succeeded");
+        };
+
+        assert_eq!(error.to_string(), format!("role \"{name}\" does not exist"));
+    }
+}
 
 #[test]
 fn created_role_is_visible_to_another_connection() {
@@ -508,6 +550,11 @@ fn run_interrupted_at(
 
 fn current_user(conn: &PgConnection) -> String {
     let mut stmt = conn.query("SELECT current_user").unwrap().unwrap();
+    stmt.run_collect_rows().unwrap()[0][0].to_string()
+}
+
+fn session_user(conn: &PgConnection) -> String {
+    let mut stmt = conn.query("SELECT session_user").unwrap().unwrap();
     stmt.run_collect_rows().unwrap()[0][0].to_string()
 }
 

@@ -24,7 +24,7 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
-use turso_core::ConnectOpts;
+use turso_core::{ConnectOpts, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
@@ -429,7 +429,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<(), String> {
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key))
         .map_err(to_sqlite_error)?;
 
     if let Some(busy_timeout) = busy_timeout {

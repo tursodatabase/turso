@@ -7,6 +7,7 @@ use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags,
 
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
+use turso_core::SessionRole;
 
 fn make_conn(seed: u64) -> Result<(Arc<Connection>, Arc<MemorySimIO>)> {
     let io = make_io(seed);
@@ -38,7 +39,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     Ok(conn)
 }
 
@@ -51,8 +52,8 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn1 = db.connect(ConnectOpts::new())?;
-    let conn2 = db.connect(ConnectOpts::new())?;
+    let conn1 = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    let conn2 = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     Ok((conn1, conn2))
 }
 
