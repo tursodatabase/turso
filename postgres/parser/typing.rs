@@ -764,7 +764,14 @@ fn function_result_type(name: &str, arguments: &[ExprType]) -> ExprType {
         | "ascii" => Ok(PgType::Int4),
         "lower" | "upper" | "trim" | "btrim" | "ltrim" | "rtrim" | "substr" | "substring"
         | "replace" | "concat" | "concat_ws" | "left" | "right" | "repeat" | "reverse" | "md5"
-        | "lpad" | "rpad" | "initcap" | "string_agg" | "version" | "format" => Ok(PgType::Text),
+        | "lpad" | "rpad" | "initcap" | "string_agg" | "version" | "format" | "quote_ident"
+        | "quote_literal" | "array_to_string" | "current_database" | "acldefault" => {
+            Ok(PgType::Text)
+        }
+        "array_agg" => match first_argument(name, arguments)? {
+            PgType::Unknown => Err(function_on(name, &PgType::Unknown)),
+            element => PgType::array_of(element.clone()).ok_or_else(|| function_on(name, &element)),
+        },
         "round" | "ceil" | "ceiling" | "floor" | "trunc" => match arguments.len() {
             1 => match first_argument(name, arguments)? {
                 PgType::Float8 => Ok(PgType::Float8),
@@ -788,7 +795,9 @@ fn function_result_type(name: &str, arguments: &[ExprType]) -> ExprType {
         | "pg_get_constraintdef"
         | "pg_get_indexdef"
         | "chr" => Ok(PgType::Text),
-        "pg_backend_pid" | "array_length" | "int4" => Ok(PgType::Int4),
+        "pg_backend_pid" | "array_length" | "array_upper" | "array_lower" | "int4" => {
+            Ok(PgType::Int4)
+        }
         "int8" => Ok(PgType::Int8),
         "float8" => Ok(PgType::Float8),
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
@@ -2868,6 +2877,29 @@ mod tests {
     fn a_subscript_of_an_array_has_the_element_type() {
         assert_eq!(type_from_t("('{1,2}'::int2[])[1]"), Some(PgType::Int2));
         assert_eq!(type_from_t("('{1,2}'::oid[])[1] = 1"), Some(PgType::Bool));
+    }
+
+    #[test]
+    fn array_agg_is_an_array_of_its_argument() {
+        assert_eq!(type_from_t("array_agg(a)"), Some(array_of(PgType::Int4)));
+        assert_eq!(type_from_t("array_agg(b)"), Some(array_of(PgType::Text)));
+        assert_eq!(type_from_t("array_agg(ts)"), None);
+        assert_eq!(type_from_t("array_agg('x')"), None);
+    }
+
+    #[test]
+    fn more_functions_with_one_result_type_are_typed() {
+        for (call, expected) in [
+            ("quote_ident(b)", PgType::Text),
+            ("quote_literal(b)", PgType::Text),
+            ("array_to_string('{a}'::text[], ',')", PgType::Text),
+            ("current_database()", PgType::Text),
+            ("acldefault('r', a)", PgType::Text),
+            ("array_upper('{a}'::text[], 1)", PgType::Int4),
+            ("array_lower('{a}'::text[], 1)", PgType::Int4),
+        ] {
+            assert_eq!(type_from_t(call), Some(expected), "{call}");
+        }
     }
 
     #[test]
