@@ -1,5 +1,4 @@
-//! Map from transaction id to a value, for `MvStore::txs` and
-//! `MvStore::finalized_tx_states`.
+//! Map from transaction id to a value, for `MvStore::txs`.
 //!
 //! Transaction ids come from one counter, so the transactions that run at the same
 //! time fall into different shards. A lookup locks one shard for reading. Each shard
