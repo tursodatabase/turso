@@ -4250,6 +4250,123 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+/// VACUUM INTO must preserve vector data stored as `vector64` (double-precision,
+/// Float64Dense) blobs, not only the single-precision `vector32` path exercised
+/// by [`test_vacuum_into_preserves_vector_blobs`]. Each element is 8 bytes rather
+/// than 4, so this guards the wider payload specifically: the destination must
+/// hash identically to the source and reproduce the same cosine distance, which
+/// only holds if every byte of every vector round-trips through the vacuum.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_vector64_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector64('[1.0, 0.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector64('[0.0, 1.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector64('[0.0, 0.0, 1.0, 0.0]'))")?;
+    let source_hash = compute_dbhash(&tmp_db);
+
+    // Compute a distance on the source for comparison.
+    let source_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vectors64.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM vectors");
+    assert_eq!(count[0].0, 3);
+
+    // The distance matching confirms the vector64 blobs survived intact.
+    let dest_dist: Vec<(f64,)> = dest_conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+    assert_eq!(source_dist, dest_dist);
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve array-typed columns (`text[]`, `integer[]`), one of
+/// the rich types a STRICT table accepts when custom types are enabled. Arrays
+/// are stored as blobs, so the file-level dbhash equality proves the raw payload
+/// round-trips; decoding `tags`/`scores` back to text and reading `array_length`
+/// on the destination proves the copy is still a usable, well-formed array and
+/// not merely identical bytes. The destination is compared against the source
+/// rather than a hard-coded encoding, so the test stays correct even if the
+/// array text representation changes.
+#[test]
+fn test_vacuum_into_preserves_arrays() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE arr (
+            id INTEGER PRIMARY KEY,
+            tags text[],
+            scores integer[]
+        ) STRICT",
+    )?;
+    conn.execute("INSERT INTO arr VALUES (1, ARRAY['a', 'b', 'c'], ARRAY[10, 20, 30])")?;
+    conn.execute("INSERT INTO arr VALUES (2, ARRAY['x'], ARRAY[1])")?;
+
+    let hash_opts = turso_dbhash::DbHashOptions {
+        table_filter: Some("arr".to_string()),
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, opts).hash;
+
+    let source_text: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, tags, scores FROM arr ORDER BY id");
+    let source_lengths: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT id, array_length(tags), array_length(scores) FROM arr ORDER BY id");
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("arrays.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        compute_dbhash_with_options_and_database_opts(&dest_db, &hash_opts, opts).hash,
+        source_hash,
+    );
+
+    let dest_text: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT id, tags, scores FROM arr ORDER BY id");
+    assert_eq!(
+        dest_text, source_text,
+        "VACUUM INTO must preserve array text representation"
+    );
+
+    let dest_lengths: Vec<(i64, i64, i64)> = dest_conn
+        .exec_rows("SELECT id, array_length(tags), array_length(scores) FROM arr ORDER BY id");
+    assert_eq!(
+        dest_lengths, source_lengths,
+        "VACUUM INTO must preserve array_length on the copied arrays"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Plain VACUUM tests
 // ---------------------------------------------------------------------------
