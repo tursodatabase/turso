@@ -4,7 +4,7 @@ mod create_function;
 pub mod functions;
 pub use create_function::{
     display_signature_type_name, is_base_type_name, is_pseudo_type_name,
-    return_type_mismatch_message,
+    return_type_mismatch_message, CalledFunction,
 };
 mod names;
 use pg_query::NodeEnum;
