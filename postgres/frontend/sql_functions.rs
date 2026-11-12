@@ -129,6 +129,11 @@ impl FunctionCatalog {
         self.by_oid.values()
     }
 
+    fn in_namespace(&self, namespace: NamespaceId) -> impl Iterator<Item = &SqlFunction> {
+        self.iter()
+            .filter(move |function| function.namespace == namespace)
+    }
+
     /// The functions named `name` of `namespace`, which differ in their
     /// parameter types.
     pub(crate) fn named<'a>(
@@ -253,6 +258,15 @@ fn parse_stored_function(sql: &str) -> turso_core::Result<ast::CreateFunction> {
         Ok(_) => Err(corrupt("it is not CREATE FUNCTION".to_string())),
         Err(error) => Err(corrupt(error.to_string())),
     }
+}
+
+/// Whether schema `schema_name` has a function.
+pub(crate) fn schema_has_functions(connection: &Connection, schema_name: &str) -> bool {
+    let Some(namespace) = connection.qualifier(schema_name) else {
+        return false;
+    };
+    function_catalog(&connection.current_schema())
+        .is_some_and(|functions| functions.in_namespace(namespace.target.id).next().is_some())
 }
 
 /// The functions that the engine loaded with the relation catalog, or None
