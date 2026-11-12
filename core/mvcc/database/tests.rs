@@ -5691,6 +5691,33 @@ fn test_blocking_checkpoint_empties_the_row_store_that_a_cursor_reads() {
     assert_eq!(ids_of_completed_statement(&mut select), [1]);
 }
 
+/// The commit of a statement can start a checkpoint. The statement must close its MVCC
+/// cursors before that commit, so that the checkpoint can free the row store.
+#[test]
+fn test_statement_closes_its_mvcc_cursors_before_its_commit_starts_a_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let mvcc_store = db.get_mvcc_store();
+    let row_store_before_checkpoint = Arc::downgrade(&mvcc_store.row_store());
+
+    let mut insert = conn.prepare("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(ids_of_completed_statement(&mut insert).is_empty());
+
+    assert!(row_store_before_checkpoint.upgrade().is_none());
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t ORDER BY id").len(),
+        2,
+        "the checkpoint lost a row"
+    );
+}
+
 /// Steps `statement` until it is complete, and does not reset it.
 fn ids_of_completed_statement(statement: &mut Statement) -> Vec<i64> {
     let mut ids = Vec::new();
