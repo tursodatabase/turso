@@ -150,6 +150,17 @@ expect {
 }
 
 @setup auth_functions
+test auth-helper-default-is-printed-with-its-schema {
+    CREATE TABLE notes (owner uuid DEFAULT auth.uid(), audience text DEFAULT auth.role());
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
+    WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 'notes') ORDER BY adnum;
+}
+expect {
+    auth.uid()
+    auth.role()
+}
+
+@setup auth_functions
 test auth-helpers-in-a-check-constraint {
     CREATE TABLE notes (owner uuid CHECK (owner = auth.uid()), audience text CHECK (audience = auth.role()));
     SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","role":"authenticated"}', false);

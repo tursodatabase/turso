@@ -4134,9 +4134,15 @@ fn constraint_column_list<'a>(
 
 fn render_expr(expr: &ast::Expr) -> String {
     let mut expr = expr.clone();
+    let mut schema_functions = Vec::new();
     walk_expr_mut(&mut expr, &mut |expr| {
         if let ast::Expr::FunctionCall { name, args, .. } = expr {
-            if args.is_empty() {
+            if turso_pg_parser::translator::split_function_name(name.as_str())
+                .0
+                .is_some()
+            {
+                schema_functions.push(name.clone());
+            } else if args.is_empty() {
                 if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
                     *expr = ast::Expr::Id(ast::Name::from_string(keyword));
                 }
@@ -4154,7 +4160,23 @@ fn render_expr(expr: &ast::Expr) -> String {
         Ok(WalkControl::Continue)
     })
     .expect("rewriting role functions does not fail");
-    expr.to_string()
+    let mut sql = expr.to_string();
+    // The name of a function of a schema is the schema and the function in
+    // one name, which prints as one quoted identifier: `"auth.uid" ()`.
+    // PostgreSQL prints `auth.uid()`.
+    for name in schema_functions {
+        let (schema, function) = turso_pg_parser::translator::split_function_name(name.as_str());
+        let schema = schema.expect("only names with a schema are collected");
+        sql = sql.replace(
+            &format!("{} (", name.as_ident()),
+            &format!(
+                "{}.{}(",
+                quote_identifier(schema),
+                quote_identifier(function)
+            ),
+        );
+    }
+    sql
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
