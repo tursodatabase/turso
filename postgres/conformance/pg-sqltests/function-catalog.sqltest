@@ -1229,6 +1229,34 @@ expect @tursopg error {
     a function with the name of the built-in function "count" is not supported
 }
 
+# PostgreSQL creates a function with the name of a built-in function or of a
+# table, and it checks the body. An error of the body comes before the
+# refusal of the name, as in PostgreSQL.
+test function-with-the-name-of-a-built-in-function-and-a-body-that-does-not-compile {
+    CREATE FUNCTION abs(text) RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such table: nosuch
+}
+
+test function-with-the-name-of-a-table-and-a-body-that-does-not-compile {
+    CREATE TABLE item (a integer);
+    CREATE FUNCTION item(text) RETURNS integer LANGUAGE sql AS $$SELECT a FROM nosuch$$;
+}
+@sqlstate 42P01
+expect error {
+    relation "nosuch" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such table: nosuch
+}
+
 # to_hex is a built-in function of PostgreSQL that tursopg does not have.
 # PostgreSQL calls its built-in function, because the types of the arguments
 # are the same. tursopg would call the function of the user.
