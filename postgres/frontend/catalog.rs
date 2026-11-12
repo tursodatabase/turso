@@ -2445,7 +2445,7 @@ impl SnapshotRows for PgSequenceTable {
 
 /// The sequences the catalogs list, each with its stored oid and its
 /// namespace, so a join on them agrees across catalogs.
-fn sequence_catalog_entries(schema: &Schema) -> Vec<(i64, NamespaceId, &Sequence)> {
+pub(crate) fn sequence_catalog_entries(schema: &Schema) -> Vec<(i64, NamespaceId, &Sequence)> {
     let mut sequences = Vec::new();
     for namespace in namespaces_sorted(schema) {
         let mut named: Vec<_> = schema
@@ -2552,6 +2552,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_options_to_table",
         VTabKind::TableValuedFunction,
         crate::options::PgOptionsToTable,
+    );
+    options = options.native_module(
+        "pg_get_sequence_data",
+        VTabKind::TableValuedFunction,
+        crate::sequence_data::PgGetSequenceData,
     );
     options = options.native_module(
         "pg_class",

@@ -7,6 +7,7 @@ mod error;
 mod functions;
 mod options;
 mod policies;
+mod sequence_data;
 mod session;
 mod settings;
 mod statement;

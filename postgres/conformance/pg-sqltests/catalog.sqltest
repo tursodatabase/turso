@@ -1228,6 +1228,88 @@ expect {
     descending_seq|bigint|-5|-2|-1|-99|1|f
 }
 
+# pg_dump of PostgreSQL 18 reads each sequence's value with
+# pg_get_sequence_data. The tests pass the oid from pg_class, as pg_dump
+# does.
+test pg-get-sequence-data-of-an-unused-sequence {
+    CREATE SEQUENCE sd_unused START 5;
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_unused';
+}
+expect {
+    5|f
+}
+
+test pg-get-sequence-data-after-nextval {
+    CREATE SEQUENCE sd_used START 5 INCREMENT 3;
+    SELECT nextval('sd_used');
+    SELECT nextval('sd_used');
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_used';
+}
+expect {
+    5
+    8
+    8|t
+}
+
+test pg-get-sequence-data-of-a-descending-sequence {
+    CREATE SEQUENCE sd_descending INCREMENT -2;
+    SELECT nextval('sd_descending');
+    SELECT nextval('sd_descending');
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_descending';
+}
+expect {
+    -1
+    -3
+    -3|t
+}
+
+test pg-get-sequence-data-after-setval {
+    CREATE SEQUENCE sd_set;
+    SELECT setval('sd_set', 42, false);
+    SELECT d.last_value, d.is_called FROM pg_class c, pg_get_sequence_data(c.oid) d
+    WHERE c.relname = 'sd_set';
+}
+expect {
+    42
+    42|f
+}
+
+test pg-get-sequence-data-of-a-table-is-null {
+    CREATE TABLE sd_table (id int);
+    SELECT coalesce(d.last_value::text, 'null'), coalesce(d.is_called::text, 'null')
+    FROM pg_class c, pg_get_sequence_data(c.oid) d WHERE c.relname = 'sd_table';
+}
+expect {
+    null|null
+}
+
+test pg-get-sequence-data-without-privileges-is-null {
+    CREATE ROLE sd_stranger;
+    CREATE SEQUENCE sd_private;
+    SET ROLE sd_stranger;
+    SELECT coalesce(d.last_value::text, 'null'), coalesce(d.is_called::text, 'null')
+    FROM pg_class c, pg_get_sequence_data(c.oid) d WHERE c.relname = 'sd_private';
+}
+expect {
+    null|null
+}
+
+test pg-get-sequence-data-in-the-pg-dump-query {
+    CREATE SEQUENCE sd_dumped START 10;
+    SELECT nextval('sd_dumped');
+    SELECT c.relname, s.seqstart, d.last_value, d.is_called
+    FROM pg_catalog.pg_sequence s, pg_get_sequence_data(s.seqrelid) d,
+         pg_catalog.pg_class c
+    WHERE c.oid = s.seqrelid AND c.relname = 'sd_dumped';
+}
+expect {
+    10
+    sd_dumped|10|10|t
+}
+
 # As in PostgreSQL 18, every NOT NULL column has a NOT NULL constraint,
 # primary key columns included. pg_dump 18 reads them.
 test pg-constraint-lists-not-null-constraints {
