@@ -1,8 +1,8 @@
 //! The PostgreSQL frontend's schema state: what the engine keeps for it as
 //! the opaque dialect schema state of the main database. It holds the
-//! relation catalog of [`crate::classes`], and the roles of [`crate::roles`]
-//! with their memberships of [`crate::auth_members`], each loaded from its
-//! own table.
+//! relation catalog of [`crate::classes`], the roles of [`crate::roles`]
+//! with their memberships of [`crate::auth_members`], and the functions of
+//! [`crate::sql_functions`], each loaded from its own table.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -13,11 +13,13 @@ use turso_core::{CatalogChange, LimboError, Value};
 use crate::auth_members;
 use crate::classes::{self, ClassCatalog};
 use crate::roles::{self, RoleCatalog};
+use crate::sql_functions::{self, FunctionCatalog};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchemaState {
     pub(crate) classes: Arc<ClassCatalog>,
     pub(crate) roles: Arc<RoleCatalog>,
+    pub(crate) functions: Arc<FunctionCatalog>,
 }
 
 /// The frontend's schema state, or None when it is not loaded, as in a
@@ -27,10 +29,10 @@ pub(crate) fn schema_state(schema: &Schema) -> Option<&SchemaState> {
 }
 
 /// [`turso_core::Dialect::schema_state_queries`] for the PostgreSQL
-/// frontend: the relation catalog, then the roles, then the memberships. A
-/// database without the relation catalog has no schema state. The
-/// membership table is read only with the roles table, which is created
-/// before it.
+/// frontend: the relation catalog, then the roles, then the memberships,
+/// then the functions. A database without the relation catalog has no
+/// schema state. The membership table is read only with the roles table,
+/// which is created before it.
 pub(crate) fn schema_state_queries(schema: &Schema) -> Vec<String> {
     let Some(classes_query) = classes::schema_state_query(schema) else {
         return Vec::new();
@@ -40,31 +42,46 @@ pub(crate) fn schema_state_queries(schema: &Schema) -> Vec<String> {
         queries.push(roles_query);
         queries.extend(auth_members::schema_state_query(schema));
     }
+    queries.extend(sql_functions::schema_state_query(schema));
     queries
 }
 
 /// [`turso_core::Dialect::build_schema_state`] for the PostgreSQL frontend.
 /// A database without the roles table has no roles, and one without the
-/// membership table has no memberships.
+/// membership table has no memberships, and one without the functions table
+/// has no functions.
 pub(crate) fn build_schema_state(
     schema: &Schema,
     results: &[Vec<Vec<Value>>],
 ) -> turso_core::Result<Arc<dyn Any + Send + Sync>> {
-    let (class_rows, role_rows, membership_rows): (_, &[_], &[_]) = match results {
-        [class_rows] => (class_rows, &[], &[]),
-        [class_rows, role_rows] => (class_rows, role_rows, &[]),
-        [class_rows, role_rows, membership_rows] => (class_rows, role_rows, membership_rows),
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "expected the rows of up to three schema state queries, got {}",
-                results.len()
-            )))
+    let has_roles = roles::schema_state_query(schema).is_some();
+    let has_memberships = has_roles && auth_members::schema_state_query(schema).is_some();
+    let has_functions = sql_functions::schema_state_query(schema).is_some();
+    let expected =
+        1 + usize::from(has_roles) + usize::from(has_memberships) + usize::from(has_functions);
+    if results.len() != expected {
+        return Err(LimboError::InternalError(format!(
+            "expected the rows of {expected} schema state queries, got {}",
+            results.len()
+        )));
+    }
+    let mut results = results.iter();
+    let mut next_rows = |present: bool| -> &[Vec<Value>] {
+        match present {
+            true => results.next().expect("the length is checked above"),
+            false => &[],
         }
     };
+    let class_rows = next_rows(true);
+    let role_rows = next_rows(has_roles);
+    let membership_rows = next_rows(has_memberships);
+    let function_rows = next_rows(has_functions);
     let roles = RoleCatalog::new(role_rows, membership_rows)?;
+    let functions = FunctionCatalog::new(function_rows)?;
     Ok(Arc::new(SchemaState {
         classes: Arc::new(ClassCatalog::build(schema, class_rows)?),
         roles: Arc::new(roles),
+        functions: Arc::new(functions),
     }))
 }
 
@@ -76,22 +93,30 @@ pub(crate) fn apply_catalog_change(
     change: &CatalogChange,
     values: &[Value],
 ) -> turso_core::Result<()> {
+    update(schema, |state| match change {
+        CatalogChange::CreateRole { name, options } => {
+            Arc::make_mut(&mut state.roles).apply_create_role(name, options, values)
+        }
+        CatalogChange::GrantRole { revoke, .. } => {
+            Arc::make_mut(&mut state.roles).apply_grant_role(*revoke, values)
+        }
+        _ => Arc::make_mut(&mut state.classes).apply(change, values),
+    })
+}
+
+/// Changes the state of `schema` with `change`. Does nothing when the state
+/// is not loaded.
+pub(crate) fn update(
+    schema: &mut Schema,
+    change: impl FnOnce(&mut SchemaState) -> turso_core::Result<()>,
+) -> turso_core::Result<()> {
     let Some(state) = schema.dialect_schema.take() else {
         return Ok(());
     };
     let mut state: Arc<SchemaState> = state.downcast().map_err(|_| {
         LimboError::InternalError("the dialect schema state is not the frontend's".into())
     })?;
-    let state_mut = Arc::make_mut(&mut state);
-    let result = match change {
-        CatalogChange::CreateRole { name, options } => {
-            Arc::make_mut(&mut state_mut.roles).apply_create_role(name, options, values)
-        }
-        CatalogChange::GrantRole { revoke, .. } => {
-            Arc::make_mut(&mut state_mut.roles).apply_grant_role(*revoke, values)
-        }
-        _ => Arc::make_mut(&mut state_mut.classes).apply(change, values),
-    };
+    let result = change(Arc::make_mut(&mut state));
     schema.dialect_schema = Some(state);
     result
 }

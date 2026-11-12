@@ -362,8 +362,16 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("there is no parameter $") {
         SQLSTATE_UNDEFINED_PARAMETER
-    } else if msg == "subqueries in policies are not supported" {
+    } else if msg == "subqueries in policies are not supported"
+        || (msg.starts_with("function ")
+            && (msg.ends_with(" is not supported in an index")
+                || msg.ends_with(" is not supported in a generated column")))
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg.ends_with(" may not be used as a window function")
+        || msg.contains(" may not be used with non-aggregate ")
+    {
+        SQLSTATE_WRONG_OBJECT_TYPE
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))

@@ -9,6 +9,7 @@ mod parse_edge_cases;
 mod role;
 mod row_security;
 mod sequence;
+mod sql_functions;
 mod table;
 mod type_aliases;
 mod update_from;
