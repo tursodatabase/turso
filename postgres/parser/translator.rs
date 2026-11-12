@@ -5,8 +5,8 @@
 
 use crate::coerce::{
     assignment_decision, bool_literal, check_unary_operand, coerce, coerce_assignment,
-    coerce_operands, coerce_to_boolean, engine_cast, engine_cast_as, CastContext, CastDecision,
-    CastMethod, OperatorKind, PgType,
+    coerce_operands, coerce_to_boolean, coerce_to_common, engine_cast, engine_cast_as, CastContext,
+    CastDecision, CastMethod, OperatorKind, PgType,
 };
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
@@ -2119,11 +2119,13 @@ impl PostgreSQLTranslator {
         }
 
         if is_set_operation(select) {
+            self.check_set_operation(select)?;
             return self.translate_set_operation(select);
         }
 
         // VALUES clause: standalone VALUES (1,'a'), (2,'b') ...
         if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            self.check_values_columns(select)?;
             let mut rows = Vec::new();
             for row_node in &select.values_lists {
                 let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
@@ -3360,11 +3362,7 @@ impl PostgreSQLTranslator {
                 }
             }
             Some(pg_query::protobuf::node::Node::CoalesceExpr(coalesce)) => {
-                let args = coalesce
-                    .args
-                    .iter()
-                    .map(|a| Ok(Box::new(self.translate_expr(a)?)))
-                    .collect::<Result<Vec<_>, ParseError>>()?;
+                let args = self.translate_common_type_values("COALESCE", &coalesce.args)?;
                 Ok(ast::Expr::FunctionCall {
                     name: exact_name("COALESCE"),
                     distinctness: None,
@@ -3384,11 +3382,10 @@ impl PostgreSQLTranslator {
                     Ok(MinMaxOp::IsLeast) => "MIN",
                     _ => return Err(ParseError::ParseError("MinMaxExpr: unsupported op".into())),
                 };
-                let args = minmax
-                    .args
-                    .iter()
-                    .map(|a| Ok(Box::new(self.translate_expr(a)?)))
-                    .collect::<Result<Vec<_>, ParseError>>()?;
+                let args = self.translate_common_type_values(
+                    typing::min_max_construct(minmax.op),
+                    &minmax.args,
+                )?;
                 Ok(ast::Expr::FunctionCall {
                     name: exact_name(func_name),
                     distinctness: None,
@@ -4535,57 +4532,86 @@ impl PostgreSQLTranslator {
         }))
     }
 
+    #[allow(clippy::vec_box)]
+    fn translate_common_type_values(
+        &self,
+        construct: &str,
+        nodes: &[pg_query::protobuf::Node],
+    ) -> Result<Vec<Box<ast::Expr>>, ParseError> {
+        let values = nodes
+            .iter()
+            .map(|node| Ok((self.translate_expr(node)?, self.type_of(node))))
+            .collect::<Result<Vec<_>, ParseError>>()?;
+        Ok(self
+            .coerce_to_common_of(construct, values)?
+            .into_iter()
+            .map(Box::new)
+            .collect())
+    }
+
     fn translate_case_expr(
         &self,
         case_expr: &pg_query::protobuf::CaseExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Translate optional base expression (CASE <expr> WHEN ...)
-        let base = if let Some(arg) = &case_expr.arg {
-            Some(Box::new(self.translate_expr(arg)?))
-        } else {
-            None
-        };
-
-        // Translate WHEN/THEN pairs
-        let mut when_then_pairs = Vec::new();
+        let mut conditions = Vec::new();
+        let mut results = Vec::new();
         for arg in &case_expr.args {
-            match &arg.node {
-                Some(pg_query::protobuf::node::Node::CaseWhen(case_when)) => {
-                    let when_expr = if let Some(expr) = &case_when.expr {
-                        Box::new(self.translate_expr(expr)?)
-                    } else {
-                        return Err(ParseError::ParseError(
-                            "CASE WHEN missing condition".to_string(),
-                        ));
-                    };
-                    let then_expr = if let Some(result) = &case_when.result {
-                        Box::new(self.translate_expr(result)?)
-                    } else {
-                        return Err(ParseError::ParseError(
-                            "CASE WHEN missing THEN result".to_string(),
-                        ));
-                    };
-                    when_then_pairs.push((when_expr, then_expr));
-                }
-                _ => {
-                    return Err(ParseError::ParseError(
-                        "Expected CaseWhen node in CASE expression".to_string(),
-                    ));
-                }
-            }
+            let Some(pg_query::protobuf::node::Node::CaseWhen(case_when)) = &arg.node else {
+                return Err(ParseError::ParseError(
+                    "Expected CaseWhen node in CASE expression".to_string(),
+                ));
+            };
+            let Some(when_node) = &case_when.expr else {
+                return Err(ParseError::ParseError(
+                    "CASE WHEN missing condition".to_string(),
+                ));
+            };
+            let Some(result_node) = &case_when.result else {
+                return Err(ParseError::ParseError(
+                    "CASE WHEN missing THEN result".to_string(),
+                ));
+            };
+            let condition = match &case_expr.arg {
+                Some(_) => self.translate_expr(when_node)?,
+                None => self.translate_condition(when_node, "CASE/WHEN")?,
+            };
+            conditions.push((condition, self.type_of(when_node)));
+            results.push((self.translate_expr(result_node)?, self.type_of(result_node)));
+        }
+        if let Some(defresult) = &case_expr.defresult {
+            results.insert(
+                0,
+                (self.translate_expr(defresult)?, self.type_of(defresult)),
+            );
         }
 
-        // Translate optional ELSE expression
-        let else_expr = if let Some(defresult) = &case_expr.defresult {
-            Some(Box::new(self.translate_expr(defresult)?))
-        } else {
-            None
+        let (base, conditions) = match &case_expr.arg {
+            Some(base_node) => {
+                let mut operands = vec![(self.translate_expr(base_node)?, self.type_of(base_node))];
+                operands.extend(conditions);
+                let mut converted = self
+                    .coerce_operands_of("=", OperatorKind::Comparison, operands)?
+                    .into_iter();
+                let base = converted.next().map(Box::new);
+                (base, converted.collect::<Vec<_>>())
+            }
+            None => (None, conditions.into_iter().map(|(expr, _)| expr).collect()),
         };
+
+        let mut results = self.coerce_to_common_of("CASE", results)?.into_iter();
+        let else_expr = case_expr.defresult.as_ref().and_then(|_| results.next());
+        let when_then_pairs = conditions
+            .into_iter()
+            .map(|condition| {
+                let result = results.next().expect("one converted result for each WHEN");
+                (Box::new(condition), Box::new(result))
+            })
+            .collect();
 
         Ok(ast::Expr::Case {
             base,
             when_then_pairs,
-            else_expr,
+            else_expr: else_expr.map(Box::new),
         })
     }
 
@@ -5537,6 +5563,24 @@ impl PostgreSQLTranslator {
         Ok(())
     }
 
+    fn coerce_to_common_of(
+        &self,
+        construct: &str,
+        values: Vec<(ast::Expr, ExprType)>,
+    ) -> Result<Vec<ast::Expr>, ParseError> {
+        let stored = self
+            .for_stored_sql
+            .then(|| values.iter().map(|(expr, _)| expr.clone()).collect());
+        let (exprs, types): (Vec<_>, Vec<_>) = values.into_iter().unzip();
+        let result = self
+            .known_types(types)
+            .and_then(|types| coerce_to_common(construct, exprs.into_iter().zip(types).collect()));
+        match (result, stored) {
+            (Err(_), Some(exprs)) => Ok(exprs),
+            (result, _) => result,
+        }
+    }
+
     fn known_type(&self, typed: ExprType) -> Result<Option<PgType>, ParseError> {
         if self.for_stored_sql {
             return Ok(typed.ok());
@@ -5549,6 +5593,26 @@ impl PostgreSQLTranslator {
             return Ok(typed.into_iter().map(|ty| ty.ok()).collect());
         }
         require_types(typed)
+    }
+
+    fn check_set_operation(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<(), ParseError> {
+        match typing::check_set_operation_columns(select, &self.scopes.borrow()) {
+            Err(_) if self.for_stored_sql => Ok(()),
+            result => result,
+        }
+    }
+
+    fn check_values_columns(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<(), ParseError> {
+        match typing::check_values_columns(select, &self.scopes.borrow()) {
+            Err(_) if self.for_stored_sql => Ok(()),
+            result => result,
+        }
     }
 
     fn translate_create_sequence(
@@ -13276,6 +13340,11 @@ mod tests {
                 "operator does not exist: - text",
             ),
             (
+                "SELECT CASE a WHEN b THEN 1 END FROM t",
+                does_not_exist,
+                "operator does not exist: integer = text",
+            ),
+            (
                 "SELECT '1' + '1'",
                 "42725",
                 "operator is not unique: unknown + unknown",
@@ -13340,6 +13409,10 @@ mod tests {
                 "SELECT 1 FROM t WHERE f IN (SELECT f FROM t)",
             ),
             (
+                "SELECT CASE a WHEN '1' THEN 1 END FROM t",
+                "SELECT CASE a WHEN 1 THEN 1 END FROM t",
+            ),
+            (
                 "SELECT 1 FROM t WHERE ts = ts",
                 "SELECT 1 FROM t WHERE ts = ts",
             ),
@@ -13370,6 +13443,11 @@ mod tests {
             (
                 "SELECT count(*) FILTER (WHERE a) FROM t",
                 "FILTER",
+                "integer",
+            ),
+            (
+                "SELECT CASE WHEN a THEN 1 END FROM t",
+                "CASE/WHEN",
                 "integer",
             ),
             ("SELECT a AND d FROM t", "AND", "integer"),
@@ -13423,6 +13501,7 @@ mod tests {
             "SELECT 1 FROM t WHERE NULL",
             "SELECT 1 FROM t WHERE a = 1 AND d",
             "SELECT 1 FROM t WHERE d IS TRUE",
+            "SELECT CASE WHEN d THEN 1 END FROM t",
             "CREATE TABLE n (x int CHECK (x > 0))",
             "CREATE INDEX i ON t (a) WHERE d",
         ] {
@@ -13751,10 +13830,130 @@ mod tests {
         for sql in [
             "INSERT INTO t (a) SELECT b FROM t",
             "INSERT INTO t (f) SELECT a FROM t",
+            "SELECT CASE WHEN d THEN a ELSE b END FROM t",
+            "SELECT COALESCE(a, b) FROM t",
+            "SELECT a FROM t UNION SELECT b FROM t",
+            "SELECT * FROM (VALUES (1), ('x'::text)) v",
             "SELECT age('2024-01-01')",
         ] {
             assert_cast_accepted(&translator, sql);
         }
+    }
+
+    #[test]
+    fn case_with_a_base_converts_the_base_and_every_value_to_one_type() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "SELECT CASE a WHEN 1 THEN 'x' WHEN '2' THEN 'y' END FROM t",
+            "SELECT CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'y' END \"case\" FROM t",
+        );
+        assert_translates_to(
+            &translator,
+            "SELECT CASE a WHEN 1 THEN 'x' WHEN 2.5 THEN 'y' END FROM t",
+            "SELECT CASE CAST (a AS REAL) WHEN CAST (1 AS REAL) THEN 'x' WHEN 2.5 THEN 'y' END \"case\" FROM t",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT CASE a WHEN 1 THEN 'x' WHEN b THEN 'y' END FROM t",
+            "42883",
+            "operator does not exist: integer = text",
+        );
+    }
+
+    #[test]
+    fn case_results_convert_to_their_common_type() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "SELECT CASE WHEN d THEN a ELSE '5' END FROM t",
+            "SELECT CASE WHEN d THEN a ELSE 5 END \"case\" FROM t",
+        );
+        assert_translates_to(
+            &translator,
+            "SELECT CASE WHEN d THEN a WHEN a > 1 THEN 2.5 END FROM t",
+            "SELECT CASE WHEN d THEN CAST (a AS REAL) WHEN a > 1 THEN 2.5 END \"case\" FROM t",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT CASE WHEN d THEN 1 ELSE 'x' END FROM t",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT CASE WHEN d THEN a ELSE b END FROM t",
+            "42804",
+            "CASE types text and integer cannot be matched",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT CASE WHEN d THEN ts ELSE '2024-01-01' END FROM t",
+            "0A000",
+            "a cast from unknown to timestamp is not supported",
+        );
+    }
+
+    #[test]
+    fn coalesce_greatest_and_least_convert_their_arguments_to_a_common_type() {
+        let translator = operand_translator();
+        assert_translates_to(
+            &translator,
+            "SELECT COALESCE(a, '0'), GREATEST(a, 1.5), LEAST(a, 2) FROM t",
+            "SELECT COALESCE (a, 0) coalesce, MAX (CAST (a AS REAL), 1.5) greatest, MIN (a, 2) least FROM t",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT COALESCE(a, b) FROM t",
+            "42804",
+            "COALESCE types integer and text cannot be matched",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT GREATEST(a, b) FROM t",
+            "42804",
+            "GREATEST types integer and text cannot be matched",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT LEAST(a, b) FROM t",
+            "42804",
+            "LEAST types integer and text cannot be matched",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT COALESCE(ts, '2024-01-01') FROM t",
+            "0A000",
+            "a cast from unknown to timestamp is not supported",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT COALESCE(a, 'x') FROM t",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        );
+    }
+
+    #[test]
+    fn set_operation_and_values_columns_are_checked_but_not_converted() {
+        let translator = operand_translator();
+        assert_rejected(
+            &translator,
+            "SELECT a FROM t UNION SELECT b FROM t",
+            "42804",
+            "UNION types integer and text cannot be matched",
+        );
+        assert_rejected(
+            &translator,
+            "SELECT * FROM (VALUES (1), ('x'::text)) v",
+            "42804",
+            "VALUES types integer and text cannot be matched",
+        );
+        assert_translates_to(
+            &translator,
+            "SELECT 1 UNION SELECT 'a'",
+            "SELECT 1 UNION SELECT 'a'",
+        );
     }
 
     #[test]
@@ -13811,5 +14010,130 @@ mod tests {
             "SELECT '\\x01'::bytea || '\\x02'",
             "SELECT CAST (X'01'AS BLOB) || X'02'",
         );
+    }
+
+    fn assert_type_not_known(translator: &PostgreSQLTranslator, sql: &str, description: &str) {
+        assert_rejected(
+            translator,
+            sql,
+            "0A000",
+            &format!("the type of {description} is not known"),
+        );
+    }
+
+    #[test]
+    fn every_conversion_rejects_a_value_whose_type_is_not_known() {
+        let translator = operand_translator();
+        for (sql, description) in [
+            (
+                "SELECT 1 FROM t WHERE json_extract(b, 'x') = 1",
+                "the function json_extract",
+            ),
+            (
+                "SELECT 1 FROM t WHERE 1 = json_extract(b, 'x')",
+                "the function json_extract",
+            ),
+            (
+                "SELECT 1 FROM t WHERE json_extract(b, 'x')",
+                "the function json_extract",
+            ),
+            (
+                "SELECT json_extract(b, 'x')::int FROM t",
+                "the function json_extract",
+            ),
+            (
+                "SELECT -json_extract(b, 'x') FROM t",
+                "the function json_extract",
+            ),
+            (
+                "SELECT json_extract(b, 'x') || 'x' FROM t",
+                "the function json_extract",
+            ),
+            (
+                "SELECT json_extract(b, 'x') IN (1, 2) FROM t",
+                "the function json_extract",
+            ),
+            (
+                "SELECT 1 FROM t WHERE a IN (SELECT json_extract(b, 'x') FROM t)",
+                "the function json_extract",
+            ),
+            (
+                "SELECT COALESCE(json_extract(b, 'x'), 1) FROM t",
+                "the function json_extract",
+            ),
+            (
+                "SELECT CASE WHEN d THEN json_extract(b, 'x') ELSE 1 END FROM t",
+                "the function json_extract",
+            ),
+            ("SELECT b ->> 'x' = 'y' FROM t", "the operator ->>"),
+            ("SELECT ARRAY[a] = ARRAY[a] FROM t", "an ARRAY constructor"),
+            ("SELECT (a, b) = (1, 'x') FROM t", "a row value"),
+            (
+                "SELECT x = 1 FROM generate_series(1.5::float8, 3) AS x",
+                "a column of generate_series",
+            ),
+            (
+                "INSERT INTO t (a) SELECT json_extract(b, 'x') FROM t",
+                "the function json_extract",
+            ),
+            (
+                "UPDATE t SET a = json_extract(b, 'x')",
+                "the function json_extract",
+            ),
+        ] {
+            assert_type_not_known(&translator, sql, description);
+        }
+    }
+
+    #[test]
+    fn a_value_whose_type_is_not_known_is_fine_where_no_conversion_is_needed() {
+        let translator = operand_translator();
+        for sql in [
+            "SELECT json_extract(b, 'x') FROM t",
+            "SELECT json_extract(b, 'x'), a FROM t WHERE d",
+            "SELECT count(json_extract(b, 'x')) FROM t",
+            "SELECT 1 FROM t WHERE json_extract(b, 'x') IS NULL",
+        ] {
+            if let Err(error) = translate_with(&translator, sql) {
+                panic!("{sql}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_that_does_not_resolve_is_left_for_the_engine_to_report() {
+        let translator = operand_translator();
+        for sql in [
+            "SELECT nosuch = 1 FROM t",
+            "SELECT 1 FROM nosuch WHERE x = 1",
+            "SELECT 1 FROM t WHERE nosuch",
+            "SELECT json_extract(nosuch, 'x') = 1 FROM t",
+            "SELECT nosuch::int FROM t",
+            "INSERT INTO nosuch (a) SELECT json_extract(b, 'x') FROM t",
+            "UPDATE nosuch SET a = json_extract(b, 'x')",
+        ] {
+            if let Err(error) = translate_with(&translator, sql) {
+                panic!("{sql}: {error}");
+            }
+        }
+        if let Err(error) = translate_with(&PostgreSQLTranslator::new(), "SELECT a = 1 FROM t") {
+            panic!("a translator with no lookup: {error}");
+        }
+    }
+
+    #[test]
+    fn stored_sql_keeps_loading_a_value_whose_type_is_not_known() {
+        let translator = operand_translator().for_stored_sql();
+        for sql in [
+            "SELECT 1 FROM t WHERE json_extract(b, 'x') = 1",
+            "SELECT json_extract(b, 'x')::int FROM t",
+            "INSERT INTO t (a) SELECT json_extract(b, 'x') FROM t",
+            "UPDATE t SET a = json_extract(b, 'x')",
+            "SELECT COALESCE(json_extract(b, 'x'), 1) FROM t",
+        ] {
+            if let Err(error) = translate_with(&translator, sql) {
+                panic!("{sql}: {error}");
+            }
+        }
     }
 }
