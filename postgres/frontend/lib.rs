@@ -5,6 +5,7 @@ mod classes;
 mod copy;
 mod error;
 mod functions;
+mod json_operators;
 mod options;
 mod policies;
 mod session;
