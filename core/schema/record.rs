@@ -1,17 +1,14 @@
 //! Reading and rewriting the rows of the schema table (`sqlite_schema`).
 //!
-//! Code outside `core/schema` must not index into these records itself. It
-//! should call the functions here, so only this file knows the column layout.
-//!
-//! TODO: make these functions go through `Dialect`, so the SQLite and
-//! PostgreSQL frontends can store different schema records.
+//! Only this file knows the column layout. Code outside `core/schema` reads
+//! these records through [`super::SqliteSchemaStore`].
 
 use crate::types::{ImmutableRecord, ImmutableRecordRef, Value, ValueRef};
 use crate::{LimboError, Numeric, Result};
 
 /// Number of columns in a SQLite schema record: type, name, tbl_name,
 /// rootpage, sql.
-pub const SCHEMA_RECORD_COLUMN_COUNT: usize = 5;
+pub(super) const SCHEMA_RECORD_COLUMN_COUNT: usize = 5;
 
 const TYPE_COLUMN: usize = 0;
 const NAME_COLUMN: usize = 1;
@@ -56,7 +53,7 @@ pub struct SchemaRecord {
 
 impl SchemaRecord {
     /// Decode a schema record from its serialized bytes.
-    pub fn decode(record_bytes: &[u8]) -> Result<Self> {
+    pub(super) fn decode(record_bytes: &[u8]) -> Result<Self> {
         let record = ImmutableRecordRef::from_bin_record(record_bytes);
         let column_count = record.column_count();
         if column_count < SCHEMA_RECORD_COLUMN_COUNT {
@@ -96,7 +93,7 @@ impl SchemaRecord {
 }
 
 /// Return a copy of a schema record with its root page replaced.
-pub fn schema_record_with_root_page(
+pub(super) fn schema_record_with_root_page(
     record_bytes: &[u8],
     root_page: i64,
 ) -> Result<ImmutableRecord> {
