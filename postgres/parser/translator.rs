@@ -3041,6 +3041,7 @@ impl PostgreSQLTranslator {
                         .as_str(),
                     "json" | "jsonb"
                 );
+                self.check_type_name(type_name, TypeUse::Column)?;
                 let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
                 let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'$.\"{}\"'",
@@ -3425,6 +3426,7 @@ impl PostgreSQLTranslator {
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
+                self.check_type_name(pg_type_name, TypeUse::Cast)?;
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
                     expr,
@@ -5702,6 +5704,7 @@ impl PostgreSQLTranslator {
 #[derive(Debug, Clone, Copy)]
 enum TypeUse {
     Column,
+    Cast,
     /// The base type of a domain.
     Domain,
 }
@@ -5712,6 +5715,7 @@ impl TypeUse {
     fn row_type_feature(self, type_name: &str) -> String {
         match self {
             Self::Column => format!("a column of row type {type_name}"),
+            Self::Cast => format!("a cast to row type {type_name}"),
             Self::Domain => format!("a domain over row type {type_name}"),
         }
     }

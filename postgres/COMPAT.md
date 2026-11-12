@@ -161,9 +161,9 @@ numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Other type names pass through as custom types, such as enums and
-domains. A column or a domain of the row type of a table or view is rejected
-(0A000), and a name that is neither a built-in type nor a custom type fails
-with 42704.
+domains. A column, a domain or a cast of the row type of a table or view is
+rejected (0A000), and a name that is neither a built-in type nor a custom type
+fails with 42704.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
