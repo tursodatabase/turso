@@ -1259,6 +1259,14 @@ fn get_subquery_parser<'a>(
                 });
                 Ok(WalkControl::Continue)
             }
+            ast::Expr::FunctionCall { .. } => {
+                // Binding expands the calls of most clauses before their
+                // subqueries are planned. A clause that is not bound, such
+                // as VALUES or RETURNING, gets the expansion here. The walk
+                // goes on into the expansion.
+                resolver.catalog.expand_call_with_subquery(expr)?;
+                Ok(WalkControl::Continue)
+            }
             _ => Ok(WalkControl::Continue),
         }
     })

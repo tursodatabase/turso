@@ -99,10 +99,11 @@ pub(crate) fn validate_check_expr(
             }
             ast::Expr::FunctionCall {
                 name,
+                distinctness,
                 args,
                 filter_over,
                 order_by,
-                ..
+                within_group,
             } => {
                 super::expr::validate_function_tail(
                     name.as_str(),
@@ -114,7 +115,19 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
+                let clauses = super::catalog::AggregateClauses::new(
+                    distinctness,
+                    order_by,
+                    within_group,
+                    filter_over,
+                );
+                if resolver
+                    .expand_function_call(name.as_str(), args, clauses)?
+                    .is_some()
+                {
+                    // The dialect compiles an expression of its own in
+                    // place of the call.
+                } else if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                     if func.is_aggregate() {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
@@ -406,7 +419,10 @@ fn resolve_check_expr_type(
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
         ast::Expr::FunctionCall { name, args, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
+            let clauses = super::catalog::AggregateClauses::of(expr);
+            if let Some(expansion) = resolver.expand_function_call(name.as_str(), args, clauses)? {
+                resolve_check_expr_type(&expansion, columns, resolver)
+            } else if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
                 resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
             } else {
                 bail_parse_error!(
@@ -728,9 +744,14 @@ fn validate(
                 match &constraint.constraint {
                     ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
+                        resolver.check_no_calls_with_subqueries(expr, "a CHECK constraint")?;
                     }
-                    ast::ColumnConstraint::Default(expr) => validate_default_expr(expr, col_i)?,
+                    ast::ColumnConstraint::Default(expr) => {
+                        validate_default_expr(expr, col_i)?;
+                        resolver.check_no_calls_with_subqueries(expr, "a column default")?;
+                    }
                     ast::ColumnConstraint::Generated { expr, .. } => {
+                        resolver.check_no_expanded_function_calls(expr, "a generated column")?;
                         validate_generated_function_calls(expr, resolver)?;
                     }
                     ast::ColumnConstraint::Collate { collation_name } => {
@@ -757,6 +778,7 @@ fn validate(
         for constraint in constraints {
             if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
+                resolver.check_no_calls_with_subqueries(expr, "a CHECK constraint")?;
             }
         }
 
@@ -2657,6 +2679,10 @@ pub(crate) fn find_object_using_sequence(
 /// Validate an encode or decode expression for safety.
 /// Rejects subqueries, aggregates, and window functions.
 fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -> Result<()> {
+    // A function that the dialect expands could cast to the type, and the
+    // expansion of the cast would then expand the function again without
+    // end. A domain or type also keeps values that the function computed.
+    resolver.check_no_expanded_function_calls(expr, &format!("{kind} expressions"))?;
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {

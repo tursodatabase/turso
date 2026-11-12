@@ -118,6 +118,15 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
+    for expr in columns
+        .iter()
+        .map(|column| column.expr.as_ref())
+        .chain(where_clause.as_deref())
+    {
+        resolver
+            .catalog
+            .check_no_expanded_function_calls(expr, "an index")?;
+    }
     let mut original_idx_name = idx_name;
     let mut original_tbl_name = tbl_name;
     let namespace = match stored_index_of_namespace(

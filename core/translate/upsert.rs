@@ -1845,7 +1845,16 @@ fn emit_do_update_subqueries<'a>(
     rowid_reg: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    let exprs: Vec<&mut ast::Expr> = exprs.filter(|e| expr_contains_subquery(e)).collect();
+    let mut exprs: Vec<&mut ast::Expr> = exprs.collect();
+    // A call that stands for an expression with a subquery counts as a
+    // subquery.
+    for expr in exprs.iter_mut() {
+        resolver.catalog.expand_calls_with_subqueries(expr)?;
+    }
+    let exprs: Vec<&mut ast::Expr> = exprs
+        .into_iter()
+        .filter(|e| expr_contains_subquery(e))
+        .collect();
     if exprs.is_empty() {
         return Ok(());
     }

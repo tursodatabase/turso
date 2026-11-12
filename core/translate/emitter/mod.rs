@@ -2357,6 +2357,9 @@ fn emit_check_constraint_bytecode(
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 
+        resolver
+            .catalog
+            .check_no_calls_with_subqueries(&check_constraint.expr, "a CHECK constraint")?;
         let mut rewritten_expr = check_constraint.expr.clone();
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();

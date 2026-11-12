@@ -97,7 +97,7 @@ pub mod vtab;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
-pub use function::{ExternalFunc, Func, ScalarFunc};
+pub use function::{Deterministic, ExternalFunc, Func, ScalarFunc};
 /// The ENCODE of the built-in date and time types, also used by the PostgreSQL
 /// frontend to check input in `pg_input_is_valid`.
 pub use functions::datetime_input::exec_temporal_encode;
@@ -155,9 +155,9 @@ pub use dialect::{
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
     CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
     DependentObject, Dialect, DropColumn, DropIndex, DropSchema, DropSequence, DropTable,
-    DropTrigger, DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn,
-    RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes, TableText,
-    TempTriggerOfRenamedTable,
+    DropTrigger, DropType, DropView, FunctionScope, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes,
+    TableText, TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,

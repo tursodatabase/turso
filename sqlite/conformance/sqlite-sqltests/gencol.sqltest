@@ -3426,6 +3426,25 @@ expect error {
     non-deterministic functions prohibited in generated columns
 }
 
+# SQLite checks what a generated column may use before it counts the
+# arguments of a function.
+test gencol_alter_add_random_error_before_argument_count_error {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (abs(a, 2) + random());
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+@skip-if sqlite "ALTER COLUMN ... TO is Turso syntax"
+test gencol_alter_column_random_error_before_argument_count_error {
+    CREATE TABLE t1(a INTEGER, b);
+    ALTER TABLE t1 ALTER COLUMN b TO b AS (abs(a, 2) + random());
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
 # CURRENT_TIMESTAMP/CURRENT_DATE/CURRENT_TIME literals are as
 # non-deterministic as random(); an index on such a column desyncs as soon
 # as the value is recomputed on a later read.

@@ -481,6 +481,12 @@ fn bind_policy_expr(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<ast::Expr> {
+    // CREATE POLICY refuses a call that the dialect expands, but a function
+    // created later can take the name of a function that a stored policy
+    // calls. Its body is not checked as a policy, so it is refused here.
+    resolver
+        .catalog
+        .check_no_expanded_function_calls(expr, "a policy")?;
     let mut policy_table = table.clone();
     policy_table.identifier = normalize_ident(&btree.declared_name);
     policy_table.has_alias = false;
@@ -794,6 +800,12 @@ fn prepare_policy_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     let table_name = normalize_ident(&table.declared_name);
+    // The checks below are of the condition as it is stored. The expression
+    // that the dialect compiles in place of a call is not checked, and it
+    // can have a subquery.
+    resolver
+        .catalog
+        .check_no_expanded_function_calls(expr, "a policy")?;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         match expr {
             ast::Expr::Subquery(select) => {
