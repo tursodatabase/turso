@@ -1,11 +1,13 @@
-//! CREATE FUNCTION and CREATE PROCEDURE, which tursopg does not support yet.
+//! CREATE FUNCTION, CREATE PROCEDURE and DROP FUNCTION.
 //!
-//! Every statement is rejected. A statement that PostgreSQL also rejects gets
-//! PostgreSQL's error. Otherwise the error names the first feature that
-//! tursopg does not support, so that each feature can be enabled on its own.
+//! tursopg supports SQL functions whose parameters and result have base
+//! types and whose body is one query in a dollar-quoted string. A statement
+//! that PostgreSQL rejects gets PostgreSQL's error. Any other statement that
+//! tursopg does not support gets an error that names the first feature it
+//! does not support, so that each feature can be enabled on its own.
 
 use crate::cmdtag::CommandTag;
-use crate::names::{extract_key_columns, is_default_schema, object_name};
+use crate::names::{extract_key_columns, schema_qualifier};
 use crate::sqlstate::{
     SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_OBJECT,
@@ -17,23 +19,97 @@ use pg_query::protobuf::{
 };
 use pg_query::NodeEnum;
 use std::collections::HashMap;
+use turso_parser::ast;
 
-/// The error for `stmt`, a CREATE FUNCTION or CREATE PROCEDURE statement of
-/// `sql`.
-pub(crate) fn reject_create_function(sql: &str, stmt: &CreateFunctionStmt) -> ParseError {
-    match check_create_function(sql, stmt) {
-        Err(error) => error,
-        Ok(()) => ParseError::not_supported("CREATE FUNCTION"),
+/// The statement that `stmt`, a CREATE FUNCTION statement, translates to.
+/// The text of the statement is not known here, so a body that is not
+/// dollar-quoted is accepted: [`check_create_function`] rejects it.
+pub(crate) fn translate_create_function(
+    stmt: &CreateFunctionStmt,
+) -> Result<ast::Stmt, ParseError> {
+    let function = checked_function(None, stmt)?;
+    Ok(ast::Stmt::CreateFunction(ast::CreateFunction {
+        or_replace: stmt.replace,
+        name: function.name,
+        parameter_types: function.parameter_types,
+        return_type: function.return_type,
+        body: function.body,
+    }))
+}
+
+/// Rejects `stmt`, a CREATE FUNCTION or CREATE PROCEDURE statement of `sql`,
+/// when PostgreSQL or tursopg does not support it.
+pub(crate) fn check_create_function(
+    sql: &str,
+    stmt: &CreateFunctionStmt,
+) -> Result<(), ParseError> {
+    checked_function(Some(sql), stmt).map(|_| ())
+}
+
+/// The name of `type_name` in the signature of a function: the name
+/// PostgreSQL stores for a built-in type, such as `int4` for `integer`,
+/// with `[]` for each array dimension. Type modifiers do not take part in a
+/// signature.
+fn signature_type_name(type_name: &TypeName) -> Result<String, ParseError> {
+    let names = extract_key_columns(&type_name.names)?;
+    let name = match names.as_slice() {
+        [name] => name.clone(),
+        [schema, name] if schema == "pg_catalog" => name.clone(),
+        _ => names.join("."),
+    };
+    Ok(name + &"[]".repeat(type_name.array_bounds.len()))
+}
+
+/// The schema and name of a function. A function is not stored under the
+/// names of PostgreSQL's own schemas.
+fn function_name(names: &[pg_query::protobuf::Node]) -> Result<ast::QualifiedName, ParseError> {
+    let names = extract_key_columns(names)?;
+    let (schema, name) = match names.as_slice() {
+        [name] => (None, name),
+        [schema, name] => (Some(schema), name),
+        [] => return Err(ParseError::ParseError("missing function name".to_string())),
+        _ => return Err(ParseError::not_supported("a cross-database reference")),
+    };
+    // A call names a function of a schema as `schema.name`.
+    if name.contains('.') || schema.is_some_and(|schema| schema.contains('.')) {
+        return Err(ParseError::not_supported(
+            "a function or schema name with a dot",
+        ));
     }
+    let name = ast::Name::exact(name.clone());
+    Ok(match schema {
+        Some(schema) if matches!(schema.as_str(), "pg_catalog" | "information_schema") => {
+            return Err(ParseError::not_supported(format!(
+                "a function in schema {schema}"
+            )))
+        }
+        Some(schema) => ast::QualifiedName::fullname(
+            ast::Name::exact(schema_qualifier(schema)?.to_string()),
+            name,
+        ),
+        None => ast::QualifiedName::single(name),
+    })
+}
+
+/// What CREATE FUNCTION defines, once PostgreSQL and tursopg accept it.
+struct CheckedFunction {
+    name: ast::QualifiedName,
+    parameter_types: Vec<String>,
+    return_type: String,
+    body: String,
 }
 
 /// Raises the errors of PostgreSQL in the order PostgreSQL raises them, then
-/// the error for the first feature that tursopg does not support.
-fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), ParseError> {
+/// the error for the first feature that tursopg does not support. `sql` is
+/// the text of the statement, when it is known.
+fn checked_function(
+    sql: Option<&str>,
+    stmt: &CreateFunctionStmt,
+) -> Result<CheckedFunction, ParseError> {
     if stmt.is_procedure {
         return Err(ParseError::not_supported("CREATE PROCEDURE"));
     }
-    object_name(&stmt.funcname, is_default_schema, "function")?;
+    let name = function_name(&stmt.funcname)?;
     let options = function_options(&stmt.options)?;
     let language = function_language(&options, stmt)?;
     let is_sql = language == "sql";
@@ -73,25 +149,83 @@ fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), Par
     if options.contains_key("window") {
         return Err(ParseError::not_supported("WINDOW in CREATE FUNCTION"));
     }
-    if let Some(as_item) = options.get("as") {
+    if let (Some(sql), Some(as_item)) = (sql, options.get("as")) {
         if !is_dollar_quoted_after(sql, as_item.location)? {
             return Err(ParseError::not_supported(
                 "a function body that is not dollar-quoted",
             ));
         }
     }
-    if let Some(statements) = &body_statements {
-        check_body_statements(statements)?;
-    }
+    let body_statements = body_statements.expect("an SQL function without a RETURN has a body");
+    check_body_statements(&body_statements)?;
     for (parameter, class) in parameters.iter().zip(&parameter_types) {
         check_parameter_features(parameter, class)?;
     }
-    if let Some(class) = &result_type {
-        check_result_features(stmt, class)?;
-    }
+    let result_type = result_type.expect("a function without OUT parameters has a result type");
+    check_result_features(stmt, &result_type)?;
     check_option_features(&stmt.options)?;
-    if stmt.replace {
-        return Err(ParseError::not_supported("CREATE OR REPLACE FUNCTION"));
+    check_body_query(&body_statements, stmt)?;
+    let parameter_types = parameters
+        .iter()
+        .map(|parameter| {
+            signature_type_name(
+                parameter
+                    .arg_type
+                    .as_ref()
+                    .expect("the type of each parameter was checked"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let return_type = signature_type_name(
+        stmt.return_type
+            .as_ref()
+            .expect("the result type was checked"),
+    )?;
+    Ok(CheckedFunction {
+        name,
+        parameter_types,
+        return_type,
+        body: body.expect("the body was parsed").to_string(),
+    })
+}
+
+/// Rejects a body whose final statement cannot give the function's result,
+/// as PostgreSQL does when it validates the function. The frontend checks
+/// the rest of what PostgreSQL validates, which needs the query compiled.
+fn check_body_query(
+    statements: &pg_query::ParseResult,
+    stmt: &CreateFunctionStmt,
+) -> Result<(), ParseError> {
+    let result_type = || {
+        stmt.return_type
+            .as_ref()
+            .map(display_type_name)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let mismatch = || -> Result<(), ParseError> {
+        Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
+            message: return_type_mismatch_message(&result_type()?),
+        })
+    };
+    // A function's final statement must be SELECT or have RETURNING, which
+    // PostgreSQL says in the DETAIL of the error.
+    let Some(NodeEnum::SelectStmt(select)) = statements
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|statement| statement.stmt.as_ref())
+        .and_then(|statement| statement.node.as_ref())
+    else {
+        return mismatch();
+    };
+    // The final statement must return exactly one column. The frontend
+    // counts the columns of a query that compiles. A SELECT without columns
+    // does not compile in tursopg.
+    let is_plain_select = select.larg.is_none() && select.values_lists.is_empty();
+    if is_plain_select && select.target_list.is_empty() {
+        return mismatch();
     }
     Ok(())
 }
@@ -349,7 +483,8 @@ fn is_dollar_quoted_after(sql: &str, as_location: i32) -> Result<bool, ParseErro
     Ok(sql[body.start as usize..].starts_with('$'))
 }
 
-/// Rejects a body that is not a single query.
+/// Rejects a body that is not a single query. An empty body is left to
+/// [`check_body_query`], which gives it PostgreSQL's error.
 fn check_body_statements(statements: &pg_query::ParseResult) -> Result<(), ParseError> {
     let [statement] = statements.protobuf.stmts.as_slice() else {
         if statements.protobuf.stmts.is_empty() {
@@ -565,6 +700,44 @@ fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
     Ok(text)
 }
 
+/// PostgreSQL's error for a body whose result is not what the function
+/// returns. `return_type` is the type as PostgreSQL writes it in errors.
+pub fn return_type_mismatch_message(return_type: &str) -> String {
+    format!("return type mismatch in function declared to return {return_type}")
+}
+
+/// The type name as PostgreSQL writes it in most errors, such as `integer`
+/// for `int4`.
+fn display_type_name(type_name: &TypeName) -> Result<String, ParseError> {
+    Ok(display_signature_type_name(&signature_type_name(
+        type_name,
+    )?))
+}
+
+/// The name that PostgreSQL writes in most errors for the type that a
+/// signature names `name`, such as `integer` for `int4`.
+pub fn display_signature_type_name(name: &str) -> String {
+    let element = name.trim_end_matches("[]");
+    let display = match element {
+        "bool" => "boolean",
+        "int2" => "smallint",
+        "int4" => "integer",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "varchar" => "character varying",
+        "bpchar" => "character",
+        "char" => "\"char\"",
+        "time" => "time without time zone",
+        "timetz" => "time with time zone",
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "varbit" => "bit varying",
+        other => other,
+    };
+    format!("{display}{}", &name[element.len()..])
+}
+
 // FIXME: the three lists that follow are written by hand, and they must
 // follow the PostgreSQL version of pg_query. They are also one of three
 // places that say what a type name is. The FIXME in
@@ -691,3 +864,39 @@ const BASE_TYPES: &[&str] = &[
     "tsmultirange",
     "tstzmultirange",
 ];
+
+#[cfg(test)]
+mod tests {
+    use crate::translator::PostgreSQLTranslator;
+    use turso_parser::ast;
+
+    fn translate(sql: &str) -> ast::Stmt {
+        let parsed = crate::parse(sql).unwrap();
+        PostgreSQLTranslator::new().translate(&parsed).unwrap()
+    }
+
+    #[test]
+    fn create_function_keeps_the_types_as_postgres_stores_them() {
+        let ast::Stmt::CreateFunction(function) = translate(
+            "CREATE OR REPLACE FUNCTION app.pad(varchar(10), int, double precision) \
+             RETURNS timestamp with time zone LANGUAGE sql AS $$ SELECT now() $$",
+        ) else {
+            panic!("expected CREATE FUNCTION");
+        };
+        assert!(function.or_replace);
+        assert_eq!(function.name.namespace.unwrap().as_str(), "app");
+        assert_eq!(function.name.name.as_str(), "pad");
+        assert_eq!(function.parameter_types, ["varchar", "int4", "float8"]);
+        assert_eq!(function.return_type, "timestamptz");
+        assert_eq!(function.body, " SELECT now() ");
+    }
+
+    #[test]
+    fn a_function_statement_formats_as_sql() {
+        assert_eq!(
+            translate("CREATE FUNCTION greet(text) RETURNS text LANGUAGE sql AS $$SELECT 'hi'$$")
+                .to_string(),
+            "CREATE FUNCTION greet (text) RETURNS text AS 'SELECT ''hi'''"
+        );
+    }
+}

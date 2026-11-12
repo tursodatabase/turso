@@ -12,6 +12,7 @@ mod roles;
 mod schema_state;
 mod session;
 mod settings;
+mod sql_functions;
 mod statement;
 mod unnest;
 

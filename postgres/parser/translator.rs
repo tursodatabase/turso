@@ -236,6 +236,9 @@ impl PostgreSQLTranslator {
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
             NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
+            NodeRef::CreateFunctionStmt(create) => {
+                crate::create_function::translate_create_function(create)?
+            }
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
             NodeRef::IndexStmt(idx) => self.translate_create_index(idx)?,
@@ -8572,7 +8575,8 @@ pub fn frontend_stmt(
     if let Some(NodeRef::CreateFunctionStmt(stmt)) =
         parse_result.protobuf.nodes().first().map(|(node, ..)| node)
     {
-        return Err(crate::create_function::reject_create_function(sql, stmt));
+        crate::create_function::check_create_function(sql, stmt)?;
+        return Ok(None);
     }
     if let Some(stmt) = try_extract_set(parse_result) {
         return Ok(Some(FrontendStmt::Set(stmt)));

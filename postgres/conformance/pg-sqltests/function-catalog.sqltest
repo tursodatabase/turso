@@ -1,0 +1,328 @@
+# The catalog of SQL functions: CREATE FUNCTION, CREATE OR REPLACE FUNCTION
+# and pg_proc.
+#
+# tursopg stores a function but cannot call it yet. The tests that call a
+# function are in create-function.sqltest.
+
+@database :memory:
+
+# pg_proc
+
+test pg-proc-shows-a-function {
+    CREATE FUNCTION add_one(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1 + 1$$;
+    SELECT proname, prosrc, pronargs, prorettype, proargtypes, prokind, provolatile
+    FROM pg_proc WHERE proname = 'add_one';
+}
+expect {
+    add_one|SELECT $1 + 1|1|23|23|f|v
+}
+
+# prosrc is the body as the user wrote it, with its comments and line breaks.
+test pg-proc-keeps-the-body-as-written {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $body$
+        -- returns one
+        SELECT 1;
+    $body$;
+    SELECT count(*) FROM pg_proc
+    WHERE proname = 'one' AND prosrc = E'\n        -- returns one\n        SELECT 1;\n    ';
+}
+expect {
+    1
+}
+
+test pg-proc-shows-the-parameter-types {
+    CREATE FUNCTION pad(text, bigint, boolean) RETURNS text LANGUAGE sql AS $$SELECT $1$$;
+    SELECT pronargs, proargtypes, prorettype FROM pg_proc WHERE proname = 'pad';
+}
+expect {
+    3|25 20 16|25
+}
+
+test pg-proc-shows-the-sql-language {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT p.prolang, l.lanname FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+    WHERE p.proname = 'one';
+}
+expect {
+    14|sql
+}
+
+test pg-language-has-the-sql-language {
+    SELECT oid, lanname, lanowner, lanispl, lanpltrusted FROM pg_language WHERE lanname = 'sql';
+}
+expect {
+    14|sql|10|f|t
+}
+
+# pronamespace is the oid of the function's schema in pg_namespace, as in
+# PostgreSQL. The oid of public is the same as in PostgreSQL. The oid of any
+# other schema is not: tursopg derives it from the id of the namespace.
+test pg-proc-shows-the-schema {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    SELECT p.proname, n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname IN ('one', 'two') ORDER BY p.proname;
+    SELECT pronamespace FROM pg_proc WHERE proname = 'two';
+}
+expect {
+    one|app
+    two|public
+    2200
+}
+
+test function-oid-is-a-user-object-oid {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one' AND oid >= 16384;
+}
+expect {
+    1
+}
+
+test function-is-not-in-pg-class {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_class WHERE relname LIKE 'one%';
+}
+expect {
+    0
+}
+
+# Schemas
+
+test function-goes-to-the-first-schema-of-the-search-path {
+    CREATE SCHEMA app;
+    SET search_path = app, public;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'one';
+}
+expect {
+    app
+}
+
+test function-without-a-schema-to-create-in {
+    SET search_path = nosuch;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
+}
+
+test same-function-in-two-schemas {
+    CREATE SCHEMA app;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql AS $$SELECT 10$$;
+    SELECT n.nspname, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'one' ORDER BY n.nspname;
+}
+expect {
+    app|SELECT 10
+    public|SELECT 1
+}
+
+# PostgreSQL lets a superuser create a function in pg_catalog.
+test function-in-pg-catalog {
+    CREATE FUNCTION pg_catalog.one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function in schema pg_catalog is not supported
+}
+
+# tursopg names a function of a schema `schema.name` in a call, so neither
+# name can have a dot.
+test function-name-with-a-dot {
+    CREATE FUNCTION "a.b"() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'a.b';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function or schema name with a dot is not supported
+}
+
+# Overloading
+
+test functions-with-different-parameter-types {
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
+    CREATE FUNCTION show(text) RETURNS text LANGUAGE sql AS $$SELECT 'text'$$;
+    CREATE FUNCTION show(integer, integer) RETURNS text LANGUAGE sql AS $$SELECT 'two'$$;
+    SELECT pronargs, proargtypes FROM pg_proc WHERE proname = 'show' ORDER BY pronargs, proargtypes;
+}
+expect {
+    1|23
+    1|25
+    2|23 23
+}
+
+test function-with-the-same-parameter-types {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+}
+@sqlstate 42723
+expect error {
+    function "one" already exists with same argument types
+}
+
+# A type modifier and another name of a type do not make another function.
+test function-with-the-same-parameter-types-written-differently {
+    CREATE FUNCTION show(varchar(10), int4) RETURNS text LANGUAGE sql AS $$SELECT $1$$;
+    CREATE FUNCTION show(character varying, integer) RETURNS text LANGUAGE sql AS $$SELECT $1$$;
+}
+@sqlstate 42723
+expect error {
+    function "show" already exists with same argument types
+}
+
+# CREATE OR REPLACE
+
+test replace-keeps-the-oid {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE TABLE before AS SELECT oid AS function_oid FROM pg_proc WHERE proname = 'one';
+    CREATE OR REPLACE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    SELECT p.prosrc, count(*) FROM pg_proc p JOIN before b ON b.function_oid = p.oid
+    WHERE p.proname = 'one' GROUP BY p.prosrc;
+}
+expect {
+    SELECT 2|1
+}
+
+test replace-creates-a-function-that-does-not-exist {
+    CREATE OR REPLACE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT prosrc FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    SELECT 1
+}
+
+test replace-with-other-parameter-types-adds-a-function {
+    CREATE FUNCTION show(integer) RETURNS text LANGUAGE sql AS $$SELECT 'integer'$$;
+    CREATE OR REPLACE FUNCTION show(text) RETURNS text LANGUAGE sql AS $$SELECT 'text'$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'show';
+}
+expect {
+    2
+}
+
+test replace-with-another-return-type {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE OR REPLACE FUNCTION one() RETURNS text LANGUAGE sql AS $$SELECT 'one'$$;
+}
+@sqlstate 42P13
+expect error {
+    cannot change return type of existing function
+}
+
+# Transactions
+
+test rollback-removes-a-created-function {
+    BEGIN;
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+    ROLLBACK;
+    SELECT count(*) FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    1
+    0
+}
+
+test rollback-restores-a-replaced-function {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    BEGIN;
+    CREATE OR REPLACE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    ROLLBACK;
+    SELECT prosrc FROM pg_proc WHERE proname = 'one';
+}
+expect {
+    SELECT 1
+}
+
+# The body is checked when the function is created.
+
+test body-reads-a-table {
+    CREATE TABLE t (a integer);
+    CREATE FUNCTION first_a() RETURNS integer LANGUAGE sql AS $$SELECT a FROM t ORDER BY a LIMIT 1$$;
+    SELECT prosrc FROM pg_proc WHERE proname = 'first_a';
+}
+expect {
+    SELECT a FROM t ORDER BY a LIMIT 1
+}
+
+test body-returns-no-column {
+    CREATE FUNCTION nothing() RETURNS integer LANGUAGE sql AS $$SELECT$$;
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
+}
+
+test body-is-empty {
+    CREATE FUNCTION nothing() RETURNS integer LANGUAGE sql AS $$ $$;
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
+}
+
+# PostgreSQL rejects a result that has no assignment cast to the return type.
+# tursopg does not know the types of expressions, so it accepts the function.
+test body-returns-another-type {
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 'one'::text$$;
+}
+@sqlstate 42P13
+expect error {
+    return type mismatch in function declared to return integer
+}
+expect @tursopg {
+}
+
+# Features that tursopg does not support
+
+# A relation can have the text of a function's signature as its name.
+test table-with-the-signature-of-a-function-as-its-name {
+    CREATE TABLE "one()" (a integer);
+    CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    CREATE FUNCTION two() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+    CREATE VIEW "two()" AS SELECT 2 AS a;
+    SELECT count(*) FROM pg_proc WHERE proname IN ('one', 'two');
+    SELECT count(*) FROM "one()";
+    SELECT a FROM "two()";
+}
+expect {
+    2
+    0
+    2
+}
+
+# tursopg has fewer base types than PostgreSQL.
+test parameter-of-a-base-type-that-tursopg-does-not-have {
+    CREATE FUNCTION cents(money) RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+    SELECT pronargs FROM pg_proc WHERE proname = 'cents';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of type money is not supported
+}
+
+test result-of-a-base-type-that-tursopg-does-not-have {
+    CREATE FUNCTION origin() RETURNS point LANGUAGE sql AS $$SELECT '(0,0)'::point$$;
+    SELECT pronargs FROM pg_proc WHERE proname = 'origin';
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function result of type point is not supported
+}
