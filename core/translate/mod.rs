@@ -172,9 +172,9 @@ pub fn translate(
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
     if check_privileges
         && !resolver
-            .schema()
-            .roles
-            .is_superuser(connection.current_role())
+            .catalog
+            .dialect
+            .role_is_superuser(resolver.schema(), connection.current_role())
     {
         resolver.role_is_not_superuser = true;
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
@@ -439,7 +439,7 @@ fn translate_statement(
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
         ast::Stmt::CreateRole { role_name } => {
-            roles::translate_create_role(&role_name, resolver, program)?
+            roles::translate_create_role(&role_name, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {

@@ -10,22 +10,18 @@
 //! granted privileges on, which row-level security limits, and switches
 //! roles. It may not use a sequence or change the schema it does not own.
 
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
 use crate::Connection;
 use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
-use crate::security::roles::{
-    RoleId, CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME,
-    ROLES_TABLE_NAME,
-};
+use crate::security::roles::RoleId;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
-use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::translate::schema::emit_schema_cookie;
+use crate::vdbe::builder::ProgramBuilder;
 use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
@@ -277,13 +273,14 @@ fn may_act_as_owner(
 /// Whether the session may `SET ROLE` to `role`, which is what giving a
 /// relation to `role` takes.
 fn may_set_role(resolver: &Resolver, connection: &Arc<Connection>, role: &ast::RoleSpec) -> bool {
-    let roles = &resolver.schema().roles;
+    let dialect = &resolver.catalog.dialect;
+    let schema = resolver.schema();
     let target = match role {
         ast::RoleSpec::CurrentRole => Some(connection.current_role()),
         ast::RoleSpec::SessionUser => Some(connection.session_role()),
-        ast::RoleSpec::Name(name) => roles.get_by_name(name).map(|role| role.id),
+        ast::RoleSpec::Name(name) => dialect.role_by_name(schema, name),
     };
-    target.is_some_and(|target| roles.can_set_role(connection.current_role(), target))
+    target.is_some_and(|target| dialect.can_set_role(schema, connection.current_role(), target))
 }
 
 /// The name a denial calls `role` by.
@@ -363,7 +360,7 @@ pub(crate) fn check_privilege(
     }
     let schema = resolver.schema();
     let role = table_reader(resolver, connection.current_role());
-    if schema.roles.is_superuser(role)
+    if resolver.catalog.dialect.role_is_superuser(schema, role)
         || resolver
             .catalog
             .dialect
@@ -585,165 +582,26 @@ pub fn translate_grant(
     Ok(())
 }
 
-/// Creates a role that is not a superuser and cannot log in.
+/// `CREATE ROLE`: the dialect stores the role, through the same hook as its
+/// other catalog changes.
 pub fn translate_create_role(
     role_name: &str,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
-    if !resolver.catalog.dialect.supports_roles() {
-        bail_parse_error!("CREATE ROLE is not supported");
-    }
-    if resolver.schema().roles.get_by_name(role_name).is_some() {
-        bail_parse_error!("role \"{role_name}\" already exists");
-    }
-    let superuser = false;
-
-    let existing = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME);
-    let (roles_table, roles_root_page, (name_index, name_index_root_page)) = match existing {
-        Some(table) => {
-            let name_index = resolver
-                .schema()
-                .get_indices(NamespaceId::ROOT, ROLES_TABLE_NAME)
-                .find(|index| index.name == ROLES_NAME_INDEX_NAME)
-                .cloned()
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!("{ROLES_TABLE_NAME} has no name index"))
-                })?;
-            emit_schema_cookie(resolver, program);
-            let root_page = RegisterOrLiteral::Literal(table.root_page);
-            let name_index_root_page = RegisterOrLiteral::Literal(name_index.root_page);
-            (table, root_page, (name_index, name_index_root_page))
-        }
-        // Creating the table bumps the schema cookie too.
-        None => {
-            let mut created = emit_create_internal_table(
-                program,
-                resolver,
-                ROLES_TABLE_NAME,
-                CREATE_ROLES_TABLE_SQL,
-                &[CREATE_ROLES_NAME_INDEX_SQL],
-            )?;
-            let name_index = created.indexes.pop().expect("one index was created");
-            (created.table, created.root_page, name_index)
-        }
-    };
-    let roles_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(roles_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: roles_cursor_id,
-        root_page: roles_root_page,
-        db: MAIN_DB_ID,
-    });
-    let name_index_cursor_id = program.alloc_cursor_index(None, &name_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: name_index_cursor_id,
-        root_page: name_index_root_page,
-        db: MAIN_DB_ID,
-    });
-
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: roles_cursor_id,
-        rowid_reg: id_reg,
-        prev_largest_reg: 0,
-    });
-    let first_column_reg = program.alloc_registers(3);
-    program.emit_insn(Insn::Null {
-        dest: first_column_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::String8 {
-        value: role_name.to_string(),
-        dest: first_column_reg + 1,
-    });
-    program.emit_insn(Insn::Integer {
-        value: superuser as i64,
-        dest: first_column_reg + 2,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(first_column_reg),
-        count: to_u32(3),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: roles_cursor_id,
-        key_reg: id_reg,
-        record_reg,
-        flag: InsertFlags::new().skip_last_rowid(),
-        table_name: ROLES_TABLE_NAME.to_string(),
-    });
-    emit_role_name_index_entry(
+    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_catalog_changes(
         program,
-        name_index_cursor_id,
-        &name_index.name,
-        role_name,
-        id_reg,
-    );
-
-    program.emit_insn(Insn::AddRole {
-        db: MAIN_DB_ID,
-        id_reg,
-        name: role_name.to_string(),
-        superuser,
-    });
+        resolver.schema(),
+        connection,
+        &[crate::CatalogChange::CreateRole {
+            name: role_name.to_string(),
+        }],
+    )?;
+    emit_schema_cookie(resolver, program);
     Ok(())
-}
-
-/// Adds the role's name to the name index, failing if another role has the
-/// name. The in-memory catalog has already rejected a name it knows, so this
-/// only fails if the stored table has a role the catalog does not.
-fn emit_role_name_index_entry(
-    program: &mut ProgramBuilder,
-    cursor_id: usize,
-    index_name: &str,
-    role_name: &str,
-    id_reg: usize,
-) {
-    let key_reg = program.alloc_registers(2);
-    program.emit_insn(Insn::String8 {
-        value: role_name.to_string(),
-        dest: key_reg,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: id_reg,
-        dst_reg: key_reg + 1,
-        extra_amount: 0,
-    });
-    let no_conflict = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
-        cursor_id,
-        target_pc: no_conflict,
-        record_reg: key_reg,
-        num_regs: 1,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_CONSTRAINT_UNIQUE,
-        description: format!("role \"{role_name}\" already exists"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(no_conflict);
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(key_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: Some(index_name.to_string()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id,
-        record_reg,
-        unpacked_start: Some(key_reg),
-        unpacked_count: Some(2),
-        flags: IdxInsertFlags::new(),
-    });
 }
 
 #[cfg(test)]

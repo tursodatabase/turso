@@ -34,8 +34,9 @@ use turso_parser::ast::{
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
-/// A change a statement makes to a relation of the main database. DDL
-/// translation tells the dialect about it through
+/// A change a statement makes to the dialect's catalog of the main
+/// database: to a relation, or to the roles. Translation tells the dialect
+/// about it through
 /// [`Dialect::translate_catalog_changes`], and the dialect's own bytecode
 /// tells it back through [`Dialect::apply_catalog_change`] once the change
 /// is written.
@@ -92,6 +93,8 @@ pub enum CatalogChange {
         policy_name: String,
         if_exists: bool,
     },
+    /// `CREATE ROLE name`: a role that is not a superuser and cannot log in.
+    CreateRole { name: String },
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
@@ -328,14 +331,6 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a database of this dialect stores roles in the roles table.
-    ///
-    /// SQLite has no roles, so a table named like the roles table is an
-    /// ordinary table.
-    fn supports_roles(&self) -> bool {
-        false
-    }
-
     /// SQL statements that read the dialect's own schema state, such as the
     /// PostgreSQL frontend's relation catalog table, or none when this
     /// database keeps none. The statements run with engine semantics after
@@ -365,10 +360,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership, privileges or row-level security and refuses
-    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
-    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY` and
-    /// `DROP POLICY`.
+    /// has no roles, ownership, privileges or row-level security and refuses
+    /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
+    /// `GRANT`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`
+    /// and `DROP POLICY`.
     fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -405,6 +400,11 @@ pub trait Dialect: Send + Sync + 'static {
                         "row-level security is not supported".to_string(),
                     ));
                 }
+                CatalogChange::CreateRole { .. } => {
+                    return Err(LimboError::ParseError(
+                        "CREATE ROLE is not supported".to_string(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -431,6 +431,28 @@ pub trait Dialect: Send + Sync + 'static {
     /// made while it was attached could not be opened later.
     fn supports_relation_ddl_in_attached_databases(&self) -> bool {
         true
+    }
+
+    /// The id of the role named `name`, case-sensitively, when the dialect
+    /// stores roles. A dialect without roles has none, so a connection can
+    /// run only as the superuser.
+    fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
+        let _ = (schema, name);
+        None
+    }
+
+    /// Whether `role` passes every privilege check. [`RoleId::SUPERUSER`]
+    /// does in every dialect.
+    fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
+        let _ = schema;
+        role == RoleId::SUPERUSER
+    }
+
+    /// Whether a session whose current role is `member` may switch to `role`
+    /// with `SET ROLE`. A superuser may switch to any role, any role may
+    /// switch to itself, and no session may switch to [`RoleId::PUBLIC`].
+    fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        role != RoleId::PUBLIC && (member == role || self.role_is_superuser(schema, member))
     }
 
     /// The role that owns relation `name` of `namespace`, when the dialect

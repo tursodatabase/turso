@@ -4,7 +4,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
+use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -269,11 +269,6 @@ enum ReparsePhase {
     /// Loading the CREATE TYPE statements `type_sqls`, then building the
     /// materialized views and indexes collected by the `sqlite_schema` scan.
     BuildIndexes { type_sqls: Vec<String> },
-    /// Loading roles from the roles table into the role catalog.
-    LoadRoles {
-        stmt: Box<Statement>,
-        rows: Vec<Vec<Value>>,
-    },
     /// Loading the dialect's own schema state, such as the PostgreSQL
     /// frontend's relation catalog: `stmt` reads one query into `rows`, the
     /// rows of the queries before it are in `results`, and `queries` are
@@ -1524,7 +1519,7 @@ impl Connection {
         // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
         // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
         // with a new clean schema that has the same header cookie.
-        self.install_schema_keeping_catalogs(&fresh)?;
+        self.install_schema_keeping_dialect_schema(&fresh)?;
 
         let stmt = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
 
@@ -1579,7 +1574,7 @@ impl Connection {
                         )
                     {
                         // Install the schema so the namespaces table can be read.
-                        self.install_schema_keeping_catalogs(&inner.fresh)?;
+                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
                         let stmt = self.prepare_internal(format!(
                             "SELECT id, name FROM {}",
                             crate::schema::TURSO_NAMESPACES_TABLE_NAME
@@ -1622,7 +1617,7 @@ impl Connection {
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
-                                self.install_schema_keeping_catalogs(&inner.fresh)?;
+                                self.install_schema_keeping_dialect_schema(&inner.fresh)?;
                             }
                             *pending = Some(work);
                         }
@@ -1701,7 +1696,7 @@ impl Connection {
                             .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         // Temporarily install the schema so we can query against it.
-                        self.install_schema_keeping_catalogs(&inner.fresh)?;
+                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
@@ -1730,19 +1725,7 @@ impl Connection {
                         &self.syms.read(),
                         type_sqls,
                     )?;
-                    inner.phase = self.load_roles_phase(&inner.fresh)?;
-                }
-                ReparsePhase::LoadRoles { stmt, rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        turso_assert!(
-                            !matches!(self.get_tx_state(), TransactionState::None),
-                            "roles must be read in a transaction"
-                        );
-                        rows.push(row.get_values().cloned().collect());
-                        Ok(())
-                    }));
-                    inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
-                    inner.phase = self.load_dialect_schema_phase(&inner.fresh, true)?;
+                    inner.phase = self.load_dialect_schema_phase(&inner.fresh)?;
                 }
                 ReparsePhase::LoadDialectSchema {
                     stmt,
@@ -1796,44 +1779,18 @@ impl Connection {
         }
     }
 
-    /// Returns the phase that loads the roles table into `fresh`, moving on
-    /// to the dialect's schema state and then the stats refresh if the
-    /// dialect has no roles or the database has no roles table. The fresh
-    /// schema is installed first, because the current schema may not contain
-    /// the roles table yet.
-    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !self.db.dialect().supports_roles() {
-            return self.load_dialect_schema_phase(fresh, false);
-        }
-        if !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME) {
-            return self.load_dialect_schema_phase(fresh, false);
-        }
-        self.install_schema_keeping_catalogs(fresh)?;
-        let stmt = self.prepare_engine_metadata_read(SELECT_ROLES_SQL)?;
-        Ok(ReparsePhase::LoadRoles {
-            stmt: Box::new(stmt),
-            rows: Vec::new(),
-        })
-    }
-
     /// Returns the phase that loads the dialect's own schema state into
     /// `fresh`, or the stats refresh phase if the dialect keeps none in this
-    /// database. `schema_installed` says whether the roles phase already
-    /// installed the fresh schema on the connection.
-    fn load_dialect_schema_phase(
-        self: &Arc<Connection>,
-        fresh: &Schema,
-        schema_installed: bool,
-    ) -> Result<ReparsePhase> {
+    /// database. The fresh schema is installed first, because the current
+    /// schema may not contain the dialect's tables yet.
+    fn load_dialect_schema_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
         let mut queries = VecDeque::from(self.db.dialect().schema_state_queries(fresh));
         let Some(sql) = queries.pop_front() else {
             return Ok(ReparsePhase::RefreshStats {
                 stats: Default::default(),
             });
         };
-        if !schema_installed {
-            self.install_schema_keeping_catalogs(fresh)?;
-        }
+        self.install_schema_keeping_dialect_schema(fresh)?;
         let stmt = self.prepare_engine_metadata_read(&sql)?;
         Ok(ReparsePhase::LoadDialectSchema {
             stmt: Box::new(stmt),
@@ -1844,8 +1801,7 @@ impl Connection {
     }
 
     /// Prepares a read of an engine table that holds state the schema is
-    /// built from: the schema table, the roles, or the dialect's own schema
-    /// state. The table belongs to the engine, so its name is looked up in
+    /// built from: the schema table or the dialect's own schema state. The table belongs to the engine, so its name is looked up in
     /// every database, whatever the search path says, and no role's
     /// privileges limit the read. The read is a top-level statement, so it
     /// runs in its own read transaction when the schema is read outside a
@@ -1897,15 +1853,14 @@ impl Connection {
     }
 
     /// Installs a copy of `fresh` as the connection's schema while the schema
-    /// is still being read, keeping the roles and the dialect's schema state
-    /// loaded before. Both are empty in `fresh` until their tables are read,
-    /// and a statement compiled in between must not see them empty: without
-    /// the dialect's schema state, no table has an owner, privileges or
-    /// row-level security.
-    fn install_schema_keeping_catalogs(&self, fresh: &Schema) -> Result<()> {
+    /// is still being read, keeping the dialect's schema state loaded before.
+    /// It is empty in `fresh` until the dialect's tables are read, and a
+    /// statement compiled in between must not see it empty: without it, no
+    /// role exists and no table has an owner, privileges or row-level
+    /// security.
+    fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
         self.with_schema_mut(|schema| {
             let mut installed = fresh.try_clone()?;
-            installed.roles.clone_from(&schema.roles);
             installed.dialect_schema.clone_from(&schema.dialect_schema);
             *schema = installed;
             Ok::<_, crate::alloc::TryReserveError>(())
@@ -3720,14 +3675,6 @@ impl Connection {
             .search_order(self.search_path.read().as_deref())
     }
 
-    /// Returns the roles of the main database as seen by this connection.
-    /// Outside a transaction, this includes roles that other connections
-    /// committed.
-    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
-        self.maybe_update_schema();
-        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
-    }
-
     pub fn session_role(&self) -> RoleId {
         self.session_role
     }
@@ -3736,8 +3683,14 @@ impl Connection {
         *self.current_role.read()
     }
 
+    /// Whether the current role passes every privilege check. Outside a
+    /// transaction, this sees role changes that other connections committed.
     pub fn current_role_is_superuser(&self) -> bool {
-        self.role_catalog().is_superuser(self.current_role())
+        self.maybe_update_schema();
+        let role = self.current_role();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            self.db.dialect().role_is_superuser(schema, role)
+        })
     }
 
     /// Whether the current role may read the value of `sequence` of
@@ -5995,9 +5948,9 @@ mod tests {
         Ok(())
     }
 
-    /// The reparse of the schema installs a fresh schema before its roles
-    /// and the dialect's schema state are read, and a statement compiled
-    /// meanwhile must not see them empty.
+    /// The reparse of the schema installs a fresh schema before the
+    /// dialect's schema state is read, and a statement compiled meanwhile
+    /// must not see it empty.
     #[test]
     fn schema_installed_while_being_read_keeps_the_loaded_dialect_schema() {
         let db = Database::open_file(
@@ -6016,7 +5969,7 @@ mod tests {
         let fresh = Schema::with_options(false, &EngineDialect).unwrap();
         assert!(fresh.dialect_schema.is_none());
 
-        conn.install_schema_keeping_catalogs(&fresh).unwrap();
+        conn.install_schema_keeping_dialect_schema(&fresh).unwrap();
 
         assert!(conn.schema.read().dialect_schema.is_some());
     }

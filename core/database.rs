@@ -5,8 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
-use crate::security::roles::SELECT_ROLES_SQL;
-use crate::security::roles::{RoleId, SessionRole, ROLES_TABLE_NAME};
+use crate::security::roles::{RoleId, SessionRole};
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -351,11 +350,9 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
-    /// Reads the roles table into the role catalog. Runs after MVCC
-    /// bootstrap, because before it an MVCC database has no table roots and
-    /// has not replayed its logical log.
-    LoadingRoles,
-    /// Reads the dialect's own schema state, after the roles it refers to.
+    /// Reads the dialect's own schema state. Runs after MVCC bootstrap,
+    /// because before it an MVCC database has no table roots and has not
+    /// replayed its logical log.
     LoadingDialectSchema,
     Done,
 }
@@ -577,10 +574,6 @@ pub struct OpenDbAsyncState {
     /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
     /// when `DatabaseOpts::with_mvcc` is set, held across yields.
     mvcc_convert_stmt: Option<crate::Statement>,
-    /// The roles table scan of `LoadingRoles` and the rows read so far, held
-    /// across yields.
-    roles_stmt: Option<Box<Statement>>,
-    role_rows: Vec<Vec<Value>>,
     /// The dialect schema state queries of `LoadingDialectSchema` not yet
     /// started, the one being read with its rows so far, and the rows of the
     /// finished ones, held across yields.
@@ -612,8 +605,6 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
-            roles_stmt: None,
-            role_rows: Vec::new(),
             dialect_schema_queries: None,
             dialect_schema_stmt: None,
             dialect_schema_rows: Vec::new(),
@@ -1835,46 +1826,6 @@ impl Database {
                         db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
                     }
 
-                    state.phase = OpenDbAsyncPhase::LoadingRoles;
-                }
-
-                OpenDbAsyncPhase::LoadingRoles => {
-                    let db = state
-                        .db
-                        .as_ref()
-                        .expect("db must be initialized in Init phase");
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    if state.roles_stmt.is_none() {
-                        let schema = db.schema.lock().clone();
-                        let has_roles_table = db.dialect().supports_roles()
-                            && schema
-                                .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-                                .is_some();
-                        *conn.schema.write() = schema;
-                        if has_roles_table {
-                            state.roles_stmt = Some(Box::new(
-                                conn.prepare_engine_metadata_read(SELECT_ROLES_SQL)?,
-                            ));
-                        }
-                    }
-                    if let Some(stmt) = state.roles_stmt.as_mut() {
-                        let rows = &mut state.role_rows;
-                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                            rows.push(row.get_values().cloned().collect());
-                            Ok(())
-                        }));
-                        state.roles_stmt = None;
-                        let roles =
-                            Arc::new(crate::security::roles::RoleCatalog::new(&state.role_rows)?);
-                        db.with_schema_mut(|schema| {
-                            schema.roles = roles;
-                            Ok(())
-                        })?;
-                    }
-
                     state.phase = OpenDbAsyncPhase::LoadingDialectSchema;
                 }
 
@@ -1888,10 +1839,9 @@ impl Database {
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
                     if state.dialect_schema_queries.is_none() {
-                        let queries = {
-                            let schema = conn.schema.read();
-                            db.dialect().schema_state_queries(&schema)
-                        };
+                        let schema = db.schema.lock().clone();
+                        let queries = db.dialect().schema_state_queries(&schema);
+                        *conn.schema.write() = schema;
                         state.dialect_schema_queries = Some(queries.into());
                     }
                     loop {
@@ -2762,8 +2712,9 @@ impl Database {
         let SessionRole::Named(name) = role else {
             return Ok(RoleId::SUPERUSER);
         };
-        match self.schema.lock().roles.get_by_name(name) {
-            Some(role) => Ok(role.id),
+        let role = self.dialect().role_by_name(&self.schema.lock(), name);
+        match role {
+            Some(role) => Ok(role),
             None => Err(LimboError::InvalidArgument(format!(
                 "role \"{name}\" does not exist"
             ))),

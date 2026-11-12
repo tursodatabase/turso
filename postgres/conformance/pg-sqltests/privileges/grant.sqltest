@@ -636,9 +636,9 @@ expect error {
 @skip-if postgres "PostgreSQL has no __turso_internal_* tables"
 test grant-on-an-engine-table-is-not-supported {
     CREATE ROLE gs_catalog_grantee;
-    GRANT SELECT ON pg_catalog.__turso_internal_roles TO gs_catalog_grantee;
+    GRANT SELECT ON pg_catalog.__turso_internal_authid TO gs_catalog_grantee;
 }
 @sqlstate 0A000
 expect error {
-    GRANT on internal table __turso_internal_roles is not supported
+    GRANT on internal table __turso_internal_authid is not supported
 }

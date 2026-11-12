@@ -11,7 +11,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
+    BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
     TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
@@ -1762,7 +1762,6 @@ fn open_namespaces_table_for_writing(
                 &format!(
                     "CREATE TABLE {TURSO_NAMESPACES_TABLE_NAME}(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
                 ),
-                &[],
             )?;
             (created.table, created.root_page)
         }
@@ -2993,7 +2992,6 @@ fn persist_type_definition(
             resolver,
             TURSO_TYPES_TABLE_NAME,
             &format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
-            &[],
         )?;
         (types_table, types_root_page) = (created.table, created.root_page);
     }
@@ -3051,9 +3049,8 @@ fn persist_type_definition(
 
 /// Creates one of the engine's own tables in the main database the first
 /// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
-/// in the in-memory schema, and the same for each of `create_index_sqls`.
-/// Returns the table and the root page that the new B-tree will have, and
-/// each index with its root page.
+/// in the in-memory schema. Returns the table and the root page that the new
+/// B-tree will have.
 ///
 /// `SetCookie` is what marks the transaction as having changed the schema,
 /// so that a rollback restores the connection schema (see
@@ -3065,7 +3062,6 @@ pub(crate) fn emit_create_internal_table(
     resolver: &Resolver,
     table_name: &str,
     create_sql: &str,
-    create_index_sqls: &[&str],
 ) -> Result<InternalTable> {
     let root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
@@ -3095,34 +3091,6 @@ pub(crate) fn emit_create_internal_table(
         Some(create_sql.to_string()),
     )?;
     let table = Arc::new(BTreeTable::from_sql(create_sql, 0)?);
-    let mut indexes = Vec::with_capacity(create_index_sqls.len());
-    for create_index_sql in create_index_sqls {
-        let index = Arc::new(Index::from_sql(
-            resolver.catalog.symbol_table,
-            create_index_sql,
-            0,
-            &table,
-            resolver.schema(),
-        )?);
-        let index_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: MAIN_DB_ID,
-            root: index_root_reg,
-            flags: CreateBTreeFlags::new_index(),
-        });
-        emit_schema_entry(
-            program,
-            resolver,
-            schema_cursor_id,
-            None,
-            SchemaEntryType::Index,
-            &index.name,
-            table_name,
-            index_root_reg,
-            Some(create_index_sql.to_string()),
-        )?;
-        indexes.push((index, RegisterOrLiteral::Register(index_root_reg)));
-    }
     emit_schema_cookie(resolver, program);
     program.emit_insn(Insn::ParseSchema {
         db: MAIN_DB_ID,
@@ -3132,7 +3100,6 @@ pub(crate) fn emit_create_internal_table(
     Ok(InternalTable {
         table,
         root_page: RegisterOrLiteral::Register(root_reg),
-        indexes,
     })
 }
 
@@ -3140,7 +3107,6 @@ pub(crate) fn emit_create_internal_table(
 pub(crate) struct InternalTable {
     pub(crate) table: Arc<BTreeTable>,
     pub(crate) root_page: RegisterOrLiteral<i64>,
-    pub(crate) indexes: Vec<(Arc<Index>, RegisterOrLiteral<i64>)>,
 }
 
 /// Marks the transaction as having changed the schema, so that a rollback restores the connection

@@ -7,6 +7,8 @@ mod error;
 mod functions;
 mod options;
 mod policies;
+mod roles;
+mod schema_state;
 mod session;
 mod settings;
 mod statement;

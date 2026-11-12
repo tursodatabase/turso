@@ -1,5 +1,5 @@
 use crate::common::TempDatabase;
-use turso_core::{ConnectOpts, SessionRole};
+use turso_core::{ConnectOpts, NamespaceId, SessionRole, MAIN_DB_ID};
 use turso_pg::{ErrorReport, PgConnection};
 
 #[test]
@@ -123,16 +123,16 @@ fn stored_roles_table_keeps_role_names_unique() {
     let db = db.reopen();
 
     let conn = db.connect_limbo();
-    let has_unique_name_index = conn.with_schema(turso_core::MAIN_DB_ID, |schema| {
+    let has_unique_name_index = conn.with_schema(MAIN_DB_ID, |schema| {
         schema
-            .get_indices(turso_core::NamespaceId::ROOT, "__turso_internal_roles")
+            .get_indices(NamespaceId::ROOT, "__turso_internal_authid")
             .any(|index| {
                 index.unique
                     && index
                         .columns
                         .iter()
                         .map(|column| column.name.as_str())
-                        .eq(["name"])
+                        .eq(["rolname"])
             })
     });
     assert!(has_unique_name_index);
@@ -522,7 +522,7 @@ fn interrupted_create_role_leaves_no_role_behind() {
         }
 
         assert!(
-            conn.inner().role_catalog().get_by_name("alice").is_none(),
+            !role_names(&conn).iter().any(|name| name == "alice"),
             "interrupted at step {interrupt_at_step}, the role is still in the catalog"
         );
         conn.execute("CREATE ROLE alice").unwrap();

@@ -5,7 +5,9 @@ use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
-use turso_core::security::roles::{RoleCatalog, RoleId};
+use turso_core::security::roles::RoleId;
+
+use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -304,7 +306,7 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
     let role = acl_role_name(
-        &role_name_by_oid(&conn.role_catalog(), owner).unwrap_or_else(|| owner.to_string()),
+        &role_name_by_oid(&connection_roles(conn), owner).unwrap_or_else(|| owner.to_string()),
     );
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
@@ -583,7 +585,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
-    role_name_in(&conn.role_catalog(), role)
+    role_name_in(&connection_roles(conn), role)
 }
 
 /// The role of a connection is normally in the catalog, but it may have been
@@ -599,7 +601,7 @@ fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
 }
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
-    role_name_by_oid(&conn.role_catalog(), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
+    role_name_by_oid(&connection_roles(conn), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {

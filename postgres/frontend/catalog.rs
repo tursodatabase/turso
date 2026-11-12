@@ -1,4 +1,5 @@
 use crate::functions::validate_pg_input;
+use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
@@ -12,7 +13,7 @@ use turso_core::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
         AUTOINCREMENT_SEQ_PREFIX,
     },
-    security::roles::{Role, RoleCatalog, RoleId},
+    security::roles::RoleId,
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
@@ -235,9 +236,7 @@ impl Dialect for PostgresDialect {
     }
 
     fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        crate::classes::schema_state_query(schema)
-            .into_iter()
-            .collect()
+        crate::schema_state::schema_state_queries(schema)
     }
 
     fn build_schema_state(
@@ -245,13 +244,7 @@ impl Dialect for PostgresDialect {
         schema: &Schema,
         results: &[Vec<Vec<Value>>],
     ) -> turso_core::Result<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        let [rows] = results else {
-            return Err(turso_core::LimboError::InternalError(format!(
-                "expected the rows of one schema state query, got {}",
-                results.len()
-            )));
-        };
-        crate::classes::build_schema_state(schema, rows)
+        crate::schema_state::build_schema_state(schema, results)
     }
 
     fn translate_catalog_changes(
@@ -261,6 +254,9 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
+        if let [turso_core::CatalogChange::CreateRole { name }] = changes {
+            return crate::roles::translate_create_role(program, schema, name);
+        }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
 
@@ -270,7 +266,19 @@ impl Dialect for PostgresDialect {
         change: &turso_core::CatalogChange,
         values: &[Value],
     ) -> turso_core::Result<()> {
-        crate::classes::apply_catalog_change(schema, change, values)
+        crate::schema_state::apply_catalog_change(schema, change, values)
+    }
+
+    fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
+        schema_roles(schema).get_by_name(name).map(|role| role.id)
+    }
+
+    fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
+        schema_roles(schema).is_superuser(role)
+    }
+
+    fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        schema_roles(schema).can_set_role(member, role)
     }
 
     fn relation_owner(
@@ -304,10 +312,6 @@ impl Dialect for PostgresDialect {
         name: &str,
     ) -> &'a [turso_core::security::policy::RowPolicy] {
         crate::classes::row_security_policies(schema, namespace, name)
-    }
-
-    fn supports_roles(&self) -> bool {
-        true
     }
 
     fn default_namespaces(&self) -> &'static [&'static str] {
@@ -472,7 +476,7 @@ fn relation_owner_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> i6
 fn relation_acl(conn: &Connection, schema: &Schema, namespace: NamespaceId, name: &str) -> Value {
     match crate::classes::relation_acl(schema, namespace, name) {
         Some(acl) => {
-            let roles = conn.role_catalog();
+            let roles = connection_roles(conn);
             Value::build_text(acl.display_text(&|oid| {
                 role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
             }))
@@ -491,7 +495,7 @@ fn relation_owner_name(
 ) -> String {
     let owner =
         crate::classes::relation_owner(schema, namespace, name).unwrap_or(RoleId::SUPERUSER);
-    postgres_roles(&conn.role_catalog())
+    postgres_roles(&connection_roles(conn))
         .find(|role| role.id == owner)
         .map(|role| role.name)
         .unwrap_or_else(|| BOOTSTRAP_SUPERUSER_NAME.to_string())
@@ -1017,7 +1021,7 @@ impl SnapshotRows for PgRolesTable {
     const ESTIMATED_ROWS: u32 = 2;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        let mut rows: Vec<_> = postgres_roles(&conn.role_catalog())
+        let mut rows: Vec<_> = postgres_roles(&connection_roles(conn))
             .map(|role| role_row(&role))
             .collect();
         rows.push(vec![
