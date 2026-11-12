@@ -21,6 +21,7 @@ use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
+use super::insert::column_default_expr;
 use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
@@ -472,12 +473,11 @@ fn prepare_update_plan(
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
-        bind_and_rewrite_expr(
+        bind_set_expr(
             &mut set.expr,
             Some(&mut read_scope_tables),
-            None,
-            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
+            resolver,
         )?;
     }
 
@@ -490,7 +490,7 @@ fn prepare_update_plan(
         connection,
     )?;
 
-    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
+    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name, resolver)?;
 
     let result_columns = if !body.returning.is_empty() {
         // Plan subqueries in RETURNING expressions before processing
@@ -573,10 +573,37 @@ fn prepare_update_plan(
     })
 }
 
+pub(super) fn bind_set_expr(
+    expr: &mut Box<Expr>,
+    mut read_scope_tables: Option<&mut TableReferences>,
+    behavior: BindingBehavior,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    if matches!(expr.as_ref(), Expr::Default) {
+        return Ok(());
+    }
+    if let Expr::Parenthesized(exprs) = expr.as_mut() {
+        if exprs.len() > 1 {
+            for expr in exprs.iter_mut() {
+                bind_set_expr(
+                    expr,
+                    read_scope_tables.as_deref_mut(),
+                    behavior.clone(),
+                    resolver,
+                )?;
+            }
+            return Ok(());
+        }
+    }
+    bind_and_rewrite_expr(expr, read_scope_tables, None, resolver, behavior)?;
+    Ok(())
+}
+
 fn collect_update_set_clauses(
     sets: &mut [ast::Set],
     table: &Table,
     table_name: &str,
+    resolver: &Resolver,
 ) -> crate::Result<Vec<UpdateSetClause>> {
     let column_lookup: HashMap<String, usize> = table
         .columns()
@@ -591,12 +618,16 @@ fn collect_update_set_clauses(
         let values = split_update_set_values(*expr, set.col_names.len())?;
 
         for (col_name, expr) in set.col_names.iter().zip(values.into_iter()) {
-            let expr = Box::new(expr);
+            let mut expr = Box::new(expr);
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
                 Some(idx) => {
-                    table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
+                    let col = &table.columns()[*idx];
+                    col.ensure_not_generated("UPDATE", col_name.as_str())?;
+                    if matches!(expr.as_ref(), Expr::Default) {
+                        expr = column_default_expr(col, table.is_strict(), resolver);
+                    }
                     *idx
                 }
                 None => match rowid_name_column_index(table, &ident) {
