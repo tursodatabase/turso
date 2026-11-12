@@ -1,0 +1,18 @@
+# Which catalog tables a role that is not a superuser may read through the
+# PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+
+@database :memory:
+
+test role-without-privileges-can-read-catalogs {
+    CREATE TABLE rc_table (x int);
+    CREATE ROLE rc_reader;
+    SET ROLE rc_reader;
+    SELECT CASE WHEN count(*) > 0 THEN 'readable' ELSE 'empty' END FROM pg_roles;
+    SELECT CASE WHEN count(*) > 0 THEN 'readable' ELSE 'empty' END FROM pg_class;
+}
+expect {
+    readable
+    readable
+}
