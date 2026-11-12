@@ -540,6 +540,7 @@ impl SnapshotRows for PgClassTable {
             relpages INTEGER,
             reltuples REAL,
             relallvisible INTEGER,
+            relallfrozen INTEGER,
             reltoastrelid INTEGER,
             relhasindex BOOLEAN,
             relisshared BOOLEAN,
@@ -602,6 +603,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(1),                                             // relpages
                 Value::from_f64(0.0),                                           // reltuples
                 Value::from_i64(0),                                             // relallvisible
+                Value::from_i64(0),                                             // relallfrozen
                 Value::from_i64(0),                                             // reltoastrelid
                 Value::from_i64(relhasindex),                                   // relhasindex
                 Value::from_i64(0),                                             // relisshared
@@ -643,6 +645,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(1),                                       // relpages
                 Value::from_f64(0.0),                                     // reltuples
                 Value::from_i64(0),                                       // relallvisible
+                Value::from_i64(0),                                       // relallfrozen
                 Value::from_i64(0),                                       // reltoastrelid
                 Value::from_i64(0),                                       // relhasindex
                 Value::from_i64(0),                                       // relisshared
@@ -680,7 +683,8 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),
                 Value::from_i64(1),
                 Value::from_f64(1.0),
-                Value::from_i64(0),
+                Value::from_i64(0), // relallvisible
+                Value::from_i64(0), // relallfrozen
                 Value::from_i64(0),
                 Value::from_i64(0),
                 Value::from_i64(0),
@@ -1206,7 +1210,7 @@ impl SnapshotRows for PgDatabaseTable {
             dattablespace INTEGER,
             datcollate TEXT,
             datctype TEXT,
-            daticulocale TEXT,
+            datlocale TEXT,
             daticurules TEXT,
             datacl TEXT,
             tableoid INTEGER HIDDEN
@@ -1231,7 +1235,7 @@ impl SnapshotRows for PgDatabaseTable {
             Value::from_i64(1663),            // dattablespace (pg_default)
             Value::build_text("en_US.UTF-8"), // datcollate
             Value::build_text("en_US.UTF-8"), // datctype
-            Value::Null,                      // daticulocale
+            Value::Null,                      // datlocale
             Value::Null,                      // daticurules
             Value::Null,                      // datacl
         ]]
@@ -1991,7 +1995,7 @@ enum ConstraintKind {
     Check,
 }
 
-const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
+const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, conenforced BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conperiod BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgConstraintTable;
@@ -2051,9 +2055,10 @@ impl SnapshotRows for PgConstraintTable {
                     Value::build_text(conname),
                     Value::from_i64(2200),
                     Value::build_text(contype),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(1),
+                    Value::from_i64(0), // condeferrable
+                    Value::from_i64(0), // condeferred
+                    Value::from_i64(1), // conenforced
+                    Value::from_i64(1), // convalidated
                     Value::from_i64(table_oid),
                     Value::from_i64(0),
                     Value::from_i64(index.oid),
@@ -2062,9 +2067,10 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,
                     Value::Null,
                     Value::Null,
-                    Value::from_i64(1),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
+                    Value::from_i64(1), // conislocal
+                    Value::from_i64(0), // coninhcount
+                    Value::from_i64(0), // connoinherit
+                    Value::from_i64(0), // conperiod
                     Value::build_text(format!("{{{conkey}}}")),
                     Value::Null,
                     Value::Null,
@@ -2144,6 +2150,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::build_text(contype),                 // contype
                     Value::from_i64(0),                         // condeferrable
                     Value::from_i64(0),                         // condeferred
+                    Value::from_i64(1),                         // conenforced
                     Value::from_i64(1),                         // convalidated
                     Value::from_i64(table_oid),                 // conrelid
                     Value::from_i64(0),                         // contypid
@@ -2156,6 +2163,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),                         // conislocal
                     Value::from_i64(0),                         // coninhcount
                     Value::from_i64(0),                         // connoinherit
+                    Value::from_i64(0),                         // conperiod
                     Value::build_text(format!("{{{conkey}}}")), // conkey
                     Value::Null,                                // confkey
                     Value::Null,                                // conpfeqop
@@ -2216,6 +2224,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
+                    Value::from_i64(1),                                // conenforced
                     Value::from_i64(1),                                // convalidated
                     Value::from_i64(table_oid),                        // conrelid
                     Value::from_i64(0),                                // contypid
@@ -2228,6 +2237,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),                                // conislocal
                     Value::from_i64(0),                                // coninhcount
                     Value::from_i64(0),                                // connoinherit
+                    Value::from_i64(0),                                // conperiod
                     Value::build_text(format!("{{{conkey}}}")),        // conkey
                     Value::build_text(format!("{{{confkey}}}")),       // confkey
                     Value::Null,                                       // conpfeqop
@@ -2264,6 +2274,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::build_text(contype),      // contype
                     Value::from_i64(0),              // condeferrable
                     Value::from_i64(0),              // condeferred
+                    Value::from_i64(1),              // conenforced
                     Value::from_i64(1),              // convalidated
                     Value::from_i64(table_oid),      // conrelid
                     Value::from_i64(0),              // contypid
@@ -2276,6 +2287,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),              // conislocal
                     Value::from_i64(0),              // coninhcount
                     Value::from_i64(0),              // connoinherit
+                    Value::from_i64(0),              // conperiod
                     if conkey.is_empty() {
                         Value::Null
                     } else {
@@ -2682,7 +2694,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, pubgencols TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_namespace",
@@ -2851,7 +2863,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             "CREATE TABLE pg_subscription (
             oid INTEGER, subdbid INTEGER, subskiplsn TEXT, subname TEXT, subowner INTEGER,
             subenabled BOOLEAN, subbinary BOOLEAN, substream TEXT, subtwophasestate TEXT,
-            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN,
+            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN, subfailover BOOLEAN,
             subconninfo TEXT, subslotname TEXT, subsynccommit TEXT, subpublications TEXT[],
             suborigin TEXT, tableoid INTEGER HIDDEN
         )",
@@ -3220,7 +3232,7 @@ impl RelationRow {
     const OID_COLUMN: usize = 0;
     const NAMESPACE_OID_COLUMN: usize = 2;
     const ACCESS_METHOD_OID_COLUMN: usize = 6;
-    const KIND_COLUMN: usize = 16;
+    const KIND_COLUMN: usize = 17;
 
     fn from_row(row: &[Value]) -> Self {
         Self {
@@ -3247,11 +3259,11 @@ impl<'a> ConstraintRow<'a> {
     // Zero-based positions in PgConstraintTable's SQL column order.
     const OID_COLUMN: usize = 0;
     const KIND_COLUMN: usize = 3;
-    const TABLE_OID_COLUMN: usize = 7;
-    const INDEX_OID_COLUMN: usize = 9;
-    const REFERENCED_TABLE_OID_COLUMN: usize = 11;
-    const COLUMN_NUMBERS_COLUMN: usize = 18;
-    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 19;
+    const TABLE_OID_COLUMN: usize = 8;
+    const INDEX_OID_COLUMN: usize = 10;
+    const REFERENCED_TABLE_OID_COLUMN: usize = 12;
+    const COLUMN_NUMBERS_COLUMN: usize = 20;
+    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 21;
 
     fn from_row(row: &'a [Value]) -> Self {
         Self {
