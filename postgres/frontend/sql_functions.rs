@@ -780,13 +780,21 @@ pub(crate) fn is_built_in_function(connection: &Connection, name: &str) -> bool 
 /// Whether the engine has a function `name`, for some number of arguments.
 fn is_engine_function(name: &str) -> bool {
     // The list has one name for each function and each number of arguments.
-    let is_listed = turso_core::Func::builtin_function_list()
+    let list = turso_core::Func::builtin_function_list();
+    let is_listed = list
         .iter()
         .any(|function| function.name.eq_ignore_ascii_case(name));
     // The lookup of a call also finds the other names of a function, such
     // as `array_overlaps` for `array_overlap`. An error means that the
-    // engine has the function, but not for this number of arguments.
-    let is_found_by_a_call = (0..=2).any(|argument_count| {
+    // engine has the function, but not for this number of arguments. The
+    // lookup can depend on the number of arguments, so each number that a
+    // listed function accepts is tried.
+    let most_arguments = list
+        .iter()
+        .map(|function| function.narg)
+        .max()
+        .map_or(0, |count| count.max(0) as usize);
+    let is_found_by_a_call = (0..=most_arguments).any(|argument_count| {
         !matches!(
             turso_core::Func::resolve_function(name, argument_count),
             Ok(None)
