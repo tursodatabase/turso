@@ -50,6 +50,10 @@ use turso_pg_parser::sqlstate::{
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
+use crate::auth_members::{
+    AUTH_MEMBERS_TABLE_NAME, CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL,
+    CREATE_AUTH_MEMBERS_TABLE_SQL,
+};
 use crate::catalog::{role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
 use crate::policies;
@@ -1897,6 +1901,13 @@ pub(crate) fn initialize_schema(
     {
         statements.push(CREATE_AUTHID_TABLE_SQL.to_string());
         statements.push(CREATE_AUTHID_NAME_INDEX_SQL.to_string());
+    }
+    if schema
+        .get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
+        .is_none()
+    {
+        statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
+        statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
     }
     Ok(statements)
 }

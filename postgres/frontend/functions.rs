@@ -615,7 +615,7 @@ fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
 
 /// The role of a connection is normally in the catalog, but it may have been
 /// dropped by another connection since the connection was opened.
-fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
+pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
     match crate::catalog::postgres_roles(roles).find(|found| found.id == role) {
         Some(role) => Ok(role.name),
         None => Err(sqlstate_error(
@@ -1936,15 +1936,18 @@ mod tests {
 
     #[test]
     fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
-        let with_alice = RoleCatalog::new(&[vec![
-            Value::from_i64(1),
-            Value::build_text("alice"),
-            Value::from_i64(0),
-            Value::from_i64(1),
-            Value::from_i64(0),
-        ]])
+        let with_alice = RoleCatalog::new(
+            &[vec![
+                Value::from_i64(1),
+                Value::build_text("alice"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+            ]],
+            &[],
+        )
         .unwrap();
-        let without_alice = RoleCatalog::new(&[]).unwrap();
+        let without_alice = RoleCatalog::new(&[], &[]).unwrap();
         let alice = with_alice.get_by_name("alice").unwrap().id;
         assert_eq!(role_name_in(&with_alice, alice).unwrap(), "alice");
 
