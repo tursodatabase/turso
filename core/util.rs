@@ -356,6 +356,7 @@ pub fn parse_schema_rows(
 /// statements `type_sqls`, then build the materialized views and indexes
 /// collected during the scan.
 pub fn populate_types_views_then_indices(
+    dialect: &dyn crate::dialect::Dialect,
     state: &mut ParseSchemaRowsState,
     schema: &mut Schema,
     syms: &SymbolTable,
@@ -367,6 +368,7 @@ pub fn populate_types_views_then_indices(
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
     schema.populate_types_views_then_indices(
+        dialect,
         syms,
         type_sqls,
         inner.materialized_view_info,
@@ -422,9 +424,9 @@ pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
 /// `create_vtab` grammar rule), classification is done by parsing rather than
 /// by substring or token matching, which would misclassify regular tables
 /// whose SQL merely contains the text (e.g. in a DEFAULT literal).
-pub fn sql_is_create_virtual_table(sql: &str) -> bool {
+pub fn sql_is_create_virtual_table(dialect: &dyn crate::dialect::Dialect, sql: &str) -> bool {
     matches!(
-        crate::dialect::engine::parse_statement(sql),
+        crate::dialect::parse_statement(dialect, sql),
         Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
     )
 }
@@ -2995,7 +2997,9 @@ pub mod rename_column_view {
     }
 
     /// `namespace` is the namespace of the view, where its names resolve.
+    #[allow(clippy::too_many_arguments)]
     pub fn rewrite_view_sql_for_column_rename(
+        dialect: &dyn crate::dialect::Dialect,
         view_sql: &str,
         schema: &Schema,
         namespace: NamespaceId,
@@ -3006,6 +3010,7 @@ pub mod rename_column_view {
     ) -> Result<Option<RewrittenView>> {
         let mut visiting_views = HashSet::default();
         rewrite_view_sql_for_column_rename_inner(
+            dialect,
             view_sql,
             schema,
             namespace,
@@ -3019,6 +3024,7 @@ pub mod rename_column_view {
 
     #[allow(clippy::too_many_arguments)]
     fn rewrite_view_sql_for_column_rename_inner(
+        dialect: &dyn crate::dialect::Dialect,
         view_sql: &str,
         schema: &Schema,
         namespace: NamespaceId,
@@ -3028,7 +3034,7 @@ pub mod rename_column_view {
         new_column: &str,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
-        let cmd = crate::dialect::engine::parse_statement(view_sql)
+        let cmd = crate::dialect::parse_statement(dialect, view_sql)
             .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}")))?;
         let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
             temporary,
@@ -3054,6 +3060,7 @@ pub mod rename_column_view {
                 view_columns_from_select(&original_select, schema, namespace, &view_columns)?;
 
             let ctx = ViewRewriteCtx::new(
+                dialect,
                 schema,
                 namespace,
                 target_table,
@@ -3188,6 +3195,8 @@ pub mod rename_column_view {
     }
 
     struct ViewRewriteCtx<'a> {
+        /// Parses the stored SQL of the views the view body reads.
+        dialect: &'a dyn crate::dialect::Dialect,
         schema: &'a Schema,
         /// The namespace of the view being rewritten.
         namespace: NamespaceId,
@@ -3205,6 +3214,7 @@ pub mod rename_column_view {
 
     impl<'a> ViewRewriteCtx<'a> {
         fn new(
+            dialect: &'a dyn crate::dialect::Dialect,
             schema: &'a Schema,
             namespace: NamespaceId,
             target_table: &'a str,
@@ -3213,6 +3223,7 @@ pub mod rename_column_view {
             new_column: &'a str,
         ) -> Self {
             Self {
+                dialect,
                 schema,
                 namespace,
                 target_table,
@@ -3553,6 +3564,7 @@ pub mod rename_column_view {
 
                         let mut rename_map = HashMap::default();
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename_inner(
+                            ctx.dialect,
                             &view.sql,
                             ctx.schema,
                             ctx.namespace,

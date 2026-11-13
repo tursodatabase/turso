@@ -255,7 +255,7 @@ fn build_plan_for_connection(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::EngineDialect),
+        Arc::new(crate::dialect::DefaultDialect::new(connection.dialect())),
         None,
         RoleId::SUPERUSER,
     );

@@ -2,10 +2,11 @@
 //! need a dialect that can parse, so they are here and not in turso_core.
 
 use turso_core::schema::BTreeTable;
+use turso_sqlite::SqliteDialect;
 
 /// Builds a table from the SQLite text of its `CREATE TABLE`.
 fn table_from_sql(sql: &str, root_page: i64) -> turso_core::Result<BTreeTable> {
-    BTreeTable::from_sql(sql, root_page)
+    BTreeTable::from_stored_sql(&SqliteDialect, sql, root_page, false)
 }
 
 pub mod collate;

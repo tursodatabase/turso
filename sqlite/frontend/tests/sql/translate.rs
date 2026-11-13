@@ -70,7 +70,7 @@ fn test_regexp_no_function_registered() {
 
     // Use an empty SymbolTable so regexp() is not available.
     let empty_syms = SymbolTable::new();
-    let cmd = turso_core::dialect::engine::parse_statement("SELECT 'x' REGEXP 'y'")
+    let cmd = turso_core::dialect::parse_statement(&SqliteDialect, "SELECT 'x' REGEXP 'y'")
         .transpose()
         .unwrap()
         .unwrap();
@@ -300,7 +300,7 @@ fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
     let pager = conn.pager.load().clone();
     let syms = SymbolTable::new();
 
-    let cmd = turso_core::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
+    let cmd = turso_core::dialect::parse_statement(&SqliteDialect, "INSERT INTO t(v) VALUES('x')")
         .transpose()
         .unwrap()
         .unwrap();
@@ -347,7 +347,7 @@ fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
     let pager = conn.pager.load().clone();
     let syms = SymbolTable::new();
 
-    let cmd = turso_core::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
+    let cmd = turso_core::dialect::parse_statement(&SqliteDialect, "INSERT INTO t(v) VALUES('x')")
         .transpose()
         .unwrap()
         .unwrap();

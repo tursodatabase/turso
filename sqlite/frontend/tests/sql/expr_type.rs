@@ -200,7 +200,7 @@ fn value_kind_of_every_type() {
 fn parse_expr(sql: &str) -> ast::Expr {
     let select_sql = format!("SELECT {sql}");
     let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
-        turso_core::dialect::engine::parse_statement(&select_sql)
+        turso_core::dialect::parse_statement(&SqliteDialect, &select_sql)
     else {
         panic!("not a SELECT: {sql}");
     };
@@ -231,6 +231,7 @@ fn test_schema() -> Schema {
     let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
     schema
         .add_type_from_sql(
+            &SqliteDialect,
             "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
             &SymbolTable::new(),
         )

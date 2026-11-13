@@ -42,6 +42,17 @@ impl Dialect for RowSecurityInSchemasWithState {
         SqliteDialect.parse(sql)
     }
 
+    fn parse_internal(&self, sql: &str) -> turso_core::Result<(Option<ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> turso_core::Result<BTreeTable> {
         SqliteDialect.parse_table_sql(sql, root_page)
     }

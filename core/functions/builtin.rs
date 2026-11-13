@@ -1,19 +1,7 @@
-//! The engine's own SQL and the built-ins every dialect composes with.
-//!
-//! The engine compiles SQLite syntax: a frontend dialect translates its
-//! statements into the SQLite AST, and the statements the engine runs for
-//! itself are written in SQLite SQL. This module has the parts of that
-//! language that every dialect shares: the parser entry points, the
-//! built-in functions, and the built-in catalog tables (`pragma_*`
-//! table-valued functions, `json_each`/`json_tree`, `sqlite_dbpage`,
-//! `btree_dump`, and `sqlite_turso_types`), which each dialect registers
-//! with [`register_builtin_catalog`].
-//!
-//! [`EngineDialect`] is the dialect of the statements the engine runs for
-//! itself. The SQLite dialect that users open databases with is
-//! `SqliteDialect` in the `turso_sqlite` crate.
+//! The built-in SQL functions: the names they resolve from and the scalar
+//! functions' code.
 
-use super::ScalarFuncContext;
+use crate::dialect::ScalarFuncContext;
 use crate::functions::datetime::{
     exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
     exec_strftime, exec_time, exec_timediff, exec_unixepoch,
@@ -30,10 +18,7 @@ use crate::numeric::decimal::{
     numeric_from_value, validate_precision_scale, MAX_FRACTION_DIGITS,
 };
 use crate::numeric::Numeric;
-use crate::pragma::PragmaVirtualTable;
-use crate::schema::{Schema, Table};
 use crate::stats::StatAccum;
-use crate::sync::Arc;
 use crate::translate::roles;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{
@@ -42,13 +27,11 @@ use crate::vdbe::array::{
     exec_array_remove, exec_array_slice, exec_array_to_string, exec_string_to_array,
 };
 use crate::vdbe::{registers_to_ref_values, Register};
-use crate::vtab::{VirtualTable, VirtualTableType};
 use crate::{LimboError, Value, ValueRef};
 use bigdecimal::Zero;
 use branches::{mark_unlikely, unlikely};
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
-use turso_ext::VTabKind;
 
 /// SQLite version reported by compatibility APIs.
 ///
@@ -66,161 +49,6 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 #[allow(unused_imports)]
 use crate::function::{AggFunc, Func, MathFunc, ScalarFunc, VectorFunc, WindowFunc};
-
-/// The dialect of the statements the engine runs for itself: SQLite SQL
-/// with the built-in functions and catalog tables.
-pub(crate) struct EngineDialect;
-
-impl super::Dialect for EngineDialect {
-    fn name(&self) -> &'static str {
-        "engine"
-    }
-}
-
-/// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that
-/// marks it is valid SQLite syntax, so without this check the SQLite parser
-/// would accept the PostgreSQL DDL with SQLite column semantics.
-pub fn reject_postgres_table_sql(sql: &str) -> crate::Result<()> {
-    if sql.starts_with(super::POSTGRES_TABLE_SQL_PREFIX) {
-        return Err(crate::LimboError::Corrupt(format!(
-            "malformed database schema: table was created by the postgres frontend: {sql}"
-        )));
-    }
-    Ok(())
-}
-
-/// Parse the first SQLite statement in `sql` and return its consumed byte count.
-pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
-    let cmd = parser.next_cmd()?;
-    Ok((cmd, parser.offset()))
-}
-
-/// Parse the first SQLite statement in `sql`.
-pub fn parse_statement(sql: &str) -> crate::Result<Option<turso_parser::ast::Cmd>> {
-    Ok(parse(sql)?.0)
-}
-
-/// Parse the column definition of an `ALTER TABLE` statement.
-pub fn parse_column_definition(
-    sql: &str,
-    in_alter: bool,
-) -> crate::Result<turso_parser::ast::ColumnDefinition> {
-    Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(in_alter)?)
-}
-
-/// Formats canonical SQLite `CREATE TABLE` text from its AST.
-pub fn format_table_sql(
-    tbl_name: &turso_parser::ast::QualifiedName,
-    body: &turso_parser::ast::CreateTableBody,
-) -> crate::Result<String> {
-    match body {
-        turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
-            "CREATE TABLE {} {}",
-            tbl_name.name.as_ident(),
-            body
-        )),
-        turso_parser::ast::CreateTableBody::AsSelect(_) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-        }
-    }
-}
-
-/// Parse persisted SQLite table SQL into a `CREATE TABLE` statement.
-pub fn parse_table_sql_ast(sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-    let (cmd, _) = parse(sql)?;
-    match cmd {
-        Some(turso_parser::ast::Cmd::Stmt(stmt @ turso_parser::ast::Stmt::CreateTable { .. })) => {
-            Ok(stmt)
-        }
-        other => Err(crate::LimboError::Corrupt(format!(
-            "persisted table SQL is not CREATE TABLE: {other:?}"
-        ))),
-    }
-}
-
-/// Recover persisted SQLite table SQL for schema replay.
-///
-/// SQLite text without a database qualifier can be replayed unchanged. A
-/// qualified name must be removed because the vacuum target only exposes its
-/// main schema.
-pub fn table_sql_for_replay(sql: &str) -> crate::Result<String> {
-    let stmt = parse_table_sql_ast(sql)?;
-    let turso_parser::ast::Stmt::CreateTable {
-        mut tbl_name,
-        temporary,
-        if_not_exists,
-        body,
-    } = stmt
-    else {
-        unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
-    };
-
-    if tbl_name.namespace.take().is_none() {
-        return Ok(sql.to_string());
-    }
-
-    Ok(turso_parser::ast::Stmt::CreateTable {
-        tbl_name,
-        temporary,
-        if_not_exists,
-        body,
-    }
-    .to_string())
-}
-
-/// Insert the standard SQLite-style catalog tables into `schema`.
-///
-/// `pragma_*` virtual tables use the dedicated `VirtualTableType::Pragma`
-/// variant (they aren't `InternalVirtualTable`), so they are inserted
-/// directly. The rest go through [`Schema::register_internal_vtab`] — the
-/// same path external callers use via [`crate::Database::register_internal_vtab`].
-pub fn register_builtin_catalog(
-    schema: &mut Schema,
-    enable_custom_types: bool,
-) -> crate::Result<()> {
-    for vtab in pragma_vtabs() {
-        schema.insert_table(
-            NamespaceId::ROOT,
-            vtab.name.to_owned(),
-            Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
-        );
-    }
-
-    #[cfg(feature = "json")]
-    {
-        schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_each())?;
-        schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_tree())?;
-    }
-    #[cfg(feature = "cli_only")]
-    {
-        schema.register_internal_vtab(crate::dbpage::DbPageTable::new())?;
-        schema.register_internal_vtab(crate::btree_dump::BtreeDumpTable::new())?;
-    }
-    if enable_custom_types {
-        schema.register_internal_vtab(crate::turso_types_vtab::TursoTypesTable::new())?;
-    }
-    Ok(())
-}
-
-/// Build a `VirtualTable` for each PRAGMA table-valued function.
-fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
-    PragmaVirtualTable::functions()
-        .into_iter()
-        .map(|(tab, schema_sql)| {
-            Arc::new(VirtualTable {
-                name: format!("pragma_{}", tab.pragma_name),
-                columns: VirtualTable::resolve_columns(schema_sql)
-                    .expect("pragma table-valued function schema resolution should not fail"),
-                kind: VTabKind::TableValuedFunction,
-                vtab_type: VirtualTableType::Pragma(tab),
-                vtab_id: 0,
-                is_droppable: false,
-                innocuous: true,
-            })
-        })
-        .collect()
-}
 
 /// Resolve a name against the built-in SQLite function set.
 ///

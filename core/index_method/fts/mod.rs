@@ -347,8 +347,12 @@ pub fn parse_field_weights(
 pub struct FtsIndexMethod;
 
 impl IndexMethod for FtsIndexMethod {
-    fn attach(&self, cfg: &IndexMethodConfiguration) -> Result<Arc<dyn IndexMethodAttachment>> {
-        let attachment = FtsIndexAttachment::new(cfg.clone())?;
+    fn attach(
+        &self,
+        dialect: &dyn crate::dialect::Dialect,
+        cfg: &IndexMethodConfiguration,
+    ) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let attachment = FtsIndexAttachment::new(dialect, cfg.clone())?;
         Ok(Arc::new(attachment))
     }
 
@@ -688,7 +692,10 @@ impl FtsIndexAttachment {
         verify = "neural",
         id = "fts_with_keys_all_validated_and_consumed"
     )]
-    pub fn new(cfg: IndexMethodConfiguration) -> Result<Self> {
+    pub fn new(
+        dialect: &dyn crate::dialect::Dialect,
+        cfg: IndexMethodConfiguration,
+    ) -> Result<Self> {
         // Validate WITH clause keys the same way bad values are validated:
         // a typo like `tokenzier` must be an error, not a silently different
         // index. Keys are matched case-insensitively.
@@ -897,15 +904,18 @@ impl FtsIndexAttachment {
         let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
         // Pattern 6: match (no LIMIT)
         let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
-        let patterns = parse_patterns(&[
-            &score_pattern,          // 0
-            &combined_ordered_limit, // 1
-            &combined_ordered,       // 2
-            &combined_limit,         // 3
-            &combined,               // 4
-            &match_limit,            // 5
-            &match_pattern,          // 6
-        ])?;
+        let patterns = parse_patterns(
+            dialect,
+            &[
+                &score_pattern,          // 0
+                &combined_ordered_limit, // 1
+                &combined_ordered,       // 2
+                &combined_limit,         // 3
+                &combined,               // 4
+                &match_limit,            // 5
+                &match_pattern,          // 6
+            ],
+        )?;
         Ok(Self {
             cfg,
             schema,
@@ -1002,6 +1012,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
 
     fn rename_column(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         from: &str,
         to: &str,
     ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
@@ -1028,7 +1039,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
                 *weights = crate::types::Text::new(renamed_weights);
             }
         }
-        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
+        Ok(Some(Arc::new(FtsIndexAttachment::new(dialect, cfg)?)))
     }
 }
 

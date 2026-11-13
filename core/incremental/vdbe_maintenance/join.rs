@@ -540,7 +540,7 @@ pub(super) fn emit_inner_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::EngineDialect),
+        Arc::new(crate::dialect::DefaultDialect::new(connection.dialect())),
         None,
         RoleId::SUPERUSER,
     );
@@ -792,7 +792,7 @@ pub(super) fn emit_semi_or_anti_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::EngineDialect),
+        Arc::new(crate::dialect::DefaultDialect::new(connection.dialect())),
         None,
         RoleId::SUPERUSER,
     );

@@ -6,17 +6,20 @@ use turso_core::translate::index::canonical_create_index_sql;
 #[allow(unused_imports)]
 use turso_core::CaptureDataChangesExt;
 use turso_parser::ast;
+use turso_sqlite::SqliteDialect;
 
 #[test]
 fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-    let stmt =
-        match turso_core::dialect::engine::parse_statement("CREATE INDEX aux.idx1 ON t1(name);")
-            .unwrap()
-            .unwrap()
-        {
-            ast::Cmd::Stmt(stmt) => stmt,
-            other => panic!("expected statement, got {other:?}"),
-        };
+    let stmt = match turso_core::dialect::parse_statement(
+        &SqliteDialect,
+        "CREATE INDEX aux.idx1 ON t1(name);",
+    )
+    .unwrap()
+    .unwrap()
+    {
+        ast::Cmd::Stmt(stmt) => stmt,
+        other => panic!("expected statement, got {other:?}"),
+    };
 
     // let's confirm that the stmt does carry `aux`
     let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {

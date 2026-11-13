@@ -1198,9 +1198,12 @@ pub fn translate_alter_table(
                 "#,
             );
 
-            let cmd = crate::dialect::engine::parse_statement(&stmt).map_err(|e| {
-                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
-            })?;
+            let cmd = crate::dialect::parse_statement(resolver.catalog.dialect.as_ref(), &stmt)
+                .map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "failed to parse generated UPDATE statement: {e}"
+                    ))
+                })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                 return Err(LimboError::ParseError(
                     "generated UPDATE statement did not parse as expected".to_string(),
@@ -1414,9 +1417,12 @@ pub fn translate_alter_table(
                 "#,
             );
 
-            let cmd = crate::dialect::engine::parse_statement(&stmt).map_err(|e| {
-                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
-            })?;
+            let cmd = crate::dialect::parse_statement(resolver.catalog.dialect.as_ref(), &stmt)
+                .map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "failed to parse generated UPDATE statement: {e}"
+                    ))
+                })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                 return Err(LimboError::ParseError(
                     "generated UPDATE statement did not parse as expected".to_string(),
@@ -1615,6 +1621,7 @@ pub fn translate_alter_table(
                         .namespace_name(database_id)
                         .unwrap_or_else(|| "main".to_string());
                     let new_sql = rewrite_trigger_sql_for_table_rename(
+                        resolver.catalog.dialect.as_ref(),
                         &trigger_entry.trigger.sql,
                         table_name,
                         new_name,
@@ -1797,7 +1804,11 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
+                let cmd = crate::dialect::parse_statement(
+                    resolver.catalog.dialect.as_ref(),
+                    &update_stmt,
+                )
+                .map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
                     ))
@@ -1894,7 +1905,11 @@ pub fn translate_alter_table(
                 let Some(index_method) = &index.index_method else {
                     continue;
                 };
-                if let Some(attachment) = index_method.rename_column(old_column_name, col_name)? {
+                if let Some(attachment) = index_method.rename_column(
+                    resolver.catalog.dialect.as_ref(),
+                    old_column_name,
+                    col_name,
+                )? {
                     renamed_index_methods.push((index.name.clone(), attachment));
                 }
             }
@@ -2221,6 +2236,7 @@ pub fn translate_alter_table(
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views(namespace.id) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                            resolver.catalog.dialect.as_ref(),
                             &view.sql,
                             s,
                             namespace.id,
@@ -2246,6 +2262,7 @@ pub fn translate_alter_table(
                             let mut rewrites = Vec::new();
                             for (view_name, view) in s.views(NamespaceId::ROOT) {
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                                    resolver.catalog.dialect.as_ref(),
                                     &view.sql,
                                     s,
                                     NamespaceId::ROOT,
@@ -2377,7 +2394,11 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
+                let cmd = crate::dialect::parse_statement(
+                    resolver.catalog.dialect.as_ref(),
+                    &update_stmt,
+                )
+                .map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
                     ))
@@ -2410,7 +2431,11 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
+                let cmd = crate::dialect::parse_statement(
+                    resolver.catalog.dialect.as_ref(),
+                    &update_stmt,
+                )
+                .map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse view update SQL for {view_name}: {e}"
                     ))
@@ -3291,12 +3316,13 @@ Here are some helpers related to that: */
 /// `CREATE TEMP TRIGGER ... ON aux.t` during
 /// `ALTER TABLE main.t RENAME TO ...`.
 fn rewrite_trigger_sql_for_table_rename(
+    dialect: &dyn crate::dialect::Dialect,
     trigger_sql: &str,
     old_table_name: &str,
     new_table_name: &str,
     renamed_db_name: &str,
 ) -> Result<String> {
-    let cmd = crate::dialect::engine::parse_statement(trigger_sql)
+    let cmd = crate::dialect::parse_statement(dialect, trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
@@ -3374,7 +3400,7 @@ fn rewrite_trigger_sql_for_column_rename(
     resolver: &Resolver,
 ) -> Result<String> {
     // Parse the trigger SQL
-    let cmd = crate::dialect::engine::parse_statement(trigger_sql)
+    let cmd = crate::dialect::parse_statement(resolver.catalog.dialect.as_ref(), trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
